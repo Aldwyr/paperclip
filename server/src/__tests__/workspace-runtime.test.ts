@@ -43,6 +43,7 @@ import {
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
   setWorkspaceRuntimeExposureDepsForTests,
+  stripRuntimeServiceIdentityEnvOverrides,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
   stopRuntimeServicesForProjectWorkspace,
@@ -467,6 +468,14 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
     expect(sanitized.npm_config_tailscale_auth).toBeUndefined();
     expect(sanitized.npm_config_authenticated_private).toBeUndefined();
     expect(sanitized.HOST).toBe("0.0.0.0");
+  });
+
+  it("removes Paperclip identity overrides from managed runtime-service env", () => {
+    expect(stripRuntimeServiceIdentityEnvOverrides({
+      PAPERCLIP_HOME: "/shared/paperclip-home",
+      PAPERCLIP_INSTANCE_ID: "project-primary-runtime",
+      PORT: "3101",
+    })).toEqual({ PORT: "3101" });
   });
 });
 
@@ -4619,7 +4628,7 @@ describe("ensureRuntimeServicesForRun", () => {
             command: serviceCommand,
             cwd: ".",
             env: {
-              PAPERCLIP_HOME: "{{workspace.cwd}}/.paperclip/runtime-services",
+              WORKSPACE_MARKER: "{{workspace.cwd}}/.paperclip/runtime-services",
             },
             port: { type: "auto" },
             readiness: {
