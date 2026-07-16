@@ -13,6 +13,7 @@ import { experimentalSettingKey } from "@paperclipai/shared";
 import { instanceSettingsApi } from "@/api/instanceSettings";
 import { useHiddenSettings } from "@/hooks/useHiddenSettings";
 import { getWorktreeInstanceId, isWorktreeRuntime } from "../lib/worktree-branding";
+import { WorktreeRunEngineBanner } from "@/components/WorktreeRunEngineBanner";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -37,43 +38,6 @@ function issueHref(identifier: string | null, issueId: string) {
 
 function formatRecoveryState(state: string) {
   return state.replace(/_/g, " ");
-}
-
-type WorktreeRunExecutionDisplayState =
-  | { kind: "off" }
-  | { kind: "armed"; activatedAt: string }
-  | { kind: "fail_closed"; reason: "missing_cutoff" | "missing_instance_id" | "instance_mismatch" };
-
-/**
- * Mirror of the server's `resolveWorktreeRunExecutionActivation` fail-closed
- * ladder (server/src/services/instance-settings.ts) so the card never claims a
- * copied/legacy row is arming execution. The derived fields are display-only —
- * the PATCH the toggle sends still writes just the boolean.
- */
-function resolveWorktreeRunExecutionDisplayState(
-  settings:
-    | Pick<
-        InstanceExperimentalSettings,
-        | "enableWorktreeRunExecution"
-        | "worktreeRunExecutionActivatedAt"
-        | "worktreeRunExecutionActivationInstanceId"
-      >
-    | undefined,
-  currentInstanceId: string | null,
-): WorktreeRunExecutionDisplayState {
-  if (settings?.enableWorktreeRunExecution !== true) return { kind: "off" };
-  if (!settings.worktreeRunExecutionActivatedAt) return { kind: "fail_closed", reason: "missing_cutoff" };
-  if (!currentInstanceId) return { kind: "fail_closed", reason: "missing_instance_id" };
-  if (settings.worktreeRunExecutionActivationInstanceId !== currentInstanceId) {
-    return { kind: "fail_closed", reason: "instance_mismatch" };
-  }
-  return { kind: "armed", activatedAt: settings.worktreeRunExecutionActivatedAt };
-}
-
-function formatActivationTimestamp(iso: string): string {
-  const parsed = new Date(iso);
-  if (Number.isNaN(parsed.getTime())) return iso;
-  return parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 // PAP-11233: keep Conference Room code intact, but hide the user-facing opt-in for now.
@@ -277,6 +241,7 @@ export function InstanceExperimentalSettings() {
       queryClient.setQueryData(queryKeys.instance.experimentalSettings, updatedSettings);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.instance.experimentalSettings }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.instance.worktreeRunEngine }),
         queryClient.invalidateQueries({ queryKey: ["built-in-agents"] }),
         queryClient.invalidateQueries({ queryKey: queryKeys.health }),
       ]);
@@ -466,6 +431,37 @@ export function InstanceExperimentalSettings() {
           {actionError}
         </div>
       )}
+
+      {inWorktree ? (
+        <Card className="block p-5">
+          <div className="flex flex-col gap-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-sm font-semibold">Run tasks in this worktree</h2>
+                  {worktreeRunExecutionManaged ? <ManagedByCloudBadge /> : null}
+                </div>
+                <p className="max-w-2xl text-sm text-muted-foreground">
+                  This is an isolated git-worktree preview instance. Turn this on to let the scheduler execute runs
+                  here. Only tasks created after enabling will run automatically — copied/pre-existing tasks stay
+                  parked. Toggling off and on resets the cutoff.
+                </p>
+              </div>
+              <ToggleSwitch
+                checked={enableWorktreeRunExecution}
+                onCheckedChange={(checked) => {
+                  if (worktreeRunExecutionManaged) return;
+                  toggleMutation.mutate({ enableWorktreeRunExecution: checked });
+                }}
+                disabled={toggleMutation.isPending || worktreeRunExecutionManaged}
+                aria-label="Toggle worktree run execution setting"
+              />
+            </div>
+
+            <WorktreeRunEngineBanner variant="detail" />
+          </div>
+        </Card>
+      ) : null}
 
       <ExperimentalToggleCard
         title="Apps"
