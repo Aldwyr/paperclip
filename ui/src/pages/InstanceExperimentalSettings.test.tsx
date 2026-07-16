@@ -103,6 +103,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableSandboxDuplexBridge: false,
     enableWorktreeRunExecution: false,
     worktreeRunExecutionInstanceNonce: null,
+    worktreeRunExecutionSeedEpoch: null,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
   };
