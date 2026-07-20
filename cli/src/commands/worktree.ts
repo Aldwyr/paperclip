@@ -68,6 +68,7 @@ import {
   loadWithoutEmbeddedPostgresExitHooks,
   prepareEmbeddedPostgresNativeRuntime,
 } from "@paperclipai/db";
+import { WORKTREE_SEED_QUARANTINE_ERROR_CODE } from "@paperclipai/shared";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
 import { expandHomePrefix } from "../config/home.js";
@@ -1352,7 +1353,7 @@ export async function quarantineSeededWorktreeExecutionState(
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
-          errorCode: "worktree_seed_quarantine",
+          errorCode: WORKTREE_SEED_QUARANTINE_ERROR_CODE,
           processPid: null,
           processGroupId: null,
           scheduledRetryAt: null,
