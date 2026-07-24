@@ -322,10 +322,6 @@ export function InstanceExperimentalSettings() {
   const managedKeys = experimentalQuery.data?.managedKeys ?? {};
   const enableWorktreeRunExecution = experimentalQuery.data?.enableWorktreeRunExecution === true;
   const worktreeRunExecutionManaged = managedKeys.enableWorktreeRunExecution?.managed === true;
-  const worktreeRunExecutionState = resolveWorktreeRunExecutionDisplayState(
-    experimentalQuery.data,
-    getWorktreeInstanceId(),
-  );
   const enableEnvironments = experimentalQuery.data?.enableEnvironments === true;
   const enableManagedSandboxOnly = experimentalQuery.data?.enableManagedSandboxOnly === true;
   const enableIsolatedWorkspaces = experimentalQuery.data?.enableIsolatedWorkspaces === true;
