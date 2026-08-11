@@ -2541,6 +2541,7 @@ describeEmbeddedPostgres("tool access service", () => {
       "github",
       "slack",
       "notion",
+      "posthog",
       "linear",
       "google-sheets",
       "context7",
@@ -2548,6 +2549,13 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(res.body.apps.map((app: { slug: string }) => app.slug)).not.toContain("google-drive");
     expect(res.body.apps).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          slug: "posthog",
+          methods: expect.arrayContaining([
+            expect.objectContaining({ key: "mcp-oauth", auth: "oauth" }),
+            expect.objectContaining({ key: "mcp-api-key", auth: "api_key" }),
+          ]),
+        }),
         expect.objectContaining({
           slug: "slack",
           methods: expect.arrayContaining([
