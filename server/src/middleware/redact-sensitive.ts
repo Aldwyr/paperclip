@@ -49,6 +49,15 @@ const SENSITIVE_KEYS = new Set<string>([
   // credential carried as a query parameter, so it must never reach a log line
   // even though the exchange itself answers 302.
   "ticket",
+  // Not secrets Paperclip holds, but attacker-authored prose: an OAuth provider
+  // controls `error_description` / `error_uri` on the callback query string, and
+  // `customProps` copies the whole query into 4xx log lines. Paperclip maps the
+  // `error` code to its own copy instead of reflecting these, so they have no
+  // debugging value here either (PAP-17108).
+  "error_description",
+  "errordescription",
+  "error_uri",
+  "erroruri",
 ]);
 
 const MAX_DEPTH = 6;

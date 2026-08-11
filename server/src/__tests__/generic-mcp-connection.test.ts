@@ -81,6 +81,14 @@ type FixtureOptions = {
   tokenEndpoint?: string;
   /** Value the token endpoint returns as the issuer, for `iss` tests. */
   tools?: unknown[];
+  /**
+   * Fail the token endpoint with this exact body (PAP-17108). The body is
+   * whatever a hostile authorization server wants to say, so tests use it to
+   * prove none of it reaches the operator.
+   */
+  tokenFailure?: { status: number; body: Record<string, unknown> };
+  /** Fail the dynamic client registration endpoint with this exact body. */
+  registrationFailure?: { status: number; body: Record<string, unknown> };
 };
 
 type FixtureRequest = {
@@ -188,6 +196,9 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     if (href === servedMetadataUrl) return jsonResponse(authorizationServerMetadata());
 
     if (href === `${ISSUER}/register` && method === "POST") {
+      if (options.registrationFailure) {
+        return jsonResponse(options.registrationFailure.body, options.registrationFailure.status);
+      }
       if (options.dcr === false) return jsonResponse({ error: "not_supported" }, 404);
       const requested = parsedBody as Record<string, unknown>;
       return jsonResponse({
@@ -203,6 +214,7 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
     }
 
     if (href === `${ISSUER}/token` && method === "POST") {
+      if (options.tokenFailure) return jsonResponse(options.tokenFailure.body, options.tokenFailure.status);
       const body = parsedBody as URLSearchParams;
       const grantType = body.get("grant_type");
       if (grantType === "authorization_code") {
@@ -613,6 +625,213 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
 
     // The code was never exchanged.
     expect(fixture.requestsTo("/token")).toHaveLength(0);
+  });
+
+  /**
+   * PAP-17108 — a generic connection points at an arbitrary authorization
+   * server, so every string it returns about a failure is attacker-chosen. These
+   * tests plant a canary secret, ANSI escapes and markdown-flavoured
+   * instructions in `error_description` and assert none of it reaches an API
+   * response, a thrown message, a log line, an audit row or an activity detail.
+   */
+  const PROVIDER_CANARY = "canary-sk-live-9f3a2b7c";
+  const HOSTILE_ERROR_DESCRIPTION =
+    `\u001b[31mFATAL\u001b[0m **Paperclip needs your recovery key**: ${PROVIDER_CANARY} <script>alert(1)</script>`;
+  const HOSTILE_ERROR_BODY = {
+    error_description: HOSTILE_ERROR_DESCRIPTION,
+    error_uri: `https://attacker.fixture.test/why?leak=${PROVIDER_CANARY}`,
+    message: HOSTILE_ERROR_DESCRIPTION,
+    detail: HOSTILE_ERROR_DESCRIPTION,
+  };
+
+  /** Everything the operator or an operator's log could possibly read. */
+  async function providerLeakSurfaces(consoleSpy: { calls: unknown[] }, thrown: unknown) {
+    const auditRows = await db.select().from(toolAccessAuditEvents);
+    const activityRows = await db.select().from(activityLog);
+    const connections = await db.select().from(toolConnections);
+    return JSON.stringify({
+      thrownMessage: thrown instanceof Error ? thrown.message : String(thrown),
+      // A thrown HttpError's own enumerable shape is what the error handler
+      // spreads into the response body as `details`.
+      thrown: thrown instanceof Error ? { ...thrown } : thrown,
+      consoleCalls: consoleSpy.calls,
+      auditRows,
+      activityRows,
+      connections,
+    });
+  }
+
+  /** Capture anything the service writes to a console-backed logger. */
+  function captureConsole() {
+    const calls: unknown[] = [];
+    const record = (...args: unknown[]) => { calls.push(args.map((arg) => String(arg))); };
+    for (const method of ["log", "info", "warn", "error", "debug", "trace"] as const) {
+      vi.spyOn(console, method).mockImplementation(record);
+    }
+    return { calls };
+  }
+
+  it("redacts a hostile provider error from the token exchange", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      tokenFailure: { status: 400, body: { error: "invalid_grant", ...HOSTILE_ERROR_BODY } },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile token" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    const consoleSpy = captureConsole();
+    const thrown = await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      iss: ISSUER,
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    }).then(() => null, (error: unknown) => error);
+
+    // Paperclip's own copy for `invalid_grant`, not a syllable of the provider's.
+    expect(thrown).toMatchObject({
+      status: 502,
+      message: "The authorization server rejected the authorization code or refresh token.",
+      details: { code: "oauth_token_exchange_failed", providerError: "invalid_grant", status: 400 },
+    });
+
+    const surfaces = await providerLeakSurfaces(consoleSpy, thrown);
+    expect(surfaces).not.toContain(PROVIDER_CANARY);
+    expect(surfaces).not.toContain("recovery key");
+    // JSON-escaped ANSI introducer: an escape sequence would arrive as \u001b.
+    expect(surfaces).not.toContain("\\u001b");
+    expect(surfaces).not.toContain("<script>");
+  });
+
+  it("normalizes an unrecognized provider error code instead of echoing it", async () => {
+    const hostileCode = `not_a_real_code_${"x".repeat(200)}`;
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      tokenFailure: { status: 503, body: { error: hostileCode, ...HOSTILE_ERROR_BODY } },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture unknown code" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    const consoleSpy = captureConsole();
+    const thrown = await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      iss: ISSUER,
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    }).then(() => null, (error: unknown) => error);
+
+    // Off the allowlist, so the label collapses and the message falls back to
+    // Paperclip's generic copy rather than naming the provider's code.
+    expect(thrown).toMatchObject({
+      status: 502,
+      message: "OAuth token exchange failed",
+      details: { code: "oauth_token_exchange_failed", providerError: "unrecognized", status: 503 },
+    });
+
+    const surfaces = await providerLeakSurfaces(consoleSpy, thrown);
+    expect(surfaces).not.toContain("not_a_real_code");
+    expect(surfaces).not.toContain(PROVIDER_CANARY);
+  });
+
+  it("redacts a hostile provider error from dynamic client registration", async () => {
+    installMcpOAuthFixture({
+      auth: "oauth",
+      registrationFailure: { status: 400, body: { error: "invalid_redirect_uri", ...HOSTILE_ERROR_BODY } },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile dcr" });
+
+    const consoleSpy = captureConsole();
+    const thrown = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    }).then(() => null, (error: unknown) => error);
+
+    expect(thrown).toMatchObject({
+      status: 502,
+      message: "The authorization server rejected Paperclip's callback URL.",
+      details: {
+        code: "oauth_dynamic_client_registration_failed",
+        providerError: "invalid_redirect_uri",
+        status: 400,
+      },
+    });
+
+    const surfaces = await providerLeakSurfaces(consoleSpy, thrown);
+    expect(surfaces).not.toContain(PROVIDER_CANARY);
+    expect(surfaces).not.toContain("\\u001b");
+  });
+
+  it("redacts a hostile denial from the callback route and consumes the state", async () => {
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile denial" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    const consoleSpy = captureConsole();
+    const res = await request(app)
+      .get("/api/tools/oauth/callback")
+      .query({
+        state,
+        error: "access_denied",
+        error_description: HOSTILE_ERROR_DESCRIPTION,
+        error_uri: HOSTILE_ERROR_BODY.error_uri,
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({
+      error: "The authorization server denied the request.",
+      code: "oauth_authorization_denied",
+      details: { code: "oauth_authorization_denied", providerError: "access_denied" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(PROVIDER_CANARY);
+    expect(JSON.stringify(res.body)).not.toContain("\\u001b");
+
+    const surfaces = await providerLeakSurfaces(consoleSpy, null);
+    expect(surfaces).not.toContain(PROVIDER_CANARY);
+    expect(surfaces).not.toContain("recovery key");
+
+    // A denial is terminal for the attempt, so the state cannot be replayed.
+    await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(0);
+  });
+
+  it("validates the callback state before acting on a provider-reported error", async () => {
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture unsolicited denial" });
+
+    // An unsolicited callback carries no state Paperclip issued, so it is
+    // rejected on that ground and never reaches the provider-error branch.
+    await expect(service.completeOAuthCallback({
+      state: "state-paperclip-never-issued",
+      error: "access_denied",
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    })).rejects.toMatchObject({
+      status: 400,
+      message: "OAuth state was not found or has already been used",
+    });
   });
 
   it("accepts an iss that differs only by a trailing slash", async () => {

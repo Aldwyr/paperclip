@@ -150,6 +150,107 @@ const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 
 /**
+ * Upstream OAuth error redaction (PAP-17108).
+ *
+ * A generic remote MCP connection points at an arbitrary authorization server,
+ * so everything that server says about a failure is attacker-chosen: `error`,
+ * `error_description`, `error_uri`, and the response body. Paperclip surfaces
+ * connection failures to the operator through API responses, board UI copy,
+ * audit rows and logs, so reflecting any of that text would let a hostile
+ * provider plant secrets, ANSI escapes, or instructions ("paste your recovery
+ * key here") into Paperclip's own voice.
+ *
+ * The rule is therefore: the operator only ever reads text Paperclip authored.
+ * The provider's `error` code survives — as a *label* in structured `details`,
+ * never in a message — and only when it is one of the codes the RFCs define,
+ * because a label is still untrusted input. Everything else is dropped, and an
+ * unrecognized code collapses to `unrecognized` rather than being echoed.
+ *
+ * `error_description` and the response body are never read at all: no call site
+ * below parses them, which is what keeps a future edit from quietly
+ * reintroducing the reflection.
+ */
+const OAUTH_PROVIDER_ERROR_CODES = new Set([
+  // RFC 6749 §4.1.2.1 — authorization endpoint (the callback-denial path).
+  "access_denied",
+  "invalid_request",
+  "invalid_scope",
+  "server_error",
+  "temporarily_unavailable",
+  "unauthorized_client",
+  "unsupported_response_type",
+  // RFC 6749 §5.2 — token endpoint (authorization-code and refresh exchanges).
+  "invalid_client",
+  "invalid_grant",
+  "unsupported_grant_type",
+  // RFC 7591 §3.2.2 — dynamic client registration.
+  "invalid_client_metadata",
+  "invalid_redirect_uri",
+  "invalid_software_statement",
+  "unapproved_software_statement",
+  // OpenID Connect Core §3.1.2.6 — interactive re-authentication prompts.
+  "account_selection_required",
+  "consent_required",
+  "interaction_required",
+  "login_required",
+]);
+
+/** What an `error` that is absent, malformed, or off the allowlist becomes. */
+const UNRECOGNIZED_OAUTH_PROVIDER_ERROR = "unrecognized";
+const MAX_OAUTH_PROVIDER_ERROR_LENGTH = 64;
+const OAUTH_PROVIDER_ERROR_PATTERN = /^[a-z0-9_-]+$/;
+
+/**
+ * Stable, Paperclip-authored operator copy for each allowlisted provider error.
+ * Deliberately keyed on the code alone: the calling context is already carried
+ * by the Paperclip `code` in `details`, so one table serves the callback,
+ * token-exchange and registration paths without any of them composing a message
+ * out of provider text.
+ */
+const OAUTH_PROVIDER_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: "The authorization server denied the request.",
+  account_selection_required: "The authorization server needs an account to be selected. Try connecting again.",
+  consent_required: "The authorization server needs consent to be granted. Try connecting again.",
+  interaction_required: "The authorization server needs to be signed in to interactively. Try connecting again.",
+  invalid_client: "The authorization server rejected Paperclip's OAuth client.",
+  invalid_client_metadata: "The authorization server rejected Paperclip's client registration details.",
+  invalid_grant: "The authorization server rejected the authorization code or refresh token.",
+  invalid_redirect_uri: "The authorization server rejected Paperclip's callback URL.",
+  invalid_request: "The authorization server rejected the request as malformed.",
+  invalid_scope: "The authorization server rejected the requested permissions.",
+  invalid_software_statement: "The authorization server rejected Paperclip's client registration details.",
+  login_required: "The authorization server needs to be signed in to. Try connecting again.",
+  server_error: "The authorization server reported an internal error. Try again shortly.",
+  temporarily_unavailable: "The authorization server is temporarily unavailable. Try again shortly.",
+  unapproved_software_statement: "The authorization server rejected Paperclip's client registration details.",
+  unauthorized_client: "The authorization server refused to authorize Paperclip's OAuth client.",
+  unsupported_grant_type: "The authorization server does not support the grant Paperclip uses.",
+  unsupported_response_type: "The authorization server does not support the sign-in flow Paperclip uses.",
+};
+
+/**
+ * Reduce a provider-supplied `error` to a bounded, allowlisted label safe to
+ * keep in structured `details`. Returns `null` only when the provider sent no
+ * `error` at all, so the caller can tell "silent failure" from "said something
+ * Paperclip does not recognize".
+ */
+function normalizeOAuthProviderError(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  // Bound length and character class before the allowlist even though
+  // membership implies both: these limits are what keeps the label safe if the
+  // allowlist above ever grows a pattern-matched entry.
+  if (value.length > MAX_OAUTH_PROVIDER_ERROR_LENGTH) return UNRECOGNIZED_OAUTH_PROVIDER_ERROR;
+  if (!OAUTH_PROVIDER_ERROR_PATTERN.test(value)) return UNRECOGNIZED_OAUTH_PROVIDER_ERROR;
+  return OAUTH_PROVIDER_ERROR_CODES.has(value) ? value : UNRECOGNIZED_OAUTH_PROVIDER_ERROR;
+}
+
+/** Paperclip's own message for a provider failure, never the provider's. */
+function oauthProviderErrorMessage(providerError: string | null, fallback: string): string {
+  if (!providerError) return fallback;
+  return OAUTH_PROVIDER_ERROR_MESSAGES[providerError] ?? fallback;
+}
+
+/**
  * Where this deployment publishes its Client ID Metadata Document. The document's
  * own URL is the `client_id` Paperclip presents, so this path is a stable part of
  * the deployment's public contract with every authorization server that has seen
@@ -4791,11 +4892,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     });
     const record = asRecord(await response.json().catch(() => ({})) as unknown);
     if (!response.ok) {
-      const providerError = typeof record.error === "string" ? record.error : null;
-      const message = typeof record.error_description === "string"
-        ? record.error_description
-        : "OAuth dynamic client registration failed";
-      throw new HttpError(502, message, {
+      const providerError = normalizeOAuthProviderError(record.error);
+      throw new HttpError(502, oauthProviderErrorMessage(providerError, "OAuth dynamic client registration failed"), {
         code: "oauth_dynamic_client_registration_failed",
         providerError,
         status: response.status,
@@ -5212,12 +5310,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const payload = await response.json().catch(() => ({})) as unknown;
     const record = asRecord(payload);
     if (!response.ok || record.ok === false) {
-      const providerError = typeof record.error === "string" ? record.error : null;
-      const message = typeof record.error_description === "string"
-        ? record.error_description
-        : providerError
-          ? providerError
-          : "OAuth token exchange failed";
+      const providerError = normalizeOAuthProviderError(record.error);
+      const message = oauthProviderErrorMessage(providerError, "OAuth token exchange failed");
       if (input.grantType === "refresh_token" && providerError === "invalid_grant") {
         throw new HttpError(422, "OAuth authorization has expired. Reconnect this app to continue.", {
           code: "oauth_reauthorization_required",
@@ -6504,15 +6598,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function completeOAuthCallback(input: {
     state: string;
     code?: string | null;
+    /**
+     * RFC 6749 `error`. Untrusted, and deliberately the *only* thing read from a
+     * failed callback — `error_description` and `error_uri` are not accepted as
+     * input at all, so there is nothing for a hostile provider to reflect
+     * through (PAP-17108).
+     */
     error?: string | null;
-    errorDescription?: string | null;
     redirectUri: string;
     /** RFC 9207 `iss`, when the authorization server returns it. */
     iss?: string | null;
     actor?: ActorInfo;
   }): Promise<ConnectToolAppResult> {
-    if (input.error) throw badRequest(input.errorDescription ?? `OAuth provider returned ${input.error}`);
-    if (!input.code) throw badRequest("OAuth callback is missing a code");
     const [stateRow] = await db
       .select()
       .from(toolOauthStates)
@@ -6527,6 +6624,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     } else {
       assertSameOAuthActor(stateRow, input.actor);
     }
+    // The provider's report of a failure is only acted on once the callback is
+    // bound to a state Paperclip issued and to the actor that started the flow,
+    // so an unsolicited callback cannot drive this path at all. A denial is
+    // terminal for the attempt, so the state is consumed either way.
+    if (input.error) {
+      await db.delete(toolOauthStates).where(eq(toolOauthStates.state, input.state));
+      const providerError = normalizeOAuthProviderError(input.error);
+      throw new HttpError(400, oauthProviderErrorMessage(providerError, "The authorization server denied the request."), {
+        code: "oauth_authorization_denied",
+        providerError,
+      });
+    }
+    if (!input.code) throw badRequest("OAuth callback is missing a code");
     await db.delete(toolOauthStates).where(eq(toolOauthStates.state, input.state));
 
     let connection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);

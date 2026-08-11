@@ -358,7 +358,9 @@ export function toolAccessRoutes(
     const state = typeof req.query.state === "string" ? req.query.state : "";
     const code = typeof req.query.code === "string" ? req.query.code : null;
     const error = typeof req.query.error === "string" ? req.query.error : null;
-    const errorDescription = typeof req.query.error_description === "string" ? req.query.error_description : null;
+    // `error_description` / `error_uri` are read from neither the query nor the
+    // provider's body: they are provider-authored prose, and Paperclip maps the
+    // `error` code to its own copy instead of reflecting them (PAP-17108).
     const iss = typeof req.query.iss === "string" ? req.query.iss : null;
     const pendingState = state ? await svc.peekOAuthState(state) : null;
     if (!pendingState || !hasCompanyAccess(req, pendingState.companyId)) {
@@ -369,7 +371,6 @@ export function toolAccessRoutes(
       state,
       code,
       error,
-      errorDescription,
       iss,
       redirectUri: oauthRedirectUri(),
       actor: getActorInfo(req),

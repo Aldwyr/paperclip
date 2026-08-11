@@ -32,6 +32,24 @@ describe("redactSensitive", () => {
     }
   });
 
+  it("redacts an OAuth provider's error_description and error_uri from a callback query", () => {
+    const out = redactSensitive({
+      state: "paperclip-state",
+      error: "access_denied",
+      error_description: "\u001b[31mPaste your recovery key\u001b[0m sk-live-canary",
+      error_uri: "https://attacker.example/explain?leak=sk-live-canary",
+    }) as Record<string, unknown>;
+
+    // The `error` code is Paperclip's one allowlisted label, so it stays legible
+    // in logs; the provider's prose does not.
+    expect(out.error).toBe("access_denied");
+    expect(out.state).toBe("paperclip-state");
+    expect(out.error_description).toBe("[REDACTED]");
+    expect(out.error_uri).toBe("[REDACTED]");
+    expect(JSON.stringify(out)).not.toContain("sk-live-canary");
+    expect(JSON.stringify(out)).not.toContain("\\u001b");
+  });
+
   it("does not redact a bare `token` field — pagination cursors and CSRF tokens are not credentials", () => {
     const out = redactSensitive({ token: "next-page-cursor", limit: 20 }) as Record<string, unknown>;
 
