@@ -18,6 +18,14 @@ const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
+/**
+ * Matches undici's `headersTimeout`/`bodyTimeout`, which the platform `fetch`
+ * applied for free. Without it a remote server that accepts the connection and
+ * then stays silent would hold the request open indefinitely — the OAuth callers
+ * pass no `AbortSignal`, so nothing else would ever cut it loose.
+ */
+const DEFAULT_RESPONSE_TIMEOUT_MS = 300_000;
+
 /** How a verified socket is opened. Overridable so tests can simulate a rebind. */
 export type RemoteHttpSocketFactory = (target: {
   address: string;
@@ -37,6 +45,8 @@ export type GuardedRemoteHttpFetchOptions = RemoteHttpEndpointGuardOptions & {
    */
   socketFactory?: RemoteHttpSocketFactory;
   connectTimeoutMs?: number;
+  /** Deadline for response headers, and idle deadline between body chunks. */
+  responseTimeoutMs?: number;
   /**
    * Platform `fetch`, used only when the deployment allows private endpoints and
    * there is therefore no egress boundary to pin against.
@@ -116,7 +126,16 @@ async function pinnedRequest(
   });
 
   try {
-    return await sendRequest({ endpoint, hostname, port, useTls, socket, init, signal });
+    return await sendRequest({
+      endpoint,
+      hostname,
+      port,
+      useTls,
+      socket,
+      init,
+      signal,
+      responseTimeoutMs: options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
+    });
   } catch (error) {
     socket.destroy();
     throw error;
@@ -182,8 +201,9 @@ async function sendRequest(input: {
   socket: Socket;
   init: RequestInit;
   signal: AbortSignal | null;
+  responseTimeoutMs: number;
 }): Promise<Response> {
-  const { endpoint, hostname, port, useTls, socket, init, signal } = input;
+  const { endpoint, hostname, port, useTls, socket, init, signal, responseTimeoutMs } = input;
   const headers = new Headers(init.headers);
   const body = readRequestBody(init.body);
   const method = (init.method ?? "GET").toUpperCase();
@@ -214,8 +234,22 @@ async function sendRequest(input: {
       ...(signal ? { signal } : {}),
     }, resolve);
     req.on("error", reject);
+    // Headers deadline. `req.setTimeout` is socket-idle based, which a server
+    // that dribbles bytes could reset forever, so hold a hard timer instead.
+    const headersTimer = setTimeout(() => {
+      req.destroy(new Error("Remote MCP endpoint did not send response headers in time"));
+    }, responseTimeoutMs);
+    headersTimer.unref?.();
+    req.on("response", () => clearTimeout(headersTimer));
+    req.on("error", () => clearTimeout(headersTimer));
     if (body !== undefined) req.write(body);
     req.end();
+  });
+
+  // Body idle deadline, mirroring undici's `bodyTimeout`: a stalled stream is
+  // destroyed so `response.text()` rejects instead of hanging the caller.
+  message.setTimeout(responseTimeoutMs, () => {
+    message.destroy(new Error("Remote MCP endpoint stalled while sending its response body"));
   });
 
   const responseHeaders = new Headers();

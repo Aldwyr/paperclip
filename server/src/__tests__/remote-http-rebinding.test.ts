@@ -294,6 +294,46 @@ describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
     expect(response.headers.get("content-encoding")).toBeNull();
   });
 
+  it("gives up on a server that accepts the connection and never answers", async () => {
+    // Platform `fetch` applied undici's headersTimeout for free. The OAuth
+    // callers pass no AbortSignal, so the pinned transport has to own the
+    // deadline or a silent server would hold the request open forever.
+    const upstream = await startServer(() => {
+      /* accept the request and never respond */
+    });
+    const network = routingSocketFactory({ [PUBLIC_ADDRESS]: upstream.port });
+
+    await expect(guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+      allowPrivateNetwork: false,
+      lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+      socketFactory: network.factory,
+      responseTimeoutMs: 150,
+      error: guardError,
+    })).rejects.toThrow(/did not send response headers/);
+
+    expect(upstream.requests).toHaveLength(1);
+  });
+
+  it("gives up on a response body that stalls midway", async () => {
+    const upstream = await startServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"partial":');
+      // never finishes the body
+    });
+    const network = routingSocketFactory({ [PUBLIC_ADDRESS]: upstream.port });
+
+    const response = await guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+      allowPrivateNetwork: false,
+      lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+      socketFactory: network.factory,
+      responseTimeoutMs: 150,
+      error: guardError,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).rejects.toThrow();
+  });
+
   it("still refuses a private IP literal before any transport runs", async () => {
     await expect(guardedRemoteHttpFetch("http://169.254.169.254/latest/meta-data/", {}, {
       allowPrivateNetwork: false,
