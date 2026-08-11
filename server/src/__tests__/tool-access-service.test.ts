@@ -37,11 +37,12 @@ import {
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
+import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { classifyRisk, toolAccessService } from "../services/tool-access.js";
+import { classifyRisk, normalizeConnectionMethodConfig, toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
@@ -2659,6 +2660,62 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(result.actions.readOnly).toEqual([
       expect.objectContaining({ toolName: "kv_get", riskLevel: "read" }),
     ]);
+  });
+
+  it("requires an explicit PostHog method and projects validated project filters", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "posthog",
+      configValues: { projectId: "12345", features: "insights" },
+    }, { actorType: "user", actorId: "board" })).rejects.toMatchObject({ status: 400 });
+
+    const fetchMock = mockToolsList([
+      { name: "query_insight", annotations: { readOnlyHint: true } },
+      { name: "delete_feature_flag" },
+      { name: "brand_new_tool" },
+    ]);
+    const result = await service.connectGalleryApp(company.id, {
+      galleryKey: "posthog",
+      connectionMethodKey: "mcp-api-key",
+      credentialValues: { "credentials.authorization": "phx_test-secret" },
+      configValues: {
+        projectId: "12345",
+        readOnly: true,
+        features: "insights, error_tracking\ninsights",
+        tools: "query_insight",
+        mode: "tools",
+      },
+    }, { actorType: "user", actorId: "board" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://mcp.posthog.com/mcp?project_id=12345&readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "Bearer phx_test-secret" }),
+      }),
+    );
+    expect(result.connection).toMatchObject({
+      authKind: "api_key",
+      config: {
+        sourceTemplateKey: "posthog",
+        connectionMethodKey: "mcp-api-key",
+        methodConfig: {
+          projectId: "12345",
+          readOnly: true,
+          features: "insights,error_tracking",
+          tools: "query_insight",
+          mode: "tools",
+        },
+        safeDefault: true,
+      },
+    });
+    expect(JSON.stringify(result.connection.config)).not.toContain("phx_test-secret");
+    expect(result.catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolName: "query_insight", riskLevel: "read", status: "active" }),
+      expect.objectContaining({ toolName: "delete_feature_flag", riskLevel: "destructive", status: "quarantined" }),
+      expect.objectContaining({ toolName: "brand_new_tool", riskLevel: "write", status: "quarantined" }),
+    ]));
   });
 
   it("stores approved class-3 credential refs on thin tool connections", async () => {
@@ -7091,5 +7148,44 @@ describe("classifyRisk", () => {
     }
     expect(notionRisk("notion-delete-page")).toBe("destructive");
     expect(classifyRisk({ name: "move_pages" })).toBe("read");
+  });
+
+  it("uses conservative PostHog defaults for unknown and nested-execution tools", () => {
+    expect(classifyRisk({ name: "query_insight", annotations: { readOnlyHint: true } }, "posthog")).toBe("read");
+    expect(classifyRisk({ name: "brand_new_tool" }, "posthog")).toBe("write");
+    expect(classifyRisk({ name: "exec" }, "posthog")).toBe("destructive");
+  });
+});
+
+describe("normalizeConnectionMethodConfig", () => {
+  const posthog = getConnectableAppDefinition("posthog")!;
+  const apiKeyMethod = posthog.methods.find((method) => method.key === "mcp-api-key")!;
+
+  it("normalizes and projects PostHog scope without accepting arbitrary config", () => {
+    expect(normalizeConnectionMethodConfig(apiKeyMethod, {
+      projectId: "12345",
+      readOnly: true,
+      features: "insights, error_tracking\ninsights",
+      tools: "query_insight",
+      mode: "tools",
+    })).toEqual({
+      values: {
+        projectId: "12345",
+        readOnly: true,
+        features: "insights,error_tracking",
+        tools: "query_insight",
+        mode: "tools",
+      },
+      url: "https://mcp.posthog.com/mcp?project_id=12345&readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
+    });
+    expect(() => normalizeConnectionMethodConfig(apiKeyMethod, {
+      projectId: "not-a-project",
+      features: "insights",
+    })).toThrow("Project ID has an invalid value");
+    expect(() => normalizeConnectionMethodConfig(apiKeyMethod, {
+      projectId: "12345",
+      features: "insights",
+      apiKey: "must-not-be-config",
+    })).toThrow("Unknown connection setting: apiKey");
   });
 });
