@@ -8,6 +8,8 @@ import {
   identitySchema,
   requestSchema,
   resultSchema,
+  semanticToolSchema,
+  stopReasonSchema,
   terminalSchema,
 } from "./generated/schema-bundle.js";
 import {
@@ -20,11 +22,22 @@ export const PRP_PROTOCOL_NAME = "paperclip.runner";
 export const PRP_PROTOCOL_VERSION = 1;
 export const PRP_FIXTURE_SCHEMA = "paperclip.prp.fixture.v1";
 
-type EventReferences = [typeof terminalSchema, typeof resultSchema];
+type TerminalReferences = [typeof stopReasonSchema];
+type EventReferences = [
+  typeof semanticToolSchema,
+  typeof stopReasonSchema,
+  typeof terminalSchema,
+  typeof resultSchema,
+];
 export type PrpIdentity = FromSchema<typeof identitySchema>;
 export type PrpCapabilities = FromSchema<typeof capabilitiesSchema>;
 export type PrpCommand = FromSchema<typeof commandSchema>;
-export type PrpTerminalState = FromSchema<typeof terminalSchema>;
+export type PrpSemanticToolEnvelope = FromSchema<typeof semanticToolSchema>;
+export type PrpStopReason = FromSchema<typeof stopReasonSchema>;
+export type PrpTerminalState = FromSchema<
+  typeof terminalSchema,
+  { references: TerminalReferences }
+>;
 export type PrpRequest = FromSchema<typeof requestSchema>;
 export type PrpStructuredRunResult = FromSchema<typeof resultSchema>;
 export type PrpEvent = FromSchema<
@@ -127,6 +140,35 @@ function versionIssues(value: unknown): ProtocolValidationIssue[] {
           message: `event schemaVersion ${actual} is unsupported; this implementation requires 1`,
         });
       }
+      const payload = asRecord(event?.payload);
+      const semanticTool = asRecord(payload?.semantic_tool);
+      const semanticToolVersion = semanticTool?.schemaVersion;
+      if (typeof semanticToolVersion === "number" && semanticToolVersion !== 1) {
+        issues.push({
+          code: "unsupported_required_version",
+          path: `/events/${index}/payload/semantic_tool/schemaVersion`,
+          message: `semantic_tool schemaVersion ${semanticToolVersion} is unsupported; this implementation requires 1`,
+        });
+      }
+      const stopReason = asRecord(payload?.stopReason);
+      const stopReasonVersion = stopReason?.schemaVersion;
+      if (typeof stopReasonVersion === "number" && stopReasonVersion !== 1) {
+        issues.push({
+          code: "unsupported_required_version",
+          path: `/events/${index}/payload/stopReason/schemaVersion`,
+          message: `stopReason schemaVersion ${stopReasonVersion} is unsupported; this implementation requires 1`,
+        });
+      }
+    });
+  }
+  const capabilities = asRecord(fixture.capabilities);
+  const semanticTools = asRecord(capabilities?.semanticTools);
+  const semanticToolsVersion = semanticTools?.schemaVersion;
+  if (typeof semanticToolsVersion === "number" && semanticToolsVersion !== 1) {
+    issues.push({
+      code: "unsupported_required_version",
+      path: "/capabilities/semanticTools/schemaVersion",
+      message: `semanticTools schemaVersion ${semanticToolsVersion} is unsupported; this implementation requires 1`,
     });
   }
   return issues;
@@ -143,6 +185,10 @@ function ajvIssue(error: ErrorObject): ProtocolValidationIssue {
 function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
   const issues: ProtocolValidationIssue[] = [];
   const uniqueEvents = new Map<string, PrpEvent>();
+  const semanticCalls = new Map<
+    string,
+    { input?: { envelope: PrpSemanticToolEnvelope; index: number }; result?: { envelope: PrpSemanticToolEnvelope; index: number } }
+  >();
   fixture.events.forEach((event, index) => {
     if (event.runId !== fixture.identity.runId) {
       issues.push({
@@ -164,14 +210,70 @@ function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
     const existing = uniqueEvents.get(event.sourceEventId);
     if (existing === undefined) {
       uniqueEvents.set(event.sourceEventId, event);
-    } else if (canonicalJson(existing) !== canonicalJson(event)) {
-      issues.push({
-        code: "binding_mismatch",
-        path: `/events/${index}/sourceEventId`,
-        message: "duplicate sourceEventId deliveries must be byte-equivalent",
-      });
+    } else {
+      if (canonicalJson(existing) !== canonicalJson(event)) {
+        issues.push({
+          code: "binding_mismatch",
+          path: `/events/${index}/sourceEventId`,
+          message: "duplicate sourceEventId deliveries must be byte-equivalent",
+        });
+      }
+      // At-least-once source delivery is not a second semantic invocation.
+      return;
+    }
+    const payload = asRecord(event.payload);
+    const semanticTool = asRecord(payload?.semantic_tool) as PrpSemanticToolEnvelope | null;
+    if (semanticTool !== null) {
+      const correlation = asRecord(semanticTool.correlation);
+      for (const [field, actual, expected] of [
+        ["runId", correlation?.runId, event.runId],
+        ["normalizedSessionId", correlation?.normalizedSessionId, event.normalizedSessionId],
+        ["turnId", correlation?.turnId, event.turnId],
+        ["itemId", correlation?.itemId, event.itemId],
+      ] as const) {
+        if (actual !== expected) {
+          issues.push({
+            code: "binding_mismatch",
+            path: `/events/${index}/payload/semantic_tool/correlation/${field}`,
+            message: `semantic_tool correlation ${field} must match the containing event`,
+          });
+        }
+      }
+      const call = semanticCalls.get(semanticTool.callId) ?? {};
+      const phase = semanticTool.phase;
+      if (call[phase] !== undefined) {
+        issues.push({
+          code: "binding_mismatch",
+          path: `/events/${index}/payload/semantic_tool/callId`,
+          message: `semantic_tool call ${semanticTool.callId} must contain exactly one ${phase} envelope`,
+        });
+      } else {
+        call[phase] = { envelope: semanticTool, index };
+        semanticCalls.set(semanticTool.callId, call);
+      }
     }
   });
+
+  for (const [callId, call] of semanticCalls) {
+    if (call.input === undefined || call.result === undefined) {
+      const present = call.input ?? call.result;
+      issues.push({
+        code: "binding_mismatch",
+        path: `/events/${present?.index ?? 0}/payload/semantic_tool/callId`,
+        message: `semantic_tool call ${callId} must contain one input and one result envelope`,
+      });
+      continue;
+    }
+    for (const field of ["operationId", "idempotencyKey"] as const) {
+      if (canonicalJson(call.input.envelope[field]) !== canonicalJson(call.result.envelope[field])) {
+        issues.push({
+          code: "binding_mismatch",
+          path: `/events/${call.result.index}/payload/semantic_tool/${field}`,
+          message: `semantic_tool result ${field} must match its input envelope`,
+        });
+      }
+    }
+  }
 
   fixture.commands.forEach((command, index) => {
     if (command.controllerSeq !== index + 1) {

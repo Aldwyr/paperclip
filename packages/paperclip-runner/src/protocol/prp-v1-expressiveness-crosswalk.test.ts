@@ -64,4 +64,13 @@ describe("PRP v1 expressiveness crosswalk", () => {
       }
     }
   });
+
+  it("has no unlanded additive receipt or fixture/document gap", () => {
+    expect(
+      crosswalk.facts.filter((fact) =>
+        fact.classification === "additive_v1_change"
+        || fact.classification === "missing_fixture_docs",
+      ),
+    ).toEqual([]);
+  });
 });

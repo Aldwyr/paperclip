@@ -34,6 +34,45 @@
     "runtimeRequests": { "type": "boolean" },
     "structuredResult": { "type": "boolean" },
     "typedEvents": { "type": "boolean" },
+    "semanticTools": {
+      "type": "object",
+      "required": ["schema", "schemaVersion", "operations"],
+      "properties": {
+        "schema": { "const": "paperclip.prp.semantic_tools.v1" },
+        "schemaVersion": { "const": 1 },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["operationId", "version", "availability", "redactionDisposition"],
+            "properties": {
+              "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              },
+              "version": { "const": 1 },
+              "availability": { "enum": ["available", "denied", "unsupported"] },
+              "redactionDisposition": { "const": "digest_only" },
+              "requiredClaims": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "maxLength": 160 },
+                "uniqueItems": true
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "pattern": "^[a-z][a-z0-9_.:-]*$"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
     "unsupported": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },

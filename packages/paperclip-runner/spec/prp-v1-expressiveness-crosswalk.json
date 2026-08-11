@@ -2,19 +2,103 @@
   "$schema": "./prp-v1-expressiveness-crosswalk.schema.json",
   "version": 1,
   "facts": [
-    {"id":"semantic-tool-exposure","classification":"additive_v1_change","wire":"capabilities.schema.json","evidence":["capabilities.schema.json#/properties/unsupported","spec/capability/capabilities.yaml"],"invariant":"Advertised operations are a typed operation-id set with grant, task-mode, and redaction disposition; generic_api_request never counts as coverage.","correction":{"kind":"additive_schema","target":"capabilities.semanticTools","fixtures":["semantic-tool-denied.json","semantic-tool-unsupported.json"]}},
-    {"id":"semantic-tool-call-result","classification":"additive_v1_change","wire":"event.schema.json","evidence":["event.schema.json#/properties/eventType","docs/capability-semantic-tools.md"],"invariant":"Each semantic invocation has one call id, operation id, input digest/redaction disposition, and exactly one typed result receipt.","correction":{"kind":"additive_event","target":"semantic_tool.call|result","fixtures":["semantic-tool-happy-path.json","semantic-tool-duplicate-retry.json"]}},
-    {"id":"semantic-tool-denial-and-redaction","classification":"additive_v1_change","wire":"event.schema.json","evidence":["event.schema.json#/properties/eventType","docs/capability-authorization-and-exposure.md"],"invariant":"A denied operation yields a typed safe receipt naming the failed boundary; secret values and hidden identifiers are absent.","correction":{"kind":"additive_schema","target":"semantic_tool.receipt","fixtures":["semantic-tool-denied.json","semantic-tool-redaction.json"]}},
-    {"id":"optimistic-write-conflict","classification":"additive_v1_change","wire":"event.schema.json","evidence":["event.schema.json#/properties/eventType","docs/capability-mock-control-plane-port.md"],"invariant":"A mutation receipt carries operation id, idempotency key, outcome, stable code, retryability, and safe current revision when applicable.","correction":{"kind":"additive_schema","target":"semantic_tool.receipt","fixtures":["document-conflict.json","document-duplicate-retry.json"]}},
-    {"id":"artifacts-and-deliverables","classification":"compositional_v1_with_invariant","wire":"result.schema.json","evidence":["result.schema.json#/properties/artifacts","protocol/fixtures/replay/happy-path.json"],"invariant":"Every artifact ref is produced by a typed semantic receipt or registered control-plane work product, and is linked to the terminal result by run id."},
-    {"id":"governance-links-and-interactions","classification":"compositional_v1_with_invariant","wire":"request.schema.json","evidence":["request.schema.json#/oneOf/1","event.schema.json#/properties/eventType"],"invariant":"Interaction and approval targets are immutable revision/decision references carried in a typed target envelope, not an unconstrained request payload."},
-    {"id":"blockers-monitors-and-wakes","classification":"compositional_v1_with_invariant","wire":"result.schema.json","evidence":["result.schema.json#/properties/blocker","result.schema.json#/properties/continuation","event.schema.json#/properties/eventType"],"invariant":"A blocked or yielded result names a bounded owner/action or continuation kind; wake routing remains a control-plane decision and emits only safe causal identifiers."},
-    {"id":"budget-cost-stop-reason","classification":"additive_v1_change","wire":"terminal.schema.json","evidence":["terminal.schema.json#/properties/runTerminalState","docs/capability-disposition.md"],"invariant":"A budget/cost stop includes a typed stop reason, observed limit class, safe usage aggregate, and control-plane decision id.","correction":{"kind":"additive_schema","target":"terminal.stopReason","fixtures":["budget-stop.json"]}},
-    {"id":"audit-and-idempotency-receipts","classification":"additive_v1_change","wire":"event.schema.json","evidence":["event.schema.json#/required","protocol/fixtures/replay/duplicate-event.json"],"invariant":"Source-event idempotency is already replay-safe; semantic mutation idempotency additionally requires a stable operation receipt/audit ref.","correction":{"kind":"additive_schema","target":"semantic_tool.receipt","fixtures":["semantic-tool-duplicate-retry.json"]}},
-    {"id":"capability-negotiation-and-unsupported","classification":"direct_v1","wire":"capabilities.schema.json","evidence":["capabilities.schema.json#/required","capabilities.schema.json#/properties/unsupported","protocol/fixtures/replay/unsupported-required-version.json"],"invariant":"The controller binds behavior to the negotiated typed booleans/version and treats unsupported required versions as fail-closed."},
-    {"id":"end-to-end-causality","classification":"compositional_v1_with_invariant","wire":"event.schema.json","evidence":["event.schema.json#/required","terminal.schema.json#/properties/workAssessmentId","protocol/fixtures/replay/golden/happy-path.snapshot.json"],"invariant":"Run, session, turn, item, source-event, work-assessment, status-decision, request, and receipt identifiers form an acyclic trace from command to terminal decision."},
-    {"id":"control-plane-local-lifecycle","classification":"control_plane_local","wire":"none","evidence":["docs/capability-disposition.md","spec/capability/capabilities.yaml"],"invariant":"Checkout/release, wake routing, budget enforcement, audit persistence, run persistence/replay, assignment, and monitor management are not runner tool calls and must not be serialized as semantic operations."},
-    {"id":"future-cross-company-and-destructive-admin","classification":"breaking_v2_work","wire":"none","evidence":["docs/capability-disposition.md","docs/capability-future-binding-boundary.md"],"invariant":"Cross-company discovery, broad audit access, destructive document lifecycle, and company administration require separately governed product contracts; v1 must reject rather than tunnel them through generic payloads."},
-    {"id":"existing-fixture-and-doc-coverage","classification":"missing_fixture_docs","wire":"protocol/fixtures/replay","evidence":["protocol/fixtures/replay/duplicate-event.json","protocol/fixtures/replay/unknown-optional-fields.json","src/protocol/replay-contract.test.ts"],"invariant":"Every accepted additive correction ships a golden replay, duplicate/retry, redaction/denial, and unknown-version fixture before it is called direct support."}
+    {
+      "id": "semantic-tool-exposure",
+      "classification": "direct_v1",
+      "wire": "capabilities.schema.json",
+      "evidence": ["capabilities.schema.json#/properties/semanticTools", "protocol/fixtures/replay/semantic-tool-unknown-optional-envelope.json"],
+      "invariant": "Advertised operations are a typed operation-id set with availability, required claims, and redaction disposition; generic_api_request never counts as coverage."
+    },
+    {
+      "id": "semantic-tool-call-result",
+      "classification": "direct_v1",
+      "wire": "event.schema.json",
+      "evidence": ["event.schema.json#/allOf", "semantic-tool.schema.json", "protocol/fixtures/replay/semantic-tool-artifact-happy-path.json"],
+      "invariant": "Each semantic invocation has one call id, operation id, safe input digest, and exactly one typed result receipt."
+    },
+    {
+      "id": "semantic-tool-denial-and-redaction",
+      "classification": "direct_v1",
+      "wire": "semantic-tool.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/authorizationBoundary", "protocol/fixtures/replay/semantic-tool-denial-redaction.json"],
+      "invariant": "A denied operation yields a typed safe receipt naming the failed boundary; secret values and hidden identifiers are absent."
+    },
+    {
+      "id": "optimistic-write-conflict",
+      "classification": "direct_v1",
+      "wire": "semantic-tool.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/currentRevision", "protocol/fixtures/replay/semantic-tool-conflict-duplicate-retry.json"],
+      "invariant": "A mutation receipt carries operation id, idempotency key, outcome, stable code, retryability, and safe current revision when applicable."
+    },
+    {
+      "id": "artifacts-and-deliverables",
+      "classification": "compositional_v1_with_invariant",
+      "wire": "semantic-tool.schema.json + result.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/artifactRefs", "result.schema.json#/properties/artifacts", "protocol/fixtures/replay/semantic-tool-artifact-happy-path.json"],
+      "invariant": "Every artifact ref is produced by a typed semantic receipt or registered work product and remains linked to the terminal result by run id."
+    },
+    {
+      "id": "governance-links-and-interactions",
+      "classification": "compositional_v1_with_invariant",
+      "wire": "semantic-tool.schema.json + request.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/targets", "protocol/fixtures/replay/semantic-tool-governance-wake-monitor.json"],
+      "invariant": "Interaction and approval targets are immutable revision or decision references carried in a typed target envelope."
+    },
+    {
+      "id": "blockers-monitors-and-wakes",
+      "classification": "compositional_v1_with_invariant",
+      "wire": "semantic-tool.schema.json + result.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/causalRefs", "result.schema.json#/properties/continuation", "protocol/fixtures/replay/semantic-tool-governance-wake-monitor.json"],
+      "invariant": "A blocked or yielded result names a bounded continuation; wake routing remains a control-plane decision and emits only safe causal identifiers."
+    },
+    {
+      "id": "budget-cost-stop-reason",
+      "classification": "direct_v1",
+      "wire": "terminal.schema.json",
+      "evidence": ["terminal.schema.json#/properties/stopReason", "stop-reason.schema.json", "protocol/fixtures/replay/budget-cost-stop-reason.json"],
+      "invariant": "A budget or cost stop includes a typed reason, observed limit class, safe usage aggregate, and control-plane decision id."
+    },
+    {
+      "id": "audit-and-idempotency-receipts",
+      "classification": "direct_v1",
+      "wire": "semantic-tool.schema.json",
+      "evidence": ["semantic-tool.schema.json#/properties/operationReceiptId", "protocol/fixtures/replay/semantic-tool-conflict-duplicate-retry.json"],
+      "invariant": "Source-event and semantic mutation idempotency are distinct; an exact semantic retry reuses its stable operation receipt and records the duplicate link."
+    },
+    {
+      "id": "capability-negotiation-and-unsupported",
+      "classification": "direct_v1",
+      "wire": "capabilities.schema.json",
+      "evidence": ["capabilities.schema.json#/properties/semanticTools", "protocol/fixtures/replay/semantic-tool-unknown-optional-envelope.json", "protocol/fixtures/replay/semantic-tool-unsupported-required-version.json"],
+      "invariant": "The controller binds behavior to negotiated typed capability versions, accepts optional extensions, and rejects unknown required versions fail-closed."
+    },
+    {
+      "id": "end-to-end-causality",
+      "classification": "compositional_v1_with_invariant",
+      "wire": "event.schema.json + semantic-tool.schema.json + terminal.schema.json",
+      "evidence": ["event.schema.json#/required", "semantic-tool.schema.json#/properties/correlation", "protocol/fixtures/replay/semantic-tool-governance-wake-monitor.json"],
+      "invariant": "Run, session, turn, item, source-event, governed-target, wake, monitor, decision, and receipt identifiers form an inspectable trace to terminal disposition."
+    },
+    {
+      "id": "control-plane-local-lifecycle",
+      "classification": "control_plane_local",
+      "wire": "none",
+      "evidence": ["docs/capability-disposition.md", "spec/capability/capabilities.yaml"],
+      "invariant": "Checkout and release, wake routing, budget enforcement, audit persistence, run persistence and replay, assignment, and monitor management are not runner tool calls."
+    },
+    {
+      "id": "future-cross-company-and-destructive-admin",
+      "classification": "breaking_v2_work",
+      "wire": "none",
+      "evidence": ["docs/capability-disposition.md", "docs/capability-future-binding-boundary.md"],
+      "invariant": "Cross-company discovery, broad audit access, destructive document lifecycle, and company administration require separately governed contracts; v1 rejects rather than tunnels them."
+    },
+    {
+      "id": "existing-fixture-and-doc-coverage",
+      "classification": "direct_v1",
+      "wire": "protocol/fixtures/replay",
+      "evidence": ["src/protocol/replay-contract.test.ts", "runner/crates/runner-core/src/replay.rs", "docs/protocol-compatibility.md"],
+      "invariant": "Every accepted additive correction ships golden replay, duplicate and retry, redaction and denial, optional-extension, and unknown-required-version conformance coverage."
+    }
   ]
 }

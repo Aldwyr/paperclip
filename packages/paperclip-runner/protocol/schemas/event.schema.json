@@ -52,6 +52,44 @@
   },
   "allOf": [
     {
+      "if": { "properties": { "eventType": { "const": "mcp_app.tool_input" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "semantic_tool": {
+                "allOf": [
+                  { "$ref": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json" },
+                  { "type": "object", "properties": { "phase": { "const": "input" } } }
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "eventType": { "const": "mcp_app.tool_result" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "semantic_tool": {
+                "allOf": [
+                  { "$ref": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json" },
+                  { "type": "object", "properties": { "phase": { "const": "result" } } }
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
       "if": { "properties": { "eventType": { "const": "run.terminal" } } },
       "then": {
         "properties": {

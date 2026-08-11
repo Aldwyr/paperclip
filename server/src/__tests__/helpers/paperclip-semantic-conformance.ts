@@ -95,7 +95,13 @@ export class PaperclipProductionSemanticConformanceAdapter implements SemanticCo
       input: vector.input,
     });
     const after = world.port.snapshot();
-    return normalizeCapabilitySemanticObservation({ result, before, after, taskId: world.taskId });
+    return normalizeCapabilitySemanticObservation({
+      result,
+      before,
+      after,
+      taskId: world.taskId,
+      semanticInput: vector.input,
+    });
   }
 }
 

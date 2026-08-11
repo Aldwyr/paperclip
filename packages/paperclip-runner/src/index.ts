@@ -13,6 +13,7 @@ export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
 export * from "./protocol/replay-contract.js";
 export * from "./protocol/replay-loader.js";
+export * from "./protocol/semantic-tool-receipts.js";
 export * from "./reducer/session-reducer.js";
 export * from "./generated/capability-contract.js";
 export * from "./semantic-tools/index.js";

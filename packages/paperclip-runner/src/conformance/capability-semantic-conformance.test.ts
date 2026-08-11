@@ -50,5 +50,9 @@ describe("capability semantic conformance vectors", () => {
       .toMatchObject({ task: { status: "done" } });
     expect(report.rows.find((row) => row.vectorId === "terminal-with-dependency")?.observation.state)
       .toMatchObject({ task: { status: "done" }, dependencies: [expect.any(String)] });
+    expect(report.rows.every((row) => row.observation.receipt?.operationReceiptPresent === true))
+      .toBe(true);
+    expect(report.rows.find((row) => row.vectorId === "document-stale-revision")?.observation.receipt)
+      .toMatchObject({ outcome: "conflict", authorizationBoundary: "revision", retryable: false });
   });
 });

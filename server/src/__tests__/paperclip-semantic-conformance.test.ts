@@ -94,5 +94,7 @@ describeEmbedded("Paperclip semantic mock/production conformance", () => {
       .toMatchObject({ interactions: [{ continuationPolicy: "wake_assignee" }] });
     expect(report.rows.find((row) => row.vectorId === "terminal-finish")?.observation.state)
       .toMatchObject({ task: { status: "done" } });
+    expect(report.rows.every((row) => row.observation.receipt?.operationReceiptPresent === true))
+      .toBe(true);
   }, 30_000);
 });

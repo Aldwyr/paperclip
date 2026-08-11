@@ -24,6 +24,7 @@ Each tutorial explains the capability it exercises and the contract it proves.
 
 - [Architecture and dependency boundary](architecture.md)
 - [PRP compatibility and versioning policy](protocol-compatibility.md)
+- [PRP v1 expressiveness audit](../spec/prp-v1-expressiveness-audit.md)
 - [ADR 0001: runner, testing, and eval package boundaries](adr/0001-runner-testing-eval-package-boundaries.md)
 - [Local protocol and supervision](local-runner.md)
 - [Durable transport and recovery](durable-recovery.md)

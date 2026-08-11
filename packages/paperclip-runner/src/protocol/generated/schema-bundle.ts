@@ -120,6 +120,72 @@ export const capabilitiesSchema = {
     "typedEvents": {
       "type": "boolean"
     },
+    "semanticTools": {
+      "type": "object",
+      "required": [
+        "schema",
+        "schemaVersion",
+        "operations"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.prp.semantic_tools.v1"
+        },
+        "schemaVersion": {
+          "const": 1
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "operationId",
+              "version",
+              "availability",
+              "redactionDisposition"
+            ],
+            "properties": {
+              "operationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+              },
+              "version": {
+                "const": 1
+              },
+              "availability": {
+                "enum": [
+                  "available",
+                  "denied",
+                  "unsupported"
+                ]
+              },
+              "redactionDisposition": {
+                "const": "digest_only"
+              },
+              "requiredClaims": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "uniqueItems": true
+              },
+              "reasonCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160,
+                "pattern": "^[a-z][a-z0-9_.:-]*$"
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    },
     "unsupported": {
       "type": "array",
       "items": {
@@ -221,6 +287,393 @@ export const commandSchema = {
   "additionalProperties": true
 } as const;
 
+export const semanticToolSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json",
+  "title": "PRP provider-neutral semantic tool envelope",
+  "type": "object",
+  "required": [
+    "schema",
+    "schemaVersion",
+    "phase",
+    "operationId",
+    "callId",
+    "correlation",
+    "idempotencyKey",
+    "content"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.prp.semantic_tool.v1"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "phase": {
+      "enum": [
+        "input",
+        "result"
+      ]
+    },
+    "operationId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "callId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "correlation": {
+      "type": "object",
+      "required": [
+        "runId",
+        "normalizedSessionId",
+        "turnId",
+        "itemId"
+      ],
+      "properties": {
+        "runId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "normalizedSessionId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "itemId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "requestId": {
+          "$ref": "#/$defs/stableId"
+        }
+      },
+      "additionalProperties": true
+    },
+    "idempotencyKey": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "content": {
+      "$ref": "#/$defs/safeContent"
+    },
+    "outcome": {
+      "enum": [
+        "succeeded",
+        "denied",
+        "conflict",
+        "duplicate",
+        "unavailable",
+        "failed"
+      ]
+    },
+    "code": {
+      "$ref": "#/$defs/stableCode"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "authorizationBoundary": {
+      "enum": [
+        "company",
+        "actor",
+        "active_task",
+        "grant",
+        "governed_action",
+        "lock",
+        "revision"
+      ]
+    },
+    "operationReceiptId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "auditReceiptId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "currentRevision": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "$ref": "#/$defs/stableId"
+        }
+      ]
+    },
+    "duplicateOfReceiptId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "artifactRefs": {
+      "type": "array",
+      "items": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/safeReference"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "artifact",
+                  "work_product"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "uniqueItems": true
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/immutableTarget"
+      },
+      "uniqueItems": true
+    },
+    "causalRefs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/safeReference"
+      },
+      "uniqueItems": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "result"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "outcome",
+          "code",
+          "retryable",
+          "authorizationBoundary",
+          "operationReceiptId"
+        ]
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "stableCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[a-z][a-z0-9_.:-]*$"
+    },
+    "safeContent": {
+      "type": "object",
+      "required": [
+        "digest",
+        "redactionDisposition",
+        "references"
+      ],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "redactionDisposition": {
+          "enum": [
+            "digest_only",
+            "allowlisted_references",
+            "redacted"
+          ]
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/safeReference"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "safeReference": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "task",
+            "document_revision",
+            "interaction",
+            "approval",
+            "decision",
+            "artifact",
+            "work_product",
+            "wake",
+            "monitor",
+            "audit",
+            "operation"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        }
+      },
+      "additionalProperties": true
+    },
+    "immutableTarget": {
+      "type": "object",
+      "required": [
+        "kind",
+        "id",
+        "immutable"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "document_revision",
+            "interaction",
+            "approval",
+            "decision"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/stableId"
+        },
+        "immutable": {
+          "const": true
+        },
+        "revisionId": {
+          "$ref": "#/$defs/stableId"
+        },
+        "decisionId": {
+          "$ref": "#/$defs/stableId"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+} as const;
+
+export const stopReasonSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/stop-reason.schema.json",
+  "title": "PRP terminal stop reason receipt",
+  "type": "object",
+  "required": [
+    "schema",
+    "schemaVersion",
+    "receiptId",
+    "kind",
+    "code",
+    "retryable",
+    "decisionId",
+    "limitClass",
+    "aggregate"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.prp.stop_reason.v1"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "receiptId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "kind": {
+      "enum": [
+        "budget",
+        "cost"
+      ]
+    },
+    "code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[a-z][a-z0-9_.:-]*$"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "decisionId": {
+      "$ref": "#/$defs/stableId"
+    },
+    "limitClass": {
+      "enum": [
+        "company_monthly",
+        "actor_monthly",
+        "project_monthly",
+        "run_cost",
+        "provider_quota"
+      ]
+    },
+    "aggregate": {
+      "type": "object",
+      "required": [
+        "unit",
+        "observed",
+        "limit",
+        "window"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "cents",
+            "usd_micros",
+            "tokens"
+          ]
+        },
+        "observed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "window": {
+          "enum": [
+            "run",
+            "monthly_utc",
+            "provider_window"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "relatedReceiptIds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stableId"
+      },
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    }
+  }
+} as const;
+
 export const terminalSchema = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://paperclip.dev/schemas/prp/v1/terminal.schema.json",
@@ -266,6 +719,9 @@ export const terminalSchema = {
     "statusDecisionId": {
       "type": "string",
       "minLength": 1
+    },
+    "stopReason": {
+      "$ref": "https://paperclip.dev/schemas/prp/v1/stop-reason.schema.json"
     }
   },
   "additionalProperties": true
@@ -811,6 +1267,74 @@ export const eventSchema = {
       "if": {
         "properties": {
           "eventType": {
+            "const": "mcp_app.tool_input"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "semantic_tool": {
+                "allOf": [
+                  {
+                    "$ref": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "const": "input"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "mcp_app.tool_result"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "semantic_tool": {
+                "allOf": [
+                  {
+                    "$ref": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "const": "result"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
             "const": "run.terminal"
           }
         }
@@ -913,12 +1437,14 @@ export const fixtureSchema = {
 } as const;
 
 export const prpSchemaBundle = {
-  identity: identitySchema,
-  capabilities: capabilitiesSchema,
-  command: commandSchema,
-  terminal: terminalSchema,
-  request: requestSchema,
-  result: resultSchema,
-  event: eventSchema,
-  fixture: fixtureSchema,
+  "identity": identitySchema,
+  "capabilities": capabilitiesSchema,
+  "command": commandSchema,
+  "semantic-tool": semanticToolSchema,
+  "stop-reason": stopReasonSchema,
+  "terminal": terminalSchema,
+  "request": requestSchema,
+  "result": resultSchema,
+  "event": eventSchema,
+  "fixture": fixtureSchema,
 } as const;

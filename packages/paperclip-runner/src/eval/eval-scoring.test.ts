@@ -7,6 +7,11 @@ import {
   scoreEval,
   type EvalObservation,
 } from "./eval-scoring.js";
+import {
+  createPrpBudgetStopReason,
+  createPrpSemanticToolResultEnvelope,
+} from "../protocol/semantic-tool-receipts.js";
+import type { PrpEvent } from "../protocol/replay-contract.js";
 
 function greenObservation(overrides: Partial<EvalObservation> = {}): EvalObservation {
   return {
@@ -207,6 +212,59 @@ describe("scoreEval — dimensions are scored separately (red counterparts)", ()
     expect(card.dimensions.trace_completeness.score).toBeCloseTo(5 / 6, 5);
   });
 
+  it("derives semantic receipt and terminal completeness from PRP wire events", () => {
+    const card = scoreEval(
+      greenObservation({
+        trace: {
+          receiptIds: [],
+          terminalPresent: false,
+          wireEvents: wireTrace(),
+        },
+      }),
+      OPTIONS,
+    );
+    expect(card.dimensions.trace_completeness).toMatchObject({ score: 1, passed: true });
+  });
+
+  it("rejects a PRP receipt whose operation does not match the observed call", () => {
+    const events = wireTrace();
+    const payload = events[0]!.payload as Record<string, unknown>;
+    const receipt = payload.semantic_tool as Record<string, unknown>;
+    receipt.operationId = "report_progress";
+    const card = scoreEval(
+      greenObservation({ trace: { receiptIds: ["legacy-must-not-mask-wire"], terminalPresent: true, wireEvents: events } }),
+      OPTIONS,
+    );
+    expect(card.dimensions.trace_completeness.reasons).toContain("trace missing receipt-per-call");
+  });
+
+  it("requires a receipt and decision id when a terminal advertises a stop reason", () => {
+    const events = wireTrace();
+    const terminal = events[1]!.payload as Record<string, unknown>;
+    terminal.stopReason = createPrpBudgetStopReason({
+      receiptId: "stop-receipt-1",
+      kind: "budget",
+      code: "budget_hard_stop",
+      retryable: true,
+      decisionId: "budget-decision-1",
+      limitClass: "actor_monthly",
+      aggregate: { unit: "cents", observed: 5000, limit: 5000, window: "monthly_utc" },
+    });
+    const card = scoreEval(
+      greenObservation({ trace: { receiptIds: [], terminalPresent: false, wireEvents: events } }),
+      OPTIONS,
+    );
+    expect(card.dimensions.trace_completeness).toMatchObject({ score: 1, passed: true });
+
+    delete (terminal.stopReason as Record<string, unknown>).decisionId;
+    const invalid = scoreEval(
+      greenObservation({ trace: { receiptIds: [], terminalPresent: false, wireEvents: events } }),
+      OPTIONS,
+    );
+    expect(invalid.dimensions.trace_completeness.reasons)
+      .toContain("trace missing stop-reason-receipt");
+  });
+
   it("drops quality_efficiency when a budget is exceeded", () => {
     const card = scoreEval(
       greenObservation({ efficiency: { latencyMs: 9000, totalTokens: 400, costUsd: 0.01, attempts: 1 } }),
@@ -225,6 +283,65 @@ describe("scoreEval — dimensions are scored separately (red counterparts)", ()
     expect(card.dimensions.quality_efficiency.reasons).toContain("no efficiency budget declared");
   });
 });
+
+function wireTrace(): PrpEvent[] {
+  const correlation = {
+    runId: "run-1",
+    normalizedSessionId: "session-1",
+    turnId: "turn-1",
+    itemId: "item-1",
+  };
+  return [
+    {
+      schema: "paperclip.prp.event.v1",
+      sourceEventId: "wire-event-1",
+      sourceSeq: 1,
+      sourceInstanceId: "wire-test",
+      sourceKind: "runner",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+      eventType: "mcp_app.tool_result",
+      schemaVersion: 1,
+      priority: 1,
+      emittedAt: "2026-08-11T00:00:00.000Z",
+      payload: {
+        semantic_tool: createPrpSemanticToolResultEnvelope({
+          operationId: "finish_task",
+          callId: "call-1",
+          correlation,
+          idempotencyKey: "finish-once",
+          content: { disposition: "applied" },
+          outcome: "succeeded",
+          code: "ok",
+          retryable: false,
+          authorizationBoundary: "active_task",
+        }),
+      },
+    },
+    {
+      schema: "paperclip.prp.event.v1",
+      sourceEventId: "wire-event-2",
+      sourceSeq: 2,
+      sourceInstanceId: "wire-test",
+      sourceKind: "runner",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      eventType: "run.terminal",
+      schemaVersion: 1,
+      priority: 0,
+      emittedAt: "2026-08-11T00:00:01.000Z",
+      payload: {
+        schema: "paperclip.prp.terminal.v1",
+        turnTerminalState: "completed",
+        runTerminalState: "succeeded",
+        reportedWorkDisposition: "done",
+      },
+    },
+  ];
+}
 
 describe("scoreEval — determinism and weighting", () => {
   it("is deterministic for identical observations", () => {

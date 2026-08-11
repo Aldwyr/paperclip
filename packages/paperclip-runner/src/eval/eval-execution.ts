@@ -23,6 +23,13 @@ import {
   type EvalFaultClass,
 } from "./eval-bundle.js";
 import { scoreEval, type AuthorizationState, type EvalObservation } from "./eval-scoring.js";
+import type { PrpEvent } from "../protocol/replay-contract.js";
+import {
+  createPrpSemanticToolInputEnvelope,
+  createPrpSemanticToolResultEnvelope,
+  semanticAuthorizationBoundaryForCode,
+  semanticOutcomeForCode,
+} from "../protocol/semantic-tool-receipts.js";
 
 export const EVAL_BEHAVIOR_IDS = [
   "checkout_context",
@@ -579,14 +586,156 @@ async function runBehaviorCase(bundle: EvalBundle, spec: BehaviorCase): Promise<
       sessionId: SESSION_ID,
       turnId: `turn-${caseId}`,
       itemId: `item-${caseId}`,
-      receiptIds: results.map((result) => result.callId),
+      receiptIds: [],
       terminalPresent: true,
+      wireEvents: evalWireEvents({
+        caseId,
+        invocations: spec.invocations,
+        results,
+        authorizationRecords,
+      }),
     },
     efficiency: { attempts: observedCalls.length },
     budget: { maxAttempts: spec.maxAttempts ?? Math.max(1, spec.expectedCalls.length) },
   };
   await adapter.stop();
   return { behavior: spec.behavior, counterpart: spec.counterpart, observation };
+}
+
+function evalWireEvents(input: {
+  caseId: string;
+  invocations: readonly Invocation[];
+  results: readonly CapabilitySemanticToolResult[];
+  authorizationRecords: ReturnType<CapabilitySemanticDispatcher["authorizationRecords"]>;
+}): PrpEvent[] {
+  const events: PrpEvent[] = [];
+  const turnId = `turn:${input.caseId}`;
+  const emittedAt = "2026-08-11T00:00:00.000Z";
+  const append = (
+    eventType: "mcp_app.tool_input" | "mcp_app.tool_result" | "run.terminal",
+    payload: Record<string, unknown>,
+    itemId?: string,
+  ): void => {
+    const sourceSeq = events.length + 1;
+    events.push({
+      schema: "paperclip.prp.event.v1",
+      sourceEventId: `eval-wire:${input.caseId}:${sourceSeq}`,
+      sourceSeq,
+      sourceInstanceId: "eval-wire",
+      sourceKind: "runner",
+      runId: RUN_ID,
+      normalizedSessionId: SESSION_ID,
+      turnId,
+      ...(itemId === undefined ? {} : { itemId }),
+      eventType,
+      schemaVersion: 1,
+      priority: eventType === "run.terminal" ? 0 : 1,
+      emittedAt,
+      payload,
+    });
+  };
+
+  input.results.forEach((result, index) => {
+    const invocation = input.invocations[index]!;
+    const itemId = `item:${result.callId}`;
+    const correlation = { runId: RUN_ID, normalizedSessionId: SESSION_ID, turnId, itemId };
+    const idempotencyKey = semanticIdempotencyKey(invocation.input);
+    append("mcp_app.tool_input", {
+      semantic_tool: createPrpSemanticToolInputEnvelope({
+        operationId: result.operationId,
+        callId: result.callId,
+        correlation,
+        idempotencyKey,
+        content: invocation.input,
+      }),
+    }, itemId);
+    const code = result.ok ? semanticSuccessCode(result.result) : result.denial.controlPlaneCode ?? result.denial.code;
+    const authorizationRecord = input.authorizationRecords.find(
+      (record) => record.phase === "invocation" && record.callId === result.callId,
+    );
+    append("mcp_app.tool_result", {
+      semantic_tool: createPrpSemanticToolResultEnvelope({
+        operationId: result.operationId,
+        callId: result.callId,
+        correlation,
+        idempotencyKey,
+        content: result,
+        outcome: semanticOutcomeForCode({
+          ok: result.ok,
+          code,
+          disposition: result.ok && isRecord(result.result) ? result.result.disposition : undefined,
+        }),
+        code,
+        retryable: result.ok ? false : result.denial.retryable,
+        authorizationBoundary: semanticAuthorizationBoundaryForCode(code),
+        ...(authorizationRecord === undefined ? {} : { auditReceiptId: authorizationRecord.id }),
+        currentRevision: result.stateRevision,
+        artifactRefs: result.ok ? semanticArtifactRefs(result.result) : [],
+        causalRefs: result.ok ? semanticCausalRefs(result.result) : [],
+      }),
+    }, itemId);
+  });
+  append("run.terminal", {
+    schema: "paperclip.prp.terminal.v1",
+    turnTerminalState: "completed",
+    runTerminalState: "succeeded",
+    reportedWorkDisposition: "done",
+  }, `item:${input.caseId}`);
+  return events;
+}
+
+function semanticIdempotencyKey(value: unknown): string | null {
+  return isRecord(value) && typeof value.idempotencyKey === "string"
+    ? value.idempotencyKey
+    : null;
+}
+
+function semanticSuccessCode(value: unknown): string {
+  return isRecord(value) && value.disposition === "duplicate" ? "duplicate" : "ok";
+}
+
+function semanticArtifactRefs(value: unknown) {
+  return semanticRefs(value).filter((reference) =>
+    reference.kind === "artifact" || reference.kind === "work_product",
+  );
+}
+
+function semanticCausalRefs(value: unknown) {
+  return semanticRefs(value).filter((reference) =>
+    ["document_revision", "interaction", "approval", "decision", "wake", "monitor"].includes(reference.kind),
+  );
+}
+
+function semanticRefs(value: unknown): Array<{
+  kind: "task" | "document_revision" | "interaction" | "approval" | "decision" | "artifact" | "work_product" | "wake" | "monitor" | "audit" | "operation";
+  id: string;
+}> {
+  if (!isRecord(value) || !Array.isArray(value.entityRefs)) return [];
+  const kindMap = {
+    task: "task",
+    revision: "document_revision",
+    interaction: "interaction",
+    approval: "approval",
+    decision: "decision",
+    artifact: "artifact",
+    "work-product": "work_product",
+    wake: "wake",
+    monitor: "monitor",
+    audit: "audit",
+    command: "operation",
+  } as const;
+  return value.entityRefs.flatMap((entry) => {
+    if (typeof entry !== "string") return [];
+    const separator = entry.indexOf(":");
+    if (separator < 1) return [];
+    const kind = kindMap[entry.slice(0, separator) as keyof typeof kindMap];
+    const id = entry.slice(separator + 1);
+    return kind === undefined || id.length === 0 ? [] : [{ kind, id }];
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

@@ -21,6 +21,9 @@ production control-plane behavior.
 | `protocolVersion` | `1` | Required. Negotiate the highest overlapping version; no overlap fails closed. |
 | `fixtureVersion` | `1` | Required by the conformance corpus. Unknown values fail closed. |
 | `event.schemaVersion` | `1` | Required on every event. Unknown values fail closed before reduction. |
+| `capabilities.semanticTools.schemaVersion` | `1` | Optional advertisement. When present, an unknown required version fails closed. |
+| `payload.semantic_tool.schemaVersion` | `1` | Optional on paired semantic tool input/result events. When present, an unknown required version fails closed. |
+| `terminal.stopReason.schemaVersion` | `1` | Optional budget/cost receipt. When present, an unknown required version fails closed. |
 | Typed `schema` discriminators | `*.v1` | Required. Unknown required schema identities fail JSON Schema validation. |
 
 Wire protocol versions and fixture-corpus versions are independent. A fixture
@@ -44,6 +47,35 @@ represented only after the consumer advertises support for it.
 The forward-compatibility fixture proves that optional fields survive validation
 without changing the v1 snapshot. The unsupported-version fixture proves that a
 required v2 protocol cannot be replayed by this consumer.
+
+## Provider-neutral semantic receipts
+
+- `capabilities.semanticTools` advertises stable operation IDs, availability,
+  required claims, and redaction disposition without naming a provider API.
+- `mcp_app.tool_input` and `mcp_app.tool_result` may carry paired
+  `semantic_tool` envelopes. Correlation IDs must match the containing event;
+  operation ID and idempotency key must match across the pair.
+- Content is represented by a canonical SHA-256 digest plus allowlisted typed
+  references. Raw credentials, provider payloads, and hidden identifiers do not
+  belong on the wire.
+- Result receipts distinguish success, denial, conflict, exact duplicate,
+  unavailable, and failure. They can name the authorization boundary, safe
+  revision, artifact/work-product refs, immutable governed targets, and bounded
+  wake/monitor causality.
+- `terminal.stopReason` records budget/cost kind, stable code, retryability,
+  limit class, safe aggregate, and decision receipt.
+
+These fields are trace evidence only. The v1 reducer ignores `semantic_tool`
+payloads, so adding or extending the optional envelope has no projection
+effect. Eval `trace_completeness` treats PRP wire receipts as authoritative when
+present and retains the pre-existing scalar fallback for live evidence that has
+not yet emitted them.
+
+Seven conformance fixtures cover artifact success, redacted denial without
+fallback, stale conflict plus duplicate retry, governed target and continuation
+causality, budget/cost stop, unknown optional fields, and rejection of an
+unknown required version. The six accepted fixtures have shared TypeScript and
+Rust golden parity summaries.
 
 ## Replay semantics
 

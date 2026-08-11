@@ -9,6 +9,9 @@ pub const PRP_PROTOCOL_VERSION: u64 = 1;
 const PRP_FIXTURE_VERSION: u64 = 1;
 const PRP_FIXTURE_SCHEMA: &str = "paperclip.prp.fixture.v1";
 const PRP_EVENT_SCHEMA: &str = "paperclip.prp.event.v1";
+const PRP_SEMANTIC_TOOL_SCHEMA: &str = "paperclip.prp.semantic_tool.v1";
+const PRP_STOP_REASON_SCHEMA: &str = "paperclip.prp.stop_reason.v1";
+const PRP_SEMANTIC_TOOLS_CAPABILITY_SCHEMA: &str = "paperclip.prp.semantic_tools.v1";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +20,7 @@ struct ReplayFixture {
     fixture_version: u64,
     protocol_version: u64,
     identity: ReplayIdentity,
+    capabilities: Value,
     events: Vec<ReplayEvent>,
     result: Value,
 }
@@ -100,6 +104,11 @@ pub fn reduce_replay_fixture(input: &str) -> Result<ReplayParitySummary, ReplayE
             fixture.schema
         )));
     }
+    validate_optional_versioned_envelope(
+        fixture.capabilities.get("semanticTools"),
+        PRP_SEMANTIC_TOOLS_CAPABILITY_SCHEMA,
+        "semanticTools",
+    )?;
 
     let mut delivery_counts = HashMap::<&str, usize>::new();
     for event in &fixture.events {
@@ -135,6 +144,16 @@ pub fn reduce_replay_fixture(input: &str) -> Result<ReplayParitySummary, ReplayE
                 event.schema_version
             )));
         }
+        validate_optional_versioned_envelope(
+            event.payload.get("semantic_tool"),
+            PRP_SEMANTIC_TOOL_SCHEMA,
+            "semantic_tool",
+        )?;
+        validate_optional_versioned_envelope(
+            event.payload.get("stopReason"),
+            PRP_STOP_REASON_SCHEMA,
+            "stopReason",
+        )?;
         if event.run_id != fixture.identity.run_id {
             return Err(ReplayError::invalid(
                 "event runId must match identity.runId",
@@ -219,6 +238,35 @@ pub fn reduce_replay_fixture(input: &str) -> Result<ReplayParitySummary, ReplayE
     })
 }
 
+fn validate_optional_versioned_envelope(
+    envelope: Option<&Value>,
+    expected_schema: &str,
+    field: &str,
+) -> Result<(), ReplayError> {
+    let Some(envelope) = envelope else {
+        return Ok(());
+    };
+    let schema = envelope
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    if schema != expected_schema {
+        return Err(ReplayError::invalid(format!(
+            "unsupported required {field} schema {schema}; expected {expected_schema}"
+        )));
+    }
+    let version = envelope
+        .get("schemaVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if version != 1 {
+        return Err(ReplayError::invalid(format!(
+            "unsupported required {field} schemaVersion {version}; expected 1"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{reduce_replay_fixture, ReplayParitySummary};
@@ -269,6 +317,36 @@ mod tests {
         "unknown-optional-fields",
         "unknown-optional-fields"
     );
+    parity_case!(
+        replay_fixture_parity_semantic_tool_artifact_happy_path,
+        "semantic-tool-artifact-happy-path",
+        "semantic-tool-artifact-happy-path"
+    );
+    parity_case!(
+        replay_fixture_parity_semantic_tool_denial_redaction,
+        "semantic-tool-denial-redaction",
+        "semantic-tool-denial-redaction"
+    );
+    parity_case!(
+        replay_fixture_parity_semantic_tool_conflict_duplicate_retry,
+        "semantic-tool-conflict-duplicate-retry",
+        "semantic-tool-conflict-duplicate-retry"
+    );
+    parity_case!(
+        replay_fixture_parity_semantic_tool_governance_wake_monitor,
+        "semantic-tool-governance-wake-monitor",
+        "semantic-tool-governance-wake-monitor"
+    );
+    parity_case!(
+        replay_fixture_parity_budget_cost_stop_reason,
+        "budget-cost-stop-reason",
+        "budget-cost-stop-reason"
+    );
+    parity_case!(
+        replay_fixture_parity_semantic_tool_unknown_optional_envelope,
+        "semantic-tool-unknown-optional-envelope",
+        "semantic-tool-unknown-optional-envelope"
+    );
 
     #[test]
     fn replay_fixture_parity_rejects_unsupported_required_version() {
@@ -279,6 +357,17 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported required protocolVersion 2"));
+    }
+
+    #[test]
+    fn replay_fixture_parity_rejects_unsupported_semantic_tool_version() {
+        let error = reduce_replay_fixture(include_str!(
+            "../../../../protocol/fixtures/replay/semantic-tool-unsupported-required-version.json"
+        ))
+        .expect_err("semantic_tool v2 fixture must fail closed");
+        assert!(error
+            .to_string()
+            .contains("unsupported required semantic_tool schema paperclip.prp.semantic_tool.v2"));
     }
 
     #[test]

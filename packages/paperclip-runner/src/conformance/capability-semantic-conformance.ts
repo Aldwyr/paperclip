@@ -11,6 +11,12 @@ import {
   type CapabilitySemanticDispatcherOptions,
 } from "../semantic-tools/dispatcher.js";
 import type { CapabilitySemanticToolResult } from "../semantic-tools/types.js";
+import {
+  createPrpSemanticToolInputEnvelope,
+  createPrpSemanticToolResultEnvelope,
+  semanticAuthorizationBoundaryForCode,
+  semanticOutcomeForCode,
+} from "../protocol/semantic-tool-receipts.js";
 import type {
   SemanticConformanceAdapter,
   SemanticConformanceObservation,
@@ -192,7 +198,13 @@ export class CapabilityMockSemanticConformanceAdapter implements SemanticConform
       input: vector.input,
     });
     const after = world.port.snapshot();
-    return normalizeCapabilitySemanticObservation({ result, before, after, taskId: world.taskId });
+    return normalizeCapabilitySemanticObservation({
+      result,
+      before,
+      after,
+      taskId: world.taskId,
+      semanticInput: vector.input,
+    });
   }
 
   async stop(): Promise<void> {
@@ -229,18 +241,77 @@ export function normalizeCapabilitySemanticObservation(input: {
   readonly before: Readonly<CapabilityFixtureState>;
   readonly after: Readonly<CapabilityFixtureState>;
   readonly taskId: string;
+  readonly semanticInput: unknown;
 }): SemanticConformanceObservation {
   const { result, before, after, taskId } = input;
+  const run = after.runs.find((candidate) => candidate.taskId === taskId);
+  if (run === undefined) throw new Error(`semantic_conformance_run_missing:${taskId}`);
+  const idempotencyKey = idempotencyKeyFrom(input.semanticInput);
+  const disposition = result.ok && isRecord(result.result) ? result.result.disposition : undefined;
+  const code = result.ok && disposition === "duplicate"
+    ? "duplicate"
+    : result.ok
+      ? "ok"
+      : result.denial.controlPlaneCode ?? result.denial.code;
+  const effects = result.ok ? normalizeEffects(result.result) : [];
+  const authorization = result.ok
+    ? { outcome: "allowed" as const }
+    : {
+        outcome: "denied" as const,
+        code,
+      };
+  const envelopeBase = {
+    operationId: result.operationId,
+    callId: result.callId,
+    correlation: {
+      runId: run.id,
+      normalizedSessionId: run.sessionId,
+      turnId: `turn:${result.callId}`,
+      itemId: `item:${result.callId}`,
+    },
+    idempotencyKey,
+  };
+  const inputReceipt = createPrpSemanticToolInputEnvelope({
+    ...envelopeBase,
+    content: input.semanticInput,
+  });
+  const receipt = createPrpSemanticToolResultEnvelope({
+    ...envelopeBase,
+    content: { authorization, effects },
+    outcome: semanticOutcomeForCode({
+      ok: result.ok,
+      code,
+      disposition,
+    }),
+    code,
+    retryable: result.ok ? false : result.denial.retryable,
+    authorizationBoundary: semanticAuthorizationBoundaryForCode(code),
+    ...(after.audit.length <= before.audit.length
+      ? {}
+      : { auditReceiptId: after.audit.at(-1)?.id }),
+    currentRevision: result.stateRevision,
+  });
   return Object.freeze({
-    authorization: result.ok
-      ? { outcome: "allowed" as const }
-      : {
-          outcome: "denied" as const,
-          code: result.denial.controlPlaneCode ?? result.denial.code,
-        },
+    authorization,
     state: projectSemanticState(after, taskId),
-    effects: result.ok ? normalizeEffects(result.result) : [],
+    effects,
     audit: after.audit.length > before.audit.length ? [{ outcome: "recorded" }] : [],
+    receipt: {
+      schema: receipt.schema,
+      schemaVersion: receipt.schemaVersion,
+      phase: "result",
+      operationId: receipt.operationId,
+      callId: receipt.callId,
+      idempotencyKeyPresent: receipt.idempotencyKey !== null,
+      outcome: String(receipt.outcome),
+      code: String(receipt.code),
+      retryable: receipt.retryable === true,
+      authorizationBoundary: String(receipt.authorizationBoundary),
+      operationReceiptPresent: typeof receipt.operationReceiptId === "string",
+      inputDigestPresent: typeof inputReceipt.content.digest === "string",
+      outputDigestPresent: typeof receipt.content.digest === "string",
+      currentRevisionPresent: receipt.currentRevision !== undefined,
+    },
   });
 }
 
@@ -291,6 +362,17 @@ function normalizeEffects(result: unknown): readonly unknown[] {
     entityKinds: [...new Set(entityRefs.map((reference) => reference.split(":", 1)[0]))].sort(),
     scheduledWakeCount: scheduledWakeIds.length,
   }];
+}
+
+function idempotencyKeyFrom(value: unknown): string | null {
+  if (!isRecord(value)) return null;
+  return typeof value.idempotencyKey === "string" && value.idempotencyKey.length > 0
+    ? value.idempotencyKey
+    : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function mockWorld(

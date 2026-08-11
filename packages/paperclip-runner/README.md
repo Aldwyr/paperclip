@@ -164,6 +164,7 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 - [Capability live runnerd/Codex loop](docs/capability-live-runnerd-codex.md)
 - [Capability issue-thread UI](docs/capability-issue-thread-ui.md)
 - [PRP compatibility/versioning policy](docs/protocol-compatibility.md)
+- [PRP v1 expressiveness audit](spec/prp-v1-expressiveness-audit.md)
 - [Cumulative end-to-end tutorial](docs/tutorials/end-to-end.md)
 - [OKF knowledge bundle](knowledge/)
 - [Normative native-runner contract](spec/native-runner-contract.md)

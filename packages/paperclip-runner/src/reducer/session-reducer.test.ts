@@ -22,6 +22,12 @@ const fixtureNames = [
   "duplicate-event",
   "source-gap",
   "unknown-optional-fields",
+  "semantic-tool-artifact-happy-path",
+  "semantic-tool-denial-redaction",
+  "semantic-tool-conflict-duplicate-retry",
+  "semantic-tool-governance-wake-monitor",
+  "budget-cost-stop-reason",
+  "semantic-tool-unknown-optional-envelope",
 ];
 
 async function loadFixture(name: string): Promise<PrpFixture> {

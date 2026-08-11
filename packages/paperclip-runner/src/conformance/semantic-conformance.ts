@@ -17,6 +17,23 @@ export interface SemanticConformanceObservation {
   readonly state: unknown;
   readonly effects: readonly unknown[];
   readonly audit: readonly unknown[];
+  /** Provider-neutral normalized view of the PRP semantic result receipt. */
+  readonly receipt?: {
+    readonly schema: "paperclip.prp.semantic_tool.v1";
+    readonly schemaVersion: 1;
+    readonly phase: "result";
+    readonly operationId: string;
+    readonly callId: string;
+    readonly idempotencyKeyPresent: boolean;
+    readonly outcome: string;
+    readonly code: string;
+    readonly retryable: boolean;
+    readonly authorizationBoundary: string;
+    readonly operationReceiptPresent: boolean;
+    readonly inputDigestPresent: boolean;
+    readonly outputDigestPresent: boolean;
+    readonly currentRevisionPresent: boolean;
+  };
 }
 
 export type SemanticConformanceAdapterKind = "mock" | "production_binding";

@@ -2,6 +2,8 @@ import type {
   CapabilityEvalCaseResult,
   CapabilityLiveCodexMatrixResult,
 } from "../conformance/capability-eval-suite.js";
+import type { PrpEvent } from "../protocol/replay-contract.js";
+import { prpSemanticToolResultReceipts } from "../protocol/semantic-tool-receipts.js";
 import type { EvalFaultClass } from "./eval-bundle.js";
 
 /**
@@ -64,6 +66,11 @@ export interface EvalTraceEvidence {
   /** One safe receipt/operation id per observed semantic call. */
   receiptIds: string[];
   terminalPresent: boolean;
+  /**
+   * When present, PRP is authoritative for causal ids, semantic receipts, and
+   * terminal presence. Legacy live snapshots continue to use the scalar fields.
+   */
+  wireEvents?: PrpEvent[];
 }
 
 export interface EvalEfficiencyEvidence {
@@ -200,22 +207,82 @@ function scoreTrajectoryRestraint(obs: EvalObservation): { score: number; reason
 
 function scoreTraceCompleteness(obs: EvalObservation): { score: number; reasons: string[] } {
   const reasons: string[] = [];
+  const wire = obs.trace.wireEvents === undefined
+    ? null
+    : traceEvidenceFromPrpEvents(obs.trace.wireEvents, obs.observedCalls);
+  const trace = wire ?? obs.trace;
   const receiptsComplete =
-    obs.trace.receiptIds.length >= obs.observedCalls.length &&
-    obs.trace.receiptIds.every((id) => id.length > 0);
+    trace.receiptIds.length >= obs.observedCalls.length &&
+    trace.receiptIds.every((id) => id.length > 0) &&
+    (wire?.semanticReceiptsMatchCalls ?? true);
   const checks: Array<[string, boolean]> = [
-    ["runId", Boolean(obs.trace.runId)],
-    ["sessionId", Boolean(obs.trace.sessionId)],
-    ["turnId", Boolean(obs.trace.turnId)],
-    ["itemId", Boolean(obs.trace.itemId)],
-    ["terminal", obs.trace.terminalPresent],
+    ["runId", Boolean(trace.runId)],
+    ["sessionId", Boolean(trace.sessionId)],
+    ["turnId", Boolean(trace.turnId)],
+    ["itemId", Boolean(trace.itemId)],
+    ["terminal", trace.terminalPresent],
     ["receipt-per-call", receiptsComplete],
   ];
+  if (wire?.stopReasonPresent) {
+    checks.push(["stop-reason-receipt", wire.stopReasonReceiptValid]);
+  }
   for (const [label, present] of checks) {
     if (!present) reasons.push(`trace missing ${label}`);
   }
   const passed = checks.filter(([, present]) => present).length;
   return { score: clamp01(passed / checks.length), reasons };
+}
+
+export function traceEvidenceFromPrpEvents(
+  events: readonly PrpEvent[],
+  observedCalls: readonly string[] = [],
+): EvalTraceEvidence & {
+  semanticReceiptsMatchCalls: boolean;
+  stopReasonPresent: boolean;
+  stopReasonReceiptValid: boolean;
+} {
+  const receipts = prpSemanticToolResultReceipts(events);
+  const receiptCalls = receipts.map((receipt) => String(receipt.operationId));
+  const semanticReceiptsMatchCalls = receiptCalls.length === observedCalls.length
+    && observedCalls.every((operationId, index) =>
+      receiptCalls[index] === operationId
+      && typeof receipts[index]?.operationReceiptId === "string"
+      && String(receipts[index]?.operationReceiptId).length > 0,
+    );
+  const terminal = events.find((event) => event.eventType === "run.terminal");
+  const terminalPayload = asRecord(terminal?.payload);
+  const stopReason = asRecord(terminalPayload?.stopReason);
+  const stopReasonPresent = stopReason !== null;
+  const stopReasonReceiptValid = !stopReasonPresent || (
+    stopReason?.schema === "paperclip.prp.stop_reason.v1"
+    && stopReason.schemaVersion === 1
+    && typeof stopReason.receiptId === "string"
+    && stopReason.receiptId.length > 0
+    && typeof stopReason.decisionId === "string"
+    && stopReason.decisionId.length > 0
+  );
+  const correlated = events.find((event) => event.eventType === "mcp_app.tool_result")
+    ?? events.find((event) => event.turnId !== undefined);
+  return {
+    runId: events[0]?.runId,
+    sessionId: correlated?.normalizedSessionId,
+    turnId: correlated?.turnId,
+    itemId: correlated?.itemId,
+    receiptIds: receipts.flatMap((receipt) =>
+      typeof receipt.operationReceiptId === "string" ? [receipt.operationReceiptId] : [],
+    ),
+    terminalPresent: terminal !== undefined,
+    wireEvents: [...events],
+    semanticReceiptsMatchCalls,
+    stopReasonPresent,
+    stopReasonReceiptValid,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function scoreQualityEfficiency(obs: EvalObservation): { score: number; reasons: string[] } {

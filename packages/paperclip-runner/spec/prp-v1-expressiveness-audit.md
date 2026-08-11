@@ -4,10 +4,12 @@
 
 PRP v1 is sufficient for runner lifecycle, replay integrity, negotiated runner
 features, runtime/issue-thread request routing, structured work disposition,
-and terminal causality. It is **not** yet sufficient to claim a provider-neutral
-semantic-control-plane protocol: tool invocation, authorization denial,
-redaction, optimistic concurrency, mutation receipts, and budget stop reasons
-are presently represented only by event or request `payload` extension space.
+terminal causality, and provider-neutral semantic-control-plane receipts. The
+optional `semantic_tool` and `terminal.stopReason` envelopes now type tool
+invocation, authorization denial, redaction, optimistic concurrency, mutation
+receipts, artifacts, governed targets, causal continuations, and budget stops.
+They remain receipts for control-plane-owned operations, not a provider tool
+catalog or permission to move control-plane policy into the runner.
 
 `prp-v1-expressiveness-crosswalk.json` is the machine-checked source for this
 verdict. Its Vitest gate rejects an unclassified required fact, a fact justified
@@ -39,12 +41,18 @@ coverage row.
   assessment, and issue-status decision references. Existing golden replay,
   duplicate-event, unknown-optional-fields, and unsupported-required-version
   fixtures demonstrate the compatibility boundary.
+- `capabilities.semanticTools` advertises versioned, provider-neutral operation
+  availability and redaction rules. Paired `mcp_app.tool_input` and
+  `mcp_app.tool_result` events carry one safe `semantic_tool` envelope per call.
+- `terminal.stopReason` carries a safe budget/cost aggregate and the decision
+  receipt that stopped the run. Eval `trace_completeness` reads these PRP wire
+  receipts when available while retaining the existing live-evidence fallback.
 
-## Required additive v1 envelope
+## Landed additive v1 envelope
 
-The smallest correction is one optional, versioned `semantic_tool` envelope
-for `mcp_app.tool_input` / `mcp_app.tool_result` (or equivalent new event
-types), plus an optional `terminal.stopReason` envelope. It must define:
+The correction is one optional, versioned `semantic_tool` envelope for
+`mcp_app.tool_input` / `mcp_app.tool_result`, plus an optional
+`terminal.stopReason` envelope. It defines:
 
 - operation id, call id, correlation ids, idempotency key, outcome, stable
   code, retryability, and audit/operation receipt id;
@@ -58,10 +66,10 @@ types), plus an optional `terminal.stopReason` envelope. It must define:
   result; immutable interaction/approval document or decision targets; and
   budget stop reason/aggregate/decision id.
 
-This is additive because existing v1 consumers can ignore the optional typed
-envelope. It is not permission to add speculative semantic events: the
-crosswalk names the exact facts and the conformance vectors that must land
-with any schema change.
+This remains additive because existing v1 consumers can ignore the optional
+typed envelopes. The reducer intentionally does not project them into session
+state; they supply inspectable trace evidence only. Unknown optional fields are
+accepted, while an unknown required envelope version fails closed.
 
 ## Classification and fixture plan
 
@@ -70,19 +78,20 @@ compositional v1 with a listed invariant, control-plane-local, additive v1,
 missing fixture/docs, or breaking v2 work. Direct and compositional support is
 never inferred merely from `additionalProperties: true`.
 
-Before an additive change graduates to direct support, add these fixtures and
-golden projections:
+The additive change graduated to direct support with these fixtures and golden
+projections:
 
-1. semantic tool happy path and artifact registration;
-2. denied operation with redaction assertions and no fallback call;
-3. stale optimistic write conflict and exact duplicate/retry receipt;
-4. immutable interaction/approval target plus wake/monitor causal chain;
-5. budget/cost terminal stop reason;
-6. unknown optional envelope fields accepted without changing v1 projection;
-7. unknown required envelope version rejected fail-closed.
+1. `semantic-tool-artifact-happy-path.json` — artifact and work-product receipt;
+2. `semantic-tool-denial-redaction.json` — denied/redacted with no fallback;
+3. `semantic-tool-conflict-duplicate-retry.json` — stale conflict and exact retry;
+4. `semantic-tool-governance-wake-monitor.json` — immutable governed targets and continuation chain;
+5. `budget-cost-stop-reason.json` — typed terminal budget/cost stop;
+6. `semantic-tool-unknown-optional-envelope.json` — optional fields accepted with unchanged projection;
+7. `semantic-tool-unsupported-required-version.json` — required v2 envelope rejected fail-closed.
 
-Each mutation fixture must replay to a golden summary/snapshot and be executed
-through mock and real adapters with normalized receipt/state-diff comparison.
+The six accepted fixtures replay to TypeScript/Rust parity summaries and golden
+snapshots. Shared high-risk semantic vectors compare normalized receipt and
+state-diff observations across deterministic mock and production bindings.
 
 ## Explicit exclusions
 
@@ -99,4 +108,4 @@ or denied outcomes rather than tunnel those operations through generic payloads.
   accepted protocol schema/event addition.
 - A semantic receipt is typed and safe before any surface is marked supported.
 - Control-plane-local decisions stay out of the semantic tool wire.
-- Fixture/document debt is recorded separately from a protocol semantic gap.
+- Eval trace scoring consumes wire receipts without changing projection semantics.
