@@ -33,6 +33,7 @@ export * from "./tracer/local-runner-live.js";
 export * from "./generated/capability-contract.js";
 export * from "./tools/index.js";
 export * as acceptedCapabilitySemanticTools from "./semantic-tools/index.js";
+export * from "./catalog/index.js";
 export * from "./live/clean-room.js";
 export * from "./live/live-session.js";
 export * from "./live/runnerd-codex-transport.js";
