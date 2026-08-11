@@ -11,7 +11,6 @@ import {
   Loader2,
   Lock,
   Search,
-  ShieldAlert,
   TerminalSquare,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -50,11 +49,13 @@ import { copyTextToClipboard } from "@/lib/clipboard";
 import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { AppLogo } from "./AppLogo";
+import { UnverifiedServerBadge } from "./UnverifiedServerBadge";
 import { appSourceConnectHref, isMcpDirectOAuthConnectSlug } from "./app-connect-policy";
 import { parseGoogleSheetIds } from "./google-sheets";
 import {
   canSubmitGenericConnect,
   customHeaderError,
+  defaultGenericMcpName,
   endpointHost,
   genericConnectGuidance,
   genericConnectPayload,
@@ -680,7 +681,7 @@ export function AppsConnect() {
   const appName =
     connectResult?.application.name ??
     entry?.name ??
-    (linkName.trim() || defaultLinkName(linkUrl) || "this app");
+    (linkName.trim() || defaultGenericMcpName(linkUrl) || "this app");
   const zapierEntry = zapierSource
     ? galleryQuery.data?.apps.find((app) => app.slug === "zapier") ?? null
     : null;
@@ -731,7 +732,7 @@ export function AppsConnect() {
             setEntry(null);
             setGalleryName("");
             setLinkUrl(url);
-            setLinkName(matchedEntry?.name ?? defaultLinkName(url) ?? "");
+            setLinkName(matchedEntry?.name ?? defaultGenericMcpName(url) ?? "");
             setLinkNeedsKey(false);
             setLinkKey("");
             setCredentials({});
@@ -1378,14 +1379,6 @@ function normalizeAppLink(value: string): string | null {
   }
 }
 
-function defaultLinkName(link: string): string | null {
-  try {
-    return new URL(link).hostname.replace(/^www\./, "");
-  } catch {
-    return null;
-  }
-}
-
 /**
  * The guided universal flow for an unknown remote MCP server (PAP-17087, plan 2).
  *
@@ -1463,6 +1456,11 @@ function LinkConnectStep({
   };
   const canSubmit = canSubmitGenericConnect(draft);
   const showSimpleKeyQuestion = authMode === "auto";
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (guidance?.focus === "name") nameInputRef.current?.focus();
+  }, [guidance]);
 
   const updateHeader = (id: string, patch: Partial<CustomHeaderRow>) => {
     onHeadersChange(headers.map((row) => (row.id === id ? { ...row, ...patch } : row)));
@@ -1505,6 +1503,7 @@ function LinkConnectStep({
         <div>
           <label className="text-sm font-medium text-foreground" htmlFor="generic-mcp-name">Name</label>
           <Input
+            ref={nameInputRef}
             id="generic-mcp-name"
             value={name}
             onChange={(e) => onNameChange(e.target.value)}
@@ -1716,18 +1715,6 @@ const GENERIC_AUTH_MODE_OPTIONS: Array<{ mode: GenericMcpAuthMode; label: string
     hint: "You\u2019ll sign in at the provider. Add a client ID and secret only if the provider requires you to register Paperclip first.",
   },
 ];
-
-function UnverifiedServerBadge({ host, className }: { host: string | null; className?: string }) {
-  return (
-    <div className={cn("flex flex-wrap items-center gap-2 text-xs", className)}>
-      <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 font-medium text-amber-700 dark:text-amber-400">
-        <ShieldAlert className="h-3 w-3" />
-        Unverified server
-      </span>
-      {host ? <span className="font-mono text-muted-foreground">{host}</span> : null}
-    </div>
-  );
-}
 
 function StoredSecurelyNote() {
   return (
@@ -2135,7 +2122,7 @@ function ActionGroup({
   if (actions.length === 0) return null;
   return (
     <div className="rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between border-b border-border px-5 py-3">
+      <div className="flex items-center justify-between border-b border-border px-5 py-2.5 sm:py-3">
         <div className="text-sm">
           <span className="font-bold text-foreground">{title}</span>
           <span className="ml-2 text-muted-foreground">· {hint}</span>
@@ -2153,7 +2140,7 @@ function ActionGroup({
           const on = enabled[action.catalogEntryId] ?? false;
           const showAskFirst = on && askFirstLevels.includes(action.riskLevel);
           return (
-            <div key={action.catalogEntryId} className="flex items-center gap-4 px-5 py-3">
+            <div key={action.catalogEntryId} className="flex items-center gap-4 px-5 py-2.5 sm:py-3">
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium text-foreground">
                   {action.title ?? action.toolName}
@@ -2167,7 +2154,11 @@ function ActionGroup({
                   Ask first
                 </span>
               )}
-              <ToggleSwitch checked={on} onCheckedChange={(next) => onToggle(action.catalogEntryId, next)} />
+              <ToggleSwitch
+                aria-label={`${action.title ?? action.toolName} allowed`}
+                checked={on}
+                onCheckedChange={(next) => onToggle(action.catalogEntryId, next)}
+              />
             </div>
           );
         })}
@@ -2199,7 +2190,7 @@ function ActionsStep({
   const enabledCount = Object.values(enabled).filter(Boolean).length;
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 sm:space-y-5">
       <div className="flex items-start gap-3">
         <span className="mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-full border-2 border-emerald-500 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
           <Check className="h-3.5 w-3.5" />
@@ -2236,7 +2227,7 @@ function ActionsStep({
         askFirstLevels={askFirstLevels}
       />
 
-      <div className="flex items-center justify-between pt-1">
+      <div className="flex items-center justify-between sm:pt-1">
         <Button variant="ghost" onClick={onBack}>
           Back
         </Button>

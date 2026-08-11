@@ -1169,8 +1169,28 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
           isWrite: false,
           isDestructive: false,
           status: "active",
+        }, {
+          catalogEntryId: "cat-search",
+          toolName: "search_things",
+          title: "Search things",
+          description: null,
+          riskLevel: "read",
+          isReadOnly: true,
+          isWrite: false,
+          isDestructive: false,
+          status: "active",
         }],
-        canMakeChanges: [],
+        canMakeChanges: [{
+          catalogEntryId: "cat-delete",
+          toolName: "qa_delete_widget",
+          title: null,
+          description: null,
+          riskLevel: "destructive",
+          isReadOnly: false,
+          isWrite: true,
+          isDestructive: true,
+          status: "active",
+        }],
       },
       catalog: [],
       suggestedDefaults: { askFirstRiskLevels: ["write", "destructive"] },
@@ -1184,6 +1204,9 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
     expect(container.textContent).toContain("List things");
     expect(container.textContent).toContain("Unverified server");
     expect(container.textContent).toContain("mcp.example.test");
+    expect(
+      Array.from(container.querySelectorAll('[role="switch"]')).map((toggle) => toggle.getAttribute("aria-label")),
+    ).toEqual(["List things allowed", "Search things allowed", "qa_delete_widget allowed"]);
   });
 
   it("offers a curated setup as a convenience without leaving the generic flow", async () => {

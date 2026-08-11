@@ -285,6 +285,23 @@ describe("AppDetail", () => {
     expect(updateConnectionMock).toHaveBeenCalledWith("conn-1", { enabled: false });
   });
 
+  it("keeps the unverified-server marker on URL-only connection details", async () => {
+    getConnectionMock.mockResolvedValue(
+      connection({
+        name: "127.0.0.1",
+        config: { url: "http://127.0.0.1:8848/mcp" },
+        transportConfig: { url: "http://127.0.0.1:8848/mcp" },
+      }),
+    );
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Custom app");
+    expect(container.textContent).toContain("hosted at 127.0.0.1");
+    expect(container.textContent).toContain("Unverified server");
+    expect(container.textContent).toContain("127.0.0.1:8848");
+  });
+
   it("redirects a missing tab to setup", async () => {
     mockParams.tab = undefined;
 

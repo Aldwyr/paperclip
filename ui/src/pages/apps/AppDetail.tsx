@@ -29,6 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { AppLogo } from "./AppLogo";
+import { UnverifiedServerBadge } from "./UnverifiedServerBadge";
 import {
   appDefinitionLogoUrl,
   appDefinitionName,
@@ -523,6 +524,8 @@ function AppDetailHeader({
   onRenameCancel: () => void;
   onRenameSubmit: (value: string) => void;
 }) {
+  const unverifiedHost = unverifiedRemoteHost(connection);
+
   return (
     <header className="flex flex-wrap items-start justify-between gap-4">
       <div className="flex items-center gap-3">
@@ -567,6 +570,7 @@ function AppDetailHeader({
           {connectionDisplaySecondaryHint(connection) && (
             <p className="text-xs text-muted-foreground">{connectionDisplaySecondaryHint(connection)}</p>
           )}
+          {unverifiedHost ? <UnverifiedServerBadge host={unverifiedHost} className="mt-1" /> : null}
           <div className="mt-1 flex items-center gap-2">
             <StatusBadge status={status} />
             <span className="text-xs text-muted-foreground">
@@ -577,6 +581,28 @@ function AppDetailHeader({
       </div>
     </header>
   );
+}
+
+function unverifiedRemoteHost(connection: ToolConnection): string | null {
+  const sourceTemplateKey = connection.config?.sourceTemplateKey ?? connection.transportConfig.sourceTemplateKey;
+  if (
+    connection.transport !== "mcp_remote"
+    || (typeof sourceTemplateKey === "string" && sourceTemplateKey.trim())
+  ) return null;
+
+  const value = connection.config?.url
+    ?? connection.config?.endpoint
+    ?? connection.config?.remoteUrl
+    ?? connection.transportConfig.url
+    ?? connection.transportConfig.endpoint
+    ?? connection.transportConfig.remoteUrl;
+  if (typeof value !== "string") return null;
+
+  try {
+    return new URL(value).host || null;
+  } catch {
+    return null;
+  }
 }
 
 type StatusInfo = { label: string; tone: "connected" | "attention" | "paused" };
