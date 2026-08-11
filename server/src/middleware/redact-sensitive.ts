@@ -87,17 +87,20 @@ function isUrlishKey(key: string): boolean {
   return URLISH_KEYS.has(key.toLowerCase());
 }
 
-function stripSecretBearingUrlParts(value: string): string {
+export function stripSecretBearingUrlParts(value: string): string {
+  const suffixStart = value.search(/[?#]/);
+  const withoutQueryOrFragment = suffixStart === -1 ? value : value.slice(0, suffixStart);
+
   try {
-    const url = new URL(value);
-    if (!url.username && !url.password && !url.search && !url.hash) return value;
+    const url = new URL(withoutQueryOrFragment);
+    if (!url.username && !url.password && suffixStart === -1) return value;
     url.username = "";
     url.password = "";
-    url.search = "";
-    url.hash = "";
     return url.toString();
   } catch {
-    return value;
+    // Request URLs are normally origin-form paths rather than absolute URLs.
+    // They still need the same query/fragment policy as URL-valued payloads.
+    return withoutQueryOrFragment;
   }
 }
 

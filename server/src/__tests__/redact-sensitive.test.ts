@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redactSensitive } from "../middleware/redact-sensitive.js";
+import { redactSensitive, stripSecretBearingUrlParts } from "../middleware/redact-sensitive.js";
 
 describe("redactSensitive", () => {
   it("redacts a plaintext password field on a sign-in body", () => {
@@ -114,5 +114,13 @@ describe("redactSensitive", () => {
     const json = JSON.stringify(out);
     expect(json).not.toContain("null");
     expect(json).not.toContain("[1,2,3]");
+  });
+});
+
+describe("stripSecretBearingUrlParts", () => {
+  it("keeps a request path legible while dropping its complete query and fragment", () => {
+    expect(stripSecretBearingUrlParts(
+      "/api/tools/oauth/callback?code=authorization-code&error_description=provider-prose#fragment",
+    )).toBe("/api/tools/oauth/callback");
   });
 });

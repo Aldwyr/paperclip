@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
 import express from "express";
+import pino from "pino";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -37,6 +39,8 @@ import { toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
+import { createHttpLogger } from "../middleware/logger.js";
+import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -271,9 +275,11 @@ async function createCompany(db: ReturnType<typeof createDb>) {
 function createRouteApp(
   db: ReturnType<typeof createDb>,
   deployment?: { deploymentMode: "authenticated"; deploymentExposure: "public" },
+  requestLogger?: express.RequestHandler,
 ) {
   const app = express();
   app.use(express.json());
+  if (requestLogger) app.use(requestLogger);
   app.use((req, _res, next) => {
     req.actor = {
       type: "board",
@@ -784,7 +790,15 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     installMcpOAuthFixture({ auth: "oauth" });
     const company = await createCompany(db);
     const service = toolAccessService(db);
-    const app = createRouteApp(db);
+    const logChunks: string[] = [];
+    const logStream = new Writable({
+      write(chunk, _encoding, callback) {
+        logChunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const requestLogger = createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, logStream));
+    const app = createRouteApp(db, undefined, requestLogger);
     const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile denial" });
     const start = await service.startOAuth(company.id, connected.connectionId, {
       redirectUri: REDIRECT_URI,
@@ -797,6 +811,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       .get("/api/tools/oauth/callback")
       .query({
         state,
+        code: "oauth-authorization-code-canary-4d7e1f",
         error: "access_denied",
         error_description: HOSTILE_ERROR_DESCRIPTION,
         error_uri: HOSTILE_ERROR_BODY.error_uri,
@@ -814,6 +829,22 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const surfaces = await providerLeakSurfaces(consoleSpy, null);
     expect(surfaces).not.toContain(PROVIDER_CANARY);
     expect(surfaces).not.toContain("recovery key");
+
+    const httpLog = logChunks.join("");
+    expect(httpLog).not.toContain("oauth-authorization-code-canary-4d7e1f");
+    expect(httpLog).not.toContain(PROVIDER_CANARY);
+    expect(httpLog).not.toContain(HOSTILE_ERROR_DESCRIPTION);
+    expect(httpLog).not.toContain(state);
+
+    const logRecord = JSON.parse(httpLog.trim()) as {
+      msg: string;
+      req: { method: string; url: string; query?: unknown };
+      reqQuery?: unknown;
+    };
+    expect(logRecord.msg).toBe("GET /api/tools/oauth/callback 400");
+    expect(logRecord.req).toMatchObject({ method: "GET", url: "/api/tools/oauth/callback" });
+    expect(logRecord.req.query).toBeUndefined();
+    expect(logRecord.reqQuery).toBeUndefined();
 
     // A denial is terminal for the attempt, so the state cannot be replayed.
     await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(0);
