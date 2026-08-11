@@ -47,6 +47,7 @@ import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { copyTextToClipboard } from "@/lib/clipboard";
+import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { AppLogo } from "./AppLogo";
 import { appSourceConnectHref, isMcpDirectOAuthConnectSlug } from "./app-connect-policy";
@@ -211,6 +212,8 @@ export function AppsConnect() {
   const [installAgentIds, setInstallAgentIds] = useState<Set<string>>(new Set());
   const [oauthPhase, setOAuthPhase] = useState<OAuthConnectPhase>("entry");
   const [oauthError, setOAuthError] = useState<string | null>(null);
+  /** Host of the page the operator is about to be sent to, shown while redirecting. */
+  const [authorizationHost, setAuthorizationHost] = useState<string | null>(null);
   const directOAuthStartedRef = useRef(false);
   const directOAuthRetryingRef = useRef(false);
 
@@ -337,8 +340,17 @@ export function AppsConnect() {
   const oauthStartMutation = useMutation({
     mutationFn: (connectionId: string) => toolsApi.startOAuth(connectionId),
     onSuccess: ({ authorizationUrl }) => {
+      // The endpoint chose this address, so it is checked here too — this is the
+      // line where an unsafe scheme would actually run (PAP-17099).
+      const target = resolveAuthorizationTarget(authorizationUrl);
+      if (!target.ok) {
+        setOAuthPhase("error");
+        setOAuthError(target.message);
+        return;
+      }
+      setAuthorizationHost(target.host);
       setOAuthPhase("redirecting");
-      navigateTopLevel(authorizationUrl);
+      navigateTopLevel(target.url);
     },
     onError: (error) => {
       const details = error instanceof ApiError && error.body && typeof error.body === "object"
@@ -409,9 +421,17 @@ export function AppsConnect() {
           startOAuth(result.connectionId);
           return;
         }
+        const target = resolveAuthorizationTarget(startUrl);
+        if (!target.ok) {
+          setGenericOAuthPending(true);
+          setOAuthPhase("error");
+          setOAuthError(target.message);
+          return;
+        }
+        setAuthorizationHost(target.host);
         setOAuthPhase("redirecting");
         setGenericOAuthPending(true);
-        navigateTopLevel(startUrl);
+        navigateTopLevel(target.url);
         return;
       }
       setLinkGuidance(null);
@@ -576,6 +596,7 @@ export function AppsConnect() {
         entry={directOAuthEntry}
         phase={oauthPhase}
         error={oauthError}
+        authorizationHost={authorizationHost}
         onRetry={async () => {
           setOAuthError(null);
           setOAuthPhase("starting");
@@ -633,6 +654,7 @@ export function AppsConnect() {
         }}
         phase={oauthPhase}
         error={oauthError}
+        authorizationHost={authorizationHost}
         onRetry={() => {
           setOAuthError(null);
           const connectionId = connectResult?.connectionId;
@@ -943,6 +965,7 @@ export function OAuthConnectStateScreen({
   identity,
   phase,
   error,
+  authorizationHost,
   onRetry,
   onCancel,
 }: {
@@ -952,6 +975,12 @@ export function OAuthConnectStateScreen({
   identity?: { name: string; unverifiedHost: string | null };
   phase: OAuthConnectPhase;
   error?: string | null;
+  /**
+   * Host of the authorization page being opened. A valid HTTPS authorization
+   * page can still be a phishing page, so the operator sees exactly which host
+   * they are being handed to (PAP-17099).
+   */
+  authorizationHost?: string | null;
   onRetry: () => void;
   onCancel: () => void;
 }) {
@@ -970,7 +999,9 @@ export function OAuthConnectStateScreen({
       : phase === "redirecting"
         ? {
             title: `Opening ${serverName}`,
-            body: `Continue in ${serverName} to choose a workspace and approve access.`,
+            body: authorizationHost
+              ? `Continue at ${authorizationHost} to choose a workspace and approve access. Only approve access if you recognize that address.`
+              : `Continue in ${serverName} to choose a workspace and approve access.`,
           }
         : {
             title: `${serverName} couldn’t connect`,

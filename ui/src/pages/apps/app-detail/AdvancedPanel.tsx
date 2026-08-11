@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/context/ToastContext";
 import { redactUrlSecrets } from "@/lib/redact-url-secrets";
+import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import type { AppDetailSectionProps } from "./types";
 
@@ -89,7 +90,16 @@ export function ReconnectCard({
   const { pushToast } = useToast();
   const reconnectOAuth = useMutation({
     mutationFn: () => toolsApi.startOAuth(connection.id),
-    onSuccess: ({ authorizationUrl }) => navigateTopLevel(authorizationUrl),
+    onSuccess: ({ authorizationUrl }) => {
+      // Reconnect navigates to the same discovered address a fresh connect does,
+      // so it goes through the same gate (PAP-17099).
+      const target = resolveAuthorizationTarget(authorizationUrl);
+      if (!target.ok) {
+        pushToast({ title: "Couldn’t start sign-in", body: target.message, tone: "error" });
+        return;
+      }
+      navigateTopLevel(target.url);
+    },
     onError: (error) =>
       pushToast({
         title: "Couldn’t start sign-in",

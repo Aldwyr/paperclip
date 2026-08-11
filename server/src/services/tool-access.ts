@@ -116,6 +116,12 @@ import {
   mcpRemoteHeaderNameFromConfigPath,
   mcpRemoteHeaderRejectionMessage,
 } from "@paperclipai/shared";
+import {
+  checkOAuthEndpointUrl,
+  oauthEndpointUrlRejectionMessage,
+  type OAuthEndpointKind,
+  type OAuthEndpointUrlRejection,
+} from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -1515,9 +1521,38 @@ function descriptorHash(tool: McpToolDescriptor, riskLevel: ToolRiskLevel): stri
   });
 }
 
+/**
+ * Did this error come from the OAuth endpoint gate (PAP-17099)? Such a refusal
+ * is Paperclip's own decision about an unsafe address, so it must keep its code
+ * and its 422 instead of being folded into a generic upstream failure.
+ */
+function originOf(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
+function isOAuthEndpointRejection(error: unknown): boolean {
+  if (!(error instanceof HttpError)) return false;
+  const code = asRecord(error.details).code;
+  return typeof code === "string" && code.endsWith("_endpoint_rejected");
+}
+
+function healthFailureHttpStatus(failure: { status: ToolConnectionHealthStatus; code: string }): number {
+  if (failure.status === "missing_secret") return 422;
+  if (failure.code.endsWith("_endpoint_rejected")) return 422;
+  return 502;
+}
+
 function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStatus; message: string; code: string } {
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (isOAuthEndpointRejection(error)) {
+      return { status: "error", message: error.message, code: String(code) };
+    }
     if (code === "oauth_challenge") {
       return {
         status: "error",
@@ -1649,6 +1684,94 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
   async function assertRemoteEndpointAllowed(config: Record<string, unknown>): Promise<string> {
     return assertRemoteHttpUrlAllowed(remoteEndpoint(config));
+  }
+
+  /**
+   * OAuth endpoint scheme/transport gate (PAP-17099).
+   *
+   * Every OAuth endpoint Paperclip acts on is attacker-influenced: discovered
+   * metadata, a `WWW-Authenticate` hint, a pasted config, or a gallery default.
+   * The authorization endpoint is the sharpest one because it is handed to the
+   * operator's browser as a top-level navigation, so `javascript:`/`data:` there
+   * would run in the board's origin. `checkOAuthEndpointUrl` is the single place
+   * that decides; loopback `http:` is accepted only under the same
+   * local-development policy that governs private remote endpoints, and
+   * Paperclip's own origin is exempt from the transport rule because a
+   * first-party endpoint (the smoke-lab fixture) is served exactly as the board
+   * itself is.
+   */
+  function oauthEndpointRejected(kind: OAuthEndpointKind, reason: OAuthEndpointUrlRejection): HttpError {
+    return new HttpError(422, oauthEndpointUrlRejectionMessage(kind, reason), {
+      code: `oauth_${kind}_endpoint_rejected`,
+      reason,
+    });
+  }
+
+  /**
+   * Origins that are Paperclip itself: this deployment's configured public URL,
+   * plus the callback origin of the request in hand when there is one. Only the
+   * plaintext-transport rule is relaxed for these.
+   */
+  function firstPartyOrigins(candidate?: string | null): string[] {
+    const configured = process.env.PAPERCLIP_PUBLIC_URL?.trim()
+      || process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL?.trim()
+      || process.env.BETTER_AUTH_URL?.trim()
+      || process.env.BETTER_AUTH_BASE_URL?.trim()
+      || null;
+    return [originOf(candidate), originOf(configured)].filter((origin): origin is string => Boolean(origin));
+  }
+
+  /**
+   * Origins for which the plaintext-transport rule is relaxed when checking
+   * `value`. Adds the smoke-lab fixture's own origin, because that provider is
+   * mounted on this deployment's own routes — `assertNotSmokeLabOAuthEndpoints`
+   * is what stops any other connection from claiming those paths — and a smoke
+   * run may be driven against a deployment served over plaintext HTTP.
+   */
+  function insecureTransportExemptions(value: unknown, candidate?: string | null): string[] {
+    const origins = firstPartyOrigins(candidate);
+    if (typeof value === "string" && isSmokeLabOAuthUrl(value)) {
+      const origin = originOf(value);
+      if (origin) origins.push(origin);
+    }
+    return origins;
+  }
+
+  /** Throws unless `value` is an endpoint Paperclip may use (and navigate to). */
+  function assertOAuthEndpointUrl(
+    kind: OAuthEndpointKind,
+    value: unknown,
+    options: { firstPartyOrigin?: string | null } = {},
+  ): string {
+    const check = checkOAuthEndpointUrl(value, {
+      allowInsecureLoopback: allowPrivateRemoteEndpoints(),
+      allowInsecureOrigins: insecureTransportExemptions(value, options.firstPartyOrigin),
+    });
+    if (!check.ok) throw oauthEndpointRejected(kind, check.reason);
+    return check.url;
+  }
+
+  /**
+   * Discovery variant: an unusable endpoint is dropped rather than thrown, so a
+   * second advertised authorization server (or a later metadata candidate) still
+   * gets a chance. Rejections are recorded in `rejections`; discovery raises the
+   * first one only if it ends up with nothing safe to use, so the operator sees
+   * *why* instead of a bare "does not advertise OAuth sign in".
+   */
+  function safeOAuthEndpointUrl(
+    kind: OAuthEndpointKind,
+    value: unknown,
+    rejections: HttpError[],
+    firstPartyOrigin?: string | null,
+  ): string | null {
+    if (value === null || value === undefined || value === "") return null;
+    const check = checkOAuthEndpointUrl(value, {
+      allowInsecureLoopback: allowPrivateRemoteEndpoints(),
+      allowInsecureOrigins: insecureTransportExemptions(value, firstPartyOrigin),
+    });
+    if (check.ok) return check.url;
+    if (check.reason !== "missing") rejections.push(oauthEndpointRejected(kind, check.reason));
+    return null;
   }
 
   function trustedRuntimeHost() {
@@ -3248,7 +3371,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         actor,
         details: { status: failure.status, transport: connection.transport },
       });
-      throw new HttpError(failure.status === "missing_secret" ? 422 : 502, failure.message, {
+      throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
         connection: toConnection(updated),
         runtimeSlot,
@@ -3276,7 +3399,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         details: { status: failure.status },
         actor,
       });
-      throw new HttpError(failure.status === "missing_secret" ? 422 : 502, failure.message, {
+      throw new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
         setupUrl: connectionSetupUrl(connection),
         reconnectUrl: connectionReconnectUrl(connection),
@@ -4253,12 +4376,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function endpointsFromMetadataUrl(
     connection: typeof toolConnections.$inferSelect,
     metadataUrl: string,
+    rejections: HttpError[] = [],
+    firstPartyOrigin?: string | null,
   ): Promise<OAuthProviderEndpoints | null> {
     const metadata = await fetchJsonRecord(metadataUrl);
     if (!metadata) return null;
-    let authorizationUrl = typeof metadata.authorization_endpoint === "string" ? metadata.authorization_endpoint : null;
-    let tokenUrl = typeof metadata.token_endpoint === "string" ? metadata.token_endpoint : null;
-    let registrationUrl = typeof metadata.registration_endpoint === "string" ? metadata.registration_endpoint : null;
+    // Every endpoint below is a string the remote server chose, so none of them
+    // is adopted before `safeOAuthEndpointUrl` has vetted its scheme and host.
+    let authorizationUrl = safeOAuthEndpointUrl("authorization", metadata.authorization_endpoint, rejections, firstPartyOrigin);
+    let tokenUrl = safeOAuthEndpointUrl("token", metadata.token_endpoint, rejections, firstPartyOrigin);
+    let registrationUrl = safeOAuthEndpointUrl("registration", metadata.registration_endpoint, rejections, firstPartyOrigin);
     let scopes = normalizeOauthScopes(metadata.scopes_supported);
     let codeChallengeMethodsSupported = normalizeOauthScopes(metadata.code_challenge_methods_supported);
     let tokenEndpointAuthMethodsSupported = normalizeOauthScopes(metadata.token_endpoint_auth_methods_supported);
@@ -4276,10 +4403,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     for (const candidate of authServerMetadataUrls(metadata)) {
       const authMetadata = await fetchJsonRecord(candidate.metadataUrl);
       if (!authMetadata) continue;
-      const candidateAuthorizationUrl = typeof authMetadata.authorization_endpoint === "string"
-        ? authMetadata.authorization_endpoint
-        : null;
-      const candidateTokenUrl = typeof authMetadata.token_endpoint === "string" ? authMetadata.token_endpoint : null;
+      const candidateAuthorizationUrl = safeOAuthEndpointUrl(
+        "authorization",
+        authMetadata.authorization_endpoint,
+        rejections,
+        firstPartyOrigin,
+      );
+      const candidateTokenUrl = safeOAuthEndpointUrl("token", authMetadata.token_endpoint, rejections, firstPartyOrigin);
       if (!candidateAuthorizationUrl && !candidateTokenUrl) continue;
       // RFC 8414 §3.3: the metadata document's `issuer` must match the issuer we
       // used to build the discovery URL, or the document is not authoritative.
@@ -4289,7 +4419,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (advertisedIssuer && !sameOAuthIssuer(advertisedIssuer, candidate.issuer)) continue;
       authorizationUrl = authorizationUrl ?? candidateAuthorizationUrl;
       tokenUrl = tokenUrl ?? candidateTokenUrl;
-      registrationUrl = registrationUrl ?? (typeof authMetadata.registration_endpoint === "string" ? authMetadata.registration_endpoint : null);
+      registrationUrl = registrationUrl
+        ?? safeOAuthEndpointUrl("registration", authMetadata.registration_endpoint, rejections, firstPartyOrigin);
       issuer = issuer ?? advertisedIssuer ?? candidate.issuer;
       if (scopes.length === 0) scopes = normalizeOauthScopes(authMetadata.scopes_supported);
       if (codeChallengeMethodsSupported.length === 0) {
@@ -4322,12 +4453,28 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function discoverOAuthEndpoints(
     connection: typeof toolConnections.$inferSelect,
     challenge?: string | null,
+    firstPartyOrigin?: string | null,
   ): Promise<OAuthProviderEndpoints | null> {
     const oauth = oauthConfig(connection);
     const hints = challenge ? challengeOAuthHints(challenge) : null;
-    const configuredAuthorizationUrl =
-      typeof oauth.authorizationUrl === "string" ? oauth.authorizationUrl : hints?.authorizationUrl ?? null;
-    const configuredTokenUrl = typeof oauth.tokenUrl === "string" ? oauth.tokenUrl : hints?.tokenUrl ?? null;
+    // A configured endpoint was pasted by an operator or persisted from an
+    // earlier discovery, and a hint came straight out of the endpoint's
+    // `WWW-Authenticate` header. Neither is more trusted than metadata, so both
+    // go through the same gate; an unusable one is dropped so full metadata
+    // discovery still runs below.
+    const rejections: HttpError[] = [];
+    const configuredAuthorizationUrl = safeOAuthEndpointUrl(
+      "authorization",
+      typeof oauth.authorizationUrl === "string" ? oauth.authorizationUrl : hints?.authorizationUrl ?? null,
+      rejections,
+      firstPartyOrigin,
+    );
+    const configuredTokenUrl = safeOAuthEndpointUrl(
+      "token",
+      typeof oauth.tokenUrl === "string" ? oauth.tokenUrl : hints?.tokenUrl ?? null,
+      rejections,
+      firstPartyOrigin,
+    );
     const provider = oauthProviderForConnection(connection, typeof oauth.metadataUrl === "string" ? oauth.metadataUrl : hints?.metadataUrl);
     const scopes = normalizeOauthScopes(oauth.scopes).length > 0
       ? normalizeOauthScopes(oauth.scopes)
@@ -4348,7 +4495,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         scopes,
         authorizationUrl: configuredAuthorizationUrl,
         tokenUrl: configuredTokenUrl,
-        registrationUrl: typeof oauth.registrationUrl === "string" ? oauth.registrationUrl : null,
+        registrationUrl: safeOAuthEndpointUrl("registration", oauth.registrationUrl, rejections, firstPartyOrigin),
         codeChallengeMethodsSupported: normalizeOauthScopes(oauth.codeChallengeMethodsSupported),
         tokenEndpointAuthMethodsSupported: normalizeOauthScopes(oauth.tokenEndpointAuthMethodsSupported),
         grantType,
@@ -4371,7 +4518,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       metadataCandidates.push(...wellKnownMetadataUrls(endpoint.toString()));
     }
     for (const metadataUrl of [...new Set(metadataCandidates)]) {
-      const endpoints = await endpointsFromMetadataUrl(connection, metadataUrl);
+      const endpoints = await endpointsFromMetadataUrl(connection, metadataUrl, rejections, firstPartyOrigin);
       if (endpoints) {
         return {
           ...endpoints,
@@ -4381,6 +4528,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         };
       }
     }
+    // Nothing usable was found *and* something was refused on the way: report the
+    // refusal rather than the generic "does not advertise OAuth sign in", so the
+    // operator learns the server offered an unsafe address.
+    if (rejections.length > 0) throw rejections[0];
     return null;
   }
 
@@ -4400,7 +4551,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (!authorizationUrl || !tokenUrl) {
       throw unprocessable("OAuth provider endpoints are not configured for this app");
     }
-    return { provider: app.slug, scopes: method.defaults?.scopesHint ?? [], authorizationUrl, tokenUrl, grantType: "authorization_code", metadataUrl };
+    // A gallery default is Paperclip's own data, but it is still a URL that ends
+    // up as a browser navigation, and the metadata branch above reads the same
+    // untrusted document a generic connection does. Both go through the gate.
+    return {
+      provider: app.slug,
+      scopes: method.defaults?.scopesHint ?? [],
+      authorizationUrl: assertOAuthEndpointUrl("authorization", authorizationUrl),
+      tokenUrl: assertOAuthEndpointUrl("token", tokenUrl),
+      grantType: "authorization_code",
+      metadataUrl,
+    };
   }
 
   async function oauthEndpointsForConnection(
@@ -4415,14 +4576,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const hasCompleteGalleryEndpointHints = Boolean(
       galleryMethod?.defaults?.authorizationEndpoint && galleryMethod.defaults.tokenEndpoint,
     );
-    const discovered = connection.transport === "mcp_remote" && !hasCompleteGalleryEndpointHints
-      ? await discoverOAuthEndpoints(connection, challenge)
+    // The smoke-lab fixture's endpoints are first-party and complete, so
+    // discovery is not just unnecessary there, it must not run: an unreachable
+    // fixture endpoint would fail the whole callback.
+    const firstPartyOrigin = originOf(redirectUri);
+    const discovered = !smokeLabEndpoints && connection.transport === "mcp_remote" && !hasCompleteGalleryEndpointHints
+      ? await discoverOAuthEndpoints(connection, challenge, firstPartyOrigin)
       : null;
     const endpoints = smokeLabEndpoints
       ?? discovered
       ?? (galleryEntry && galleryMethod?.auth === "oauth"
         ? await oauthProviderEndpoints(galleryEntry, galleryMethod.key)
-        : await discoverOAuthEndpoints(connection, challenge));
+        : await discoverOAuthEndpoints(connection, challenge, firstPartyOrigin));
     if (!endpoints) throw unprocessable("This app connection does not advertise OAuth sign in");
     assertNotSmokeLabOAuthEndpoints(connection, endpoints);
     return endpoints;
@@ -4619,7 +4784,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       // others apply native-client redirect rules without it.
       application_type: "web",
     };
-    const response = await fetchRemoteHttpUrl(input.endpoints.registrationUrl, {
+    const response = await fetchRemoteHttpUrl(assertOAuthEndpointUrl("registration", input.endpoints.registrationUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(requestedMetadata),
@@ -5031,7 +5196,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     // exchange) to this MCP server.
     if (input.resource) body.set("resource", input.resource);
 
-    const response = await fetchRemoteHttpUrl(input.tokenUrl, {
+    // The token URL can come from a connection row written before the endpoint
+    // gate existed, so a client secret / authorization code never leaves
+    // Paperclip without re-checking the transport it would leave over.
+    const tokenUrl = assertOAuthEndpointUrl("token", input.tokenUrl, {
+      // Paperclip's own callback origin, so a first-party token endpoint keeps
+      // working on a deployment that is itself served over plaintext HTTP.
+      firstPartyOrigin: originOf(input.redirectUri),
+    });
+    const response = await fetchRemoteHttpUrl(tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
@@ -5674,7 +5847,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       } catch (error) {
         if (!galleryEntry && error instanceof HttpError && asRecord(error.details).code === "oauth_challenge") {
           const [oauthConnection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionRow.id));
-          const endpoints = await discoverOAuthEndpoints(oauthConnection).catch(() => null);
+          const endpoints = await discoverOAuthEndpoints(oauthConnection).catch((discoveryError: unknown) => {
+            // "This server advertised an address Paperclip refuses to open" is a
+            // refusal, not a failed discovery: keep it instead of collapsing it
+            // into the generic sign-in-required error.
+            if (isOAuthEndpointRejection(discoveryError)) throw discoveryError;
+            return null;
+          });
           if (!endpoints) throw error;
           return {
             connectionId: oauthConnection.id,
@@ -6195,7 +6374,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       expiresAt,
     });
 
-    const authorizationUrl = new URL(endpoints.authorizationUrl);
+    // Last gate before this URL becomes a top-level browser navigation. Every
+    // producer above already validates, so reaching a rejection here means a new
+    // path was added without one — fail closed rather than hand the board an
+    // unvetted target.
+    const authorizationUrl = new URL(assertOAuthEndpointUrl("authorization", endpoints.authorizationUrl, {
+      // Paperclip's own callback origin: a first-party authorization endpoint is
+      // served however this deployment is served, plaintext LAN host included.
+      firstPartyOrigin: originOf(input.redirectUri),
+    }));
     authorizationUrl.searchParams.set("response_type", "code");
     authorizationUrl.searchParams.set("client_id", client.clientId);
     authorizationUrl.searchParams.set("redirect_uri", input.redirectUri);

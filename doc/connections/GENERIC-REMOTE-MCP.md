@@ -112,6 +112,33 @@ URL, the callback URI, and the company. If any of those change:
 
 Credentials are never reused across issuers or across companies.
 
+### Endpoint addresses are validated before they are used
+
+Every OAuth endpoint address is chosen by the remote server — in discovered
+metadata, in a `WWW-Authenticate` hint, in a pasted config, or in a gallery
+default — and the authorization endpoint additionally becomes a top-level browser
+navigation. All of them are parsed by one shared validator
+(`checkOAuthEndpointUrl` in `@paperclipai/shared`) and must be:
+
+- **`https:`.** Plain `http:` is refused, except for a loopback host under the
+  local-development policy (the same policy that allows private remote
+  endpoints), and except for this deployment's own origin.
+- **Free of embedded credentials.** `https://accounts.google.com@evil.test/…`
+  reads as the wrong site to a human, so Paperclip refuses it.
+- **Free of a fragment**, and a well-formed absolute URL.
+
+`javascript:`, `data:`, `file:` and friends are therefore refused before they can
+reach `window.location`. The board applies the same validator to the address it
+receives, so an unsafe value cannot pass the API boundary and then execute at the
+navigation boundary. A refusal is reported as
+`oauth_<kind>_endpoint_rejected` (422) and the unsafe value is never persisted on
+the connection.
+
+An address that passes is still only an address: a valid HTTPS authorization page
+can be a phishing page. The redirect screen names the host you are being sent to,
+and the **Unverified server** label stays visible for an endpoint with no curated
+definition.
+
 ### Protocol conformance
 
 - RFC 8707 `resource` on authorization, token, and refresh requests, naming the

