@@ -1,0 +1,791 @@
+import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  activityLog,
+  agents,
+  authUsers,
+  companies,
+  companyMemberships,
+  companySecretBindings,
+  companySecrets,
+  companySecretVersions,
+  createDb,
+  principalPermissionGrants,
+  secretAccessEvents,
+  toolAccessAuditEvents,
+  toolApplications,
+  toolCatalogEntries,
+  toolConnectionInstalls,
+  toolConnections,
+  toolOauthStates,
+  toolProfileBindings,
+  toolProfileEntries,
+  toolProfiles,
+  toolRuntimeSlots,
+} from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { toolAccessService } from "../services/tool-access.js";
+import { toolAccessPolicyService } from "../services/tool-access-policy.js";
+import { toolAccessRoutes } from "../routes/tool-access.js";
+import { errorHandler } from "../middleware/index.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+/**
+ * PAP-17087 — a connection to an unknown remote MCP server must get the same
+ * treatment as a curated one, so these tests deliberately never name a gallery
+ * app. Every endpoint below is served by the in-process fixture, so the whole
+ * generic path (discovery → registration → authorization → catalog → review) is
+ * deterministic and needs no network or vendor credentials.
+ */
+
+const PUBLIC_BASE_URL = "https://paperclip.fixture.test";
+const REDIRECT_URI = `${PUBLIC_BASE_URL}/api/tools/oauth/callback`;
+const CLIENT_METADATA_DOCUMENT_URL = `${PUBLIC_BASE_URL}/api/tools/oauth/client-metadata`;
+
+const MCP_ORIGIN = "https://mcp.fixture.test";
+const MCP_URL = `${MCP_ORIGIN}/mcp`;
+/** A pathful issuer, so RFC 8414 well-known insertion is actually exercised. */
+const ISSUER = `${MCP_ORIGIN}/tenant/acme`;
+
+const FIXTURE_TOOLS = [
+  { name: "list_insights", description: "List insights", annotations: { readOnlyHint: true } },
+  { name: "create_insight", description: "Create an insight", annotations: { readOnlyHint: false } },
+];
+
+type FixtureOptions = {
+  /** How the MCP endpoint authenticates. */
+  auth?: "public" | "oauth" | "header";
+  /** For `auth: "header"`, the header the endpoint requires and its value. */
+  requiredHeader?: { name: string; value: string };
+  /** Advertise Client ID Metadata Document support on the authorization server. */
+  cimd?: boolean;
+  /** Advertise a dynamic client registration endpoint. */
+  dcr?: boolean;
+  /** Serve authorization-server metadata under the RFC 8414 insertion path only. */
+  wellKnownStyle?: "rfc8414" | "oidc-suffix";
+  /** Value the token endpoint returns as the issuer, for `iss` tests. */
+  tools?: unknown[];
+};
+
+type FixtureRequest = {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: URLSearchParams | Record<string, unknown> | null;
+};
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  const body = JSON.stringify(payload);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (name: string) => (name.toLowerCase() === "content-type" ? "application/json" : null),
+    },
+    text: async () => body,
+    json: async () => payload,
+  } as unknown as Response;
+}
+
+function unauthorizedMcpResponse(resourceMetadataUrl: string): Response {
+  return {
+    ok: false,
+    status: 401,
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === "www-authenticate"
+          ? `Bearer resource_metadata="${resourceMetadataUrl}"`
+          : null,
+    },
+    text: async () => "",
+    json: async () => ({}),
+  } as unknown as Response;
+}
+
+function headerRecord(init: RequestInit | undefined): Record<string, string> {
+  const raw = init?.headers;
+  if (!raw) return {};
+  if (raw instanceof Headers) return Object.fromEntries(raw.entries());
+  if (Array.isArray(raw)) return Object.fromEntries(raw as Array<[string, string]>);
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, string>).map(([key, value]) => [key.toLowerCase(), value]),
+  );
+}
+
+/**
+ * A single fetch implementation standing in for an MCP server plus its
+ * authorization server. Returns the request log so tests can assert on the exact
+ * protocol parameters Paperclip sent (RFC 8707 `resource`, DCR metadata, PKCE).
+ */
+function installMcpOAuthFixture(options: FixtureOptions = {}) {
+  const auth = options.auth ?? "public";
+  const requests: FixtureRequest[] = [];
+  const issuedCodes = new Map<string, { codeChallenge: string; resource: string | null }>();
+  let accessToken: string | null = null;
+  const tools = options.tools ?? FIXTURE_TOOLS;
+  const resourceMetadataUrl = `${MCP_ORIGIN}/.well-known/oauth-protected-resource/mcp`;
+
+  const authorizationServerMetadata = () => ({
+    issuer: ISSUER,
+    authorization_endpoint: `${ISSUER}/authorize`,
+    token_endpoint: `${ISSUER}/token`,
+    ...(options.dcr === false ? {} : { registration_endpoint: `${ISSUER}/register` }),
+    ...(options.cimd ? { client_id_metadata_document_supported: true } : {}),
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["mcp:read", "mcp:write"],
+  });
+
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    const href = String(url);
+    const method = (init?.method ?? "GET").toUpperCase();
+    const headers = headerRecord(init);
+    const bodyText = typeof init?.body === "string" ? init.body : init?.body?.toString?.() ?? null;
+    const parsedBody = bodyText
+      ? headers["content-type"]?.includes("json")
+        ? (JSON.parse(bodyText) as Record<string, unknown>)
+        : new URLSearchParams(bodyText)
+      : null;
+    requests.push({ method, url: href, headers, body: parsedBody });
+
+    if (href === MCP_URL && method === "POST") {
+      if (auth === "oauth" && headers.authorization !== `Bearer ${accessToken}`) {
+        return unauthorizedMcpResponse(resourceMetadataUrl);
+      }
+      if (auth === "header" && options.requiredHeader) {
+        const supplied = headers[options.requiredHeader.name.toLowerCase()];
+        if (supplied !== options.requiredHeader.value) return unauthorizedMcpResponse(resourceMetadataUrl);
+      }
+      return jsonResponse({ jsonrpc: "2.0", id: "paperclip-catalog-refresh", result: { tools } });
+    }
+
+    if (href === resourceMetadataUrl) {
+      return jsonResponse({ resource: MCP_URL, authorization_servers: [ISSUER] });
+    }
+
+    // RFC 8414 inserts the well-known segment before the issuer path; OIDC
+    // Discovery appends it. The fixture serves whichever style the test asked
+    // for so both discovery orders are covered.
+    const rfc8414Url = `${MCP_ORIGIN}/.well-known/oauth-authorization-server/tenant/acme`;
+    const oidcSuffixUrl = `${ISSUER}/.well-known/oauth-authorization-server`;
+    const servedMetadataUrl = options.wellKnownStyle === "oidc-suffix" ? oidcSuffixUrl : rfc8414Url;
+    if (href === servedMetadataUrl) return jsonResponse(authorizationServerMetadata());
+
+    if (href === `${ISSUER}/register` && method === "POST") {
+      if (options.dcr === false) return jsonResponse({ error: "not_supported" }, 404);
+      const requested = parsedBody as Record<string, unknown>;
+      return jsonResponse({
+        client_id: "fixture-dcr-client",
+        // A conforming server echoes back what it registered, and Paperclip
+        // rejects the response when it doesn't match what was requested.
+        redirect_uris: requested.redirect_uris,
+        grant_types: requested.grant_types,
+        response_types: requested.response_types,
+        token_endpoint_auth_method: requested.token_endpoint_auth_method,
+        application_type: requested.application_type,
+      });
+    }
+
+    if (href === `${ISSUER}/token` && method === "POST") {
+      const body = parsedBody as URLSearchParams;
+      const grantType = body.get("grant_type");
+      if (grantType === "authorization_code") {
+        const issued = issuedCodes.get(body.get("code") ?? "");
+        if (!issued) return jsonResponse({ error: "invalid_grant" }, 400);
+      }
+      accessToken = `fixture-access-${randomUUID()}`;
+      return jsonResponse({
+        access_token: accessToken,
+        refresh_token: "fixture-refresh",
+        expires_in: 3600,
+        token_type: "Bearer",
+        scope: "mcp:read",
+      });
+    }
+
+    // 404 rather than throw: discovery legitimately probes several well-known
+    // paths, and a real server answers the ones it does not serve with a 404.
+    return jsonResponse({ error: "not_found" }, 404);
+  });
+
+  return {
+    fetchMock,
+    requests,
+    /** Pretend the operator approved the consent screen and got a code back. */
+    issueAuthorizationCode(authorizationUrl: string) {
+      const parsed = new URL(authorizationUrl);
+      const code = `fixture-code-${randomUUID()}`;
+      issuedCodes.set(code, {
+        codeChallenge: parsed.searchParams.get("code_challenge") ?? "",
+        resource: parsed.searchParams.get("resource"),
+      });
+      return code;
+    },
+    requestsTo(pathSuffix: string) {
+      return requests.filter((entry) => entry.url.endsWith(pathSuffix));
+    },
+  };
+}
+
+async function createCompany(db: ReturnType<typeof createDb>) {
+  return db
+    .insert(companies)
+    .values({
+      name: `Generic MCP ${randomUUID()}`,
+      issuePrefix: `GM${randomUUID().slice(0, 6).toUpperCase()}`,
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
+function createRouteApp(
+  db: ReturnType<typeof createDb>,
+  deployment?: { deploymentMode: "authenticated"; deploymentExposure: "public" },
+) {
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = {
+      type: "board",
+      userId: "board-user",
+      userName: "Board User",
+      userEmail: null,
+      isInstanceAdmin: true,
+      source: "local_implicit",
+    };
+    next();
+  });
+  app.use("/api", toolAccessRoutes(db, { ...deployment }));
+  app.use(errorHandler);
+  return app;
+}
+
+describeEmbeddedPostgres("generic remote MCP connections", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-generic-mcp-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    await db.delete(toolOauthStates);
+    await db.delete(secretAccessEvents);
+    await db.delete(companySecretBindings);
+    await db.delete(companySecretVersions);
+    await db.delete(companySecrets);
+    await db.delete(activityLog);
+    await db.delete(toolAccessAuditEvents);
+    await db.delete(toolRuntimeSlots);
+    await db.delete(toolConnectionInstalls);
+    await db.delete(toolProfileBindings);
+    await db.delete(toolProfileEntries);
+    await db.delete(toolProfiles);
+    await db.delete(toolCatalogEntries);
+    await db.delete(toolConnections);
+    await db.delete(toolApplications);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
+    await db.delete(agents);
+    await db.delete(companies);
+    await db.delete(authUsers);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("connects a public unknown endpoint with conservative defaults and quarantine", async () => {
+    installMcpOAuthFixture({ auth: "public" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const result = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture MCP" });
+
+    expect(result.auth ?? null).toBeNull();
+    expect(result.actions.readOnly.map((action) => action.toolName)).toEqual(["list_insights"]);
+    expect(result.actions.canMakeChanges.map((action) => action.toolName)).toEqual(["create_insight"]);
+    // Reads are on for review, anything that can change data starts off.
+    expect(result.suggestedDefaults).toMatchObject({ askFirstRiskLevels: ["write", "destructive"] });
+
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, result.connectionId));
+    expect(connection).toMatchObject({ transport: "mcp_remote", authKind: "none", status: "draft" });
+    // An unknown endpoint stays labelled unverified and quarantines whatever it
+    // grows later, exactly like the curated path's conservative defaults.
+    expect(connection!.config).toMatchObject({ quarantineNewEntries: true, unverifiedServer: true });
+    // No curated definition was consulted: nothing recorded a template key, so
+    // this connection cannot be depending on gallery metadata for anything.
+    expect(connection!.config).not.toHaveProperty("sourceTemplateKey");
+    expect(connection!.config).not.toHaveProperty("connectionMethodKey");
+  });
+
+  it("stores a bearer key as a secret and never reads it back", async () => {
+    installMcpOAuthFixture({
+      auth: "header",
+      requiredHeader: { name: "Authorization", value: "Bearer fixture-key-123" },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const result = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture bearer",
+      authMode: "bearer",
+      credentialValues: { "credentials.authorization": "fixture-key-123" },
+    });
+
+    expect(result.catalog).toHaveLength(2);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, result.connectionId));
+    expect(connection!.authKind).toBe("api_key");
+    expect(JSON.stringify(connection!.config)).not.toContain("fixture-key-123");
+    expect(JSON.stringify(connection!.credentialRefs)).not.toContain("fixture-key-123");
+    expect(JSON.stringify(result.connection)).not.toContain("fixture-key-123");
+    expect(connection!.credentialSecretRefs.map((ref) => ref.configPath)).toEqual(["credentials.authorization"]);
+  });
+
+  it("stores custom header values as secrets and shows only header names", async () => {
+    installMcpOAuthFixture({
+      auth: "header",
+      requiredHeader: { name: "X-Api-Key", value: "phx_fixture_secret" },
+    });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const result = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture headers",
+      authMode: "custom_headers",
+      credentialValues: { "headers.X-Api-Key": "phx_fixture_secret" },
+    });
+
+    expect(result.catalog).toHaveLength(2);
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, result.connectionId));
+    const serialized = JSON.stringify({
+      config: connection!.config,
+      credentialRefs: connection!.credentialRefs,
+      credentialSecretRefs: connection!.credentialSecretRefs,
+    });
+    expect(serialized).not.toContain("phx_fixture_secret");
+    // The header *name* is what review and diagnostics get to show.
+    expect(serialized).toContain("X-Api-Key");
+  });
+
+  it("rejects header names Paperclip refuses to send", async () => {
+    installMcpOAuthFixture({ auth: "public" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    await expect(service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture unsafe header",
+      credentialValues: { "headers.Host": "evil.example" },
+    })).rejects.toMatchObject({ status: 400 });
+
+    await expect(service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture split header",
+      credentialValues: { "headers.X-Api-Key": "abc\r\nX-Injected: 1" },
+    })).rejects.toMatchObject({ status: 400 });
+
+    // Nothing partial survived either rejection.
+    await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
+    await expect(db.select().from(companySecrets)).resolves.toHaveLength(0);
+  });
+
+  it("registers dynamically for an unknown OAuth endpoint and completes the flow", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture OAuth" });
+    // Discovery succeeded, so the wizard gets a real sign-in branch rather than
+    // an error, and it already knows which server it is about to trust.
+    expect(connected.auth).toMatchObject({ kind: "oauth", issuer: ISSUER, resource: MCP_URL });
+
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(start.registrationSource).toBe("dcr");
+    expect(start.issuer).toBe(ISSUER);
+
+    const registration = fixture.requestsTo("/register");
+    expect(registration).toHaveLength(1);
+    expect(registration[0]!.body).toMatchObject({
+      redirect_uris: [REDIRECT_URI],
+      token_endpoint_auth_method: "none",
+      application_type: "web",
+    });
+
+    const authorizationUrl = new URL(start.authorizationUrl);
+    expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(`${ISSUER}/authorize`);
+    expect(authorizationUrl.searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(authorizationUrl.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorizationUrl.searchParams.get("code_challenge")).toBeTruthy();
+    // RFC 8707: the MCP server is named so the token can be audience-restricted.
+    expect(authorizationUrl.searchParams.get("resource")).toBe(MCP_URL);
+
+    const [afterStart] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(afterStart!.authKind).toBe("oauth");
+    expect(afterStart!.config).toMatchObject({
+      oauth: { issuer: ISSUER, expectedIssuer: ISSUER, resource: MCP_URL, clientRegistrationSource: "dcr" },
+    });
+
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    const completed = await service.completeOAuthCallback({
+      state: authorizationUrl.searchParams.get("state")!,
+      code,
+      iss: ISSUER,
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    // Same catalog/review pipeline a curated connection gets.
+    expect(completed.actions.readOnly.map((action) => action.toolName)).toEqual(["list_insights"]);
+    expect(completed.actions.canMakeChanges.map((action) => action.toolName)).toEqual(["create_insight"]);
+
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("resource")).toBe(MCP_URL);
+    expect((tokenRequest.body as URLSearchParams).get("code_verifier")).toBeTruthy();
+
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection).toMatchObject({ status: "active", enabled: true, authKind: "oauth" });
+    // The access token lives in a secret, never in the config JSON.
+    expect(JSON.stringify(connection!.config)).not.toContain("fixture-access-");
+    expect(connection!.credentialSecretRefs.map((ref) => ref.configPath).sort())
+      .toEqual(["oauth.access_token", "oauth.refresh_token"]);
+  });
+
+  it("discovers a pathful issuer through the OIDC suffix form too", async () => {
+    installMcpOAuthFixture({ auth: "oauth", wellKnownStyle: "oidc-suffix" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture suffix" });
+    expect(connected.auth).toMatchObject({ kind: "oauth", issuer: ISSUER });
+  });
+
+  it("prefers a Client ID Metadata Document over dynamic registration", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture CIMD" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("cimd");
+    // The client_id *is* the document URL, so nothing was registered.
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe(CLIENT_METADATA_DOCUMENT_URL);
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
+  });
+
+  it("falls back to dynamic registration when the callback is not public HTTPS", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture local CIMD" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      // A loopback callback cannot serve a client_id an authorization server can
+      // fetch, so CIMD is unavailable and DCR has to carry the flow.
+      redirectUri: "http://localhost:3100/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("dcr");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+  });
+
+  it("prefers a deployment-preconfigured client over any registration", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_CLIENT_ID", "preconfigured-client");
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture preconfigured" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("preconfigured");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("preconfigured-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
+  });
+
+  it("asks for a preregistered client when the server offers neither CIMD nor DCR", async () => {
+    installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const app = createRouteApp(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+
+    const response = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: MCP_URL, name: "Fixture manual" })
+      .expect(201);
+
+    // The draft connection is real; only the client is missing. Losing the draft
+    // here would make the operator start over just to paste a client id.
+    expect(response.body.auth).toMatchObject({ kind: "oauth", startUrl: null, manualClientRequired: true });
+    await expect(db.select().from(toolConnections)).resolves.toHaveLength(1);
+  });
+
+  it("uses preregistered client credentials without registering anything", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth", dcr: false });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual client",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client", clientSecret: "operator-secret" },
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(start.registrationSource).toBe("manual");
+    expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe("operator-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(0);
+
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    // The client secret is a secret ref, and specifically *not* a credential ref:
+    // it goes to the token endpoint, never onto an MCP request as a header.
+    expect(connection!.credentialSecretRefs.some((ref) => ref.configPath === "oauth.client_secret")).toBe(true);
+    expect(connection!.credentialRefs.some((ref) => ref.name === "oauth.client_secret")).toBe(false);
+    expect(JSON.stringify(connection!.config)).not.toContain("operator-secret");
+
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+    await service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const tokenRequest = fixture.requestsTo("/token").at(-1)!;
+    expect((tokenRequest.body as URLSearchParams).get("client_secret")).toBe("operator-secret");
+  });
+
+  it("refuses a callback whose iss names a different authorization server", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture iss" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    await expect(service.completeOAuthCallback({
+      state,
+      code,
+      iss: "https://attacker.fixture.test",
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    })).rejects.toMatchObject({ status: 400, details: { code: "oauth_issuer_mismatch" } });
+
+    // The code was never exchanged.
+    expect(fixture.requestsTo("/token")).toHaveLength(0);
+  });
+
+  it("accepts an iss that differs only by a trailing slash", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture iss slash" });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+    await expect(service.completeOAuthCallback({
+      state: new URL(start.authorizationUrl).searchParams.get("state")!,
+      code,
+      iss: `${ISSUER}/`,
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    })).resolves.toMatchObject({ connectionId: connected.connectionId });
+  });
+
+  it("re-registers rather than reusing a client bound to a different callback", async () => {
+    const fixture = installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture rebind" });
+    await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+
+    // Same redirect URI: the stored client is still bound, so nothing re-registers.
+    await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
+
+    // Different callback origin: the binding no longer holds.
+    await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://other.fixture.test/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(fixture.requestsTo("/register")).toHaveLength(2);
+  });
+
+  it("will not auto-re-register over a client the operator supplied", async () => {
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture manual rebind",
+      authMode: "oauth",
+      oauthClient: { clientId: "operator-client" },
+    });
+    await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    // The callback moved. Paperclip cannot re-register in the operator's console,
+    // so it must stop and say so rather than silently minting a new client.
+    await expect(service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://other.fixture.test/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    })).rejects.toMatchObject({ details: { code: "oauth_manual_client_rebinding_required" } });
+  });
+
+  it("rejects a private-network endpoint in an authenticated public deployment", async () => {
+    installMcpOAuthFixture({ auth: "public" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+    });
+
+    await expect(service.connectGalleryApp(company.id, {
+      link: "http://127.0.0.1:8848/mcp",
+      name: "Fixture loopback",
+    })).rejects.toMatchObject({ details: { code: "remote_http_private_endpoint" } });
+    await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
+  });
+
+  it("keeps generic connections inside their own company", async () => {
+    installMcpOAuthFixture({ auth: "public" });
+    const owner = await createCompany(db);
+    const other = await createCompany(db);
+    const service = toolAccessService(db);
+
+    const connected = await service.connectGalleryApp(owner.id, { link: MCP_URL, name: "Fixture scoped" });
+
+    await expect(service.getConnection(connected.connectionId, other.id)).rejects.toMatchObject({ status: 404 });
+    await expect(service.startOAuth(other.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    })).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("gives a generic connection the same review, access, install, gateway and revoke path", async () => {
+    installMcpOAuthFixture({ auth: "public" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const policy = toolAccessPolicyService(db);
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id,
+      name: `Generic MCP agent ${randomUUID()}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture governance" });
+    const readEntry = connected.catalog.find((entry) => entry.toolName === "list_insights")!;
+    const writeEntry = connected.catalog.find((entry) => entry.toolName === "create_insight")!;
+
+    // Action selection: enable the read, leave the state-changing action off.
+    const finished = await service.finishGalleryAppConnection(company.id, connected.connectionId, {
+      enabledCatalogEntryIds: [readEntry.id],
+      askFirstCatalogEntryIds: [],
+      access: { agentIds: [agent!.id] },
+    }, { actorType: "user", actorId: "board-user" });
+
+    expect(finished.connection).toMatchObject({ status: "active", enabled: true });
+    expect(finished.profile).toMatchObject({ profileKey: `app:${connected.connectionId}`, defaultAction: "deny" });
+    expect(finished.profileBindings).toEqual([
+      expect.objectContaining({ targetType: "agent", targetId: agent!.id }),
+    ]);
+
+    const decisionInput = (catalogEntryId: string, toolName: string) => ({
+      companyId: company.id,
+      actor: { actorType: "agent" as const, actorId: agent!.id, agentId: agent!.id },
+      request: { connectionId: connected.connectionId, catalogEntryId, toolName },
+    });
+
+    // Action selection is what the app profile encodes: the enabled read is
+    // allowed for the chosen agent, and the state-changing action the operator
+    // left off is denied by the profile's `deny` default.
+    await expect(policy.decide(decisionInput(readEntry.id, "list_insights")))
+      .resolves.toMatchObject({ allowed: true, reasonCode: "allow_profile" });
+    await expect(policy.decide(decisionInput(writeEntry.id, "create_insight")))
+      .resolves.toMatchObject({ allowed: false, reasonCode: "deny_default" });
+
+    // Installation targets the chosen agent, same as a curated connection.
+    await service.putConnectionInstalls(connected.connectionId, {
+      installs: [{ targetType: "agent", targetId: agent!.id, enabled: true }],
+    }, { actorType: "user", actorId: "board-user" });
+    const installs = await db.select().from(toolConnectionInstalls)
+      .where(eq(toolConnectionInstalls.connectionId, connected.connectionId));
+    expect(installs).toEqual([expect.objectContaining({ targetType: "agent", targetId: agent!.id })]);
+
+    // Revoke: archiving the connection removes access but keeps the trail.
+    await service.archiveConnection(connected.connectionId, company.id);
+    const afterRevoke = await policy.decide(decisionInput(readEntry.id, "list_insights"));
+    expect(afterRevoke.allowed).toBe(false);
+
+    const auditEvents = await db.select().from(toolAccessAuditEvents)
+      .where(eq(toolAccessAuditEvents.companyId, company.id));
+    expect(auditEvents.length).toBeGreaterThan(0);
+  });
+
+  it("serves a client metadata document with no company or secret data", async () => {
+    const company = await createCompany(db);
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", PUBLIC_BASE_URL);
+    const app = createRouteApp(db);
+
+    const response = await request(app).get("/api/tools/oauth/client-metadata").expect(200);
+
+    expect(response.body).toMatchObject({
+      client_id: CLIENT_METADATA_DOCUMENT_URL,
+      redirect_uris: [REDIRECT_URI],
+      token_endpoint_auth_method: "none",
+      application_type: "web",
+    });
+    expect(JSON.stringify(response.body)).not.toContain(company.id);
+  });
+});

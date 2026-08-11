@@ -4823,6 +4823,48 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   }
 
   /**
+   * Record the issuer/resource/callback/company a client is bound to, the first
+   * time that client is actually used.
+   *
+   * A dynamically registered or CIMD client is stamped at registration. A client
+   * the operator pasted in has no binding until now — without this, its
+   * `clientRedirectUri` would stay unset forever and `oauthClientBindingMatches`
+   * would keep accepting it for *any* callback, which is exactly the drift the
+   * binding check exists to catch.
+   */
+  async function stampOAuthClientBinding(
+    connection: typeof toolConnections.$inferSelect,
+    endpoints: OAuthProviderEndpoints,
+    redirectUri: string,
+  ): Promise<typeof toolConnections.$inferSelect> {
+    const oauth = oauthConfig(connection);
+    const nextBinding = {
+      clientRedirectUri: redirectUri,
+      clientIssuer: typeof oauth.clientIssuer === "string" && oauth.clientIssuer
+        ? oauth.clientIssuer
+        : endpoints.issuer ?? null,
+      clientResource: typeof oauth.clientResource === "string" && oauth.clientResource
+        ? oauth.clientResource
+        : endpoints.resource ?? null,
+      clientCompanyId: typeof oauth.clientCompanyId === "string" && oauth.clientCompanyId
+        ? oauth.clientCompanyId
+        : connection.companyId,
+    };
+    const unchanged = Object.entries(nextBinding).every(([key, value]) => oauth[key] === value);
+    if (unchanged) return connection;
+    const nextConfig = { ...connection.config, oauth: { ...oauth, ...nextBinding } };
+    const [updated] = await db
+      .update(toolConnections)
+      .set({ config: nextConfig, transportConfig: nextConfig, updatedAt: now() })
+      .where(and(
+        eq(toolConnections.id, connection.id),
+        eq(toolConnections.companyId, connection.companyId),
+      ))
+      .returning();
+    return updated ?? connection;
+  }
+
+  /**
    * May Paperclip mint client material for this connection without an operator
    * pasting client credentials?
    *
@@ -4856,10 +4898,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
     // 2. Client material already bound to this issuer/resource/callback/company.
     if (oauthClientBindingMatches(input.connection, input.endpoints, input.redirectUri)) {
+      const bound = await stampOAuthClientBinding(input.connection, input.endpoints, input.redirectUri);
       return {
-        connection: input.connection,
-        client: await oauthClientForConnection(input.connection, input.endpoints.provider, input.actor),
-        source: storedOAuthClientRegistrationSource(input.connection),
+        connection: bound,
+        client: await oauthClientForConnection(bound, input.endpoints.provider, input.actor),
+        source: storedOAuthClientRegistrationSource(bound),
       };
     }
     const oauth = oauthConfig(input.connection);
@@ -4889,10 +4932,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         return { connection: latest, client: latestConfigured, source: "preconfigured" as const };
       }
       if (oauthClientBindingMatches(latest, input.endpoints, input.redirectUri)) {
+        const bound = await stampOAuthClientBinding(latest, input.endpoints, input.redirectUri);
         return {
-          connection: latest,
-          client: await oauthClientForConnection(latest, input.endpoints.provider, input.actor),
-          source: storedOAuthClientRegistrationSource(latest),
+          connection: bound,
+          client: await oauthClientForConnection(bound, input.endpoints.provider, input.actor),
+          source: storedOAuthClientRegistrationSource(bound),
         };
       }
       // 3. Client ID Metadata Documents: no registration call at all, so prefer
