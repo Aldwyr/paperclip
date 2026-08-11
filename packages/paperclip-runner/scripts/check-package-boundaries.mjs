@@ -12,6 +12,9 @@ const violations = [];
 if (runnerManifest.exports?.["./testing"] === undefined) {
   violations.push("runner package must declare the ./testing export");
 }
+if (runnerManifest.exports?.["./evals"] === undefined) {
+  violations.push("runner package must declare the ./evals integration export");
+}
 for (const privatePath of ["mock-core", "conformance", "scenarios", "src/tools", "./tools/"]) {
   if (runtimeIndex.includes(privatePath)) {
     violations.push(`runtime root must not export test/eval path: ${privatePath}`);

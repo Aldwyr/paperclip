@@ -36,6 +36,7 @@ Public runner exports are:
 | Export | Stability and purpose |
 |---|---|
 | `@paperclipai/paperclip-runner` | Runtime contracts, runner clients/backends, PRP validation/replay, canonical catalog/dispatcher, and compatibility preflight |
+| `@paperclipai/paperclip-runner/evals` | Versioned native-attempt/build metadata, explicit runnerd artifact resolver, and complete App/Evals compatibility negotiation |
 | `@paperclipai/paperclip-runner/testing` | Deterministic mocks, PRP port conformance, and provider-neutral semantic conformance kit |
 | `./browser`, `./react`, `./standalone`, `./styles.css` | Existing explicitly named UI/standalone consumers |
 
@@ -85,6 +86,10 @@ contracts are published in `PAPERCLIP_RUNNER_COMPATIBILITY`:
 | Canonical catalog | 1 | Operation removals, renames, placement changes, or incompatible schemas require a new contract version |
 | PRP | 1 | Highest overlapping required protocol version; no overlap fails closed |
 | Runner client | 1 | Breaking runnerd/client interface changes require a new version |
+| runnerd artifact | 1 | Binary metadata/package disagreement or digest mismatch fails before launch |
+| Harness driver | 1 | Breaking descriptor/config/session/conformance behavior requires a new version |
+| Native execution | 1 | Breaking App attempt-bundle semantics require a new schema version and converter |
+| Evals integration | 1 | Breaking package/binary/catalog/driver join behavior requires a new version |
 | Control-plane adapter | 1 | Breaking `ControlPlanePort` or production-binding expectations require a new version |
 | Testkit | 1 | Breaking mock seed, vector, observation, or conformance behavior requires a new version |
 | Eval corpus | 1 | Runner declares a supported inclusive corpus-version range; out-of-range bundles fail before execution |
@@ -108,9 +113,10 @@ pnpm --filter @paperclipai/paperclip-runner check:clean-consumers
 The second command builds and packs both packages, then installs tarballs into
 two newly created consumers:
 
-1. An Evals-side consumer imports only declared runner root and `./testing`
-   exports, executes the deterministic PRP conformance kit, and proves an
-   unsupported provider operation fails explicitly.
+1. An Evals-side consumer imports only declared runner root, `./evals`, and
+   `./testing` exports; validates the native bundle; executes deterministic PRP
+   and harness-driver conformance; resolves a separately copied runnerd by
+   explicit path/digest; and proves provider/driver mismatches fail explicitly.
 2. An App-side consumer installs the eval kernel as a development dependency,
    runs a generic matrix after runner compatibility preflight, and proves the
    runner manifest has no Evals runtime dependency.

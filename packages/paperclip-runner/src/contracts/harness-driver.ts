@@ -4,6 +4,26 @@ import type {
 } from "../protocol/replay-contract.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "./types.js";
 
+export const HARNESS_DRIVER_CONTRACT_VERSION = 1 as const;
+
+export interface HarnessDriverConfigIssue {
+  path: string;
+  code: string;
+  message: string;
+}
+
+export type HarnessDriverConfigValidation =
+  | { ok: true; config: Record<string, unknown>; issues: [] }
+  | { ok: false; config: null; issues: HarnessDriverConfigIssue[] };
+
+export interface HarnessTranscriptSnapshot {
+  schema: "paperclip-runner/harness-transcript/v1";
+  complete: boolean;
+  eventCount: number;
+  events: PrpEvent[];
+  omissionReason: string | null;
+}
+
 export interface HarnessDriverDescriptor {
   kind: string;
   displayName: string;
@@ -322,6 +342,7 @@ export interface HarnessSession {
   read?(): Promise<Record<string, unknown>>;
   reconcile?(): Promise<Record<string, unknown>>;
   usage?(): Promise<Record<string, unknown> | null>;
+  transcript?(): Promise<HarnessTranscriptSnapshot>;
   snapshot(): Promise<PersistedHarnessSession>;
   close(input: { reason: string; force?: boolean }): Promise<void>;
 }
@@ -329,6 +350,7 @@ export interface HarnessSession {
 /** A local harness implementation hidden behind the runner daemon boundary. */
 export interface HarnessDriver {
   descriptor(): Promise<HarnessDriverDescriptor>;
+  validateConfig?(config: unknown): Promise<HarnessDriverConfigValidation>;
   openSession(input: OpenHarnessSessionInput): Promise<HarnessSession>;
   recoverSession?(
     snapshot: PersistedHarnessSession,

@@ -13,6 +13,10 @@
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
     },
+    "./evals": {
+      "types": "./dist/evals/index.d.ts",
+      "import": "./dist/evals/index.js"
+    },
     "./browser": {
       "types": "./dist/browser/index.d.ts",
       "import": "./dist/browser/index.js"

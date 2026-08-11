@@ -88,6 +88,7 @@ function violationReason({ file, packageRoot, specifier }) {
     "@paperclipai/paperclip-runner/react",
     "@paperclipai/paperclip-runner/standalone",
     "@paperclipai/paperclip-runner/testing",
+    "@paperclipai/paperclip-runner/evals",
     "@paperclipai/paperclip-runner/styles.css",
   ]);
   if (

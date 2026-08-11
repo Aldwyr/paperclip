@@ -6,6 +6,26 @@ use paperclip_runner_core::durable::{
     capture_bootstrap_ticket, run_durable_runner, BootstrapTicket, DurableRunnerConfig,
 };
 use paperclip_runner_core::local_runner::{run_local_runner, LocalRunnerError, RunnerConfig};
+use serde_json::json;
+
+const RUNNERD_BUILD_METADATA_SCHEMA: &str = "paperclip-runner/runnerd-build-metadata/v1";
+
+fn build_metadata() -> serde_json::Value {
+    json!({
+        "schema": RUNNERD_BUILD_METADATA_SCHEMA,
+        "binaryName": "paperclip-runnerd",
+        "packageName": "@paperclipai/paperclip-runner",
+        "packageVersion": env!("CARGO_PKG_VERSION"),
+        "binaryContractVersion": 1,
+        "nativeExecutionVersion": 1,
+        "harnessDriverVersion": 1,
+        "prp": {
+            "name": "paperclip.runner",
+            "minimumVersion": 1,
+            "maximumVersion": 1
+        }
+    })
+}
 
 fn value(args: &[String], name: &str) -> Result<String, LocalRunnerError> {
     let index = args
@@ -162,6 +182,10 @@ fn run_durable_mode(
 
 fn run(bootstrap_ticket: Option<BootstrapTicket>) -> Result<(), LocalRunnerError> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--build-metadata"] {
+        println!("{}", build_metadata());
+        return Ok(());
+    }
     if args
         .iter()
         .any(|argument| argument == "--codex-app-server-proxy")
@@ -185,6 +209,23 @@ fn run(bootstrap_ticket: Option<BootstrapTicket>) -> Result<(), LocalRunnerError
             optional_u64(&args, "--shutdown-grace-ms")?.unwrap_or(100),
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_metadata_names_the_versioned_eval_contracts() {
+        let metadata = build_metadata();
+        assert_eq!(metadata["schema"], RUNNERD_BUILD_METADATA_SCHEMA);
+        assert_eq!(metadata["packageVersion"], "0.1.2");
+        assert_eq!(metadata["binaryContractVersion"], 1);
+        assert_eq!(metadata["nativeExecutionVersion"], 1);
+        assert_eq!(metadata["harnessDriverVersion"], 1);
+        assert_eq!(metadata["prp"]["minimumVersion"], 1);
+        assert_eq!(metadata["prp"]["maximumVersion"], 1);
+    }
 }
 
 fn main() -> ExitCode {

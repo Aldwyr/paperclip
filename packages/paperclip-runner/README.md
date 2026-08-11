@@ -17,6 +17,9 @@ imports or starts Paperclip's server, UI, CLI, or production database.
 
 - `@paperclipai/paperclip-runner` — production contracts, clients/backends,
   PRP validation/replay, canonical catalog/dispatcher, and compatibility check.
+- `@paperclipai/paperclip-runner/evals` — versioned native-attempt/build
+  metadata, explicit digest-verified runnerd artifact resolution, and complete
+  App/Evals compatibility negotiation.
 - `@paperclipai/paperclip-runner/testing` — deterministic mocks plus PRP and
   semantic conformance kits. Tests and Paperclip Evals import this explicitly.
 - `@paperclipai/paperclip-eval-kernel` — separately packed generic eval matrix
@@ -164,6 +167,7 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 - [Capability live runnerd/Codex loop](docs/capability-live-runnerd-codex.md)
 - [Capability issue-thread UI](docs/capability-issue-thread-ui.md)
 - [PRP compatibility/versioning policy](docs/protocol-compatibility.md)
+- [Paperclip Evals integration contract](docs/evals-integration.md)
 - [PRP v1 expressiveness audit](spec/prp-v1-expressiveness-audit.md)
 - [Cumulative end-to-end tutorial](docs/tutorials/end-to-end.md)
 - [OKF knowledge bundle](knowledge/)

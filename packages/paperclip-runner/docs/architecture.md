@@ -14,7 +14,7 @@
                          byte-identical Conformance result
 
 Paperclip App production binding --> implements ControlPlanePort
-Paperclip Evals --> consumes packed runtime + ./testing exports
+Paperclip Evals --> consumes packed runtime + ./evals + ./testing exports
 ```
 
 The dependency arrow always points from an implementation toward a contract.
@@ -28,6 +28,9 @@ recorded in [ADR 0001](adr/0001-runner-testing-eval-package-boundaries.md).
 
 - The package root is runtime-only: PRP, runner/client contracts, normalized
   backends, catalog/dispatcher, and compatibility preflight.
+- `./evals` is the stable integration join: native attempt schema/fixture,
+  build metadata, complete package/binary/PRP/catalog/driver negotiation, and
+  explicit digest-verified runnerd artifact resolution.
 - `./testing` contains deterministic mocks and conformance kits.
 - `@paperclipai/paperclip-eval-kernel` contains generic orchestration only and
   is permitted in App CI/tests as a development dependency, never at runtime.
@@ -66,6 +69,11 @@ The Rust `runner-core` crate establishes the production language/package
 boundary and checks the same fixture summaries. Local runner adds the package-local
 `paperclip-runnerd` and `fake-harness` binaries without changing that dependency
 direction.
+
+Evals receives runnerd as a separate content-addressed artifact. The package
+does not discover or bundle a host-specific executable: the consumer supplies
+an explicit path and digest, then reads versioned metadata from that exact
+binary. See [the Evals integration contract](evals-integration.md).
 
 ## Language ownership
 

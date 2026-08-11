@@ -7,7 +7,12 @@ export const PAPERCLIP_RUNNER_COMPATIBILITY = Object.freeze({
   components: Object.freeze({
     catalog: 1,
     protocol: 1,
+    prp: 1,
     runnerClient: 1,
+    runnerdBinary: 1,
+    harnessDriver: 1,
+    nativeExecution: 1,
+    evalIntegration: 1,
     controlPlaneAdapter: 1,
     testkit: 1,
   }),

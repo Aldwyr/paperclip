@@ -155,3 +155,22 @@ tool error is not a compatibility negotiation mechanism.
 
 See [ADR 0001](adr/0001-runner-testing-eval-package-boundaries.md) for the
 component rules and clean-consumer packaging gate.
+
+## Evals integration negotiation
+
+The packed `./evals` entry point adds a stricter execution preflight for the
+App/Evals join. `assertPaperclipRunnerEvalCompatibility` requires simultaneous
+agreement on package semver, runnerd build metadata, a common PRP version,
+semantic catalog version and SHA-256 digest, harness-driver contract and
+required capabilities, and the native-execution version. It reports
+`paperclip_runner_eval_incompatible` with expected/received values for every
+mismatch and must run before launching a provider.
+
+runnerd itself reports `paperclip-runner/runnerd-build-metadata/v1` from
+`--build-metadata`. The consumer passes its path and expected content digest to
+`resolvePaperclipRunnerdArtifact`; implicit PATH or source-tree discovery is
+not part of the contract. Native attempt output is
+`paperclip-runner/native-execution/v1`, whose parser accepts unknown additive
+fields but rejects unknown required versions and inconsistent terminal,
+semantic-denial, usage, or transcript facts. Full fields and the deterministic
+gate are documented in [the Evals integration contract](evals-integration.md).
