@@ -2,7 +2,7 @@
 type: Evidence Report
 title: Capability Live Codex Matrix
 description: Real Codex semantic-tool choices and resulting mock control-plane state.
-generated: { by: process:capability-live-eval, at: 2026-08-11T17:38:30.000Z }
+generated: { by: process:capability-live-eval, at: 2026-08-11T18:14:30.145Z }
 status: stable
 ---
 

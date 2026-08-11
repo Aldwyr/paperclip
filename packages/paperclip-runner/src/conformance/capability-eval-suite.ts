@@ -6,6 +6,7 @@ import type { CapabilityFixtureSeed, CapabilityJsonValue } from "../mock-core/ca
 import { CapabilitySemanticToolRuntime } from "../tools/capability-semantic-tool-runtime.js";
 import { CapabilityCodexToolBinding, CapabilityFakeAgentToolBinding } from "../tools/capability-tool-bindings.js";
 import { capabilityFixtureRunCapabilities } from "../scenarios/fixture-run-capabilities.js";
+import { capabilitySemanticToolDescriptor } from "../semantic-tools/catalog.js";
 import { CapabilityLiveSessionService } from "../live/live-session.js";
 
 const GENERATED_HEADER = "# GENERATED FILE — DO NOT EDIT. Run pnpm generate:capability-inventory.\n";
@@ -323,7 +324,12 @@ export async function runCapabilityLiveCodexMatrix(
       const expectedCalls = row.primaryDisposition === "control_plane_owned" ? [] : [plan.operationId];
       const liveInput = {
         ...(typeof plan.input === "object" && plan.input !== null && !Array.isArray(plan.input) ? plan.input : {}),
-        idempotencyKey: `capability-live:${row.id}`,
+        // Only mutating operations declare a retry key. Read operations close
+        // their schema with `additionalProperties: false`, so injecting one
+        // unconditionally makes the model dictate an input the tool must reject.
+        ...(operationAcceptsIdempotencyKey(plan.operationId)
+          ? { idempotencyKey: `capability-live:${row.id}` }
+          : {}),
       };
       const prompt = expectedCalls.length === 0
         ? "Do not call any tools. Reply with exactly: control-plane-owned."
@@ -337,10 +343,18 @@ export async function runCapabilityLiveCodexMatrix(
         .map((entry) => String(entry.data.operationId));
       const expectedState = operationMutatesState(plan.operationId) ? "mutated" : "unchanged";
       const observedState = snapshot.mockState === initialMockState ? "unchanged" : "mutated";
+      // A rejected call still emits a `tool_call` entry, and a rejected read
+      // leaves state `unchanged` exactly like a successful one. Comparing calls
+      // and state alone therefore reports such a case as green, so the denial
+      // itself has to be part of the gate.
+      const deniedCalls = snapshot.evidence
+        .filter((entry) => entry.kind === "tool_result" && isDeniedToolResult(entry.data.result))
+        .map((entry) => String(entry.data.operationId));
       if (
         turn.status !== "completed" ||
         JSON.stringify(observedCalls) !== JSON.stringify(expectedCalls) ||
-        observedState !== expectedState
+        observedState !== expectedState ||
+        deniedCalls.length > 0
       ) {
         throw new Error(JSON.stringify({
           caseId: row.id,
@@ -349,6 +363,7 @@ export async function runCapabilityLiveCodexMatrix(
           observedCalls,
           expectedState,
           observedState,
+          deniedCalls,
           toolResults: snapshot.evidence.filter((entry) => entry.kind === "tool_result").map((entry) => entry.data.result),
         }));
       }
@@ -418,6 +433,17 @@ function liveFixtureSeed(actorGrants: readonly string[]): CapabilityFixtureSeed 
 
 function operationMutatesState(operationId: string): boolean {
   return !["checkout_task", "search_tasks", "list_agents"].includes(operationId);
+}
+
+/** True when the operation's own schema declares the retry key. */
+function operationAcceptsIdempotencyKey(operationId: string): boolean {
+  const properties = capabilitySemanticToolDescriptor(operationId)?.inputSchema?.properties;
+  return typeof properties === "object" && properties !== null && "idempotencyKey" in properties;
+}
+
+/** A typed semantic result the dispatcher rejected rather than applied. */
+function isDeniedToolResult(result: unknown): boolean {
+  return typeof result === "object" && result !== null && (result as { ok?: unknown }).ok === false;
 }
 
 async function toolSurfaceParity(sample: Array<{ caseId: string; group: string; semanticOperation: string }>) {

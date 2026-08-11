@@ -2,7 +2,7 @@
 type: Evidence Report
 title: Live Runner Eval Slice Report
 description: Scored real-Codex capability matrix bound to its secret-free eval bundle.
-generated: { by: process:capability-live-eval, at: 2026-08-11T17:38:30.000Z }
+generated: { by: process:capability-live-eval, at: 2026-08-11T18:14:30.145Z }
 status: stable
 ---
 

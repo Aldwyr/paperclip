@@ -61,6 +61,45 @@ describe("scoreEval — green vertical slice", () => {
   });
 });
 
+describe("scoreEval — a denied call cannot score a passing outcome", () => {
+  // Regression: a rejected read operation leaves the control plane `unchanged`
+  // exactly like a successful one, so comparing final state alone scored the
+  // case 1.0 across every dimension. This masked a real live-matrix failure
+  // where `search_tasks` was rejected as `input_invalid`.
+  it("fails semantic outcome when a declared-allowed read is denied", () => {
+    const card = scoreEval(
+      greenObservation({
+        caseId: "se-get-issue-01",
+        expectedCalls: ["search_tasks"],
+        observedCalls: ["search_tasks"],
+        finalState: { expected: "unchanged", observed: "unchanged" },
+        authorization: { expected: "allowed", observed: "denied" },
+      }),
+      OPTIONS,
+    );
+    expect(card.dimensions.semantic_outcome.score).toBe(0);
+    expect(card.dimensions.semantic_outcome.reasons.join(" ")).toContain("denied");
+    expect(card.overall.passed).toBe(false);
+    // The model still chose the right tool, so trajectory stays green — the
+    // failure is the operation's effect, not the model's selection.
+    expect(card.dimensions.trajectory_restraint.score).toBe(1);
+  });
+
+  it("keeps a correctly denied case green when denial is what the case declared", () => {
+    const card = scoreEval(
+      greenObservation({
+        expectedCalls: [],
+        observedCalls: [],
+        finalState: { expected: "unchanged", observed: "unchanged" },
+        authorization: { expected: "denied", observed: "denied" },
+      }),
+      OPTIONS,
+    );
+    expect(card.dimensions.semantic_outcome.score).toBe(1);
+    expect(card.overall.passed).toBe(true);
+  });
+});
+
 describe("scoreEval — the hard-invariant gate", () => {
   it("forces overall 0 when a forbidden call is invoked, independent of outcome", () => {
     const card = scoreEval(

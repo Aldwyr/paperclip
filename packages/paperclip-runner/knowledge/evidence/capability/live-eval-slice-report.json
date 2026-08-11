@@ -68,15 +68,15 @@
         "trace": {
           "runId": "run-capability-live-ap-approval-deny-01",
           "sessionId": "session-capability-live-ap-approval-deny-01",
-          "turnId": "019ff1e7-5e9e-7353-abc9-734f85ed535b",
-          "itemId": "evidence-000022",
+          "turnId": "019ff208-7d1d-74f3-8bb2-1f2489e336d5",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 4056,
+          "latencyMs": 5762,
           "attempts": 1
         },
         "budget": {
@@ -162,15 +162,15 @@
         "trace": {
           "runId": "run-capability-live-ar-no-done-without-upload-01",
           "sessionId": "session-capability-live-ar-no-done-without-upload-01",
-          "turnId": "019ff1e7-6ffb-7123-9f0a-37ca2f894aa2",
-          "itemId": "evidence-000022",
+          "turnId": "019ff208-94a3-7be2-a152-6558026f2c81",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 3568,
+          "latencyMs": 6153,
           "attempts": 1
         },
         "budget": {
@@ -256,15 +256,15 @@
         "trace": {
           "runId": "run-capability-live-bl-cancelled-not-resolved-01",
           "sessionId": "session-capability-live-bl-cancelled-not-resolved-01",
-          "turnId": "019ff1e7-7f46-7292-b3ab-5b5d6b99e09f",
-          "itemId": "evidence-000022",
+          "turnId": "019ff208-ada0-7402-8f7c-9170569cd3c8",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 4079,
+          "latencyMs": 3412,
           "attempts": 1
         },
         "budget": {
@@ -350,15 +350,15 @@
         "trace": {
           "runId": "run-capability-live-cm-mention-structured-01",
           "sessionId": "session-capability-live-cm-mention-structured-01",
-          "turnId": "019ff1e7-909c-70e2-b9b7-8e53cd6dac67",
-          "itemId": "evidence-000021",
+          "turnId": "019ff208-bbe7-7cb0-b299-9fe09ccaf31a",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 3621,
+          "latencyMs": 3525,
           "attempts": 1
         },
         "budget": {
@@ -440,13 +440,13 @@
         "trace": {
           "runId": "run-capability-live-co-409-stop-01",
           "sessionId": "session-capability-live-co-409-stop-01",
-          "turnId": "019ff1e7-a051-7760-992c-39e9c9f2b09c",
-          "itemId": "transcript-000023",
+          "turnId": "019ff208-caa9-7573-9c98-cdfda85e0d6a",
+          "itemId": "transcript-000016",
           "receiptIds": [],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 1864,
+          "latencyMs": 4763,
           "attempts": 1
         },
         "budget": {
@@ -534,15 +534,15 @@
         "trace": {
           "runId": "run-capability-live-dp-base-revision-01",
           "sessionId": "session-capability-live-dp-base-revision-01",
-          "turnId": "019ff1e7-a905-7551-b66a-08d1fd0832fd",
-          "itemId": "evidence-000022",
+          "turnId": "019ff208-de3c-7572-8b4c-622fa11b671b",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 3685,
+          "latencyMs": 3258,
           "attempts": 1
         },
         "budget": {
@@ -624,13 +624,13 @@
         "trace": {
           "runId": "run-capability-live-er-blocked-dedup-01",
           "sessionId": "session-capability-live-er-blocked-dedup-01",
-          "turnId": "019ff1e7-b8d6-7eb2-9d4d-e98b659fdfc0",
-          "itemId": "transcript-000023",
+          "turnId": "019ff208-ebe0-74c3-8ec0-5d771d020a9c",
+          "itemId": "transcript-000016",
           "receiptIds": [],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 2033,
+          "latencyMs": 4953,
           "attempts": 1
         },
         "budget": {
@@ -714,13 +714,13 @@
         "trace": {
           "runId": "run-capability-live-hb-context-01",
           "sessionId": "session-capability-live-hb-context-01",
-          "turnId": "019ff1e7-c239-7462-8d23-dda298d0fa58",
-          "itemId": "transcript-000023",
+          "turnId": "019ff209-0043-7423-9957-be6301c6e951",
+          "itemId": "transcript-000016",
           "receiptIds": [],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 1658,
+          "latencyMs": 1660,
           "attempts": 1
         },
         "budget": {
@@ -808,15 +808,15 @@
         "trace": {
           "runId": "run-capability-live-ix-checkbox-01",
           "sessionId": "session-capability-live-ix-checkbox-01",
-          "turnId": "019ff1e7-ca3a-7ad2-9d67-35ee17cb6042",
-          "itemId": "evidence-000021",
+          "turnId": "019ff209-0839-7db2-9a98-bd9296ef4db5",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 9631,
+          "latencyMs": 8222,
           "attempts": 1
         },
         "budget": {
@@ -902,15 +902,15 @@
         "trace": {
           "runId": "run-capability-live-mh-blocked-handoff-01",
           "sessionId": "session-capability-live-mh-blocked-handoff-01",
-          "turnId": "019ff1e7-f14e-7962-91e0-60f4b2c1ee5e",
-          "itemId": "evidence-000022",
+          "turnId": "019ff209-2953-7062-a513-6e7e28b324af",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 3474,
+          "latencyMs": 3811,
           "attempts": 1
         },
         "budget": {
@@ -996,15 +996,15 @@
         "trace": {
           "runId": "run-capability-live-rf-api-404-report-01",
           "sessionId": "session-capability-live-rf-api-404-report-01",
-          "turnId": "019ff1e8-0054-7102-8629-5a629712bc29",
-          "itemId": "evidence-000023",
+          "turnId": "019ff209-393b-79c2-bb53-6be66cf76b9a",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000025"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 5691,
+          "latencyMs": 2986,
           "attempts": 1
         },
         "budget": {
@@ -1086,13 +1086,13 @@
         "trace": {
           "runId": "run-capability-live-rs-dependency-blocked-wake-01",
           "sessionId": "session-capability-live-rs-dependency-blocked-wake-01",
-          "turnId": "019ff1e8-17fc-7600-aa46-84429760dcdd",
-          "itemId": "transcript-000023",
+          "turnId": "019ff209-45de-7522-a2b0-1d92a284d0e0",
+          "itemId": "transcript-000016",
           "receiptIds": [],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 1908,
+          "latencyMs": 1895,
           "attempts": 1
         },
         "budget": {
@@ -1175,20 +1175,20 @@
         },
         "authorization": {
           "expected": "allowed",
-          "observed": "denied"
+          "observed": "allowed"
         },
         "trace": {
           "runId": "run-capability-live-se-get-issue-01",
           "sessionId": "session-capability-live-se-get-issue-01",
-          "turnId": "019ff1e8-20ea-73e2-9cc6-3e2d8f6fc948",
-          "itemId": "evidence-000024",
+          "turnId": "019ff209-51ed-70b2-95ee-bdadb2065065",
+          "itemId": "evidence-000014",
           "receiptIds": [
-            "evidence-000025"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 4504,
+          "latencyMs": 3067,
           "attempts": 1
         },
         "budget": {
@@ -1274,15 +1274,15 @@
         "trace": {
           "runId": "run-capability-live-st-backlog-park-01",
           "sessionId": "session-capability-live-st-backlog-park-01",
-          "turnId": "019ff1e8-33f6-7f93-88b9-83ad36eac2bb",
-          "itemId": "evidence-000022",
+          "turnId": "019ff209-6083-7312-bed2-2d89633f7a43",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 4513,
+          "latencyMs": 3508,
           "attempts": 1
         },
         "budget": {
@@ -1368,15 +1368,15 @@
         "trace": {
           "runId": "run-capability-live-su-crossteam-billing-01",
           "sessionId": "session-capability-live-su-crossteam-billing-01",
-          "turnId": "019ff1e8-470b-7550-a6b6-8c0c842eb948",
-          "itemId": "evidence-000022",
+          "turnId": "019ff209-6f30-7003-8833-a84e62737f6b",
+          "itemId": "evidence-000015",
           "receiptIds": [
-            "evidence-000023"
+            "evidence-000016"
           ],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 6353,
+          "latencyMs": 4524,
           "attempts": 1
         },
         "budget": {
@@ -1458,13 +1458,13 @@
         "trace": {
           "runId": "run-capability-live-wk-ask-mode-01",
           "sessionId": "session-capability-live-wk-ask-mode-01",
-          "turnId": "019ff1e8-617d-7ba3-8c12-84e6c5d011d0",
-          "itemId": "transcript-000023",
+          "turnId": "019ff209-81ce-71a3-973c-5afea691f385",
+          "itemId": "transcript-000016",
           "receiptIds": [],
           "terminalPresent": true
         },
         "efficiency": {
-          "latencyMs": 1731,
+          "latencyMs": 1498,
           "attempts": 1
         },
         "budget": {

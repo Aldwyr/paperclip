@@ -417,7 +417,8 @@
             "gate": false,
             "weight": 0.35,
             "reasons": [
-              "control-plane state unchanged, expected mutated"
+              "control-plane state unchanged, expected mutated",
+              "operation denied but the case declared it allowed"
             ]
           },
           "trajectory_restraint": {

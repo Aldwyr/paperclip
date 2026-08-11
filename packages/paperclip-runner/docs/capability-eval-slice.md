@@ -36,7 +36,10 @@ separately scored 0..1 value per dimension:
   that should have been denied. A gate failure forces the overall score to 0
   regardless of the other dimensions.
 - **`semantic_outcome`** — the resulting control-plane state matches expectation
-  (mutated vs unchanged).
+  (mutated vs unchanged) *and* a call the case declared allowed was not rejected.
+  Both halves are required: a rejected read leaves the control plane `unchanged`
+  exactly like a successful one, so the state comparison alone would score a
+  failed call as a pass by coincidence.
 - **`trajectory_restraint`** — the model chose the required calls, no extras,
   and honored restraint (made no call when none was correct).
 - **`trace_completeness`** — the run emitted a complete causal trace (run,
@@ -65,6 +68,15 @@ report.
 dimensions. Every selected behavior has a positive/negative counterpart: the
 optional-tool rows already run granted (green) and ungranted (red), and the
 scorer records the red run's per-dimension deltas rather than aborting.
+
+The matrix prompt dictates the exact JSON input for the operation under test, so
+that input must satisfy the operation's own schema. Only mutating operations
+declare `idempotencyKey`; read operations close their schema with
+`additionalProperties: false`. Injecting a retry key unconditionally therefore
+made the model dictate an input the tool had to reject — the call was recorded,
+state stayed `unchanged` as expected, and the case scored a false green. The
+matrix now derives the key from the catalog descriptor and fails any case whose
+typed result came back `ok: false`, so a rejected call can never read as green.
 
 ## Behavior and fault execution
 
