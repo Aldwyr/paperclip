@@ -252,6 +252,10 @@ export {
   type HumanizableConnection,
 } from "./humanize-connection.js";
 export {
+  MCP_CONFIG_HELP_INSTRUCTIONS,
+  MCP_CONFIG_HELP_PROMPT,
+} from "./mcp-config-help-prompt.js";
+export {
   MCP_REMOTE_HEADER_LIMITS,
   checkMcpRemoteHeaderName,
   checkMcpRemoteHeaderValue,

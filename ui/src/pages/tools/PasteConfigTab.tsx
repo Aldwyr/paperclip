@@ -13,6 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { toolsApi } from "@/api/tools";
+import { McpConfigHelpDialog } from "./McpConfigHelpDialog";
 import { ErrorState } from "./shared";
 
 const SAMPLE_CONFIG = `{
@@ -159,9 +160,12 @@ export function PasteConfigTab({ companyId }: { companyId: string }) {
 
   return (
     <div className="space-y-5">
-      <p className="max-w-2xl text-sm text-muted-foreground">
-        Paste the MCP config snippet from the tool's README and we'll turn it into a friendly setup.
-      </p>
+      <div className="flex max-w-2xl items-start gap-1.5">
+        <p className="text-sm text-muted-foreground">
+          Paste the MCP config snippet from the tool's README and we'll turn it into a friendly setup.
+        </p>
+        <McpConfigHelpDialog />
+      </div>
       <p className="text-xs text-muted-foreground">
         Just a URL?{" "}
         <Link to="/apps" className="text-primary hover:underline">

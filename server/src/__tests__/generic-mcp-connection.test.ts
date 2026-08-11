@@ -26,6 +26,7 @@ import {
   toolRuntimeSlots,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import { MCP_CONFIG_HELP_PROMPT } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -771,6 +772,32 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const auditEvents = await db.select().from(toolAccessAuditEvents)
       .where(eq(toolAccessAuditEvents.companyId, company.id));
     expect(auditEvents.length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The help prompt tells an agent exactly what JSON shape to return. Prove that
+   * shape survives the real preview parser, using the example lifted out of the
+   * prompt itself rather than a hand-copied duplicate — otherwise the prompt and
+   * the parser can drift and only an operator would find out.
+   */
+  it("parses the JSON shape the help prompt asks an agent for", async () => {
+    const service = toolAccessService(db);
+    const jsonBlock = MCP_CONFIG_HELP_PROMPT.slice(
+      MCP_CONFIG_HELP_PROMPT.indexOf("{"),
+      MCP_CONFIG_HELP_PROMPT.lastIndexOf("}") + 1,
+    );
+    // Sanity-check the extraction before relying on it.
+    expect(() => JSON.parse(jsonBlock)).not.toThrow();
+
+    const preview = await service.previewMcpJsonImport({ mcpJson: jsonBlock });
+
+    expect(preview.drafts).toHaveLength(1);
+    expect(preview.drafts[0]).toMatchObject({ transport: "mcp_remote" });
+    expect(preview.drafts[0]!.config).toMatchObject({ url: "https://mcp.example.com/mcp" });
+    // The placeholder header name comes through as a field to ask the operator
+    // for, which is exactly what the prompt promises will happen.
+    expect(preview.drafts[0]!.credentialFields.map((field) => field.configPath))
+      .toContain("headers.Authorization");
   });
 
   it("serves a client metadata document with no company or secret data", async () => {
