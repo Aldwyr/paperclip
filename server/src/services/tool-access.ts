@@ -130,7 +130,11 @@ import { guardedRemoteHttpFetch, type GuardedRemoteHttpFetchOptions } from "./re
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
-import { narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
+import {
+  effectiveToolProfileBindings,
+  narrowestScopeBindings,
+  profileIdsInBindingOrder,
+} from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure, TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC } from "./tool-runtime-metrics.js";
 import { createToolRuntimeSupervisor, ToolRuntimeSupervisorError } from "./tool-runtime-supervisor.js";
 
@@ -2875,7 +2879,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   }
 
   async function appProfileForConnection(
-    dbClient: Pick<Db, "select" | "insert">,
+    dbClient: Pick<Db, "select" | "insert" | "delete">,
     connection: typeof toolConnections.$inferSelect,
   ) {
     const profileKey = `app:${connection.id}`;
@@ -2895,26 +2899,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         metadata: { source: "tool_connection_install", connectionId: connection.id },
       }).returning();
     }
-    const [existingEntry] = await dbClient
-      .select({ id: toolProfileEntries.id })
-      .from(toolProfileEntries)
+    // Installation controls where a connection is exposed, not which actions
+    // it grants. The app wizard's catalog-entry includes are the authority for
+    // action selection, so remove the legacy connection-wide include that used
+    // to silently turn every installed action on.
+    await dbClient
+      .delete(toolProfileEntries)
       .where(and(
         eq(toolProfileEntries.companyId, connection.companyId),
         eq(toolProfileEntries.profileId, profile.id),
         eq(toolProfileEntries.selectorType, "connection"),
+        eq(toolProfileEntries.effect, "include"),
         eq(toolProfileEntries.connectionId, connection.id),
-      ))
-      .limit(1);
-    if (!existingEntry) {
-      await dbClient.insert(toolProfileEntries).values({
-        companyId: connection.companyId,
-        profileId: profile.id,
-        selectorType: "connection",
-        effect: "include",
-        applicationId: connection.applicationId,
-        connectionId: connection.id,
-      });
-    }
+      ));
     return profile;
   }
 
@@ -8260,11 +8257,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .from(toolProfileBindings)
         .where(eq(toolProfileBindings.companyId, companyId))
         .orderBy(asc(toolProfileBindings.priority), asc(toolProfileBindings.createdAt));
-      const bindings = narrowestScopeBindings(allBindings.filter((binding) =>
+      const matchingBindings = allBindings.filter((binding) =>
         (binding.targetType === "company" && binding.targetId === companyId)
         || (binding.targetType === "agent" && binding.targetId === agentId)
-      ));
-      if (bindings.length === 0) {
+      );
+      if (matchingBindings.length === 0) {
         return {
           agentId,
           profiles: [],
@@ -8275,12 +8272,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           installedConnections: await resolveInstalledConnectionsForAgent(companyId, agentId),
         };
       }
-      const profileIds = profileIdsInBindingOrder(bindings);
-      const profiles = await db
+      const candidateProfileIds = profileIdsInBindingOrder(matchingBindings);
+      const candidateProfiles = await db
         .select()
         .from(toolProfiles)
-        .where(and(eq(toolProfiles.companyId, companyId), inArray(toolProfiles.id, profileIds)));
-      const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+        .where(and(eq(toolProfiles.companyId, companyId), inArray(toolProfiles.id, candidateProfileIds)));
+      const bindings = effectiveToolProfileBindings(matchingBindings, candidateProfiles);
+      const profileIds = profileIdsInBindingOrder(bindings);
+      const profilesById = new Map(candidateProfiles.map((profile) => [profile.id, profile]));
       const activeProfiles = profileIds
         .map((profileId) => profilesById.get(profileId) ?? null)
         .filter((profile): profile is typeof toolProfiles.$inferSelect => Boolean(profile && profile.status === "active"));

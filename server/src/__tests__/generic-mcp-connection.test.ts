@@ -1270,15 +1270,26 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
     const policy = toolAccessPolicyService(db);
-    const [agent] = await db.insert(agents).values({
-      companyId: company.id,
-      name: `Generic MCP agent ${randomUUID()}`,
-      role: "engineer",
-      status: "active",
-      adapterType: "process",
-      adapterConfig: {},
-      runtimeConfig: {},
-    }).returning();
+    const [agent, outsideAgent] = await db.insert(agents).values([
+      {
+        companyId: company.id,
+        name: `Generic MCP agent ${randomUUID()}`,
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+      {
+        companyId: company.id,
+        name: `Outside MCP agent ${randomUUID()}`,
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+    ]).returning();
 
     const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture governance" });
     const readEntry = connected.catalog.find((entry) => entry.toolName === "list_insights")!;
@@ -1297,9 +1308,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       expect.objectContaining({ targetType: "agent", targetId: agent!.id }),
     ]);
 
-    const decisionInput = (catalogEntryId: string, toolName: string) => ({
+    const decisionInput = (catalogEntryId: string, toolName: string, agentId = agent!.id) => ({
       companyId: company.id,
-      actor: { actorType: "agent" as const, actorId: agent!.id, agentId: agent!.id },
+      actor: { actorType: "agent" as const, actorId: agentId, agentId },
       request: { connectionId: connected.connectionId, catalogEntryId, toolName },
     });
 
@@ -1310,6 +1321,19 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
       .resolves.toMatchObject({ allowed: true, reasonCode: "allow_profile" });
     await expect(policy.decide(decisionInput(writeEntry.id, "create_insight")))
       .resolves.toMatchObject({ allowed: false, reasonCode: "deny_default" });
+    await expect(policy.decide(decisionInput(readEntry.id, "list_insights", outsideAgent!.id)))
+      .resolves.toMatchObject({ allowed: false, reasonCode: "deny_default" });
+
+    // Simulate a profile written by the legacy install path. Saving installs
+    // must self-heal this over-broad entry as well as avoiding it for new apps.
+    await db.insert(toolProfileEntries).values({
+      companyId: company.id,
+      profileId: finished.profile.id,
+      selectorType: "connection",
+      effect: "include",
+      applicationId: connected.connection.applicationId,
+      connectionId: connected.connectionId,
+    });
 
     // Installation targets the chosen agent, same as a curated connection.
     await service.putConnectionInstalls(connected.connectionId, {
@@ -1318,6 +1342,19 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     const installs = await db.select().from(toolConnectionInstalls)
       .where(eq(toolConnectionInstalls.connectionId, connected.connectionId));
     expect(installs).toEqual([expect.objectContaining({ targetType: "agent", targetId: agent!.id })]);
+    const installedProfileEntries = await db.select().from(toolProfileEntries)
+      .where(eq(toolProfileEntries.profileId, finished.profile.id));
+    expect(installedProfileEntries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        selectorType: "connection",
+        connectionId: connected.connectionId,
+        effect: "include",
+      }),
+    ]));
+    await expect(policy.decide(decisionInput(readEntry.id, "list_insights")))
+      .resolves.toMatchObject({ allowed: true, reasonCode: "allow_profile" });
+    await expect(policy.decide(decisionInput(writeEntry.id, "create_insight")))
+      .resolves.toMatchObject({ allowed: false, reasonCode: "deny_default" });
 
     // Revoke: archiving the connection removes access but keeps the trail.
     await service.archiveConnection(connected.connectionId, company.id);

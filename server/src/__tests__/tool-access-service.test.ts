@@ -5384,6 +5384,20 @@ describeEmbeddedPostgres("tool access service", () => {
       expect.objectContaining({ id: duplicateEntry.id, riskLevel: "write", isWrite: true }),
     ]));
 
+    // A narrower profile must not make an app shared with "All agents"
+    // disappear. App action selection is an additive capability assignment;
+    // ordinary profile precedence still governs non-app defaults.
+    const existingAgentProfile = await service.createProfile(company.id, {
+      profileKey: `existing-agent-profile-${randomUUID()}`,
+      name: "Existing agent defaults",
+      defaultAction: "deny",
+    });
+    await service.bindProfile(
+      existingAgentProfile.id,
+      { targetType: "agent", targetId: agent.id },
+      { actorType: "user", actorId: "board" },
+    );
+
     await expect(service.finishGalleryAppConnection(otherCompany.id, connection.id, {
       enabledCatalogEntryIds: [fetchEntry.id],
       askFirstCatalogEntryIds: [],
@@ -7040,11 +7054,14 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(unusedRow!.lastUsedAt).toBeNull();
   });
 
-  it("syncs installs, auto-extends agent access, and exposes install state", async () => {
+  it("syncs installs without widening action access or calling the remote tool", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { connection } = await createRemoteToolFixture(db, company.id);
-    const app = createRouteApp(db);
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const app = createRouteApp(db, undefined, createToolGatewayService(db, {
+      toolActionSigningSecret: "test-secret",
+    }));
 
     const put = await request(app)
       .put(`/api/tool-connections/${connection.id}/installs`)
@@ -7071,7 +7088,17 @@ describeEmbeddedPostgres("tool access service", () => {
 
     const effective = await toolAccessService(db).getEffectiveProfilesForAgent(company.id, agent.id);
     expect(effective.installedConnections.map((item) => item.id)).toEqual([connection.id]);
-    expect(effective.allowedTools.some((tool) => tool.connectionId === connection.id)).toBe(true);
+    expect(effective.allowedTools.some((tool) => tool.connectionId === connection.id)).toBe(false);
+
+    const deniedCall = await request(app)
+      .post(`/api/tool-connections/${connection.id}/test-calls`)
+      .send({ agentId: agent.id, toolName: "send_email", parameters: { to: "a@example.com" } })
+      .expect(200);
+    expect(deniedCall.body).toMatchObject({
+      decision: "off",
+      error: { reasonCode: "deny_default" },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
 
     const get = await request(app).get(`/api/tool-connections/${connection.id}`);
     expect(get.status).toBe(200);
