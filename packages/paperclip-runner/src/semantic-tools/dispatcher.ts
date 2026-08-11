@@ -52,6 +52,7 @@ class SemanticDispatchFailure extends Error {
     readonly code: CapabilitySemanticDenialCode,
     message: string,
     readonly retryable = false,
+    readonly controlPlaneCode?: string,
   ) {
     super(message);
     this.name = "SemanticDispatchFailure";
@@ -158,6 +159,7 @@ export class CapabilitySemanticDispatcher {
         failure.code,
         failure.message,
         failure.retryable,
+        failure.controlPlaneCode,
       );
       this.#record(policyContext, decision, call.callId, call.input, result);
       return result;
@@ -427,6 +429,7 @@ export class CapabilitySemanticDispatcher {
     code: Exclude<CapabilitySemanticAuthorizationDecision["code"], "allowed">,
     message: string,
     retryable = false,
+    controlPlaneCode?: string,
   ): CapabilitySemanticToolResult {
     return deepFreeze({
       ok: false,
@@ -435,6 +438,7 @@ export class CapabilitySemanticDispatcher {
       denial: {
         schema: "paperclip.semantic-denial.v1",
         code,
+        ...(controlPlaneCode === undefined ? {} : { controlPlaneCode }),
         message: redactSemanticValue(message) as string,
         retryable,
       },
@@ -449,6 +453,7 @@ function commandOutcome(outcome: CapabilityCommandOutcome): OperationSuccess {
       "control_plane_denied",
       outcome.error.message,
       outcome.error.retryable,
+      outcome.error.code,
     );
   }
   return { result: outcome.result as unknown as CapabilityJsonValue, stateRevision: outcome.result.stateRevision };

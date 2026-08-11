@@ -265,6 +265,8 @@ export interface CapabilityFixtureState {
   company: CapabilityFixtureCompany;
   actors: CapabilityFixtureActor[];
   tasks: CapabilityFixtureTask[];
+  /** Known task ids outside the fixture company, without leaking foreign data. */
+  outOfScopeTaskIds: string[];
   comments: CapabilityFixtureComment[];
   documents: CapabilityFixtureDocument[];
   interactions: CapabilityFixtureInteraction[];
@@ -458,6 +460,7 @@ export interface CapabilityFixtureSeed {
   company?: Partial<CapabilityFixtureCompany>;
   actors?: CapabilityFixtureActor[];
   tasks?: CapabilityFixtureTask[];
+  outOfScopeTaskIds?: string[];
   comments?: CapabilityFixtureComment[];
   documents?: CapabilityFixtureDocument[];
   interactions?: CapabilityFixtureInteraction[];
@@ -536,6 +539,7 @@ export function createCapabilityFixtureState(seed: CapabilityFixtureSeed = {}): 
     company,
     actors: structuredClone(actors),
     tasks: structuredClone(tasks),
+    outOfScopeTaskIds: structuredClone(seed.outOfScopeTaskIds ?? []),
     comments: structuredClone(seed.comments ?? []),
     documents: structuredClone(seed.documents ?? []),
     interactions: structuredClone(seed.interactions ?? []),

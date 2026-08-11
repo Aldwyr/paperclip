@@ -25,6 +25,14 @@ imports or starts Paperclip's server, UI, CLI, or production database.
 The package root has no mock or scenario exports, and no Paperclip Evals runtime
 dependency. See [ADR 0001](docs/adr/0001-runner-testing-eval-package-boundaries.md).
 
+The two conformance surfaces intentionally prove different contracts. The
+existing `runControlPlanePortConformance` suite checks narrow PRP run/event
+persistence. `CAPABILITY_HIGH_RISK_SEMANTIC_VECTORS` and
+`runSemanticConformanceKit` compare normalized tool authorization, state,
+effects, audit, retries, conflicts, redaction, continuation, and terminal
+decisions. The production adapter stays App-owned and invokes Paperclip's real
+route/service authorities; it does not copy those rules into this package.
+
 ## Quick start
 
 From the repository root:
@@ -162,7 +170,8 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 
 Codex adds the package-local real-model reference driver, Live console adds the
 package-local browser console, and SDK extracts a reusable public SDK plus
-two standalone consumers. Production Paperclip integration remains deferred.
+two standalone consumers. Runtime production Paperclip integration remains
+deferred; the App-owned production conformance adapter is test-only.
 
 The SDK reference console opens in direct chat mode. Enter a normal prompt,
 then open the protocol inspector to review events and reducer state. Expand a

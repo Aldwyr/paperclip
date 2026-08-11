@@ -61,6 +61,8 @@ export class CapabilityMockControlPlaneAdapter implements CapabilityMockControlP
     this.#state = isFixtureState(seed)
       ? clone(seed)
       : createCapabilityFixtureState(seed);
+    // Serialized v1 fixtures from before company-scope sentinels remain valid.
+    this.#state.outOfScopeTaskIds ??= [];
     this.#validateState();
   }
 
@@ -863,12 +865,6 @@ export class CapabilityMockControlPlaneAdapter implements CapabilityMockControlP
       }
       case "finish_task": {
         requireText(command.summary, "completion summary");
-        if (this.#state.blockers.some((blocker) => blocker.taskId === task.id)) {
-          throw new CapabilityMockControlPlaneError(
-            "task_has_blockers",
-            "a fixture task with unresolved blockers cannot be finished",
-          );
-        }
         this.#transitionTask(run, task, "done", command.kind);
         task.completedAt = this.#now();
         const comment = this.#appendComment(task.id, run.actorId, command.summary);
@@ -1388,6 +1384,12 @@ export class CapabilityMockControlPlaneAdapter implements CapabilityMockControlP
   #task(id: string): CapabilityFixtureTask {
     const task = this.#state.tasks.find((candidate) => candidate.id === id);
     if (task === undefined) {
+      if (this.#state.outOfScopeTaskIds.includes(id)) {
+        throw new CapabilityMockControlPlaneError(
+          "company_scope_violation",
+          "fixture entity is outside the run company",
+        );
+      }
       throw new CapabilityMockControlPlaneError("task_missing", `fixture task ${id} not found`);
     }
     return task;

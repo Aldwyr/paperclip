@@ -8,6 +8,7 @@
 export * from "./index.js";
 export * from "./conformance/control-plane-port.js";
 export * from "./conformance/semantic-conformance.js";
+export * from "./conformance/capability-semantic-conformance.js";
 export * from "./mock-core/mock-control-plane-adapter.js";
 export * from "./mock-core/capability-control-plane-types.js";
 export * from "./mock-core/capability-mock-control-plane-adapter.js";

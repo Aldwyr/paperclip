@@ -171,6 +171,8 @@ export interface CapabilitySemanticToolDenial {
   readonly denial: {
     readonly schema: "paperclip.semantic-denial.v1";
     readonly code: CapabilitySemanticDenialCode;
+    /** Stable authority error code when the semantic boundary was allowed. */
+    readonly controlPlaneCode?: string;
     readonly message: string;
     readonly retryable: boolean;
   };
