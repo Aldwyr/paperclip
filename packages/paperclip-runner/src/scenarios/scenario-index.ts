@@ -110,7 +110,7 @@ const FIXTURE_PROFILES: Record<string, Partial<CapabilityScenarioProfile>> = {
   "skill-test-task": {
     seed: "skill_test",
     taskMode: "skill_test",
-    claims: ["test:generic_api"],
+    claims: ["test:generic_api_request"],
     policy: {
       allowGenericEscapeHatch: true,
       genericEscapeHatchAllowlist: [{ method: "GET", path: "/api/issues/*" }],

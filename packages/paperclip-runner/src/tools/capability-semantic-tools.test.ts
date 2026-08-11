@@ -451,12 +451,12 @@ describe("Capability security policy", () => {
   });
 
   it("keeps the generic escape hatch test-only, explicitly granted, and allowlisted", async () => {
-    const denied = await runtimeFor({ workMode: "skill_test", scenarioGrants: ["test:generic_api"] });
+    const denied = await runtimeFor({ workMode: "skill_test", scenarioGrants: ["test:generic_api_request"] });
     expect(denied.runtime.visibleTools().tools.map((tool) => tool.operationId)).not.toContain("generic_api_request");
 
     const { runtime } = await runtimeFor({
       workMode: "skill_test",
-      scenarioGrants: ["test:generic_api"],
+      scenarioGrants: ["test:generic_api_request"],
       policy: {
         allowGenericEscapeHatch: true,
         genericEscapeHatchAllowlist: [{ method: "GET", path: "/mock/health" }],

@@ -500,7 +500,7 @@ function derivedWorkSteps(
   const marker = `Capability scenario ${entry.id}`;
   // Skill-test scenarios are the only place the generic escape hatch exists;
   // exercising it here is what makes the test-only warning visible in the UI.
-  const escapeHatch: CapabilityPlanStep[] = entry.scenarioClaims.includes("test:generic_api")
+  const escapeHatch: CapabilityPlanStep[] = entry.scenarioClaims.includes("test:generic_api_request")
     ? [
         read(
           "generic_api_request",

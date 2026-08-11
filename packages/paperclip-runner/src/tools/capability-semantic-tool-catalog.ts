@@ -1,13 +1,24 @@
+import {
+  capabilityCanonicalOperationsForSurface,
+  type CapabilityCanonicalOperation,
+} from "../catalog/canonical-operations.js";
 import type {
   CapabilityJsonSchema,
+  CapabilityMockCommandMapping,
   CapabilityOptionalCatalogGroup,
+  CapabilityRedactionRule,
   CapabilitySemanticToolDescriptor,
-  CapabilityToolTaskMode,
 } from "./capability-semantic-tool-types.js";
 
-const ALL_MODES: CapabilityToolTaskMode[] = ["standard", "ask", "planning", "skill_test"];
-const WORK_MODES: CapabilityToolTaskMode[] = ["standard", "planning", "skill_test"];
-const STANDARD_MODES: CapabilityToolTaskMode[] = ["standard", "skill_test"];
+// ---------------------------------------------------------------------------
+// This catalog no longer declares an independent operation list. Placement,
+// required claims, task modes, allowed roles, side-effect class, idempotency,
+// and optional-group membership are single-sourced from
+// `src/catalog/canonical-operations.ts` (PAP-17039). This module supplies only
+// the scenario-surface *presentation*: title, description, input schema, the
+// abstract mock-command mapping, and any redaction rules.
+// ---------------------------------------------------------------------------
+
 const RESULT_SCHEMA = objectSchema({
   schema: stringSchema({ enum: ["paperclip.capability.tool-result.v1"] }),
   ok: { type: "boolean" },
@@ -17,23 +28,23 @@ const RESULT_SCHEMA = objectSchema({
   commandResult: {},
   authorization: {},
 }, ["schema", "ok", "operationId", "operationResultId", "value", "commandResult", "authorization"]);
-const SECRET_REDACTION = [
+const SECRET_REDACTION: CapabilityRedactionRule[] = [
   {
     path: "$.value",
-    replacement: "[SECRET_VALUE]" as const,
-    appliesTo: ["output", "error", "authorization_record"] as const,
+    replacement: "[SECRET_VALUE]",
+    appliesTo: ["output", "error", "authorization_record"],
   },
 ];
-const AUTH_REDACTION = [
+const AUTH_REDACTION: CapabilityRedactionRule[] = [
   {
     path: "$.headers.authorization",
-    replacement: "[REDACTED]" as const,
-    appliesTo: ["input", "output", "error", "authorization_record"] as const,
+    replacement: "[REDACTED]",
+    appliesTo: ["input", "output", "error", "authorization_record"],
   },
   {
     path: "$.headers.cookie",
-    replacement: "[REDACTED]" as const,
-    appliesTo: ["input", "output", "error", "authorization_record"] as const,
+    replacement: "[REDACTED]",
+    appliesTo: ["input", "output", "error", "authorization_record"],
   },
 ];
 
@@ -52,161 +63,83 @@ function objectSchema(
   return { type: "object", properties, required, additionalProperties: false };
 }
 
-function descriptor(
-  value: Omit<CapabilitySemanticToolDescriptor, "version" | "redaction"> & {
-    redaction?: CapabilitySemanticToolDescriptor["redaction"];
-  },
-): CapabilitySemanticToolDescriptor {
-  const { redaction, ...rest } = value;
-  return { version: 1, ...rest, redaction: redaction ?? [] };
+/** Per-operation scenario presentation, keyed by canonical operation id. */
+interface ScenarioPresentation {
+  /** Bespoke title; optional tools default to a title derived from the id. */
+  readonly title?: string;
+  /** Bespoke description; optional tools default to a group-scoped sentence. */
+  readonly description?: string;
+  readonly inputSchema: CapabilityJsonSchema;
+  readonly mockCommandMapping: CapabilityMockCommandMapping;
+  readonly redaction?: CapabilityRedactionRule[];
 }
 
-const ALWAYS_TOOLS: CapabilitySemanticToolDescriptor[] = [
-  descriptor({
-    operationId: "get_task_context",
+const PRESENTATION: Readonly<Record<string, ScenarioPresentation>> = {
+  // --- always tools (bespoke titles/descriptions) ---
+  get_task_context: {
     title: "Get task context",
     description: "Read the active task, ancestors, wake context, linked results, and budget summary.",
     inputSchema: objectSchema({}),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "context_read", projection: "active_task" },
-  }),
-  descriptor({
-    operationId: "get_task_history",
+  },
+  get_task_history: {
     title: "Get task history",
     description: "Read comments and audit-visible history for the active task only.",
     inputSchema: objectSchema({ limit: { type: "integer", minimum: 1 } }),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "snapshot_read", projection: "active_task_history" },
-  }),
-  descriptor({
-    operationId: "list_documents",
+  },
+  list_documents: {
     title: "List task documents",
     description: "List document metadata attached to the active task.",
     inputSchema: objectSchema({}),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "snapshot_read", projection: "active_task_documents" },
-  }),
-  descriptor({
-    operationId: "read_document",
+  },
+  read_document: {
     title: "Read task document",
     description: "Read one document on the active task by stable key.",
     inputSchema: objectSchema({ key: stringSchema({ minLength: 1 }) }, ["key"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "snapshot_read", projection: "active_task_document" },
-  }),
-  descriptor({
-    operationId: "list_document_revisions",
+  },
+  list_document_revisions: {
     title: "List document revisions",
     description: "Inspect revision history for one active-task document.",
     inputSchema: objectSchema({ key: stringSchema({ minLength: 1 }) }, ["key"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "snapshot_read", projection: "active_task_document_revisions" },
-  }),
-  descriptor({
-    operationId: "report_progress",
+  },
+  report_progress: {
     title: "Report progress",
     description: "Append a durable progress update to the active task.",
     inputSchema: objectSchema({ body: stringSchema({ minLength: 1 }) }, ["body"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: WORK_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "report_progress" },
-  }),
-  descriptor({
-    operationId: "answer_status_question",
+  },
+  answer_status_question: {
     title: "Answer status question",
     description: "Post an answer to a status question without changing task state.",
     inputSchema: objectSchema({ body: stringSchema({ minLength: 1 }) }, ["body"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "report_progress" },
-  }),
-  descriptor({
-    operationId: "finish_task",
+  },
+  finish_task: {
     title: "Finish task",
     description: "Finish the active task with a durable completion summary.",
     inputSchema: objectSchema({ summary: stringSchema({ minLength: 1 }) }, ["summary"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: STANDARD_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "finish_task" },
-  }),
-  descriptor({
-    operationId: "block_task",
+  },
+  block_task: {
     title: "Block task",
     description: "Block the active task with a reason and optional first-class dependencies.",
     inputSchema: objectSchema({
       reason: stringSchema({ minLength: 1 }),
       blockedByTaskIds: arraySchema(stringSchema({ minLength: 1 })),
     }, ["reason"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: WORK_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "block_task" },
-  }),
-  descriptor({
-    operationId: "request_review",
+  },
+  request_review: {
     title: "Request task review",
     description: "Move the active task to review with a durable summary.",
     inputSchema: objectSchema({ summary: stringSchema({ minLength: 1 }) }, ["summary"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: WORK_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "request_review" },
-  }),
-  descriptor({
-    operationId: "write_document",
+  },
+  write_document: {
     title: "Write task document",
     description: "Create or revision-safely update an active-task document.",
     inputSchema: objectSchema({
@@ -216,17 +149,9 @@ const ALWAYS_TOOLS: CapabilitySemanticToolDescriptor[] = [
       baseRevisionId: { oneOf: [stringSchema({ minLength: 1 }), { type: "null" }] },
       changeSummary: stringSchema(),
     }, ["key", "title", "body", "baseRevisionId"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: WORK_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "write_document" },
-  }),
-  descriptor({
-    operationId: "request_human_input",
+  },
+  request_human_input: {
     title: "Request human input",
     description: "Create a typed confirmation, checkbox, question, task suggestion, or item-verdict request.",
     inputSchema: objectSchema({
@@ -237,17 +162,9 @@ const ALWAYS_TOOLS: CapabilitySemanticToolDescriptor[] = [
       targetRevisionId: { oneOf: [stringSchema({ minLength: 1 }), { type: "null" }] },
       continuationPolicy: stringSchema({ enum: ["none", "wake_assignee", "wake_assignee_on_accept"] }),
     }, ["interactionKind", "title", "prompt", "continuationPolicy"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: WORK_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "request_human_input" },
-  }),
-  descriptor({
-    operationId: "register_deliverable",
+  },
+  register_deliverable: {
     title: "Register deliverable",
     description: "Register an inspectable artifact and its work product on the active task.",
     inputSchema: objectSchema({
@@ -258,96 +175,186 @@ const ALWAYS_TOOLS: CapabilitySemanticToolDescriptor[] = [
       contentRef: stringSchema({ minLength: 1 }),
       title: stringSchema({ minLength: 1 }),
     }, ["filename", "contentType", "byteSize", "sha256", "contentRef", "title"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: STANDARD_MODES,
-    sideEffectClass: "task_write",
-    idempotency: "required",
     mockCommandMapping: { kind: "semantic_command", commandKind: "register_deliverable" },
-  }),
-  descriptor({
-    operationId: "inspect_operation_result",
+  },
+  inspect_operation_result: {
     title: "Inspect operation result",
     description: "Read a prior semantic operation result from this run.",
     inputSchema: objectSchema({ operationResultId: stringSchema({ minLength: 1 }) }, ["operationResultId"]),
-    outputSchema: RESULT_SCHEMA,
-    disposition: "always_agent_tool",
-    optionalGroup: null,
-    requiredClaims: [],
-    taskModes: ALL_MODES,
-    sideEffectClass: "read",
-    idempotency: "none",
     mockCommandMapping: { kind: "operation_result" },
-  }),
-];
+  },
 
-function optional(
-  operationId: string,
-  group: CapabilityOptionalCatalogGroup,
-  requiredClaims: string[],
-  sideEffectClass: CapabilitySemanticToolDescriptor["sideEffectClass"],
-  mapping: CapabilitySemanticToolDescriptor["mockCommandMapping"],
-  inputSchema: CapabilityJsonSchema = objectSchema({}),
-  options: Partial<Pick<CapabilitySemanticToolDescriptor, "allowedRoles" | "redaction" | "taskModes" | "idempotency">> = {},
-): CapabilitySemanticToolDescriptor {
-  const title = operationId.split("_").map((part) => part[0]!.toUpperCase() + part.slice(1)).join(" ");
-  return descriptor({
-    operationId,
+  // --- optional tools (title/description derived from id + group) ---
+  search_tasks: {
+    inputSchema: objectSchema({ query: stringSchema(), status: stringSchema() }),
+    mockCommandMapping: { kind: "snapshot_read", projection: "company_tasks" },
+  },
+  list_agents: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "snapshot_read", projection: "company_actors" },
+  },
+  list_projects: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "discovery.projects" },
+  },
+  list_goals: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "discovery.goals" },
+  },
+  create_task: {
+    inputSchema: objectSchema({
+      title: stringSchema({ minLength: 1 }),
+      description: stringSchema(),
+      assigneeActorId: stringSchema(),
+      priority: stringSchema(),
+      blockedByTaskIds: arraySchema(stringSchema()),
+    }, ["title"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "create_task" },
+  },
+  set_dependencies: {
+    inputSchema: objectSchema({ blockedByTaskIds: arraySchema(stringSchema({ minLength: 1 })) }, ["blockedByTaskIds"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "set_dependencies" },
+  },
+  list_approvals: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "snapshot_read", projection: "company_approvals" },
+  },
+  request_approval: {
+    inputSchema: objectSchema({ approvalType: stringSchema({ minLength: 1 }), payload: {} }, ["approvalType", "payload"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "request_approval" },
+  },
+  decide_approval: {
+    inputSchema: objectSchema({
+      approvalId: stringSchema({ minLength: 1 }),
+      decision: stringSchema({ enum: ["approved", "rejected", "cancelled"] }),
+      note: stringSchema({ minLength: 1 }),
+    }, ["approvalId", "decision", "note"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "decide_approval" },
+  },
+  comment_on_approval: {
+    inputSchema: objectSchema({ approvalId: stringSchema({ minLength: 1 }), body: stringSchema({ minLength: 1 }) }, ["approvalId", "body"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "comment_on_approval" },
+  },
+  list_cases: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "cases.list" },
+  },
+  upsert_case: {
+    inputSchema: objectSchema({ key: stringSchema({ minLength: 1 }), body: stringSchema() }, ["key", "body"]),
+    mockCommandMapping: { kind: "mock_extension", extension: "cases.upsert" },
+  },
+  get_workspace_runtime: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "snapshot_read", projection: "active_task_workspace" },
+  },
+  control_workspace_service: {
+    inputSchema: objectSchema({
+      serviceId: stringSchema({ minLength: 1 }),
+      action: stringSchema({ enum: ["start", "stop", "fail"] }),
+      url: stringSchema(),
+    }, ["serviceId", "action"]),
+    mockCommandMapping: { kind: "semantic_command", commandKind: "control_workspace_service" },
+  },
+  list_routines: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "routines.list" },
+  },
+  manage_routine: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "routines.manage" },
+  },
+  list_company_skills: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "company_skills.list" },
+  },
+  sync_company_skills: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "company_skills.sync" },
+  },
+  list_secret_metadata: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "secrets.metadata" },
+  },
+  read_secret_value: {
+    inputSchema: objectSchema({ name: stringSchema({ minLength: 1 }) }, ["name"]),
+    mockCommandMapping: { kind: "mock_extension", extension: "secrets.value" },
+    redaction: [...SECRET_REDACTION],
+  },
+  export_company: {
+    inputSchema: objectSchema({}),
+    mockCommandMapping: { kind: "mock_extension", extension: "portability.export" },
+  },
+  administer_company: {
+    inputSchema: objectSchema({ action: stringSchema({ minLength: 1 }), payload: {} }, ["action"]),
+    mockCommandMapping: { kind: "mock_extension", extension: "company.admin" },
+  },
+  generic_api_request: {
+    inputSchema: objectSchema({
+      method: stringSchema({ minLength: 1 }),
+      path: stringSchema({ minLength: 1 }),
+      headers: { type: "object", additionalProperties: stringSchema() },
+      body: {},
+    }, ["method", "path"]),
+    mockCommandMapping: { kind: "mock_extension", extension: "test.generic_api" },
+    redaction: [...AUTH_REDACTION],
+  },
+};
+
+function titleFor(operationId: string): string {
+  return operationId.split("_").map((part) => part[0]!.toUpperCase() + part.slice(1)).join(" ");
+}
+
+function descriptionFor(title: string, group: CapabilityOptionalCatalogGroup): string {
+  return `${title} through the Capability ${group.replaceAll("_", " ")} capability set.`;
+}
+
+function toDescriptor(operation: CapabilityCanonicalOperation): CapabilitySemanticToolDescriptor {
+  const presentation = PRESENTATION[operation.operationId];
+  if (presentation === undefined) {
+    throw new Error(`Missing scenario presentation for operation ${operation.operationId}.`);
+  }
+  const title = presentation.title ?? titleFor(operation.operationId);
+  const description = presentation.description
+    ?? descriptionFor(title, operation.optionalGroup ?? "discovery");
+  return Object.freeze({
+    operationId: operation.operationId,
+    version: 1,
     title,
-    description: `${title} through the Capability ${group.replaceAll("_", " ")} capability set.`,
-    inputSchema,
+    description,
+    inputSchema: presentation.inputSchema,
     outputSchema: RESULT_SCHEMA,
-    disposition: "optional_agent_tool",
-    optionalGroup: group,
-    requiredClaims,
-    taskModes: options.taskModes ?? STANDARD_MODES,
-    sideEffectClass,
-    idempotency: options.idempotency ?? (sideEffectClass === "read" ? "none" : "required"),
-    redaction: options.redaction,
-    allowedRoles: options.allowedRoles,
-    mockCommandMapping: mapping,
+    disposition: operation.placement,
+    optionalGroup: operation.optionalGroup,
+    requiredClaims: [...operation.requiredClaims],
+    ...(operation.allowedRoles === undefined ? {} : { allowedRoles: [...operation.allowedRoles] }),
+    taskModes: [...operation.taskModes],
+    sideEffectClass: operation.sideEffectClass,
+    idempotency: operation.idempotency,
+    redaction: presentation.redaction ?? [],
+    mockCommandMapping: presentation.mockCommandMapping,
   });
 }
 
-const OPTIONAL_TOOLS: CapabilitySemanticToolDescriptor[] = [
-  optional("search_tasks", "discovery", ["discovery:tasks:read"], "read", { kind: "snapshot_read", projection: "company_tasks" }, objectSchema({ query: stringSchema(), status: stringSchema() })),
-  optional("list_agents", "discovery", ["discovery:agents:read"], "read", { kind: "snapshot_read", projection: "company_actors" }),
-  optional("list_projects", "discovery", ["discovery:projects:read"], "read", { kind: "mock_extension", extension: "discovery.projects" }),
-  optional("list_goals", "discovery", ["discovery:goals:read"], "read", { kind: "mock_extension", extension: "discovery.goals" }),
+const SCENARIO_OPERATIONS = capabilityCanonicalOperationsForSurface("scenario");
+const canonicalById = new Map(SCENARIO_OPERATIONS.map((operation) => [operation.operationId, operation]));
 
-  optional("create_task", "delegation_dependencies", ["delegation:tasks:create"], "company_write", { kind: "semantic_command", commandKind: "create_task" }, objectSchema({ title: stringSchema({ minLength: 1 }), description: stringSchema(), assigneeActorId: stringSchema(), priority: stringSchema(), blockedByTaskIds: arraySchema(stringSchema()) }, ["title"])),
-  optional("set_dependencies", "delegation_dependencies", ["dependencies:write"], "company_write", { kind: "semantic_command", commandKind: "set_dependencies" }, objectSchema({ blockedByTaskIds: arraySchema(stringSchema({ minLength: 1 })) }, ["blockedByTaskIds"])),
+// Bidirectional parity: every presented operation is a canonical scenario-surface
+// operation, and every canonical scenario-surface operation has a presentation.
+for (const key of Object.keys(PRESENTATION)) {
+  if (!canonicalById.has(key)) {
+    throw new Error(`Scenario presentation ${key} is not a canonical scenario-surface operation.`);
+  }
+}
+for (const operation of SCENARIO_OPERATIONS) {
+  if (PRESENTATION[operation.operationId] === undefined) {
+    throw new Error(`Canonical scenario operation ${operation.operationId} has no scenario presentation.`);
+  }
+}
 
-  optional("list_approvals", "governance", ["governance:approvals:read"], "read", { kind: "snapshot_read", projection: "company_approvals" }),
-  optional("request_approval", "governance", ["governance:approvals:request"], "governance", { kind: "semantic_command", commandKind: "request_approval" }, objectSchema({ approvalType: stringSchema({ minLength: 1 }), payload: {} }, ["approvalType", "payload"])),
-  optional("decide_approval", "governance", ["governance:approvals:decide"], "governance", { kind: "semantic_command", commandKind: "decide_approval" }, objectSchema({ approvalId: stringSchema({ minLength: 1 }), decision: stringSchema({ enum: ["approved", "rejected", "cancelled"] }), note: stringSchema({ minLength: 1 }) }, ["approvalId", "decision", "note"]), { allowedRoles: ["board", "approver", "security"] }),
-  optional("comment_on_approval", "governance", ["governance:approvals:comment"], "governance", { kind: "semantic_command", commandKind: "comment_on_approval" }, objectSchema({ approvalId: stringSchema({ minLength: 1 }), body: stringSchema({ minLength: 1 }) }, ["approvalId", "body"])),
-
-  optional("list_cases", "cases", ["cases:read"], "read", { kind: "mock_extension", extension: "cases.list" }),
-  optional("upsert_case", "cases", ["cases:write"], "company_write", { kind: "mock_extension", extension: "cases.upsert" }, objectSchema({ key: stringSchema({ minLength: 1 }), body: stringSchema() }, ["key", "body"])),
-
-  optional("get_workspace_runtime", "workspace_runtime", ["workspace:read"], "read", { kind: "snapshot_read", projection: "active_task_workspace" }),
-  optional("control_workspace_service", "workspace_runtime", ["workspace:control"], "workspace_control", { kind: "semantic_command", commandKind: "control_workspace_service" }, objectSchema({ serviceId: stringSchema({ minLength: 1 }), action: stringSchema({ enum: ["start", "stop", "fail"] }), url: stringSchema() }, ["serviceId", "action"])),
-
-  optional("list_routines", "routines", ["routines:read"], "read", { kind: "mock_extension", extension: "routines.list" }),
-  optional("manage_routine", "routines", ["routines:write"], "admin", { kind: "mock_extension", extension: "routines.manage" }),
-
-  optional("list_company_skills", "company_skills", ["company_skills:read"], "read", { kind: "mock_extension", extension: "company_skills.list" }),
-  optional("sync_company_skills", "company_skills", ["company_skills:write"], "admin", { kind: "mock_extension", extension: "company_skills.sync" }),
-
-  optional("list_secret_metadata", "secrets", ["secrets:metadata:read"], "read", { kind: "mock_extension", extension: "secrets.metadata" }),
-  optional("read_secret_value", "secrets", ["secrets:values:read"], "secret_read", { kind: "mock_extension", extension: "secrets.value" }, objectSchema({ name: stringSchema({ minLength: 1 }) }, ["name"]), { redaction: [...SECRET_REDACTION], idempotency: "none" }),
-
-  optional("export_company", "portability_admin", ["portability:export"], "admin", { kind: "mock_extension", extension: "portability.export" }),
-  optional("administer_company", "portability_admin", ["company:admin"], "admin", { kind: "mock_extension", extension: "company.admin" }, objectSchema({ action: stringSchema({ minLength: 1 }), payload: {} }, ["action"]), { allowedRoles: ["board", "ceo", "admin"] }),
-
-  optional("generic_api_request", "test_escape_hatch", ["test:generic_api"], "test_escape_hatch", { kind: "mock_extension", extension: "test.generic_api" }, objectSchema({ method: stringSchema({ minLength: 1 }), path: stringSchema({ minLength: 1 }), headers: { type: "object", additionalProperties: stringSchema() }, body: {} }, ["method", "path"]), { taskModes: ["skill_test"], redaction: [...AUTH_REDACTION] }),
-];
-
+// Declaration order follows the presentation map so the exported surface stays
+// stable; the operation set itself is single-sourced from the canonical list.
 export const CAPABILITY_SEMANTIC_TOOL_CATALOG: readonly CapabilitySemanticToolDescriptor[] = Object.freeze(
-  [...ALWAYS_TOOLS, ...OPTIONAL_TOOLS].map((tool) => Object.freeze(tool)),
+  Object.keys(PRESENTATION).map((operationId) => toDescriptor(canonicalById.get(operationId)!)),
 );
 
 export const CAPABILITY_OPTIONAL_TOOL_CATALOGS: Readonly<
@@ -370,5 +377,7 @@ export function capabilitySemanticTool(operationId: string): CapabilitySemanticT
 }
 
 function toolsInGroup(group: CapabilityOptionalCatalogGroup): readonly CapabilitySemanticToolDescriptor[] {
-  return Object.freeze(OPTIONAL_TOOLS.filter((tool) => tool.optionalGroup === group));
+  return Object.freeze(
+    CAPABILITY_SEMANTIC_TOOL_CATALOG.filter((tool) => tool.optionalGroup === group),
+  );
 }

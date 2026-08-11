@@ -1,72 +1,43 @@
 /**
- * Canonical semantic-catalog reconciliation authority.
+ * Semantic-catalog reconciliation ledger and drift authority.
  *
- * The runner historically carried two independently hand-maintained semantic
- * catalogs:
+ * The single source of truth for the operation list, placement, required
+ * claims, and task-mode policy is `./canonical-operations.ts`
+ * (`CAPABILITY_CANONICAL_OPERATIONS`). Both catalog modules — `src/tools/`
+ * (scenario/eval) and `src/semantic-tools/` (live provider) — now derive their
+ * operation set and those facts from it (PAP-17039), so neither can declare an
+ * independent list or an independent claim/mode policy.
  *
- * - `src/tools/` — the rich scenario/eval descriptor (placement, side-effect
- *   class, idempotency, redaction, mock mapping) consumed by the scenario and
- *   conformance layers and exported as the package-root default.
- * - `src/semantic-tools/` — the live runtime engine (catalog + policy +
- *   dispatcher) that drives live Codex, the issue-thread projection, and the
- *   generated provider-neutral contracts.
- *
- * PAP-17025 makes this module the single machine-readable authority over the
- * union of both surfaces so no specification calls either catalog canonical.
- * It enumerates every operation once, names its placement, claims, task modes,
- * roles, side-effect class, idempotency rule, redaction, mock mapping, real
- * binding status, and PRP-evidence shape, and computes every op-set and
- * metadata divergence between the two catalogs so drift checks can fail on any
- * unrecorded change. Physically collapsing the two catalog modules into
- * derivations of this authority (which changes live tool schemas and generated
- * goldens and needs live re-QA) is the sequenced follow-on within PAP-17025.
+ * This module is the drift gate on top of that source: it enriches the
+ * canonical list with the scenario mock mapping and redaction facts, and it
+ * recomputes every remaining metadata divergence between the two catalogs'
+ * actual descriptors so a drift check fails on any unrecorded change. After the
+ * collapse the only surviving divergence is input-schema *shape*: the live
+ * provider schema threads `idempotencyKey` in-band with provider bounds for the
+ * model, while the observable scenario runtime threads idempotency out-of-band.
+ * That is a single, reviewed projection of one contract, recorded below.
  */
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG as SCENARIO_CATALOG } from "../tools/capability-semantic-tool-catalog.js";
-import type {
-  CapabilityMockCommandMapping,
-  CapabilitySideEffectClass,
-  CapabilityToolDisposition,
-  CapabilityToolTaskMode,
-  ScenarioChatdempotencyBehavior,
-} from "../tools/capability-semantic-tool-types.js";
+import type { CapabilityMockCommandMapping } from "../tools/capability-semantic-tool-types.js";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG as LIVE_CATALOG } from "../semantic-tools/catalog.js";
+import {
+  CAPABILITY_CANONICAL_OPERATIONS,
+  capabilityCanonicalOperation,
+  type CapabilityCanonicalOperation,
+  type CapabilityRealBindingStatus,
+} from "./canonical-operations.js";
 
-/** Where an operation is executable today, before real Paperclip binding. */
-export type CapabilityRealBindingStatus = "live_codex" | "scenario_mock" | "test_only";
+export type { CapabilityCatalogSurface, CapabilityRealBindingStatus } from "./canonical-operations.js";
 
-/** Which hand-maintained catalog module(s) currently define the operation. */
-export type CapabilityCatalogSurface = "scenario" | "live";
-
-export interface CapabilityCanonicalOperation {
-  readonly operationId: string;
-  /** Catalog module(s) that define this operation today. */
-  readonly surfaces: readonly CapabilityCatalogSurface[];
-  readonly placement: CapabilityToolDisposition;
-  readonly requiredClaims: readonly string[];
-  readonly taskModes: readonly CapabilityToolTaskMode[];
-  readonly allowedRoles?: readonly string[];
-  readonly sideEffectClass: CapabilitySideEffectClass;
-  readonly idempotency: ScenarioChatdempotencyBehavior;
-  /** True when the operation declares any redaction rule. */
+/**
+ * The canonical operation enriched with the scenario mock mapping and redaction
+ * flag, for consumers and drift tests that assert full per-operation metadata.
+ */
+export interface CapabilityReconciledOperation extends CapabilityCanonicalOperation {
+  /** True when the scenario descriptor declares any redaction rule. */
   readonly redacts: boolean;
+  /** Scenario mock-command mapping; `null` for live-only operations. */
   readonly mockCommandMapping: CapabilityMockCommandMapping | null;
-  readonly realBindingStatus: CapabilityRealBindingStatus;
-  /**
-   * No semantic operation is bound to a real Paperclip service yet; the mock is
-   * the only backend. The real-service binding is deliverable G of the
-   * foundation plan (PAP-17016), tracked per operation once it lands.
-   */
-  readonly realServiceBinding: "unbound";
-  /** Intended PRP evidence family carrying this operation's effect. */
-  readonly prpEvidence: string;
-  /**
-   * The formal PRP expressiveness proof is deliverable C of the foundation
-   * plan; until it lands every entry is `audit_pending` rather than proven.
-   */
-  readonly prpBindingStatus: "audit_pending";
-  /** Legacy MCP alias ids folded into this operation, if any. */
-  readonly legacyAliases: readonly string[];
-  readonly note?: string;
 }
 
 export type CapabilityCatalogDivergenceField =
@@ -83,320 +54,82 @@ export interface CapabilityCatalogDivergence {
   readonly disposition: string;
 }
 
-// ---------------------------------------------------------------------------
-// Reconciliation table (hand-authored decisions, one row per union operation).
-// Fields the two catalogs already carry are read from the descriptors; only
-// facts neither catalog encodes live here: real binding status, PRP evidence,
-// legacy aliases, and any side-effect/idempotency call for live-only ops.
-// ---------------------------------------------------------------------------
+const scenarioById = new Map(SCENARIO_CATALOG.map((tool) => [tool.operationId, tool]));
+const liveById = new Map(LIVE_CATALOG.map((tool) => [tool.operationId as string, tool]));
 
-interface ReconciliationRow {
-  readonly realBindingStatus: CapabilityRealBindingStatus;
-  readonly legacyAliases?: readonly string[];
-  readonly note?: string;
-  /** Required only for the four live-only ops absent from the rich catalog. */
-  readonly liveOnly?: {
-    readonly placement: CapabilityToolDisposition;
-    readonly sideEffectClass: CapabilitySideEffectClass;
-    readonly idempotency: ScenarioChatdempotencyBehavior;
-    readonly prpEvidence: string;
-  };
-}
-
-const RECONCILIATION: Readonly<Record<string, ReconciliationRow>> = {
-  // --- always-present active-task surface (shared) ---
-  get_task_context: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipMe"] },
-  get_task_history: { realBindingStatus: "live_codex" },
-  list_documents: { realBindingStatus: "live_codex" },
-  read_document: { realBindingStatus: "live_codex" },
-  list_document_revisions: { realBindingStatus: "live_codex" },
-  report_progress: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipAddComment"] },
-  answer_status_question: { realBindingStatus: "live_codex" },
-  write_document: { realBindingStatus: "live_codex" },
-  request_human_input: { realBindingStatus: "live_codex" },
-  register_deliverable: { realBindingStatus: "live_codex" },
-  finish_task: { realBindingStatus: "live_codex" },
-  block_task: { realBindingStatus: "live_codex" },
-  request_review: { realBindingStatus: "live_codex" },
-  // `inspect_operation_result` is scenario-only: the live dispatcher returns
-  // results inline rather than exposing a re-read tool.
-  inspect_operation_result: {
-    realBindingStatus: "scenario_mock",
-    note: "Scenario/eval-only re-read of a prior operation result; the live dispatcher returns results inline.",
-  },
-
-  // --- discovery (shared + live-only) ---
-  search_tasks: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipListIssues"] },
-  list_agents: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipListAgents"] },
-  get_agent: {
-    realBindingStatus: "live_codex",
-    legacyAliases: ["mcp:paperclipGetAgent"],
-    liveOnly: {
-      placement: "optional_agent_tool",
-      sideEffectClass: "read",
-      idempotency: "none",
-      prpEvidence: "read projection surfaced via a tool-result item event; no control-plane state diff",
-    },
-  },
-  list_projects: {
-    realBindingStatus: "scenario_mock",
-    note: "Scenario/eval-only discovery via mock extension; no live dispatcher binding yet.",
-  },
-  list_goals: {
-    realBindingStatus: "scenario_mock",
-    note: "Scenario/eval-only discovery via mock extension; no live dispatcher binding yet.",
-  },
-
-  // --- delegation & dependencies (shared) ---
-  create_task: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipCreateIssue"] },
-  set_dependencies: { realBindingStatus: "live_codex" },
-
-  // --- governance (shared + live-only) ---
-  list_approvals: { realBindingStatus: "live_codex" },
-  request_approval: { realBindingStatus: "live_codex" },
-  decide_approval: { realBindingStatus: "live_codex" },
-  comment_on_approval: { realBindingStatus: "live_codex" },
-  get_approval: {
-    realBindingStatus: "live_codex",
-    liveOnly: {
-      placement: "optional_agent_tool",
-      sideEffectClass: "read",
-      idempotency: "none",
-      prpEvidence: "approval read projection surfaced via a tool-result item event; no state diff",
-    },
-  },
-  get_approval_context: {
-    realBindingStatus: "live_codex",
-    liveOnly: {
-      placement: "optional_agent_tool",
-      sideEffectClass: "read",
-      idempotency: "none",
-      prpEvidence: "approval-plus-linked-tasks read projection via a tool-result item event; no state diff",
-    },
-  },
-
-  // --- workspace runtime (shared) ---
-  get_workspace_runtime: { realBindingStatus: "live_codex" },
-  control_workspace_service: { realBindingStatus: "live_codex" },
-
-  // --- control-plane wake scheduling (live-only) ---
-  schedule_wake: {
-    realBindingStatus: "live_codex",
-    liveOnly: {
-      placement: "optional_agent_tool",
-      sideEffectClass: "task_write",
-      idempotency: "required",
-      prpEvidence: "wake scheduling recorded as a run/attention continuation event; deterministic delay",
-    },
-    note: "Bounded, deterministic mock wake scheduling; requires the control_plane:wakes claim.",
-  },
-
-  // --- scenario-only optional surfaces (mock extensions, no live binding) ---
-  list_cases: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  upsert_case: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  list_routines: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  manage_routine: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  list_company_skills: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  sync_company_skills: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  list_secret_metadata: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension; metadata only." },
-  read_secret_value: {
-    realBindingStatus: "scenario_mock",
-    note: "Scenario/eval-only mock extension; secret value redacted from every observable sink.",
-  },
-  export_company: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-  administer_company: { realBindingStatus: "scenario_mock", note: "Scenario/eval-only mock extension." },
-
-  // --- test-only escape hatch (shared, never product coverage) ---
-  generic_api_request: {
-    realBindingStatus: "test_only",
-    note: "Test-only escape hatch; explicitly cannot count as product capability coverage (PAP-17016 deliverable D).",
-  },
-};
-
-// ---------------------------------------------------------------------------
-// Derivation.
-// ---------------------------------------------------------------------------
-
-function prpEvidenceForSideEffect(sideEffectClass: CapabilitySideEffectClass): string {
-  switch (sideEffectClass) {
-    case "read":
-      return "read projection surfaced via a tool-result item event; no control-plane state diff";
-    case "task_write":
-      return "semantic-operation item event plus active-task state diff, work-assessment, and issue-status-decision events";
-    case "company_write":
-      return "semantic-operation item event plus company-entity state diff and audit record";
-    case "governance":
-      return "approval lifecycle plus governed-wait continuation and audit events";
-    case "workspace_control":
-      return "workspace service lifecycle event";
-    case "secret_read":
-      return "redacted tool-result item event; secret value never reaches the wire";
-    case "admin":
-      return "company admin/portability item event plus audit record";
-    case "test_escape_hatch":
-      return "test-only; excluded from product PRP evidence";
-    default:
-      return "audit_pending";
-  }
-}
-
-type LiveDescriptor = (typeof LIVE_CATALOG)[number];
-const scenarioById = new Map<string, (typeof SCENARIO_CATALOG)[number]>(
-  SCENARIO_CATALOG.map((tool) => [tool.operationId, tool]),
-);
-const liveById = new Map<string, LiveDescriptor>(
-  LIVE_CATALOG.map((tool) => [tool.operationId as string, tool]),
-);
-
-const UNION_IDS: readonly string[] = [
-  ...new Set([...scenarioById.keys(), ...liveById.keys()]),
-].sort();
-
-function buildOperation(operationId: string): CapabilityCanonicalOperation {
-  const row = RECONCILIATION[operationId];
-  if (row === undefined) {
-    throw new Error(`Missing reconciliation decision for operation ${operationId}.`);
-  }
-  const scenario = scenarioById.get(operationId);
-  const live = liveById.get(operationId);
-  const surfaces: CapabilityCatalogSurface[] = [];
-  if (scenario !== undefined) surfaces.push("scenario");
-  if (live !== undefined) surfaces.push("live");
-
-  if (scenario !== undefined) {
-    return freeze({
-      operationId,
-      surfaces,
-      placement: scenario.disposition,
-      requiredClaims: [...scenario.requiredClaims],
-      taskModes: [...scenario.taskModes],
-      ...(scenario.allowedRoles === undefined ? {} : { allowedRoles: [...scenario.allowedRoles] }),
-      sideEffectClass: scenario.sideEffectClass,
-      idempotency: scenario.idempotency,
-      redacts: scenario.redaction.length > 0,
-      mockCommandMapping: scenario.mockCommandMapping,
-      realBindingStatus: row.realBindingStatus,
-      realServiceBinding: "unbound",
-      prpEvidence: prpEvidenceForSideEffect(scenario.sideEffectClass),
-      prpBindingStatus: "audit_pending",
-      legacyAliases: row.legacyAliases ?? [],
-      ...(row.note === undefined ? {} : { note: row.note }),
-    });
-  }
-
-  // Live-only operation: the rich catalog does not define it, so the
-  // reconciliation row must supply placement, side-effect class, and evidence.
-  if (live === undefined || row.liveOnly === undefined) {
-    throw new Error(`Live-only operation ${operationId} needs an explicit reconciliation row.`);
-  }
-  return freeze({
-    operationId,
-    surfaces,
-    placement: row.liveOnly.placement,
-    requiredClaims: [...live.requiredClaims],
-    taskModes: [...live.allowedModes] as CapabilityToolTaskMode[],
-    ...(live.allowedRoles === undefined ? {} : { allowedRoles: [...live.allowedRoles] }),
-    sideEffectClass: row.liveOnly.sideEffectClass,
-    idempotency: row.liveOnly.idempotency,
-    redacts: false,
-    mockCommandMapping: null,
-    realBindingStatus: row.realBindingStatus,
-    realServiceBinding: "unbound",
-    prpEvidence: row.liveOnly.prpEvidence,
-    prpBindingStatus: "audit_pending",
-    legacyAliases: row.legacyAliases ?? [],
-    ...(row.note === undefined ? {} : { note: row.note }),
+function enrich(operation: CapabilityCanonicalOperation): CapabilityReconciledOperation {
+  const scenario = scenarioById.get(operation.operationId);
+  return Object.freeze({
+    ...operation,
+    redacts: scenario !== undefined && scenario.redaction.length > 0,
+    mockCommandMapping: scenario?.mockCommandMapping ?? null,
   });
 }
 
-/** The single canonical catalog: the union of both surfaces, sorted by id. */
-export const CAPABILITY_CANONICAL_CATALOG: readonly CapabilityCanonicalOperation[] = Object.freeze(
-  UNION_IDS.map(buildOperation),
+/** The single canonical catalog, enriched with scenario mock/redaction facts. */
+export const CAPABILITY_CANONICAL_CATALOG: readonly CapabilityReconciledOperation[] = Object.freeze(
+  CAPABILITY_CANONICAL_OPERATIONS.map(enrich),
 );
 
-const canonicalById = new Map(
-  CAPABILITY_CANONICAL_CATALOG.map((operation) => [operation.operationId, operation]),
-);
-
-export function capabilityCanonicalOperation(
-  operationId: string,
-): CapabilityCanonicalOperation | undefined {
-  return canonicalById.get(operationId);
-}
-
 // ---------------------------------------------------------------------------
-// Divergence ledger: every metadata difference between the two catalogs for a
-// shared operation, each with a recorded disposition. Drift checks pin this set
-// so a new, unrecorded divergence fails.
+// Divergence ledger. Placement, required claims, and task modes are now single
+// sourced, so those fields cannot diverge. Input-schema shape is the one
+// intentional per-surface projection; every entry carries its disposition.
 // ---------------------------------------------------------------------------
 
-function inputSchemaShape(schema: { properties?: Record<string, unknown>; required?: readonly string[] } | undefined): string {
+function inputSchemaShape(
+  schema: { properties?: Record<string, unknown>; required?: readonly string[] } | undefined,
+): string {
   const properties = Object.keys(schema?.properties ?? {}).sort();
   const required = [...(schema?.required ?? [])].sort();
   return `properties=[${properties.join(",")}] required=[${required.join(",")}]`;
 }
 
 /**
- * Input schemas differ by design between the two surfaces: the scenario
- * descriptor keeps idempotency out-of-band and omits provider bounds, while the
- * live provider descriptor threads `idempotencyKey` in-band and adds
- * length/pattern bounds for the model. Unifying the schema is the
- * schema-migration follow-on within PAP-17025.
+ * Input schemas are a single contract projected two ways by design: the live
+ * provider descriptor threads `idempotencyKey` in-band and carries provider
+ * length/pattern bounds for the model, while the observable scenario runtime
+ * threads idempotency out-of-band. This is a reviewed, intentional projection,
+ * not two independently authored schemas.
  */
 const INPUT_SCHEMA_SHAPE_DISPOSITION =
-  "Input schema differs by design (scenario keeps idempotency out-of-band and omits provider bounds; the live provider descriptor threads idempotencyKey in-band with length/pattern bounds). Unify in the schema-migration follow-on.";
-
-/**
- * The two catalogs apply task-mode policy differently: the scenario/eval
- * catalog scopes modes to the coverage the suite drives (adds `skill_test`,
- * restricts optional reads to `standard`), while the live catalog encodes the
- * runtime exposure policy (opens optional reads to `ask`/`planning`, keeps
- * terminal writes `standard`-only). The canonical target — one task-mode policy
- * per operation — is decided in the schema-migration follow-on within
- * PAP-17025. The exact divergent op-set is pinned by the drift test.
- */
-const TASK_MODE_DISPOSITION =
-  "Task-mode policy differs between the scenario suite's coverage modes and the live runtime exposure policy. Reconcile to one canonical policy in the schema-migration follow-on.";
-
-const DIVERGENCE_DISPOSITIONS: Readonly<Record<string, string>> = {
-  "generic_api_request:requiredClaims":
-    "Test-only escape hatch. The scenario claim `test:generic_api` and the live claim `test:generic_api_request` are the same reviewed test-only grant; unified in the schema-migration follow-on.",
-};
+  "Reviewed intentional projection of one input contract: the live provider descriptor threads idempotencyKey in-band with provider bounds for the model; the observable scenario runtime threads idempotency out-of-band. The operation list, claims, and task modes are single-sourced from canonical-operations.ts.";
 
 function buildDivergences(): readonly CapabilityCatalogDivergence[] {
   const divergences: CapabilityCatalogDivergence[] = [];
-  for (const operationId of UNION_IDS) {
-    const scenario = scenarioById.get(operationId);
-    const live = liveById.get(operationId);
+  for (const operation of CAPABILITY_CANONICAL_OPERATIONS) {
+    const scenario = scenarioById.get(operation.operationId);
+    const live = liveById.get(operation.operationId);
     if (scenario === undefined || live === undefined) continue;
 
     const record = (
       field: CapabilityCatalogDivergenceField,
       scenarioValue: string,
       liveValue: string,
+      disposition: string,
     ): void => {
       if (scenarioValue === liveValue) return;
-      const disposition =
-        field === "inputSchemaShape"
-          ? INPUT_SCHEMA_SHAPE_DISPOSITION
-          : field === "taskModes"
-            ? TASK_MODE_DISPOSITION
-            : (DIVERGENCE_DISPOSITIONS[`${operationId}:${field}`] ??
-              "UNRECORDED — reconcile or add a disposition.");
-      divergences.push({ operationId, field, scenario: scenarioValue, live: liveValue, disposition });
+      divergences.push({ operationId: operation.operationId, field, scenario: scenarioValue, live: liveValue, disposition });
     };
 
     record(
       "requiredClaims",
       [...scenario.requiredClaims].sort().join(","),
       [...live.requiredClaims].sort().join(","),
+      "UNRECORDED — required claims are single-sourced from canonical-operations.ts and must not diverge.",
     );
     record(
       "taskModes",
       [...scenario.taskModes].sort().join(","),
       [...live.allowedModes].sort().join(","),
+      "UNRECORDED — task modes are single-sourced from canonical-operations.ts and must not diverge.",
     );
-    record("inputSchemaShape", inputSchemaShape(scenario.inputSchema), inputSchemaShape(live.inputSchema));
+    record(
+      "inputSchemaShape",
+      inputSchemaShape(scenario.inputSchema),
+      inputSchemaShape(live.inputSchema),
+      INPUT_SCHEMA_SHAPE_DISPOSITION,
+    );
   }
   return Object.freeze(divergences);
 }
@@ -426,13 +159,13 @@ export function capabilityCatalogReconciliation(): CapabilityCatalogReconciliati
   };
   let alwaysCount = 0;
   let optionalCount = 0;
-  for (const operation of CAPABILITY_CANONICAL_CATALOG) {
+  for (const operation of CAPABILITY_CANONICAL_OPERATIONS) {
     byRealBindingStatus[operation.realBindingStatus] += 1;
     if (operation.placement === "always_agent_tool") alwaysCount += 1;
     else if (operation.placement === "optional_agent_tool") optionalCount += 1;
   }
   return {
-    unionCount: UNION_IDS.length,
+    unionCount: CAPABILITY_CANONICAL_OPERATIONS.length,
     scenarioCount: scenarioIds.size,
     liveCount: liveIds.size,
     sharedCount: [...scenarioIds].filter((id) => liveIds.has(id)).length,
@@ -445,11 +178,10 @@ export function capabilityCatalogReconciliation(): CapabilityCatalogReconciliati
   };
 }
 
-/** Convenience for docs/generators: the canonical operation-id list, sorted. */
-export function capabilityCanonicalOperationIds(): readonly string[] {
-  return UNION_IDS;
-}
-
-function freeze<T>(value: T): T {
-  return Object.freeze(value);
+/** The reconciled operation for one id, or undefined. */
+export function capabilityReconciledOperation(
+  operationId: string,
+): CapabilityReconciledOperation | undefined {
+  const operation = capabilityCanonicalOperation(operationId);
+  return operation === undefined ? undefined : enrich(operation);
 }

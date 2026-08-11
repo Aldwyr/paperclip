@@ -1,17 +1,23 @@
 # Semantic Catalog Reconciliation
 
-**Document status:** Canonical reconciliation ledger (PAP-17025)<br>
+**Document status:** Canonical reconciliation ledger (PAP-17025 gate + PAP-17039 collapse)<br>
 **Date:** 2026-08-11<br>
-**Authority:** `src/catalog/reconciliation.ts` (machine-readable), drift-checked by `src/catalog/reconciliation.test.ts` and `src/catalog/catalog-docs.test.ts`.<br>
+**Source of truth:** `src/catalog/canonical-operations.ts` (`CAPABILITY_CANONICAL_OPERATIONS`) — the single hand-authored 41-operation list. Both catalog modules derive their operation set, placement, required claims, and task-mode policy from it.<br>
+**Drift authority:** `src/catalog/reconciliation.ts` (machine-readable ledger), drift-checked by `src/catalog/reconciliation.test.ts` and `src/catalog/catalog-docs.test.ts`.<br>
 **Parent plan:** Runner foundation review plan (PAP-17016), deliverable D and execution step 1.
 
 ## Purpose
 
-The runner carried two independently hand-maintained semantic catalogs. This is
-the first reconciliation gate of the foundation plan: establish one
-machine-readable authority over both, name every operation's full metadata, and
-record every divergence with an explicit disposition so no specification calls
-either catalog canonical and no stale count or unreviewed divergence can land.
+The runner carried two independently hand-maintained semantic catalogs. PAP-17025
+established one machine-readable authority over both and recorded every
+divergence. **PAP-17039 performed the physical collapse:** the authoritative
+operation list, placement, required claims, and task-mode policy now live once in
+`src/catalog/canonical-operations.ts`, and both catalog modules derive from it —
+neither declares an independent operation list or an independent claim/mode
+policy any longer. Each catalog supplies only its per-surface *presentation*
+(title, description, input/output schema, and the scenario-only mock mapping and
+redaction rules), and a bidirectional parity check fails the build if either
+catalog's presentation set drifts from the canonical surface.
 
 ## The two catalogs
 
@@ -29,20 +35,19 @@ Reconciled op-set relationship (pinned by the drift test):
 
 ## Canonical authority decision
 
-- **Descriptor schema:** the rich `src/tools/` descriptor is the canonical shape.
-  It is the only one that already names placement, side-effect class,
-  idempotency, redaction, and mock mapping — the per-operation facts the plan
-  requires. The canonical authority extends it with **real-binding status** and
-  **PRP-evidence shape**.
-- **Machine-readable authority:** `src/catalog/reconciliation.ts` enumerates the
-  41-op union exactly once (`CAPABILITY_CANONICAL_CATALOG`), each entry naming
-  placement, claims, task modes, roles, side-effect class, idempotency,
-  redaction, mock mapping, real-binding status, PRP evidence, and legacy
-  aliases. `capabilityCatalogReconciliation()` computes the op-set summary and
-  the divergence ledger.
-- No spec should call either `src/tools/` or `src/semantic-tools/` canonical.
-  Both remain in place this increment; the follow-on collapses them into
-  derivations of the authority.
+- **Single source of truth:** `src/catalog/canonical-operations.ts` hand-authors
+  the 41-op union exactly once (`CAPABILITY_CANONICAL_OPERATIONS`), each entry
+  naming surfaces, placement, optional group, claims, task modes, roles,
+  side-effect class, idempotency, disabled-by-default, real-binding status, PRP
+  evidence, and legacy aliases. Both catalog modules import it and project it:
+  `src/tools/` renders the rich scenario descriptor and `src/semantic-tools/`
+  renders the live provider descriptor.
+- **Drift ledger:** `src/catalog/reconciliation.ts` enriches the canonical list
+  with the scenario mock mapping and redaction flag (`CAPABILITY_CANONICAL_CATALOG`),
+  and `capabilityCatalogReconciliation()` recomputes the op-set summary and any
+  remaining metadata divergence between the two catalogs' actual descriptors.
+- Neither `src/tools/` nor `src/semantic-tools/` is canonical; both are
+  projections of `canonical-operations.ts`.
 
 ## Real-binding status (before real Paperclip service binding)
 
@@ -58,28 +63,43 @@ current executability is classified as:
 - **`test_only` (1):** `generic_api_request` — the escape hatch, which by rule
   **cannot count as product capability coverage**.
 
-## Divergence ledger
+## Divergence ledger (after the PAP-17039 collapse)
 
-For every shared operation the authority compares `requiredClaims`, task modes,
-and input-schema shape, and records a disposition. The drift test fails if a new
-divergence appears without one.
+`requiredClaims` and task modes are single-sourced from
+`canonical-operations.ts`, so the two catalogs cannot diverge on them; the drift
+test asserts both divergence sets are now **empty**. The reconciliation ledger
+recomputes divergences from the two catalogs' actual descriptors:
 
-- **Claims (1):** `generic_api_request` requires `test:generic_api` (scenario)
-  vs `test:generic_api_request` (live). Same reviewed test-only grant; unify in
-  the follow-on.
-- **Task modes (15):** `block_task`, `comment_on_approval`,
-  `control_workspace_service`, `create_task`, `decide_approval`, `finish_task`,
-  `get_workspace_runtime`, `list_agents`, `list_approvals`,
-  `register_deliverable`, `report_progress`, `request_approval`,
-  `request_review`, `search_tasks`, `set_dependencies`. The scenario catalog
-  scopes modes to the coverage the suite drives (adds `skill_test`, restricts
-  optional reads to `standard`); the live catalog encodes the runtime exposure
-  policy (opens optional reads to `ask`/`planning`, keeps terminal writes
-  `standard`-only). Reconcile to one canonical policy in the follow-on.
-- **Input-schema shape (shared mutations and some reads):** the scenario
-  descriptor keeps idempotency out-of-band and omits provider bounds; the live
-  provider descriptor threads `idempotencyKey` in-band and adds length/pattern
-  bounds for the model. Unify the schema in the follow-on.
+- **Claims (0):** unified. `generic_api_request` carries a single claim,
+  `test:generic_api_request`, on both surfaces.
+- **Task modes (0):** unified to one canonical policy — **the live runtime
+  exposure policy unioned with `skill_test`**. Reads stay open in every mode;
+  work-writes (`report_progress`, `write_document`, `request_human_input`,
+  `register_deliverable`) allow `standard`/`planning`/`skill_test`; lifecycle
+  and state writes (`finish_task`, `block_task`, `request_review`, `create_task`,
+  `set_dependencies`, request/decide/comment approvals, `control_workspace_service`)
+  allow `standard`/`skill_test`. The `skill_test` mode makes every operation the
+  eval harness must drive drivable, while the live runtime keeps its intended
+  per-mode exposure.
+- **Input-schema shape (reviewed intentional projection):** one input contract is
+  projected two ways by design — the live provider descriptor threads
+  `idempotencyKey` in-band with provider length/pattern bounds for the model,
+  while the observable scenario runtime threads idempotency out-of-band. This is
+  a single reviewed projection recorded in the ledger, not two independently
+  authored schemas.
+
+### Effect on live provider schemas (QA gate)
+
+- The generated live contract golden `generated/capability/semantic-tool-contracts.json`
+  is **byte-identical** after the collapse: it serializes name, description,
+  input/output schema, exposure, and required claims — none of which changed on
+  the live surface (`allowedModes` is not serialized).
+- The live runtime **`allowedModes`** gained `skill_test` for the nine
+  previously `standard`-only operations (`finish_task`, `block_task`,
+  `request_review`, `create_task`, `set_dependencies`, `request_approval`,
+  `decide_approval`, `control_workspace_service`, `schedule_wake`). This is a
+  behavioral change to eval-harness exposure only; real live tasks never run in
+  `skill_test` mode.
 
 ## Legacy MCP aliases
 
@@ -92,33 +112,41 @@ operation for the well-known aliases (for example `paperclipListAgents` →
 `list_agents`, `paperclipGetAgent` → `get_agent`, `paperclipListIssues` →
 `search_tasks`, `paperclipCreateIssue` → `create_task`).
 
-## Deliberate decisions recorded for the surface-ledger and eval tasks
+## Collapse decisions executed by PAP-17039
 
-This increment makes **no runtime behavior change** — both catalogs keep their
-exact current surfaces, so the live golden and scenario suites are unchanged.
-The reconciliation records the following decisions to be executed by the
-schema-migration follow-on and consumed by the real-surface-ledger (deliverable
-B) and eval (deliverable F) tasks:
+1. **One source of truth.** `src/tools/` and `src/semantic-tools/` no longer
+   declare independent operation lists; both project
+   `CAPABILITY_CANONICAL_OPERATIONS`. Placement, optional group, required claims,
+   task modes, allowed roles, side-effect class, idempotency, and
+   disabled-by-default are single-sourced. Bidirectional parity checks fail the
+   build on any drift between a catalog's presentation and the canonical surface.
+2. **`generic_api_request` claim unified** to `test:generic_api_request`
+   (scenario callers/tests updated). It stays `test_only` and is excluded from
+   product capability coverage.
+3. **One canonical task-mode policy** (live runtime policy ∪ `skill_test`); the
+   ledger's 15 task-mode divergences are resolved to zero.
+4. **Input schema unified as one contract, projected two ways** — idempotency
+   in-band with provider bounds for the model, out-of-band for the observable
+   scenario runtime — recorded as the single reviewed intentional projection.
+5. **Placement of scenario-only (13) and live-only (4) operations retained.** The
+   13 scenario-only ops stay `scenario_mock` (eval-only via mock extensions); the
+   4 live-only reads/continuation ops (`get_agent`, `get_approval`,
+   `get_approval_context`, `schedule_wake`) stay `live_codex` with no scenario
+   projection. No operation crossed surfaces this increment; a future real-service
+   binding (deliverable G) is where scenario-only ops would gain a live binding.
 
-1. Collapse `src/tools/` and `src/semantic-tools/` catalog lists into
-   derivations of `src/catalog/reconciliation.ts`, so there is one source of
-   truth and the second module is compatibility-only.
-2. Unify the `generic_api_request` claim to a single test-only grant.
-3. Choose one canonical task-mode policy per operation (the ledger's 15 task-mode
-   divergences).
-4. Unify the input-schema shape (idempotency handling and provider bounds) —
-   this changes the live provider schemas the model sees and the generated
-   `semantic-tool-contracts.json` golden, and therefore requires live/browser
-   re-QA.
-5. Decide the placement of the 13 scenario-only and 4 live-only operations on the
-   unified surface (which become always/optional, which stay scenario/eval-only,
-   which gain a live binding).
+Consumed by the real-surface-ledger (deliverable B) and eval (deliverable F)
+tasks: the live contract golden is unchanged; the only behavioral delta is the
+`allowedModes` `skill_test` addition described above.
 
 ## Verification
 
-- `src/catalog/reconciliation.test.ts` — pins the op-set relationship, requires a
-  reconciliation entry and full metadata for every union operation, classifies
-  real-binding status, and requires a disposition for every divergence.
+- `src/catalog/reconciliation.test.ts` — pins the op-set relationship, asserts
+  both catalogs derive their operation set from the canonical source, asserts
+  claims/modes/placement are single-sourced (no divergence), and requires a
+  reviewed disposition for the surviving input-schema projection.
 - `src/catalog/catalog-docs.test.ts` — recomputes the catalog counts and
   membership in `docs/capability-semantic-tools.md` from the catalog so a stale
   hand count fails.
+- Live golden byte-identity checked by `check:semantic-contracts`; the scenario
+  and live runtime behavior is covered by the `test:scenarios` suites.

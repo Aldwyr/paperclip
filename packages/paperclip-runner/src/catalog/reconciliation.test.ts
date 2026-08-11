@@ -6,8 +6,11 @@ import { describe, expect, it } from "vitest";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG as SCENARIO_CATALOG } from "../tools/capability-semantic-tool-catalog.js";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG as LIVE_CATALOG } from "../semantic-tools/catalog.js";
 import {
-  CAPABILITY_CANONICAL_CATALOG,
+  CAPABILITY_CANONICAL_OPERATIONS,
   capabilityCanonicalOperation,
+} from "./canonical-operations.js";
+import {
+  CAPABILITY_CANONICAL_CATALOG,
   capabilityCatalogReconciliation,
 } from "./reconciliation.js";
 
@@ -45,18 +48,42 @@ describe("canonical semantic-catalog reconciliation authority", () => {
     ]);
   });
 
-  it("defines exactly one canonical entry per union operation", () => {
-    expect(CAPABILITY_CANONICAL_CATALOG).toHaveLength(41);
-    const ids = CAPABILITY_CANONICAL_CATALOG.map((operation) => operation.operationId);
-    expect(new Set(ids).size).toBe(ids.length);
-    const scenarioIds = new Set(SCENARIO_CATALOG.map((tool) => tool.operationId));
-    const liveIds = new Set(LIVE_CATALOG.map((tool) => tool.operationId));
-    for (const id of [...scenarioIds, ...liveIds]) {
-      expect(capabilityCanonicalOperation(id)).toBeDefined();
+  it("is the single source both catalogs derive their operation set from", () => {
+    expect(CAPABILITY_CANONICAL_OPERATIONS).toHaveLength(41);
+    const canonicalIds = new Set(CAPABILITY_CANONICAL_OPERATIONS.map((operation) => operation.operationId));
+    // Neither catalog may contain an operation absent from the canonical source.
+    for (const tool of SCENARIO_CATALOG) expect(canonicalIds.has(tool.operationId)).toBe(true);
+    for (const tool of LIVE_CATALOG) expect(canonicalIds.has(tool.operationId)).toBe(true);
+    // Every canonical operation is projected onto the surface(s) it names.
+    for (const operation of CAPABILITY_CANONICAL_OPERATIONS) {
+      if (operation.surfaces.includes("scenario")) {
+        expect(SCENARIO_CATALOG.some((tool) => tool.operationId === operation.operationId)).toBe(true);
+      }
+      if (operation.surfaces.includes("live")) {
+        expect(LIVE_CATALOG.some((tool) => tool.operationId === operation.operationId)).toBe(true);
+      }
+    }
+  });
+
+  it("single-sources claims and task modes so the two catalogs cannot diverge", () => {
+    for (const operation of CAPABILITY_CANONICAL_OPERATIONS) {
+      const scenario = SCENARIO_CATALOG.find((tool) => tool.operationId === operation.operationId);
+      const live = LIVE_CATALOG.find((tool) => tool.operationId === operation.operationId);
+      if (scenario !== undefined) {
+        expect([...scenario.requiredClaims].sort()).toEqual([...operation.requiredClaims].sort());
+        expect([...scenario.taskModes].sort()).toEqual([...operation.taskModes].sort());
+        expect(scenario.disposition).toBe(operation.placement);
+      }
+      if (live !== undefined) {
+        expect([...live.requiredClaims].sort()).toEqual([...operation.requiredClaims].sort());
+        expect([...live.allowedModes].sort()).toEqual([...operation.taskModes].sort());
+        expect(live.exposure).toBe(operation.placement === "always_agent_tool" ? "always" : "optional");
+      }
     }
   });
 
   it("names placement, claims, task modes, side-effect class, idempotency, redaction, mock mapping, real binding status, and PRP evidence for every operation", () => {
+    expect(CAPABILITY_CANONICAL_CATALOG).toHaveLength(41);
     for (const operation of CAPABILITY_CANONICAL_CATALOG) {
       expect(operation.placement).toMatch(/^(always|optional)_agent_tool$/);
       expect(Array.isArray(operation.requiredClaims)).toBe(true);
@@ -85,7 +112,16 @@ describe("canonical semantic-catalog reconciliation authority", () => {
     expect(capabilityCanonicalOperation("generic_api_request")?.realBindingStatus).toBe("test_only");
   });
 
-  it("records a disposition for every metadata divergence between the two catalogs", () => {
+  it("unifies the generic_api_request claim to a single test-only grant", () => {
+    const canonical = capabilityCanonicalOperation("generic_api_request");
+    expect(canonical?.requiredClaims).toEqual(["test:generic_api_request"]);
+    const scenario = SCENARIO_CATALOG.find((tool) => tool.operationId === "generic_api_request");
+    const live = LIVE_CATALOG.find((tool) => tool.operationId === "generic_api_request");
+    expect(scenario?.requiredClaims).toEqual(["test:generic_api_request"]);
+    expect(live?.requiredClaims).toEqual(["test:generic_api_request"]);
+  });
+
+  it("leaves zero claim or task-mode divergence, and only the reviewed input-schema projection", () => {
     const { divergences } = capabilityCatalogReconciliation();
     // No divergence may be left unrecorded, regardless of field.
     for (const divergence of divergences) {
@@ -97,33 +133,18 @@ describe("canonical semantic-catalog reconciliation authority", () => {
         .map((entry) => entry.operationId)
         .sort();
 
-    // The only claim divergence is the reviewed test-only escape-hatch grant.
-    expect(idsFor("requiredClaims")).toEqual(["generic_api_request"]);
+    // Claims and task modes are single-sourced from canonical-operations.ts, so
+    // there is nothing left to reconcile on either field.
+    expect(idsFor("requiredClaims")).toEqual([]);
+    expect(idsFor("taskModes")).toEqual([]);
 
-    // Task-mode policy diverges systematically between the two surfaces; the
-    // exact op-set is pinned so a new, unreviewed divergence fails the gate.
-    expect(idsFor("taskModes")).toEqual([
-      "block_task",
-      "comment_on_approval",
-      "control_workspace_service",
-      "create_task",
-      "decide_approval",
-      "finish_task",
-      "get_workspace_runtime",
-      "list_agents",
-      "list_approvals",
-      "register_deliverable",
-      "report_progress",
-      "request_approval",
-      "request_review",
-      "search_tasks",
-      "set_dependencies",
-    ]);
-
-    // Input schemas legitimately differ across the two surfaces today; every one
-    // carries the shared schema-migration disposition.
-    for (const divergence of divergences.filter((entry) => entry.field === "inputSchemaShape")) {
-      expect(divergence.disposition).toMatch(/schema-migration follow-on/);
+    // Input schemas remain a single contract projected two ways (idempotency
+    // in-band for the provider, out-of-band for the observable runtime); every
+    // entry carries the reviewed projection disposition.
+    const inputSchema = divergences.filter((entry) => entry.field === "inputSchemaShape");
+    expect(inputSchema.length).toBeGreaterThan(0);
+    for (const divergence of inputSchema) {
+      expect(divergence.disposition).toMatch(/Reviewed intentional projection/);
     }
   });
 
@@ -143,7 +164,7 @@ describe("canonical semantic-catalog reconciliation authority", () => {
     }
     // Every legacy alias named by the canonical authority must be a real
     // inventory row, so a native-mapping note cannot reference a phantom alias.
-    for (const operation of CAPABILITY_CANONICAL_CATALOG) {
+    for (const operation of CAPABILITY_CANONICAL_OPERATIONS) {
       for (const alias of operation.legacyAliases) {
         expect(aliasIds.has(alias)).toBe(true);
       }
