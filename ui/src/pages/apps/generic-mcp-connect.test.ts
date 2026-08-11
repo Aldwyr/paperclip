@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   canSubmitGenericConnect,
   customHeaderError,
+  defaultGenericMcpName,
   endpointHost,
   genericConnectGuidance,
   genericConnectPayload,
@@ -35,6 +36,20 @@ describe("endpointHost", () => {
   });
 });
 
+describe("defaultGenericMcpName", () => {
+  it("keeps the port and path so endpoints on one host get distinct names", () => {
+    expect(defaultGenericMcpName("http://127.0.0.1:47399/mcp"))
+      .toBe("127.0.0.1:47399/mcp");
+    expect(defaultGenericMcpName("http://127.0.0.1:47400/analytics/mcp"))
+      .toBe("127.0.0.1:47400/analytics/mcp");
+  });
+
+  it("does not copy a potentially secret query string into the name", () => {
+    expect(defaultGenericMcpName("https://www.example.test/mcp?token=secret"))
+      .toBe("example.test/mcp");
+  });
+});
+
 describe("genericConnectGuidance", () => {
   it("names the URL as the thing to fix for invalid, unsafe and unreachable endpoints", () => {
     for (const code of [
@@ -55,6 +70,11 @@ describe("genericConnectGuidance", () => {
 
   it("points at the deployment when Paperclip itself has no public HTTPS address", () => {
     expect(genericConnectGuidance("oauth_redirect_origin_unsupported", null).focus).toBe("deployment");
+  });
+
+  it("points at the name field when the connection name is already used", () => {
+    const guidance = genericConnectGuidance("tool_access_name_conflict", null);
+    expect(guidance).toMatchObject({ title: "That name is taken", focus: "name" });
   });
 
   it("passes a rejected header's own message through", () => {

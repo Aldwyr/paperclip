@@ -36,11 +36,30 @@ export function endpointHost(url: string): string | null {
 }
 
 /**
+ * A useful, non-secret default label for an arbitrary endpoint.
+ *
+ * Keep the port and path: one host commonly serves several MCP endpoints, and
+ * collapsing all of them to the hostname makes the second connection fail the
+ * company-wide application-name constraint. Query strings are deliberately
+ * excluded because remote MCP URLs can carry credentials there.
+ */
+export function defaultGenericMcpName(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.host.replace(/^www\./, "");
+    const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+    return `${host}${path}`.slice(0, 160) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Where the operator has to look to fix a failed connect attempt. The wizard uses
  * this to decide whether to reopen the URL field or the credential section, rather
  * than leaving them to guess which of the two was wrong.
  */
-export type GenericConnectFocus = "url" | "credentials" | "deployment" | "none";
+export type GenericConnectFocus = "url" | "name" | "credentials" | "deployment" | "none";
 
 export interface GenericConnectGuidance {
   title: string;
@@ -85,6 +104,12 @@ export function genericConnectGuidance(
         title: "Paperclip can't send that header",
         body: fallback,
         focus: "credentials",
+      };
+    case "tool_access_name_conflict":
+      return {
+        title: "That name is taken",
+        body: "Choose a different name for this connection, then try again.",
+        focus: "name",
       };
     case "oauth_challenge":
       return {

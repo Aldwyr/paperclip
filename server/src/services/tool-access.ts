@@ -1655,6 +1655,9 @@ function healthFailureHttpStatus(failure: { status: ToolConnectionHealthStatus; 
 function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStatus; message: string; code: string } {
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (typeof code === "string" && code.startsWith("remote_http_")) {
+      return { status: "error", message: error.message, code };
+    }
     if (isOAuthEndpointRejection(error)) {
       return { status: "error", message: error.message, code: String(code) };
     }
@@ -4120,7 +4123,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   function defaultLinkName(link: string): string {
     try {
       const url = new URL(link);
-      return url.hostname.replace(/^www\./, "") || "MCP app";
+      const host = url.host.replace(/^www\./, "");
+      const path = url.pathname === "/" ? "" : url.pathname.replace(/\/+$/, "");
+      return `${host}${path}`.slice(0, 160) || "MCP app";
     } catch {
       return "MCP app";
     }
@@ -7285,7 +7290,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             ),
           )
           .limit(1);
-        if (duplicate) throw conflict("A tool access record with that name already exists");
+        if (duplicate) {
+          throw conflict("A tool access record with that name already exists", {
+            code: "tool_access_name_conflict",
+          });
+        }
       }
       const [row] = await db
         .update(toolApplications)
@@ -8863,7 +8872,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         constraint?.includes("tool_applications") ||
         /duplicate key value|unique constraint|tool_applications_company_id_name_unique/i.test(message)
       ) {
-        throw conflict("A tool access record with that name already exists");
+        throw conflict("A tool access record with that name already exists", {
+          code: "tool_access_name_conflict",
+        });
       }
       throw error;
     },

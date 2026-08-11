@@ -113,7 +113,10 @@ export function toolAccessRoutes(
   function oauthRedirectUri() {
     const configured = configuredPublicBaseUrl();
     if (!configured) {
-      throw unprocessable("OAuth connections require PAPERCLIP_PUBLIC_URL or an auth public base URL");
+      throw unprocessable(
+        "This Paperclip needs a browser-reachable HTTPS address (or loopback HTTP) before browser sign-in can start.",
+        { code: "oauth_redirect_origin_unsupported" },
+      );
     }
     return new URL("/api/tools/oauth/callback", configured).toString();
   }

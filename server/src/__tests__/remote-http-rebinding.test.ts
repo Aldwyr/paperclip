@@ -116,6 +116,24 @@ function rebindingLookup(): { lookup: () => Promise<Array<{ address: string; fam
 }
 
 describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
+  it("turns a platform-fetch DNS cause into the stable DNS code", async () => {
+    const cause = Object.assign(new Error("getaddrinfo ENOTFOUND missing.invalid"), {
+      code: "ENOTFOUND",
+    });
+    const unpinnedFetch = (async () => {
+      throw Object.assign(new TypeError("fetch failed"), { cause });
+    }) as typeof fetch;
+
+    await expect(guardedRemoteHttpFetch("https://8.8.8.8/mcp", {}, {
+      allowPrivateNetwork: true,
+      unpinnedFetch,
+      error: guardError,
+    })).rejects.toMatchObject({
+      code: "remote_http_dns_failed",
+      message: "Remote MCP connection hostname could not be resolved",
+    });
+  });
+
   it("pins the connection to the approved address so a rebind never reaches loopback", async () => {
     const upstream = await startServer();
     const internal = await startServer();

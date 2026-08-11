@@ -202,7 +202,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     const nameInput = Array.from(container.querySelectorAll<HTMLInputElement>("input")).find(
       (i) => i.getAttribute("placeholder") === "My app",
     );
-    expect(nameInput?.value).toBe("example.com");
+    expect(nameInput?.value).toBe("example.com/actions");
   });
 
   it("opens the selected app directly on its setup route", async () => {
@@ -628,7 +628,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     expect(connectAppMock).toHaveBeenCalledTimes(1);
     const [, input] = connectAppMock.mock.calls[0];
-    expect(input).toMatchObject({ link: "https://www.example.com/actions", name: "example.com" });
+    expect(input).toMatchObject({ link: "https://www.example.com/actions", name: "example.com/actions" });
     expect(input.credentialValues).toBeUndefined();
   });
 
@@ -1148,6 +1148,14 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
     return new ApiError(message, status, { error: message, details: { code } });
   }
 
+  it("defaults the connection name from host, port, and path", async () => {
+    await render();
+    await gotoLinkFrame(container, "http://127.0.0.1:47399/mcp");
+
+    expect(container.querySelector<HTMLInputElement>("#generic-mcp-name")?.value)
+      .toBe("127.0.0.1:47399/mcp");
+  });
+
   it("keeps the endpoint host and Unverified server visible from setup through review", async () => {
     await render();
     await gotoLinkFrame(container, "https://mcp.example.test/mcp");
@@ -1247,6 +1255,43 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
     await flushReact();
 
     expect(container.textContent).toContain("We couldn't find that host");
+  });
+
+  it("uses deployment guidance without rendering the server env-var message", async () => {
+    connectAppMock.mockRejectedValue(apiError(
+      422,
+      "oauth_redirect_origin_unsupported",
+      "OAuth connections require PAPERCLIP_PUBLIC_URL or an auth public base URL",
+    ));
+    await render();
+    await gotoLinkFrame(container, "https://mcp.example.test/mcp");
+    await act(async () => {
+      buttonByText("Check link")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("This Paperclip needs a public HTTPS address first");
+    expect(container.textContent).not.toContain("PAPERCLIP_PUBLIC_URL");
+  });
+
+  it("renders a name conflict as name guidance and focuses the Name field", async () => {
+    connectAppMock.mockRejectedValue(apiError(
+      409,
+      "tool_access_name_conflict",
+      "A tool access record with that name already exists",
+    ));
+    await render();
+    await gotoLinkFrame(container, "https://mcp.example.test/mcp");
+    await act(async () => {
+      buttonByText("Check link")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    const nameInput = container.querySelector<HTMLInputElement>("#generic-mcp-name");
+    expect(container.textContent).toContain("That name is taken");
+    expect(document.activeElement).toBe(nameInput);
   });
 
   it("opens advanced authentication when the server wants a credential we can't discover", async () => {

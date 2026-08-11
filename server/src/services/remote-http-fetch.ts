@@ -32,6 +32,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
  * pass `responseTimeoutMs` so this default never truncates it.
  */
 const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
+const DNS_RESOLUTION_ERROR_CODES = new Set(["ENODATA", "ENOTFOUND", "EAI_AGAIN"]);
 
 /** How a verified socket is opened. Overridable so tests can simulate a rebind. */
 export type RemoteHttpSocketFactory = (target: {
@@ -103,9 +104,32 @@ export async function guardedRemoteHttpFetch(
   const literalHost = isIP(endpoint.hostname.replace(/^\[|\]$/g, "")) !== 0;
   const platformFetch = options.unpinnedFetch ?? fetch;
   if (approved.length === 0 || literalHost) {
-    return platformFetch(endpoint.toString(), { ...init, redirect: "manual" });
+    try {
+      return await platformFetch(endpoint.toString(), { ...init, redirect: "manual" });
+    } catch (error) {
+      if (isDnsResolutionError(error)) {
+        throw options.error(
+          "Remote MCP connection hostname could not be resolved",
+          "remote_http_dns_failed",
+        );
+      }
+      throw error;
+    }
   }
   return pinnedRequest(endpoint, approved, init, options);
+}
+
+/** Node's platform fetch wraps DNS failures in TypeError.cause. */
+function isDnsResolutionError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const record = current as { code?: unknown; cause?: unknown };
+    if (typeof record.code === "string" && DNS_RESOLUTION_ERROR_CODES.has(record.code)) return true;
+    current = record.cause;
+  }
+  return false;
 }
 
 async function pinnedRequest(

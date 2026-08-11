@@ -274,7 +274,10 @@ async function createCompany(db: ReturnType<typeof createDb>) {
 
 function createRouteApp(
   db: ReturnType<typeof createDb>,
-  deployment?: { deploymentMode: "authenticated"; deploymentExposure: "public" },
+  deployment?: {
+    deploymentMode: "authenticated" | "local_trusted";
+    deploymentExposure: "public" | "private";
+  },
   requestLogger?: express.RequestHandler,
 ) {
   const app = express();
@@ -358,6 +361,73 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     // this connection cannot be depending on gallery metadata for anything.
     expect(connection!.config).not.toHaveProperty("sourceTemplateKey");
     expect(connection!.config).not.toHaveProperty("connectionMethodKey");
+  });
+
+  it("emits DNS guidance for a real NXDOMAIN failure", async () => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db, {
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: "https://qa-nonexistent.invalid/mcp", name: "Missing DNS fixture" });
+
+    // Public-mode preflight returns 400; local-mode platform fetch reports the
+    // same failure from the health check as 502. The machine code is the stable
+    // UI contract across both paths.
+    expect([400, 502]).toContain(response.status);
+    expect(response.body).toMatchObject({
+      details: { code: "remote_http_dns_failed" },
+    });
+    expect(response.body.error).not.toBe("fetch failed");
+    await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
+  });
+
+  it("emits a stable code when an application name is already used", async () => {
+    const company = await createCompany(db);
+    await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `existing:${randomUUID()}`,
+      name: "Taken fixture name",
+      type: "mcp_http",
+      status: "active",
+      metadata: {},
+    });
+    const app = createRouteApp(db, {
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+    });
+
+    const response = await request(app)
+      .post(`/api/companies/${company.id}/tools/apps/connect`)
+      .send({ link: "http://127.0.0.1:8848/mcp", name: "Taken fixture name" })
+      .expect(409);
+
+    expect(response.body).toMatchObject({
+      details: { code: "tool_access_name_conflict" },
+    });
+  });
+
+  it("emits deployment guidance without exposing server env-var names", async () => {
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "");
+    vi.stubEnv("PAPERCLIP_AUTH_PUBLIC_BASE_URL", "");
+    vi.stubEnv("BETTER_AUTH_URL", "");
+    vi.stubEnv("BETTER_AUTH_BASE_URL", "");
+    const app = createRouteApp(db, {
+      deploymentMode: "local_trusted",
+      deploymentExposure: "private",
+    });
+
+    const response = await request(app)
+      .get("/api/tools/oauth/client-metadata")
+      .expect(422);
+
+    expect(response.body).toMatchObject({
+      details: { code: "oauth_redirect_origin_unsupported" },
+    });
+    expect(JSON.stringify(response.body)).not.toContain("PAPERCLIP_PUBLIC_URL");
   });
 
   it("stores a bearer key as a secret and never reads it back", async () => {
