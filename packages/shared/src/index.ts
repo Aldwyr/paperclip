@@ -1338,6 +1338,8 @@ export type {
   ToolConnectionInstall,
   ToolConnectionInstallSnapshot,
   ToolConnectionInstallTargetType,
+  ToolConnectionRemovalResult,
+  ToolConnectionRemovalSummary,
   ConnectionGrant,
   ConnectionGrantKind,
   ConnectionGrantStatus,

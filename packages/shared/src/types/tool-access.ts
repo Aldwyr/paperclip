@@ -190,6 +190,51 @@ export interface ToolConnectionInstallSnapshot {
   installs: ToolConnectionInstall[];
 }
 
+/**
+ * What a connection removal actually tore down (PAP-17119).
+ *
+ * Removing an app is a revocation boundary, not a cosmetic archive, so the
+ * receipt is counts and outcomes only — never a secret name, key, or value,
+ * because this summary is echoed into the activity log the whole company reads.
+ */
+export interface ToolConnectionRemovalSummary {
+  /** Connection-owned secrets revoked at the provider and deleted locally. */
+  secretsRevoked: number;
+  /** Secrets left in place because another consumer still binds them. */
+  secretsRetainedShared: number;
+  /** Credential refs cleared off the connection row. */
+  credentialRefsCleared: number;
+  /** `company_secret_bindings` rows removed for this connection. */
+  secretBindingsRemoved: number;
+  grantsRevoked: number;
+  installsRemoved: number;
+  /**
+   * `deleted` when the app-managed `app:<connectionId>` profile could go away,
+   * `archived` when a gateway still references it (the row survives with no
+   * entries and a non-active status), `absent` when there was never one.
+   */
+  appProfile: "deleted" | "archived" | "absent";
+  appProfileEntriesRemoved: number;
+  appProfileBindingsRemoved: number;
+  catalogEntriesMarkedRemoved: number;
+  oauthStatesDiscarded: number;
+  /** Token hashes wiped from the retained connection-token issuance ledger. */
+  tokenIssuanceHashesCleared: number;
+  /**
+   * Live local runtimes shut down. A running child process holds the injected
+   * credential in memory, so it is an access path of its own.
+   */
+  runtimeSlotsStopped: number;
+  gatewayTokensRevoked: number;
+  gatewaySessionsRevoked: number;
+  applicationArchived: boolean;
+}
+
+export interface ToolConnectionRemovalResult {
+  connection: ToolConnection;
+  removal: ToolConnectionRemovalSummary;
+}
+
 export type ConnectionTokenScope = string | string[];
 export type ConnectionTokenSubject = { type: "app" } | { type: "user"; userId: string };
 

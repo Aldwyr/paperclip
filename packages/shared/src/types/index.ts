@@ -470,6 +470,8 @@ export type {
   ToolConnectionInstall,
   ToolConnectionInstallSnapshot,
   ToolConnectionInstallTargetType,
+  ToolConnectionRemovalResult,
+  ToolConnectionRemovalSummary,
   ConnectionTokenAttribution,
   ConnectionRecoverableErrorCode,
   ConnectionRecoverableErrorPayload,

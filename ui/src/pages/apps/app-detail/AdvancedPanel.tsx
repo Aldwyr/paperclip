@@ -286,7 +286,8 @@ export function DangerZone({
         <div>
           <p className="text-sm font-medium text-foreground">Remove this app</p>
           <p className="text-xs text-muted-foreground">
-            Agents lose access to {appName} right away. You can connect it again later.
+            Deletes the saved credentials for {appName} and takes agent access away right away.
+            Connecting it again later needs a new sign-in or key.
           </p>
         </div>
         {confirming ? (

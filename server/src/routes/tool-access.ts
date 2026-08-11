@@ -832,8 +832,15 @@ export function toolAccessRoutes(
     if (!existing) return;
     assertToolAppMutationAccess(req, existing.companyId);
     const applicationBefore = await svc.getApplication(existing.applicationId);
-    const connection = await svc.archiveConnection(existing.id);
+    const { connection, removal } = await svc.archiveConnection(
+      existing.id,
+      existing.companyId,
+      getActorInfo(req),
+    );
     const applicationAfter = await svc.getApplication(existing.applicationId);
+    // The receipt is counts and outcomes only. Removal is a revocation boundary
+    // (PAP-17119) and operators need to see what it tore down, but this row is
+    // company-readable activity, so it never carries a secret name or value.
     await logActivity(db, {
       companyId: connection.companyId,
       actorType: "user",
@@ -841,7 +848,7 @@ export function toolAccessRoutes(
       action: "tool_connection.archived",
       entityType: "tool_connection",
       entityId: connection.id,
-      details: { transport: connection.transport },
+      details: { transport: connection.transport, ...removal },
     });
     if (applicationBefore.status !== "archived" && applicationAfter.status === "archived") {
       await logActivity(db, {
@@ -854,7 +861,7 @@ export function toolAccessRoutes(
         details: { type: applicationAfter.type, name: applicationAfter.name, reason: "last_connection_removed" },
       });
     }
-    res.json(connection);
+    res.json({ ...connection, removal });
   });
 
   router.post("/tool-connections/:connectionId/health-check", async (req, res) => {

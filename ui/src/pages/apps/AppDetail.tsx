@@ -273,7 +273,7 @@ export function AppDetail() {
       queryClient.invalidateQueries({ queryKey: queryKeys.apps.attention(selectedCompanyId!) });
       pushToast({
         title: "App removed",
-        body: `${appName} no longer has access. You can connect it again any time.`,
+        body: `${appName} no longer has access and its credentials are deleted. Connecting it again needs a new sign-in or key.`,
         tone: "success",
       });
       navigate("/apps/connections");
