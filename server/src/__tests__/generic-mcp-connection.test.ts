@@ -12,6 +12,8 @@ import {
   companySecrets,
   companySecretVersions,
   createDb,
+  issueThreadInteractions,
+  issues,
   principalPermissionGrants,
   secretAccessEvents,
   toolAccessAuditEvents,
@@ -315,6 +317,8 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await db.delete(toolCatalogEntries);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issues);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -831,6 +835,194 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     })).rejects.toMatchObject({
       status: 400,
       message: "OAuth state was not found or has already been used",
+    });
+  });
+
+  /**
+   * PAP-17109 — a denial or a cancel is a final answer to an authorization
+   * request, so it has to end the request rather than just fail the callback.
+   * Left live, the `state` the user refused stays completable for the rest of its
+   * TTL by anyone who can produce a code, and the board keeps showing a prompt
+   * for a flow the user already declined.
+   */
+  describe("denied and cancelled callbacks", () => {
+    it("stops a later code from completing a flow the user refused", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture denied" });
+      const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+      // Held before the denial on purpose: this is the whole attack. A code that
+      // shows up after "no" must not be exchangeable.
+      const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+      await expect(service.completeOAuthCallback({ state, error: "access_denied", redirectUri: REDIRECT_URI, actor }))
+        .rejects.toMatchObject({ status: 400, details: { code: "oauth_authorization_denied" } });
+
+      await expect(service.completeOAuthCallback({ state, code, iss: ISSUER, redirectUri: REDIRECT_URI, actor }))
+        .rejects.toMatchObject({ status: 400, message: "OAuth state was not found or has already been used" });
+
+      expect(fixture.requestsTo("/token")).toHaveLength(0);
+      const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+      // Still a draft: nothing about the refused attempt made it a live connection.
+      expect(connection).toMatchObject({ status: "draft" });
+      expect(connection!.credentialSecretRefs.some((ref) => ref.configPath === "oauth.access_token")).toBe(false);
+    });
+
+    it("treats a cancel the same as a denial even when the provider names it its own way", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture cancelled" });
+      const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+      const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+      // Real providers invent their own cancel codes. Whether or not Paperclip
+      // recognizes the label, the request is over.
+      const thrown = await service.completeOAuthCallback({
+        state,
+        error: "user_cancelled_authorize",
+        redirectUri: REDIRECT_URI,
+        actor,
+      }).then(() => null, (error: unknown) => error);
+      expect(thrown).toMatchObject({ status: 400, details: { code: "oauth_authorization_denied" } });
+      expect((thrown as Error).message).not.toContain("user_cancelled_authorize");
+
+      await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+      await expect(service.completeOAuthCallback({ state, code, iss: ISSUER, redirectUri: REDIRECT_URI, actor }))
+        .rejects.toMatchObject({ status: 400 });
+      expect(fixture.requestsTo("/token")).toHaveLength(0);
+    });
+
+    it("will not let another session's denial spend a pending request", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const owner = { actorType: "user" as const, actorId: "board-user", sessionId: "owner-session" };
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture victim" });
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: owner,
+      });
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+      // Same user, different browser session.
+      await expect(service.completeOAuthCallback({
+        state,
+        error: "access_denied",
+        redirectUri: REDIRECT_URI,
+        actor: { ...owner, sessionId: "other-session" },
+      })).rejects.toMatchObject({ status: 403 });
+
+      // A different user — which is also how a different company arrives, since a
+      // state is bound to the actor id that started it and the callback route
+      // authorizes against the state row's own company.
+      await expect(service.completeOAuthCallback({
+        state,
+        error: "access_denied",
+        redirectUri: REDIRECT_URI,
+        actor: { ...owner, actorId: "someone-else" },
+      })).rejects.toMatchObject({ status: 403 });
+
+      // Neither refusal cost the owner anything: the request is still live and
+      // still completable.
+      await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(1);
+      const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+      await expect(service.completeOAuthCallback({ state, code, iss: ISSUER, redirectUri: REDIRECT_URI, actor: owner }))
+        .resolves.toMatchObject({ connectionId: connected.connectionId });
+    });
+
+    it("resolves the board's pending authorization prompt as rejected", async () => {
+      installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const [agent] = await db.insert(agents).values({
+        companyId: company.id,
+        name: `Connector ${randomUUID()}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      }).returning();
+      const [issue] = await db.insert(issues).values({
+        companyId: company.id,
+        title: "Connect the analytics app",
+      }).returning();
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture prompt" });
+
+      // The agent-driven shape: the agent asks, the board user answers in the
+      // provider's window, so the prompt's fate is decided by the callback.
+      const start = await service.startOAuth(company.id, connected.connectionId, {
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "agent", actorId: agent!.id },
+        subjectUserId: "board-user",
+        issueId: issue!.id,
+      });
+      const [pending] = await db.select().from(issueThreadInteractions);
+      expect(pending).toMatchObject({ kind: "request_confirmation", status: "pending" });
+
+      await expect(service.completeOAuthCallback({
+        state: new URL(start.authorizationUrl).searchParams.get("state")!,
+        error: "access_denied",
+        redirectUri: REDIRECT_URI,
+        actor: { actorType: "user", actorId: "board-user" },
+      })).rejects.toMatchObject({ status: 400, details: { code: "oauth_authorization_denied" } });
+
+      const [resolved] = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, pending!.id));
+      expect(resolved).toMatchObject({ status: "rejected", resolvedByUserId: "board-user" });
+      expect(resolved!.result).toMatchObject({ outcome: "rejected" });
+      expect(resolved!.resolvedAt).not.toBeNull();
+      // The prompt's reason is Paperclip's own copy, never the provider's.
+      expect(JSON.stringify(resolved!.result)).not.toContain("access_denied");
+      await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);
+    });
+
+    it("lets only one of two simultaneous callbacks exchange a code", async () => {
+      const fixture = installMcpOAuthFixture({ auth: "oauth" });
+      const company = await createCompany(db);
+      const service = toolAccessService(db);
+      const actor = { actorType: "user" as const, actorId: "board-user" };
+      const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture replay" });
+      const start = await service.startOAuth(company.id, connected.connectionId, { redirectUri: REDIRECT_URI, actor });
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+      const code = fixture.issueAuthorizationCode(start.authorizationUrl);
+
+      // A second database handle, because a race needs two connections: this
+      // driver pipelines everything issued through one handle, which would
+      // serialize the two callbacks and prove nothing. With two connections both
+      // callbacks can read a live state row before either deletes it, so the
+      // atomic `DELETE … RETURNING` is what picks the winner.
+      const otherDb = createDb(tempDb!.connectionString);
+      const otherService = toolAccessService(otherDb);
+      let settled: PromiseSettledResult<unknown>[];
+      try {
+        // Connect before racing: paying TCP and startup latency inside the race
+        // would just hand the first callback an uncontested head start.
+        await otherDb.select().from(companies).limit(1);
+        settled = await Promise.allSettled([
+          service.completeOAuthCallback({ state, code, iss: ISSUER, redirectUri: REDIRECT_URI, actor }),
+          otherService.completeOAuthCallback({ state, code, iss: ISSUER, redirectUri: REDIRECT_URI, actor }),
+        ]);
+      } finally {
+        await otherDb.$client.end({ timeout: 5 });
+      }
+
+      expect(settled.filter((entry) => entry.status === "fulfilled")).toHaveLength(1);
+      // The loser never reached the token endpoint at all.
+      expect(fixture.requestsTo("/token")).toHaveLength(1);
+      const rejection = settled.find((entry) => entry.status === "rejected") as PromiseRejectedResult;
+      expect(rejection.reason).toMatchObject({
+        status: 400,
+        message: "OAuth state was not found or has already been used",
+      });
     });
   });
 

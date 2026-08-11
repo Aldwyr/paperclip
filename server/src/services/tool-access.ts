@@ -6595,6 +6595,82 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return row ?? null;
   }
 
+  /**
+   * Answer a pending authorization request exactly once (PAP-17109).
+   *
+   * Every terminal callback — success, denial, cancel — comes through here, so
+   * the row that authorizes a token exchange stops existing the moment the flow
+   * reaches an outcome. Two properties matter and they pull in opposite
+   * directions:
+   *
+   * - A stranger's callback must not *consume* the request. So the row is loaded
+   *   and bound to the caller before anything is deleted; a failed binding check
+   *   leaves the victim's flow live and completable.
+   * - A replayed callback must not *complete* the request. So the delete is the
+   *   single statement that decides ownership: `RETURNING` hands the row to
+   *   exactly one of two concurrent callbacks, and the loser is told the state is
+   *   spent instead of exchanging a code against it.
+   */
+  async function consumeOAuthState(state: string, actor: ActorInfo | undefined) {
+    const [stateRow] = await db
+      .select()
+      .from(toolOauthStates)
+      .where(eq(toolOauthStates.state, state))
+      .limit(1);
+    if (!stateRow) throw badRequest("OAuth state was not found or has already been used");
+    if (stateRow.expiresAt.getTime() <= Date.now()) throw badRequest("OAuth state has expired");
+    if (stateRow.subjectUserId) {
+      if (actor?.actorType !== "user" || actor.actorId !== stateRow.subjectUserId) {
+        throw forbidden("OAuth callback user does not match the requested subject");
+      }
+    } else {
+      assertSameOAuthActor(stateRow, actor);
+    }
+    const [consumed] = await db
+      .delete(toolOauthStates)
+      .where(eq(toolOauthStates.state, state))
+      .returning();
+    if (!consumed) throw badRequest("OAuth state was not found or has already been used");
+    return consumed;
+  }
+
+  /**
+   * End the board's "Connect your account" prompt when the user declines in the
+   * provider's window (PAP-17109). Without this the card stays `pending`, so the
+   * board keeps offering an authorization link for a flow the user just refused
+   * and the requesting agent never learns the answer.
+   *
+   * Scoped to a still-`pending` row: a board user who already answered the card
+   * directly keeps their own answer.
+   */
+  async function rejectPendingOAuthInteraction(
+    stateRow: typeof toolOauthStates.$inferSelect,
+    actor: ActorInfo | undefined,
+  ) {
+    if (!stateRow.interactionId) return;
+    const now = new Date();
+    await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "rejected",
+        result: {
+          version: 1,
+          outcome: "rejected",
+          // Paperclip's own words: the provider's explanation is untrusted and
+          // this reason is rendered in the thread (PAP-17108).
+          reason: "Authorization was declined or cancelled in the provider's window",
+        },
+        resolvedByUserId: actor?.actorType === "user" ? actor.actorId : null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, stateRow.interactionId),
+        eq(issueThreadInteractions.companyId, stateRow.companyId),
+        eq(issueThreadInteractions.status, "pending"),
+      ));
+  }
+
   async function completeOAuthCallback(input: {
     state: string;
     code?: string | null;
@@ -6610,34 +6686,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     iss?: string | null;
     actor?: ActorInfo;
   }): Promise<ConnectToolAppResult> {
-    const [stateRow] = await db
-      .select()
-      .from(toolOauthStates)
-      .where(eq(toolOauthStates.state, input.state))
-      .limit(1);
-    if (!stateRow) throw badRequest("OAuth state was not found or has already been used");
-    if (stateRow.expiresAt.getTime() <= Date.now()) throw badRequest("OAuth state has expired");
-    if (stateRow.subjectUserId) {
-      if (input.actor?.actorType !== "user" || input.actor.actorId !== stateRow.subjectUserId) {
-        throw forbidden("OAuth callback user does not match the requested subject");
-      }
-    } else {
-      assertSameOAuthActor(stateRow, input.actor);
-    }
-    // The provider's report of a failure is only acted on once the callback is
-    // bound to a state Paperclip issued and to the actor that started the flow,
-    // so an unsolicited callback cannot drive this path at all. A denial is
-    // terminal for the attempt, so the state is consumed either way.
+    // Binding first, outcome second: the provider's report of a failure is only
+    // acted on once the callback is bound to a state Paperclip issued and to the
+    // actor that started the flow, so an unsolicited callback cannot drive any
+    // path here. Consuming the state up front is what makes a denial terminal —
+    // a refused request must not stay completable by a later code (PAP-17109).
+    const stateRow = await consumeOAuthState(input.state, input.actor);
     if (input.error) {
-      await db.delete(toolOauthStates).where(eq(toolOauthStates.state, input.state));
+      await rejectPendingOAuthInteraction(stateRow, input.actor);
       const providerError = normalizeOAuthProviderError(input.error);
       throw new HttpError(400, oauthProviderErrorMessage(providerError, "The authorization server denied the request."), {
         code: "oauth_authorization_denied",
         providerError,
       });
     }
+    // Neither a code nor an error is not a usable answer either. It still spends
+    // the request: the recovery is a fresh authorization, not a state left live
+    // waiting for a better callback.
     if (!input.code) throw badRequest("OAuth callback is missing a code");
-    await db.delete(toolOauthStates).where(eq(toolOauthStates.state, input.state));
 
     let connection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);
     const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
