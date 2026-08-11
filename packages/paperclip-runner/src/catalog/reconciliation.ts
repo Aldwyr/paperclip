@@ -110,7 +110,7 @@ const RECONCILIATION: Readonly<Record<string, ReconciliationRow>> = {
   list_documents: { realBindingStatus: "live_codex" },
   read_document: { realBindingStatus: "live_codex" },
   list_document_revisions: { realBindingStatus: "live_codex" },
-  report_progress: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipCommentOnIssue"] },
+  report_progress: { realBindingStatus: "live_codex", legacyAliases: ["mcp:paperclipAddComment"] },
   answer_status_question: { realBindingStatus: "live_codex" },
   write_document: { realBindingStatus: "live_codex" },
   request_human_input: { realBindingStatus: "live_codex" },

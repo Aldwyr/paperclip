@@ -135,10 +135,18 @@ describe("canonical semantic-catalog reconciliation authority", () => {
     const inventory = JSON.parse(raw.replace(/^#.*$/m, ""));
     expect(inventory.inventoryRole).toBe("legacy_alias_index");
     expect(inventory.rows.length).toBeGreaterThan(0);
+    const aliasIds = new Set<string>(inventory.rows.map((row: { id: string }) => row.id));
     for (const row of inventory.rows) {
       // Every alias is either folded into a native eval/operation or explicitly
       // dispositioned; a bare alias without a disposition fails the gate.
       expect(typeof row.foldedInto === "string" && row.foldedInto.length > 0).toBe(true);
+    }
+    // Every legacy alias named by the canonical authority must be a real
+    // inventory row, so a native-mapping note cannot reference a phantom alias.
+    for (const operation of CAPABILITY_CANONICAL_CATALOG) {
+      for (const alias of operation.legacyAliases) {
+        expect(aliasIds.has(alias)).toBe(true);
+      }
     }
   });
 });
