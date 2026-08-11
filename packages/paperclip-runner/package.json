@@ -75,6 +75,7 @@
     "check:capability-inventory": "node scripts/check-capability-inventory.mjs",
     "test:capability-inventory": "node scripts/check-capability-inventory.test.mjs",
     "test:capability-evals": "vitest run src/conformance/capability-eval-suite.test.ts",
+    "test:eval-slice": "vitest run src/eval",
     "report:capability-evals": "pnpm run build:typescript && node scripts/run-capability-eval-suite.mjs",
     "report:capability-live-evals": "pnpm run build:typescript && cargo build --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd && node scripts/run-capability-live-eval-matrix.mjs",
     "check:conformance-parity": "vitest run src/tracer/conformance-runner.test.ts && cargo test --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core runs_the_mock_core_path_with_stable_output && node -e \"process.stdout.write('Rust and TypeScript Conformance tracer output matches the shared golden fixture.\\n')\"",

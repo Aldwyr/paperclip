@@ -39,6 +39,7 @@ Each tutorial explains the capability it exercises and the contract it proves.
 - [Capability semantic tool catalog](capability-semantic-tools.md)
 - [Capability authorization and exposure](capability-authorization-and-exposure.md)
 - [Capability eval-derived conformance](capability-eval-conformance.md)
+- [Runner eval vertical slice (bundle + scoring)](capability-eval-slice.md)
 - [Capability browser scenario explorer](capability-scenario-explorer.md)
 - [Capability live runnerd/Codex loop](capability-live-runnerd-codex.md)
 - [Capability execution modes and identity (fake vs real Codex)](capability-execution-modes.md)

@@ -18,4 +18,5 @@ export * from "./generated/capability-contract.js";
 export * from "./semantic-tools/index.js";
 export * as acceptedCapabilitySemanticTools from "./semantic-tools/index.js";
 export * from "./catalog/index.js";
+export * from "./eval/index.js";
 export * from "./compatibility.js";
