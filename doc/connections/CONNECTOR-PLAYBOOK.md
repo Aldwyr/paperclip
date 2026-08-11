@@ -4,6 +4,19 @@ This playbook is the repeatable template for adding a vendor to the Apps catalog
 
 Use it when Paperclip acts on an external system through a governed connection: a stored credential, a capability catalog, access profiles and policy rules, and audit. Inbound integrations, such as an external client acting on Paperclip, use gateway or webhook guidance instead.
 
+**A catalog entry is a convenience layer, not a prerequisite.** Since
+[PAP-17087](/PAP/issues/PAP-17087), an operator can connect any
+standards-compliant remote HTTP MCP server from **Connect your own MCP server**
+or **Paste a config** with no Paperclip code change at all — including servers
+that need browser sign-in. Those two routes are the documented baseline; see
+[Connecting any remote MCP server](./GENERIC-REMOTE-MCP.md).
+
+Write a catalog entry when Paperclip should *promote* a vendor: branding, tailored
+fields, field validation, scoped defaults, and support copy. A definition adds
+those conveniences and nothing else. It must not create a second connection,
+change ownership, or be necessary for health, catalog, or governance — a curated
+route and the generic route converge on the same connection and review pipeline.
+
 Every connector built with this playbook is a **plane P2** connection — a resource token in the instance vault, acquired via the connect broker, never a sign-in authenticator. Before writing a connector, read [Identity vs. connections](./README.md#identity-vs-connections) for the P1/P2/P3 boundary and the D7 standing rule (sign-in tokens are never reused as resource tokens; id.paperclip.ing never stores resource tokens; no connections hub on the ID service).
 
 ## Output
@@ -210,6 +223,15 @@ most; the broker resolves endpoints at connect time:
    `authorization_endpoint`, `token_endpoint`, and — when the vendor supports
    dynamic registration — `registration_endpoint`.
 
+For an issuer that has a path, step 3 is tried in both the RFC 8414 insertion
+form (`/.well-known/oauth-authorization-server<path>`) and the widely deployed
+OIDC suffix form (`<path>/.well-known/oauth-authorization-server`), and a
+document whose `issuer` disagrees with the issuer used to build the URL is
+discarded. Authorization, token, and refresh requests all carry the RFC 8707
+`resource` indicator naming the canonical MCP endpoint, and RFC 9207 `iss` is
+validated against the persisted expected issuer when the authorization server
+returns it.
+
 The broker implements this in `discoverOAuthEndpoints`
 (`server/src/services/tool-access.ts`), but discovery is **not**
 unconditional. `oauthEndpointsForConnection` resolves endpoints in this
@@ -258,6 +280,24 @@ registers a client on the fly and stores it on the connection:
   broker uses them (`customer` ownership) and skips registration. List both
   `customer` and `dcr` in the method's `ownershipModes` when the vendor
   supports both.
+
+Since [PAP-17087](/PAP/issues/PAP-17087), DCR is **one of four** registration
+tiers, and `ownershipModes` gates only the *curated* path. The broker resolves a
+client in this order: a deployment-preconfigured client, then a Client ID
+Metadata Document when the authorization server advertises one (requires a public
+HTTPS `PAPERCLIP_PUBLIC_URL`), then DCR, then client credentials the operator
+preregistered and pasted in. A URL-only connection with no `AppDefinition` may
+use the CIMD and DCR tiers too, but only after validated protected-resource and
+authorization-server discovery produced a metadata document. Registered client
+material is bound to the issuer, MCP resource URL, callback URI, and company;
+when a binding moves, a Paperclip-minted client re-registers and an
+operator-supplied one asks the operator to re-enter it. Full detail in
+[Connecting any remote MCP server](./GENERIC-REMOTE-MCP.md#how-sign-in-gets-a-client).
+
+For a curated entry, `ownershipModes` still decides whether Paperclip may
+dynamically register on that vendor's behalf: omit `dcr` for a vendor that must
+not be auto-registered, and the broker will not fall through to the generic
+registration path for it.
 
 **DCR needs neither Paperclip ID nor Paperclip Connect.** DCR is always
 instance-local (ratified in the PAP-14828 connector-service spec, section 10

@@ -10,6 +10,15 @@ Paperclip connects to PostHog's hosted MCP service at
 Paperclip does not silently fall back from OAuth to an API key. The selected
 method is saved on the connection and reused for reconnects.
 
+This curated connection is the polished route and is what most users should use:
+it provides branding, project selection, read-only/feature/tool/mode controls,
+field validation, and tailored guidance. None of it is *required* to reach
+PostHog's MCP server. Since [PAP-17087](/PAP/issues/PAP-17087), PostHog can also
+be connected generically from **Connect your own MCP server** by pasting
+`https://mcp.posthog.com/mcp` — with a personal API key, with explicit headers, or
+through browser sign-in — with no Paperclip-specific code involved. See
+[Connecting any remote MCP server](./GENERIC-REMOTE-MCP.md).
+
 ## Service involvement
 
 PostHog hosts both the MCP resource and OAuth authorization service. Paperclip
