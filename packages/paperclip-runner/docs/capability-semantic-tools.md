@@ -17,8 +17,11 @@ list, not a disposition — they are never exposed as tools. See
 [capability disposition](capability-disposition.md) and
 [authorization and exposure](capability-authorization-and-exposure.md).
 
-The catalog holds **36 tools**: 14 always-agent tools and 22 optional tools
+The catalog holds **37 tools**: 14 always-agent tools and 23 optional tools
 across 10 groups.
+
+<!-- These counts are drift-checked against src/tools/capability-semantic-tool-catalog.ts
+by src/catalog/catalog-docs.test.ts; update the catalog, not the numbers. -->
 
 ### Always-agent tools (14)
 
@@ -27,7 +30,7 @@ across 10 groups.
 `finish_task`, `block_task`, `request_review`, `write_document`,
 `request_human_input`, `register_deliverable`, `inspect_operation_result`.
 
-### Optional tools (22), by group
+### Optional tools (23), by group
 
 | Group | Tools |
 | --- | --- |
