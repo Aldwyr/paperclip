@@ -19,12 +19,19 @@ const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 
 /**
- * Matches undici's `headersTimeout`/`bodyTimeout`, which the platform `fetch`
- * applied for free. Without it a remote server that accepts the connection and
- * then stays silent would hold the request open indefinitely — the OAuth callers
- * pass no `AbortSignal`, so nothing else would ever cut it loose.
+ * Stands in for undici's `headersTimeout`/`bodyTimeout`, which the platform
+ * `fetch` applied for free. Without it a remote server that accepts the
+ * connection and then stays silent would hold the request open indefinitely —
+ * the OAuth callers pass no `AbortSignal`, so nothing else would ever cut it
+ * loose (PAP-17110).
+ *
+ * Deliberately far tighter than undici's 300 s: everything that reaches this
+ * transport is metadata discovery, a token exchange, a DCR call or an MCP
+ * JSON-RPC round trip, none of which has any business taking minutes. Callers
+ * that own a longer budget — `tools/call`, which an operator can raise to 60 s —
+ * pass `responseTimeoutMs` so this default never truncates it.
  */
-const DEFAULT_RESPONSE_TIMEOUT_MS = 300_000;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
 
 /** How a verified socket is opened. Overridable so tests can simulate a rebind. */
 export type RemoteHttpSocketFactory = (target: {
@@ -115,15 +122,7 @@ async function pinnedRequest(
 
   signal?.throwIfAborted?.();
 
-  const socket = await openVerifiedSocket({
-    address: approved[0]!,
-    approvedSet,
-    port,
-    hostname,
-    useTls,
-    signal,
-    options,
-  });
+  const socket = await dialApprovedAddress({ approved, approvedSet, port, hostname, useTls, signal, options });
 
   try {
     return await sendRequest({
@@ -135,11 +134,51 @@ async function pinnedRequest(
       init,
       signal,
       responseTimeoutMs: options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
+      error: options.error,
     });
   } catch (error) {
     socket.destroy();
     throw error;
   }
+}
+
+/** An approved address that could not be reached, so the next one may be tried. */
+class UnreachableAddressError extends Error {
+  constructor(readonly reason: unknown) {
+    super("Remote MCP approved address was unreachable");
+  }
+}
+
+/**
+ * Try the approved addresses in resolution order.
+ *
+ * `fetch` walks every A/AAAA record before giving up, so pinning to `approved[0]`
+ * alone would break a multi-homed host whose first record happens to be dead. A
+ * peer that fails the address check is a different matter — that is the rebinding
+ * defence firing, not a reachability problem — so it fails closed immediately
+ * rather than moving down the list.
+ */
+async function dialApprovedAddress(input: {
+  approved: string[];
+  approvedSet: Set<string>;
+  port: number;
+  hostname: string;
+  useTls: boolean;
+  signal: AbortSignal | null;
+  options: GuardedRemoteHttpFetchOptions;
+}): Promise<Socket | TLSSocket> {
+  let lastReason: unknown;
+  for (const address of input.approved) {
+    input.signal?.throwIfAborted?.();
+    try {
+      return await openVerifiedSocket({ ...input, address });
+    } catch (error) {
+      if (!(error instanceof UnreachableAddressError)) throw error;
+      lastReason = error.reason;
+    }
+  }
+  throw lastReason
+    ?? input.options.error("Remote MCP endpoint could not be reached", "remote_http_connect_failed");
 }
 
 /**
@@ -163,7 +202,15 @@ async function openVerifiedSocket(input: {
 
   const raw = factory({ address, port, hostname, useTls });
 
-  await once(raw, "connect", { signal, timeoutMs: connectTimeoutMs, what: "connect to" });
+  try {
+    await once(raw, "connect", { signal, timeoutMs: connectTimeoutMs, what: "connect to" });
+  } catch (error) {
+    // A connect timeout used to leave the half-open socket behind, because
+    // nothing above this point owns it yet.
+    raw.destroy();
+    if (signal?.aborted) throw error;
+    throw new UnreachableAddressError(error);
+  }
 
   const peer = raw.remoteAddress ? normalizeIpAddress(raw.remoteAddress) : null;
   if (!peer || isPrivateOrReservedIp(peer) || !approvedSet.has(peer)) {
@@ -188,7 +235,8 @@ async function openVerifiedSocket(input: {
   } catch (error) {
     secure.destroy();
     raw.destroy();
-    throw error;
+    if (signal?.aborted) throw error;
+    throw new UnreachableAddressError(error);
   }
   return secure;
 }
@@ -202,8 +250,9 @@ async function sendRequest(input: {
   init: RequestInit;
   signal: AbortSignal | null;
   responseTimeoutMs: number;
+  error: RemoteHttpEndpointErrorFactory;
 }): Promise<Response> {
-  const { endpoint, hostname, port, useTls, socket, init, signal, responseTimeoutMs } = input;
+  const { endpoint, hostname, port, useTls, socket, init, signal, responseTimeoutMs, error } = input;
   const headers = new Headers(init.headers);
   const body = readRequestBody(init.body);
   const method = (init.method ?? "GET").toUpperCase();
@@ -237,7 +286,9 @@ async function sendRequest(input: {
     // Headers deadline. `req.setTimeout` is socket-idle based, which a server
     // that dribbles bytes could reset forever, so hold a hard timer instead.
     const headersTimer = setTimeout(() => {
-      req.destroy(new Error("Remote MCP endpoint did not send response headers in time"));
+      // Destroying the request tears the socket down too, so a silent peer costs
+      // neither a pending handler nor a leaked descriptor.
+      req.destroy(error("Remote MCP endpoint did not respond in time", "remote_http_response_timeout"));
     }, responseTimeoutMs);
     headersTimer.unref?.();
     req.on("response", () => clearTimeout(headersTimer));
@@ -249,8 +300,13 @@ async function sendRequest(input: {
   // Body idle deadline, mirroring undici's `bodyTimeout`: a stalled stream is
   // destroyed so `response.text()` rejects instead of hanging the caller.
   message.setTimeout(responseTimeoutMs, () => {
-    message.destroy(new Error("Remote MCP endpoint stalled while sending its response body"));
+    message.destroy(error("Remote MCP endpoint stalled mid-response", "remote_http_response_timeout"));
   });
+  // A finished response must not leave an armed socket timer behind, or a later
+  // reader of the same socket inherits a deadline it never asked for.
+  const disarm = () => message.setTimeout(0);
+  message.once("end", disarm);
+  message.once("close", disarm);
 
   const responseHeaders = new Headers();
   for (const [key, value] of Object.entries(message.headers)) {

@@ -3107,7 +3107,13 @@ export function createToolGatewayService(
             arguments: parameters ?? {},
           },
         }),
-      }, remoteHttpFetchOptions());
+      }, {
+        ...remoteHttpFetchOptions(),
+        // This call site owns a caller-set budget that can exceed the
+        // transport's default response deadline, so hand it down rather than
+        // letting the tighter default cut a legitimately slow tool short.
+        responseTimeoutMs: ms,
+      });
       const body = await readBoundedRemoteResponse(response);
       execution.response = {
         httpStatus: response.status,

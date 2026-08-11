@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
+import { connect as netConnect, createServer as netCreateServer, type AddressInfo, type Socket } from "node:net";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -79,18 +79,26 @@ function guardError(message: string, code: string) {
 function routingSocketFactory(routes: Record<string, number>): {
   factory: RemoteHttpSocketFactory;
   dialled: string[];
+  sockets: Socket[];
 } {
   const dialled: string[] = [];
+  const sockets: Socket[] = [];
   const factory: RemoteHttpSocketFactory = (target) => {
     dialled.push(target.address);
     const port = routes[target.address];
     if (port === undefined) throw new Error(`test network has no route to ${target.address}`);
     const socket = netConnect({ host: "127.0.0.1", port });
     openSockets.push(socket);
+    sockets.push(socket);
     Object.defineProperty(socket, "remoteAddress", { get: () => target.address, configurable: true });
     return socket;
   };
-  return { factory, dialled };
+  return { factory, dialled, sockets };
+}
+
+/** Waits for the socket bookkeeping the transport does after it rejects. */
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
 /** A name server that answers public first and loopback afterwards. */
@@ -309,9 +317,45 @@ describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
       socketFactory: network.factory,
       responseTimeoutMs: 150,
       error: guardError,
-    })).rejects.toThrow(/did not send response headers/);
+    })).rejects.toMatchObject({ code: "remote_http_response_timeout" });
 
+    // The deadline has to hand back the socket, not just the request handler:
+    // a bounded call that still leaks a descriptor per silent peer is the same
+    // exhaustion bug wearing a timer.
     expect(upstream.requests).toHaveLength(1);
+    await flush();
+    expect(network.sockets.map((socket) => socket.destroyed)).toEqual([true]);
+  });
+
+  it("gives up on a peer that dribbles response headers forever", async () => {
+    // This is why the headers deadline is a hard timer rather than
+    // `req.setTimeout`: an idle timeout never fires against this peer, because
+    // every trickled header line resets it.
+    const raw = netCreateServer((socket) => {
+      socket.write("HTTP/1.1 200 OK\r\n");
+      const beat = setInterval(() => socket.write("x-pad: keepalive\r\n"), 25);
+      const stop = () => clearInterval(beat);
+      socket.on("close", stop);
+      socket.on("error", stop);
+    });
+    await new Promise<void>((resolve) => raw.listen(0, "127.0.0.1", resolve));
+    const port = (raw.address() as AddressInfo).port;
+    const network = routingSocketFactory({ [PUBLIC_ADDRESS]: port });
+
+    try {
+      await expect(guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+        allowPrivateNetwork: false,
+        lookup: async () => [{ address: PUBLIC_ADDRESS, family: 4 }],
+        socketFactory: network.factory,
+        responseTimeoutMs: 150,
+        error: guardError,
+      })).rejects.toMatchObject({ code: "remote_http_response_timeout" });
+
+      await flush();
+      expect(network.sockets.map((socket) => socket.destroyed)).toEqual([true]);
+    } finally {
+      await new Promise<void>((resolve) => raw.close(() => resolve()));
+    }
   });
 
   it("gives up on a response body that stalls midway", async () => {
@@ -331,7 +375,64 @@ describe("guarded remote HTTP fetch (PAP-17098 DNS rebinding)", () => {
     });
 
     expect(response.status).toBe(200);
-    await expect(response.text()).rejects.toThrow();
+    await expect(response.text()).rejects.toMatchObject({ code: "remote_http_response_timeout" });
+    await flush();
+    expect(network.sockets.map((socket) => socket.destroyed)).toEqual([true]);
+  });
+
+  it("falls over to the next approved address when the first is unreachable", async () => {
+    // Pinning must not cost the failover `fetch` gave a multi-homed host: one
+    // dead A record should not take the connection down with it.
+    const upstream = await startServer();
+    const dead = await startServer();
+    // Close the listener so the address is routable but refuses connections.
+    await new Promise<void>((resolve) => dead.server.close(() => resolve()));
+    const network = routingSocketFactory({
+      "93.184.216.35": dead.port,
+      [PUBLIC_ADDRESS]: upstream.port,
+    });
+
+    const response = await guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+      allowPrivateNetwork: false,
+      lookup: async () => [
+        { address: "93.184.216.35", family: 4 },
+        { address: PUBLIC_ADDRESS, family: 4 },
+      ],
+      socketFactory: network.factory,
+      error: guardError,
+    });
+
+    await expect(response.json()).resolves.toEqual({ ok: true });
+    expect(network.dialled).toEqual(["93.184.216.35", PUBLIC_ADDRESS]);
+  });
+
+  it("fails closed instead of falling over when a peer fails the address check", async () => {
+    // Failover covers unreachable addresses only. A peer that answers from an
+    // unapproved address is the rebinding defence firing, and must not be
+    // retried past.
+    const internal = await startServer();
+    const upstream = await startServer();
+    const dialled: string[] = [];
+    const factory: RemoteHttpSocketFactory = (target) => {
+      dialled.push(target.address);
+      const socket = netConnect({ host: "127.0.0.1", port: internal.port });
+      openSockets.push(socket);
+      return socket;
+    };
+
+    await expect(guardedRemoteHttpFetch(`http://${REBIND_HOST}/mcp`, {}, {
+      allowPrivateNetwork: false,
+      lookup: async () => [
+        { address: "93.184.216.35", family: 4 },
+        { address: PUBLIC_ADDRESS, family: 4 },
+      ],
+      socketFactory: factory,
+      error: guardError,
+    })).rejects.toMatchObject({ code: "remote_http_private_endpoint" });
+
+    expect(dialled).toEqual(["93.184.216.35"]);
+    expect(internal.requests).toHaveLength(0);
+    expect(upstream.requests).toHaveLength(0);
   });
 
   it("still refuses a private IP literal before any transport runs", async () => {
