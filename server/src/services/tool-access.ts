@@ -541,7 +541,7 @@ export function normalizeConnectionMethodConfig(
   };
 }
 
-function projectedConnectionHeaders(connection: typeof toolConnections.$inferSelect): Record<string, string> {
+export function projectedConnectionHeaders(connection: typeof toolConnections.$inferSelect): Record<string, string> {
   const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string"
     ? connection.config.sourceTemplateKey
     : null;

@@ -72,10 +72,12 @@ values for either.
    execution tools remain quarantined, and unknown PostHog tools default to
    write risk until reviewed.
 
-The safe configuration is projected to PostHog as `project_id`, `readonly`,
-`features`, `tools`, and `mode` query parameters. PostHog documents these
-options in its [MCP overview](https://posthog.com/docs/model-context-protocol)
-and [MCP FAQ](https://posthog.com/docs/model-context-protocol/faq).
+Paperclip sends the project scope as the `x-posthog-project-id` managed header.
+It sends `readonly`, `features`, `tools`, and `mode` as query parameters. The
+managed header is identical during catalog discovery and tool execution, and a
+caller cannot override it. PostHog documents these options in its [MCP
+overview](https://posthog.com/docs/model-context-protocol) and [MCP
+FAQ](https://posthog.com/docs/model-context-protocol/faq).
 
 PostHog does not charge for MCP requests themselves, but the actions they
 perform can consume normal PostHog usage or AI credits.

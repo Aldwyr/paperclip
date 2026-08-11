@@ -41,8 +41,8 @@
             "maxLength": 32
           },
           "transport": {
-            "location": "query",
-            "name": "project_id"
+            "location": "header",
+            "name": "x-posthog-project-id"
           }
         },
         {
@@ -153,8 +153,8 @@
             "maxLength": 32
           },
           "transport": {
-            "location": "query",
-            "name": "project_id"
+            "location": "header",
+            "name": "x-posthog-project-id"
           }
         },
         {

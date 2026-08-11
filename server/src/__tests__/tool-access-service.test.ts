@@ -2698,9 +2698,12 @@ describeEmbeddedPostgres("tool access service", () => {
     }, { actorType: "user", actorId: "board" });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://mcp.posthog.com/mcp?project_id=12345&readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
+      "https://mcp.posthog.com/mcp?readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
       expect.objectContaining({
-        headers: expect.objectContaining({ Authorization: "Bearer phx_test-secret" }),
+        headers: expect.objectContaining({
+          Authorization: "Bearer phx_test-secret",
+          "x-posthog-project-id": "12345",
+        }),
       }),
     );
     expect(result.connection).toMatchObject({
@@ -7184,7 +7187,8 @@ describe("normalizeConnectionMethodConfig", () => {
         tools: "query_insight",
         mode: "tools",
       },
-      url: "https://mcp.posthog.com/mcp?project_id=12345&readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
+      url: "https://mcp.posthog.com/mcp?readonly=true&features=insights%2Cerror_tracking&tools=query_insight&mode=tools",
+      headers: { "x-posthog-project-id": "12345" },
     });
     expect(() => normalizeConnectionMethodConfig(apiKeyMethod, {
       projectId: "not-a-project",
