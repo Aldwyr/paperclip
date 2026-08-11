@@ -112,8 +112,35 @@ function capabilityCookie(request, surface, value, maxAgeSeconds = CAPABILITY_MA
   }; SameSite=Strict`;
 }
 
-async function loadRunner() {
-  return import(new URL("../dist/index.js", import.meta.url).href);
+async function importDistRunnerModule(relativePath) {
+  return import(new URL(`../dist/${relativePath}`, import.meta.url).href);
+}
+
+export async function loadCapabilityIssueThreadRunner(importModule = importDistRunnerModule) {
+  const [cleanRoom, liveSession, turnStream, issueThread, fixtureState, liveConsole] =
+    await Promise.all([
+      importModule("live/clean-room.js"),
+      importModule("live/live-session.js"),
+      importModule("live/turn-stream.js"),
+      importModule("issue-thread/index.js"),
+      importModule("mock-core/capability-control-plane-types.js"),
+      importModule("mock-core/live-console-demo-server.js"),
+    ]);
+
+  // This package-owned server intentionally depends on private demo/live modules.
+  // Keep that dependency explicit instead of widening the package's public root.
+  return {
+    CAPABILITY_TURN_STREAM_HEADERS: turnStream.CAPABILITY_TURN_STREAM_HEADERS,
+    CAPABILITY_TURN_STREAM_SCHEMA: turnStream.CAPABILITY_TURN_STREAM_SCHEMA,
+    CapabilityLiveSessionService: liveSession.CapabilityLiveSessionService,
+    InMemoryCapabilityLiveSessionStore: liveSession.InMemoryCapabilityLiveSessionStore,
+    assertLiveConsoleLoopbackBindHost: liveConsole.assertLiveConsoleLoopbackBindHost,
+    createCapabilityCleanRoomSessionInput: cleanRoom.createCapabilityCleanRoomSessionInput,
+    createCapabilityFixtureState: fixtureState.createCapabilityFixtureState,
+    encodeCapabilityTurnStreamFrame: turnStream.encodeCapabilityTurnStreamFrame,
+    projectCapabilityIssueThread: issueThread.projectCapabilityIssueThread,
+    toCapabilityPublicThreadView: issueThread.toCapabilityPublicThreadView,
+  };
 }
 
 function scratchRoot() {
@@ -174,7 +201,7 @@ class RouteError extends Error {
 }
 
 export function createCapabilityIssueThreadMiddleware(options = {}) {
-  const load = options.loadRunner ?? loadRunner;
+  const load = options.loadRunner ?? loadCapabilityIssueThreadRunner;
   const workingDirectoryRoot = options.scratchRoot ?? scratchRoot();
   let bootstrap = null;
   let bindHost = options.bindHost ?? "127.0.0.1";

@@ -475,11 +475,29 @@ let scratchParent: string;
 let scratchRoot: string;
 const requestedUrls: string[] = [];
 
+const sourceRunnerModuleLoaders: Record<string, () => Promise<unknown>> = {
+  "live/clean-room.js": async () => await import("./clean-room.js"),
+  "live/live-session.js": async () => await import("./live-session.js"),
+  "live/turn-stream.js": async () => await import("./turn-stream.js"),
+  "issue-thread/index.js": async () => await import("../issue-thread/index.js"),
+  "mock-core/capability-control-plane-types.js": async () =>
+    await import("../mock-core/capability-control-plane-types.js"),
+  "mock-core/live-console-demo-server.js": async () =>
+    await import("../mock-core/live-console-demo-server.js"),
+};
+
+async function loadSourceRunnerModule(relativePath: string): Promise<unknown> {
+  const load = sourceRunnerModuleLoaders[relativePath];
+  if (load === undefined) throw new Error(`Unexpected runner module: ${relativePath}`);
+  return await load();
+}
+
 async function createMiddleware(state: FakeProviderState, root: string) {
   const module = await import("../../scripts/capability-issue-thread-server.mjs");
   return module.createCapabilityIssueThreadMiddleware({
     bindHost: "127.0.0.1",
-    loadRunner: async () => await import("../index.js"),
+    loadRunner: async () =>
+      await module.loadCapabilityIssueThreadRunner(loadSourceRunnerModule),
     scratchRoot: root,
     transportFactory: fakeTransportFactory(state),
   });
