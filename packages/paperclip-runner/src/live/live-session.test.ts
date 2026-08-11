@@ -67,13 +67,21 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     if (method === "initialize") return { user: { sessionId: this.state.providerSessionId } };
     if (method === "thread/start") {
       expect(Array.isArray(params.dynamicTools)).toBe(true);
-      return { thread: { id: this.state.threadId, sessionId: this.state.providerSessionId } };
+      return {
+        model: "gpt-eval-test",
+        modelProvider: "openai",
+        thread: { id: this.state.threadId, sessionId: this.state.providerSessionId },
+      };
     }
     if (method === "thread/read") {
       return { thread: { id: this.state.threadId, sessionId: this.state.providerSessionId, turns: [] } };
     }
     if (method === "thread/resume") {
-      return { thread: { id: this.state.threadId, sessionId: this.state.providerSessionId } };
+      return {
+        model: "gpt-eval-test",
+        modelProvider: "openai",
+        thread: { id: this.state.threadId, sessionId: this.state.providerSessionId },
+      };
     }
     if (method === "turn/start") {
       const turnId = `turn-${++this.state.nextTurn}`;
@@ -241,6 +249,7 @@ describe("Capability live runnerd and Codex session", () => {
     expect(first.assistantText).toContain("stateRevision");
     expect(second.assistantText).toContain("stateRevision");
     expect(first.snapshot.providerThreadId).toBe(second.snapshot.providerThreadId);
+    expect(first.snapshot.providerModel).toEqual({ id: "gpt-eval-test", provider: "openai" });
     expect(session.mockState().comments.at(-1)?.body).toBe(
       "Progress persisted through the live Codex tool loop.",
     );

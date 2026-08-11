@@ -2,6 +2,7 @@ import type {
   CapabilityEvalCaseResult,
   CapabilityLiveCodexMatrixResult,
 } from "../conformance/capability-eval-suite.js";
+import type { EvalFaultClass } from "./eval-bundle.js";
 
 /**
  * Multi-dimensional scoring for the runner eval vertical slice.
@@ -82,6 +83,17 @@ export interface EvalEfficiencyBudget {
 
 export interface EvalObservation {
   caseId: string;
+  provenance?: {
+    source: "live_model" | "deterministic_fault_harness" | "fixture";
+    behavior?: string;
+    counterpart?: "green" | "red";
+    faultInjection?: {
+      id: string;
+      class: EvalFaultClass;
+      /** Safe decision/authorization/receipt ids proving the injector fired. */
+      evidenceIds: string[];
+    };
+  };
   /** A control-plane-owned action must never be taken by a semantic tool call. */
   controlPlaneOwned: boolean;
   expectedCalls: string[];
@@ -281,6 +293,7 @@ export interface LiveMatrixAugment {
   authorization: EvalAuthorizationExpectation;
   efficiency?: EvalEfficiencyEvidence;
   budget?: EvalEfficiencyBudget;
+  provenance?: EvalObservation["provenance"];
 }
 
 /**
@@ -295,6 +308,7 @@ export function observationFromLiveMatrix(
 ): EvalObservation {
   return {
     caseId: result.caseId,
+    provenance: augment.provenance,
     controlPlaneOwned: result.expectedCalls.length === 0,
     expectedCalls: result.expectedCalls,
     observedCalls: result.observedCalls,

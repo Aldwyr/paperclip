@@ -11,7 +11,8 @@ import { createHash } from "node:crypto";
  *
  * The bundle is a *declaration*, not a live secret store: it must never carry a
  * credential, hidden company identifier, or raw secret payload. Grants are typed
- * grant strings (`domain:resource:action`), not secret material. Callers should
+ * canonical claim strings (`domain:action` or `domain:resource:action`), not
+ * secret material. Callers should
  * run {@link assertBundleSecretFree} before persisting a bundle as evidence.
  */
 export const EVAL_BUNDLE_SCHEMA = "paperclip.runner.eval-bundle.v1" as const;
@@ -82,7 +83,7 @@ export interface EvalBundle {
   model: EvalBundleModel;
   launchContext: EvalBundleLaunchContext;
   promptPolicy: EvalBundlePromptPolicy;
-  /** Typed grant strings (`domain:resource:action`) unlocked for the candidate. */
+  /** Typed canonical claim strings unlocked for the candidate. */
   grants: string[];
   runner: EvalBundleRunner;
   controlPlaneAdapter: EvalBundleControlPlaneAdapter;
@@ -141,9 +142,9 @@ const SECRET_VALUE_PATTERNS: Array<{ id: string; pattern: RegExp }> = [
  */
 export function assertBundleSecretFree(bundle: EvalBundle): void {
   for (const grant of bundle.grants) {
-    if (!/^[a-z0-9]+(:[a-z0-9_]+){2}$/.test(grant)) {
+    if (!/^[a-z0-9_]+(?::[a-z0-9_]+){1,2}$/.test(grant)) {
       throw new EvalBundleSecretError(
-        `grant "${grant}" is not a typed domain:resource:action grant`,
+        `grant "${grant}" is not a typed canonical capability claim`,
         "grants",
       );
     }

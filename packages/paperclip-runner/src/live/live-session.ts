@@ -101,6 +101,8 @@ export interface CapabilityLiveSessionSnapshot {
   sessionId: string;
   providerThreadId: string;
   providerSessionId: string | null;
+  /** Safe provider identity retained for reproducible eval bundle declarations. */
+  providerModel?: { id: string; provider: string };
   status: CapabilityLiveSessionStatus;
   activeTurnId: string | null;
   createdAt: string;
@@ -440,6 +442,7 @@ export class CapabilityLiveSession {
   #processEvidence: CapabilityRunnerdProcessEvidence | null = null;
   #providerThreadId = "";
   #providerSessionId: string | null = null;
+  #providerModel: { id: string; provider: string } | undefined;
   #status: CapabilityLiveSessionStatus = "starting";
   #activeTurnId: string | null = null;
   #revision = 0;
@@ -471,6 +474,9 @@ export class CapabilityLiveSession {
     this.#priorAuthorizationRecords = structuredClone(options.snapshot?.authorizationRecords ?? []);
     this.#providerThreadId = options.snapshot?.providerThreadId ?? "";
     this.#providerSessionId = options.snapshot?.providerSessionId ?? null;
+    this.#providerModel = options.snapshot?.providerModel === undefined
+      ? undefined
+      : structuredClone(options.snapshot.providerModel);
     this.#activeTurnId = options.snapshot?.activeTurnId ?? null;
     this.#revision = options.snapshot?.revision ?? 0;
     this.#entryCounter = this.#transcript.length + this.#evidence.length;
@@ -600,6 +606,9 @@ export class CapabilityLiveSession {
       sessionId: this.id,
       providerThreadId: this.#providerThreadId,
       providerSessionId: this.#providerSessionId,
+      ...(this.#providerModel === undefined
+        ? {}
+        : { providerModel: structuredClone(this.#providerModel) }),
       status: this.#status,
       activeTurnId: this.#activeTurnId,
       createdAt: this.#createdAt,
@@ -818,6 +827,7 @@ export class CapabilityLiveSession {
         throw new Error("Codex reconnect resumed a different provider thread");
       }
       this.#providerSessionId = text(resumedThread.sessionId) || this.#providerSessionId;
+      this.#captureProviderModel(resumed);
       this.#activeTurnId = null;
     } else {
       const opened = await this.#transport.request("thread/start", {
@@ -835,6 +845,7 @@ export class CapabilityLiveSession {
       this.#providerThreadId = text(thread.id);
       if (this.#providerThreadId.length === 0) throw new Error("Codex thread response omitted thread.id");
       this.#providerSessionId = text(thread.sessionId) || text(record(initialized.user).sessionId) || null;
+      this.#captureProviderModel(opened);
     }
     this.#status = "idle";
     this.#appendEvidence("session", null, {
@@ -848,6 +859,13 @@ export class CapabilityLiveSession {
     });
     this.#pump = this.#pumpNotifications();
     await this.#persist();
+  }
+
+  #captureProviderModel(response: Record<string, unknown>): void {
+    const thread = record(response.thread);
+    const id = text(response.model, text(thread.model));
+    const provider = text(response.modelProvider, text(thread.modelProvider));
+    if (id.length > 0 && provider.length > 0) this.#providerModel = { id, provider };
   }
 
   async #disconnect(reason: string): Promise<void> {

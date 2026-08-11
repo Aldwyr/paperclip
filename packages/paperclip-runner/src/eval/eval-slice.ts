@@ -103,10 +103,16 @@ export function buildEvalSliceReport(
 /** A compact, human-readable rendering of a slice report for inspection. */
 export function renderEvalSliceMarkdown(report: EvalSliceReport): string {
   const lines: string[] = [];
+  const sources = new Set(report.cases.map((entry) => entry.observation.provenance?.source));
+  const sourceDescription = report.generatedFromLiveModel
+    ? "real model tool choice"
+    : sources.size === 1 && sources.has("deterministic_fault_harness")
+      ? "deterministic fault harness"
+      : "fixture observations";
   lines.push(`# Runner eval slice — ${report.bundle.id}`);
   lines.push("");
   lines.push(`- Bundle: \`${report.bundle.summary}\``);
-  lines.push(`- Source: ${report.generatedFromLiveModel ? "real model tool choice" : "fixture observations"}`);
+  lines.push(`- Source: ${sourceDescription}`);
   lines.push(
     `- Cases: ${report.aggregate.caseCount} · passed ${report.aggregate.passed} · gate failures ${report.aggregate.gateFailures} · mean overall ${report.aggregate.meanOverall}`,
   );
@@ -119,12 +125,13 @@ export function renderEvalSliceMarkdown(report: EvalSliceReport): string {
   lines.push("");
   lines.push("## Cases");
   lines.push("");
-  lines.push("| case | gate | overall | outcome | trajectory | trace | efficiency |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- |");
-  for (const { scorecard } of report.cases) {
+  lines.push("| case | source | counterpart | fault | gate | overall | outcome | trajectory | trace | efficiency |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const { scorecard, observation } of report.cases) {
     const d = scorecard.dimensions;
+    const provenance = observation.provenance;
     lines.push(
-      `| ${scorecard.caseId} | ${d.hard_invariants.passed ? "ok" : "FAIL"} | ${scorecard.overall.score} | ${d.semantic_outcome.score} | ${d.trajectory_restraint.score} | ${d.trace_completeness.score} | ${d.quality_efficiency.score} |`,
+      `| ${scorecard.caseId} | ${provenance?.source ?? "unspecified"} | ${provenance?.counterpart ?? "—"} | ${provenance?.faultInjection?.class ?? "—"} | ${d.hard_invariants.passed ? "ok" : "FAIL"} | ${scorecard.overall.score} | ${d.semantic_outcome.score} | ${d.trajectory_restraint.score} | ${d.trace_completeness.score} | ${d.quality_efficiency.score} |`,
     );
   }
   lines.push("");

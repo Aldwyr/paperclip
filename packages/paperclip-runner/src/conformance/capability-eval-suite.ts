@@ -58,7 +58,33 @@ export interface CapabilityLiveCodexMatrixResult {
   forbiddenCalls: string[];
   observedCalls: string[];
   finalState: { expected: "unchanged" | "mutated"; observed: "unchanged" | "mutated" };
+  providerModel: { id: string; provider: string };
+  /** Browser-safe evidence retained from the live-session snapshot for scoring. */
+  scoringEvidence: {
+    trace: {
+      runId: string;
+      sessionId: string;
+      turnId: string;
+      itemId: string;
+      receiptIds: string[];
+      terminalPresent: boolean;
+    };
+    authorization: {
+      expected: "allowed" | "denied" | "absent";
+      observed: "allowed" | "denied" | "absent";
+    };
+    efficiency: { latencyMs: number; attempts: number };
+    budget: { maxLatencyMs: number; maxAttempts: number };
+  };
 }
+
+/** One fixed candidate grant set shared by every live-matrix case. */
+export const CAPABILITY_LIVE_EVAL_GRANTS = Object.freeze([
+  "delegation:tasks:create",
+  "discovery:agents:read",
+  "discovery:tasks:read",
+  "governance:approvals:request",
+]);
 
 export interface CapabilityEvalParityReport {
   schema: "paperclip.capability.eval-parity-report.v1";
@@ -284,9 +310,11 @@ export async function runCapabilityLiveCodexMatrix(
     const service = new CapabilityLiveSessionService();
     const session = await service.create({
       workingDirectory,
-      seed: liveFixtureSeed(plan.grants),
-      capabilities: capabilityFixtureRunCapabilities(plan.grants),
-      explicitClaims: plan.grants,
+      seed: liveFixtureSeed(CAPABILITY_LIVE_EVAL_GRANTS),
+      capabilities: capabilityFixtureRunCapabilities(CAPABILITY_LIVE_EVAL_GRANTS),
+      explicitClaims: [...CAPABILITY_LIVE_EVAL_GRANTS],
+      runId: `run-capability-live-${row.id}`,
+      sessionId: `session-capability-live-${row.id}`,
       turnTimeoutMs: 60_000,
       scenario: { id: `capability-live-eval-${row.id}` },
     });
@@ -300,16 +328,23 @@ export async function runCapabilityLiveCodexMatrix(
       const prompt = expectedCalls.length === 0
         ? "Do not call any tools. Reply with exactly: control-plane-owned."
         : `Call ${plan.operationId} exactly once with this JSON input: ${JSON.stringify(liveInput)}. Do not call any other tool. Reply after the typed result.`;
-      await session.sendMessage(prompt);
-      const snapshot = session.snapshot();
+      const turnStartedAt = Date.now();
+      const turn = await session.sendMessage(prompt);
+      const latencyMs = Date.now() - turnStartedAt;
+      const snapshot = turn.snapshot;
       const observedCalls = snapshot.evidence
         .filter((entry) => entry.kind === "tool_call")
         .map((entry) => String(entry.data.operationId));
       const expectedState = operationMutatesState(plan.operationId) ? "mutated" : "unchanged";
       const observedState = snapshot.mockState === initialMockState ? "unchanged" : "mutated";
-      if (JSON.stringify(observedCalls) !== JSON.stringify(expectedCalls) || observedState !== expectedState) {
+      if (
+        turn.status !== "completed" ||
+        JSON.stringify(observedCalls) !== JSON.stringify(expectedCalls) ||
+        observedState !== expectedState
+      ) {
         throw new Error(JSON.stringify({
           caseId: row.id,
+          turnStatus: turn.status,
           expectedCalls,
           observedCalls,
           expectedState,
@@ -317,6 +352,23 @@ export async function runCapabilityLiveCodexMatrix(
           toolResults: snapshot.evidence.filter((entry) => entry.kind === "tool_result").map((entry) => entry.data.result),
         }));
       }
+      if (snapshot.providerModel === undefined) {
+        throw new Error(`live Codex case ${row.id} did not report its provider model identity`);
+      }
+      const invocationRecords = snapshot.authorizationRecords.filter(
+        (record) => record.phase === "invocation" && record.callId !== null,
+      );
+      const observedAuthorization = observedCalls.length === 0
+        ? "absent"
+        : invocationRecords.every((record) => record.allowed)
+          ? "allowed"
+          : "denied";
+      const toolReceipts = snapshot.evidence.filter((entry) => entry.kind === "tool_result");
+      const itemId = snapshot.evidence.find((entry) => entry.kind === "tool_call")?.id
+        ?? snapshot.transcript.find(
+          (entry) => entry.role === "assistant" && entry.turnId === turn.turnId,
+        )?.id
+        ?? `turn:${turn.turnId}:terminal`;
       matrix.push({
         caseId: row.id,
         group,
@@ -325,6 +377,23 @@ export async function runCapabilityLiveCodexMatrix(
         forbiddenCalls: row.forbiddenSemantics,
         observedCalls,
         finalState: { expected: expectedState, observed: observedState },
+        providerModel: snapshot.providerModel,
+        scoringEvidence: {
+          trace: {
+            runId: snapshot.authority.runId,
+            sessionId: snapshot.sessionId,
+            turnId: turn.turnId,
+            itemId,
+            receiptIds: toolReceipts.map((entry) => entry.id),
+            terminalPresent: true,
+          },
+          authorization: {
+            expected: expectedCalls.length === 0 ? "absent" : "allowed",
+            observed: observedAuthorization,
+          },
+          efficiency: { latencyMs, attempts: 1 },
+          budget: { maxLatencyMs: 60_000, maxAttempts: 1 },
+        },
       });
     } finally {
       await service.shutdown(session.id, `Capability live eval ${row.id} complete`);
@@ -333,7 +402,7 @@ export async function runCapabilityLiveCodexMatrix(
   return matrix;
 }
 
-function liveFixtureSeed(actorGrants: string[]): CapabilityFixtureSeed {
+function liveFixtureSeed(actorGrants: readonly string[]): CapabilityFixtureSeed {
   return {
     actors: [{
       id: "actor-1",
@@ -342,7 +411,7 @@ function liveFixtureSeed(actorGrants: string[]): CapabilityFixtureSeed {
       role: "engineer",
       status: "active",
       budgetId: "budget-actor-1",
-      capabilityGrants: actorGrants,
+      capabilityGrants: [...actorGrants],
     }],
   };
 }
