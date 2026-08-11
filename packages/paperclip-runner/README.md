@@ -13,6 +13,18 @@ session and issue-thread surfaces, a public browser/React SDK, a standalone
 adapter demo, and a deterministic mock control plane. None of these surfaces
 imports or starts Paperclip's server, UI, CLI, or production database.
 
+## Public package surfaces
+
+- `@paperclipai/paperclip-runner` — production contracts, clients/backends,
+  PRP validation/replay, canonical catalog/dispatcher, and compatibility check.
+- `@paperclipai/paperclip-runner/testing` — deterministic mocks plus PRP and
+  semantic conformance kits. Tests and Paperclip Evals import this explicitly.
+- `@paperclipai/paperclip-eval-kernel` — separately packed generic eval matrix
+  orchestration, permitted in Paperclip App only as a development dependency.
+
+The package root has no mock or scenario exports, and no Paperclip Evals runtime
+dependency. See [ADR 0001](docs/adr/0001-runner-testing-eval-package-boundaries.md).
+
 ## Quick start
 
 From the repository root:
@@ -84,6 +96,8 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 | `check:forbidden-imports` | Reject TypeScript imports and Cargo path dependencies that cross into Paperclip core. |
 | `check:tracked-imports` | Reject tracked imports and `package.json` entry points that only resolve against untracked files, so a clean checkout of any commit builds. |
 | `check:numbered-milestones` | Reject numbered construction-milestone names in tracked package paths and source. |
+| `check:package-boundaries` | Enforce the acyclic runtime/testing/eval dependency and manifest boundary. |
+| `check:clean-consumers` | Pack runner and eval-kernel tarballs and install them in two clean consumers. |
 | `check:conformance-parity` | Require byte-for-byte equivalent Rust and TypeScript tracer output. |
 | `check:replay-goldens` | Require all reducer snapshots and cross-language summaries to match checked goldens. |
 | `check:replay-parity` | Run TypeScript and Rust against the same Replay fixture summaries. |
@@ -121,6 +135,7 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 ## Navigate
 
 - [Architecture and dependency boundary](docs/architecture.md)
+- [ADR 0001: runner, testing, and eval package boundaries](docs/adr/0001-runner-testing-eval-package-boundaries.md)
 - [Tutorial index](docs/index.md)
 - [Conformance hand-run tutorial](docs/tutorials/conformance-standalone-tracer.md)
 - [Replay hand-run tutorial](docs/tutorials/replay.md)

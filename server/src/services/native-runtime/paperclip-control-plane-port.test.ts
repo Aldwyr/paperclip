@@ -20,16 +20,18 @@ import {
   workAssessments,
 } from "@paperclipai/db";
 import {
-  CONTROL_PLANE_CONFORMANCE_RESULT,
-  CONTROL_PLANE_CONFORMANCE_TERMINAL,
-  CONTROL_PLANE_CONFORMANCE_OPEN,
   executeNativeSession,
-  runControlPlanePortConformance,
   type NativeSessionBackend,
   type PrpEvent,
   type PrpStructuredRunResult,
   type PrpTerminalState,
 } from "@paperclipai/paperclip-runner";
+import {
+  CONTROL_PLANE_CONFORMANCE_RESULT,
+  CONTROL_PLANE_CONFORMANCE_TERMINAL,
+  CONTROL_PLANE_CONFORMANCE_OPEN,
+  runControlPlanePortConformance,
+} from "@paperclipai/paperclip-runner/testing";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";

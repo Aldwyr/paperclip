@@ -17,7 +17,7 @@ import {
   CONTROL_PLANE_CONFORMANCE_OPEN,
   CONTROL_PLANE_CONFORMANCE_RESULT,
   CONTROL_PLANE_CONFORMANCE_TERMINAL,
-} from "@paperclipai/paperclip-runner";
+} from "@paperclipai/paperclip-runner/testing";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { reconcileNativeFinalizations } from "../services/native-runtime/native-finalization-reconciler.js";
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";

@@ -29,7 +29,7 @@ the separate skillless, network-disabled workspace permission profile.
 Import the package root and construct `CapabilityLiveSessionService`:
 
 ```ts
-import { CapabilityLiveSessionService } from "@paperclipai/paperclip-runner";
+import { CapabilityLiveSessionService } from "@paperclipai/paperclip-runner/testing";
 
 const service = new CapabilityLiveSessionService({ store });
 const session = await service.create({ workingDirectory });

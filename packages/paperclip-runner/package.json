@@ -9,6 +9,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    },
     "./browser": {
       "types": "./dist/browser/index.d.ts",
       "import": "./dist/browser/index.js"
@@ -65,6 +69,8 @@
     "check:forbidden-imports": "node scripts/check-forbidden-imports.mjs",
     "check:tracked-imports": "node scripts/check-tracked-imports.mjs",
     "check:numbered-milestones": "node scripts/check-numbered-milestones.mjs",
+    "check:package-boundaries": "node scripts/check-package-boundaries.mjs",
+    "check:clean-consumers": "node scripts/check-clean-consumers.mjs",
     "generate:capability-inventory": "node scripts/generate-capability-inventory.mjs",
     "check:capability-inventory": "node scripts/check-capability-inventory.mjs",
     "test:capability-inventory": "node scripts/check-capability-inventory.test.mjs",
@@ -105,12 +111,23 @@
     "console:sdk": "pnpm run build:typescript && vite --config vite.sdk.config.ts --host 127.0.0.1 --port 4181",
     "browser:dev": "pnpm run build:typescript && pnpm run build:runner-binaries && vite --config vite.config.ts",
     "browser:preview": "vite preview --config vite.config.ts",
-    "verify": "pnpm run build && pnpm run typecheck && pnpm run check:replay-goldens && pnpm run test && pnpm run test:sdk && pnpm run test:scenarios && pnpm run check:browser-tokens && pnpm run test:browser && pnpm run test:browser:sdk && pnpm run test:browser:scenarios && pnpm run check:forbidden-imports && pnpm run check:tracked-imports && pnpm run check:numbered-milestones && pnpm run docs:validate && pnpm run check:conformance-parity && pnpm run check:replay-parity && pnpm run trace:conformance && pnpm run replay:fixture && pnpm run trace:local-runner -- --quiet && pnpm run trace:durable-recovery",
+    "verify": "pnpm run build && pnpm run typecheck && pnpm run check:replay-goldens && pnpm run test && pnpm run test:sdk && pnpm run test:scenarios && pnpm run check:browser-tokens && pnpm run test:browser && pnpm run test:browser:sdk && pnpm run test:browser:scenarios && pnpm run check:forbidden-imports && pnpm run check:tracked-imports && pnpm run check:numbered-milestones && pnpm run check:package-boundaries && pnpm run check:clean-consumers && pnpm run docs:validate && pnpm run check:conformance-parity && pnpm run check:replay-parity && pnpm run trace:conformance && pnpm run replay:fixture && pnpm run trace:local-runner -- --quiet && pnpm run trace:durable-recovery",
     "verify:rootless": "bash scripts/verify-rootless-linux.sh"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0"
   },
   "peerDependencies": {
     "react": ">=18",
     "react-dom": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -118,7 +135,6 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^4.7.0",
-    "ajv": "^8.20.0",
     "axe-core": "^4.12.1",
     "json-schema-to-ts": "^3.1.1",
     "react": "^19.2.7",

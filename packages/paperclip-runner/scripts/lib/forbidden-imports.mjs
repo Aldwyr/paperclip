@@ -82,10 +82,12 @@ function isForbiddenBrowserPackage(specifier) {
 function violationReason({ file, packageRoot, specifier }) {
   const relativeFile = relative(packageRoot, file).split(/[\\/]/).join("/");
   const isExampleConsumer = relativeFile.startsWith("examples/");
+  const isCleanConsumerHarness = relativeFile === "scripts/check-clean-consumers.mjs";
   const publicRunnerImports = new Set([
     "@paperclipai/paperclip-runner/browser",
     "@paperclipai/paperclip-runner/react",
     "@paperclipai/paperclip-runner/standalone",
+    "@paperclipai/paperclip-runner/testing",
     "@paperclipai/paperclip-runner/styles.css",
   ]);
   if (
@@ -102,6 +104,12 @@ function violationReason({ file, packageRoot, specifier }) {
     specifier !== "@paperclipai/paperclip-runner" &&
     !publicRunnerImports.has(specifier)
   ) {
+    if (
+      isCleanConsumerHarness
+      && specifier === "@paperclipai/paperclip-eval-kernel"
+    ) {
+      return null;
+    }
     return "Paperclip workspace packages are outside the standalone boundary";
   }
 

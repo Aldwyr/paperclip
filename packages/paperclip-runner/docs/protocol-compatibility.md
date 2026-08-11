@@ -111,3 +111,15 @@ and deployment policy remain separately reviewed work.
 
 Breaking changes require a new required version. Additive optional fields may
 remain in v1 only when old consumers can safely ignore them.
+
+## Package-level compatibility
+
+PRP is one independently versioned component of the runner bundle. Catalog,
+runner-client, control-plane-adapter, testkit, and eval-corpus compatibility is
+declared by `PAPERCLIP_RUNNER_COMPATIBILITY` and checked before execution by
+`assertPaperclipRunnerCompatibility`. A mismatch fails with
+`paperclip_runner_incompatible` and stable per-issue codes; a provider-specific
+tool error is not a compatibility negotiation mechanism.
+
+See [ADR 0001](adr/0001-runner-testing-eval-package-boundaries.md) for the
+component rules and clean-consumer packaging gate.

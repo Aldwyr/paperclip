@@ -13,11 +13,26 @@
                                       v
                          byte-identical Conformance result
 
-Paperclip core (later) --> implements ControlPlanePort / NativeSessionBackend
+Paperclip App production binding --> implements ControlPlanePort
+Paperclip Evals --> consumes packed runtime + ./testing exports
 ```
 
 The dependency arrow always points from an implementation toward a contract.
 The standalone package does not reach backward into a Paperclip implementation.
+The production implementation lives in
+`server/src/services/native-runtime/paperclip-control-plane-port.ts`; it depends
+on the public port, never the reverse. The accepted package/export ownership is
+recorded in [ADR 0001](adr/0001-runner-testing-eval-package-boundaries.md).
+
+## Public package surfaces
+
+- The package root is runtime-only: PRP, runner/client contracts, normalized
+  backends, catalog/dispatcher, and compatibility preflight.
+- `./testing` contains deterministic mocks and conformance kits.
+- `@paperclipai/paperclip-eval-kernel` contains generic orchestration only and
+  is permitted in App CI/tests as a development dependency, never at runtime.
+- Paperclip Evals owns scenario content, matrices, provider configuration,
+  scoring, and reports.
 
 ## Core contracts
 

@@ -23,14 +23,16 @@ import {
   workAssessments,
 } from "@paperclipai/db";
 import {
-  CONTROL_PLANE_CONFORMANCE_RESULT,
-  CONTROL_PLANE_CONFORMANCE_TERMINAL,
   type NativeExecutionInputV1,
   type NativeSession,
   type NativeSessionBackend,
   type PersistedNativeSession,
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
+import {
+  CONTROL_PLANE_CONFORMANCE_RESULT,
+  CONTROL_PLANE_CONFORMANCE_TERMINAL,
+} from "@paperclipai/paperclip-runner/testing";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import {
