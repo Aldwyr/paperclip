@@ -61,6 +61,68 @@ describe("tool access validators", () => {
     }).success).toBe(false);
   });
 
+  // PAP-17087: the guided generic flow and paste-config both reach the connect
+  // endpoint, so unsafe header names/values are rejected once at this boundary.
+  it("accepts generic advanced-authentication input for a pasted URL", () => {
+    const parsed = connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      authMode: "custom_headers",
+      credentialValues: {
+        "headers.X-Api-Key": "phx_abc123",
+        "headers.X-PostHog-Project-Id": "12345",
+      },
+    });
+    expect(parsed.success).toBe(true);
+
+    const manualClient = connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      authMode: "oauth",
+      oauthClient: { clientId: "client-abc", clientSecret: "shhh" },
+    });
+    expect(manualClient.success).toBe(true);
+  });
+
+  it("rejects header credentials Paperclip refuses to send", () => {
+    for (const configPath of ["headers.Host", "headers.Cookie", "headers.Transfer-Encoding", "headers.Sec-Fetch-Mode"]) {
+      const parsed = connectToolAppSchema.safeParse({
+        link: "https://mcp.example.test/mcp",
+        credentialValues: { [configPath]: "value" },
+      });
+      expect(parsed.success, configPath).toBe(false);
+    }
+  });
+
+  it("rejects header names and values that could split the outbound request", () => {
+    const badName = connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      credentialValues: { "headers.X-Bad\r\nX-Injected": "value" },
+    });
+    expect(badName.success).toBe(false);
+
+    const badValue = connectToolAppSchema.safeParse({
+      link: "https://mcp.example.test/mcp",
+      credentialValues: { "headers.X-Api-Key": "abc\r\nX-Injected: 1" },
+    });
+    expect(badValue.success).toBe(false);
+    if (!badValue.success) {
+      // The message names the header but must never echo the rejected value.
+      const message = badValue.error.issues[0]?.message ?? "";
+      expect(message).toContain("X-Api-Key");
+      expect(message).not.toContain("X-Injected");
+    }
+  });
+
+  it("keeps generic advanced authentication off the curated gallery path", () => {
+    expect(connectToolAppSchema.safeParse({
+      galleryKey: "posthog",
+      authMode: "bearer",
+    }).success).toBe(false);
+    expect(connectToolAppSchema.safeParse({
+      galleryKey: "posthog",
+      oauthClient: { clientId: "client-abc" },
+    }).success).toBe(false);
+  });
+
   it("accepts secret references for connection credentials", () => {
     const parsed = createToolConnectionSchema.safeParse({
       applicationId: "11111111-1111-4111-8111-111111111111",

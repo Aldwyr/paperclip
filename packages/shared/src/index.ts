@@ -252,6 +252,17 @@ export {
   type HumanizableConnection,
 } from "./humanize-connection.js";
 export {
+  MCP_REMOTE_HEADER_LIMITS,
+  checkMcpRemoteHeaderName,
+  checkMcpRemoteHeaderValue,
+  isSafeMcpRemoteHeaderName,
+  isSafeMcpRemoteHeaderValue,
+  mcpRemoteHeaderNameFromConfigPath,
+  mcpRemoteHeaderRejectionMessage,
+  type McpRemoteHeaderCheck,
+  type McpRemoteHeaderRejection,
+} from "./mcp-remote-headers.js";
+export {
   COMPANY_STATUSES,
   DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
   MAX_COMPANY_ATTACHMENT_MAX_BYTES,
@@ -1245,7 +1256,9 @@ export type {
   SecretProposalView,
   ApproveSecretProposalInput,
   RejectSecretProposalInput,
+  ConnectToolAppAuthChallenge,
   ConnectToolAppResult,
+  ToolOAuthClientRegistrationSource,
   ToolOAuthStartResult,
   ToolActionRequest,
   ToolAccessDecision,
@@ -2011,6 +2024,9 @@ export {
   createToolTrustRuleFromActionRequestSchema,
   revokeToolTrustRuleSchema,
   connectToolAppSchema,
+  GENERIC_MCP_AUTH_MODES,
+  genericMcpAuthModeSchema,
+  genericMcpOAuthClientSchema,
   reconnectToolAppSchema,
   createToolApplicationSchema,
   finishToolAppSchema,

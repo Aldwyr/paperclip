@@ -911,6 +911,29 @@ export interface ToolAppConnectionActionSummary {
   status: ToolCatalogEntryStatus;
 }
 
+/**
+ * How Paperclip obtained the OAuth client it will use for a connection
+ * (PAP-17087). Ordered by preference: a client the deployment preconfigured for
+ * that issuer, then a Client ID Metadata Document, then dynamic registration,
+ * then client credentials the operator preregistered and pasted in.
+ */
+export type ToolOAuthClientRegistrationSource = "preconfigured" | "cimd" | "dcr" | "manual";
+
+/**
+ * What an unknown remote MCP endpoint told Paperclip it needs, so the wizard can
+ * branch without re-probing. `manualClientRequired` means discovery succeeded but
+ * the authorization server supports neither CIMD nor DCR, so the operator has to
+ * supply a preregistered client under Advanced authentication.
+ */
+export interface ConnectToolAppAuthChallenge {
+  kind: "oauth";
+  startUrl: string | null;
+  issuer?: string | null;
+  resource?: string | null;
+  registrationSource?: ToolOAuthClientRegistrationSource | null;
+  manualClientRequired?: boolean;
+}
+
 export interface ConnectToolAppResult {
   connectionId: string;
   application: ToolApplication;
@@ -921,10 +944,7 @@ export interface ConnectToolAppResult {
     canMakeChanges: ToolAppConnectionActionSummary[];
   };
   suggestedDefaults: Record<string, unknown>;
-  auth?: {
-    kind: "oauth";
-    startUrl: string | null;
-  } | null;
+  auth?: ConnectToolAppAuthChallenge | null;
 }
 
 export interface ToolOAuthStartResult {
