@@ -3469,6 +3469,10 @@ describeEmbeddedPostgres("tool access service", () => {
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
+      // PAP-17087: Paperclip's callback is a server-side HTTPS endpoint, so
+      // registration must declare a `web` client rather than let the
+      // authorization server apply native-client redirect rules.
+      application_type: "web",
     }]);
 
     fetchMock.mockClear();

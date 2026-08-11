@@ -66,6 +66,7 @@ import type {
   ToolConnectionInstallSnapshot,
   ToolConnectionHealthCheckResult,
   ToolConnectionHealthStatus,
+  ToolConnectionAuthKind,
   ToolConnectionTransport,
   ToolOAuthStartResult,
   ToolAppsAttentionResponse,
@@ -109,6 +110,12 @@ import type {
   UnbindToolProfileBinding,
 } from "@paperclipai/shared";
 import { CLASS3_STATIC_LEASE_ALLOWLIST, credentialConfigPath, getAvailableConnectionMethod, getAvailableConnectionMethods, getConnectableAppDefinition, isToolConnectionAttentionHealth, recommendedDefaultsForApp } from "@paperclipai/shared";
+import {
+  checkMcpRemoteHeaderName,
+  checkMcpRemoteHeaderValue,
+  mcpRemoteHeaderNameFromConfigPath,
+  mcpRemoteHeaderRejectionMessage,
+} from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
@@ -135,6 +142,35 @@ const OAUTH_REFRESH_LEASE_MS = 120_000;
 const OAUTH_REFRESH_LEASE_WAIT_MS = 30_000;
 const OAUTH_REFRESH_LEASE_POLL_MS = 25;
 
+/**
+ * Where this deployment publishes its Client ID Metadata Document. The document's
+ * own URL is the `client_id` Paperclip presents, so this path is a stable part of
+ * the deployment's public contract with every authorization server that has seen
+ * it — changing it invalidates existing CIMD registrations.
+ */
+export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH = "/api/tools/oauth/client-metadata";
+
+/**
+ * Paperclip's client metadata for CIMD (RFC 7591 metadata, served rather than
+ * registered). Only the callback for this deployment appears in it, so an
+ * authorization server that fetches it can see exactly one legal redirect target.
+ */
+export function oauthClientIdMetadataDocument(input: {
+  clientId: string;
+  redirectUri: string;
+}): Record<string, unknown> {
+  return {
+    client_id: input.clientId,
+    client_name: `Paperclip (${new URL(input.redirectUri).host})`,
+    client_uri: new URL("/", input.clientId).toString(),
+    redirect_uris: [input.redirectUri],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    application_type: "web",
+  };
+}
+
 type OAuthProviderEndpoints = {
   provider: string;
   scopes: string[];
@@ -145,7 +181,105 @@ type OAuthProviderEndpoints = {
   tokenEndpointAuthMethodsSupported?: string[];
   grantType?: "authorization_code" | "client_credentials";
   metadataUrl?: string | null;
+  /**
+   * Canonical authorization-server issuer, when discovery found one. Registered
+   * client material is bound to it, `iss` on the callback is validated against
+   * it, and reconnect/refresh reuse it instead of re-deriving a provider key.
+   */
+  issuer?: string | null;
+  /**
+   * RFC 8707 resource indicator: the MCP endpoint the token is for. Sent on both
+   * authorization and token requests so the authorization server can audience-
+   * restrict the access token to this server rather than to everything Paperclip
+   * has ever connected.
+   */
+  resource?: string | null;
+  /** The authorization server advertised support for Client ID Metadata Documents. */
+  clientIdMetadataDocumentSupported?: boolean;
 };
+
+/**
+ * Where an OAuth client came from, in the preference order the current MCP
+ * client-registration guidance recommends (PAP-17087).
+ */
+type OAuthClientRegistrationSource = "preconfigured" | "cimd" | "dcr" | "manual";
+
+/**
+ * RFC 8414 §3.1 requires the well-known path to be *inserted between* the
+ * issuer host and its path component, but a large amount of deployed software
+ * only serves the naive suffix form. OpenID Connect Discovery 1.0 in turn
+ * specifies the suffix form. Try all of them for an issuer that has a path, and
+ * the plain origin form when it doesn't.
+ */
+function wellKnownMetadataUrls(issuer: string): string[] {
+  let parsed: URL;
+  try {
+    parsed = new URL(issuer);
+  } catch {
+    return [];
+  }
+  const suffixes = ["oauth-authorization-server", "openid-configuration"];
+  const path = parsed.pathname.replace(/\/+$/, "");
+  const urls: string[] = [];
+  for (const suffix of suffixes) {
+    if (path) {
+      // RFC 8414: https://host/.well-known/<suffix><path>
+      urls.push(new URL(`/.well-known/${suffix}${path}`, parsed.origin).toString());
+      // OIDC Discovery / widely deployed: https://host<path>/.well-known/<suffix>
+      urls.push(new URL(`${path}/.well-known/${suffix}`, parsed.origin).toString());
+    }
+    urls.push(new URL(`/.well-known/${suffix}`, parsed.origin).toString());
+  }
+  return [...new Set(urls)];
+}
+
+/**
+ * Protected-resource metadata lives at `/.well-known/oauth-protected-resource`
+ * with the resource's path appended (RFC 9728 §3.1). Probe the path-aware form
+ * first so a multi-tenant host that serves several MCP servers resolves to the
+ * right one, then fall back to the origin form.
+ */
+function protectedResourceMetadataUrls(endpoint: URL): string[] {
+  const path = endpoint.pathname.replace(/\/+$/, "");
+  const urls: string[] = [];
+  if (path) urls.push(new URL(`/.well-known/oauth-protected-resource${path}`, endpoint.origin).toString());
+  urls.push(new URL("/.well-known/oauth-protected-resource", endpoint.origin).toString());
+  return [...new Set(urls)];
+}
+
+/**
+ * Canonical RFC 8707 resource indicator for an MCP endpoint: origin + path, with
+ * query, fragment and any trailing slash removed. Vendor query parameters belong
+ * to the connection config, not to the token audience.
+ */
+function canonicalResourceIndicator(endpoint: string): string | null {
+  try {
+    const parsed = new URL(endpoint);
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.origin}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Two issuers are the same authorization server only when scheme, host, port and
+ * path match exactly (a trailing slash is not significant). Used for `iss`
+ * validation on the callback and for detecting that a stored registration is
+ * bound to a different server than the one we just discovered.
+ */
+function sameOAuthIssuer(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.protocol === right.protocol
+      && left.host === right.host
+      && left.pathname.replace(/\/+$/, "") === right.pathname.replace(/\/+$/, "");
+  } catch {
+    return false;
+  }
+}
 
 const oauthRegistrationFlights = new Map<string, Promise<unknown>>();
 
@@ -2979,12 +3113,23 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               codeChallengeMethodsSupported: endpoints.codeChallengeMethodsSupported ?? [],
               tokenEndpointAuthMethodsSupported: endpoints.tokenEndpointAuthMethodsSupported ?? [],
               grantType: endpoints.grantType ?? "authorization_code",
+              issuer: endpoints.issuer ?? null,
+              resource: endpoints.resource ?? null,
+              clientIdMetadataDocumentSupported: endpoints.clientIdMetadataDocumentSupported === true,
               discoveredAt: new Date().toISOString(),
             },
           };
           await db
             .update(toolConnections)
-            .set({ config: nextConfig, transportConfig: nextConfig, updatedAt: new Date() })
+            .set({
+              // Record the discovered auth kind now, so a URL-only connection that
+              // is waiting on sign-in reads as OAuth everywhere rather than
+              // falling back to `authKind: none` semantics.
+              authKind: "oauth",
+              config: nextConfig,
+              transportConfig: nextConfig,
+              updatedAt: new Date(),
+            })
             .where(eq(toolConnections.id, connection.id));
         }
         throw new HttpError(502, "This app needs you to sign in.", {
@@ -3761,8 +3906,26 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
     for (const configPath of Object.keys(credentialValues).sort()) {
       if (!configPath.startsWith("headers.")) continue;
-      const headerName = configPath.slice("headers.".length).trim();
-      if (!headerName) continue;
+      const headerName = mcpRemoteHeaderNameFromConfigPath(configPath);
+      if (!headerName) throw badRequest("Header names cannot be blank.", { code: "mcp_header_rejected" });
+      // The API schema already rejected unsafe headers, but this is the last
+      // point before a name becomes a real outbound request header — and the
+      // normalized paste-config path lands here too — so re-check rather than
+      // trust the caller.
+      const nameCheck = checkMcpRemoteHeaderName(headerName);
+      if (!nameCheck.ok) {
+        throw badRequest(mcpRemoteHeaderRejectionMessage(headerName, nameCheck.reason!), {
+          code: "mcp_header_rejected",
+          headerName,
+        });
+      }
+      const valueCheck = checkMcpRemoteHeaderValue(credentialValues[configPath] ?? "");
+      if (!valueCheck.ok) {
+        throw badRequest(mcpRemoteHeaderRejectionMessage(headerName, valueCheck.reason!), {
+          code: "mcp_header_rejected",
+          headerName,
+        });
+      }
       fields.push({
         label: headerName,
         configPath,
@@ -3839,6 +4002,30 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return oauthClientConfig(provider);
   }
 
+  /**
+   * The URL of Paperclip's published Client ID Metadata Document, derived from the
+   * OAuth callback so the two are guaranteed same-origin.
+   *
+   * CIMD requires a `client_id` the authorization server can fetch, so it is only
+   * available when this deployment has a public HTTPS base URL. Loopback and
+   * plain-http development fall through to DCR or manual client credentials.
+   */
+  function clientIdMetadataDocumentUrl(redirectUri: string): string | null {
+    try {
+      const parsed = new URL(redirectUri);
+      if (parsed.protocol !== "https:") return null;
+      const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+      const isLoopback = hostname === "localhost"
+        || hostname.endsWith(".localhost")
+        || hostname === "::1"
+        || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+      if (isLoopback) return null;
+      return new URL(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH, parsed.origin).toString();
+    } catch {
+      return null;
+    }
+  }
+
   async function oauthClientForConnection(
     connection: typeof toolConnections.$inferSelect,
     provider: string,
@@ -3851,7 +4038,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       ? oauth.clientId.trim()
       : null;
     if (!clientId) return configured;
-    const clientSecretRef = oauth.clientRegistrationSource === "dcr"
+    // Only a client the operator preregistered can have a secret worth sending.
+    // DCR and CIMD clients are public (`token_endpoint_auth_method: none`), so
+    // resolving a secret for them would leak a credential onto the wire.
+    const registrationSource = oauth.clientRegistrationSource;
+    const clientSecretRef = registrationSource === "dcr" || registrationSource === "cimd"
       ? undefined
       : connection.credentialSecretRefs.find((ref) => ref.configPath === "oauth.client_secret");
     const clientSecret = clientSecretRef
@@ -4012,27 +4203,31 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
   }
 
-  async function authServerMetadataUrls(metadata: Record<string, unknown>): Promise<string[]> {
-    const urls: string[] = [];
+  /**
+   * Candidate authorization-server metadata URLs advertised by protected-resource
+   * metadata, paired with the issuer that advertised them so the caller can bind
+   * the resulting client material to a canonical issuer.
+   */
+  function authServerMetadataUrls(metadata: Record<string, unknown>): Array<{ issuer: string; metadataUrl: string }> {
+    const candidates: Array<{ issuer: string; metadataUrl: string }> = [];
+    const issuers: string[] = [];
     if (Array.isArray(metadata.authorization_servers)) {
       for (const server of metadata.authorization_servers) {
-        if (typeof server === "string" && server.trim()) {
-          try {
-            urls.push(new URL("/.well-known/oauth-authorization-server", server).toString());
-          } catch {
-            // Ignore malformed advertised issuers. The caller will fail if no usable endpoints remain.
-          }
-        }
+        if (typeof server === "string" && server.trim()) issuers.push(server.trim());
       }
     }
-    if (typeof metadata.issuer === "string" && metadata.issuer.trim()) {
-      try {
-        urls.push(new URL("/.well-known/oauth-authorization-server", metadata.issuer).toString());
-      } catch {
-        // Ignore malformed advertised issuers.
+    if (typeof metadata.issuer === "string" && metadata.issuer.trim()) issuers.push(metadata.issuer.trim());
+    for (const issuer of [...new Set(issuers)]) {
+      for (const metadataUrl of wellKnownMetadataUrls(issuer)) {
+        candidates.push({ issuer, metadataUrl });
       }
     }
-    return [...new Set(urls)];
+    const seen = new Set<string>();
+    return candidates.filter((candidate) => {
+      if (seen.has(candidate.metadataUrl)) return false;
+      seen.add(candidate.metadataUrl);
+      return true;
+    });
   }
 
   async function endpointsFromMetadataUrl(
@@ -4047,18 +4242,44 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     let scopes = normalizeOauthScopes(metadata.scopes_supported);
     let codeChallengeMethodsSupported = normalizeOauthScopes(metadata.code_challenge_methods_supported);
     let tokenEndpointAuthMethodsSupported = normalizeOauthScopes(metadata.token_endpoint_auth_methods_supported);
-    for (const authMetadataUrl of await authServerMetadataUrls(metadata)) {
-      const authMetadata = await fetchJsonRecord(authMetadataUrl);
+    let clientIdMetadataDocumentSupported = metadata.client_id_metadata_document_supported === true;
+    // A document that carries the authorization endpoint itself *is* the
+    // authorization-server metadata, so its own `issuer` is the canonical one.
+    // Otherwise this was protected-resource metadata and the issuer comes from
+    // whichever advertised authorization server answered.
+    let issuer = authorizationUrl && typeof metadata.issuer === "string" && metadata.issuer.trim()
+      ? metadata.issuer.trim()
+      : null;
+    const resource = typeof metadata.resource === "string" && metadata.resource.trim()
+      ? metadata.resource.trim()
+      : null;
+    for (const candidate of authServerMetadataUrls(metadata)) {
+      const authMetadata = await fetchJsonRecord(candidate.metadataUrl);
       if (!authMetadata) continue;
-      authorizationUrl = authorizationUrl ?? (typeof authMetadata.authorization_endpoint === "string" ? authMetadata.authorization_endpoint : null);
-      tokenUrl = tokenUrl ?? (typeof authMetadata.token_endpoint === "string" ? authMetadata.token_endpoint : null);
+      const candidateAuthorizationUrl = typeof authMetadata.authorization_endpoint === "string"
+        ? authMetadata.authorization_endpoint
+        : null;
+      const candidateTokenUrl = typeof authMetadata.token_endpoint === "string" ? authMetadata.token_endpoint : null;
+      if (!candidateAuthorizationUrl && !candidateTokenUrl) continue;
+      // RFC 8414 §3.3: the metadata document's `issuer` must match the issuer we
+      // used to build the discovery URL, or the document is not authoritative.
+      const advertisedIssuer = typeof authMetadata.issuer === "string" && authMetadata.issuer.trim()
+        ? authMetadata.issuer.trim()
+        : null;
+      if (advertisedIssuer && !sameOAuthIssuer(advertisedIssuer, candidate.issuer)) continue;
+      authorizationUrl = authorizationUrl ?? candidateAuthorizationUrl;
+      tokenUrl = tokenUrl ?? candidateTokenUrl;
       registrationUrl = registrationUrl ?? (typeof authMetadata.registration_endpoint === "string" ? authMetadata.registration_endpoint : null);
+      issuer = issuer ?? advertisedIssuer ?? candidate.issuer;
       if (scopes.length === 0) scopes = normalizeOauthScopes(authMetadata.scopes_supported);
       if (codeChallengeMethodsSupported.length === 0) {
         codeChallengeMethodsSupported = normalizeOauthScopes(authMetadata.code_challenge_methods_supported);
       }
       if (tokenEndpointAuthMethodsSupported.length === 0) {
         tokenEndpointAuthMethodsSupported = normalizeOauthScopes(authMetadata.token_endpoint_auth_methods_supported);
+      }
+      if (!clientIdMetadataDocumentSupported) {
+        clientIdMetadataDocumentSupported = authMetadata.client_id_metadata_document_supported === true;
       }
       if (authorizationUrl && tokenUrl) break;
     }
@@ -4072,6 +4293,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       codeChallengeMethodsSupported,
       tokenEndpointAuthMethodsSupported,
       metadataUrl,
+      issuer,
+      resource,
+      clientIdMetadataDocumentSupported,
     };
   }
 
@@ -4093,6 +4317,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const grantType = oauth.grantType === "client_credentials" || oauth.clientCredentials === true
       ? "client_credentials" as const
       : "authorization_code" as const;
+    // The resource indicator is the MCP endpoint itself, independent of which
+    // authorization server ends up serving it.
+    const configuredResource = typeof oauth.resource === "string" && oauth.resource.trim()
+      ? oauth.resource.trim()
+      : canonicalResourceIndicator(remoteEndpoint(connection.config));
     if (configuredAuthorizationUrl && configuredTokenUrl) {
       return {
         provider,
@@ -4104,6 +4333,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         tokenEndpointAuthMethodsSupported: normalizeOauthScopes(oauth.tokenEndpointAuthMethodsSupported),
         grantType,
         metadataUrl: typeof oauth.metadataUrl === "string" ? oauth.metadataUrl : hints?.metadataUrl ?? null,
+        issuer: typeof oauth.issuer === "string" && oauth.issuer.trim() ? oauth.issuer.trim() : null,
+        resource: configuredResource,
+        clientIdMetadataDocumentSupported: oauth.clientIdMetadataDocumentSupported === true,
       };
     }
 
@@ -4113,17 +4345,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     ].filter((value): value is string => Boolean(value));
     if (metadataCandidates.length === 0) {
       const endpoint = new URL(await assertRemoteEndpointAllowed(connection.config));
-      const protectedResourcePath = endpoint.pathname === "/"
-        ? "/.well-known/oauth-protected-resource"
-        : `/.well-known/oauth-protected-resource${endpoint.pathname}`;
-      metadataCandidates.push(new URL(protectedResourcePath, endpoint.origin).toString());
-      metadataCandidates.push(new URL("/.well-known/oauth-protected-resource", endpoint.origin).toString());
-      metadataCandidates.push(new URL("/.well-known/oauth-authorization-server", endpoint.origin).toString());
-      metadataCandidates.push(new URL("/.well-known/openid-configuration", endpoint.origin).toString());
+      metadataCandidates.push(...protectedResourceMetadataUrls(endpoint));
+      // The MCP server may double as its own authorization server, in which case
+      // it serves authorization-server metadata directly at (or under) its path.
+      metadataCandidates.push(...wellKnownMetadataUrls(endpoint.toString()));
     }
     for (const metadataUrl of [...new Set(metadataCandidates)]) {
       const endpoints = await endpointsFromMetadataUrl(connection, metadataUrl);
-      if (endpoints) return { ...endpoints, scopes: scopes.length > 0 ? scopes : endpoints.scopes, grantType };
+      if (endpoints) {
+        return {
+          ...endpoints,
+          scopes: scopes.length > 0 ? scopes : endpoints.scopes,
+          grantType,
+          resource: endpoints.resource ?? configuredResource,
+        };
+      }
     }
     return null;
   }
@@ -4238,6 +4474,33 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     );
   }
 
+  /**
+   * Validate RFC 9207 `iss` on the authorization callback.
+   *
+   * When an authorization server returns `iss`, it must name the same issuer the
+   * authorization request was bound to. A mismatch means the code came back from a
+   * different server than the one we sent the user to — the mix-up attack RFC 9207
+   * exists to stop — so the code is refused rather than exchanged. An absent `iss`
+   * is tolerated: it is optional, and many deployed servers omit it.
+   */
+  function assertOAuthCallbackIssuer(
+    connection: typeof toolConnections.$inferSelect,
+    endpoints: OAuthProviderEndpoints,
+    iss: string | null | undefined,
+  ) {
+    const returnedIssuer = typeof iss === "string" ? iss.trim() : "";
+    if (!returnedIssuer) return;
+    const oauth = oauthConfig(connection);
+    const expectedIssuer = typeof oauth.expectedIssuer === "string" && oauth.expectedIssuer.trim()
+      ? oauth.expectedIssuer.trim()
+      : endpoints.issuer ?? null;
+    if (!expectedIssuer) return;
+    if (sameOAuthIssuer(returnedIssuer, expectedIssuer)) return;
+    throw badRequest("Sign-in came back from an unexpected server. Start the connection again.", {
+      code: "oauth_issuer_mismatch",
+    });
+  }
+
   function invalidOAuthDcrResponse(field: string, reason: string): HttpError {
     return new HttpError(502, "OAuth provider returned incompatible dynamic client metadata", {
       code: "oauth_dcr_response_invalid",
@@ -4330,6 +4593,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
+      // RFC 7591: Paperclip's callback is a server-side HTTPS endpoint, so this
+      // is a `web` client, not a `native` one. Some authorization servers reject
+      // an https redirect URI when the default (`web`) is left implicit, and
+      // others apply native-client redirect rules without it.
+      application_type: "web",
     };
     const response = await fetchRemoteHttpUrl(input.endpoints.registrationUrl, {
       method: "POST",
@@ -4400,10 +4668,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         scopes: input.endpoints.scopes,
         codeChallengeMethodsSupported: input.endpoints.codeChallengeMethodsSupported ?? [],
         tokenEndpointAuthMethodsSupported: input.endpoints.tokenEndpointAuthMethodsSupported ?? [],
+        issuer: input.endpoints.issuer ?? oauth.issuer ?? null,
+        resource: input.endpoints.resource ?? oauth.resource ?? null,
         clientId,
-        clientRegistrationSource: "dcr",
+        clientRegistrationSource: "dcr" satisfies OAuthClientRegistrationSource,
         clientTokenEndpointAuthMethod: "none",
         clientRedirectUri: input.redirectUri,
+        // Registered client material is only valid for the issuer/resource pair
+        // it was minted against. `assertOAuthClientBinding` re-registers when any
+        // of these move, so a re-pointed endpoint can never silently reuse a
+        // client another authorization server issued.
+        clientIssuer: input.endpoints.issuer ?? null,
+        clientResource: input.endpoints.resource ?? null,
+        clientCompanyId: input.connection.companyId,
         clientIdIssuedAt,
         clientSecretExpiresAt,
       },
@@ -4427,6 +4704,144 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return updated;
   }
 
+  /**
+   * Adopt a Client ID Metadata Document as this connection's client: the
+   * `client_id` *is* the https URL of Paperclip's published client metadata, so
+   * there is nothing to register with the authorization server. Still recorded on
+   * the connection so the issuer/resource/callback binding is enforced on reuse
+   * exactly like a dynamically registered client.
+   */
+  async function adoptClientIdMetadataDocument(input: {
+    connection: typeof toolConnections.$inferSelect;
+    endpoints: OAuthProviderEndpoints;
+    redirectUri: string;
+    clientId: string;
+  }) {
+    const oauth = oauthConfig(input.connection);
+    const nextConfig = {
+      ...input.connection.config,
+      oauth: {
+        ...oauth,
+        provider: input.endpoints.provider,
+        authorizationUrl: input.endpoints.authorizationUrl,
+        tokenUrl: input.endpoints.tokenUrl,
+        registrationUrl: input.endpoints.registrationUrl ?? null,
+        metadataUrl: input.endpoints.metadataUrl ?? null,
+        scopes: input.endpoints.scopes,
+        codeChallengeMethodsSupported: input.endpoints.codeChallengeMethodsSupported ?? [],
+        tokenEndpointAuthMethodsSupported: input.endpoints.tokenEndpointAuthMethodsSupported ?? [],
+        clientIdMetadataDocumentSupported: true,
+        issuer: input.endpoints.issuer ?? oauth.issuer ?? null,
+        resource: input.endpoints.resource ?? oauth.resource ?? null,
+        clientId: input.clientId,
+        clientRegistrationSource: "cimd" satisfies OAuthClientRegistrationSource,
+        clientTokenEndpointAuthMethod: "none",
+        clientRedirectUri: input.redirectUri,
+        clientIssuer: input.endpoints.issuer ?? null,
+        clientResource: input.endpoints.resource ?? null,
+        clientCompanyId: input.connection.companyId,
+      },
+    };
+    // A CIMD client has no secret. Drop any leftover one so a stale credential
+    // from an earlier registration can never be replayed against a new issuer.
+    const nextCredentialSecretRefs = input.connection.credentialSecretRefs.filter(
+      (ref) => ref.configPath !== "oauth.client_secret",
+    );
+    const [updated] = await db
+      .update(toolConnections)
+      .set({
+        authKind: "oauth",
+        config: nextConfig,
+        transportConfig: nextConfig,
+        credentialSecretRefs: nextCredentialSecretRefs,
+        updatedAt: now(),
+      })
+      .where(and(
+        eq(toolConnections.id, input.connection.id),
+        eq(toolConnections.companyId, input.connection.companyId),
+      ))
+      .returning();
+    if (!updated) throw notFound("Tool connection not found");
+    await syncCredentialBindings(updated);
+    return updated;
+  }
+
+  /**
+   * How the client already stored on this connection was obtained. Anything
+   * unrecognised (including connections written before this field existed) reads
+   * as `manual`, which is the conservative answer: Paperclip will not silently
+   * re-register over client material it cannot prove it minted.
+   */
+  function storedOAuthClientRegistrationSource(
+    connection: typeof toolConnections.$inferSelect,
+  ): OAuthClientRegistrationSource {
+    const source = oauthConfig(connection).clientRegistrationSource;
+    return source === "cimd" || source === "dcr" || source === "preconfigured" ? source : "manual";
+  }
+
+  /**
+   * Is the client material already stored on this connection still valid for the
+   * authorization server, MCP resource, callback URI and company we are about to
+   * use it with? Client credentials are minted against exactly one such tuple;
+   * reusing them across a moved binding would let a re-pointed endpoint borrow
+   * another server's registration.
+   */
+  function oauthClientBindingMatches(
+    connection: typeof toolConnections.$inferSelect,
+    endpoints: OAuthProviderEndpoints,
+    redirectUri: string,
+  ): boolean {
+    const oauth = oauthConfig(connection);
+    if (typeof oauth.clientId !== "string" || !oauth.clientId.trim()) return false;
+    const source = typeof oauth.clientRegistrationSource === "string" ? oauth.clientRegistrationSource : null;
+    // A manually preregistered client was registered by the operator against
+    // Paperclip's callback, so it has no recorded callback until first use.
+    const redirectMatches = source === "manual"
+      ? oauth.clientRedirectUri === undefined
+        || oauth.clientRedirectUri === null
+        || oauth.clientRedirectUri === redirectUri
+      : oauth.clientRedirectUri === redirectUri;
+    if (!redirectMatches) return false;
+    if (typeof oauth.clientCompanyId === "string" && oauth.clientCompanyId !== connection.companyId) return false;
+    if (
+      endpoints.issuer
+      && typeof oauth.clientIssuer === "string"
+      && oauth.clientIssuer
+      && !sameOAuthIssuer(oauth.clientIssuer, endpoints.issuer)
+    ) {
+      return false;
+    }
+    if (
+      endpoints.resource
+      && typeof oauth.clientResource === "string"
+      && oauth.clientResource
+      && oauth.clientResource !== endpoints.resource
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * May Paperclip mint client material for this connection without an operator
+   * pasting client credentials?
+   *
+   * A curated app opts in through its `ownershipModes`. A generic remote MCP
+   * connection may register once — and only once — protected-resource and
+   * authorization-server discovery actually produced a metadata document; an
+   * endpoint that merely returned a 401 does not earn a registration.
+   */
+  function canRegisterOAuthClientDynamically(
+    connection: typeof toolConnections.$inferSelect,
+    endpoints: OAuthProviderEndpoints,
+    galleryEntry: AppDefinition | null,
+  ): boolean {
+    if (galleryEntry) {
+      return connectionMethodForConnection(galleryEntry, connection).ownershipModes.includes("dcr");
+    }
+    return connection.transport === "mcp_remote" && Boolean(endpoints.metadataUrl);
+  }
+
   async function ensureOAuthClient(input: {
     connection: typeof toolConnections.$inferSelect;
     endpoints: OAuthProviderEndpoints;
@@ -4434,39 +4849,76 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     galleryEntry: AppDefinition | null;
     actor?: ActorInfo;
   }) {
+    // 1. A client the deployment preconfigured for this issuer wins outright.
     const configured = configuredOAuthClientForConnection(input.connection, input.endpoints.provider);
-    if (configured.clientId) return { connection: input.connection, client: configured };
-    const oauth = oauthConfig(input.connection);
-    if (
-      typeof oauth.clientId === "string"
-      && oauth.clientId.trim()
-      && oauth.clientRedirectUri === input.redirectUri
-    ) {
+    if (configured.clientId) {
+      return { connection: input.connection, client: configured, source: "preconfigured" as const };
+    }
+    // 2. Client material already bound to this issuer/resource/callback/company.
+    if (oauthClientBindingMatches(input.connection, input.endpoints, input.redirectUri)) {
       return {
         connection: input.connection,
         client: await oauthClientForConnection(input.connection, input.endpoints.provider, input.actor),
+        source: storedOAuthClientRegistrationSource(input.connection),
       };
     }
-    const method = input.galleryEntry ? connectionMethodForConnection(input.galleryEntry, input.connection) : null;
-    if (!method?.ownershipModes.includes("dcr")) {
-      throw unprocessable(`OAuth client id is not configured for ${input.endpoints.provider}`);
+    const oauth = oauthConfig(input.connection);
+    if (
+      oauth.clientRegistrationSource === "manual"
+      && typeof oauth.clientId === "string"
+      && oauth.clientId.trim()
+    ) {
+      // Paperclip cannot re-register on the operator's behalf: the credentials
+      // came from a console this deployment does not control.
+      throw unprocessable(
+        "This connection's sign-in details no longer match the server it points at. Re-enter the client ID and secret to continue.",
+        { code: "oauth_manual_client_rebinding_required" },
+      );
+    }
+    if (!canRegisterOAuthClientDynamically(input.connection, input.endpoints, input.galleryEntry)) {
+      throw unprocessable(`OAuth client id is not configured for ${input.endpoints.provider}`, {
+        code: "oauth_client_registration_unavailable",
+      });
     }
 
     const key = `${input.connection.id}:${input.redirectUri}`;
     return oauthSingleFlight(oauthRegistrationFlights, key, async () => {
       const latest = await getConnectionRow(input.connection.id, input.connection.companyId);
       const latestConfigured = configuredOAuthClientForConnection(latest, input.endpoints.provider);
-      if (latestConfigured.clientId) return { connection: latest, client: latestConfigured };
-      const latestOauth = oauthConfig(latest);
-      if (
-        typeof latestOauth.clientId === "string"
-        && latestOauth.clientId.trim()
-        && latestOauth.clientRedirectUri === input.redirectUri
-      ) {
+      if (latestConfigured.clientId) {
+        return { connection: latest, client: latestConfigured, source: "preconfigured" as const };
+      }
+      if (oauthClientBindingMatches(latest, input.endpoints, input.redirectUri)) {
         return {
           connection: latest,
           client: await oauthClientForConnection(latest, input.endpoints.provider, input.actor),
+          source: storedOAuthClientRegistrationSource(latest),
         };
+      }
+      // 3. Client ID Metadata Documents: no registration call at all, so prefer
+      //    them over DCR when the authorization server advertises support.
+      const metadataDocumentUrl = input.endpoints.clientIdMetadataDocumentSupported
+        ? clientIdMetadataDocumentUrl(input.redirectUri)
+        : null;
+      if (metadataDocumentUrl) {
+        const adopted = await adoptClientIdMetadataDocument({
+          connection: latest,
+          endpoints: input.endpoints,
+          redirectUri: input.redirectUri,
+          clientId: metadataDocumentUrl,
+        });
+        return {
+          connection: adopted,
+          client: await oauthClientForConnection(adopted, input.endpoints.provider, input.actor),
+          source: "cimd" as const,
+        };
+      }
+      // 4. Dynamic client registration.
+      if (!input.endpoints.registrationUrl) {
+        throw unprocessable(
+          "This server needs sign-in details you create yourself. Add a client ID and secret under Advanced authentication.",
+          { code: "oauth_manual_client_required" },
+        );
       }
       const registered = await registerOAuthClient({
         connection: latest,
@@ -4477,6 +4929,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return {
         connection: registered,
         client: await oauthClientForConnection(registered, input.endpoints.provider, input.actor),
+        source: "dcr" as const,
       };
     });
   }
@@ -4491,6 +4944,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     codeVerifier?: string | null;
     code?: string | null;
     refreshToken?: string | null;
+    /** RFC 8707 resource indicator: the MCP server this token is for. */
+    resource?: string | null;
   }) {
     const body = new URLSearchParams();
     if (input.grantType === "client_credentials") {
@@ -4507,6 +4962,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
     body.set("client_id", input.clientId);
     if (input.clientSecret) body.set("client_secret", input.clientSecret);
+    // RFC 8707: repeat the resource indicator on the token request so the
+    // authorization server audience-restricts the access token (and any refresh
+    // exchange) to this MCP server.
+    if (input.resource) body.set("resource", input.resource);
 
     const response = await fetchRemoteHttpUrl(input.tokenUrl, {
       method: "POST",
@@ -4756,6 +5215,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         grantType,
         scopes: normalizeOauthScopes(oauth.scopes).length > 0 ? normalizeOauthScopes(oauth.scopes) : normalizeOauthScopes(oauth.scope),
         refreshToken,
+        // Refreshing must stay bound to the same MCP server the original grant
+        // named, or the authorization server may widen the token's audience.
+        resource: typeof oauth.resource === "string" && oauth.resource ? oauth.resource : null,
       });
     } catch (error) {
       if (error instanceof HttpError && asRecord(error.details).code === "oauth_reauthorization_required") {
@@ -4945,7 +5407,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           quarantineNewEntries: true,
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
-      : { ...baseConfig, quarantineNewEntries: true };
+      : { ...baseConfig, quarantineNewEntries: true, unverifiedServer: true };
+    // A pasted URL may arrive with a client the operator preregistered in the
+    // provider's own console, because that authorization server supports neither
+    // CIMD nor dynamic registration. Record the client id now; the secret becomes
+    // a Paperclip secret ref alongside the other credentials below.
+    if (!galleryEntry && input.oauthClient) {
+      config.oauth = {
+        clientId: input.oauthClient.clientId.trim(),
+        clientRegistrationSource: "manual" satisfies OAuthClientRegistrationSource,
+        clientCompanyId: companyId,
+      };
+    }
     if (galleryEntry?.slug === GOOGLE_SHEETS_GALLERY_KEY) {
       const availability = googleSheetsRobotEmailFromEnv();
       if (!availability.available) {
@@ -4968,6 +5441,20 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     assertLocalStdioCanBeEnabled(transport, false);
 
     const credentialValues = input.credentialValues ?? {};
+    // A curated method declares its auth kind. A pasted URL declares one only
+    // under Advanced authentication; on the simple path it starts from what the
+    // operator supplied and is upgraded to `oauth` when discovery proves the
+    // endpoint needs sign-in (see `remoteTools` and `startOAuth`).
+    const genericAuthKind: ToolConnectionAuthKind = method?.auth
+      ?? (input.authMode === "oauth" || input.oauthClient
+        ? "oauth"
+        : input.authMode === "bearer" || input.authMode === "custom_headers"
+          ? "api_key"
+          : input.authMode === "none"
+            ? "none"
+            : Object.keys(credentialValues).length > 0
+              ? "api_key"
+              : "none");
     const credentialSecretRefs: CreateToolConnection["credentialSecretRefs"] = [];
     const credentialRefs: McpConnectionCredentialRef[] = [];
     const createdSecretIds: string[] = [];
@@ -5008,6 +5495,27 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             prefix: field.prefix ?? null,
           });
         }
+      }
+
+      // A preregistered OAuth client secret is not a request header — it is only
+      // ever sent to the token endpoint — so it gets a secret ref with no
+      // credential ref, keeping it out of `projectedConnectionHeaders`.
+      if (!galleryEntry && input.oauthClient?.clientSecret) {
+        const secret = await secrets.create(companyId, {
+          name: `${name} OAuth client secret ${randomUUID().slice(0, 8)}`,
+          key: `tool_app.${randomUUID()}.oauth_client_secret`,
+          provider: "local_encrypted",
+          value: input.oauthClient.clientSecret,
+          description: `OAuth client secret for ${name}.`,
+        }, actorForSecret(actor));
+        createdSecretIds.push(secret.id);
+        credentialSecretRefs.push({
+          secretId: secret.id,
+          versionSelector: "latest",
+          configPath: "oauth.client_secret",
+          required: false,
+          label: "OAuth client secret",
+        });
       }
 
       if (existingApplication) {
@@ -5051,7 +5559,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (revivedConnectionPrevious) {
         [connectionRow] = await db.update(toolConnections).set({
           name,
-          authKind: method?.auth ?? "none",
+          authKind: genericAuthKind,
           transport,
           status: "draft",
           enabled: false,
@@ -5070,7 +5578,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           name,
           uid: connectionUid(applicationRow.applicationKey ?? applicationRow.name, name, connectionId),
           connectionKind: "managed",
-          authKind: method?.auth ?? "none",
+          authKind: genericAuthKind,
           transport,
           status: "draft",
           enabled: false,
@@ -5114,7 +5622,18 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               access: "all_agents",
               askFirstRiskLevels: ["write", "destructive"],
             },
-            auth: { kind: "oauth", startUrl: null },
+            // The endpoint asked for authorization and discovery found a real
+            // authorization server, so the wizard can offer "Sign in to
+            // continue" instead of a dead end. The caller starts the flow and
+            // fills in `startUrl`/`registrationSource`; it only needs the issuer
+            // and resource here to show which server the operator is about to
+            // trust.
+            auth: {
+              kind: "oauth",
+              startUrl: null,
+              issuer: endpoints.issuer ?? null,
+              resource: endpoints.resource ?? null,
+            },
           };
         }
         throw error;
@@ -5619,6 +6138,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     authorizationUrl.searchParams.set("state", state);
     authorizationUrl.searchParams.set("code_challenge", base64UrlSha256(codeVerifier));
     authorizationUrl.searchParams.set("code_challenge_method", "S256");
+    // RFC 8707: name the MCP server the resulting token is for, so an
+    // authorization server that serves several resources can audience-restrict it.
+    if (endpoints.resource) authorizationUrl.searchParams.set("resource", endpoints.resource);
     const authorizationScopes = input.scopes ?? endpoints.scopes;
     if (authorizationScopes.length > 0) authorizationUrl.searchParams.set("scope", authorizationScopes.join(" "));
 
@@ -5685,11 +6207,27 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         clientIdEnv: client.clientIdEnv,
         clientSecretEnv: client.clientSecret ? client.clientSecretEnv : null,
         credentialScope: credentialScope(connection, input.actor),
+        // Persist the issuer and resource this authorization run is bound to.
+        // `iss` on the callback is validated against `expectedIssuer`, and
+        // refresh/reconnect/revoke reuse the same pair rather than re-deriving it.
+        issuer: endpoints.issuer ?? oauthConfig(connection).issuer ?? null,
+        expectedIssuer: endpoints.issuer ?? null,
+        resource: endpoints.resource ?? oauthConfig(connection).resource ?? null,
+        clientIdMetadataDocumentSupported: endpoints.clientIdMetadataDocumentSupported === true,
       },
     };
     await db
       .update(toolConnections)
-      .set({ config: nextConfig, transportConfig: nextConfig, updatedAt: new Date() })
+      .set({
+        // A generic URL connection starts life as `authKind: none`. Once it has
+        // completed OAuth discovery and client resolution it is an OAuth
+        // connection, and refresh, reconnect, revoke and diagnostics must all
+        // treat it as one.
+        authKind: "oauth",
+        config: nextConfig,
+        transportConfig: nextConfig,
+        updatedAt: new Date(),
+      })
       .where(eq(toolConnections.id, connection.id));
 
     return {
@@ -5697,6 +6235,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       provider: endpoints.provider,
       authorizationUrl: authorizationUrl.toString(),
       expiresAt: expiresAt.toISOString(),
+      issuer: endpoints.issuer ?? null,
+      resource: endpoints.resource ?? null,
+      registrationSource: resolvedClient.source,
     };
   }
 
@@ -5715,6 +6256,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     error?: string | null;
     errorDescription?: string | null;
     redirectUri: string;
+    /** RFC 9207 `iss`, when the authorization server returns it. */
+    iss?: string | null;
     actor?: ActorInfo;
   }): Promise<ConnectToolAppResult> {
     if (input.error) throw badRequest(input.errorDescription ?? `OAuth provider returned ${input.error}`);
@@ -5740,6 +6283,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
     assertOAuthRedirectConstraints(galleryEntry, input.redirectUri);
     const endpoints = await oauthEndpointsForConnection(connection, null, input.redirectUri);
+    assertOAuthCallbackIssuer(connection, endpoints, input.iss);
     const client = await oauthClientForConnection(connection, endpoints.provider, input.actor);
     if (!client.clientId) throw unprocessable(`OAuth client id is not configured for ${endpoints.provider}`);
 
@@ -5750,6 +6294,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       redirectUri: input.redirectUri,
       codeVerifier: stateRow.codeVerifier,
       code: input.code,
+      resource: endpoints.resource,
     });
     const [existingUserGrant] = stateRow.subjectUserId
       ? await db.select().from(connectionGrants).where(and(
@@ -5854,6 +6399,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         clientIdEnv: client.clientIdEnv,
         clientSecretEnv: client.clientSecret ? client.clientSecretEnv : null,
         credentialScope: credentialScope(connection, input.actor),
+        // Keep the issuer and resource this grant was minted against so refresh,
+        // reconnect, revoke and diagnostics resolve the same authorization server
+        // instead of re-discovering one from a possibly-changed endpoint.
+        issuer: endpoints.issuer ?? oauthConfig(connection).issuer ?? null,
+        resource: endpoints.resource ?? oauthConfig(connection).resource ?? null,
         expiresAt,
         scope: token.scope,
         tokenType: token.tokenType,
@@ -5869,6 +6419,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .set({
         status: "active",
         enabled: true,
+        authKind: "oauth",
         config: nextConfig,
         transportConfig: nextConfig,
         credentialSecretRefs: nextCredentialSecretRefs,

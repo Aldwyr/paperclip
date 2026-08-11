@@ -42,9 +42,13 @@ import {
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { getActorInfo, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
-import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { badRequest, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { accessService, googleSheetsRobotEmailFromEnv, logActivity, toolAccessPolicyService, toolAccessService } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
+import {
+  OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
+  oauthClientIdMetadataDocument,
+} from "../services/tool-access.js";
 
 /** Allowlist (e.g. Google Sheets allowed spreadsheet ids) lives in connection config. */
 function allowlistIds(config: Record<string, unknown> | null | undefined): string[] {
@@ -252,17 +256,48 @@ export function toolAccessRoutes(
     });
   });
 
+  /**
+   * Paperclip's Client ID Metadata Document (PAP-17087).
+   *
+   * The document's own URL is the `client_id` Paperclip presents to an
+   * authorization server that supports CIMD, so this endpoint has to be publicly
+   * readable — an authorization server fetches it server-to-server with no
+   * Paperclip session. It contains only this deployment's callback and the
+   * grant/response/auth methods Paperclip uses: no company, connection or secret
+   * data of any kind.
+   */
+  router.get(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH.replace(/^\/api/, ""), (_req, res) => {
+    const redirectUri = oauthRedirectUri();
+    const clientId = new URL(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH, new URL(redirectUri).origin).toString();
+    res.type("application/json").json(oauthClientIdMetadataDocument({ clientId, redirectUri }));
+  });
+
   router.post("/companies/:companyId/tools/apps/connect", validate(connectToolAppSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertToolAppMutationAccess(req, companyId);
     try {
       const result = await svc.connectGalleryApp(companyId, req.body, getActorInfo(req));
       if (result.auth?.kind === "oauth") {
-        const start = await svc.startOAuth(companyId, result.connectionId, {
-          redirectUri: oauthRedirectUri(),
-          actor: getActorInfo(req),
-        });
-        result.auth.startUrl = start.authorizationUrl;
+        try {
+          const start = await svc.startOAuth(companyId, result.connectionId, {
+            redirectUri: oauthRedirectUri(),
+            actor: getActorInfo(req),
+          });
+          result.auth.startUrl = start.authorizationUrl;
+          result.auth.issuer = start.issuer ?? result.auth.issuer ?? null;
+          result.auth.resource = start.resource ?? result.auth.resource ?? null;
+          result.auth.registrationSource = start.registrationSource ?? null;
+        } catch (error) {
+          // An unknown server whose authorization server supports neither CIMD
+          // nor dynamic registration is not a failed connect: the draft
+          // connection is real and usable as soon as the operator supplies a
+          // client they registered themselves. Report that instead of a 4xx so
+          // the wizard can ask for it rather than losing the draft.
+          const code = error instanceof HttpError ? String((error.details as { code?: unknown })?.code ?? "") : "";
+          if (code !== "oauth_manual_client_required" && code !== "oauth_manual_client_rebinding_required") throw error;
+          result.auth.startUrl = null;
+          result.auth.manualClientRequired = true;
+        }
       }
       await logActivity(db, {
         companyId,
@@ -324,6 +359,7 @@ export function toolAccessRoutes(
     const code = typeof req.query.code === "string" ? req.query.code : null;
     const error = typeof req.query.error === "string" ? req.query.error : null;
     const errorDescription = typeof req.query.error_description === "string" ? req.query.error_description : null;
+    const iss = typeof req.query.iss === "string" ? req.query.iss : null;
     const pendingState = state ? await svc.peekOAuthState(state) : null;
     if (!pendingState || !hasCompanyAccess(req, pendingState.companyId)) {
       throw badRequest("Invalid or expired OAuth state");
@@ -334,6 +370,7 @@ export function toolAccessRoutes(
       code,
       error,
       errorDescription,
+      iss,
       redirectUri: oauthRedirectUri(),
       actor: getActorInfo(req),
     });

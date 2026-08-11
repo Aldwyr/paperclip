@@ -952,6 +952,11 @@ export interface ToolOAuthStartResult {
   provider: string;
   authorizationUrl: string;
   expiresAt: string;
+  /** Canonical authorization-server issuer this run is bound to, when discovered. */
+  issuer?: string | null;
+  /** RFC 8707 resource indicator sent with the request. */
+  resource?: string | null;
+  registrationSource?: ToolOAuthClientRegistrationSource | null;
 }
 
 export interface FinishToolAppResult {
