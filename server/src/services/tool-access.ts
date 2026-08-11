@@ -120,6 +120,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
+import { guardedRemoteHttpFetch, type GuardedRemoteHttpFetchOptions } from "./remote-http-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { readSignedToolArgumentsPayload } from "./tool-content-guards.js";
@@ -1608,12 +1609,29 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return endpoint.toString();
   }
 
+  function remoteHttpFetchOptions(): GuardedRemoteHttpFetchOptions {
+    return {
+      allowPrivateNetwork: allowPrivateRemoteEndpoints(),
+      error: (message, code) => badRequest(message, { code }),
+    };
+  }
+
+  /**
+   * Fetch an operator-supplied remote URL with the egress guard bound to the
+   * connection itself.
+   *
+   * `guardedRemoteHttpFetch` resolves the hostname once and dials the approved
+   * address, so a name server that answers public-then-private cannot move the
+   * connection onto a loopback or metadata address after validation
+   * (PAP-17098). Redirects stay manual and run the full guard again on the next
+   * hop, because a `Location` is just as attacker-controlled as the first URL.
+   */
   async function fetchRemoteHttpUrl(value: string, init: RequestInit = {}): Promise<Response> {
     let currentUrl = value;
     const method = (init.method ?? "GET").toUpperCase();
     for (let redirectCount = 0; redirectCount <= MAX_REMOTE_HTTP_REDIRECTS; redirectCount += 1) {
-      const safeUrl = await assertRemoteHttpUrlAllowed(currentUrl);
-      const response = await fetch(safeUrl, { ...init, redirect: "manual" });
+      const endpoint = parseRemoteHttpEndpoint(currentUrl, (message, code) => badRequest(message, { code }));
+      const response = await guardedRemoteHttpFetch(endpoint, init, remoteHttpFetchOptions());
       const location = REMOTE_HTTP_REDIRECT_STATUSES.has(response.status)
         ? response.headers?.get?.("location") ?? null
         : null;
@@ -1624,7 +1642,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (redirectCount >= MAX_REMOTE_HTTP_REDIRECTS) {
         throw new HttpError(502, "Remote OAuth endpoint redirected too many times", { code: "oauth_redirect_limit" });
       }
-      currentUrl = new URL(location, safeUrl).toString();
+      currentUrl = new URL(location, endpoint).toString();
     }
     throw new HttpError(502, "Remote OAuth endpoint redirected too many times", { code: "oauth_redirect_limit" });
   }
@@ -3082,8 +3100,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
   async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
     const headers = { ...projectedConnectionHeaders(connection), ...await resolveCredentialHeaders(connection) };
-    const endpoint = await assertRemoteEndpointAllowed(connection.config);
-    const response = await fetch(endpoint, {
+    // Pinned to the address the guard approved: `config.url` is operator-supplied,
+    // so a second DNS resolution here would reopen the rebinding window that
+    // PAP-17098 closed for the OAuth endpoints.
+    const response = await guardedRemoteHttpFetch(remoteEndpoint(connection.config), {
       method: "POST",
       // MCP Streamable HTTP requires advertising that we accept both a JSON body
       // and an SSE stream; spec-compliant servers 406 without it (see mcp-http.ts).
@@ -3094,7 +3114,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         method: "tools/list",
         params: {},
       }),
-    });
+    }, remoteHttpFetchOptions());
     if (!response.ok) {
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (response.status === 401 && /bearer|oauth|authorization/i.test(authenticate)) {

@@ -55,7 +55,8 @@ import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
 import { projectedConnectionHeaders } from "./tool-access.js";
-import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
+import { parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
+import { guardedRemoteHttpFetch, type GuardedRemoteHttpFetchOptions } from "./remote-http-fetch.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
@@ -2140,14 +2141,19 @@ export function createToolGatewayService(
     return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
   }
 
-  async function assertRemoteEndpointAllowed(config: Record<string, unknown>): Promise<string> {
-    const endpoint = new URL(remoteEndpoint(config));
-    await assertPublicRemoteHttpEndpoint(
-      endpoint,
-      { allowPrivateNetwork: allowPrivateRemoteEndpoints() },
-      (message, code) => new ToolGatewayHttpError(422, message, code),
-    );
-    return endpoint.toString();
+  /**
+   * Guard options for every outbound call to an operator-supplied MCP endpoint.
+   *
+   * The private-network check no longer runs as a standalone pre-flight: it is
+   * part of `guardedRemoteHttpFetch`, which keeps the approved address and dials
+   * it directly. Splitting validation from dispatch is what created the
+   * DNS-rebinding TOCTOU in PAP-17098.
+   */
+  function remoteHttpFetchOptions(): GuardedRemoteHttpFetchOptions {
+    return {
+      allowPrivateNetwork: allowPrivateRemoteEndpoints(),
+      error: (message, code) => new ToolGatewayHttpError(422, message, code),
+    };
   }
 
   function headerName(value: unknown): string | null {
@@ -3050,7 +3056,7 @@ export function createToolGatewayService(
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedRemoteTool(session, tool);
-    const endpoint = await assertRemoteEndpointAllowed(connection.config ?? {});
+    const endpoint = remoteEndpoint(connection.config ?? {});
     // Method-defined headers are trusted catalog configuration. Treat them as
     // managed headers so callers cannot override the scope that was reviewed
     // during tools/list. Credentials remain authoritative on collisions.
@@ -3081,7 +3087,11 @@ export function createToolGatewayService(
     const timer = setTimeout(() => controller.abort(), ms);
     timer.unref?.();
     try {
-      const response = await fetch(endpoint, {
+      // The guard runs inside this call and the connection is pinned to the
+      // address it approved, so an operator-supplied hostname cannot be rebound
+      // onto a loopback or metadata address between validation and dispatch
+      // (PAP-17098).
+      const response = await guardedRemoteHttpFetch(endpoint, {
         method: "POST",
         redirect: "manual",
         // MCP Streamable HTTP requires the Accept header advertising both a JSON
@@ -3097,7 +3107,7 @@ export function createToolGatewayService(
             arguments: parameters ?? {},
           },
         }),
-      });
+      }, remoteHttpFetchOptions());
       const body = await readBoundedRemoteResponse(response);
       execution.response = {
         httpStatus: response.status,
