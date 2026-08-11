@@ -229,8 +229,25 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     const projectInput = container.querySelector<HTMLInputElement>('input[placeholder="12345"]');
     const keyInput = container.querySelector<HTMLInputElement>('input[type="password"]');
+    const advanced = buttonByText("Advanced");
     expect(projectInput).toBeTruthy();
     expect(keyInput).toBeTruthy();
+    expect(container.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("false");
+    expect(advanced?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.textContent).not.toContain("Feature groups");
+    expect(container.textContent).not.toContain("Individual tools");
+    expect(container.textContent).not.toContain("Tool response mode");
+
+    await act(async () => {
+      advanced?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(advanced?.getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain("Feature groups");
+    expect(container.textContent).toContain("Individual tools");
+    expect(container.textContent).toContain("Tool response mode");
+
     await act(async () => {
       setInputValue(projectInput!, "12345");
       setInputValue(keyInput!, "phx_test-key");
@@ -248,8 +265,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       credentialValues: { "credentials.authorization": "phx_test-key" },
       configValues: {
         projectId: "12345",
-        readOnly: true,
-        features: "insights,error_tracking,flags,experiments",
+        readOnly: false,
         mode: "tools",
       },
       applicationId: undefined,

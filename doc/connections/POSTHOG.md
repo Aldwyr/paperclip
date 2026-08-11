@@ -24,7 +24,7 @@ sequenceDiagram
     participant M as mcp.posthog.com
     participant O as oauth.posthog.com
 
-    A->>P: Choose PostHog sign-in and project filters
+    A->>P: Choose PostHog sign-in and project
     P->>M: Discover protected-resource metadata
     M-->>P: Authorization server metadata URL
     P->>O: Discover endpoints and register OAuth client
@@ -34,8 +34,8 @@ sequenceDiagram
     O-->>P: Redirect to /api/tools/oauth/callback
     P->>O: Exchange authorization code
     O-->>P: Access and refresh tokens
-    P->>M: tools/list with project and safety filters
-    M-->>P: Filtered PostHog tool catalog
+    P->>M: tools/list with project and configured options
+    M-->>P: PostHog tool catalog
 ```
 
 The current hosted endpoints are:
@@ -60,11 +60,13 @@ values for either.
 1. In **Apps → Browse**, choose **PostHog**.
 2. Explicitly choose **Sign in with PostHog** or **Use a personal API key**.
 3. Enter the numeric PostHog project ID.
-4. Keep **Read-only mode** enabled unless agents have an approved need to make
-   changes.
-5. Limit the catalog with one or both of **Feature groups** and **Individual
-   tools**. Paperclip currently fixes response mode to individual tools; CLI
-   mode is unavailable until nested execution is governed.
+4. Leave **Read-only mode** off to expose the full PostHog action catalog.
+   Turn it on when the connection should never offer actions that change data.
+5. The default setup requests all feature groups and tools. Open **Advanced**
+   only to narrow the catalog with **Feature groups** or **Individual tools**.
+   Paperclip fixes the advanced response mode to individual tools so each
+   action can be governed; CLI mode is unavailable until nested execution is
+   governed.
 6. For OAuth, continue through browser consent. For API-key setup, create a
    personal API key using PostHog's **MCP Server** preset and paste it into
    Paperclip. Never put the key in connection configuration or a URL.
@@ -73,9 +75,10 @@ values for either.
    write risk until reviewed.
 
 Paperclip sends the project scope as the `x-posthog-project-id` managed header.
-It sends `readonly`, `features`, `tools`, and `mode` as query parameters. The
-managed header is identical during catalog discovery and tool execution, and a
-caller cannot override it. PostHog documents these options in its [MCP
+It sends configured `readonly`, `features`, `tools`, and `mode` values as query
+parameters. Leaving the optional feature and tool filters blank exposes the
+full catalog. The managed header is identical during catalog discovery and tool
+execution, and a caller cannot override it. PostHog documents these options in its [MCP
 overview](https://posthog.com/docs/model-context-protocol) and [MCP
 FAQ](https://posthog.com/docs/model-context-protocol/faq).
 

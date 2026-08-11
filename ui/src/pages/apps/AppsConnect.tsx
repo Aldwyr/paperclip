@@ -3,6 +3,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   ArrowUpRight,
   Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   ClipboardPaste,
@@ -38,6 +39,7 @@ import { AgentIcon } from "@/components/AgentIconPicker";
 import { AgentMultiSelect } from "@/components/AgentMultiSelect";
 import { InlineBanner } from "@/components/InlineBanner";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -1417,6 +1419,9 @@ function KeyStep({
     (f) => f.required === false || (values[f.configPath]?.trim().length ?? 0) > 0,
   );
   const configFields = [...(method?.tenantFields ?? []), ...(method?.extensionFields ?? [])];
+  const standardConfigFields = configFields.filter((field) => field.advanced !== true);
+  const advancedConfigFields = configFields.filter((field) => field.advanced === true);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const configFilled = configFields.every((field) => {
     if (!field.required) return true;
     const value = configValues[field.key];
@@ -1537,7 +1542,7 @@ function KeyStep({
 
         <ConnectionNameField name={name} onNameChange={onNameChange} />
 
-        {configFields.map((field) => (
+        {standardConfigFields.map((field) => (
           <MethodConfigField
             key={field.key}
             field={field}
@@ -1545,6 +1550,27 @@ function KeyStep({
             onChange={(value) => onConfigChange({ ...configValues, [field.key]: value })}
           />
         ))}
+
+        {advancedConfigFields.length > 0 && (
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+            <CollapsibleTrigger className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+              <ChevronDown className={cn("h-4 w-4 transition-transform", advancedOpen && "rotate-180")} />
+              Advanced
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-4">
+              <div className="space-y-6">
+                {advancedConfigFields.map((field) => (
+                  <MethodConfigField
+                    key={field.key}
+                    field={field}
+                    value={configValues[field.key]}
+                    onChange={(value) => onConfigChange({ ...configValues, [field.key]: value })}
+                  />
+                ))}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        )}
 
         {method && fields.length === 0 ? (
           <p className="text-sm text-muted-foreground">

@@ -91,6 +91,11 @@ Capture:
 - `methods`: explicit combinations of `transport` (`mcp_remote`, `rest_api`, `local_stdio`), `authKind` (`oauth`, `api_key`, `none`), and `ownership` (`platform_shared`, `platform_provisioned`, `customer`, `dcr`).
 - Stable connection UID namespace used to form `{namespace}/{slug}` addresses.
 - `credentialFields`: labels, vendor-call placement, header key, prefix, help URL, and required state. User-facing labels should be sanitized by the Apps UI copy layer. The saved value is always a `company_secrets` ref, not an env entry.
+- `tenantFields` and `extensionFields`: keep unavoidable identity and resource
+  boundaries in the default flow. Mark optional scope reduction, feature/tool
+  filters, response modes, and transport tuning with `advanced: true`, and give
+  advanced fields working defaults that do not require the operator to expand
+  the disclosure.
 - `oauth`: provider key, scopes, authorization URL, token URL, metadata URL if applicable.
 - `urlPatterns`: URLs that can identify this app during paste/import flows.
 - `recommendedDefaults`: access and risk defaults, especially ask-first risk levels.
@@ -150,6 +155,13 @@ The wizard path comes from auth mode and transport:
 | None | Gallery card -> configure allowed resources -> health/catalog -> access defaults. | No vendor secret; connection row still carries config and audit scope. |
 
 The operator should see Apps, Connections, and Review language. Keep protocol language behind Developer/Advanced copy.
+
+Default to the broadest vendor permissions and scopes the reviewed connection
+can support. Operators should not have to predict every future tool during
+setup. Keep the default view to the minimum inputs needed for a working
+connection, fold optional expert controls under one collapsed **Advanced**
+disclosure, and enforce safe execution afterward through Paperclip's resource
+boundaries, catalog review, ask-first policies, quarantine, and audit.
 
 ## Step 8: Apply Governance Defaults
 
@@ -750,4 +762,3 @@ End-to-end evidence belongs to PAP-16654 (P6) and the PAP-12373 matrix:
 - Revocation removes Notion tools and blocks execution.
 - Audit rows prove actor, run/issue context, connection, tool, decision,
   reason code, and outcome.
-

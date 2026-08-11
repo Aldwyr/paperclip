@@ -26,7 +26,7 @@
       "defaults": {
         "serverUrl": "https://mcp.posthog.com/mcp"
       },
-      "guidanceMd": "Pin the connection to one PostHog project, keep read-only mode enabled by default, and expose only the feature groups or tools agents need.",
+      "guidanceMd": "Pin the connection to one PostHog project and expose the full tool catalog by default. Narrow feature groups or tools only when needed.",
       "riskTier": "S3",
       "tenantFields": [
         {
@@ -49,8 +49,8 @@
           "key": "readOnly",
           "label": "Read-only mode",
           "type": "checkbox",
-          "defaultValue": true,
-          "helperMd": "Keep enabled unless agents explicitly need to change PostHog data.",
+          "defaultValue": false,
+          "helperMd": "Turn on to hide tools that can change PostHog data.",
           "transport": {
             "location": "query",
             "name": "readonly",
@@ -62,9 +62,9 @@
           "key": "features",
           "label": "Feature groups",
           "type": "textarea",
-          "placeholder": "insights, error_tracking, flags, experiments",
-          "defaultValue": "insights,error_tracking,flags,experiments",
-          "helperMd": "Comma-separated PostHog feature groups to expose.",
+          "advanced": true,
+          "placeholder": "Optional comma-separated feature groups",
+          "helperMd": "Leave blank to expose every feature group, or enter a comma-separated list to narrow access.",
           "validation": {
             "maxLength": 500
           },
@@ -78,8 +78,9 @@
           "key": "tools",
           "label": "Individual tools",
           "type": "textarea",
+          "advanced": true,
           "placeholder": "Optional comma-separated tool names",
-          "helperMd": "Optional exact tool names. These are combined with feature groups.",
+          "helperMd": "Leave blank to expose all tools. Exact names here are combined with any feature groups.",
           "validation": {
             "maxLength": 2000
           },
@@ -93,6 +94,7 @@
           "key": "mode",
           "label": "Tool response mode",
           "type": "select",
+          "advanced": true,
           "required": true,
           "placeholder": "Individual tools",
           "defaultValue": "tools",
@@ -102,25 +104,15 @@
               "label": "Individual tools"
             }
           ],
-          "helperMd": "CLI mode remains unavailable until nested execution is governed.",
+          "helperMd": "Paperclip uses individual tools so every action can be governed. CLI mode remains unavailable until nested execution is governed.",
           "transport": {
             "location": "query",
             "name": "mode"
           }
         }
       ],
-      "configRequirements": {
-        "atLeastOneOf": [
-          "features",
-          "tools"
-        ]
-      },
       "requiredResourceFilters": [
-        "project",
-        "read_only",
-        "features",
-        "tools",
-        "mode"
+        "project"
       ],
       "label": "Sign in with PostHog",
       "consoleLinks": {
@@ -138,7 +130,7 @@
       "defaults": {
         "serverUrl": "https://mcp.posthog.com/mcp"
       },
-      "guidanceMd": "Pin the connection to one PostHog project, keep read-only mode enabled by default, and expose only the feature groups or tools agents need.",
+      "guidanceMd": "Pin the connection to one PostHog project and expose the full tool catalog by default. Narrow feature groups or tools only when needed.",
       "riskTier": "S3",
       "tenantFields": [
         {
@@ -161,8 +153,8 @@
           "key": "readOnly",
           "label": "Read-only mode",
           "type": "checkbox",
-          "defaultValue": true,
-          "helperMd": "Keep enabled unless agents explicitly need to change PostHog data.",
+          "defaultValue": false,
+          "helperMd": "Turn on to hide tools that can change PostHog data.",
           "transport": {
             "location": "query",
             "name": "readonly",
@@ -174,9 +166,9 @@
           "key": "features",
           "label": "Feature groups",
           "type": "textarea",
-          "placeholder": "insights, error_tracking, flags, experiments",
-          "defaultValue": "insights,error_tracking,flags,experiments",
-          "helperMd": "Comma-separated PostHog feature groups to expose.",
+          "advanced": true,
+          "placeholder": "Optional comma-separated feature groups",
+          "helperMd": "Leave blank to expose every feature group, or enter a comma-separated list to narrow access.",
           "validation": {
             "maxLength": 500
           },
@@ -190,8 +182,9 @@
           "key": "tools",
           "label": "Individual tools",
           "type": "textarea",
+          "advanced": true,
           "placeholder": "Optional comma-separated tool names",
-          "helperMd": "Optional exact tool names. These are combined with feature groups.",
+          "helperMd": "Leave blank to expose all tools. Exact names here are combined with any feature groups.",
           "validation": {
             "maxLength": 2000
           },
@@ -205,6 +198,7 @@
           "key": "mode",
           "label": "Tool response mode",
           "type": "select",
+          "advanced": true,
           "required": true,
           "placeholder": "Individual tools",
           "defaultValue": "tools",
@@ -214,25 +208,15 @@
               "label": "Individual tools"
             }
           ],
-          "helperMd": "CLI mode remains unavailable until nested execution is governed.",
+          "helperMd": "Paperclip uses individual tools so every action can be governed. CLI mode remains unavailable until nested execution is governed.",
           "transport": {
             "location": "query",
             "name": "mode"
           }
         }
       ],
-      "configRequirements": {
-        "atLeastOneOf": [
-          "features",
-          "tools"
-        ]
-      },
       "requiredResourceFilters": [
-        "project",
-        "read_only",
-        "features",
-        "tools",
-        "mode"
+        "project"
       ],
       "label": "Use a personal API key",
       "credentialFields": [

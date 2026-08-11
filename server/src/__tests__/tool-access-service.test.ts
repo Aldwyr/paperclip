@@ -7172,6 +7172,20 @@ describe("normalizeConnectionMethodConfig", () => {
   const posthog = getConnectableAppDefinition("posthog")!;
   const apiKeyMethod = posthog.methods.find((method) => method.key === "mcp-api-key")!;
 
+  it("uses the broad PostHog catalog when optional advanced filters are untouched", () => {
+    expect(normalizeConnectionMethodConfig(apiKeyMethod, {
+      projectId: "12345",
+    })).toEqual({
+      values: {
+        projectId: "12345",
+        readOnly: false,
+        mode: "tools",
+      },
+      url: "https://mcp.posthog.com/mcp?mode=tools",
+      headers: { "x-posthog-project-id": "12345" },
+    });
+  });
+
   it("normalizes and projects PostHog scope without accepting arbitrary config", () => {
     expect(normalizeConnectionMethodConfig(apiKeyMethod, {
       projectId: "12345",
