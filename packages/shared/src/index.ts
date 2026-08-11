@@ -2031,6 +2031,8 @@ export {
   GENERIC_MCP_AUTH_MODES,
   genericMcpAuthModeSchema,
   genericMcpOAuthClientSchema,
+  type GenericMcpAuthMode,
+  type GenericMcpOAuthClient,
   reconnectToolAppSchema,
   createToolApplicationSchema,
   finishToolAppSchema,
