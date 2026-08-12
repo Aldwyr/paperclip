@@ -254,6 +254,7 @@ async function createBrokerConnection(
     rateLimitPerHour?: number;
     healthStatus?: "unknown" | "healthy" | "degraded" | "failed" | "unchecked" | "ok" | "error" | "missing_secret";
     tokenUrl?: string;
+    protocol?: "pages" | "generic" | "rfc8693";
   } = {},
 ) {
   const secret = await secretService(db).create(companyId, {
@@ -284,7 +285,8 @@ async function createBrokerConnection(
       tokenBroker: {
         enabled: true,
         path: input.path ?? "exchange",
-        tokenUrl: input.tokenUrl ?? "https://pages.example.test/v1/tokens/exchange",
+        tokenUrl: input.tokenUrl ?? "https://93.184.216.34/v1/tokens/exchange",
+        ...(input.protocol ? { protocol: input.protocol } : {}),
         parentCredentialConfigPath: "credentials.deploy_token",
         parentScopes: input.parentScopes ?? ["pages:publish:ns/dotta"],
         defaultScopes: input.defaultScopes ?? [],
@@ -475,7 +477,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
 
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
-      expect(String(url)).toBe("https://pages.example.test/v1/tokens/exchange");
+      expect(String(url)).toBe("https://93.184.216.34/v1/tokens/exchange");
       expect(init?.headers).toEqual(expect.objectContaining({ authorization: "Bearer parent-deploy-token" }));
       const body = JSON.parse(String(init?.body));
       expect(body).toMatchObject({
@@ -541,6 +543,76 @@ describeEmbeddedPostgres("tool access service", () => {
         outcome: "success",
       }),
     ]));
+  });
+
+  it.each([
+    ["generic", undefined],
+    ["RFC 8693", "rfc8693" as const],
+  ])("blocks a link-local %s token broker before credentials reach fetch", async (_label, protocol) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createBrokerConnection(db, company.id, {
+      tokenUrl: "http://169.254.169.254/latest/meta-data",
+      ...(protocol ? { protocol } : {}),
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      new Error("the parent credential must never reach the broker"),
+    );
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${connection.id}/token`)
+      .send({ scope: "pages:publish:ns/dotta" });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "remote_http_private_endpoint" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    const [issuance] = await db.select().from(connectionTokenIssuances);
+    expect(issuance).toMatchObject({
+      connectionId: connection.id,
+      outcome: "failure",
+      errorCode: "remote_http_private_endpoint",
+      tokenHash: null,
+    });
+  });
+
+  it("allows an explicitly allowlisted internal token broker through the guarded fetch", async () => {
+    vi.stubEnv("PAPERCLIP_TOKEN_BROKER_ALLOWED_HOSTS", "broker.example, 127.0.0.1");
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createBrokerConnection(db, company.id, {
+      tokenUrl: "http://127.0.0.1:8787/v1/tokens/exchange",
+    });
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      expect(String(url)).toBe("http://127.0.0.1:8787/v1/tokens/exchange");
+      expect(init).toMatchObject({
+        method: "POST",
+        redirect: "manual",
+        headers: expect.objectContaining({ authorization: "Bearer parent-deploy-token" }),
+      });
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({
+          token: "allowlisted-child-token",
+          expires_in: 600,
+          scope: "pages:publish:ns/dotta",
+        }),
+      } as Response;
+    });
+
+    const res = await request(app)
+      .post(`/api/agents/me/connections/${connection.id}/token`)
+      .send({ scope: "pages:publish:ns/dotta" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ token: "allowlisted-child-token" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("selects scoped credentials for array scopes and fails closed for unknown selectors", async () => {
@@ -1268,6 +1340,86 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(service.getEffectiveProfilesForAgent(company.id, agent.id)).resolves.toMatchObject({
       profiles: [],
       allowedToolNames: [],
+    });
+  });
+
+  it.each([
+    ["tokenBroker.tokenUrl", { tokenBroker: { enabled: true, tokenUrl: "http://169.254.169.254/token" } }],
+    ["tokenBroker.exchangeTokenUrl", { tokenBroker: { enabled: true, exchangeTokenUrl: "http://169.254.169.254/token" } }],
+    ["tokenExchangeUrl", { tokenExchangeUrl: "http://169.254.169.254/token" }],
+    ["pagesTokenExchangeUrl", { pagesTokenExchangeUrl: "http://169.254.169.254/token" }],
+  ])("rejects a link-local %s when a remote connection is created", async (_field, brokerConfig) => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+    });
+
+    await expect(service.createConnection(company.id, {
+      name: `Rejected broker ${randomUUID()}`,
+      transport: "mcp_remote",
+      config: { url: "https://93.184.216.34/mcp", ...brokerConfig },
+      enabled: true,
+      status: "active",
+    })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "remote_http_private_endpoint" },
+    });
+    await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
+  });
+
+  it("rejects a link-local token broker when a remote connection is updated", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+    });
+    const connection = await service.createConnection(company.id, {
+      name: "Initially safe broker",
+      transport: "mcp_remote",
+      config: { url: "https://93.184.216.34/mcp" },
+      enabled: true,
+      status: "active",
+    });
+
+    await expect(service.updateConnection(connection.id, {
+      config: {
+        ...connection.config,
+        tokenBroker: { enabled: true, tokenUrl: "http://169.254.169.254/token" },
+      },
+    })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "remote_http_private_endpoint" },
+    });
+    await expect(service.getConnection(connection.id)).resolves.toMatchObject({
+      config: { url: "https://93.184.216.34/mcp" },
+    });
+  });
+
+  it("implicitly allowlists the configured Pages API host for internal token brokers", async () => {
+    vi.stubEnv("PAPERCLIP_PAGES_API_URL", "http://127.0.0.1:8787");
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+    });
+
+    await expect(service.createConnection(company.id, {
+      name: "Internal Pages broker",
+      transport: "mcp_remote",
+      config: {
+        url: "https://93.184.216.34/mcp",
+        tokenBroker: {
+          enabled: true,
+          tokenUrl: "http://127.0.0.1:9999/v1/tokens/exchange",
+        },
+      },
+      enabled: true,
+      status: "active",
+    })).resolves.toMatchObject({
+      config: {
+        tokenBroker: { tokenUrl: "http://127.0.0.1:9999/v1/tokens/exchange" },
+      },
     });
   });
 

@@ -924,6 +924,22 @@ pnpm secrets:migrate-inline-env         # dry run
 pnpm secrets:migrate-inline-env --apply # apply migration
 ```
 
+## Internal Connection Token Brokers
+
+Connection token exchanges carry a resolved parent credential, so their URLs
+are public-only by default even in local/private deployments. To intentionally
+use an internal broker, configure an exact hostname allowlist:
+
+```sh
+PAPERCLIP_TOKEN_BROKER_ALLOWED_HOSTS=broker.internal.example,10.0.0.42
+```
+
+Entries are comma- or whitespace-separated exact hostnames (no wildcards). The
+host configured by `PAPERCLIP_PAGES_API_URL` is included automatically. Every
+broker hostname is resolved once and the request is pinned to the approved
+address; IPv4 and IPv6 link-local destinations remain denied even when their
+host is allowlisted.
+
 ## Company Deletion Toggle
 
 Company deletion is intended as a dev/debug capability and can be disabled at runtime:

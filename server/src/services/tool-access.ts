@@ -1841,6 +1841,63 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return assertRemoteHttpUrlAllowed(remoteEndpoint(config));
   }
 
+  function normalizeTokenBrokerAllowedHost(value: string): string | null {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = new URL(trimmed.includes("://") ? trimmed : `http://${trimmed}`);
+      return parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase() || null;
+    } catch {
+      // Invalid allowlist entries grant no access. The configured broker URL is
+      // still evaluated under the public-only policy below.
+      return null;
+    }
+  }
+
+  function tokenBrokerAllowedPrivateHosts(): Set<string> {
+    const configured = (process.env.PAPERCLIP_TOKEN_BROKER_ALLOWED_HOSTS ?? "")
+      .split(/[,\s]+/)
+      .map(normalizeTokenBrokerAllowedHost)
+      .filter((host): host is string => host !== null);
+    const pagesApiHost = normalizeTokenBrokerAllowedHost(process.env.PAPERCLIP_PAGES_API_URL ?? "");
+    if (pagesApiHost) configured.push(pagesApiHost);
+    return new Set(configured);
+  }
+
+  function tokenBrokerAllowsPrivateNetwork(endpoint: URL): boolean {
+    const hostname = endpoint.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+    return tokenBrokerAllowedPrivateHosts().has(hostname);
+  }
+
+  function tokenBrokerHttpFetchOptions(endpoint: URL): GuardedRemoteHttpFetchOptions {
+    return {
+      allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint),
+      error: (message, code) => badRequest(message, { code }),
+    };
+  }
+
+  async function assertTokenBrokerHttpUrlAllowed(value: string): Promise<string> {
+    const endpoint = parseRemoteHttpEndpoint(value, (message, code) => badRequest(message, { code }));
+    await assertPublicRemoteHttpEndpoint(
+      endpoint,
+      { allowPrivateNetwork: tokenBrokerAllowsPrivateNetwork(endpoint) },
+      (message, code) => badRequest(message, { code }),
+    );
+    return endpoint.toString();
+  }
+
+  async function assertConfiguredTokenBrokerEndpointsAllowed(config: Record<string, unknown>): Promise<void> {
+    for (const url of configuredTokenBrokerExchangeUrls(config)) {
+      await assertTokenBrokerHttpUrlAllowed(url);
+    }
+  }
+
+  async function assertRemoteConnectionEndpointsAllowed(config: Record<string, unknown>): Promise<string> {
+    const endpoint = await assertRemoteEndpointAllowed(config);
+    await assertConfiguredTokenBrokerEndpointsAllowed(config);
+    return endpoint;
+  }
+
   /**
    * OAuth endpoint scheme/transport gate (PAP-17099).
    *
@@ -2031,11 +2088,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return [];
   }
 
-  function tokenBrokerConfig(connection: typeof toolConnections.$inferSelect): Record<string, unknown> {
-    const config = asRecord(connection.config);
+  function tokenBrokerConfigFromConnectionConfig(config: Record<string, unknown>): Record<string, unknown> {
     const broker = asRecord(config.tokenBroker);
     if (Object.keys(broker).length > 0) return broker;
     return asRecord(config.broker);
+  }
+
+  function tokenBrokerConfig(connection: typeof toolConnections.$inferSelect): Record<string, unknown> {
+    return tokenBrokerConfigFromConnectionConfig(asRecord(connection.config));
+  }
+
+  function configuredTokenBrokerExchangeUrls(config: Record<string, unknown>): string[] {
+    const broker = tokenBrokerConfigFromConnectionConfig(config);
+    return [...new Set([
+      readConfigString(broker, "tokenUrl"),
+      readConfigString(broker, "exchangeTokenUrl"),
+      readConfigString(config, "tokenExchangeUrl"),
+      readConfigString(config, "pagesTokenExchangeUrl"),
+    ].filter((url): url is string => url !== null))];
   }
 
   function connectionTokenBrokerEnabled(connection: typeof toolConnections.$inferSelect): boolean {
@@ -2421,21 +2491,23 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       body.set("requested_token_type", readConfigString(broker, "requestedTokenType") ?? "urn:ietf:params:oauth:token-type:access_token");
       body.set("actor_token", Buffer.from(JSON.stringify(actor)).toString("base64url"));
       body.set("actor_token_type", readConfigString(broker, "actorTokenType") ?? "urn:ietf:params:oauth:token-type:jwt");
-      response = await fetch(url, {
+      const endpoint = parseRemoteHttpEndpoint(url, (message, code) => badRequest(message, { code }));
+      response = await guardedRemoteHttpFetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body,
-      });
+      }, tokenBrokerHttpFetchOptions(endpoint));
     } else {
       const namespace = isPages ? pagesNamespaceFromScope(input.scope) : null;
       const body = isPages && namespace
         ? { namespace, ttlSeconds: input.ttlSeconds, actions: ["publish"], actor }
         : { scope: input.scope, ttlSeconds: input.ttlSeconds, actor, audience: readConfigString(broker, "audience") };
-      response = await fetch(url, {
+      const endpoint = parseRemoteHttpEndpoint(url, (message, code) => badRequest(message, { code }));
+      response = await guardedRemoteHttpFetch(endpoint, {
         method: "POST",
         headers: { authorization: `Bearer ${parentToken}`, "content-type": "application/json" },
         body: JSON.stringify(body),
-      });
+      }, tokenBrokerHttpFetchOptions(endpoint));
     }
     const payload = await response.json().catch(() => ({})) as unknown;
     const record = asRecord(payload);
@@ -6224,7 +6296,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       config = normalizeGoogleSheetsConnectionConfig(config);
       await assertGoogleSheetsSpreadsheetOwnership(companyId, config);
     }
-    if (transport === "mcp_remote") await assertRemoteEndpointAllowed(config);
+    if (transport === "mcp_remote") await assertRemoteConnectionEndpointsAllowed(config);
     if (transport === "local_stdio") await stdioTemplateId(companyId, config);
     assertLocalStdioCanBeEnabled(transport, false);
 
@@ -7859,7 +7931,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const transport = input.transport;
       if (!transport) throw badRequest("Tool connection transport is required");
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? {});
-      if (transport === "mcp_remote") await assertRemoteEndpointAllowed(config);
+      if (transport === "mcp_remote") await assertRemoteConnectionEndpointsAllowed(config);
       if (transport === "local_stdio") await stdioTemplateId(companyId, config);
       assertLocalStdioCanBeEnabled(transport, input.enabled ?? false);
       await assertGoogleSheetsSpreadsheetOwnership(companyId, config);
@@ -8095,7 +8167,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     updateConnection: async (connectionId: string, input: UpdateToolConnection): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
       const config = normalizeGoogleSheetsConnectionConfig(input.config ?? input.transportConfig ?? existing.config);
-      if (existing.transport === "mcp_remote") await assertRemoteEndpointAllowed(config);
+      if (existing.transport === "mcp_remote") await assertRemoteConnectionEndpointsAllowed(config);
       if (existing.transport === "local_stdio") await stdioTemplateId(existing.companyId, config);
       assertLocalStdioCanBeEnabled(existing.transport, input.enabled ?? existing.enabled);
       await assertGoogleSheetsSpreadsheetOwnership(existing.companyId, config, { excludeConnectionId: existing.id });
