@@ -7045,7 +7045,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
   async function peekOAuthState(state: string) {
     const [row] = await db
-      .select({ companyId: toolOauthStates.companyId })
+      .select({
+        companyId: toolOauthStates.companyId,
+        connectionId: toolOauthStates.connectionId,
+      })
       .from(toolOauthStates)
       .where(eq(toolOauthStates.state, state))
       .limit(1);

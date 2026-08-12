@@ -120,6 +120,16 @@ export function toolAccessRoutes(
     }
     return new URL("/api/tools/oauth/callback", configured).toString();
   }
+
+  async function oauthSetupPath(companyId: string, connectionId: string) {
+    const [company] = await db
+      .select({ issuePrefix: companies.issuePrefix })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1);
+    if (!company) throw new Error("OAuth callback connection belongs to a missing company");
+    return `/${company.issuePrefix}/apps/${connectionId}/setup`;
+  }
   const access = accessService(db);
 
   async function assertBoardToolPermission(req: Request, companyId: string, permissionKey: PermissionKey) {
@@ -370,14 +380,34 @@ export function toolAccessRoutes(
       throw badRequest("Invalid or expired OAuth state");
     }
     assertToolAppMutationAccess(req, pendingState.companyId);
-    const result = await svc.completeOAuthCallback({
-      state,
-      code,
-      error,
-      iss,
-      redirectUri: oauthRedirectUri(),
-      actor: getActorInfo(req),
-    });
+    const acceptsHtml = req.get("accept")?.includes("text/html") === true;
+    let result: Awaited<ReturnType<typeof svc.completeOAuthCallback>>;
+    try {
+      result = await svc.completeOAuthCallback({
+        state,
+        code,
+        error,
+        iss,
+        redirectUri: oauthRedirectUri(),
+        actor: getActorInfo(req),
+      });
+    } catch (callbackError) {
+      if (!acceptsHtml) throw callbackError;
+      const details = callbackError instanceof HttpError
+        && callbackError.details
+        && typeof callbackError.details === "object"
+        && !Array.isArray(callbackError.details)
+        ? callbackError.details as Record<string, unknown>
+        : null;
+      const callbackErrorCode = typeof details?.code === "string" ? details.code : null;
+      const params = new URLSearchParams({
+        oauth: callbackErrorCode === "oauth_authorization_denied" ? "denied" : "failed",
+      });
+      if (callbackErrorCode) params.set("code", callbackErrorCode);
+      const setupPath = await oauthSetupPath(pendingState.companyId, pendingState.connectionId);
+      res.redirect(303, `${setupPath}?${params.toString()}`);
+      return;
+    }
     await logActivity(db, {
       companyId: result.connection.companyId,
       actorType: "user",
@@ -390,14 +420,9 @@ export function toolAccessRoutes(
         catalogEntryCount: result.catalog.length,
       },
     });
-    if (req.get("accept")?.includes("text/html")) {
-      const [company] = await db
-        .select({ issuePrefix: companies.issuePrefix })
-        .from(companies)
-        .where(eq(companies.id, result.connection.companyId))
-        .limit(1);
-      if (!company) throw new Error("OAuth callback connection belongs to a missing company");
-      res.redirect(303, `/${company.issuePrefix}/apps/${result.connection.id}/setup?oauth=connected`);
+    if (acceptsHtml) {
+      const setupPath = await oauthSetupPath(result.connection.companyId, result.connection.id);
+      res.redirect(303, `${setupPath}?oauth=connected`);
       return;
     }
     res.json(result);

@@ -920,6 +920,41 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, state))).resolves.toHaveLength(0);
   });
 
+  it("returns browser denials to setup without reflecting provider-authored details", async () => {
+    installMcpOAuthFixture({ auth: "oauth" });
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const app = createRouteApp(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      link: MCP_URL,
+      name: "Fixture browser denial",
+    });
+    const start = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: REDIRECT_URI,
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+
+    const res = await request(app)
+      .get("/api/tools/oauth/callback")
+      .set("Accept", "text/html")
+      .query({
+        state,
+        error: "access_denied",
+        error_description: HOSTILE_ERROR_DESCRIPTION,
+        error_uri: HOSTILE_ERROR_BODY.error_uri,
+      });
+
+    expect(res.status).toBe(303);
+    const location = new URL(res.headers.location, PUBLIC_BASE_URL);
+    expect(location.pathname).toBe(`/${company.issuePrefix}/apps/${connected.connectionId}/setup`);
+    expect(location.searchParams.get("oauth")).toBe("denied");
+    expect(location.searchParams.get("code")).toBe("oauth_authorization_denied");
+    expect(res.headers.location).not.toContain(PROVIDER_CANARY);
+    expect(res.headers.location).not.toContain("error_description");
+    expect(res.headers.location).not.toContain("error_uri");
+  });
+
   it("validates the callback state before acting on a provider-reported error", async () => {
     installMcpOAuthFixture({ auth: "oauth" });
     const company = await createCompany(db);
