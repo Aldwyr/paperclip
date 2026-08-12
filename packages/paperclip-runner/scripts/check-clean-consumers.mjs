@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 
@@ -13,22 +13,48 @@ const scratchParent = process.env.PAPERCLIP_RUN_SCRATCH_DIR
 await mkdir(scratchParent, { recursive: true });
 const scratchRoot = await mkdtemp(join(scratchParent, "paperclip-package-consumers-"));
 const artifactsRoot = resolve(scratchRoot, "artifacts");
+const publicationRoot = process.env.PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR === undefined
+  ? undefined
+  : resolve(process.env.PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR);
 await mkdir(artifactsRoot, { recursive: true });
 
 try {
   run("pnpm", ["run", "build:typescript"], runnerRoot);
-  run("pnpm", ["run", "build:runner-binaries"], runnerRoot);
+  run("cargo", [
+    "build",
+    "--release",
+    "--manifest-path",
+    "runner/Cargo.toml",
+    "--locked",
+    "-p",
+    "paperclip-runner-core",
+    "--bin",
+    "paperclip-runnerd",
+  ], runnerRoot);
   run("pnpm", ["run", "build"], evalKernelRoot);
   const runnerTarball = await pack(runnerRoot, artifactsRoot);
   const evalKernelTarball = await pack(evalKernelRoot, artifactsRoot);
   const runtimeDependencyTarballs = await packRunnerRuntimeDependencies(artifactsRoot);
   const runnerdArtifact = await stageRunnerdArtifact(artifactsRoot);
+  const conformanceRecord = resolve(
+    artifactsRoot,
+    "paperclip-runner-evals-conformance.json",
+  );
+  const sourceCommit = (
+    process.env.PAPERCLIP_SOURCE_COMMIT
+    ?? capture("git", ["rev-parse", "HEAD"], runnerRoot)
+  ).trim();
+  if (!/^[a-f0-9]{40}$/.test(sourceCommit)) {
+    throw new Error("PAPERCLIP_SOURCE_COMMIT must be a full lowercase Git commit SHA");
+  }
 
   await verifyEvalsConsumer(
     resolve(scratchRoot, "evals-consumer"),
     runnerTarball,
     runtimeDependencyTarballs,
     runnerdArtifact,
+    conformanceRecord,
+    sourceCommit,
   );
   await verifyAppDevConsumer(
     resolve(scratchRoot, "app-dev-consumer"),
@@ -46,7 +72,16 @@ try {
   if ("@paperclipai/paperclip-eval-kernel" in runtimeDependencies) {
     throw new Error("runner tarball has a runtime dependency on Paperclip Evals");
   }
-  process.stdout.write("Clean-consumer pack/install checks passed for Evals -> App package/runnerd and App dev -> eval kernel.\n");
+  if (publicationRoot !== undefined) {
+    await publishArtifacts({
+      publicationRoot,
+      runnerTarball,
+      runnerdArtifact,
+      conformanceRecord,
+    });
+    process.stdout.write(`Published clean-consumer artifacts at ${publicationRoot}\n`);
+  }
+  process.stdout.write("Clean-consumer pack/install checks passed for Evals -> App package/release runnerd and App dev -> eval kernel.\n");
 } finally {
   if (process.env.PAPERCLIP_KEEP_PACKAGE_CONSUMERS !== "1") {
     await rm(scratchRoot, { recursive: true, force: true });
@@ -87,12 +122,16 @@ async function packRunnerRuntimeDependencies(destination) {
 
 async function stageRunnerdArtifact(destination) {
   const suffix = process.platform === "win32" ? ".exe" : "";
-  const source = resolve(runnerRoot, `runner/target/debug/paperclip-runnerd${suffix}`);
-  const executablePath = resolve(destination, `paperclip-runnerd${suffix}`);
+  const source = resolve(runnerRoot, `runner/target/release/paperclip-runnerd${suffix}`);
+  const executablePath = resolve(
+    destination,
+    `paperclip-runnerd-${process.platform}-${process.arch}${suffix}`,
+  );
   await copyFile(source, executablePath);
   if (process.platform !== "win32") await chmod(executablePath, 0o755);
-  const sha256 = `sha256:${createHash("sha256").update(await readFile(executablePath)).digest("hex")}`;
-  return { executablePath, sha256 };
+  const bytes = await readFile(executablePath);
+  const sha256 = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  return { executablePath, sha256, byteSize: bytes.byteLength, buildProfile: "release" };
 }
 
 function localOverrides(tarballs) {
@@ -106,6 +145,8 @@ async function verifyEvalsConsumer(
   runnerTarball,
   runtimeDependencyTarballs,
   runnerdArtifact,
+  conformanceRecord,
+  sourceCommit,
 ) {
   await mkdir(consumerRoot, { recursive: true });
   await writeFile(resolve(consumerRoot, "package.json"), `${JSON.stringify({
@@ -119,6 +160,10 @@ async function verifyEvalsConsumer(
     pnpm: { overrides: localOverrides(runtimeDependencyTarballs) },
   }, null, 2)}\n`);
   await writeFile(resolve(consumerRoot, "verify.mjs"), `
+import { createHash } from "node:crypto";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { basename } from "node:path";
+
 import * as runtime from "@paperclipai/paperclip-runner";
 import * as evals from "@paperclipai/paperclip-runner/evals";
 import * as testing from "@paperclipai/paperclip-runner/testing";
@@ -218,18 +263,106 @@ const normalized = {
   effects: [],
   audit: [],
 };
-await testing.runSemanticConformanceKit({
+const semanticConformance = await testing.runSemanticConformanceKit({
   vectors: [{ id: "finish", operationId: "finish_task", input: {} }],
   adapters: [
     { id: "mock", execute: async () => normalized },
     { id: "real", execute: async () => ({ audit: [], effects: [], state: { status: "done" }, authorization: { outcome: "allowed" } }) },
   ],
 });
+
+const packageArtifactPath = process.env.PAPERCLIP_RUNNER_PACKAGE_ARTIFACT;
+const packageBytes = await readFile(packageArtifactPath);
+const packageStat = await stat(packageArtifactPath);
+const record = {
+  schema: "paperclip-runner/evals-clean-consumer-conformance/v1",
+  recordedAt: new Date().toISOString(),
+  sourceCommit: process.env.PAPERCLIP_SOURCE_COMMIT,
+  platform: { os: process.platform, arch: process.arch },
+  artifactInputsOnly: true,
+  artifacts: {
+    package: {
+      filename: basename(packageArtifactPath),
+      packageName: evals.PAPERCLIP_RUNNER_BUILD_METADATA.package.name,
+      packageVersion: evals.PAPERCLIP_RUNNER_BUILD_METADATA.package.version,
+      sha256: "sha256:" + createHash("sha256").update(packageBytes).digest("hex"),
+      byteSize: packageStat.size,
+    },
+    runnerd: {
+      filename: basename(runnerd.executablePath),
+      sha256: runnerd.sha256,
+      byteSize: runnerd.byteSize,
+      buildProfile: process.env.PAPERCLIP_RUNNERD_BUILD_PROFILE,
+      buildMetadata: runnerd.buildMetadata,
+    },
+  },
+  consumer: {
+    installMode: "offline-packed-artifact",
+    packageSpecifier: "file:" + basename(packageArtifactPath),
+    runnerdLocator: "explicit-path-and-sha256",
+    imports: [
+      "@paperclipai/paperclip-runner",
+      "@paperclipai/paperclip-runner/evals",
+      "@paperclipai/paperclip-runner/testing",
+    ],
+    appSourceTreeImports: false,
+    providerCalls: 0,
+  },
+  checks: {
+    packageExportsResolved: true,
+    mockControlPlaneConformance: report,
+    nativeExecutionFixture: {
+      schema: nativeBundle.schema,
+      rejectedToolEffectPreserved: true,
+    },
+    harnessDriverConformance: driverConformance,
+    runnerdDigestAndMetadata: true,
+    compatibilityNegotiation: integration,
+    driverMismatchFailedClosed: driverMismatchFailed,
+    providerMismatchFailedClosed: failedExplicitly,
+    semanticConformance: {
+      schema: semanticConformance.schema,
+      rowCount: semanticConformance.rows.length,
+      adapterIds: semanticConformance.rows[0]?.adapterIds ?? [],
+    },
+    transcriptComplete: driverConformance.checks.transcriptCompleteness,
+  },
+};
+await writeFile(process.env.PAPERCLIP_CONFORMANCE_RECORD, JSON.stringify(record, null, 2) + "\\n");
 `);
   installAndRun(consumerRoot, {
     PAPERCLIP_RUNNERD_ARTIFACT: runnerdArtifact.executablePath,
     PAPERCLIP_RUNNERD_SHA256: runnerdArtifact.sha256,
+    PAPERCLIP_RUNNERD_BUILD_PROFILE: runnerdArtifact.buildProfile,
+    PAPERCLIP_RUNNER_PACKAGE_ARTIFACT: runnerTarball,
+    PAPERCLIP_CONFORMANCE_RECORD: conformanceRecord,
+    PAPERCLIP_SOURCE_COMMIT: sourceCommit,
   });
+}
+
+async function publishArtifacts({
+  publicationRoot,
+  runnerTarball,
+  runnerdArtifact,
+  conformanceRecord,
+}) {
+  await mkdir(publicationRoot, { recursive: true });
+  const files = [runnerTarball, runnerdArtifact.executablePath, conformanceRecord];
+  for (const file of files) {
+    await copyFile(file, resolve(publicationRoot, basename(file)));
+  }
+  if (process.platform !== "win32") {
+    await chmod(
+      resolve(publicationRoot, basename(runnerdArtifact.executablePath)),
+      0o755,
+    );
+  }
+  const checksums = [];
+  for (const file of files) {
+    const digest = createHash("sha256").update(await readFile(file)).digest("hex");
+    checksums.push(`${digest}  ${basename(file)}`);
+  }
+  await writeFile(resolve(publicationRoot, "SHA256SUMS"), `${checksums.join("\n")}\n`);
 }
 
 async function verifyAppDevConsumer(
@@ -323,4 +456,18 @@ function run(command, args, cwd, { quiet = false, env = {} } = {}) {
     if (result.signal !== null) process.stderr.write(`Terminated by signal ${result.signal}\n`);
     throw new Error(`${command} ${args.join(" ")} failed in ${cwd}`);
   }
+}
+
+function capture(command, args, cwd) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, CI: "true" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr ?? "");
+    throw new Error(`${command} ${args.join(" ")} failed in ${cwd}`);
+  }
+  return result.stdout;
 }

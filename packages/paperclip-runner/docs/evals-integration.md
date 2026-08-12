@@ -79,13 +79,26 @@ network or provider credentials:
 
 The input fixture is
 `protocol/fixtures/evals/harness-driver-conformance.json`. The packed
-clean-consumer gate builds and copies runnerd into an isolated artifact
-directory, packs the package, installs it offline, resolves only declared
-exports, validates the native fixture, runs driver conformance, verifies binary
-metadata/digest, and exercises both compatible and incompatible negotiation.
+clean-consumer gate builds runnerd with Cargo's `release` profile, copies it
+into an isolated artifact directory, packs the package, installs it offline,
+resolves only declared exports, validates the native fixture, runs driver
+conformance, verifies binary metadata/digest, and exercises both compatible
+and incompatible negotiation. It never qualifies a debug binary.
 
 Run it with:
 
 ```sh
 pnpm --filter @paperclipai/paperclip-runner check:clean-consumers
+```
+
+Set `PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR` to retain the qualifying inputs and
+machine-readable proof outside the temporary consumer. The output contains the
+package tarball, platform-named release runnerd, `SHA256SUMS`, and
+`paperclip-runner-evals-conformance.json`. That record is produced by the clean
+consumer after it imports only the packed package, resolves the explicit binary
+and digest, and completes deterministic conformance without provider calls.
+
+```sh
+PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR=/absolute/release/directory \
+  pnpm --filter @paperclipai/paperclip-runner check:clean-consumers
 ```
