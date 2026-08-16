@@ -130,7 +130,11 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { mcpHttpRequestHeaders, parseMcpHttpResponseBody } from "./mcp-http.js";
-import { assertPublicRemoteHttpEndpoint, parseRemoteHttpEndpoint } from "./remote-http-endpoint-guard.js";
+import {
+  assertPublicRemoteHttpEndpoint,
+  parseRemoteHttpEndpoint,
+  type RemoteHttpEndpointLookup,
+} from "./remote-http-endpoint-guard.js";
 import { guardedRemoteHttpFetch, type GuardedRemoteHttpFetchOptions } from "./remote-http-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
@@ -266,6 +270,51 @@ function oauthProviderErrorMessage(providerError: string | null, fallback: strin
  * it — changing it invalidates existing CIMD registrations.
  */
 export const OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH = "/api/tools/oauth/client-metadata";
+
+/**
+ * Resolve the URL Paperclip would use as a CIMD client id, but only when its
+ * hostname is not known to resolve into a private network.
+ *
+ * An authorization server fetches this URL from outside Paperclip's network and
+ * will normally apply an SSRF guard. Tailscale/MagicDNS names are HTTPS but
+ * resolve into 100.64.0.0/10, so presenting one as a client id can only produce
+ * an `invalid_client` response. A local DNS failure remains inconclusive because
+ * split-horizon public DNS may still let the authorization server resolve it.
+ */
+export async function resolveOAuthClientIdMetadataDocumentUrl(
+  redirectUri: string,
+  lookup?: RemoteHttpEndpointLookup,
+): Promise<string | null> {
+  try {
+    const parsed = new URL(redirectUri);
+    if (parsed.protocol !== "https:") return null;
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const isLoopback = hostname === "localhost"
+      || hostname.endsWith(".localhost")
+      || hostname === "::1"
+      || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+    if (isLoopback) return null;
+    const metadataUrl = new URL(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH, parsed.origin).toString();
+    try {
+      await assertPublicRemoteHttpEndpoint(
+        new URL(metadataUrl),
+        { allowPrivateNetwork: false, lookup },
+        (message, code) => Object.assign(new Error(message), { code }),
+      );
+    } catch (error) {
+      if (
+        error instanceof Error
+        && "code" in error
+        && error.code === "remote_http_private_endpoint"
+      ) {
+        return null;
+      }
+    }
+    return metadataUrl;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Paperclip's client metadata for CIMD (RFC 7591 metadata, served rather than
@@ -421,6 +470,8 @@ type ToolAccessServiceOptions = {
   deploymentExposure?: DeploymentExposure;
   trustedLocalStdioRuntimeHost?: string | null;
   now?: () => Date;
+  /** Test seam for deciding whether an OAuth client metadata URL is publicly resolvable. */
+  oauthClientMetadataLookup?: RemoteHttpEndpointLookup;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -4775,30 +4826,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return oauthClientConfig(provider);
   }
 
-  /**
-   * The URL of Paperclip's published Client ID Metadata Document, derived from the
-   * OAuth callback so the two are guaranteed same-origin.
-   *
-   * CIMD requires a `client_id` the authorization server can fetch, so it is only
-   * available when this deployment has a public HTTPS base URL. Loopback and
-   * plain-http development fall through to DCR or manual client credentials.
-   */
-  function clientIdMetadataDocumentUrl(redirectUri: string): string | null {
-    try {
-      const parsed = new URL(redirectUri);
-      if (parsed.protocol !== "https:") return null;
-      const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-      const isLoopback = hostname === "localhost"
-        || hostname.endsWith(".localhost")
-        || hostname === "::1"
-        || /^127(?:\.\d{1,3}){3}$/.test(hostname);
-      if (isLoopback) return null;
-      return new URL(OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH, parsed.origin).toString();
-    } catch {
-      return null;
-    }
-  }
-
   async function oauthClientForConnection(
     connection: typeof toolConnections.$inferSelect,
     provider: string,
@@ -5347,19 +5374,23 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     record: Record<string, unknown>,
     field: "redirect_uris" | "grant_types" | "response_types",
     expected: string[],
+    options: { allowAdditional?: boolean } = {},
   ) {
     if (record[field] === undefined) throw invalidOAuthDcrResponse(field, "missing");
     const value = record[field];
     if (
       !Array.isArray(value)
-      || value.length !== expected.length
+      || value.length < expected.length
+      || value.length > 32
       || value.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > 2_048)
     ) {
       throw invalidOAuthDcrResponse(field, "invalid_array");
     }
-    const actual = [...value].sort();
-    const required = [...expected].sort();
-    if (actual.some((entry, index) => entry !== required[index])) {
+    const actual = new Set(value);
+    if (
+      expected.some((entry) => !actual.has(entry))
+      || (!options.allowAdditional && actual.size !== expected.length)
+    ) {
       throw invalidOAuthDcrResponse(field, "registered_value_mismatch");
     }
   }
@@ -5436,7 +5467,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       required: false,
       maxLength: MAX_OAUTH_DCR_CLIENT_SECRET_LENGTH,
     });
-    assertOAuthDcrArray(record, "redirect_uris", requestedMetadata.redirect_uris);
+    // Some authorization servers add a first-party routing callback to the
+    // registered redirect set. Paperclip never navigates to that URI, and PKCE
+    // still binds codes to this client, so accept a bounded superset while
+    // requiring our exact callback to remain registered. Grants and response
+    // types stay exact because Paperclip must not adopt unsupported flows.
+    assertOAuthDcrArray(record, "redirect_uris", requestedMetadata.redirect_uris, { allowAdditional: true });
     assertOAuthDcrArray(record, "grant_types", requestedMetadata.grant_types);
     assertOAuthDcrArray(record, "response_types", requestedMetadata.response_types);
     if (
@@ -5602,10 +5638,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connection: typeof toolConnections.$inferSelect,
     endpoints: OAuthProviderEndpoints,
     redirectUri: string,
+    clientIdMetadataDocumentUrl: string | null,
   ): boolean {
     const oauth = oauthConfig(connection);
     if (typeof oauth.clientId !== "string" || !oauth.clientId.trim()) return false;
     const source = typeof oauth.clientRegistrationSource === "string" ? oauth.clientRegistrationSource : null;
+    // A URL client id that now resolves only to a private network is unusable by
+    // an external authorization server. Treat the stored binding as stale so a
+    // retry can replace it with a dynamically registered client.
+    if (source === "cimd" && oauth.clientId !== clientIdMetadataDocumentUrl) return false;
     // A manually preregistered client was registered by the operator against
     // Paperclip's callback, so it has no recorded callback until first use.
     const redirectMatches = source === "manual"
@@ -5708,8 +5749,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (configured.clientId) {
       return { connection: input.connection, client: configured, source: "preconfigured" as const };
     }
+    const metadataDocumentUrl = input.endpoints.clientIdMetadataDocumentSupported
+      ? await resolveOAuthClientIdMetadataDocumentUrl(input.redirectUri, options.oauthClientMetadataLookup)
+      : null;
     // 2. Client material already bound to this issuer/resource/callback/company.
-    if (oauthClientBindingMatches(input.connection, input.endpoints, input.redirectUri)) {
+    if (oauthClientBindingMatches(input.connection, input.endpoints, input.redirectUri, metadataDocumentUrl)) {
       const bound = await stampOAuthClientBinding(input.connection, input.endpoints, input.redirectUri);
       return {
         connection: bound,
@@ -5743,7 +5787,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (latestConfigured.clientId) {
         return { connection: latest, client: latestConfigured, source: "preconfigured" as const };
       }
-      if (oauthClientBindingMatches(latest, input.endpoints, input.redirectUri)) {
+      if (oauthClientBindingMatches(latest, input.endpoints, input.redirectUri, metadataDocumentUrl)) {
         const bound = await stampOAuthClientBinding(latest, input.endpoints, input.redirectUri);
         return {
           connection: bound,
@@ -5753,9 +5797,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
       // 3. Client ID Metadata Documents: no registration call at all, so prefer
       //    them over DCR when the authorization server advertises support.
-      const metadataDocumentUrl = input.endpoints.clientIdMetadataDocumentSupported
-        ? clientIdMetadataDocumentUrl(input.redirectUri)
-        : null;
       if (metadataDocumentUrl) {
         const adopted = await adoptClientIdMetadataDocument({
           connection: latest,

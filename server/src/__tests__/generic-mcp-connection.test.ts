@@ -95,6 +95,8 @@ type FixtureOptions = {
   tokenFailure?: { status: number; body: Record<string, unknown> };
   /** Fail the dynamic client registration endpoint with this exact body. */
   registrationFailure?: { status: number; body: Record<string, unknown> };
+  /** Extra provider-owned callbacks returned alongside the requested callback. */
+  registrationExtraRedirectUris?: string[];
 };
 
 type FixtureRequest = {
@@ -210,8 +212,11 @@ function installMcpOAuthFixture(options: FixtureOptions = {}) {
       return jsonResponse({
         client_id: "fixture-dcr-client",
         // A conforming server echoes back what it registered, and Paperclip
-        // rejects the response when it doesn't match what was requested.
-        redirect_uris: requested.redirect_uris,
+        // requires its own callback even when the provider adds a routing URI.
+        redirect_uris: [
+          ...(requested.redirect_uris as string[]),
+          ...(options.registrationExtraRedirectUris ?? []),
+        ],
         grant_types: requested.grant_types,
         response_types: requested.response_types,
         token_endpoint_auth_method: requested.token_endpoint_auth_method,
@@ -579,7 +584,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
   it("prefers a Client ID Metadata Document over dynamic registration", async () => {
     const fixture = installMcpOAuthFixture({ auth: "oauth", cimd: true });
     const company = await createCompany(db);
-    const service = toolAccessService(db);
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
 
     const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture CIMD" });
     const start = await service.startOAuth(company.id, connected.connectionId, {
@@ -591,6 +598,39 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     // The client_id *is* the document URL, so nothing was registered.
     expect(new URL(start.authorizationUrl).searchParams.get("client_id")).toBe(CLIENT_METADATA_DOCUMENT_URL);
     expect(fixture.requestsTo("/register")).toHaveLength(0);
+  });
+
+  it("replaces a private-only Client ID Metadata Document with dynamic registration", async () => {
+    const fixture = installMcpOAuthFixture({
+      auth: "oauth",
+      cimd: true,
+      registrationExtraRedirectUris: [`${ISSUER}/oauth/callback/`],
+    });
+    const company = await createCompany(db);
+    let metadataAddress = "93.184.216.34";
+    const service = toolAccessService(db, {
+      oauthClientMetadataLookup: async () => [{ address: metadataAddress, family: 4 }],
+    });
+
+    const connected = await service.connectGalleryApp(company.id, { link: MCP_URL, name: "Fixture private CIMD" });
+    const firstStart = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://paperclip.tailnet.test:42001/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+    expect(firstStart.registrationSource).toBe("cimd");
+
+    // A private DNS answer models a Tailscale/MagicDNS callback. The first start
+    // also proves retry migration: a connection that persisted the now-unusable
+    // CIMD client id must not keep presenting it forever.
+    metadataAddress = "100.100.100.100";
+    const retry = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri: "https://paperclip.tailnet.test:42001/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "board-user" },
+    });
+
+    expect(retry.registrationSource).toBe("dcr");
+    expect(new URL(retry.authorizationUrl).searchParams.get("client_id")).toBe("fixture-dcr-client");
+    expect(fixture.requestsTo("/register")).toHaveLength(1);
   });
 
   it("falls back to dynamic registration when the callback is not public HTTPS", async () => {
