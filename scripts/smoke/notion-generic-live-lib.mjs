@@ -164,6 +164,63 @@ export function assertAutomaticRegistrationSource(source) {
   return source;
 }
 
+export function persistedOAuthStartResult(connection, authorizationUrl) {
+  const cleanAuthorizationUrl = typeof authorizationUrl === "string" ? authorizationUrl.trim() : "";
+  const oauth = connection?.config?.oauth;
+  if (!connection?.id || !cleanAuthorizationUrl || !oauth || typeof oauth !== "object" || Array.isArray(oauth)) {
+    return null;
+  }
+  return {
+    connectionId: connection.id,
+    authorizationUrl: cleanAuthorizationUrl,
+    registrationSource: oauth.clientRegistrationSource ?? null,
+    issuer: oauth.issuer ?? null,
+    resource: oauth.resource ?? null,
+  };
+}
+
+function nonNegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+/**
+ * Normalize the server's sanitized removal receipt. Partial-flow cleanup may
+ * legitimately remove zero installs or credentials; the completed smoke uses
+ * the stricter mode to prove the installed/authenticated state was revoked.
+ */
+export function connectionRemovalFacts(receipt, { requireInstalled = false } = {}) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return null;
+  const numericFields = [
+    "installsRemoved",
+    "appProfileBindingsRemoved",
+    "credentialRefsCleared",
+    "secretsRevoked",
+    "secretBindingsRemoved",
+    "grantsRevoked",
+    "oauthStatesDiscarded",
+    "runtimeSlotsStopped",
+  ];
+  if (numericFields.some((key) => !nonNegativeInteger(receipt[key]))) return null;
+  const credentialsRemoved = receipt.credentialRefsCleared + receipt.secretsRevoked;
+  if (!["absent", "deleted", "archived"].includes(receipt.appProfile)) return null;
+  if (requireInstalled && (
+    receipt.installsRemoved !== 1
+    || receipt.appProfileBindingsRemoved < 1
+    || credentialsRemoved < 1
+    || !["deleted", "archived"].includes(receipt.appProfile)
+  )) return null;
+  return {
+    credentialsRemoved,
+    secretBindingsRemoved: receipt.secretBindingsRemoved,
+    grantsRevoked: receipt.grantsRevoked,
+    accessBindingsRemoved: receipt.appProfileBindingsRemoved,
+    installsRemoved: receipt.installsRemoved,
+    oauthStatesDiscarded: receipt.oauthStatesDiscarded,
+    runtimeSlotsStopped: receipt.runtimeSlotsStopped,
+    appProfile: receipt.appProfile,
+  };
+}
+
 export function safeEndpointSummary(raw, label) {
   let endpoint;
   try {

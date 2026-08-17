@@ -3,11 +3,13 @@ import test from "node:test";
 import {
   assertAutomaticRegistrationSource,
   assertSanitizedEvidence,
+  connectionRemovalFacts,
   extractNotionIdentity,
   inspectAuthorizationUrl,
   NotionGenericLivePreflightError,
   parseRuntimeAbsenceProof,
   parseSanitizedAgentProof,
+  persistedOAuthStartResult,
   preflightNotionGenericLive,
   prepareNotionGenericLiveSmoke,
   safeEndpointSummary,
@@ -145,6 +147,71 @@ test("authorization proof requires automatic registration, PKCE, callback, resou
     () => safeEndpointSummary("http://mcp.notion.com/token", "token"),
     (error) => error instanceof NotionGenericLivePreflightError && error.code === "unsafe_token_endpoint",
   );
+});
+
+test("authorization proof rejects a provider login page after OAuth parameters were consumed", () => {
+  assert.throws(
+    () => inspectAuthorizationUrl("https://id.notion.test/login", {
+      callbackUrl: "https://paperclip.example/api/tools/oauth/callback",
+      resource: "https://mcp.notion.com/mcp",
+      registrationSource: "dcr",
+      baseUrl: "https://paperclip.example",
+    }),
+    (error) => error instanceof NotionGenericLivePreflightError
+      && error.code === "authorization_parameter_missing",
+  );
+});
+
+test("reconstructs the inline OAuth start from durable connection state and provider navigation", () => {
+  assert.deepEqual(persistedOAuthStartResult({
+    id: "connection-123",
+    config: {
+      oauth: {
+        clientRegistrationSource: "cimd",
+        issuer: "https://mcp.notion.com",
+        resource: "https://mcp.notion.com/mcp",
+      },
+    },
+  }, " https://mcp.notion.com/authorize?state=not-recorded "), {
+    connectionId: "connection-123",
+    authorizationUrl: "https://mcp.notion.com/authorize?state=not-recorded",
+    registrationSource: "cimd",
+    issuer: "https://mcp.notion.com",
+    resource: "https://mcp.notion.com/mcp",
+  });
+  assert.equal(persistedOAuthStartResult({ id: "connection-123", config: {} }, "https://example.test"), null);
+});
+
+test("accepts zero-count cleanup before setup but requires full revocation after install", () => {
+  const partial = {
+    installsRemoved: 0,
+    appProfileBindingsRemoved: 0,
+    credentialRefsCleared: 0,
+    secretsRevoked: 0,
+    secretBindingsRemoved: 0,
+    grantsRevoked: 0,
+    oauthStatesDiscarded: 1,
+    runtimeSlotsStopped: 0,
+    appProfile: "absent",
+  };
+  assert.deepEqual(connectionRemovalFacts(partial), {
+    credentialsRemoved: 0,
+    secretBindingsRemoved: 0,
+    grantsRevoked: 0,
+    accessBindingsRemoved: 0,
+    installsRemoved: 0,
+    oauthStatesDiscarded: 1,
+    runtimeSlotsStopped: 0,
+    appProfile: "absent",
+  });
+  assert.equal(connectionRemovalFacts(partial, { requireInstalled: true }), null);
+  assert.ok(connectionRemovalFacts({
+    ...partial,
+    installsRemoved: 1,
+    appProfileBindingsRemoved: 1,
+    secretsRevoked: 1,
+    appProfile: "deleted",
+  }, { requireInstalled: true }));
 });
 
 test("workspace proof extraction and fresh-run comments retain only sanitized identity", () => {
