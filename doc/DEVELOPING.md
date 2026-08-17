@@ -1024,6 +1024,36 @@ Optional auth flags (for authenticated mode):
 - `PAPERCLIP_AUTH_HEADER` (for example `Bearer ...`)
 - `PAPERCLIP_COOKIE` (session cookie header value)
 
+## PostHog MCP Live Smoke Test
+
+The PostHog smoke targets an already-running authenticated Paperclip instance.
+It is deliberately separate from `pnpm test` and `pnpm test:e2e` because it
+uses a live vendor OAuth flow and creates a short-lived connection plus one
+fresh-run proof issue.
+
+```sh
+PAPERCLIP_E2E_BASE_URL=https://paperclip.example.test \
+PAPERCLIP_E2E_EMAIL=operator@example.test \
+PAPERCLIP_DEV_LOGIN_PASSWORD='<environment-delivered>' \
+POSTHOG_PROJECT_ID=483530 \
+pnpm smoke:posthog-live
+```
+
+The command fails before browser launch unless all four variables are present,
+and never prints their values. It creates no trace, video, or HAR, begins
+screenshots only after OAuth returns to Paperclip, enables read actions only,
+installs the connection on `CodexCoderPro` only, runs `project-get` with `{}`
+from the board Test panel and a fresh agent run, then removes the connection.
+Sanitized JSON and PNG evidence defaults to `PAPERCLIP_RUN_SCRATCH_DIR` when the
+command runs in a heartbeat; set `POSTHOG_EVIDENCE_DIR` for a different output
+directory.
+
+Run the focused harness checks without contacting Paperclip or PostHog:
+
+```sh
+node --test scripts/smoke/posthog-live.test.mjs
+```
+
 ## OpenClaw Docker UI One-Command Script
 
 To boot OpenClaw in Docker and print a host-browser dashboard URL in one command:
