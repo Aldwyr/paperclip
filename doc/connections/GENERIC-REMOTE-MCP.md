@@ -182,3 +182,41 @@ in-process MCP server plus authorization server. It needs no network and no
 vendor credentials, and every case connects by URL without naming a gallery app.
 A credentialed vendor smoke (for example live PostHog OAuth) may be recorded by
 QA but is not required for deterministic verification.
+
+### Opt-in generic Notion live smoke
+
+`pnpm smoke:notion-generic-live` exercises the generic **Advanced → Paste a
+config** route against `https://mcp.notion.com/mcp`. It is intentionally outside
+the normal unit, browser, and CI-required suites. Run it only against an
+already-running, browser-reachable HTTPS Paperclip instance with these bindings
+provided by the execution environment:
+
+- `PAPERCLIP_E2E_BASE_URL`, `PAPERCLIP_E2E_EMAIL`, and
+  `PAPERCLIP_DEV_LOGIN_PASSWORD` for the target instance;
+- `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, `PAPERCLIP_RUN_ID`, and
+  `PAPERCLIP_TASK_ID` for the control plane;
+- the approved on-demand secret binding
+  `access.notion_generic_flow_test_account`, delivered by the agent secret API
+  under its normalized key `generic-flow-test-account`, for the existing Notion
+  test account.
+
+Check the URL, health endpoint, and binding metadata without retrieving the
+credential value or opening a browser:
+
+```sh
+pnpm smoke:notion-generic-live -- --dry-run
+```
+
+The live command retrieves the credential only after the safe preflight and
+Paperclip login succeed. It disables trace, video, and HAR capture, takes only
+post-callback screenshots, enables and invokes only `notion-get-self`, proves
+`notion-create-pages` remains locally denied, and removes its uniquely named
+connection in a `finally` cleanup. Its `summary.json` and PNG files contain
+sanitized IDs, decisions, outcomes, and endpoint origins/paths only; they
+default to `PAPERCLIP_RUN_SCRATCH_DIR`, or to `NOTION_EVIDENCE_DIR` when set.
+
+Run the credential-free harness checks with:
+
+```sh
+node --test scripts/smoke/notion-generic-live.test.mjs
+```

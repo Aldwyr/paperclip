@@ -51,6 +51,7 @@
     "smoke:openclaw-docker-ui": "./scripts/smoke/openclaw-docker-ui.sh",
     "smoke:openclaw-sse-standalone": "./scripts/smoke/openclaw-sse-standalone.sh",
     "smoke:mcp-fixtures": "node scripts/smoke/mcp-fixture-harness.mjs",
+    "smoke:notion-generic-live": "node scripts/smoke/notion-generic-live.mjs",
     "smoke:posthog-live": "node scripts/smoke/posthog-live.mjs",
     "smoke:pipelines-tutorial": "./scripts/smoke/pipelines-tutorial-smoke.sh",
     "smoke:terminal-bench-loop-skill": "node scripts/smoke/terminal-bench-loop-skill-smoke.mjs",
