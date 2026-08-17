@@ -340,10 +340,10 @@ function summarizeBoardKeyScope(scopeConfig: BoardApiKeyScopeConfig | null): str
     [BoardApiKeyScopePreset, (typeof BOARD_API_KEY_SCOPE_PRESETS)[BoardApiKeyScopePreset]]
   >).find(([, preset]) =>
     preset.permissions.length === scopeConfig.permissions.length
-    && preset.permissions.every((permission, index) => permission === scopeConfig.permissions[index])
+    && preset.permissions.every((permission) => scopeConfig.permissions.includes(permission))
     && preset.instanceCapabilities.length === scopeConfig.instanceCapabilities.length
     && preset.instanceCapabilities.every(
-      (capability, index) => capability === scopeConfig.instanceCapabilities[index],
+      (capability) => scopeConfig.instanceCapabilities.includes(capability),
     ));
   const label = matchingPreset?.[0] ?? "custom";
   return `${label}:${scopeConfig.companyIds.length}_companies`;

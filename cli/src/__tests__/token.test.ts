@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BOARD_API_KEY_SCOPE_PRESETS } from "@paperclipai/shared";
 import { registerTokenCommands } from "../commands/client/token.js";
 
 const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
@@ -325,5 +326,37 @@ describe("token commands", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe("http://localhost:3100/api/board-api-keys");
     expect(fetchMock.mock.calls[1]?.[0]).toBe("http://localhost:3100/api/board-api-keys/board-key-1");
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+  });
+
+  it("recognizes a preset scope when its valid permissions use a different order", async () => {
+    const permissions = [...BOARD_API_KEY_SCOPE_PRESETS.read_only.permissions].reverse();
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify([{
+      id: "board-key-1",
+      name: "reader",
+      tokenPrefix: "pcp_board_123456789abc",
+      scopeConfig: {
+        version: 1,
+        kind: "scoped",
+        companyIds: [COMPANY_ID],
+        permissions,
+        instanceCapabilities: [],
+      },
+      legacyUnrestricted: false,
+      status: "active",
+      createdAt: "2026-05-23T00:00:00.000Z",
+      lastUsedAt: null,
+      expiresAt: "2026-06-22T00:00:00.000Z",
+      revokedAt: null,
+    }]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await createProgram().parseAsync([
+      "token", "board", "list",
+      "--api-base", "http://localhost:3100",
+      "--api-key", "board-token",
+    ], { from: "user" });
+
+    expect(String(log.mock.calls[0]?.[0])).toContain("scope=read_only:1_companies");
   });
 });
