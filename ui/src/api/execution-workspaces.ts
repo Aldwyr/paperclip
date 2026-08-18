@@ -114,6 +114,11 @@ export const executionWorkspacesApi = {
       `/execution-workspaces/${id}/runtime-commands/${action}`,
       sanitizeWorkspaceRuntimeControlTarget(target),
     ),
+  repair: (id: string) =>
+    api.post<{ workspace: ExecutionWorkspace; operation: WorkspaceOperation }>(
+      `/execution-workspaces/${id}/runtime-commands/repair`,
+      {},
+    ),
   update: (id: string, data: Record<string, unknown>) => api.patch<ExecutionWorkspace>(`/execution-workspaces/${id}`, data),
   /**
    * Reconcile a git-worktree branch divergence via the S4 (`PAP-1586`) op.

@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
@@ -45,6 +48,8 @@ import { appendWithCap } from "../adapters/utils.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { runExclusiveWorkspaceRuntimeControl } from "../services/workspace-operations.js";
+import { deriveWorktreeInstanceId } from "../services/workspace-instance-cleanup.js";
+import { isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
 
@@ -151,7 +156,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
   async function handleExecutionWorkspaceRuntimeCommand(req: Request, res: Response) {
     const id = req.params.id as string;
     const action = String(req.params.action ?? "").trim().toLowerCase();
-    if (action !== "start" && action !== "stop" && action !== "restart" && action !== "run") {
+    if (action !== "start" && action !== "stop" && action !== "restart" && action !== "repair" && action !== "run") {
       res.status(404).json({ error: "Workspace command action not found" });
       return;
     }
@@ -262,7 +267,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
 
-    if ((action === "start" || action === "restart") && !effectiveRuntimeConfig) {
+    if ((action === "start" || action === "restart" || action === "repair") && !effectiveRuntimeConfig) {
       res.status(422).json({ error: "Execution workspace has no workspace command configuration or inherited project workspace default" });
       return;
     }
@@ -327,7 +332,11 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     }
 
     const recordRuntimeControlOperation = () => recorder.recordOperation({
-      phase: action === "stop" ? "workspace_teardown" : "workspace_provision",
+      phase: action === "stop"
+        ? "workspace_teardown"
+        : action === "repair"
+          ? "workspace_repair"
+          : "workspace_provision",
       command: workspaceCommand?.command ?? `workspace command ${action}`,
       cwd: existing.cwd,
       metadata: {
@@ -339,7 +348,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         runtimeServiceId: selectedRuntimeServiceId,
         serviceIndex: selectedServiceIndex,
       },
-      run: async () => {
+      run: async (reportProgress) => {
         const ensureWorkspaceAvailable = async () =>
           await ensurePersistedExecutionWorkspaceAvailable({
             base: {
@@ -429,7 +438,234 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           else stderr = appendWithCap(stderr, chunk, WORKSPACE_CONTROL_OUTPUT_MAX_CHARS);
         };
 
-        if (action === "stop" || action === "restart") {
+        if (action === "repair") {
+          type RepairPhase =
+            | "managed_stop"
+            | "target_backup"
+            | "full_reseed"
+            | "managed_restart"
+            | "readiness_validation";
+          const repairDiagnostics: Array<{
+            phase: RepairPhase;
+            status: "started" | "succeeded" | "failed";
+            at: string;
+          }> = [];
+          let repairPhase: RepairPhase = "managed_stop";
+          const reportRepairPhase = async (
+            phase: RepairPhase,
+            status: "started" | "succeeded" | "failed",
+          ) => {
+            repairPhase = phase;
+            repairDiagnostics.push({ phase, status, at: new Date().toISOString() });
+            if (repairDiagnostics.length > 32) repairDiagnostics.splice(0, repairDiagnostics.length - 32);
+            await reportProgress({
+              metadata: {
+                repairPhase,
+                repairDiagnostics: [...repairDiagnostics],
+                databaseOnly: true,
+                worktreePreserved: true,
+              },
+              system: `Workspace repair ${phase}: ${status}.\n`,
+            });
+          };
+
+          try {
+            await reportRepairPhase("managed_stop", "started");
+            await stopRuntimeServicesForExecutionWorkspace({
+              db,
+              executionWorkspaceId: existing.id,
+              workspaceCwd,
+            });
+            await reportRepairPhase("managed_stop", "succeeded");
+
+            const manifestPath = path.join(workspaceCwd, ".paperclip", "seed-manifest.json");
+            const targetConfigPath = path.join(workspaceCwd, ".paperclip", "config.json");
+            let sourceConfigPath: string | null = null;
+            let previousAttemptId: string | null = null;
+            if (existsSync(manifestPath)) {
+              try {
+                const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                  attemptId?: unknown;
+                  source?: { configPath?: unknown };
+                };
+                previousAttemptId = typeof manifest.attemptId === "string" ? manifest.attemptId : null;
+                sourceConfigPath = typeof manifest.source?.configPath === "string"
+                  ? path.resolve(manifest.source.configPath)
+                  : null;
+              } catch {
+                throw new Error("Workspace seed manifest is malformed; repair source identity cannot be trusted.");
+              }
+            }
+            const baseWorkspaceCwd = projectWorkspace?.cwd ?? workspaceCwd;
+            const baseConfigPath = path.join(baseWorkspaceCwd, ".paperclip", "config.json");
+            if (!sourceConfigPath && existsSync(baseConfigPath) && path.resolve(baseConfigPath) !== path.resolve(targetConfigPath)) {
+              sourceConfigPath = baseConfigPath;
+            }
+            if (!sourceConfigPath || !existsSync(sourceConfigPath)) {
+              throw new Error("Workspace repair has no readable configured source instance.");
+            }
+
+            const cliRunner = path.join(baseWorkspaceCwd, "cli", "node_modules", "tsx", "dist", "cli.mjs");
+            const cliEntry = path.join(baseWorkspaceCwd, "cli", "src", "index.ts");
+            const cliDist = path.join(baseWorkspaceCwd, "cli", "dist", "index.js");
+            const cliArgs = existsSync(cliRunner) && existsSync(cliEntry)
+              ? [cliRunner, cliEntry]
+              : existsSync(cliDist)
+                ? [cliDist]
+                : null;
+            if (!cliArgs) {
+              throw new Error("Workspace repair cannot find a runnable Paperclip CLI in the base workspace.");
+            }
+
+            await reportRepairPhase("target_backup", "started");
+            const child = spawn(process.execPath, [
+              ...cliArgs,
+              "worktree",
+              "reseed",
+              "--from-config",
+              sourceConfigPath,
+              "--to",
+              workspaceCwd,
+              "--seed-mode",
+              "full",
+              "--yes",
+              "--backup-target",
+            ], {
+              cwd: baseWorkspaceCwd,
+              env: process.env,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            child.stdout?.on("data", (chunk: Buffer) => {
+              void onLog("stdout", chunk.toString("utf8"));
+            });
+            child.stderr?.on("data", (chunk: Buffer) => {
+              void onLog("stderr", chunk.toString("utf8"));
+            });
+            let repairCommandTimedOut = false;
+            let repairCommandForceTimeout: NodeJS.Timeout | null = null;
+            const repairCommandTimeout = setTimeout(() => {
+              repairCommandTimedOut = true;
+              child.kill("SIGTERM");
+              repairCommandForceTimeout = setTimeout(() => child.kill("SIGKILL"), 5_000);
+              repairCommandForceTimeout.unref?.();
+            }, 20 * 60_000);
+            repairCommandTimeout.unref?.();
+
+            let reseedObserved = false;
+            const manifestPoll = setInterval(() => {
+              if (reseedObserved || !existsSync(manifestPath)) return;
+              try {
+                const current = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                  attemptId?: unknown;
+                  state?: unknown;
+                };
+                if (
+                  typeof current.attemptId === "string"
+                  && current.attemptId !== previousAttemptId
+                  && (current.state === "pending" || current.state === "running" || current.state === "failed")
+                ) {
+                  reseedObserved = true;
+                }
+              } catch {
+                // The atomic manifest writer makes this unlikely; the terminal
+                // read below remains authoritative.
+              }
+            }, 100);
+            manifestPoll.unref?.();
+            const exitCode = await new Promise<number>((resolve, reject) => {
+              child.once("error", reject);
+              child.once("exit", (code) => resolve(code ?? 1));
+            }).finally(() => {
+              clearInterval(manifestPoll);
+              clearTimeout(repairCommandTimeout);
+              if (repairCommandForceTimeout) clearTimeout(repairCommandForceTimeout);
+            });
+            if (reseedObserved) {
+              await reportRepairPhase("target_backup", "succeeded");
+              await reportRepairPhase("full_reseed", "started");
+            }
+            if (exitCode !== 0) {
+              let seedFailurePhase: string | null = null;
+              try {
+                const failedManifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+                  phase?: unknown;
+                  state?: unknown;
+                };
+                seedFailurePhase = failedManifest.state === "failed" && typeof failedManifest.phase === "string"
+                  ? failedManifest.phase
+                  : null;
+              } catch {
+                // The outer repair phase remains exact when no seed phase was persisted.
+              }
+              await reportProgress({
+                metadata: { seedFailurePhase },
+                system: seedFailurePhase ? `Workspace seed failed during ${seedFailurePhase}.\n` : null,
+              });
+              throw new Error(
+                repairCommandTimedOut
+                  ? `Workspace database repair command timed out during ${repairPhase}.`
+                  : `Workspace database repair command failed during ${repairPhase}.`,
+              );
+            }
+            if (!reseedObserved) {
+              await reportRepairPhase("target_backup", "succeeded");
+              await reportRepairPhase("full_reseed", "started");
+            }
+
+            const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+            if (!isVerifiedWorktreeSeedManifest(manifest)) {
+              throw new Error("Workspace reseed returned without a verified terminal manifest.");
+            }
+            const expectedInstanceId = deriveWorktreeInstanceId(workspaceCwd);
+            if (manifest.targetInstanceId !== expectedInstanceId) {
+              throw new Error("Verified seed manifest belongs to a different workspace instance.");
+            }
+            await reportRepairPhase("full_reseed", "succeeded");
+
+            await reportRepairPhase("managed_restart", "started");
+            const availableWorkspace = await ensureWorkspaceAvailable();
+            if (!availableWorkspace) {
+              throw new Error("Execution workspace needs a local path before Paperclip can restart it.");
+            }
+            const startedServices = await startRuntimeServicesForWorkspaceControl({
+              db,
+              actor: {
+                id: actor.agentId ?? null,
+                name: actor.actorType === "user" ? "Board" : "Agent",
+                companyId: existing.companyId,
+              },
+              issue: existing.sourceIssueId
+                ? { id: existing.sourceIssueId, identifier: null, title: existing.name }
+                : null,
+              workspace: availableWorkspace,
+              executionWorkspaceId: existing.id,
+              config: {
+                workspaceRuntime: effectiveRuntimeConfig,
+                runtimeProvisionCommand:
+                  existing.config?.runtimeProvisionCommand
+                  ?? projectPolicy?.workspaceStrategy?.runtimeProvisionCommand
+                  ?? null,
+              },
+              adapterEnv: {},
+              onLog,
+              recorder,
+            });
+            runtimeServiceCount = startedServices.length;
+            await reportRepairPhase("managed_restart", "succeeded");
+
+            await reportRepairPhase("readiness_validation", "started");
+            if (
+              startedServices.length === 0
+              || startedServices.some((service) => service.status !== "running" || service.healthStatus !== "healthy")
+            ) {
+              throw new Error("Managed restart did not produce healthy runtime services.");
+            }
+            await reportRepairPhase("readiness_validation", "succeeded");
+          } catch (error) {
+            await reportRepairPhase(repairPhase, "failed");
+            throw error;
+          }
+        } else if (action === "stop" || action === "restart") {
           await stopRuntimeServicesForExecutionWorkspace({
             db,
             executionWorkspaceId: existing.id,
@@ -481,7 +717,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             throw error;
           }
           runtimeServiceCount = startedServices.length;
-        } else {
+        } else if (action !== "repair") {
           runtimeServiceCount = selectedRuntimeServiceId ? Math.max(0, (existing.runtimeServices?.length ?? 1) - 1) : 0;
         }
 
@@ -504,7 +740,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               config: { workspaceRuntime: effectiveRuntimeConfig },
               currentDesiredState,
               currentServiceStates: existing.config?.serviceStates ?? null,
-              action,
+              action: action === "repair" ? "start" : action,
               serviceIndex: selectedServiceIndex,
             });
         const metadata = mergeExecutionWorkspaceConfig(existing.metadata as Record<string, unknown> | null, {
@@ -522,6 +758,8 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               ? "Stopped execution workspace runtime services.\n"
               : action === "restart"
                 ? "Restarted execution workspace runtime services.\n"
+                : action === "repair"
+                  ? "Repaired the isolated workspace database and restarted healthy runtime services.\n"
                 : "Started execution workspace runtime services.\n",
           metadata: {
             runtimeServiceCount,
@@ -565,7 +803,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           // The operation is already terminal here. This also catches the recorder's own time
           // budget expiring on a start that never settles, which is the one failure the inner
           // handler cannot see — reconcile there too so no listener or desired state is left over.
-          if (action === "start" || action === "restart") await reconcileFailedRuntimeStart(error);
+          if (action === "start" || action === "restart" || action === "repair") {
+            await reconcileFailedRuntimeStart(error);
+          }
           throw error;
         }
       },

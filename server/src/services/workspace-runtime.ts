@@ -36,6 +36,7 @@ import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
+import { hasVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -5015,6 +5016,7 @@ export function resolveRuntimeProvisionCommand(input: {
   if (input.workspace.strategy !== "git_worktree") return "";
 
   const stateDir = path.join(input.workspace.cwd, ".paperclip");
+  const manifestPath = path.join(stateDir, "seed-manifest.json");
   const pendingMarker = path.join(stateDir, "seed-pending");
   const completeMarker = path.join(stateDir, "seed-complete");
   const provisionScript = path.join(
@@ -5022,11 +5024,11 @@ export function resolveRuntimeProvisionCommand(input: {
     "scripts",
     "provision-worktree-runtime.sh",
   );
-  if (
-    !existsSync(pendingMarker)
-    || existsSync(completeMarker)
-    || !existsSync(provisionScript)
-  ) {
+  let needsSeed = existsSync(pendingMarker) && !existsSync(completeMarker);
+  if (existsSync(manifestPath)) {
+    needsSeed = !hasVerifiedWorktreeSeedManifest(manifestPath);
+  }
+  if (!needsSeed || !existsSync(provisionScript)) {
     return "";
   }
 

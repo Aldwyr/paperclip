@@ -479,25 +479,24 @@ After `worktree init`, both the server and the CLI auto-load the repo-local `.pa
 
 Seeding a worktree database is the heaviest part of `worktree init`. That work can be deferred so a worktree is cheap to create and only pays the seed cost the first time it is actually used — the CLI/dev-time analog of the server's lazy runtime provisioning (see the board-operator guide's "Lazy runtime provisioning" section).
 
-Seeding state is tracked with two marker files under the worktree's `.paperclip/` directory:
+Seeding state is tracked in `.paperclip/seed-manifest.json`. The versioned manifest records only non-secret evidence: source instance id/config path, target instance id, seed mode, snapshot time, migration revision, attempt timestamps, current phase, terminal state, and a bounded phase diagnostic history. It never stores database credentials or auth credential material. The legacy `seed-pending` and `seed-complete` files remain read-only compatibility signals for worktrees created before the manifest shipped.
 
-- `seed-pending` — the isolated database has not been seeded yet (a **lean** worktree). Written by `worktree init` before any seed runs.
-- `seed-complete` — the database was seeded; the pending marker is removed.
+The default `worktree init` still seeds eagerly. A lean worktree (created without an eager seed) has a `pending` manifest until something seeds it on demand:
 
-The default `worktree init` still seeds eagerly and writes `seed-complete` immediately. A lean worktree (created without an eager seed) keeps its `seed-pending` marker until something seeds it on demand:
-
-- `pnpm paperclipai worktree ensure-seeded` performs the deferred seed **exactly once**. It is lock-guarded and idempotent: a present `seed-complete` marker or a missing `seed-pending` marker short-circuits it, so it is safe to call repeatedly and from concurrent processes. It reads the source instance from the `seed-pending` marker unless you pass `--from-config`.
+- `pnpm paperclipai worktree ensure-seeded` performs the deferred seed **exactly once**. It is lock-guarded and idempotent: only a complete `verified` manifest short-circuits it, so it is safe to call repeatedly and from concurrent processes. It reads the source identity from the manifest unless you pass `--from-config`.
 - `paperclipai run` calls `ensureWorktreeSeeded` automatically before doctor/boot, so `run` transparently seeds a lean worktree on first launch.
-- Managed git-worktree runtime startup also runs `scripts/provision-worktree-runtime.sh` automatically when a legacy workspace policy has no explicit runtime provision command and the worktree is still `seed-pending`. An explicitly configured runtime provision command always takes precedence.
+- Managed git-worktree runtime startup also runs `scripts/provision-worktree-runtime.sh` automatically when a legacy workspace policy has no explicit runtime provision command and the manifest is not verified. An explicitly configured runtime provision command always takes precedence.
 - Worktrees created before lazy seeding shipped have neither marker; they are treated as already-seeded for backward compatibility (never re-cloned).
 
-**Seed-pending guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose database is still `seed-pending` and points you at the fix:
+Both `minimal` and `full` modes use the same terminal validation contract. Before a manifest can become `verified`, Paperclip proves the migration journal is current and reads a credential-backed auth user, instance administrator role, active company membership, and representative cloned company/issue pair in both source and target. Restore, migrations, execution quarantine, routine pausing, workspace rebinding, and post-restore validation all run under the seed lock. An interruption leaves the exact active phase in terminal `failed` state; it cannot produce readiness evidence.
+
+**Unverified-seed guard.** `pnpm dev` (the dev-runner) refuses to boot a worktree whose manifest is pending, running, failed, malformed, or missing required verification evidence and points you at the fix:
 
 ```
 [paperclip] this worktree database is seed-pending. Run `pnpm paperclipai worktree ensure-seeded` before `pnpm dev`.
 ```
 
-This guard (`isWorktreeSeedPending` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty, unseeded database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
+This guard (`isWorktreeSeedPending` in `server/src/dev-runner-worktree.ts`) prevents `pnpm dev` from starting the app against an empty or partially restored database — run `worktree ensure-seeded` once and re-run `pnpm dev`.
 
 Provisioned git worktrees also pause seeded routines that still have enabled schedule triggers in the isolated worktree database by default. This prevents copied daily/cron routines from firing unexpectedly inside the new workspace instance during development without disabling webhook/API-only routines.
 
@@ -603,6 +602,7 @@ For an already-created worktree where you want to keep the existing repo-local c
 | `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `full`) |
 | `--yes` | Skip the destructive confirmation prompt |
 | `--allow-live-target` | Override the guard that requires the target worktree DB to be stopped first |
+| `--backup-target` | Retain a recoverable full target-DB backup before reseeding |
 
 Examples:
 
@@ -621,6 +621,8 @@ npx paperclipai worktree reseed \
   --from-instance default \
   --seed-mode full
 ```
+
+Managed workspace repair uses this same verified full-reseed contract through `POST /api/execution-workspaces/:id/runtime-commands/repair`. The exclusive, audited operation stops managed services, writes a recoverable pre-repair database backup under the isolated instance's backup directory, performs the full seed/migration/quarantine/rebinding sequence, and restarts only after terminal manifest and service-health validation. It preserves the worktree filesystem. On failure, services remain stopped while the database backup, seed manifest, bounded phase diagnostics, and operation log are retained for inspection; repair never retries itself in a loop.
 
 **`npx paperclipai worktree:make <name> [options]`** — Create `~/NAME` as a git worktree, then initialize an isolated Paperclip instance inside it. This combines `git worktree add` with `worktree init` in a single step.
 

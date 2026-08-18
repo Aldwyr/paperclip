@@ -456,6 +456,39 @@ describe("resolveRuntimeProvisionCommand", () => {
 
       await fs.writeFile(path.join(cwd, ".paperclip", "seed-complete"), "{}\n");
       expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
+
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ version: 2, state: "failed" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({ version: 2, state: "verified" }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe(
+        "bash ./scripts/provision-worktree-runtime.sh",
+      );
+      await fs.writeFile(
+        path.join(cwd, ".paperclip", "seed-manifest.json"),
+        JSON.stringify({
+          version: 2,
+          source: { instanceId: "source", configPath: "/source/config.json" },
+          snapshotAt: "2026-08-18T00:00:00.000Z",
+          seedMode: "full",
+          migrationRevision: "0001",
+          targetInstanceId: "target",
+          phase: "complete",
+          state: "verified",
+          attemptId: "attempt",
+          startedAt: "2026-08-18T00:00:00.000Z",
+          finishedAt: "2026-08-18T00:01:00.000Z",
+          diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+        }),
+      );
+      expect(resolveRuntimeProvisionCommand({ config: {}, workspace })).toBe("");
     } finally {
       await fs.rm(baseCwd, { recursive: true, force: true });
     }

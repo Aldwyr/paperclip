@@ -8,6 +8,7 @@ paperclip_instance_id="${PAPERCLIP_INSTANCE_ID:-default}"
 paperclip_dir="$worktree_cwd/.paperclip"
 worktree_config_path="$paperclip_dir/config.json"
 worktree_env_path="$paperclip_dir/.env"
+seed_manifest_path="$paperclip_dir/seed-manifest.json"
 seed_pending_marker_path="$paperclip_dir/seed-pending"
 seed_complete_marker_path="$paperclip_dir/seed-complete"
 worktree_name="${PAPERCLIP_WORKSPACE_BRANCH:-$(basename "$worktree_cwd")}"
@@ -237,25 +238,48 @@ for (const rawValue of runtimePaths) {
 EOF
 }
 
-write_seed_pending_marker() {
+write_seed_pending_manifest() {
+  SEED_MANIFEST_PATH="$seed_manifest_path" \
   SEED_PENDING_MARKER_PATH="$seed_pending_marker_path" \
   SEED_COMPLETE_MARKER_PATH="$seed_complete_marker_path" \
   SOURCE_CONFIG_PATH="$source_config_path" \
+  TARGET_INSTANCE_ID="$worktree_instance_id" \
   node <<'EOF'
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+const manifestPath = process.env.SEED_MANIFEST_PATH;
 const pendingPath = process.env.SEED_PENDING_MARKER_PATH;
 const completePath = process.env.SEED_COMPLETE_MARKER_PATH;
+const sourceConfigPath = path.resolve(process.env.SOURCE_CONFIG_PATH);
+const sourceEnvPath = path.join(path.dirname(sourceConfigPath), ".env");
+let sourceInstanceId = path.basename(path.dirname(sourceConfigPath));
+if (fs.existsSync(sourceEnvPath)) {
+  const match = fs.readFileSync(sourceEnvPath, "utf8").match(/^\s*(?:export\s+)?PAPERCLIP_INSTANCE_ID\s*=\s*["']?([^\s"'#]+)["']?/m);
+  if (match?.[1]) sourceInstanceId = match[1];
+}
 fs.rmSync(completePath, { force: true });
+fs.rmSync(pendingPath, { force: true });
+const at = new Date().toISOString();
 fs.writeFileSync(
-  pendingPath,
+  manifestPath,
   `${JSON.stringify({
-    version: 1,
-    state: "pending",
-    sourceConfigPath: path.resolve(process.env.SOURCE_CONFIG_PATH),
+    version: 2,
+    source: {
+      instanceId: sourceInstanceId,
+      configPath: sourceConfigPath,
+    },
+    snapshotAt: null,
     seedMode: "minimal",
-    createdAt: new Date().toISOString(),
+    migrationRevision: null,
+    targetInstanceId: process.env.TARGET_INSTANCE_ID,
+    phase: "pending",
+    state: "pending",
+    attemptId: crypto.randomUUID(),
+    startedAt: null,
+    finishedAt: null,
+    diagnostics: [{ phase: "pending", status: "succeeded", at }],
   }, null, 2)}\n`,
   { mode: 0o600 },
 );
@@ -551,8 +575,8 @@ else
   created_worktree_config=1
 fi
 
-if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
-  write_seed_pending_marker
+if [[ "$created_worktree_config" -eq 1 && ! -e "$seed_manifest_path" && ! -e "$seed_pending_marker_path" && ! -e "$seed_complete_marker_path" ]]; then
+  write_seed_pending_manifest
 fi
 
 list_base_node_modules_paths() {
