@@ -233,6 +233,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   async function seedResolvedDependencyBackstopFixture(opts: {
     workspaceState?: "none" | "not_finalized" | "finalized";
     assignee?: "agent" | null;
+    blockerStatus?: "done" | "cancelled";
   } = {}) {
     const workspaceState = opts.workspaceState ?? "none";
     const companyId = randomUUID();
@@ -313,7 +314,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         companyId,
         projectId: workspaceState === "none" ? null : projectId,
         title: "Synthetic completed blocker",
-        status: "done",
+        status: opts.blockerStatus ?? "done",
         priority: "medium",
         executionWorkspaceId: workspaceState === "none" ? null : executionWorkspaceId,
         issueNumber: 2,
@@ -544,6 +545,33 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(events[0]).toMatchObject({ entityId: blockedIssueId });
   });
 
+  it("reconciles a previously stranded dependent whose cancelled blocker has an unfinished workspace", async () => {
+    const { agentId, blockedIssueId, blockerIssueId } =
+      await seedResolvedDependencyBackstopFixture({
+        workspaceState: "not_finalized",
+        blockerStatus: "cancelled",
+      });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result.dependencyWakesHealed).toBe(1);
+    expect(result.dependencyWakeNotReadySkipped).toBe(0);
+    expect(result.dependencyWakeIssueIds).toEqual([blockedIssueId]);
+
+    const wake = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(wake).toMatchObject({
+      reason: "issue_blockers_resolved",
+      idempotencyKey: `issue_blockers_resolved:${blockedIssueId}:${blockerIssueId}`,
+    });
+  });
+
   it("reconciles a resolved blocked dependency after the assignee-null window closes", async () => {
     const { agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none", assignee: null });
@@ -680,7 +708,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
-  it("does not duplicate an existing dependency wake keyed to any resolved blocker", async () => {
+  it("does not duplicate an existing dependency wake keyed to any terminal blocker", async () => {
     await enableAutoRecovery();
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
@@ -688,8 +716,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.insert(issues).values({
       id: secondBlockerIssueId,
       companyId,
-      title: "Second completed blocker",
-      status: "done",
+      title: "Cancelled blocker",
+      status: "cancelled",
       priority: "medium",
       issueNumber: 3,
       identifier: "R-MULTI-3",
