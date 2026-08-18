@@ -196,17 +196,13 @@ describe("TaskChatThread recovery actions", () => {
     expect(disclosure.getAttribute("aria-expanded")).toBe("false");
     expect(retry.textContent).toBe("Try again");
 
-    flushSync(() => retry.click());
-    expect(onResolveRecoveryAction).toHaveBeenLastCalledWith("todo");
-    expect(disclosure.getAttribute("aria-expanded")).toBe("false");
-
     flushSync(() => disclosure.click());
     expect(disclosure.getAttribute("aria-expanded")).toBe("true");
     expect(container.querySelector('[data-testid="task-chat-system-notice-details"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="task-chat-recovery-try-again"]')).not.toBeNull();
 
     flushSync(() => retry.click());
-    expect(onResolveRecoveryAction).toHaveBeenCalledTimes(2);
+    expect(onResolveRecoveryAction).toHaveBeenCalledTimes(1);
     expect(onResolveRecoveryAction).toHaveBeenLastCalledWith("todo");
   });
 
@@ -255,6 +251,31 @@ describe("TaskChatThread recovery actions", () => {
 
     flushSync(() => retry.click());
     expect(onResolveRecoveryAction).not.toHaveBeenCalled();
+  });
+
+  it("submits only once across rapid clicks before pending state renders", () => {
+    const onResolveRecoveryAction = vi.fn(() => new Promise<void>(() => {}));
+    render(
+      <TaskChatThread
+        comments={[recoveryComment]}
+        onAdd={async () => {}}
+        issueId="issue-1"
+        issueStatus="blocked"
+        recoveryAction={recoveryAction}
+        onResolveRecoveryAction={onResolveRecoveryAction}
+      />,
+    );
+
+    const retry = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-recovery-try-again"]',
+    )!;
+    flushSync(() => {
+      retry.click();
+      retry.click();
+    });
+
+    expect(onResolveRecoveryAction).toHaveBeenCalledTimes(1);
+    expect(retry.disabled).toBe(true);
   });
 });
 

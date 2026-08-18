@@ -455,7 +455,7 @@ interface IssueChatThreadProps {
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   scheduledRetry?: IssueScheduledRetry | null;
   recoveryAction?: IssueRecoveryAction | null;
-  onResolveRecoveryAction?: (outcome: RecoveryResolveOutcome) => void;
+  onResolveRecoveryAction?: (outcome: RecoveryResolveOutcome) => Promise<void> | void;
   recoveryActionPending?: boolean;
   onReissueIsolatedRecoveryAction?: (request: RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;

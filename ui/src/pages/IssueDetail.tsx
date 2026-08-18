@@ -960,7 +960,7 @@ type IssueDetailChatTabProps = {
   successfulRunHandoff: Issue["successfulRunHandoff"] | null;
   scheduledRetry: Issue["scheduledRetry"] | null;
   recoveryAction: Issue["activeRecoveryAction"];
-  onResolveRecoveryAction?: (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => void;
+  onResolveRecoveryAction?: (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => Promise<void> | void;
   recoveryActionPending?: boolean;
   onReissueIsolatedRecoveryAction?: (request: import("../components/IssueRecoveryActionCard").RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;
@@ -4068,25 +4068,29 @@ export function IssueDetail() {
   }, [updateIssue.mutateAsync]);
   const activeRecoveryActionId = issue?.activeRecoveryAction?.id;
   const handleResolveRecoveryAction = useCallback(
-    (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => {
+    async (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => {
       const actionId = activeRecoveryActionId;
       if (!actionId) return;
-      switch (outcome) {
-        case "todo":
-          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "todo" });
-          return;
-        case "done":
-          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "done" });
-          return;
-        case "in_review":
-          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "in_review" });
-          return;
-        case "false_positive_done":
-          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "false_positive", sourceIssueStatus: "done" });
-          return;
-        case "false_positive_in_review":
-          void resolveRecoveryAction.mutateAsync({ actionId, outcome: "false_positive", sourceIssueStatus: "in_review" });
-          return;
+      try {
+        switch (outcome) {
+          case "todo":
+            await resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "todo" });
+            return;
+          case "done":
+            await resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "done" });
+            return;
+          case "in_review":
+            await resolveRecoveryAction.mutateAsync({ actionId, outcome: "restored", sourceIssueStatus: "in_review" });
+            return;
+          case "false_positive_done":
+            await resolveRecoveryAction.mutateAsync({ actionId, outcome: "false_positive", sourceIssueStatus: "done" });
+            return;
+          case "false_positive_in_review":
+            await resolveRecoveryAction.mutateAsync({ actionId, outcome: "false_positive", sourceIssueStatus: "in_review" });
+            return;
+        }
+      } catch {
+        // The mutation's onError handler surfaces the failure.
       }
     },
     [activeRecoveryActionId, resolveRecoveryAction.mutateAsync],

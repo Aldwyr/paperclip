@@ -101,6 +101,8 @@ export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread>;
  * folded row. flag-OFF remains byte-for-byte IssueChatThread.
  */
 export function TaskChatThread(props: TaskChatThreadProps) {
+  const recoveryRetryInFlightRef = useRef(false);
+  const [recoveryRetryInFlight, setRecoveryRetryInFlight] = useState(false);
   const {
     comments,
     interactions,
@@ -626,6 +628,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [interruptingQueuedRunId, onInterruptQueued],
   );
 
+  const handleRecoveryTryAgain = useCallback(() => {
+    if (!onResolveRecoveryAction || recoveryRetryInFlightRef.current) return;
+    recoveryRetryInFlightRef.current = true;
+    setRecoveryRetryInFlight(true);
+    void (async () => {
+      try {
+        await onResolveRecoveryAction("todo");
+      } catch {
+        // The mutation owns user-visible error reporting.
+      } finally {
+        recoveryRetryInFlightRef.current = false;
+        setRecoveryRetryInFlight(false);
+      }
+    })();
+  }, [onResolveRecoveryAction]);
+
   const renderSystemNoticeAction = useCallback(
     (item: TaskChatMessageItem) => {
       if (
@@ -645,14 +663,20 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           variant="outline"
           size="xs"
           data-testid="task-chat-recovery-try-again"
-          disabled={recoveryActionPending}
-          onClick={() => onResolveRecoveryAction("todo")}
+          disabled={recoveryActionPending || recoveryRetryInFlight}
+          onClick={handleRecoveryTryAgain}
         >
           Try again
         </Button>
       );
     },
-    [onResolveRecoveryAction, recoveryAction, recoveryActionPending],
+    [
+      handleRecoveryTryAgain,
+      onResolveRecoveryAction,
+      recoveryAction,
+      recoveryActionPending,
+      recoveryRetryInFlight,
+    ],
   );
 
   const renderInteraction = useCallback(
