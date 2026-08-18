@@ -233,6 +233,29 @@ describe("TaskChatThread recovery actions", () => {
 
     expect(container.querySelector('[data-testid="task-chat-recovery-try-again"]')).toBeNull();
   });
+
+  it("disables Try again while recovery resolution is pending", () => {
+    const onResolveRecoveryAction = vi.fn();
+    render(
+      <TaskChatThread
+        comments={[recoveryComment]}
+        onAdd={async () => {}}
+        issueId="issue-1"
+        issueStatus="blocked"
+        recoveryAction={recoveryAction}
+        onResolveRecoveryAction={onResolveRecoveryAction}
+        recoveryActionPending
+      />,
+    );
+
+    const retry = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-recovery-try-again"]',
+    )!;
+    expect(retry.disabled).toBe(true);
+
+    flushSync(() => retry.click());
+    expect(onResolveRecoveryAction).not.toHaveBeenCalled();
+  });
 });
 
 describe("TaskChatThread composer alignment (PAP-498)", () => {

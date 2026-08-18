@@ -961,6 +961,7 @@ type IssueDetailChatTabProps = {
   scheduledRetry: Issue["scheduledRetry"] | null;
   recoveryAction: Issue["activeRecoveryAction"];
   onResolveRecoveryAction?: (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => void;
+  recoveryActionPending?: boolean;
   onReissueIsolatedRecoveryAction?: (request: import("../components/IssueRecoveryActionCard").RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;
   onReconcileForwardRecoveryAction?: () => void;
@@ -1067,6 +1068,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   scheduledRetry,
   recoveryAction,
   onResolveRecoveryAction,
+  recoveryActionPending,
   onReissueIsolatedRecoveryAction,
   reissueIsolatedRecoveryActionPending,
   onReconcileForwardRecoveryAction,
@@ -1342,6 +1344,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         scheduledRetry={scheduledRetry}
         recoveryAction={recoveryAction ?? null}
         onResolveRecoveryAction={onResolveRecoveryAction}
+        recoveryActionPending={recoveryActionPending}
         onReissueIsolatedRecoveryAction={onReissueIsolatedRecoveryAction}
         reissueIsolatedRecoveryActionPending={reissueIsolatedRecoveryActionPending}
         onReconcileForwardRecoveryAction={onReconcileForwardRecoveryAction}
@@ -5285,6 +5288,7 @@ export function IssueDetail() {
               scheduledRetry={issue.scheduledRetry ?? null}
               recoveryAction={issue.activeRecoveryAction ?? null}
               onResolveRecoveryAction={handleResolveRecoveryAction}
+              recoveryActionPending={resolveRecoveryAction.isPending}
               onReissueIsolatedRecoveryAction={handleReissueIsolatedRecoveryAction}
               reissueIsolatedRecoveryActionPending={reissueIsolatedRecoveryAction.isPending}
               onReconcileForwardRecoveryAction={handleReconcileForwardRecoveryAction}

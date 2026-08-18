@@ -456,6 +456,7 @@ interface IssueChatThreadProps {
   scheduledRetry?: IssueScheduledRetry | null;
   recoveryAction?: IssueRecoveryAction | null;
   onResolveRecoveryAction?: (outcome: RecoveryResolveOutcome) => void;
+  recoveryActionPending?: boolean;
   onReissueIsolatedRecoveryAction?: (request: RecoveryReissueRequest) => void;
   reissueIsolatedRecoveryActionPending?: boolean;
   onReconcileForwardRecoveryAction?: () => void;

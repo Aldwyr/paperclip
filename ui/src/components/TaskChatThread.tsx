@@ -149,6 +149,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     liveIssueIds,
     recoveryAction,
     onResolveRecoveryAction,
+    recoveryActionPending,
   } = props;
 
   const liveWorkLinks = useMemo(
@@ -644,13 +645,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           variant="outline"
           size="xs"
           data-testid="task-chat-recovery-try-again"
+          disabled={recoveryActionPending}
           onClick={() => onResolveRecoveryAction("todo")}
         >
           Try again
         </Button>
       );
     },
-    [onResolveRecoveryAction, recoveryAction],
+    [onResolveRecoveryAction, recoveryAction, recoveryActionPending],
   );
 
   const renderInteraction = useCallback(
