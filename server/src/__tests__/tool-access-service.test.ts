@@ -5840,17 +5840,37 @@ describeEmbeddedPostgres("tool access service", () => {
     const service = toolAccessService(db);
     mockToolsList([
       { name: "list_zaps", description: "List", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } },
+      { name: "update_zap", description: "Update", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: false } },
     ]);
 
-    const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "zapier",
-      name: "Zapier reconnect",
-      credentialValues: { "credentials.authorization": "old-secret" },
-    }, { actorType: "user", actorId: "board" });
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, {
+        galleryKey: "zapier",
+        name: "Zapier reconnect",
+        credentialValues: { "credentials.authorization": "old-secret" },
+      }, { actorType: "user", actorId: "board" }));
 
     const before = await service.getConnection(connect.connectionId, company.id);
     const beforeRef = before.credentialSecretRefs.find((r) => r.configPath === "credentials.authorization")!;
     expect(beforeRef).toBeDefined();
+
+    const listEntry = connect.catalog.find((entry) => entry.toolName === "list_zaps")!;
+    const updateEntry = connect.catalog.find((entry) => entry.toolName === "update_zap")!;
+    const finished = await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id, updateEntry.id],
+      askFirstCatalogEntryIds: [updateEntry.id],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" });
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, finished.profile.id));
+    await db.update(toolCatalogEntries).set({
+      status: "quarantined",
+      quarantineReason: "pending_review",
+      quarantinedAt: new Date(),
+    }).where(eq(toolCatalogEntries.connectionId, connect.connectionId));
+    await db.update(toolConnections).set({
+      config: { ...before.config, quarantineNewEntries: true },
+      transportConfig: { ...before.transportConfig, quarantineNewEntries: true },
+    }).where(eq(toolConnections.id, connect.connectionId));
 
     await expect(
       service.reconnectGalleryApp(connect.connectionId, company.id, { credentialValues: {} }, { actorType: "user", actorId: "board" }),
@@ -5869,6 +5889,27 @@ describeEmbeddedPostgres("tool access service", () => {
     // Rotated in place: same secret, no duplicate ref created.
     expect(after.credentialSecretRefs).toHaveLength(before.credentialSecretRefs.length);
     expect(afterRef.secretId).toBe(beforeRef.secretId);
+    expect(after.config).toMatchObject({ quarantineNewEntries: false });
+    expect(after.transportConfig).toMatchObject({ quarantineNewEntries: false });
+
+    const catalogAfterReconnect = await db.select().from(toolCatalogEntries).where(
+      eq(toolCatalogEntries.connectionId, connect.connectionId),
+    );
+    expect(catalogAfterReconnect).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: listEntry.id, status: "active", quarantineReason: null }),
+      expect.objectContaining({ id: updateEntry.id, status: "active", quarantineReason: null }),
+    ]));
+    const profileEntriesAfterReconnect = await db.select().from(toolProfileEntries).where(
+      eq(toolProfileEntries.profileId, finished.profile.id),
+    );
+    expect(profileEntriesAfterReconnect).toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: listEntry.id, effect: "include" }),
+      expect.objectContaining({ catalogEntryId: updateEntry.id, effect: "include" }),
+    ]));
+    await expect(db.select().from(toolPolicies).where(and(
+      eq(toolPolicies.companyId, company.id),
+      eq(toolPolicies.enabled, true),
+    ))).resolves.toHaveLength(0);
   });
 
   it("stops and restarts local stdio runtime slots through the board service", async () => {

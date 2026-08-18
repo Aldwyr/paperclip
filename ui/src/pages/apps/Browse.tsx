@@ -119,6 +119,10 @@ export function Browse() {
   }, [gallery, trimmed]);
   const connectionSummaryBySlug = useMemo(() => {
     const connections = connectionsQuery.data?.connections ?? [];
+    const gallerySlugs = new Set(gallery.map((entry) => appDefinitionSlug(entry)));
+    const gallerySlugByName = new Map(
+      gallery.map((entry) => [appDefinitionName(entry).trim().toLowerCase(), appDefinitionSlug(entry)]),
+    );
     const connectionsByApplicationId = new Map<string, typeof connections>();
     for (const connection of connections) {
       if (connection.status === "archived" || connection.status === "draft") continue;
@@ -135,9 +139,17 @@ export function Browse() {
     }>();
     for (const application of applicationsQuery.data?.applications ?? []) {
       if (application.status === "archived") continue;
-      const slug = appApplicationSourceSlug(application);
-      if (!slug) continue;
       const appConnections = connectionsByApplicationId.get(application.id) ?? [];
+      const configuredConnectionSlug = appConnections
+        .map((connection) => connection.config?.sourceTemplateKey ?? connection.transportConfig?.sourceTemplateKey)
+        .find((value): value is string => typeof value === "string" && gallerySlugs.has(value));
+      const applicationSlug = appApplicationSourceSlug(application);
+      const slug = applicationSlug && gallerySlugs.has(applicationSlug)
+        ? applicationSlug
+        : configuredConnectionSlug
+          ?? gallerySlugByName.get(application.name.trim().toLowerCase())
+          ?? null;
+      if (!slug) continue;
       const current = summaries.get(slug);
       summaries.set(slug, {
         applicationId: current?.applicationId ?? application.id,
@@ -146,7 +158,7 @@ export function Browse() {
       });
     }
     return summaries;
-  }, [applicationsQuery.data, connectionsQuery.data]);
+  }, [applicationsQuery.data, connectionsQuery.data, gallery]);
   const userProfileById = useMemo(
     () => buildCompanyUserProfileMap(userDirectoryQuery.data?.users),
     [userDirectoryQuery.data],
@@ -321,7 +333,7 @@ function AppTile({
             className="text-xs text-muted-foreground transition-colors hover:text-foreground"
             aria-label={`Add another ${appName} account`}
           >
-            Add another account
+            Add new
           </button>
         )}
       </div>
@@ -365,7 +377,7 @@ function AppTile({
             className="text-xs text-muted-foreground transition-colors hover:text-foreground"
             aria-label={`Add another ${appName} account`}
           >
-            Add another account
+            Add new
           </button>
         )}
       </div>

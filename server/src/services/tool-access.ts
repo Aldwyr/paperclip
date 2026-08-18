@@ -4129,7 +4129,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
   }
 
-  async function refreshCatalog(connectionId: string, actor?: ActorInfo): Promise<ToolCatalogRefreshResult> {
+  async function refreshCatalog(
+    connectionId: string,
+    actor?: ActorInfo,
+    refreshOptions: { enableAllByDefault?: boolean } = {},
+  ): Promise<ToolCatalogRefreshResult> {
     const connection = await getConnectionRow(connectionId);
     const now = new Date();
     let descriptors: McpToolDescriptor[];
@@ -4161,7 +4165,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const sourceTemplateKey = typeof asRecord(connection.config).sourceTemplateKey === "string"
       ? String(asRecord(connection.config).sourceTemplateKey)
       : null;
-    const quarantineOnRefresh = shouldQuarantineNewEntries(connection)
+    const quarantineOnRefresh = !refreshOptions.enableAllByDefault
+      && shouldQuarantineNewEntries(connection)
       && (connection.status === "active" || sourceTemplateKey === "posthog");
     const safeDefault = asRecord(connection.config).safeDefault === true;
     for (const descriptor of descriptors) {
@@ -4239,9 +4244,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
     }
 
+    const normalizedConfig = refreshOptions.enableAllByDefault
+      ? { ...connection.config, quarantineNewEntries: false }
+      : connection.config;
+    const normalizedTransportConfig = refreshOptions.enableAllByDefault
+      ? { ...connection.transportConfig, quarantineNewEntries: false }
+      : connection.transportConfig;
     const [updatedConnection] = await db
       .update(toolConnections)
       .set({
+        config: normalizedConfig,
+        transportConfig: normalizedTransportConfig,
         healthStatus: "ok",
         healthMessage: "Tool catalog refreshed.",
         healthCheckedAt: now,
@@ -4264,15 +4277,25 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const activeEntries = updatedEntries.filter((entry) => entry.status === "active");
     await enableCatalogEntriesByDefault({
       connection: updatedConnection,
-      newCatalogEntryIds: activeEntries
-        .filter((entry) => {
-          const previous = existingByName.get(entry.toolName);
-          return !previous || previous.status === "quarantined";
-        })
-        .map((entry) => entry.id),
+      newCatalogEntryIds: refreshOptions.enableAllByDefault
+        ? activeEntries.map((entry) => entry.id)
+        : activeEntries
+          .filter((entry) => {
+            const previous = existingByName.get(entry.toolName);
+            return !previous || previous.status === "quarantined";
+          })
+          .map((entry) => entry.id),
       activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
       actor,
     });
+    if (refreshOptions.enableAllByDefault) {
+      await upsertAskFirstPolicies({
+        companyId: updatedConnection.companyId,
+        connection: updatedConnection,
+        askFirstEntries: [],
+        actor,
+      });
+    }
 
     await audit({
       companyId: connection.companyId,
@@ -6631,7 +6654,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         }
         throw error;
       }
-      const refresh = await refreshCatalog(connectionRow.id, actor);
+      const refresh = await refreshCatalog(connectionRow.id, actor, { enableAllByDefault: true });
       const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationRow.id));
       return {
         connectionId: refresh.connection.id,
@@ -7072,7 +7095,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .where(eq(toolConnections.id, connection.id))
       .returning();
     await syncCredentialBindings(updated);
-    return checkConnectionHealth(updated.id, actor);
+    const health = await checkConnectionHealth(updated.id, actor);
+    const refresh = await refreshCatalog(updated.id, actor, { enableAllByDefault: true });
+    return { ...health, connection: refresh.connection };
   }
 
   async function startOAuth(
@@ -7532,7 +7557,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     await syncCredentialBindings(connection);
 
     await checkConnectionHealth(connection.id, input.actor);
-    const refresh = await refreshCatalog(connection.id, input.actor);
+    const refresh = await refreshCatalog(connection.id, input.actor, { enableAllByDefault: true });
     const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
     return {
       connectionId: refresh.connection.id,

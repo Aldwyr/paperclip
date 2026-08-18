@@ -388,6 +388,16 @@ describe("AppDetail", () => {
     expect(container.textContent).not.toContain("Action permissions");
   });
 
+  it("explains that MCP actions can take a minute while Test loads", async () => {
+    mockParams.tab = "test";
+    listCatalogMock.mockImplementation(() => new Promise(() => undefined));
+
+    await renderAppDetail();
+
+    expect(container.textContent).toContain("Loading MCP actions, this may take a minute.");
+    expect(container.querySelector(".animate-spin")).toBeTruthy();
+  });
+
   it("hides secret URL parameters in setup technical details", async () => {
     mockParams.tab = "setup";
     getConnectionMock.mockResolvedValue(
@@ -698,6 +708,35 @@ describe("AppDetail", () => {
     expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [
       { targetType: "agent", targetId: "agent-1" },
     ]);
+  });
+
+  it("removes an existing agent grant directly from Permissions", async () => {
+    mockParams.tab = "permissions";
+    listProfilesMock.mockResolvedValue({
+      profiles: [{
+        profileKey: "app:conn-1",
+        entries: [
+          { effect: "include", catalogEntryId: "catalog-read" },
+          { effect: "include", catalogEntryId: "catalog-write" },
+        ],
+        bindings: [{ targetType: "agent", targetId: "agent-1" }],
+      }],
+    });
+
+    await renderAppDetail();
+
+    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove Coder access"]');
+    expect(remove).toBeTruthy();
+    await act(async () => {
+      remove!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(finishAppMock).toHaveBeenCalledWith("company-1", "conn-1", {
+      enabledCatalogEntryIds: ["catalog-read", "catalog-write"],
+      askFirstCatalogEntryIds: ["catalog-write"],
+      access: { agentIds: [] },
+    });
   });
 
   it("renders activity attribution with issue context and human resolver names", async () => {

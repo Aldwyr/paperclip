@@ -520,7 +520,7 @@ export function AppDetail() {
         catalogQuery.isError
           ? <ToolsLoadError onRetry={() => { void catalogQuery.refetch(); }} />
           : catalogQuery.isLoading
-          ? <ToolsLoading />
+          ? <ToolsLoading mcpActions />
           : <TestPanel connectionId={connectionId} appName={appName} active={active} quarantined={quarantined} />
       )}
       {activeTab === "activity" && (
@@ -636,11 +636,11 @@ function AppDetailHeader({
   );
 }
 
-function ToolsLoading() {
+function ToolsLoading({ mcpActions = false }: { mcpActions?: boolean }) {
   return (
     <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground" role="status">
       <Loader2 className="h-4 w-4 animate-spin" />
-      Loading tools…
+      {mcpActions ? "Loading MCP actions, this may take a minute." : "Loading tools…"}
     </div>
   );
 }

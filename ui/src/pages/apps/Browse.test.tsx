@@ -205,7 +205,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
   it("shows the connected owner, edits existing connections, and offers a deliberate second account", async () => {
     listApplicationsMock.mockResolvedValue({
       applications: [
-        { id: "app-notion", status: "active", applicationKey: "app-gallery:notion:one", metadata: {} },
+        { id: "app-notion", name: "Legacy integration", status: "active", applicationKey: "legacy:notion", metadata: {} },
       ],
     });
     listConnectionsMock.mockResolvedValue({
@@ -216,6 +216,8 @@ describe("Browse store door (PAP-13254 door 1)", () => {
           name: "Notion",
           status: "active",
           createdByUserId: "user-1",
+          config: { sourceTemplateKey: "notion" },
+          transportConfig: {},
         },
         { id: "conn-two", applicationId: "app-notion", status: "disabled" },
         { id: "conn-draft", applicationId: "app-notion", status: "draft" },
@@ -255,7 +257,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     const addAnother = container.querySelector<HTMLButtonElement>(
       'button[aria-label="Add another Notion account"]',
     );
-    expect(addAnother?.textContent).toContain("Add another account");
+    expect(addAnother?.textContent).toContain("Add new");
     await act(async () => {
       addAnother?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
