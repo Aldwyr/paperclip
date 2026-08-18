@@ -2,8 +2,8 @@ import type {
   NativeExecutionInputV1,
   NativeInteractionResponseEnvelope,
   StrictCompletionContractInput,
-} from "@paperclipai/paperclip-runner";
-import { parseNativeExecutionInput } from "@paperclipai/paperclip-runner";
+} from "../../vendor/paperclip-runner/index.js";
+import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 
 /** Closed constructor: callers cannot spread legacy context or environment data. */
 export function buildNativeExecutionInput(input: {

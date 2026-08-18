@@ -16,11 +16,11 @@ import type {
   PrpEvent,
   PrpTerminalState,
   ReplayControlPlaneEventsInput,
-} from "@paperclipai/paperclip-runner";
+} from "../../vendor/paperclip-runner/index.js";
 import {
   validatePrpEvent,
   validatePrpStructuredRunResult,
-} from "@paperclipai/paperclip-runner";
+} from "../../vendor/paperclip-runner/index.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { nativeSha256 } from "./canonical.js";
 

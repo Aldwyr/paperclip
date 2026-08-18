@@ -5,11 +5,11 @@ import type {
   NativeExecutionInputV1,
   NativeSession,
   NativeSessionBackend,
-} from "@paperclipai/paperclip-runner";
+} from "../../vendor/paperclip-runner/index.js";
 import {
   createCodexNativeSessionBackend,
   executeNativeSession,
-} from "@paperclipai/paperclip-runner";
+} from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";

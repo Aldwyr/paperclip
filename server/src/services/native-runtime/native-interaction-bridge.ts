@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import type { NativeInteractionResponseEnvelope } from "@paperclipai/paperclip-runner";
+import type { NativeInteractionResponseEnvelope } from "../../vendor/paperclip-runner/index.js";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import {
   agents,

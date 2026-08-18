@@ -1,7 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { completionContracts } from "@paperclipai/db";
-import type { StrictCompletionContractInput } from "@paperclipai/paperclip-runner";
+import type { StrictCompletionContractInput } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
 
 export const NATIVE_COMPLETION_CONTRACT_SCHEMA = "paperclip.completion-contract.v1";

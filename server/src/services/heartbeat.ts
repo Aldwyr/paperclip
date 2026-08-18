@@ -99,7 +99,7 @@ import {
   parseNativeExecutionInput,
   type NativeExecutionInputV1,
   type NativeSessionBackend,
-} from "@paperclipai/paperclip-runner";
+} from "../vendor/paperclip-runner/index.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
