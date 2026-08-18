@@ -234,6 +234,11 @@ export async function executePaperclipNativeSession(input: {
   execution: NativeExecutionInputV1;
   runnerInstanceId: string;
   leaseOwner?: string;
+  onSpawn?: (meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+  }) => Promise<void>;
   /** Test seam at the provider boundary; production always uses the package Codex backend. */
   backend?: NativeSessionBackend;
 }): Promise<AdapterExecutionResult> {
@@ -288,7 +293,10 @@ export async function executePaperclipNativeSession(input: {
     native = await executeNativeSession({
       input: input.execution,
       backend: input.backend
-        ?? createCodexNativeSessionBackend(input.execution, { runnerInstanceId: input.runnerInstanceId }),
+        ?? createCodexNativeSessionBackend(input.execution, {
+          runnerInstanceId: input.runnerInstanceId,
+          onSpawn: input.onSpawn,
+        }),
       controlPlane,
       runnerInstanceId: input.runnerInstanceId,
       controlPlaneInstanceId,

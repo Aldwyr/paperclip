@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -272,6 +272,43 @@ async function traceCompletedProposal(
 }
 
 describe("Codex app-server Codex driver", () => {
+  it("persists process ownership before sending provider requests", async () => {
+    const transport = new FakeCodexTransport();
+    Object.assign(transport, {
+      processInfo: () => ({
+        pid: 71_001,
+        processGroupId: 71_001,
+        startedAt: "2026-08-18T18:00:00.000Z",
+        exited: false,
+        exitCode: null,
+        signal: null,
+      }),
+    });
+    let releaseOwnership!: () => void;
+    const ownershipPersisted = new Promise<void>((resolve) => {
+      releaseOwnership = resolve;
+    });
+    const onSpawn = vi.fn(() => ownershipPersisted);
+    const driver = makeDriver([transport], { onSpawn });
+
+    const opening = driver.openSession({
+      runId: "run-owned",
+      normalizedSessionId: "normalized-owned",
+      workingDirectory: "/workspace",
+    });
+    await vi.waitFor(() => expect(onSpawn).toHaveBeenCalledOnce());
+    expect(transport.calls).toEqual([]);
+
+    releaseOwnership();
+    await opening;
+    expect(onSpawn).toHaveBeenCalledWith({
+      pid: 71_001,
+      processGroupId: 71_001,
+      startedAt: "2026-08-18T18:00:00.000Z",
+    });
+    expect(transport.calls[0]?.method).toBe("initialize");
+  });
+
   it("sends direct chat as plain text and permits a follow-up turn", async () => {
     const transport = new FakeCodexTransport();
     const driver = makeDriver([transport], { conversationMode: "direct" });

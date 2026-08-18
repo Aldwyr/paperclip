@@ -25,6 +25,7 @@ export interface CodexAppServerTransport {
 export interface CodexTransportProcessInfo {
   pid: number | null;
   processGroupId: number | null;
+  startedAt: string;
   exited: boolean;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
@@ -300,6 +301,7 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
   #resolveExit!: () => void;
   readonly #exitPromise: Promise<void>;
   readonly #processGroup: boolean;
+  readonly #startedAt: string;
   readonly #closeGraceMs: number;
   readonly #onProcess?: (info: CodexTransportProcessInfo) => void;
   #onDiagnostic?: (message: string) => void;
@@ -321,6 +323,7 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       DEFAULT_MAX_INFLIGHT_SERVER_REQUESTS,
     );
     this.#processGroup = options.processGroup === true && process.platform !== "win32";
+    this.#startedAt = new Date().toISOString();
     this.#closeGraceMs = positiveLimit(options.closeGraceMs, 1_000);
     this.#onProcess = options.onProcess;
     this.#exitPromise = new Promise<void>((resolve) => {
@@ -430,6 +433,7 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     return {
       pid: this.#process.pid ?? null,
       processGroupId: this.#processGroup ? this.#process.pid ?? null : null,
+      startedAt: this.#startedAt,
       exited: this.#exited,
       exitCode: this.#exitCode,
       signal: this.#exitSignal,

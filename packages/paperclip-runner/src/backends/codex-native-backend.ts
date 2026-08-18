@@ -10,7 +10,14 @@ import { HarnessDriverBackend } from "./harness-driver-backend.js";
  */
 export function createCodexNativeSessionBackend(
   input: NativeExecutionInputV1,
-  options: { runnerInstanceId?: string } = {},
+  options: {
+    runnerInstanceId?: string;
+    onSpawn?: (meta: {
+      pid: number;
+      processGroupId: number | null;
+      startedAt: string;
+    }) => Promise<void>;
+  } = {},
 ): NativeSessionBackend {
   return new HarnessDriverBackend(new CodexAppServerDriver({
     taskEnvelope: createCodexTaskEnvelope({
@@ -25,5 +32,6 @@ export function createCodexNativeSessionBackend(
       ],
     }),
     runnerInstanceId: options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
+    onSpawn: options.onSpawn,
   }));
 }

@@ -126,7 +126,7 @@ class GatedTransport implements CodexAppServerTransport {
   }
 
   processInfo() {
-    return { pid: 7100, processGroupId: 7100, exited: this.#closed, exitCode: null, signal: null };
+    return { pid: 7100, processGroupId: 7100, startedAt: "2026-08-01T00:00:00.000Z", exited: this.#closed, exitCode: null, signal: null };
   }
 
   async #runTurn(turnId: string): Promise<void> {

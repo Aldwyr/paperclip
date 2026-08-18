@@ -123,6 +123,7 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     return {
       pid: 4100 + this.state.transports.indexOf(this),
       processGroupId: 4100 + this.state.transports.indexOf(this),
+      startedAt: "2026-08-01T00:00:00.000Z",
       exited: this.#closed,
       exitCode: this.#closed ? 0 : null,
       signal: null,

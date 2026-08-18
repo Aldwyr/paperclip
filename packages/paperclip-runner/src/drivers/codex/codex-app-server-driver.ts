@@ -49,6 +49,7 @@ import {
   type CodexAppServerTransport,
   type CodexRpcNotification,
   type CodexRpcServerRequest,
+  type CodexTransportProcessInfo,
 } from "./app-server-transport.js";
 
 const DRIVER_KIND = "codex_app_server";
@@ -95,6 +96,11 @@ export interface CodexAppServerDriverOptions {
   now?: () => Date;
   runnerInstanceId?: string;
   onDiagnostic?: (message: string) => void;
+  onSpawn?: (meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+  }) => Promise<void>;
   capabilities?: Partial<{
     resume: boolean;
     read: boolean;
@@ -345,6 +351,7 @@ export class CodexAppServerDriver implements HarnessDriver {
     const workingDirectory = validateWorkingDirectory(input.workingDirectory, this.#options.environment);
     const transport = this.#transport();
     try {
+      await this.#persistProcessOwnership(transport);
       const initialize = await this.#initialize(transport);
       const response = await transport.request("thread/start", {
         ...securedThreadParams(workingDirectory, this.#options.environment),
@@ -388,6 +395,7 @@ export class CodexAppServerDriver implements HarnessDriver {
     }
     const transport = this.#transport();
     try {
+      await this.#persistProcessOwnership(transport);
       const initialize = await this.#initialize(transport);
       const existing = await transport.request("thread/read", {
         threadId: snapshot.driverSessionId,
@@ -452,8 +460,20 @@ export class CodexAppServerDriver implements HarnessDriver {
         args: createIsolatedCodexAppServerArgs(this.#options.environment),
         environment: createSanitizedCodexEnvironment(this.#options.environment),
         onDiagnostic: this.#options.onDiagnostic,
+        processGroup: true,
       })
     );
+  }
+
+  async #persistProcessOwnership(transport: CodexAppServerTransport): Promise<void> {
+    if (!this.#options.onSpawn) return;
+    const processInfo: CodexTransportProcessInfo | undefined = transport.processInfo?.();
+    if (!processInfo || processInfo.exited || processInfo.pid === null) return;
+    await this.#options.onSpawn({
+      pid: processInfo.pid,
+      processGroupId: processInfo.processGroupId,
+      startedAt: processInfo.startedAt,
+    });
   }
 
   async #initialize(transport: CodexAppServerTransport): Promise<Record<string, unknown>> {

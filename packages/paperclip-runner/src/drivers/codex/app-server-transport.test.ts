@@ -15,6 +15,17 @@ function nodeTransport(
 }
 
 describe("Codex app-server transport limits", () => {
+  it("reports restart-safe process-group ownership", async () => {
+    const transport = nodeTransport("process.stdin.resume()", { processGroup: true });
+    const info = transport.processInfo();
+
+    expect(info.pid).toBeGreaterThan(0);
+    expect(info.processGroupId).toBe(process.platform === "win32" ? null : info.pid);
+    expect(new Date(info.startedAt).toISOString()).toBe(info.startedAt);
+
+    await transport.close();
+  });
+
   it("rejects an oversized line before buffering the complete hostile payload", async () => {
     const diagnostics: string[] = [];
     const transport = nodeTransport(

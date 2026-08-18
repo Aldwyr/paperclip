@@ -6318,6 +6318,25 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+export async function persistHeartbeatRunProcessMetadata(
+  db: Db,
+  runId: string,
+  meta: { pid: number; processGroupId: number | null; startedAt: string },
+) {
+  const startedAt = new Date(meta.startedAt);
+  return db
+    .update(heartbeatRuns)
+    .set({
+      processPid: meta.pid,
+      processGroupId: meta.processGroupId,
+      processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+      updatedAt: new Date(),
+    })
+    .where(eq(heartbeatRuns.id, runId))
+    .returning()
+    .then((rows) => rows[0] ?? null);
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -9813,18 +9832,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string },
   ) {
-    const startedAt = new Date(meta.startedAt);
-    return db
-      .update(heartbeatRuns)
-      .set({
-        processPid: meta.pid,
-        processGroupId: meta.processGroupId,
-        processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    return persistHeartbeatRunProcessMetadata(db, runId, meta);
   }
 
   async function clearDetachedRunWarning(runId: string) {
@@ -16150,6 +16158,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             runnerInstanceId: nativeRunnerInstanceId,
             leaseOwner: runOptions.nativeLeaseOwner,
             backend: options.nativeSessionBackendFactory?.(nativeExecution),
+            onSpawn: async (meta) => {
+              await persistRunProcessMetadata(run.id, meta);
+            },
           });
         } else {
           const adapterContext = { ...context };

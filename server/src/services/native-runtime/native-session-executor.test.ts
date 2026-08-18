@@ -4,12 +4,13 @@ import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
 
 const state = vi.hoisted(() => ({
   execute: vi.fn(),
+  createBackend: vi.fn(() => ({ kind: "test" })),
   cancel: vi.fn(),
   release: null as null | (() => void),
 }));
 
 vi.mock("@paperclipai/paperclip-runner", () => ({
-  createCodexNativeSessionBackend: vi.fn(() => ({ kind: "test" })),
+  createCodexNativeSessionBackend: state.createBackend,
   executeNativeSession: state.execute,
 }));
 
@@ -139,5 +140,48 @@ describe("native session bounded recovery", () => {
       failureCode: "native_session_retry_exhausted",
       nextAttemptAt: null,
     });
+  });
+});
+
+describe("native process ownership", () => {
+  it("forwards the app-server PID and process group through the production backend seam", async () => {
+    const processMetadata = {
+      pid: 42_001,
+      processGroupId: 42_001,
+      startedAt: "2026-08-18T18:00:00.000Z",
+    };
+    const onSpawn = vi.fn(async () => undefined);
+    state.createBackend.mockClear();
+    state.execute.mockReset().mockImplementation(async (options) => {
+      await options.backend.onSpawn(processMetadata);
+      return {
+        result: { summary: "completed" },
+        terminal: { runTerminalState: "succeeded" },
+        turnId: "turn",
+        normalizedSessionId: "session",
+        providerSessionId: null,
+        driverKind: "test",
+        driverVersion: "1",
+        nativeEventCount: 1,
+        highestContiguousSourceSeq: 1,
+      };
+    });
+    state.createBackend.mockImplementationOnce((_input, options) => ({
+      kind: "test",
+      onSpawn: options.onSpawn,
+    }));
+
+    await executePaperclipNativeSession({
+      db: leaseDb(),
+      execution,
+      runnerInstanceId: "runner",
+      onSpawn,
+    });
+
+    expect(state.createBackend).toHaveBeenCalledWith(execution, {
+      runnerInstanceId: "runner",
+      onSpawn,
+    });
+    expect(onSpawn).toHaveBeenCalledWith(processMetadata);
   });
 });
