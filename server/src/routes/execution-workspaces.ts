@@ -226,6 +226,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
     const configuredServices = effectiveRuntimeConfig
       ? listConfiguredRuntimeServiceEntries({ workspaceRuntime: effectiveRuntimeConfig })
       : [];
+    const repairRestartsRuntimeServices = action === "repair" && configuredServices.length > 0;
     const workspaceCommand = effectiveRuntimeConfig
       ? findWorkspaceCommandDefinition(effectiveRuntimeConfig, target.workspaceCommandId ?? null)
       : null;
@@ -267,7 +268,7 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
       return;
     }
 
-    if ((action === "start" || action === "restart" || action === "repair") && !effectiveRuntimeConfig) {
+    if ((action === "start" || action === "restart") && !effectiveRuntimeConfig) {
       res.status(422).json({ error: "Execution workspace has no workspace command configuration or inherited project workspace default" });
       return;
     }
@@ -623,40 +624,46 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             await reportRepairPhase("full_reseed", "succeeded");
 
             await reportRepairPhase("managed_restart", "started");
-            const availableWorkspace = await ensureWorkspaceAvailable();
-            if (!availableWorkspace) {
-              throw new Error("Execution workspace needs a local path before Paperclip can restart it.");
+            let startedServices: Awaited<ReturnType<typeof startRuntimeServicesForWorkspaceControl>> = [];
+            if (repairRestartsRuntimeServices) {
+              const availableWorkspace = await ensureWorkspaceAvailable();
+              if (!availableWorkspace) {
+                throw new Error("Execution workspace needs a local path before Paperclip can restart it.");
+              }
+              startedServices = await startRuntimeServicesForWorkspaceControl({
+                db,
+                actor: {
+                  id: actor.agentId ?? null,
+                  name: actor.actorType === "user" ? "Board" : "Agent",
+                  companyId: existing.companyId,
+                },
+                issue: existing.sourceIssueId
+                  ? { id: existing.sourceIssueId, identifier: null, title: existing.name }
+                  : null,
+                workspace: availableWorkspace,
+                executionWorkspaceId: existing.id,
+                config: {
+                  workspaceRuntime: effectiveRuntimeConfig,
+                  runtimeProvisionCommand:
+                    existing.config?.runtimeProvisionCommand
+                    ?? projectPolicy?.workspaceStrategy?.runtimeProvisionCommand
+                    ?? null,
+                },
+                adapterEnv: {},
+                onLog,
+                recorder,
+              });
             }
-            const startedServices = await startRuntimeServicesForWorkspaceControl({
-              db,
-              actor: {
-                id: actor.agentId ?? null,
-                name: actor.actorType === "user" ? "Board" : "Agent",
-                companyId: existing.companyId,
-              },
-              issue: existing.sourceIssueId
-                ? { id: existing.sourceIssueId, identifier: null, title: existing.name }
-                : null,
-              workspace: availableWorkspace,
-              executionWorkspaceId: existing.id,
-              config: {
-                workspaceRuntime: effectiveRuntimeConfig,
-                runtimeProvisionCommand:
-                  existing.config?.runtimeProvisionCommand
-                  ?? projectPolicy?.workspaceStrategy?.runtimeProvisionCommand
-                  ?? null,
-              },
-              adapterEnv: {},
-              onLog,
-              recorder,
-            });
             runtimeServiceCount = startedServices.length;
             await reportRepairPhase("managed_restart", "succeeded");
 
             await reportRepairPhase("readiness_validation", "started");
             if (
-              startedServices.length === 0
-              || startedServices.some((service) => service.status !== "running" || service.healthStatus !== "healthy")
+              repairRestartsRuntimeServices
+              && (
+                startedServices.length === 0
+                || startedServices.some((service) => service.status !== "running" || service.healthStatus !== "healthy")
+              )
             ) {
               throw new Error("Managed restart did not produce healthy runtime services.");
             }
@@ -740,7 +747,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               config: { workspaceRuntime: effectiveRuntimeConfig },
               currentDesiredState,
               currentServiceStates: existing.config?.serviceStates ?? null,
-              action: action === "repair" ? "start" : action,
+              action: action === "repair"
+                ? repairRestartsRuntimeServices ? "start" : "stop"
+                : action,
               serviceIndex: selectedServiceIndex,
             });
         const metadata = mergeExecutionWorkspaceConfig(existing.metadata as Record<string, unknown> | null, {
@@ -759,13 +768,16 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
               : action === "restart"
                 ? "Restarted execution workspace runtime services.\n"
                 : action === "repair"
-                  ? "Repaired the isolated workspace database and restarted healthy runtime services.\n"
-                : "Started execution workspace runtime services.\n",
+                  ? repairRestartsRuntimeServices
+                    ? "Repaired the isolated workspace database and restarted healthy runtime services.\n"
+                    : "Repaired the isolated workspace database; no managed runtime services were configured to restart.\n"
+                  : "Started execution workspace runtime services.\n",
           metadata: {
             runtimeServiceCount,
             workspaceCommandId: workspaceCommand?.id ?? target.workspaceCommandId ?? null,
             runtimeServiceId: selectedRuntimeServiceId,
             serviceIndex: selectedServiceIndex,
+            runtimeRestarted: action === "repair" ? repairRestartsRuntimeServices : undefined,
           },
         };
       },

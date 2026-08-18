@@ -29,6 +29,7 @@ const mockStartRuntimeServices = vi.hoisted(() => vi.fn());
 const mockStopRuntimeServicesForExecutionWorkspace = vi.hoisted(() => vi.fn());
 const mockEnsurePersistedExecutionWorkspaceAvailable = vi.hoisted(() => vi.fn());
 const mockBuildWorkspaceRuntimeDesiredStatePatch = vi.hoisted(() => vi.fn());
+const mockListConfiguredRuntimeServiceEntries = vi.hoisted(() => vi.fn());
 // The integrated control path also takes the durable runtime-control lease (PAP-17205). This
 // suite covers the in-flight guard and failed-start reconciliation, so the lease always grants;
 // `execution-workspace-runtime-lease-route.test.ts` exercises the lease itself against a real db.
@@ -63,7 +64,7 @@ vi.mock("../services/workspace-runtime.js", () => ({
   buildWorkspaceRuntimeDesiredStatePatch: mockBuildWorkspaceRuntimeDesiredStatePatch,
   cleanupExecutionWorkspaceArtifacts: vi.fn(),
   ensurePersistedExecutionWorkspaceAvailable: mockEnsurePersistedExecutionWorkspaceAvailable,
-  listConfiguredRuntimeServiceEntries: vi.fn(() => []),
+  listConfiguredRuntimeServiceEntries: mockListConfiguredRuntimeServiceEntries,
   runWorkspaceJobForControl: vi.fn(),
   startRuntimeServicesForWorkspaceControl: mockStartRuntimeServices,
   stopRuntimeServicesForExecutionWorkspace: mockStopRuntimeServicesForExecutionWorkspace,
@@ -171,6 +172,7 @@ describe.sequential("execution workspace runtime control conflict and failure re
       repoRef: "main",
     });
     mockStopRuntimeServicesForExecutionWorkspace.mockResolvedValue(undefined);
+    mockListConfiguredRuntimeServiceEntries.mockReturnValue([{ name: "app" }]);
     mockWorkspaceOperationService.createRecorder.mockReturnValue({
       attachExecutionWorkspaceId: vi.fn(),
       recordOperation: async (input: any) => {
@@ -334,6 +336,78 @@ describe.sequential("execution workspace runtime control conflict and failure re
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ action: "execution_workspace.runtime_repair" }),
+      );
+    } finally {
+      fs.rmSync(workspaceCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("completes database-only repair when no managed runtime service is configured", async () => {
+    const workspaceCwd = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-route-repair-db-only-"));
+    try {
+      const configDir = path.join(workspaceCwd, ".paperclip");
+      const sourceConfigPath = path.join(workspaceCwd, "source", "config.json");
+      const cliRunner = path.join(workspaceCwd, "cli", "node_modules", "tsx", "dist", "cli.mjs");
+      const cliEntry = path.join(workspaceCwd, "cli", "src", "index.ts");
+      for (const dir of [configDir, path.dirname(sourceConfigPath), path.dirname(cliRunner), path.dirname(cliEntry)]) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(configDir, "config.json"), "{}\n");
+      fs.writeFileSync(sourceConfigPath, "{}\n");
+      fs.writeFileSync(cliRunner, "// test runner\n");
+      fs.writeFileSync(cliEntry, "// test entry\n");
+      fs.writeFileSync(path.join(configDir, "seed-manifest.json"), JSON.stringify({
+        version: 2,
+        source: { instanceId: "source", configPath: sourceConfigPath },
+        state: "failed",
+        attemptId: "previous",
+      }));
+
+      const { deriveWorktreeInstanceId } = await import("../services/workspace-instance-cleanup.js");
+      mockExecutionWorkspaceService.getById.mockResolvedValue(buildExecutionWorkspace({
+        cwd: workspaceCwd,
+        config: { desiredState: "stopped" },
+      }));
+      mockListConfiguredRuntimeServiceEntries.mockReturnValue([]);
+      mockSpawn.mockImplementation(() => {
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: PassThrough;
+          stderr: PassThrough;
+          kill: ReturnType<typeof vi.fn>;
+        };
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        child.kill = vi.fn();
+        queueMicrotask(() => {
+          fs.writeFileSync(path.join(configDir, "seed-manifest.json"), JSON.stringify({
+            version: 2,
+            source: { instanceId: "source", configPath: sourceConfigPath },
+            snapshotAt: "2026-08-18T00:00:00.000Z",
+            seedMode: "full",
+            migrationRevision: "0142_test.sql",
+            targetInstanceId: deriveWorktreeInstanceId(workspaceCwd),
+            phase: "complete",
+            state: "verified",
+            attemptId: "repair-attempt",
+            startedAt: "2026-08-18T00:00:00.000Z",
+            finishedAt: "2026-08-18T00:01:00.000Z",
+            diagnostics: [{ phase: "complete", status: "succeeded", at: "2026-08-18T00:01:00.000Z" }],
+          }));
+          child.emit("exit", 0);
+        });
+        return child;
+      });
+
+      const app = await createApp();
+      const res = await request(app)
+        .post(`/api/execution-workspaces/${executionWorkspaceId}/runtime-commands/repair`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(mockStopRuntimeServicesForExecutionWorkspace).toHaveBeenCalledTimes(1);
+      expect(mockStartRuntimeServices).not.toHaveBeenCalled();
+      expect(mockBuildWorkspaceRuntimeDesiredStatePatch).toHaveBeenCalledWith(
+        expect.objectContaining({ action: "stop" }),
       );
     } finally {
       fs.rmSync(workspaceCwd, { recursive: true, force: true });
