@@ -251,6 +251,8 @@ class PaperclipRouteSemanticPort {
   async refresh(): Promise<void> {
     const [issue] = await this.db.select().from(issues).where(eq(issues.id, this.binding.taskId));
     if (issue === undefined) throw new Error("semantic_conformance_task_missing");
+    const [run] = await this.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.binding.runId));
+    if (run === undefined) throw new Error("semantic_conformance_run_missing");
     const comments = await this.db.select().from(issueComments)
       .where(eq(issueComments.issueId, issue.id))
       .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
@@ -269,7 +271,10 @@ class PaperclipRouteSemanticPort {
     const relations = await this.db.select().from(issueRelations)
       .where(and(eq(issueRelations.relatedIssueId, issue.id), eq(issueRelations.type, "blocks")));
     const audit = await this.db.select().from(activityLog)
-      .where(eq(activityLog.companyId, this.ids.companyId))
+      .where(and(
+        eq(activityLog.companyId, this.ids.companyId),
+        eq(activityLog.runId, this.binding.runId),
+      ))
       .orderBy(asc(activityLog.createdAt), asc(activityLog.id));
 
     const state = createCapabilityFixtureState({
@@ -346,6 +351,25 @@ class PaperclipRouteSemanticPort {
       })),
     });
     state.lifecycle = "running";
+    state.activeRunId = run.id;
+    state.runs = [{
+      id: run.id,
+      companyId: run.companyId,
+      actorId: run.agentId,
+      taskId: issue.id,
+      sessionId: run.sessionIdAfter ?? run.sessionIdBefore ?? run.externalRunId ?? run.id,
+      backendKind: "runner",
+      sourceInstanceId: "paperclip-production-services",
+      status: toFixtureRunStatus(run.status),
+      attempt: run.scheduledRetryAttempt + 1,
+      openedAt: (run.startedAt ?? run.createdAt).toISOString(),
+      finishedAt: run.finishedAt?.toISOString() ?? null,
+      wake: { reason: "manual", payload: {} },
+      capabilities: [...this.binding.capabilities],
+      events: [],
+      result: null,
+      sessionCheckpoint: null,
+    }];
     state.revision = this.#state.revision + 1;
     state.audit = audit.map((entry) => ({
       id: entry.id,
@@ -487,6 +511,18 @@ class PaperclipRouteSemanticPort {
 
   private patch(path: string, body: unknown) {
     return request(this.app).patch(path).set("X-Paperclip-Run-Id", this.binding.runId).send(body);
+  }
+}
+
+function toFixtureRunStatus(status: string): CapabilityFixtureState["runs"][number]["status"] {
+  switch (status) {
+    case "running":
+    case "succeeded":
+    case "failed":
+    case "cancelled":
+      return status;
+    default:
+      throw new Error(`semantic_conformance_run_status_unmapped:${status}`);
   }
 }
 
