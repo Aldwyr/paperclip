@@ -245,7 +245,8 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     );
     expect(editButtons).toHaveLength(2);
     expect(editButtons.every((button) => button.textContent?.includes("Edit connections"))).toBe(true);
-    expect(container.textContent).toContain("2 connected");
+    // draft connections count toward the total (they are real, pending-setup connections)
+    expect(container.textContent).toContain("3 connected");
     expect(container.textContent).toContain("Dotta’s Notion");
     expect(container.querySelector('[title="Dotta"] [data-slot="avatar"]')).toBeTruthy();
 
@@ -264,6 +265,53 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(navigateMock).toHaveBeenCalledWith(
       "/apps/connect?source=notion&applicationId=app-notion&name=Notion&new=1",
     );
+  });
+
+  it("treats an existing draft-only Notion connection as editable", async () => {
+    const applicationId = "057a2df6-175f-4dde-b246-743706444122";
+    const connectionId = "46dc23c1-ecfa-46f7-8e60-34a7cdbd661e";
+    listApplicationsMock.mockResolvedValue({
+      applications: [
+        {
+          id: applicationId,
+          name: "Notion",
+          status: "active",
+          applicationKey: "notion",
+          metadata: {},
+        },
+      ],
+    });
+    listConnectionsMock.mockResolvedValue({
+      connections: [
+        {
+          id: connectionId,
+          applicationId,
+          name: "Notion",
+          status: "draft",
+          config: { sourceTemplateKey: "notion" },
+          transportConfig: {},
+        },
+      ],
+    });
+
+    await renderBrowse();
+
+    const editButtons = Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        'button[aria-label="Edit connection for Notion"]',
+      ),
+    );
+    expect(editButtons).toHaveLength(2);
+    expect(container.querySelector('button[aria-label="Connect for Notion"]')).toBeNull();
+    expect(container.textContent).toContain("1 connected");
+    expect(
+      container.querySelector('button[aria-label="Add another Notion account"]')?.textContent,
+    ).toContain("Add new");
+
+    await act(async () => {
+      editButtons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(navigateMock).toHaveBeenCalledWith(`/apps/${connectionId}/setup`);
   });
 
   it("keeps the custom URL option available when gallery search has no matches", async () => {

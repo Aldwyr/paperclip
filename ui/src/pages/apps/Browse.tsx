@@ -125,7 +125,7 @@ export function Browse() {
     );
     const connectionsByApplicationId = new Map<string, typeof connections>();
     for (const connection of connections) {
-      if (connection.status === "archived" || connection.status === "draft") continue;
+      if (connection.status === "archived") continue;
       connectionsByApplicationId.set(
         connection.applicationId,
         [...(connectionsByApplicationId.get(connection.applicationId) ?? []), connection],
