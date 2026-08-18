@@ -71,6 +71,7 @@ import type {
   SuggestTasksInteraction,
 } from "../lib/issue-thread-interactions";
 import { buildIssueThreadInteractionSummary, isIssueThreadInteraction } from "../lib/issue-thread-interactions";
+import { isLiveIssueRun } from "../lib/liveIssueIds";
 import { resolveIssueChatTranscriptRuns } from "../lib/issueChatTranscriptRuns";
 import {
   formatTimelineWorkspaceLabel,
@@ -438,10 +439,10 @@ interface IssueChatThreadProps {
   linkedRuns?: IssueChatLinkedRun[];
   timelineEvents?: IssueTimelineEvent[];
   /**
-   * Work-mode switch history from the activity feed. Only the redesigned
-   * TaskChatThread consumes this (flag: enableTaskChatRedesign) to tag each
-   * agent reply with the mode its request ran under; the legacy thread
-   * ignores it.
+   * Work-mode switch history from the activity feed. Only the chat-style
+   * TaskChatThread consumes this to tag each agent reply with the mode its
+   * request ran under; this thread — the classic task view behind
+   * enableClassicTaskInterface — ignores it.
    */
   workModeChanges?: IssueWorkModeChange[];
   liveRuns?: LiveRunForIssue[];
@@ -512,16 +513,15 @@ interface IssueChatThreadProps {
   footer?: ReactNode;
   /**
    * Issue header content (title row, badges, plugin toolbars) rendered INSIDE
-   * the thread's scroll viewport so it scrolls away with the messages. Only the
-   * redesigned TaskChatThread consumes this (flag: enableTaskChatRedesign);
-   * the legacy thread ignores it — its header stays in the page flow.
+   * the thread's scroll viewport so it scrolls away with the messages. Only
+   * the chat-style TaskChatThread consumes this; this thread ignores it — its
+   * header stays in the page flow.
    */
   threadHeader?: ReactNode;
   /**
    * The task description rendered as the requester's first chat bubble
-   * (PAP-375). Only the redesigned TaskChatThread consumes it (flag:
-   * enableTaskChatRedesign); the legacy thread ignores it — its description
-   * stays in the page header via InlineEditor.
+   * (PAP-375). Only the chat-style TaskChatThread consumes it; this thread
+   * ignores it — its description stays in the page header via InlineEditor.
    */
   issueBrief?: TaskChatIssueBrief;
   variant?: "full" | "embedded";
@@ -2929,7 +2929,11 @@ function IssueChatSystemMessage({ message }: { message: ThreadMessage }) {
   }
 
   if (custom.kind === "interaction" && interaction) {
-    if (interaction.kind === "request_confirmation" && interaction.status === "expired") {
+    if (
+      interaction.kind === "request_confirmation"
+      && interaction.status === "expired"
+      && !interaction.payload.secretProposal
+    ) {
       return (
         <ExpiredRequestConfirmationActivity
           message={message}
@@ -4438,9 +4442,10 @@ export function IssueChatThread({
   const displayLiveRuns = useMemo(() => {
     const deduped = new Map<string, LiveRunForIssue>();
     for (const run of liveRuns) {
+      if (!isLiveIssueRun(run, issueStatus)) continue;
       deduped.set(run.id, run);
     }
-    if (activeRun) {
+    if (activeRun && isLiveIssueRun(activeRun, issueStatus)) {
       deduped.set(activeRun.id, {
         id: activeRun.id,
         status: activeRun.status,
@@ -4471,7 +4476,7 @@ export function IssueChatThread({
       });
     }
     return [...deduped.values()].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-  }, [activeRun, liveRuns]);
+  }, [activeRun, issueStatus, liveRuns]);
   const transcriptRuns = useMemo(() => {
     return resolveIssueChatTranscriptRuns({
       linkedRuns,
@@ -4489,8 +4494,8 @@ export function IssueChatThread({
     return ids;
   }, [displayLiveRuns]);
   const hasActiveRun = useMemo(
-    () => displayLiveRuns.some((run) => run.status === "running") || activeRun?.status === "running",
-    [displayLiveRuns, activeRun],
+    () => displayLiveRuns.some((run) => run.status === "running"),
+    [displayLiveRuns],
   );
   // Real-time view of the handoff: a run that starts after the issue payload
   // was fetched must quiet the missing-disposition warnings without waiting
@@ -4536,6 +4541,7 @@ export function IssueChatThread({
         agentMap,
         currentUserId,
         userLabelMap,
+        issueStatus,
       }),
     [
       comments,
@@ -4552,6 +4558,7 @@ export function IssueChatThread({
       agentMap,
       currentUserId,
       userLabelMap,
+      issueStatus,
     ],
   );
   const stableMessagesRef = useRef<readonly ThreadMessage[]>([]);

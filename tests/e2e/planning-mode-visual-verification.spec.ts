@@ -1,21 +1,26 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { expect, test } from "@playwright/test";
-import { completeCloudOnboarding, HIRING_TASK_TITLE } from "./onboarding-flow";
+import {
+  expectLandsOnFirstTaskWithoutDashboardBounce,
+  instrumentNavLog,
+} from "./helpers/onboarding-landing";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const AGENT_NAME = "Chief of staff";
+const TASK_TITLE = "Paperclip onboarding";
 
 test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   const timestamp = Date.now();
   const companyName = `PAP-3413-${timestamp}`;
-  // Resolve against this file, not the cwd, so screenshots land in the
-  // gitignored tests/e2e/test-results/ rather than an untracked dir at the
-  // repo root that a contributor could commit by accident.
-  const screenshotDir = path.join(__dirname, "test-results", "planning-mode");
+  const screenshotDir = "test-results/planning-mode";
 
-  // Intercept hire → perform a REAL hire server-side with an inert http adapter
-  // so no real agent process spawns. (The cloud flow hires with
-  // requireEnvProbe: false, so there is no adapter-environment probe to stub.)
+  await instrumentNavLog(page);
+
+  await page.route("**/test-environment", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "pass", checks: [] }),
+    }),
+  );
+
   await page.route("**/agent-hires", async (route) => {
     const req = route.request();
     const body = JSON.parse(req.postData() || "{}");
@@ -42,16 +47,34 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto("/onboarding");
+  const startBtn = page.getByRole("button", { name: /Start Onboarding|New Company|Add Agent/ });
+  if (await startBtn.count()) await startBtn.first().click();
 
-  // This spec only needs a company with a seeded first task to screenshot the
-  // planning-mode UI against; drive the whole onboarding flow to get one.
-  await completeCloudOnboarding(page, {
-    companyName,
-    mission: "Capture planning mode visual evidence for the graduated task UI.",
-    choice: "hiring",
-  });
+  const createCard = page.getByRole("button", { name: /Build a new company/ });
+  if (await createCard.count()) await createCard.first().click();
 
-  await expect(page).toHaveURL(/\/dashboard$/, { timeout: 30_000 });
+  await expect(page.getByRole("heading", { name: "Name your organization" })).toBeVisible({ timeout: 15_000 });
+
+  await page.locator('input[placeholder="Acme Corp"]').fill(companyName);
+  await page.getByRole("button", { name: /^Next/ }).click();
+
+  await expect(page.getByRole("heading", { name: "Define your mission" })).toBeVisible({ timeout: 30_000 });
+  await page
+    .getByPlaceholder("What is your team trying to achieve?")
+    .fill("Capture planning mode visual evidence for the graduated task UI.");
+  await page.getByRole("button", { name: /Confirm mission/ }).click();
+
+  await page.waitForSelector('input[placeholder="Chief of staff"]', { timeout: 30_000 });
+  await expect(page.locator('input[placeholder="Chief of staff"]')).toHaveValue(AGENT_NAME);
+
+  await page.getByRole("button", { name: /^Next/ }).click();
+  await page.getByRole("button", { name: /^Connect$/ }).click();
+
+  await expect(page.getByRole("heading", { name: "Review" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /Get started/ }).click();
+  // The wizard now drops the user straight onto the first task's detail page,
+  // and must not bounce through the dashboard (PAP-404).
+  await expectLandsOnFirstTaskWithoutDashboardBounce(page);
 
   const baseOrigin = new URL(page.url()).origin;
   const companyRes = await page.request.get(`${baseOrigin}/api/companies`);
@@ -64,7 +87,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   const issues = await issueRes.json();
   const planningSeedIssue = issues.find(
     (candidate: { id: string; identifier?: string; title: string }) =>
-      candidate.title === HIRING_TASK_TITLE,
+      candidate.title === TASK_TITLE,
   );
   expect(planningSeedIssue).toBeTruthy();
 
@@ -93,11 +116,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
 
   await page.goto(issuePath);
   await expect(page.getByText("Plan mode").first()).toBeVisible();
-  await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "planning");
-  const desktopPlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
+  const desktopPlanningToggle = page.getByTestId("task-chat-composer-mode");
   await expect(desktopPlanningToggle).toBeVisible();
   await expect(desktopPlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
-  await expect(desktopPlanningToggle).toHaveAttribute("aria-pressed", "true");
 
   await page.screenshot({
     path: `${screenshotDir}/desktop-planning-detail-${timestamp}.png`,
@@ -113,11 +134,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   });
 
   await page.goto(issuePath);
-  await page.getByTestId("issue-chat-composer-work-mode-toggle").click();
-  await page.getByTestId("issue-chat-composer-work-mode-menu-standard").click();
-  await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "standard");
-  await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toHaveAttribute("data-pending-work-mode", "standard");
-  await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toHaveAttribute("aria-pressed", "false");
+  await page.getByTestId("task-chat-composer-mode").click();
+  await page.getByRole("menuitem", { name: /Agent mode/ }).click();
+  await expect(page.getByTestId("task-chat-composer-mode")).toHaveAttribute("data-pending-work-mode", "standard");
   await page.screenshot({
     path: `${screenshotDir}/desktop-standard-toggle-${timestamp}.png`,
     fullPage: true,
@@ -127,10 +146,9 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(issuePath);
   await expect(page.getByText("Plan mode").first()).toBeVisible();
-  const mobilePlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
+  const mobilePlanningToggle = page.getByTestId("task-chat-composer-mode");
   await expect(mobilePlanningToggle).toBeVisible();
   await expect(mobilePlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
-  await expect(mobilePlanningToggle).toHaveAttribute("aria-pressed", "true");
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-detail-${timestamp}.png`,
     fullPage: true,
