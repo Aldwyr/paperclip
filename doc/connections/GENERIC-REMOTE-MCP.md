@@ -200,6 +200,12 @@ provided by the execution environment:
   under its normalized key `generic-flow-test-account`, for the existing Notion
   test account.
 
+If that account requires an emailed one-time code, also set `AGENTMAIL_API_KEY`
+and `NOTION_AGENTMAIL_INBOX_ID` for the already-configured forwarding inbox. The
+smoke loads the AgentMail SDK only after Notion presents the code challenge,
+accepts only a fresh authenticated Notion message, fills the code once in
+memory, and never records the message, address, or code.
+
 Check the URL, health endpoint, and binding metadata without retrieving the
 credential value or opening a browser:
 

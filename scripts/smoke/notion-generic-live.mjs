@@ -7,9 +7,12 @@ import {
   assertSanitizedEvidence,
   connectionRemovalFacts,
   extractNotionIdentity,
+  extractNotionVerificationCode,
   fetchNotionTestCredentials,
   inspectAuthorizationUrl,
+  isFreshNotionVerificationMessage,
   NotionGenericLivePreflightError,
+  notionVerificationAuthenticationPassed,
   parseRuntimeAbsenceProof,
   parseSanitizedAgentProof,
   persistedOAuthStartResult,
@@ -24,6 +27,7 @@ const NOTION_RESOURCE = "https://mcp.notion.com/mcp";
 const NOTION_GET_SELF = "notion-get-self";
 const NOTION_CREATE_PAGES = "notion-create-pages";
 const DEFAULT_AGENT_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_VERIFICATION_TIMEOUT_MS = 2 * 60_000;
 
 class SmokeFailure extends Error {
   constructor(checkpoint, code) {
@@ -198,11 +202,73 @@ async function clickVisibleButton(page, names) {
   return false;
 }
 
+function verificationTimeoutMs() {
+  const configured = Number(process.env.NOTION_VERIFICATION_TIMEOUT_MS || DEFAULT_VERIFICATION_TIMEOUT_MS);
+  return Number.isFinite(configured)
+    ? Math.min(Math.max(configured, 30_000), 5 * 60_000)
+    : DEFAULT_VERIFICATION_TIMEOUT_MS;
+}
+
+async function fetchNotionVerificationCodeFromAgentMail({ notBefore }) {
+  const apiKey = process.env.AGENTMAIL_API_KEY?.trim();
+  const inboxId = process.env.NOTION_AGENTMAIL_INBOX_ID?.trim();
+  if (!apiKey || !inboxId) fail("C.notion-login", "verification_inbox_unavailable");
+
+  let AgentMailClient;
+  try {
+    ({ AgentMailClient } = await import("agentmail"));
+  } catch {
+    fail("C.notion-login", "agentmail_sdk_unavailable");
+  }
+  const client = new AgentMailClient({ apiKey });
+  try {
+    const inbox = await client.inboxes.get(inboxId);
+    if (inbox.inboxId !== inboxId && inbox.email !== inboxId) {
+      fail("C.notion-login", "verification_inbox_mismatch");
+    }
+  } catch (error) {
+    if (error instanceof SmokeFailure) throw error;
+    fail("C.notion-login", "verification_inbox_request_failed");
+  }
+
+  const deadline = Date.now() + verificationTimeoutMs();
+  const after = new Date(new Date(notBefore).getTime() - 5_000);
+  while (Date.now() < deadline) {
+    try {
+      let pageToken;
+      let inspected = 0;
+      do {
+        const response = await client.inboxes.messages.list(inboxId, {
+          limit: 50,
+          after,
+          ...(pageToken ? { pageToken } : {}),
+        });
+        for (const item of response.messages) {
+          inspected += 1;
+          if (!isFreshNotionVerificationMessage(item, { notBefore: after })) continue;
+          const message = await client.inboxes.messages.get(inboxId, item.messageId);
+          if (!notionVerificationAuthenticationPassed(message)) continue;
+          const code = extractNotionVerificationCode(message);
+          if (code) return code;
+        }
+        pageToken = response.nextPageToken;
+      } while (pageToken && inspected < 100);
+    } catch (error) {
+      if (error instanceof SmokeFailure) throw error;
+      fail("C.notion-login", "verification_inbox_request_failed");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  fail("C.notion-login", "verification_code_timed_out");
+}
+
 async function completeNotionAuthorization(page, config, credential, connectionId) {
   const paperclipOrigin = new URL(config.baseUrl).origin;
   const setupPath = `/${TARGET_COMPANY_PREFIX}/apps/${connectionId}/setup`;
   const deadline = Date.now() + 6 * 60_000;
+  const verificationNotBefore = new Date();
   let providerSeen = false;
+  let verificationCodeSubmitted = false;
   while (Date.now() < deadline) {
     let current;
     try {
@@ -219,7 +285,25 @@ async function completeNotionAuthorization(page, config, credential, connectionI
 
     const bodyText = await page.locator("body").innerText().catch(() => "");
     if (/check your (?:email|inbox)|verification code|one-time code/i.test(bodyText)) {
-      fail("C.notion-login", "interactive_code_required");
+      if (verificationCodeSubmitted) fail("C.notion-login", "verification_code_rejected");
+      const codeInput = page.locator([
+        'input[autocomplete="one-time-code"]',
+        'input[name*="code" i]',
+        'input[inputmode="numeric"]',
+      ].join(",")).filter({ visible: true }).first();
+      if (!await codeInput.count()) {
+        await page.waitForTimeout(300);
+        continue;
+      }
+      let code = await fetchNotionVerificationCodeFromAgentMail({ notBefore: verificationNotBefore });
+      await codeInput.fill(code);
+      code = "";
+      if (!await clickVisibleButton(page, [/^verify$/i, /^continue$/i, /^submit$/i, /^sign in$/i])) {
+        await codeInput.press("Enter");
+      }
+      verificationCodeSubmitted = true;
+      await page.waitForTimeout(600);
+      continue;
     }
 
     const usernameInput = page.locator([

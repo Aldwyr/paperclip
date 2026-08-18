@@ -12,6 +12,8 @@ const REQUIRED_ENVIRONMENT = [
 // normalized delivery key; the live harness never reads any other binding.
 export const NOTION_SECRET_BINDING_KEY = "generic-flow-test-account";
 
+const NOTION_LOGIN_MAIL_DOMAINS = ["notion.so", "makenotion.com"];
+
 export class NotionGenericLivePreflightError extends Error {
   constructor(code, details = {}) {
     super(code);
@@ -19,6 +21,73 @@ export class NotionGenericLivePreflightError extends Error {
     this.code = code;
     this.details = details;
   }
+}
+
+function emailDomain(value) {
+  const match = String(value ?? "").match(/@([A-Za-z0-9.-]+)/);
+  return match?.[1]?.toLowerCase().replace(/\.$/, "") ?? "";
+}
+
+function notionMailDomain(value) {
+  const domain = emailDomain(value);
+  return NOTION_LOGIN_MAIL_DOMAINS.some((allowed) => domain === allowed || domain.endsWith(`.${allowed}`));
+}
+
+export function isFreshNotionVerificationMessage(message, { notBefore }) {
+  const timestamp = new Date(message?.timestamp ?? message?.createdAt ?? Number.NaN).getTime();
+  const lowerSubject = String(message?.subject ?? "").toLowerCase();
+  const challengeSubject = /(?:login|verification|one[-\s]?time|temporary|security).*(?:code|pin)|(?:code|pin).*(?:login|verification|one[-\s]?time|temporary|security)/i.test(lowerSubject);
+  return notionMailDomain(message?.from)
+    && challengeSubject
+    && Number.isFinite(timestamp)
+    && timestamp >= new Date(notBefore).getTime();
+}
+
+export function notionVerificationAuthenticationPassed(message) {
+  const headers = message?.headers && typeof message.headers === "object" && !Array.isArray(message.headers)
+    ? message.headers
+    : {};
+  const authentication = Object.entries(headers)
+    .filter(([key]) => key.toLowerCase().includes("authentication-results"))
+    .map(([, value]) => String(value).toLowerCase())
+    .join(" ");
+  return authentication.includes("dkim=pass")
+    && (authentication.includes("dmarc=pass")
+      || authentication.includes("spf=pass")
+      || authentication.includes("arc=pass"));
+}
+
+export function extractNotionVerificationCode(message) {
+  const content = [
+    message?.subject,
+    message?.extractedText,
+    message?.text,
+    message?.extractedHtml,
+    message?.html,
+  ]
+    .filter((value) => typeof value === "string")
+    .join("\n")
+    .replace(/<[^>]+>/g, " ");
+  const digitSequence = "([0-9](?:[\\s-]?[0-9]){5})";
+  const patterns = [
+    new RegExp(`(?:login|verification|one[-\\s]?time|temporary|security)[^\\n]{0,40}(?:code|pin)[^0-9]{0,40}${digitSequence}`, "gi"),
+    new RegExp(`(?:code|pin)[^0-9]{0,40}${digitSequence}`, "gi"),
+    new RegExp(`${digitSequence}[^\\n]{0,40}(?:login|verification|one[-\\s]?time|temporary|security)?[^\\n]{0,20}(?:code|pin)`, "gi"),
+  ];
+  const codes = new Set();
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      const code = match[1].replace(/[^0-9]/g, "");
+      if (code.length === 6) codes.add(code);
+    }
+  }
+  for (const label of content.matchAll(/(?:code|pin)/gi)) {
+    const window = content.slice(label.index, label.index + 120);
+    for (const match of window.matchAll(/(^|[^0-9])([0-9](?:[\s-]?[0-9]){5})(?![0-9])/g)) {
+      codes.add(match[2].replace(/[^0-9]/g, ""));
+    }
+  }
+  return codes.size === 1 ? [...codes][0] : null;
 }
 
 function requiredValue(environment, key) {

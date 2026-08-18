@@ -5,8 +5,11 @@ import {
   assertSanitizedEvidence,
   connectionRemovalFacts,
   extractNotionIdentity,
+  extractNotionVerificationCode,
   inspectAuthorizationUrl,
+  isFreshNotionVerificationMessage,
   NotionGenericLivePreflightError,
+  notionVerificationAuthenticationPassed,
   parseRuntimeAbsenceProof,
   parseSanitizedAgentProof,
   persistedOAuthStartResult,
@@ -106,6 +109,35 @@ test("an unavailable secret binding fails before browser or credential entry", a
     (error) => error instanceof NotionGenericLivePreflightError && error.code === "secret_binding_unavailable",
   );
   assert.equal(browserLoaded, false);
+});
+
+test("selects only fresh authenticated Notion verification mail and extracts one code", () => {
+  const notBefore = new Date("2026-08-18T12:00:00.000Z");
+  const message = {
+    timestamp: new Date("2026-08-18T12:00:05.000Z"),
+    from: "Notion <login@mail.notion.so>",
+    subject: "Your Notion login code",
+    extractedText: "Your temporary login code is 123 456.",
+    headers: {
+      "authentication-results": "dkim=pass; spf=pass; dmarc=pass",
+    },
+  };
+  assert.equal(isFreshNotionVerificationMessage(message, { notBefore }), true);
+  assert.equal(notionVerificationAuthenticationPassed(message), true);
+  assert.equal(extractNotionVerificationCode(message), "123456");
+  assert.equal(isFreshNotionVerificationMessage({
+    ...message,
+    timestamp: new Date("2026-08-18T11:59:59.000Z"),
+  }, { notBefore }), false);
+  assert.equal(isFreshNotionVerificationMessage({
+    ...message,
+    from: "Notion <login@example.test>",
+  }, { notBefore }), false);
+  assert.equal(notionVerificationAuthenticationPassed({
+    ...message,
+    headers: { "authentication-results": "dkim=fail; spf=pass" },
+  }), false);
+  assert.equal(extractNotionVerificationCode({ ...message, extractedText: "Codes 123456 and 654321" }), null);
 });
 
 test("authorization proof requires automatic registration, PKCE, callback, resource, and safe endpoints", () => {
