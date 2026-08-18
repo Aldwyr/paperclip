@@ -230,6 +230,10 @@ export type ExecutionWorkspaceServiceOptions = {
   // becomes terminal before it archives the workspace. A value of 0 disables
   // the cooldown. The default is 7 days.
   workspaceReaperCooldownDays?: number;
+  inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
+    git: ExecutionWorkspaceCloseGitReadiness | null;
+    warnings: string[];
+  }>;
 };
 
 function parseGitHubRepository(repoUrl: string | null) {
@@ -1467,7 +1471,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
     const workspace = toExecutionWorkspace(row, runtimeServices);
-    const { git } = await inspectGitCloseReadiness(workspace);
+    const { git } = await (opts.inspectGitCloseReadiness ?? inspectGitCloseReadiness)(workspace);
     const assessment = await assessDelivery(row, git);
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
   }
@@ -2060,12 +2064,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         .where(and(...conditions))
         .orderBy(desc(executionWorkspaces.lastUsedAt), desc(executionWorkspaces.createdAt));
       const runtimeServicesByWorkspaceId = await loadEffectiveRuntimeServicesByExecutionWorkspace(db, companyId, rows);
-      return Promise.all(rows.map((row) =>
-        hydrateWorkspace(
+      // Collection reads are deliberately DB-only. Delivery-state hydration
+      // inspects git and may resolve pull requests, so doing it for every row
+      // lets a large inventory launch an unbounded number of child processes.
+      // Detail and close-readiness reads retain the live hydration path.
+      return rows.map((row) =>
+        toExecutionWorkspace(
           row,
           (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
         ),
-      ));
+      );
     },
 
     listSummaries: async (companyId: string, filters?: {
