@@ -44,8 +44,8 @@ function KeySection({
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <section className="rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between px-5 py-4">
+    <section>
+      <div className="flex items-center justify-between">
         <div className="flex items-start gap-3">
           <Lock className="mt-0.5 h-4 w-4 text-muted-foreground" />
           <div>
@@ -62,7 +62,7 @@ function KeySection({
         )}
       </div>
       {open && (
-        <div className="border-t border-border px-5 py-4">
+        <div className="pt-4">
           <ReconnectForm
             connection={connection}
             galleryEntry={galleryEntry}
@@ -255,7 +255,7 @@ function ReconnectForm({
 
 function TechnicalDetails({ connection }: { connection: ToolConnection }) {
   return (
-    <section className="rounded-xl border border-border bg-card px-5 py-4">
+    <section>
       <h2 className="text-sm font-bold text-foreground">Technical details</h2>
       <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-(--gtc-59)">
         <dt className="text-muted-foreground">Address</dt>
@@ -278,11 +278,11 @@ export function DangerZone({
 }) {
   const [confirming, setConfirming] = useState(false);
   return (
-    <section className="rounded-xl border border-destructive/40 bg-card">
-      <div className="border-b border-destructive/40 px-5 py-3 text-sm font-bold text-destructive">
+    <section className="space-y-3">
+      <div className="text-sm font-bold text-destructive">
         Danger zone
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium text-foreground">Remove this app</p>
           <p className="text-xs text-muted-foreground">

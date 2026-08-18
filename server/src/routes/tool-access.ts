@@ -57,6 +57,28 @@ function allowlistIds(config: Record<string, unknown> | null | undefined): strin
   return raw.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
+function agentOrgDepths(rows: Array<{ id: string; reportsTo: string | null }>): Map<string, number> {
+  const parentById = new Map(rows.map((row) => [row.id, row.reportsTo]));
+  const depthById = new Map<string, number>();
+
+  const depthFor = (agentId: string, path: Set<string>): number => {
+    const known = depthById.get(agentId);
+    if (known !== undefined) return known;
+    const parentId = parentById.get(agentId);
+    if (!parentId || !parentById.has(parentId) || path.has(agentId)) {
+      depthById.set(agentId, 0);
+      return 0;
+    }
+    const nextPath = new Set(path).add(agentId);
+    const depth = depthFor(parentId, nextPath) + 1;
+    depthById.set(agentId, depth);
+    return depth;
+  };
+
+  for (const row of rows) depthFor(row.id, new Set());
+  return depthById;
+}
+
 /**
  * Classify a connection PATCH into operator-visible lifecycle events so the
  * per-app Activity tab can humanize them (PAP-11284). A single update may
@@ -740,9 +762,11 @@ export function toolAccessRoutes(
         role: agents.role,
         title: agents.title,
         status: agents.status,
+        reportsTo: agents.reportsTo,
       })
       .from(agents)
       .where(eq(agents.companyId, connection.companyId));
+    const orgDepthByAgentId = agentOrgDepths(rows);
     const candidates = [];
     for (const agent of rows) {
       try {
@@ -751,7 +775,12 @@ export function toolAccessRoutes(
         continue;
       }
       candidates.push({
-        ...agent,
+        id: agent.id,
+        name: agent.name,
+        role: agent.role,
+        title: agent.title,
+        status: agent.status,
+        orgDepth: orgDepthByAgentId.get(agent.id) ?? 0,
         effectiveAccess: await options.toolGateway.summarizeConnectionAccessForAgent({
           companyId: connection.companyId,
           connectionId: connection.id,
@@ -759,6 +788,7 @@ export function toolAccessRoutes(
         }),
       });
     }
+    candidates.sort((a, b) => a.orgDepth - b.orgDepth || a.name.localeCompare(b.name));
     res.json({ agents: candidates });
   });
 

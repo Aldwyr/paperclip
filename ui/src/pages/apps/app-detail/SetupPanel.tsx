@@ -80,7 +80,7 @@ function PostHogConfigurationSection({ connection }: { connection: ToolConnectio
     ["Response mode", typeof config.mode === "string" ? config.mode : "tools"],
   ];
   return (
-    <section className="rounded-xl border border-border bg-card px-5 py-4">
+    <section>
       <h2 className="text-sm font-bold text-foreground">PostHog access scope</h2>
       <p className="mt-0.5 text-sm text-muted-foreground">
         This connection is pinned to the project and analytics surface below.
@@ -109,7 +109,7 @@ function OAuthConnectionSection({
   onStart: () => void;
 }) {
   return (
-    <section className="rounded-xl border border-border bg-card px-5 py-4">
+    <section>
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-sm font-bold text-foreground">
@@ -154,7 +154,7 @@ function GoogleSheetsAllowlistSection({
     onUpdateConfig(googleSheetsConfigWithAllowlist(connection.config, nextIds));
 
   return (
-    <section className="rounded-xl border border-border bg-card px-5 py-4">
+    <section>
       <div>
         <h2 className="text-sm font-bold text-foreground">Sheets agents can use</h2>
         <p className="mt-0.5 text-sm text-muted-foreground">
@@ -247,7 +247,7 @@ export function AppLifecycleSection({
 }) {
   const enabled = connection.enabled !== false && connection.status !== "disabled";
   return (
-    <section className="rounded-xl border border-border bg-card px-5 py-4">
+    <section>
       <div className="flex items-center justify-between gap-4">
         <div>
           <h2 className="text-sm font-bold text-foreground">
@@ -284,8 +284,8 @@ export function QuarantinedActionsReview({
   const count = entries.length;
   const selectedIds = entries.filter((entry) => enabledIds.has(entry.id)).map((entry) => entry.id);
   return (
-    <section className="overflow-hidden rounded-xl border border-amber-500/40 bg-amber-500/[0.08]">
-      <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3">
+    <section className="space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="text-sm font-semibold text-amber-800 dark:text-amber-200">
             Review {count} new {count === 1 ? "action" : "actions"}
@@ -313,12 +313,12 @@ export function QuarantinedActionsReview({
           </button>
         </div>
       </div>
-      <div className="divide-y divide-amber-500/25 border-y border-amber-500/25 bg-background">
+      <div className="divide-y divide-border">
         {entries.map((entry) => {
           const enabled = enabledIds.has(entry.id);
           const label = entry.title ?? entry.toolName;
           return (
-            <div key={entry.id} className="flex items-center gap-3 px-4 py-3">
+            <div key={entry.id} className="flex items-center gap-3 py-3">
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium text-foreground">{label}</div>
                 {entry.description && (
@@ -342,7 +342,7 @@ export function QuarantinedActionsReview({
           );
         })}
       </div>
-      <div className="flex items-center justify-between gap-3 px-4 py-3">
+      <div className="flex items-center justify-between gap-3">
         <span className="text-xs text-amber-700 dark:text-amber-300">
           {selectedIds.length} of {count} will be on
         </span>

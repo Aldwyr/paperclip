@@ -726,7 +726,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await render();
 
-    expect(container.textContent).toContain("Step 1 of 4");
+    expect(container.textContent).toContain("Step 1 of 3");
     expect(container.textContent).toContain("Connect Zapier");
     expect(container.textContent).toContain("Add MCP URL");
     expect(container.querySelector('img[src="https://example.com/zapier.png"]')).toBeTruthy();
@@ -747,15 +747,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     expect(connectAppMock).toHaveBeenCalledTimes(1);
     expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({ link: zapierUrl, name: "Zapier" });
-    expect(container.textContent).toContain("Step 2 of 4");
-    expect(container.querySelector('img[src="https://example.com/zapier.png"]')).toBeTruthy();
-
-    await act(async () => {
-      buttonByText("Continue with 1 action on")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await flushReact();
-
-    expect(container.textContent).toContain("Step 3 of 4");
+    expect(container.textContent).toContain("Step 2 of 3");
     expect(container.querySelector('img[src="https://example.com/zapier.png"]')).toBeTruthy();
 
     await act(async () => {
@@ -793,7 +785,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
 
-    expect(container.textContent).toContain("Step 4 of 4");
+    expect(container.textContent).toContain("Step 3 of 3");
     expect(container.textContent).toContain("Install Zapier tools?");
     expect(container.textContent).toContain("Not yet");
 
@@ -982,7 +974,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(connectAppMock).toHaveBeenCalledTimes(1);
-    expect(mockNavigate).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=zapier&stage=actions");
+    expect(mockNavigate).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=zapier&stage=access");
     const [, input] = connectAppMock.mock.calls[0];
     expect(input).toMatchObject({ galleryKey: "zapier", name: "Zapier" });
   });
@@ -1156,7 +1148,7 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
       .toBe("127.0.0.1:47399/mcp");
   });
 
-  it("keeps the endpoint host and Unverified server visible from setup through review", async () => {
+  it("keeps the endpoint host visible while skipping action review", async () => {
     await render();
     await gotoLinkFrame(container, "https://mcp.example.test/mcp");
 
@@ -1208,13 +1200,11 @@ describe("AppsConnect — guided generic MCP flow (PAP-17087)", () => {
     });
     await flushReact();
 
-    // Now on the review step — the label has to survive the step change.
-    expect(container.textContent).toContain("List things");
+    expect(container.textContent).toContain("Who can use mcp.example.test?");
     expect(container.textContent).toContain("Unverified server");
     expect(container.textContent).toContain("mcp.example.test");
-    expect(
-      Array.from(container.querySelectorAll('[role="switch"]')).map((toggle) => toggle.getAttribute("aria-label")),
-    ).toEqual(["List things allowed", "Search things allowed", "qa_delete_widget allowed"]);
+    expect(container.textContent).not.toContain("List things");
+    expect(container.querySelectorAll('[role="switch"]')).toHaveLength(0);
   });
 
   it("offers a curated setup as a convenience without leaving the generic flow", async () => {

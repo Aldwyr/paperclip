@@ -344,7 +344,7 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     await tempDb?.cleanup();
   });
 
-  it("connects a public unknown endpoint with conservative defaults and quarantine", async () => {
+  it("connects a public unknown endpoint with every discovered tool enabled", async () => {
     installMcpOAuthFixture({ auth: "public" });
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -354,18 +354,30 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(result.auth ?? null).toBeNull();
     expect(result.actions.readOnly.map((action) => action.toolName)).toEqual(["list_insights"]);
     expect(result.actions.canMakeChanges.map((action) => action.toolName)).toEqual(["create_insight"]);
-    // Reads are on for review, anything that can change data starts off.
     expect(result.suggestedDefaults).toMatchObject({ askFirstRiskLevels: ["write", "destructive"] });
 
     const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, result.connectionId));
     expect(connection).toMatchObject({ transport: "mcp_remote", authKind: "none", status: "draft" });
-    // An unknown endpoint stays labelled unverified and quarantines whatever it
-    // grows later, exactly like the curated path's conservative defaults.
-    expect(connection!.config).toMatchObject({ quarantineNewEntries: true, unverifiedServer: true });
+    expect(connection!.config).toMatchObject({ quarantineNewEntries: false, unverifiedServer: true });
     // No curated definition was consulted: nothing recorded a template key, so
     // this connection cannot be depending on gallery metadata for anything.
     expect(connection!.config).not.toHaveProperty("sourceTemplateKey");
     expect(connection!.config).not.toHaveProperty("connectionMethodKey");
+    const [profile] = await db.select().from(toolProfiles).where(eq(
+      toolProfiles.profileKey,
+      `app:${result.connectionId}`,
+    ));
+    expect(profile).toBeTruthy();
+    await expect(db.select().from(toolProfileEntries).where(eq(
+      toolProfileEntries.profileId,
+      profile!.id,
+    ))).resolves.toHaveLength(2);
+    await expect(db.select().from(toolProfileBindings).where(eq(
+      toolProfileBindings.profileId,
+      profile!.id,
+    ))).resolves.toEqual([
+      expect.objectContaining({ targetType: "company", targetId: company.id }),
+    ]);
   });
 
   it("emits DNS guidance for a real NXDOMAIN failure", async () => {

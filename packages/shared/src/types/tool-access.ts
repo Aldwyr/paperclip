@@ -1411,6 +1411,8 @@ export interface ToolConnectionTestAgent {
   role: string;
   title: string | null;
   status: string;
+  /** Zero-based depth in the company reporting tree; roots are highest-ranked. */
+  orgDepth: number;
   effectiveAccess: ToolConnectionAccessSummary;
 }
 

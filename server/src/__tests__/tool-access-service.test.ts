@@ -99,6 +99,24 @@ function mockToolsList(tools: unknown[]) {
   );
 }
 
+const PUBLIC_MCP_FIXTURE_URL = "https://8.8.8.8/api/mcp";
+
+async function withGalleryServerUrl<T>(
+  slug: string,
+  serverUrl: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const method = getConnectableAppDefinition(slug)?.methods[0];
+  if (!method?.defaults) throw new Error(`Missing gallery method defaults for ${slug}`);
+  const originalServerUrl = method.defaults.serverUrl;
+  method.defaults.serverUrl = serverUrl;
+  try {
+    return await operation();
+  } finally {
+    method.defaults.serverUrl = originalServerUrl;
+  }
+}
+
 function createRouteApp(
   db: ReturnType<typeof createDb>,
   actor?: Express.Request["actor"],
@@ -147,13 +165,14 @@ async function grantBoardUser(
   companyId: string,
   userId: string,
   permissionKeys: string[],
+  membershipRole: "owner" | "admin" | "operator" | "member" | "viewer" = "operator",
 ) {
   await db.insert(companyMemberships).values({
     companyId,
     principalType: "user",
     principalId: userId,
     status: "active",
-    membershipRole: "operator",
+    membershipRole,
   });
   if (permissionKeys.length > 0) {
     await db.insert(principalPermissionGrants).values(permissionKeys.map((permissionKey) => ({
@@ -1447,6 +1466,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(res.body.agents).toHaveLength(1);
     expect(res.body.agents[0]).toMatchObject({
       id: agent.id,
+      orgDepth: 0,
       effectiveAccess: {
         connectionId: connection.id,
         toolCount: 1,
@@ -1455,6 +1475,55 @@ describeEmbeddedPostgres("tool access service", () => {
         offCount: 0,
       },
     });
+  });
+
+  it("lists only writable agents and ranks the highest accessible agent first", async () => {
+    const company = await createCompany(db);
+    const userId = `scoped-tool-tester-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use"], "viewer");
+    const actor = boardSessionActor(company.id, "viewer", userId);
+    const root = await createAgent(db, company.id);
+    const [accessibleManager] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Accessible manager",
+      role: "manager",
+      reportsTo: root.id,
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+    const [accessibleReport] = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Accessible report",
+      role: "engineer",
+      reportsTo: accessibleManager!.id,
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+    }).returning();
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: userId,
+      permissionKey: "tasks:assign_scope",
+      scope: { agentIds: [accessibleManager!.id, accessibleReport!.id] },
+      grantedByUserId: "owner",
+    });
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    const app = createRouteApp(db, actor, createToolGatewayService(db, { toolActionSigningSecret: "test-secret" }));
+
+    const res = await request(app)
+      .get(`/api/tool-connections/${connection.id}/test-agents`)
+      .expect(200);
+
+    expect(res.body.agents.map((agent: { id: string }) => agent.id)).toEqual([
+      accessibleManager!.id,
+      accessibleReport!.id,
+    ]);
+    expect(res.body.agents.map((agent: { orgDepth: number }) => agent.orgDepth)).toEqual([1, 2]);
+    expect(res.body.agents).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: root.id })]));
   });
 
   it("surfaces a last-changed audit hint attributed to the agent that authored the governing policy", async () => {
@@ -5295,15 +5364,16 @@ describeEmbeddedPostgres("tool access service", () => {
       runtimeConfig: {},
     }).returning();
 
-    const connect = await service.connectGalleryApp(company.id, {
-      galleryKey: "zapier",
-      name: "Zapier workspace",
-      credentialValues: { "credentials.authorization": "zap-secret" },
-    }, { actorType: "user", actorId: "board" });
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, {
+        galleryKey: "zapier",
+        name: "Zapier workspace",
+        credentialValues: { "credentials.authorization": "zap-secret" },
+      }, { actorType: "user", actorId: "board" }));
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://mcp.zapier.com/api/mcp",
+      PUBLIC_MCP_FIXTURE_URL,
       expect.objectContaining({
         headers: expect.objectContaining({ Authorization: "Bearer zap-secret" }),
       }),
@@ -5311,7 +5381,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(connect.connection).toMatchObject({
       status: "draft",
       enabled: false,
-      config: expect.objectContaining({ sourceTemplateKey: "zapier", quarantineNewEntries: true }),
+      config: expect.objectContaining({ sourceTemplateKey: "zapier", quarantineNewEntries: false }),
       credentialSecretRefs: [
         expect.objectContaining({
           configPath: "credentials.authorization",
@@ -5390,6 +5460,10 @@ describeEmbeddedPostgres("tool access service", () => {
         expect.objectContaining({ id: updateEntry.id, status: "active", reviewedAt: expect.any(Date), quarantineReason: null }),
       ]),
     );
+
+    await db.update(toolConnections).set({
+      config: { ...connect.connection.config, quarantineNewEntries: true },
+    }).where(eq(toolConnections.id, connect.connectionId));
 
     fetchMock.mockResolvedValueOnce(mcpHttpResponse({
       jsonrpc: "2.0",
@@ -5487,6 +5561,79 @@ describeEmbeddedPostgres("tool access service", () => {
     ]));
     const attentionAfterReview = await service.listAppsNeedingAttention(company.id);
     expect(attentionAfterReview.apps).toEqual([]);
+  });
+
+  it("enables every discovered tool by default while preserving tools explicitly turned off later", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db);
+    const fetchMock = mockToolsList([
+      { name: "list_zaps", annotations: { readOnlyHint: true } },
+      { name: "update_zap", annotations: { readOnlyHint: false } },
+    ]);
+
+    const connect = await withGalleryServerUrl("zapier", PUBLIC_MCP_FIXTURE_URL, () =>
+      service.connectGalleryApp(company.id, {
+        galleryKey: "zapier",
+        credentialValues: { "credentials.authorization": "zap-secret" },
+      }, { actorType: "user", actorId: "board" }));
+    const listEntry = connect.catalog.find((entry) => entry.toolName === "list_zaps")!;
+    const updateEntry = connect.catalog.find((entry) => entry.toolName === "update_zap")!;
+    const [defaultProfile] = await db.select().from(toolProfiles).where(eq(
+      toolProfiles.profileKey,
+      `app:${connect.connectionId}`,
+    ));
+    expect(defaultProfile).toBeTruthy();
+    await expect(db.select().from(toolProfileEntries).where(eq(
+      toolProfileEntries.profileId,
+      defaultProfile!.id,
+    ))).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: listEntry.id, effect: "include" }),
+      expect.objectContaining({ catalogEntryId: updateEntry.id, effect: "include" }),
+    ]));
+    await expect(db.select().from(toolProfileBindings).where(eq(
+      toolProfileBindings.profileId,
+      defaultProfile!.id,
+    ))).resolves.toEqual([
+      expect.objectContaining({ targetType: "company", targetId: company.id }),
+    ]);
+
+    await service.finishGalleryAppConnection(company.id, connect.connectionId, {
+      enabledCatalogEntryIds: [listEntry.id],
+      askFirstCatalogEntryIds: [],
+      access: "all_agents",
+    }, { actorType: "user", actorId: "board" });
+    fetchMock.mockResolvedValueOnce(mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: "paperclip-catalog-refresh",
+      result: {
+        tools: [
+          { name: "list_zaps", annotations: { readOnlyHint: true } },
+          { name: "update_zap", annotations: { readOnlyHint: false } },
+          { name: "create_zap", annotations: { readOnlyHint: false } },
+        ],
+      },
+    }));
+
+    const refresh = await service.refreshCatalog(connect.connectionId, { actorType: "user", actorId: "board" });
+
+    expect(refresh.quarantinedCount).toBe(0);
+    expect(refresh.catalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolName: "list_zaps", status: "active" }),
+      expect.objectContaining({ toolName: "update_zap", status: "active" }),
+      expect.objectContaining({ toolName: "create_zap", status: "active" }),
+    ]));
+    const createEntry = refresh.catalog.find((entry) => entry.toolName === "create_zap")!;
+    const profileEntries = await db.select().from(toolProfileEntries).where(eq(
+      toolProfileEntries.profileId,
+      defaultProfile!.id,
+    ));
+    expect(profileEntries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: listEntry.id }),
+      expect.objectContaining({ catalogEntryId: createEntry.id }),
+    ]));
+    expect(profileEntries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ catalogEntryId: updateEntry.id }),
+    ]));
   });
 
   it("resolves Notion reads as allowed, mutations as ask-first, and denies cross-company use", async () => {

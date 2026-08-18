@@ -3088,6 +3088,75 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return profile;
   }
 
+  async function enableCatalogEntriesByDefault(input: {
+    connection: typeof toolConnections.$inferSelect;
+    newCatalogEntryIds: string[];
+    activeCatalogEntryIds: string[];
+    actor?: ActorInfo;
+  }) {
+    const profileKey = `app:${input.connection.id}`;
+    let [profile] = await db
+      .select()
+      .from(toolProfiles)
+      .where(and(
+        eq(toolProfiles.companyId, input.connection.companyId),
+        eq(toolProfiles.profileKey, profileKey),
+      ))
+      .limit(1);
+    const createdProfile = !profile;
+    if (!profile) {
+      [profile] = await db.insert(toolProfiles).values({
+        companyId: input.connection.companyId,
+        profileKey,
+        name: input.connection.name,
+        description: `Access profile for ${input.connection.name}.`,
+        status: "active",
+        defaultAction: "deny",
+        metadata: { source: "app_gallery_finish", connectionId: input.connection.id },
+      }).returning();
+      await db.insert(toolProfileBindings).values({
+        companyId: input.connection.companyId,
+        profileId: profile.id,
+        targetType: "company",
+        targetId: input.connection.companyId,
+        priority: 100,
+        metadata: { source: "app_gallery_finish" },
+        createdByAgentId: input.actor?.actorType === "agent" ? input.actor.actorId ?? null : null,
+        createdByUserId: input.actor?.actorType === "user" ? input.actor.actorId ?? null : null,
+      });
+    }
+
+    // A new connection starts with every discovered action enabled. Later
+    // refreshes extend that managed profile only for genuinely new actions, so
+    // an action the operator deliberately turned off remains off.
+    const candidateIds = [...new Set(
+      createdProfile ? input.activeCatalogEntryIds : input.newCatalogEntryIds,
+    )];
+    if (candidateIds.length === 0) return;
+    const existingEntries = await db
+      .select({ catalogEntryId: toolProfileEntries.catalogEntryId })
+      .from(toolProfileEntries)
+      .where(and(
+        eq(toolProfileEntries.companyId, input.connection.companyId),
+        eq(toolProfileEntries.profileId, profile.id),
+        inArray(toolProfileEntries.catalogEntryId, candidateIds),
+      ));
+    const configuredIds = new Set(existingEntries.flatMap((entry) =>
+      entry.catalogEntryId ? [entry.catalogEntryId] : [],
+    ));
+    const entryIds = candidateIds.filter((id) => !configuredIds.has(id));
+    if (entryIds.length === 0) return;
+    await db.insert(toolProfileEntries).values(entryIds.map((catalogEntryId) => ({
+      companyId: input.connection.companyId,
+      profileId: profile.id,
+      selectorType: "catalog_entry" as const,
+      effect: "include" as const,
+      applicationId: input.connection.applicationId,
+      connectionId: input.connection.id,
+      catalogEntryId,
+    })));
+  }
+
   async function listConnectionInstalls(connectionId: string, companyId?: string): Promise<ToolConnectionInstall[]> {
     const connection = await getConnectionRow(connectionId, companyId);
     const rows = await db
@@ -4110,7 +4179,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         ? "quarantined"
         : existing?.status === "disabled"
           ? "disabled"
-          : existing?.status === "quarantined"
+          : quarantineOnRefresh && existing?.status === "quarantined"
             ? "quarantined"
             : "active";
       if (shouldQuarantine) quarantinedCount += 1;
@@ -4131,8 +4200,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             versionHash: hash,
             schemaHash,
             lastSeenAt: now,
-            quarantinedAt: shouldQuarantine ? now : existing.quarantinedAt,
-            quarantineReason: shouldQuarantine ? "pending_review" : existing.quarantineReason,
+            quarantinedAt: status === "quarantined"
+              ? shouldQuarantine ? now : existing.quarantinedAt
+              : null,
+            quarantineReason: status === "quarantined"
+              ? shouldQuarantine ? "pending_review" : existing.quarantineReason
+              : null,
             updatedAt: now,
           })
           .where(eq(toolCatalogEntries.id, existing.id))
@@ -4187,6 +4260,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         .set({ healthStatus: "ok", healthMessage: "Approved stdio template is ready.", lastHealthCheckAt: now, updatedAt: now })
         .where(eq(toolRuntimeSlots.connectionId, connection.id));
     }
+
+    const activeEntries = updatedEntries.filter((entry) => entry.status === "active");
+    await enableCatalogEntriesByDefault({
+      connection: updatedConnection,
+      newCatalogEntryIds: activeEntries
+        .filter((entry) => {
+          const previous = existingByName.get(entry.toolName);
+          return !previous || previous.status === "quarantined";
+        })
+        .map((entry) => entry.id),
+      activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
+      actor,
+    });
 
     await audit({
       companyId: connection.companyId,
@@ -6305,10 +6391,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           sourceTemplateKey: galleryEntry.slug,
           connectionMethodKey: method?.key,
           methodConfig: normalizedMethodConfig?.values ?? {},
-          quarantineNewEntries: true,
+          quarantineNewEntries: false,
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
-      : { ...baseConfig, quarantineNewEntries: true, unverifiedServer: true };
+      : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
     // A pasted URL may arrive with a client the operator preregistered in the
     // provider's own console, because that authorization server supports neither
     // CIMD nor dynamic registration. Record the client id now; the secret becomes

@@ -22,7 +22,6 @@ import type {
   FieldDef,
   ToolApplication,
   ToolConnection,
-  ToolAppConnectionActionSummary,
 } from "@paperclipai/shared";
 import { credentialConfigPath, getAppDefinitionForUrl, getAvailableConnectionMethod, getAvailableConnectionMethods } from "@paperclipai/shared";
 import { useNavigate, useParams, useSearchParams } from "@/lib/router";
@@ -67,12 +66,11 @@ import {
 } from "./generic-mcp-connect";
 import { autoExtendNotice, INSTALL_ALL_WARNING, installInfoNotice, installPayload } from "@/lib/tool-installs";
 
-type Step = "gallery" | "key" | "actions" | "who" | "install" | "success";
+type Step = "gallery" | "key" | "who" | "install" | "success";
 export type OAuthConnectPhase = "entry" | "starting" | "redirecting" | "error";
 
 const ROUTE_STAGE_BY_STEP: Partial<Record<Step, string>> = {
   key: "setup",
-  actions: "actions",
   who: "access",
   install: "install",
   success: "complete",
@@ -86,26 +84,19 @@ function appConnectHref(appKey: string, step: Step): string {
 type AppAccessSelection = "all_agents" | { agentIds: string[] };
 type InstallMode = "none" | "specific" | "all";
 
-const STEP_LABELS = ["Pick app", "Add your key", "Choose actions", "Choose access", "Install tools"];
+const STEP_LABELS = ["Pick app", "Add your key", "Choose access", "Install tools"];
 const STEP_INDEX: Record<Exclude<Step, "success">, number> = {
   gallery: 0,
   key: 1,
-  actions: 2,
-  who: 3,
-  install: 4,
-};
-const ZAPIER_STEP_INDEX: Record<Exclude<Step, "gallery" | "success">, number> = {
-  key: 0,
-  actions: 1,
   who: 2,
   install: 3,
 };
-const ZAPIER_STEP_LABELS = ["Add MCP URL", "Choose actions", "Choose access", "Install tools"];
-
-function askFirstLevelsFrom(result: ConnectToolAppResult): string[] {
-  const raw = (result.suggestedDefaults as { askFirstRiskLevels?: unknown })?.askFirstRiskLevels;
-  return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : ["write", "destructive"];
-}
+const ZAPIER_STEP_INDEX: Record<Exclude<Step, "gallery" | "success">, number> = {
+  key: 0,
+  who: 1,
+  install: 2,
+};
+const ZAPIER_STEP_LABELS = ["Add MCP URL", "Choose access", "Install tools"];
 
 function isGoogleSheetsEntry(entry: AppDefinition | null): boolean {
   return entry?.slug === "google-sheets";
@@ -439,11 +430,11 @@ export function AppsConnect() {
       setConnectResult(result);
       const defaults: Record<string, boolean> = {};
       for (const a of result.actions.readOnly) defaults[a.catalogEntryId] = true;
-      for (const a of result.actions.canMakeChanges) defaults[a.catalogEntryId] = false;
+      for (const a of result.actions.canMakeChanges) defaults[a.catalogEntryId] = true;
       setEnabled(defaults);
       setInstallMode("none");
       setInstallAgentIds(new Set());
-      setAppStep("actions");
+      setAppStep("who");
     },
     onError: (error) => {
       const details = error instanceof ApiError && error.body && typeof error.body === "object"
@@ -553,19 +544,14 @@ export function AppsConnect() {
 
   const finishMutation = useMutation({
     mutationFn: async () => {
-      const askFirstLevels = connectResult ? askFirstLevelsFrom(connectResult) : [];
-      const changeActions = connectResult?.actions.canMakeChanges ?? [];
       const enabledIds = Object.entries(enabled)
         .filter(([, on]) => on)
         .map(([id]) => id);
-      const askFirstIds = changeActions
-        .filter((a) => enabled[a.catalogEntryId] && askFirstLevels.includes(a.riskLevel))
-        .map((a) => a.catalogEntryId);
       const selection: AppAccessSelection =
         access === "all" ? "all_agents" : { agentIds: Array.from(agentIds) };
       const result = await toolsApi.finishApp(selectedCompanyId!, connectResult!.connectionId, {
         enabledCatalogEntryIds: enabledIds,
-        askFirstCatalogEntryIds: askFirstIds,
+        askFirstCatalogEntryIds: [],
         access: selection,
       });
       const installState = installMode === "all"
@@ -688,9 +674,9 @@ export function AppsConnect() {
   const stepLabels = zapierSource
     ? ZAPIER_STEP_LABELS
     : entry && getAvailableConnectionMethods(entry).length > 1
-      ? ["Pick app", "Choose connection", "Choose actions", "Choose access", "Install tools"]
+      ? ["Pick app", "Choose connection", "Choose access", "Install tools"]
     : isGoogleSheetsEntry(entry)
-      ? ["Pick app", "Share sheet", "Choose actions", "Choose access", "Install tools"]
+      ? ["Pick app", "Share sheet", "Choose access", "Install tools"]
       : STEP_LABELS;
   const stepIndex = zapierSource && step !== "gallery" && step !== "success"
     ? ZAPIER_STEP_INDEX[step]
@@ -841,24 +827,6 @@ export function AppsConnect() {
         />
       )}
 
-      {step === "actions" && connectResult && (
-        <ActionsStep
-          appName={appName}
-          result={connectResult}
-          enabled={enabled}
-          onToggle={(id, on) => setEnabled((prev) => ({ ...prev, [id]: on }))}
-          onBulk={(ids, on) =>
-            setEnabled((prev) => {
-              const next = { ...prev };
-              for (const id of ids) next[id] = on;
-              return next;
-            })
-          }
-          onBack={() => setAppStep("key")}
-          onContinue={() => setAppStep("who")}
-        />
-      )}
-
       {step === "who" && connectResult && (
         <WhoStep
           appName={appName}
@@ -867,7 +835,7 @@ export function AppsConnect() {
           setAccess={setAccess}
           agentIds={agentIds}
           setAgentIds={setAgentIds}
-          onBack={() => setAppStep("actions")}
+          onBack={() => setAppStep("key")}
           onContinue={() => setAppStep("install")}
         />
       )}
@@ -1015,7 +983,7 @@ export function OAuthConnectStateScreen({
         subtitle="Secure MCP sign-in"
         step="key"
         activeIndex={0}
-        labels={["Connect", "Review actions", "Choose access", "Install tools"]}
+        labels={["Connect", "Choose access", "Install tools"]}
         appIdentity={entry ? { name: entry.name, logoUrl: entry.branding.logoUrl } : undefined}
         unverifiedHost={unverifiedHost}
         onCancel={onCancel}
@@ -1255,7 +1223,7 @@ function GalleryStep({
             {zapierSource
               ? "Paste the complete MCP URL Zapier gives you, including its token."
               : byo
-              ? "Paste your MCP server’s URL and we’ll walk you through permissions and review."
+              ? "Paste your MCP server’s URL and every discovered tool will be available immediately."
               : "Paste a setup link from an app that is not listed here."}
           </p>
           {!zapierSource && (
@@ -2096,150 +2064,6 @@ function MethodConfigField({
         />
       )}
       {field.helperMd && <p className="mt-2 text-xs text-muted-foreground">{field.helperMd}</p>}
-    </div>
-  );
-}
-
-function ActionGroup({
-  title,
-  hint,
-  actions,
-  enabled,
-  onToggle,
-  bulkLabel,
-  onBulk,
-  askFirstLevels,
-}: {
-  title: string;
-  hint: string;
-  actions: ToolAppConnectionActionSummary[];
-  enabled: Record<string, boolean>;
-  onToggle: (id: string, on: boolean) => void;
-  bulkLabel: string;
-  onBulk: () => void;
-  askFirstLevels: string[];
-}) {
-  if (actions.length === 0) return null;
-  return (
-    <div className="rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between border-b border-border px-5 py-2.5 sm:py-3">
-        <div className="text-sm">
-          <span className="font-bold text-foreground">{title}</span>
-          <span className="ml-2 text-muted-foreground">· {hint}</span>
-        </div>
-        <button
-          type="button"
-          onClick={onBulk}
-          className="text-xs text-muted-foreground hover:text-foreground"
-        >
-          {bulkLabel}
-        </button>
-      </div>
-      <div className="divide-y divide-border">
-        {actions.map((action) => {
-          const on = enabled[action.catalogEntryId] ?? false;
-          const showAskFirst = on && askFirstLevels.includes(action.riskLevel);
-          return (
-            <div key={action.catalogEntryId} className="flex items-center gap-4 px-5 py-2.5 sm:py-3">
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium text-foreground">
-                  {action.title ?? action.toolName}
-                </div>
-                {action.description && (
-                  <div className="truncate text-xs text-muted-foreground">{action.description}</div>
-                )}
-              </div>
-              {showAskFirst && (
-                <span className="inline-flex items-center rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-semibold text-amber-700 dark:text-amber-300">
-                  Ask first
-                </span>
-              )}
-              <ToggleSwitch
-                aria-label={`${action.title ?? action.toolName} allowed`}
-                checked={on}
-                onCheckedChange={(next) => onToggle(action.catalogEntryId, next)}
-              />
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function ActionsStep({
-  appName,
-  result,
-  enabled,
-  onToggle,
-  onBulk,
-  onBack,
-  onContinue,
-}: {
-  appName: string;
-  result: ConnectToolAppResult;
-  enabled: Record<string, boolean>;
-  onToggle: (id: string, on: boolean) => void;
-  onBulk: (ids: string[], on: boolean) => void;
-  onBack: () => void;
-  onContinue: () => void;
-}) {
-  const askFirstLevels = askFirstLevelsFrom(result);
-  const { readOnly, canMakeChanges } = result.actions;
-  const total = readOnly.length + canMakeChanges.length;
-  const enabledCount = Object.values(enabled).filter(Boolean).length;
-
-  return (
-    <div className="space-y-4 sm:space-y-5">
-      <div className="flex items-start gap-3">
-        <span className="mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-full border-2 border-emerald-500 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
-          <Check className="h-3.5 w-3.5" />
-        </span>
-        <div>
-          <div className="text-lg font-bold text-foreground">
-            Connected to {appName} — it offers {total} {total === 1 ? "action" : "actions"}.
-          </div>
-          <div className="text-sm text-muted-foreground">
-            Read-only actions are on. Anything that can change something starts off — turn on the ones you want.
-          </div>
-        </div>
-      </div>
-
-      <ActionGroup
-        title="Read only"
-        hint="these can look but not change anything"
-        actions={readOnly}
-        enabled={enabled}
-        onToggle={onToggle}
-        bulkLabel="Turn all off"
-        onBulk={() => onBulk(readOnly.map((a) => a.catalogEntryId), false)}
-        askFirstLevels={askFirstLevels}
-      />
-
-      <ActionGroup
-        title="Can make changes"
-        hint="these change something in another app"
-        actions={canMakeChanges}
-        enabled={enabled}
-        onToggle={onToggle}
-        bulkLabel="Turn all on"
-        onBulk={() => onBulk(canMakeChanges.map((a) => a.catalogEntryId), true)}
-        askFirstLevels={askFirstLevels}
-      />
-
-      <div className="flex items-center justify-between sm:pt-1">
-        <Button variant="ghost" onClick={onBack}>
-          Back
-        </Button>
-        <div className="flex items-center gap-3">
-          <span className="hidden text-xs text-muted-foreground sm:inline">
-            If {appName} adds new actions later, they start off until you review them.
-          </span>
-          <Button onClick={onContinue} disabled={enabledCount === 0}>
-            Continue with {enabledCount} {enabledCount === 1 ? "action" : "actions"} on
-          </Button>
-        </div>
-      </div>
     </div>
   );
 }
