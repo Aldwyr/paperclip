@@ -1,0 +1,3 @@
+{
+  "ignorePatterns": "packages/paperclip-runner/docs/**\npackages/paperclip-runner/generated/**\npackages/paperclip-runner/knowledge/evidence/**\npackages/paperclip-runner/protocol/fixtures/**\npackages/paperclip-runner/src/generated/**\npackages/paperclip-runner/spec/capability/*.yaml\npackages/paperclip-runner/devtools/**/src/fonts/**"
+}
