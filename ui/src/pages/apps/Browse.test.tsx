@@ -132,6 +132,8 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(text).toContain("Acme CRM");
     // Bring-your-own is a first-class row in the store.
     expect(text).toContain("Connect your own tool");
+    expect(text).toContain("All discovered actions are enabled automatically.");
+    expect(text).not.toContain("review its actions before enabling it");
   });
 
   it("enables Notion, Zapier, and custom URLs while fading unfinished integrations", async () => {
