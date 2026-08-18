@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   assertSanitizedEvidence,
   extractProjectSummary,
+  parsePosthogLiveArguments,
   parseSanitizedAgentProof,
   PosthogLivePreflightError,
   preflightFailureMessage,
@@ -776,7 +777,9 @@ async function runSmoke({ config, chromium }) {
 async function main() {
   let prepared;
   try {
+    const options = parsePosthogLiveArguments(process.argv.slice(2));
     prepared = await preparePosthogLiveSmoke({
+      baseUrl: options.baseUrl,
       loadBrowser: () => import("@playwright/test"),
     });
   } catch (error) {

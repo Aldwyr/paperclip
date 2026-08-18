@@ -1,9 +1,9 @@
 const REQUIRED_ENVIRONMENT = [
-  "PAPERCLIP_E2E_BASE_URL",
-  "PAPERCLIP_E2E_EMAIL",
-  "PAPERCLIP_DEV_LOGIN_PASSWORD",
-  "POSTHOG_PROJECT_ID",
+  "INTEGRATIONS_POSTHOG_PAPERCLIP_E2E_EMAIL",
+  "INTEGRATIONS_POSTHOG_PAPERCLIP_DEV_LOGIN_PASSWORD",
+  "INTEGRATIONS_POSTHOG_POSTHOG_PROJECT_ID",
 ];
+const REQUIRED_PROJECT_ID = "483530";
 
 export class PosthogLivePreflightError extends Error {
   constructor(code, details = {}) {
@@ -19,15 +19,31 @@ function requiredValue(environment, key) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-export function preflightPosthogLive(environment = process.env) {
+export function parsePosthogLiveArguments(args = []) {
+  if (args.length === 0) return {};
+  if (args.length === 1 && !args[0].startsWith("-")) return { baseUrl: args[0] };
+  if (args.length === 2 && args[0] === "--base-url" && args[1].trim()) {
+    return { baseUrl: args[1] };
+  }
+  throw new PosthogLivePreflightError("invalid_arguments");
+}
+
+export function preflightPosthogLive(environment = process.env, options = {}) {
   const missing = REQUIRED_ENVIRONMENT.filter((key) => requiredValue(environment, key) === "");
   if (missing.length > 0) {
     throw new PosthogLivePreflightError("missing_environment", { missing });
   }
 
+  const baseUrlValue = typeof options.baseUrl === "string" && options.baseUrl.trim()
+    ? options.baseUrl.trim()
+    : requiredValue(environment, "PAPERCLIP_API_URL");
+  if (!baseUrlValue) {
+    throw new PosthogLivePreflightError("missing_base_url");
+  }
+
   let baseUrl;
   try {
-    baseUrl = new URL(requiredValue(environment, "PAPERCLIP_E2E_BASE_URL"));
+    baseUrl = new URL(baseUrlValue);
   } catch {
     throw new PosthogLivePreflightError("invalid_base_url");
   }
@@ -41,11 +57,14 @@ export function preflightPosthogLive(environment = process.env) {
   }
   baseUrl.pathname = baseUrl.pathname.replace(/\/+$/, "") || "/";
 
-  const projectId = requiredValue(environment, "POSTHOG_PROJECT_ID");
+  const projectId = requiredValue(environment, "INTEGRATIONS_POSTHOG_POSTHOG_PROJECT_ID");
   if (!/^\d+$/.test(projectId)) {
     throw new PosthogLivePreflightError("invalid_project_id");
   }
-  const email = requiredValue(environment, "PAPERCLIP_E2E_EMAIL");
+  if (projectId !== REQUIRED_PROJECT_ID) {
+    throw new PosthogLivePreflightError("unexpected_project_id");
+  }
+  const email = requiredValue(environment, "INTEGRATIONS_POSTHOG_PAPERCLIP_E2E_EMAIL");
   if (!email.includes("@")) {
     throw new PosthogLivePreflightError("invalid_email");
   }
@@ -53,17 +72,18 @@ export function preflightPosthogLive(environment = process.env) {
   return {
     baseUrl: baseUrl.origin,
     email,
-    password: environment.PAPERCLIP_DEV_LOGIN_PASSWORD,
+    password: environment.INTEGRATIONS_POSTHOG_PAPERCLIP_DEV_LOGIN_PASSWORD,
     projectId,
   };
 }
 
 export async function preparePosthogLiveSmoke({
   environment = process.env,
+  baseUrl,
   fetchImpl = globalThis.fetch,
   loadBrowser,
 }) {
-  const config = preflightPosthogLive(environment);
+  const config = preflightPosthogLive(environment, { baseUrl });
   let response;
   try {
     response = await fetchImpl(new URL("/api/health", config.baseUrl), {
@@ -216,6 +236,12 @@ export function preflightFailureMessage(error) {
   }
   if (error.code === "health_http_error") {
     return `PostHog live smoke preflight failed: /api/health returned HTTP ${error.details.status}.`;
+  }
+  if (error.code === "missing_base_url") {
+    return "PostHog live smoke preflight failed: pass the target Paperclip URL or run inside a Paperclip heartbeat.";
+  }
+  if (error.code === "invalid_arguments") {
+    return "PostHog live smoke preflight failed: expected an optional Paperclip URL or --base-url <url>.";
   }
   return `PostHog live smoke preflight failed: ${error.code}.`;
 }

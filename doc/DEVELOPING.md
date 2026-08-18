@@ -1032,15 +1032,17 @@ uses a live vendor OAuth flow and creates a short-lived connection plus one
 fresh-run proof issue.
 
 ```sh
-PAPERCLIP_E2E_BASE_URL=https://paperclip.example.test \
-PAPERCLIP_E2E_EMAIL=operator@example.test \
-PAPERCLIP_DEV_LOGIN_PASSWORD='<environment-delivered>' \
-POSTHOG_PROJECT_ID=483530 \
-pnpm smoke:posthog-live
+INTEGRATIONS_POSTHOG_PAPERCLIP_E2E_EMAIL=operator@example.test \
+INTEGRATIONS_POSTHOG_PAPERCLIP_DEV_LOGIN_PASSWORD='<environment-delivered>' \
+INTEGRATIONS_POSTHOG_POSTHOG_PROJECT_ID=483530 \
+pnpm smoke:posthog-live https://paperclip.example.test
 ```
 
-The command fails before browser launch unless all four variables are present,
-and never prints their values. It creates no trace, video, or HAR, begins
+The command fails before browser launch unless all three integration bindings
+are present, and never prints their values. A Paperclip heartbeat derives the
+target origin from its injected `PAPERCLIP_API_URL`; the positional URL (or
+`--base-url <url>`) selects the running instance for a manual invocation. It
+creates no trace, video, or HAR, begins
 screenshots only after OAuth returns to Paperclip, enables read actions only,
 installs the connection on `CodexCoderPro` only, runs `project-get` with `{}`
 from the board Test panel and a fresh agent run, then removes the connection.
