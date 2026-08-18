@@ -21,6 +21,8 @@ const finishAppMock = vi.hoisted(() => vi.fn());
 const putConnectionInstallsMock = vi.hoisted(() => vi.fn());
 const refreshCatalogMock = vi.hoisted(() => vi.fn());
 const startOAuthMock = vi.hoisted(() => vi.fn());
+const listUserDirectoryMock = vi.hoisted(() => vi.fn());
+const getSessionMock = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockParams = vi.hoisted(() => ({ connectionId: "conn-1", tab: "setup" as string | undefined }));
 const navigateComponentMock = vi.hoisted(() => vi.fn());
@@ -48,6 +50,18 @@ vi.mock("@/api/tools", () => ({
     refreshCatalog: (connectionId: string) => refreshCatalogMock(connectionId),
     startOAuth: (connectionId: string) => startOAuthMock(connectionId),
     reconnectConnection: vi.fn(),
+  },
+}));
+
+vi.mock("@/api/access", () => ({
+  accessApi: {
+    listUserDirectory: (companyId: string) => listUserDirectoryMock(companyId),
+  },
+}));
+
+vi.mock("@/api/auth", () => ({
+  authApi: {
+    getSession: () => getSessionMock(),
   },
 }));
 
@@ -249,6 +263,11 @@ describe("AppDetail", () => {
       authorizationUrl: "https://example.test/oauth",
       expiresAt: "2026-07-10T00:00:00.000Z",
     });
+    listUserDirectoryMock.mockResolvedValue({ users: [] });
+    getSessionMock.mockResolvedValue({
+      user: { id: "user-1", name: "Dotta", image: null },
+      session: { userId: "user-1" },
+    });
   });
 
   afterEach(() => {
@@ -277,7 +296,6 @@ describe("AppDetail", () => {
       "review",
       "permissions",
       "activity",
-      "advanced",
     ]);
   });
 
@@ -327,7 +345,6 @@ describe("AppDetail", () => {
     ["review", "Review 1 new action", true],
     ["permissions", "Action permissions", true],
     ["activity", "No activity yet.", false],
-    ["advanced", "Technical details", false],
   ])("renders the %s tab panel", async (tab, expectedText, showsActionCount) => {
     mockParams.tab = tab;
 
@@ -337,6 +354,17 @@ describe("AppDetail", () => {
     expect(container.textContent?.includes("2 actions available")).toBe(showsActionCount);
     expect(container.textContent).toContain(expectedText);
     expect(container.querySelector("section.bg-card")).toBeNull();
+  });
+
+  it("redirects the legacy Advanced route to Setup", async () => {
+    mockParams.tab = "advanced";
+
+    await renderAppDetail();
+
+    expect(navigateComponentMock).toHaveBeenCalledWith({
+      to: "/apps/conn-1/setup",
+      replace: true,
+    });
   });
 
   it("renders setup without waiting for tool discovery", async () => {
@@ -360,8 +388,8 @@ describe("AppDetail", () => {
     expect(container.textContent).not.toContain("Action permissions");
   });
 
-  it("hides secret URL parameters in advanced technical details", async () => {
-    mockParams.tab = "advanced";
+  it("hides secret URL parameters in setup technical details", async () => {
+    mockParams.tab = "setup";
     getConnectionMock.mockResolvedValue(
       connection({
         config: {
@@ -446,13 +474,15 @@ describe("AppDetail", () => {
     expect(finishInput.enabledCatalogEntryIds).not.toContain("catalog-quarantined-block");
   });
 
-  it("keeps setup focused on description and lifecycle", async () => {
+  it("keeps setup focused while including technical details and the danger zone", async () => {
     mockParams.tab = "setup";
 
     await renderAppDetail();
 
     expect(container.textContent).toContain("Give agents a governed way to inspect repositories and pull requests.");
     expect(container.textContent).toContain("Agents can use this app");
+    expect(container.textContent).toContain("Technical details");
+    expect(container.textContent).toContain("Danger zone");
     expect(container.textContent).not.toContain("Read repo");
     expect(container.textContent).not.toContain("Action permissions");
     expect(container.querySelector("section.bg-card")).toBeNull();
@@ -484,6 +514,7 @@ describe("AppDetail", () => {
   it("matches connected Notion guidance to the reconnect action", async () => {
     getConnectionMock.mockResolvedValue(connection({
       name: "Notion",
+      createdByUserId: "user-1",
       config: {
         sourceTemplateKey: "notion",
         oauth: {
@@ -506,9 +537,24 @@ describe("AppDetail", () => {
         urlPatterns: [],
       }],
     });
+    listUserDirectoryMock.mockResolvedValue({
+      users: [{
+        principalId: "user-1",
+        status: "active",
+        user: {
+          id: "user-1",
+          name: "Dotta",
+          email: "dotta@example.com",
+          image: "https://example.com/dotta.png",
+        },
+      }],
+    });
 
     await renderAppDetail();
 
+    expect(container.textContent).toContain("Dotta’s Notion");
+    expect(container.textContent).toContain("Connected by");
+    expect(container.querySelector('[title="Dotta"] [data-slot="avatar"]')).toBeTruthy();
     expect(container.textContent).toContain(
       "Your workspace authorization is active. Reconnect any time to replace it.",
     );
