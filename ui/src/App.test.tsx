@@ -251,6 +251,7 @@ describe("Apps routes", () => {
     expect(appSource).toContain('<Route path="apps/connections" element={<Connections />} />');
     expect(appSource).toContain('<Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />');
     expect(appSource).toContain('<Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />');
+    expect(appSource).toContain('<Route path="apps/advanced/gateways" element={<GatewaysList />} />');
   });
 });
 
