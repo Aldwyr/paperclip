@@ -24,6 +24,28 @@ const SESSION_STORAGE_KEY = "paperclip-runner.live-console.session";
 const RECONNECT_DELAY_MS = 900;
 const MAX_RECONNECT_ATTEMPTS = 5;
 
+export interface LiveEventCursor {
+  cursor: number;
+  seenSourceEventIds: Set<string>;
+}
+
+export function createLiveEventCursor(
+  events: readonly PrpEvent[] = [],
+  cursor = 0,
+): LiveEventCursor {
+  return {
+    cursor,
+    seenSourceEventIds: new Set(events.map((event) => event.sourceEventId)),
+  };
+}
+
+export function acceptLiveEvent(cursor: LiveEventCursor, event: PrpEvent): boolean {
+  if (cursor.seenSourceEventIds.has(event.sourceEventId)) return false;
+  cursor.seenSourceEventIds.add(event.sourceEventId);
+  cursor.cursor += 1;
+  return true;
+}
+
 export type SteeringChipStatus = "pending" | "acknowledged" | "rejected" | "failed";
 
 export interface SteeringChip {
@@ -116,7 +138,7 @@ export function useLiveConsole(): LiveConsole {
   const [replayPlaying, setReplayPlaying] = useState(false);
 
   const streamRef = useRef<client.EventStreamHandle | null>(null);
-  const cursorRef = useRef(0);
+  const eventCursorRef = useRef(createLiveEventCursor());
   const sessionIdRef = useRef<string | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -134,19 +156,15 @@ export function useLiveConsole(): LiveConsole {
       closeStream();
       setConnection(attempt === 0 ? "connecting" : "reconnecting");
       setReconnectAttempt(attempt);
-      streamRef.current = client.openEventStream(sessionId, cursorRef.current, {
+      streamRef.current = client.openEventStream(sessionId, eventCursorRef.current.cursor, {
         onOpen: () => {
           setConnection("connected");
           setReconnectAttempt(0);
           setAnnouncement("Connected");
         },
         onEvent: (event) => {
-          cursorRef.current += 1;
-          setEvents((current) =>
-            current.some((candidate) => candidate.sourceEventId === event.sourceEventId)
-              ? current
-              : [...current, event],
-          );
+          if (!acceptLiveEvent(eventCursorRef.current, event)) return;
+          setEvents((current) => [...current, event]);
         },
         onError: () => {
           closeStream();
@@ -186,7 +204,7 @@ export function useLiveConsole(): LiveConsole {
       window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
       adopt(next);
       setEvents(history.events);
-      cursorRef.current = history.cursor;
+      eventCursorRef.current = createLiveEventCursor(history.events, history.cursor);
       if (resume) setAnnouncement("Replayed the durable transcript");
       subscribe(sessionId, 0);
     },
@@ -328,7 +346,7 @@ export function useLiveConsole(): LiveConsole {
       await guard(async () => {
         closeStream();
         setEvents([]);
-        cursorRef.current = 0;
+        eventCursorRef.current = createLiveEventCursor();
         setSteeringChips([]);
         setReplayActive(false);
         setReplayPosition(0);
@@ -468,7 +486,7 @@ export function useLiveConsole(): LiveConsole {
       adopt(resumed);
       const history = await client.readEvents(sessionId, 0);
       setEvents(history.events);
-      cursorRef.current = history.cursor;
+      eventCursorRef.current = createLiveEventCursor(history.events, history.cursor);
       subscribe(sessionId, 0);
       setAnnouncement("Resumed the same session");
     });
@@ -489,7 +507,7 @@ export function useLiveConsole(): LiveConsole {
     }
     window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
     sessionIdRef.current = null;
-    cursorRef.current = 0;
+    eventCursorRef.current = createLiveEventCursor();
     setState(null);
     setEvents([]);
     setSteeringChips([]);
