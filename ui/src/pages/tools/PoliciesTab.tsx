@@ -25,6 +25,7 @@ import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { projectsApi } from "@/api/projects";
 import { ApiError } from "@/api/client";
+import { AgentSelect } from "@/components/AgentMultiSelect";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -448,18 +449,7 @@ function PolicySimulator({
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1.5">
               <Label>Agent</Label>
-              <Select value={agentId} onValueChange={setAgentId}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Select an agent" />
-                </SelectTrigger>
-                <SelectContent>
-                  {agents.map((a) => (
-                    <SelectItem key={a.id} value={a.id}>
-                      {a.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <AgentSelect agents={agents} value={agentId} onChange={setAgentId} />
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="test-action">Action</Label>
@@ -596,13 +586,12 @@ function RuleBuilder({
             ))}
           </div>
           {form.whenMode === "agent" ? (
-            <Select value={form.agentId} onValueChange={(agentId) => setForm({ ...form, agentId })}>
-              <SelectTrigger><SelectValue placeholder="Choose agent" /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ANY_VALUE}>Choose agent</SelectItem>
-                {agents.map((agent) => <SelectItem key={agent.id} value={agent.id}>{agent.name}</SelectItem>)}
-              </SelectContent>
-            </Select>
+            <AgentSelect
+              agents={agents}
+              value={form.agentId === ANY_VALUE ? "" : form.agentId}
+              onChange={(agentId) => setForm({ ...form, agentId })}
+              placeholder="Choose agent"
+            />
           ) : null}
           {form.whenMode === "project" ? (
             <Select value={form.projectId} onValueChange={(projectId) => setForm({ ...form, projectId })}>

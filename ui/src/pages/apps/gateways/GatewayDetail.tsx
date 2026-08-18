@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Send } from "lucide-react";
+import { Pencil, Send } from "lucide-react";
 import type { ToolMcpGatewayTokenCreated } from "@paperclipai/shared";
 import { Link, Navigate, useNavigate, useParams } from "@/lib/router";
 import { useCompany } from "@/context/CompanyContext";
@@ -17,6 +17,7 @@ import { ErrorState } from "@/pages/tools/shared";
 import { GATEWAY_TABS, gatewayTabHref, isGatewayTabKey, type GatewayTabKey } from "./gateway-tabs";
 import { gatewaysQueryKey } from "./NewGatewayDialog";
 import { ConnectClientDialog } from "./ConnectClientDialog";
+import { EditGatewayDialog } from "./EditGatewayDialog";
 import { deriveGatewayApps, isGatewayOn } from "./gateway-helpers";
 import { OverviewPanel } from "./panels/OverviewPanel";
 import { AppsToolsPanel } from "./panels/AppsToolsPanel";
@@ -32,7 +33,8 @@ export function GatewayDetail() {
   const { selectedCompany, selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [snippetOpen, setSnippetOpen] = useState(false);
-  const [createdToken, setCreatedToken] = useState<ToolMcpGatewayTokenCreated | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [createdTokens, setCreatedTokens] = useState<ToolMcpGatewayTokenCreated[]>([]);
 
   const activeTab: GatewayTabKey | null = isGatewayTabKey(tab) ? tab : null;
 
@@ -92,6 +94,10 @@ export function GatewayDetail() {
     () => new Map((projectsQuery.data ?? []).map((project) => [project.id, project.name])),
     [projectsQuery.data],
   );
+
+  function rememberCreatedToken(token: ToolMcpGatewayTokenCreated) {
+    setCreatedTokens((current) => [token, ...current.filter((item) => item.id !== token.id)]);
+  }
 
   useEffect(() => {
     if (!gateway) return;
@@ -177,10 +183,16 @@ export function GatewayDetail() {
           <h1 className="mt-1 text-2xl font-bold tracking-tight">{gateway.name}</h1>
           <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{endpointHost}</p>
         </div>
-        <Button onClick={() => setSnippetOpen(true)}>
-          <Send className="mr-1.5 h-4 w-4" />
-          Show snippet
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => setEditing(true)}>
+            <Pencil className="mr-1.5 h-4 w-4" />
+            Edit
+          </Button>
+          <Button onClick={() => setSnippetOpen(true)}>
+            <Send className="mr-1.5 h-4 w-4" />
+            Client snippets
+          </Button>
+        </div>
       </div>
 
       <nav className="flex items-center gap-6 overflow-x-auto border-b border-border text-sm" aria-label="Gateway tabs">
@@ -220,7 +232,7 @@ export function GatewayDetail() {
         <TokensPanel
           companyId={selectedCompanyId}
           gateway={gateway}
-          onTokenCreated={(token) => setCreatedToken(token)}
+          onTokenCreated={rememberCreatedToken}
         />
       )}
       {activeTab === "activity" && (
@@ -234,7 +246,15 @@ export function GatewayDetail() {
         gateway={gateway}
         open={snippetOpen}
         onOpenChange={setSnippetOpen}
-        createdToken={createdToken}
+        createdTokens={createdTokens}
+        onTokenCreated={rememberCreatedToken}
+      />
+      <EditGatewayDialog
+        companyId={selectedCompanyId}
+        gateway={gateway}
+        profiles={profilesQuery.data?.profiles ?? []}
+        open={editing}
+        onOpenChange={setEditing}
       />
     </div>
   );

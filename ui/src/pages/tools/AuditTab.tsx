@@ -22,6 +22,7 @@ import {
   type ToolGatewayActivityEvent,
 } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
+import { AgentSelect } from "@/components/AgentMultiSelect";
 import { ToolsPageHeader, LoadingState, ErrorState, RelativeTime } from "./shared";
 import { advancedTabHref } from "./tool-tabs";
 
@@ -382,19 +383,12 @@ export function AuditTab({ companyId }: { companyId: string }) {
             ))}
           </SelectContent>
         </Select>
-        <Select value={agent} onValueChange={setAgent}>
-          <SelectTrigger className="w-40">
-            <SelectValue placeholder="Agent" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={ALL}>All agents</SelectItem>
-            {(agents.data ?? []).map((a) => (
-              <SelectItem key={a.id} value={a.id}>
-                {a.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <AgentSelect
+          agents={[{ id: ALL, name: "All agents" }, ...(agents.data ?? [])]}
+          value={agent}
+          onChange={setAgent}
+          triggerClassName="w-40"
+        />
         <Select value={outcome} onValueChange={setOutcome}>
           <SelectTrigger className="w-40">
             <SelectValue />
