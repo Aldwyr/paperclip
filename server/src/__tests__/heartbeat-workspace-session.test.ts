@@ -1676,6 +1676,65 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { name: "a different branch", branchName: "PAP-9001-derived-child-branch" },
+    { name: "no recorded branch", branchName: null },
+  ])(
+    "realizes the pinned existing branch instead of reusing an inherited workspace on $name",
+    async ({ branchName }) => {
+      const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+        issueExecutionWorkspaceId: "workspace-old",
+        issueExecutionWorkspacePreference: "reuse_existing",
+        existingExecutionWorkspaceStatus: "active",
+        requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+        existingExecutionWorkspaceBranchName: branchName,
+      });
+
+      expect(reuseRequest).toEqual({
+        requestedExecutionWorkspaceId: "workspace-old",
+        requestedShouldReuseExisting: false,
+        existingExecutionWorkspaceAvailable: false,
+      });
+
+      const metadata = buildWorkspaceConfigMetadata();
+      const decision = resolveExecutionWorkspaceConfigFreshness({
+        hasExistingWorkspace: false,
+        existingWorkspaceMetadata: null,
+        nextMetadata: metadata,
+      });
+      const realizeWorkspace = vi.fn(async () => ({ id: "pinned-branch-workspace", warnings: [] }));
+      const restoreExistingWorkspace = vi.fn(async () => ({ id: "workspace-old", warnings: [] }));
+
+      const result = await provisionExecutionWorkspaceForFreshnessDecision({
+        requestedShouldReuseExisting: reuseRequest.requestedShouldReuseExisting,
+        existingExecutionWorkspaceId: reuseRequest.requestedExecutionWorkspaceId,
+        issueRef: { id: "issue-1", identifier: "PAP-42" },
+        runId: "run-1",
+        workspaceConfigFreshness: decision,
+        restoreExistingWorkspace,
+        realizeWorkspace,
+      });
+
+      expect(result.executionWorkspace).toEqual({ id: "pinned-branch-workspace", warnings: [] });
+      expect(result.reusedExecutionWorkspace).toBeNull();
+      expect(restoreExistingWorkspace).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps reusing an inherited workspace whose branch matches the pinned existing branch", () => {
+    expect(resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-old",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      requestedExistingBranch: "PAP-14380-salvage-pap-9514",
+      existingExecutionWorkspaceBranchName: "PAP-14380-salvage-pap-9514",
+    })).toEqual({
+      requestedExecutionWorkspaceId: "workspace-old",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+  });
+
   it("fails loudly when explicit reuse restore returns no workspace", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({

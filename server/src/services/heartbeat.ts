@@ -4389,10 +4389,22 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  requestedExistingBranch?: string | null;
+  existingExecutionWorkspaceBranchName?: string | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
+  // An explicitly pinned existing branch outranks an inherited reuse_existing
+  // binding: a persisted workspace on any other branch (or with no recorded
+  // branch) is stale for this issue, so dispatch realizes the pinned branch
+  // instead of restoring the mismatched workspace.
+  const requestedExistingBranch = readNonEmptyString(input.requestedExistingBranch);
+  const existingWorkspaceMatchesRequestedBranch =
+    requestedExistingBranch === null ||
+    readNonEmptyString(input.existingExecutionWorkspaceBranchName) === requestedExistingBranch;
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    requestedExecutionWorkspaceId !== null &&
+    existingWorkspaceMatchesRequestedBranch;
 
   return {
     requestedExecutionWorkspaceId,
@@ -14345,6 +14357,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      requestedExistingBranch: issueExecutionWorkspaceSettings?.workspaceStrategy?.existingBranch ?? null,
+      existingExecutionWorkspaceBranchName: existingExecutionWorkspace?.branchName ?? null,
     });
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
     const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable

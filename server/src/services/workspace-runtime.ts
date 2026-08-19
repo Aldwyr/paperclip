@@ -3041,7 +3041,20 @@ export async function realizeExecutionWorkspace(input: {
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
+  const requestedExistingBranch = asString(rawStrategy.existingBranch, "").trim();
   if (strategyType !== "git_worktree") {
+    if (requestedExistingBranch) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}" but has type "${strategyType}"; an exact-branch workspace requires strategy type "git_worktree". Set workspaceStrategy.type to "git_worktree" or remove existingBranch.`,
+        {
+          workspaceValidation: {
+            reason: "existing_branch_requires_git_worktree",
+            requestedExistingBranch,
+            strategyType,
+          },
+        },
+      );
+    }
     return {
       ...input.base,
       strategy: "project_primary",
@@ -3055,19 +3068,56 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
-  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
-  const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
-    issue: input.issue,
-    agent: input.agent,
-    projectId: input.base.projectId,
-    repoRef: input.base.repoRef,
-  });
-  let branchName = sanitizeBranchName(renderedBranch);
+  let branchName: string;
+  if (requestedExistingBranch) {
+    // Exact-branch mode: attach the requested pre-existing branch verbatim.
+    // The branch must already exist; realization never creates, renames, or
+    // resets it, and any mismatch below fails closed instead of falling back
+    // to a derived branch or the shared checkout.
+    const existingBranchSha = await runGit(
+      ["rev-parse", "--verify", "--quiet", `refs/heads/${requestedExistingBranch}`],
+      repoRoot,
+    ).catch(() => null);
+    if (!existingBranchSha) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", but no local branch with that name exists in "${repoRoot}". Create or fetch the branch first, or remove workspaceStrategy.existingBranch; exact-branch realization never creates a branch.`,
+        {
+          workspaceValidation: {
+            reason: "existing_branch_not_found",
+            requestedExistingBranch,
+            repoRoot,
+          },
+        },
+      );
+    }
+    branchName = requestedExistingBranch;
+  } else {
+    const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
+    const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
+      issue: input.issue,
+      agent: input.agent,
+      projectId: input.base.projectId,
+      repoRef: input.base.repoRef,
+    });
+    branchName = sanitizeBranchName(renderedBranch);
+  }
   const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
   const worktreeParentDir = configuredParentDir
     ? resolveConfiguredPath(configuredParentDir, repoRoot)
     : path.join(repoRoot, ".paperclip", "worktrees");
   const worktreePath = path.join(worktreeParentDir, branchName);
+  if (path.relative(worktreeParentDir, worktreePath).startsWith("..")) {
+    throw new WorkspaceRuntimeValidationFailure(
+      `Workspace branch "${branchName}" resolves to a worktree path outside the managed worktree parent directory "${worktreeParentDir}".`,
+      {
+        workspaceValidation: {
+          reason: "worktree_path_escapes_parent_dir",
+          branchName,
+          worktreeParentDir,
+        },
+      },
+    );
+  }
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
@@ -3086,7 +3136,9 @@ export async function realizeExecutionWorkspace(input: {
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
   async function reuseExistingWorktree(reusablePath: string, effectiveBranchName = branchName, extraWarnings: string[] = []) {
-    const refresh = currentBaseRefSha
+    // An exact-branch attach must never move the requested branch, so skip
+    // the unstarted-worktree fast-forward that template-derived reuse gets.
+    const refresh = currentBaseRefSha && !requestedExistingBranch
       ? await refreshUnstartedWorktreeToBase({
           repoRoot,
           worktreePath: reusablePath,
@@ -3157,6 +3209,11 @@ export async function realizeExecutionWorkspace(input: {
       expectedBranchName: branchName,
     }).catch(() => null);
     if (validation && !validation.valid && validation.reasonCode === "branch_mismatch") {
+      if (requestedExistingBranch) {
+        // Exact-branch mode never reconciles a mismatched checkout onto
+        // another branch; the caller fails closed with the mismatch reason.
+        return { validation, branchName, warnings: [] };
+      }
       const coherence = await ensureGitWorktreeBranchCoherent({
         db: input.db ?? null,
         repoRoot,
@@ -3198,6 +3255,19 @@ export async function realizeExecutionWorkspace(input: {
     }
     const validation = reusable.validation;
     const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
+    if (requestedExistingBranch) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", but the worktree path "${worktreePath}" already exists and is not a reusable checkout of that branch${reason}. Repair or remove that worktree, then retry; exact-branch realization never reconciles it onto another branch.`,
+        {
+          workspaceValidation: {
+            reason: "existing_branch_worktree_not_reusable",
+            reasonCode: validation && !validation.valid ? validation.reasonCode : null,
+            requestedExistingBranch,
+            worktreePath,
+          },
+        },
+      );
+    }
     throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
   }
 
@@ -3209,7 +3279,75 @@ export async function realizeExecutionWorkspace(input: {
     }
     const validation = reusable.validation;
     const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
+    if (requestedExistingBranch) {
+      throw new WorkspaceRuntimeValidationFailure(
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", which is already checked out at "${registeredBranchWorktree}", but that worktree is not reusable${reason}. Repair or remove that worktree, then retry.`,
+        {
+          workspaceValidation: {
+            reason: "existing_branch_worktree_not_reusable",
+            reasonCode: validation && !validation.valid ? validation.reasonCode : null,
+            requestedExistingBranch,
+            worktreePath: registeredBranchWorktree,
+          },
+        },
+      );
+    }
     throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
+  }
+
+  if (requestedExistingBranch) {
+    try {
+      await recordGitOperation(input.recorder, {
+        phase: "worktree_prepare",
+        args: ["worktree", "add", worktreePath, branchName],
+        cwd: repoRoot,
+        metadata: {
+          repoRoot,
+          worktreePath,
+          branchName,
+          baseRef,
+          baseRefSha: currentBaseRefSha,
+          created: false,
+          attachedExistingBranch: true,
+        },
+        successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
+        failureLabel: `git worktree add ${worktreePath}`,
+      });
+    } catch (attachError) {
+      const message = attachError instanceof Error ? attachError.message : String(attachError);
+      throw new WorkspaceRuntimeValidationFailure(
+        `Could not attach existing branch "${requestedExistingBranch}" as a git worktree at "${worktreePath}": ${message}`,
+        {
+          workspaceValidation: {
+            reason: "existing_branch_attach_failed",
+            requestedExistingBranch,
+            worktreePath,
+          },
+        },
+      );
+    }
+    await provisionExecutionWorktree({
+      strategy: rawStrategy,
+      base: input.base,
+      repoRoot,
+      worktreePath,
+      branchName,
+      issue: input.issue,
+      agent: input.agent,
+      created: true,
+      recorder: input.recorder ?? null,
+    });
+    return {
+      ...input.base,
+      repoRef: baseRef,
+      strategy: "git_worktree",
+      cwd: worktreePath,
+      branchName,
+      worktreePath,
+      warnings: baseRefreshWarnings,
+      created: true,
+      baseRefSha: currentBaseRefSha,
+    };
   }
 
   try {

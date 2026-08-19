@@ -8314,3 +8314,151 @@ describe("workspace realization request additionalSources", () => {
     expect(parsed?.runtimeOverlay.runtimeProvisionCommand).toBeNull();
   });
 });
+
+describe("realizeExecutionWorkspace with an exact existing branch", () => {
+  function realizeExistingBranch(
+    repoRoot: string,
+    existingBranch: string,
+    strategyOverrides: Record<string, unknown> = {},
+  ) {
+    return realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          existingBranch,
+          ...strategyOverrides,
+        },
+      },
+      issue: {
+        id: "issue-pr-prep",
+        identifier: "PAP-9001",
+        title: "Prepare pull request for an existing branch",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+  }
+
+  async function createBranchWithCommit(repoRoot: string, branchName: string, fileName: string) {
+    const baseBranch = await readGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    await runGit(repoRoot, ["checkout", "-b", branchName]);
+    await fs.writeFile(path.join(repoRoot, fileName), `${fileName}\n`, "utf8");
+    await runGit(repoRoot, ["add", fileName]);
+    await runGit(repoRoot, ["commit", "-m", `Add ${fileName}`]);
+    await runGit(repoRoot, ["checkout", baseBranch]);
+    return readGit(repoRoot, ["rev-parse", branchName]);
+  }
+
+  it("attaches an isolated worktree checked out on exactly the requested branch", async () => {
+    const repoRoot = await createTempRepo();
+    const branchTip = await createBranchWithCommit(repoRoot, "feature/preexisting-work", "existing.txt");
+
+    const workspace = await realizeExistingBranch(repoRoot, "feature/preexisting-work");
+
+    expect(workspace.strategy).toBe("git_worktree");
+    expect(workspace.branchName).toBe("feature/preexisting-work");
+    expect(workspace.cwd).not.toBe(repoRoot);
+    expect(workspace.cwd).toContain(path.join(".paperclip", "worktrees"));
+    expect(await readGit(workspace.cwd, ["branch", "--show-current"])).toBe("feature/preexisting-work");
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
+    expect(await readGit(repoRoot, ["rev-parse", "feature/preexisting-work"])).toBe(branchTip);
+  });
+
+  it("reuses a registered legacy worktree that already has the branch checked out", async () => {
+    const repoRoot = await createTempRepo();
+    const branchTip = await createBranchWithCommit(repoRoot, "feature/legacy-checkout", "legacy.txt");
+    const legacyPath = path.join(repoRoot, ".worktrees", "legacy-checkout");
+    await runGit(repoRoot, ["worktree", "add", legacyPath, "feature/legacy-checkout"]);
+
+    const workspace = await realizeExistingBranch(repoRoot, "feature/legacy-checkout");
+
+    expect(workspace.cwd).toBe(path.resolve(legacyPath));
+    expect(workspace.branchName).toBe("feature/legacy-checkout");
+    expect(workspace.created).toBe(false);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
+    expect(await readGit(repoRoot, ["rev-parse", "feature/legacy-checkout"])).toBe(branchTip);
+  });
+
+  it("fails closed when the requested branch does not exist and creates nothing", async () => {
+    const repoRoot = await createTempRepo();
+
+    await expect(realizeExistingBranch(repoRoot, "feature/never-created")).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "existing_branch_not_found",
+          requestedExistingBranch: "feature/never-created",
+        }),
+      },
+    });
+
+    expect(await readGit(repoRoot, ["branch", "--list", "feature/never-created"])).toBe("");
+    expect(
+      existsSync(path.join(repoRoot, ".paperclip", "worktrees", "feature", "never-created")),
+    ).toBe(false);
+  });
+
+  it("fails closed instead of reconciling when the managed worktree path holds another branch", async () => {
+    const repoRoot = await createTempRepo();
+    const branchTip = await createBranchWithCommit(repoRoot, "feature/pinned", "pinned.txt");
+    const managedPath = path.join(repoRoot, ".paperclip", "worktrees", "feature/pinned");
+    await runGit(repoRoot, ["worktree", "add", "-b", "stale-occupant", managedPath]);
+
+    await expect(realizeExistingBranch(repoRoot, "feature/pinned")).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "existing_branch_worktree_not_reusable",
+          requestedExistingBranch: "feature/pinned",
+        }),
+      },
+    });
+
+    expect(await readGit(repoRoot, ["rev-parse", "feature/pinned"])).toBe(branchTip);
+    expect(await readGit(managedPath, ["branch", "--show-current"])).toBe("stale-occupant");
+  });
+
+  it("never fast-forwards an unstarted exact branch to a newer base ref", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const oldMaster = await readGit(repoRoot, ["rev-parse", "origin/master"]);
+    await runGit(repoRoot, ["branch", "release/frozen", oldMaster]);
+
+    const first = await realizeExistingBranch(repoRoot, "release/frozen", { baseRef: "origin/master" });
+    expect(await readGit(first.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
+
+    const newMaster = await advanceRemoteMaster(sourceRepo, remotePath, "advance.txt");
+    const reused = await realizeExistingBranch(repoRoot, "release/frozen", { baseRef: "origin/master" });
+
+    expect(reused.cwd).toBe(first.cwd);
+    expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
+    expect(await readGit(repoRoot, ["rev-parse", "release/frozen"])).toBe(oldMaster);
+    expect(newMaster).not.toBe(oldMaster);
+  });
+
+  it("fails closed when an existing branch is pinned on a non-worktree strategy", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/wrong-mode", "wrong-mode.txt");
+
+    await expect(
+      realizeExistingBranch(repoRoot, "feature/wrong-mode", { type: "project_primary" }),
+    ).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "existing_branch_requires_git_worktree",
+        }),
+      },
+    });
+  });
+});
