@@ -241,6 +241,7 @@ function startInput(options?: {
       worktreePath: null,
       warnings: [],
       created: false,
+      branchCreatedByRuntime: false,
     },
     executionWorkspaceId: EXECUTION_WORKSPACE_ID,
     config: {

@@ -14951,7 +14951,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? reusableExistingExecutionWorkspace?.metadata ?? null
         : null,
       source: executionWorkspace.source,
-      createdByRuntime: executionWorkspace.created,
+      // Branch ownership, not worktree freshness: attaching a worktree to a
+      // pre-existing branch reports created=true but must never make terminal
+      // cleanup delete that operator-owned branch.
+      createdByRuntime: executionWorkspace.branchCreatedByRuntime,
       configSnapshot,
       shouldReuseExisting: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
       shouldRefreshConfigSnapshot: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,

@@ -163,6 +163,12 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   worktreePath: string | null;
   warnings: string[];
   created: boolean;
+  // Branch ownership, distinct from `created` (which reports a fresh worktree
+  // checkout). True only when this realization created the branch ref itself;
+  // attaching a worktree to a pre-existing branch keeps the branch
+  // operator-owned. Persisted as metadata.createdByRuntime, which terminal
+  // cleanup uses to decide whether the branch may be deleted.
+  branchCreatedByRuntime: boolean;
   baseRefSha?: string | null;
   pendingForwardBranchReconcile?: PendingForwardBranchReconcile | null;
 }
@@ -3063,6 +3069,7 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: null,
       warnings: [],
       created: false,
+      branchCreatedByRuntime: false,
       baseRefSha: null,
     };
   }
@@ -3197,6 +3204,7 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: reusablePath,
       warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
       created: false,
+      branchCreatedByRuntime: false,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
     };
@@ -3345,11 +3353,15 @@ export async function realizeExecutionWorkspace(input: {
       branchName,
       worktreePath,
       warnings: baseRefreshWarnings,
+      // The worktree is new, but the pinned branch pre-existed: it stays
+      // operator-owned so terminal cleanup never deletes it.
       created: true,
+      branchCreatedByRuntime: false,
       baseRefSha: currentBaseRefSha,
     };
   }
 
+  let branchCreatedByRuntime = true;
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -3387,6 +3399,9 @@ export async function realizeExecutionWorkspace(input: {
         successMessage: `Attached existing branch ${branchName} at ${worktreePath}\n`,
         failureLabel: `git worktree add ${worktreePath}`,
       });
+      // The template rendered to a branch that already existed, so this
+      // attach did not create the branch and cleanup must not delete it.
+      branchCreatedByRuntime = false;
     } catch (attachError) {
       if (!gitErrorIncludes(attachError, "already checked out")) {
         throw attachError;
@@ -3419,6 +3434,7 @@ export async function realizeExecutionWorkspace(input: {
     worktreePath,
     warnings: baseRefreshWarnings,
     created: true,
+    branchCreatedByRuntime,
     baseRefSha: currentBaseRefSha,
   };
 }
@@ -3469,6 +3485,10 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     worktreePath: strategy === "git_worktree" ? (input.workspace.providerRef ?? cwd) : null,
     warnings: [],
     created: false,
+    // Restoring a persisted workspace keeps its recorded branch ownership, so
+    // a runtime-created branch stays cleanup-eligible across reuse heartbeats
+    // and an attached pre-existing branch stays operator-owned.
+    branchCreatedByRuntime: input.workspace.metadata?.createdByRuntime === true,
     baseRefSha: readRecordedBaseRefSha(input.workspace.metadata),
   };
   const provisionCommand = asString(input.workspace.config?.provisionCommand, "").trim();
@@ -3677,6 +3697,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     worktreePath,
     warnings: [...restoreRefreshWarnings, ...baseDrift.warnings],
     created,
+    branchCreatedByRuntime: realized.branchCreatedByRuntime || created,
     baseRefSha:
       recordedBaseRefSha
       ?? (created ? restoreCurrentBaseRefSha : baseDrift.branchBaseRefSha)
@@ -3837,6 +3858,10 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       warnings.push(`Could not read worktree instance pointer: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+  // Ownership signal persisted from RealizedExecutionWorkspace.branchCreatedByRuntime:
+  // true only when the runtime created the branch ref (or local_fs directory)
+  // itself. A worktree attached to a pre-existing branch persists false, so
+  // cleanup below removes the worktree but leaves the branch untouched.
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
   const cleanupCommands = input.runCleanupCommands === false
     ? []
@@ -7896,6 +7921,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           worktreePath: null,
           warnings: [],
           created: false,
+          branchCreatedByRuntime: false,
         },
         config: {
           workspaceRuntime: runtimeConfig.workspaceRuntime,
@@ -7950,6 +7976,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           worktreePath: row.strategyType === "git_worktree" ? row.cwd : null,
           warnings: [],
           created: false,
+          branchCreatedByRuntime: (row.metadata as Record<string, unknown> | null)?.createdByRuntime === true,
         },
         executionWorkspaceId: row.id,
         config: {

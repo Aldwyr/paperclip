@@ -3469,6 +3469,8 @@ describe("realizeExecutionWorkspace", () => {
       },
     });
 
+    expect(workspace.branchCreatedByRuntime).toBe(true);
+
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
         id: "execution-workspace-1",
@@ -3482,7 +3484,7 @@ describe("realizeExecutionWorkspace", () => {
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
         metadata: {
-          createdByRuntime: true,
+          createdByRuntime: workspace.branchCreatedByRuntime,
         },
       },
       projectWorkspace: {
@@ -8368,6 +8370,10 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
 
     expect(workspace.strategy).toBe("git_worktree");
     expect(workspace.branchName).toBe("feature/preexisting-work");
+    // The worktree is freshly created, but the pinned branch pre-existed and
+    // stays operator-owned so terminal cleanup never deletes it.
+    expect(workspace.created).toBe(true);
+    expect(workspace.branchCreatedByRuntime).toBe(false);
     expect(workspace.cwd).not.toBe(repoRoot);
     expect(workspace.cwd).toContain(path.join(".paperclip", "worktrees"));
     expect(await readGit(workspace.cwd, ["branch", "--show-current"])).toBe("feature/preexisting-work");
@@ -8444,6 +8450,146 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(oldMaster);
     expect(await readGit(repoRoot, ["rev-parse", "release/frozen"])).toBe(oldMaster);
     expect(newMaster).not.toBe(oldMaster);
+  });
+
+  function cleanupWorkspaceInput(
+    workspace: RealizedExecutionWorkspace,
+    repoRoot: string,
+    expectedBranchHeadSha: string,
+  ) {
+    return {
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspace.cwd,
+        providerType: "git_worktree",
+        providerRef: workspace.worktreePath,
+        branchName: workspace.branchName,
+        repoUrl: workspace.repoUrl,
+        baseRef: workspace.repoRef,
+        projectId: workspace.projectId,
+        projectWorkspaceId: workspace.workspaceId,
+        sourceIssueId: "issue-pr-prep",
+        // Persist ownership the way the heartbeat does: from the branch
+        // ownership signal, never from worktree creation.
+        metadata: { createdByRuntime: workspace.branchCreatedByRuntime },
+      },
+      projectWorkspace: {
+        cwd: repoRoot,
+        cleanupCommand: null,
+      },
+      expectedBranchHeadSha,
+    };
+  }
+
+  it("terminal cleanup removes the worktree but preserves the attached pre-existing branch at its tip", async () => {
+    const repoRoot = await createTempRepo();
+    const branchTip = await createBranchWithCommit(repoRoot, "feature/operator-owned", "operator.txt");
+
+    const workspace = await realizeExistingBranch(repoRoot, "feature/operator-owned");
+    expect(workspace.created).toBe(true);
+    expect(workspace.branchCreatedByRuntime).toBe(false);
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+      cleanupWorkspaceInput(workspace, repoRoot, branchTip),
+    );
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/operator-owned"])).toBe(branchTip);
+  });
+
+  it("terminal cleanup preserves a pre-existing branch pinned via a literal branchTemplate", async () => {
+    const repoRoot = await createTempRepo();
+    const branchTip = await createBranchWithCommit(repoRoot, "feature/literal-pin", "literal.txt");
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "feature/literal-pin",
+        },
+      },
+      issue: {
+        id: "issue-pr-prep",
+        identifier: "PAP-9002",
+        title: "Prepare pull request via a literal branch template",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(workspace.branchName).toBe("feature/literal-pin");
+    expect(workspace.created).toBe(true);
+    expect(workspace.branchCreatedByRuntime).toBe(false);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts(
+      cleanupWorkspaceInput(workspace, repoRoot, branchTip),
+    );
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/literal-pin"])).toBe(branchTip);
+  });
+
+  it("restoring a persisted workspace keeps the recorded branch ownership", async () => {
+    const repoRoot = await createTempRepo();
+    await createBranchWithCommit(repoRoot, "feature/persisted-ownership", "persisted-ownership.txt");
+    const first = await realizeExistingBranch(repoRoot, "feature/persisted-ownership");
+
+    async function restoreWithMetadata(metadata: Record<string, unknown>) {
+      return await ensurePersistedExecutionWorkspaceAvailable({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        workspace: {
+          mode: "isolated_workspace",
+          strategyType: "git_worktree",
+          cwd: first.cwd,
+          providerRef: first.worktreePath,
+          projectId: "project-1",
+          projectWorkspaceId: "workspace-1",
+          repoUrl: null,
+          baseRef: "HEAD",
+          branchName: first.branchName,
+          metadata,
+        },
+        issue: {
+          id: "issue-pr-prep",
+          identifier: "PAP-9003",
+          title: "Restore keeps branch ownership",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    }
+
+    const operatorOwned = await restoreWithMetadata({ createdByRuntime: false });
+    expect(operatorOwned?.branchCreatedByRuntime).toBe(false);
+
+    const runtimeOwned = await restoreWithMetadata({ createdByRuntime: true });
+    expect(runtimeOwned?.branchCreatedByRuntime).toBe(true);
   });
 
   it("fails closed when an existing branch is pinned on a non-worktree strategy", async () => {
