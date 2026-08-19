@@ -147,6 +147,33 @@ describe("selectConfiguredRuntimeServiceRows", () => {
     ]);
   });
 
+  it("can fall back to legacy execution-workspace scope for directly configured services", () => {
+    const projectScopedHistory = runtimeServiceRow({
+      serviceName: "worker",
+      command: "pnpm worker",
+    });
+    const legacyExecutionScopedWeb = runtimeServiceRow({
+      executionWorkspaceId: randomUUID(),
+      scopeType: "execution_workspace",
+      scopeId: randomUUID(),
+      serviceName: "web",
+      command: "pnpm dev",
+    });
+
+    const selected = selectConfiguredRuntimeServiceRows(
+      [projectScopedHistory, legacyExecutionScopedWeb],
+      { services: [{ name: "web", command: "pnpm dev" }] },
+      { fallbackScopeTypes: ["execution_workspace"] },
+    );
+
+    expect(selected).toEqual([
+      expect.objectContaining({
+        id: legacyExecutionScopedWeb.id,
+        configIndex: 0,
+      }),
+    ]);
+  });
+
   it("selects the row for the configured port instead of newer history on another port", () => {
     const previousPort = runtimeServiceRow({
       port: 42013,

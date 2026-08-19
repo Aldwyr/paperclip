@@ -1227,7 +1227,11 @@ async function loadEffectiveRuntimeServicesByExecutionWorkspace(
         return [
           row.id,
           workspaceRuntime
-            ? selectConfiguredRuntimeServiceRows(runtimeServiceRows, workspaceRuntime)
+            ? selectConfiguredRuntimeServiceRows(runtimeServiceRows, workspaceRuntime, {
+                // Runtime rows created before shared services defaulted to project-workspace
+                // scope remain valid for configs owned directly by an execution workspace.
+                fallbackScopeTypes: ["execution_workspace"],
+              })
             : runtimeServiceRows,
         ] as const;
       }

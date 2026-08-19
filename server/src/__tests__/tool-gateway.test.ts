@@ -1405,7 +1405,11 @@ rl.on("line", (line) => {
     ]));
   });
 
-  it("blocks private remote HTTP endpoints in authenticated public deployments before dispatch", async () => {
+  it.each([
+    ["local_trusted", { deploymentMode: "local_trusted" as const, deploymentExposure: "private" as const }],
+    ["authenticated/private", { deploymentMode: "authenticated" as const, deploymentExposure: "private" as const }],
+    ["authenticated/public", { deploymentMode: "authenticated" as const, deploymentExposure: "public" as const }],
+  ])("always blocks link-local gateway dispatch in %s before fetch", async (_label, deployment) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -1417,10 +1421,7 @@ rl.on("line", (line) => {
     await allowAllToolsForAgent(db, company.id, agent.id);
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("fetch should not be called"));
     try {
-      const gateway = createTestToolGatewayService(db, {
-        deploymentMode: "authenticated",
-        deploymentExposure: "public",
-      });
+      const gateway = createTestToolGatewayService(db, deployment);
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const connectedTool = (await gateway.listToolsForSession(session.token))
         .find((tool) => tool.providerType === "mcp_remote_http");

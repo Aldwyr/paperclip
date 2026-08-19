@@ -109,6 +109,7 @@ export function toolAccessRoutes(
   options: {
     deploymentMode?: DeploymentMode;
     deploymentExposure?: DeploymentExposure;
+    authPublicBaseUrl?: string | null;
     trustedLocalStdioRuntimeHost?: string | null;
     toolGateway?: ToolGatewayService;
   } = {},
@@ -123,6 +124,8 @@ export function toolAccessRoutes(
       || process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL?.trim()
       || process.env.BETTER_AUTH_URL?.trim()
       || process.env.BETTER_AUTH_BASE_URL?.trim()
+      || options.authPublicBaseUrl?.trim()
+      || process.env.PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL?.trim()
     );
     if (!raw) return null;
     try {

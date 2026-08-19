@@ -4498,7 +4498,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectUrlKey: "workspaces",
       projectName: "Workspaces",
       branchName: "paperclip/a",
-      serviceCount: 2,
+      serviceCount: 1,
       runningServiceCount: 1,
       primaryServiceUrl: "http://localhost:3100",
       primaryServiceUrlRunning: true,

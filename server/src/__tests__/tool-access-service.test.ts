@@ -121,7 +121,10 @@ function createRouteApp(
   db: ReturnType<typeof createDb>,
   actor?: Express.Request["actor"],
   toolGateway?: ToolGatewayService,
-  deployment?: { deploymentMode: "authenticated"; deploymentExposure: "public" },
+  deployment?: {
+    deploymentMode: "local_trusted" | "authenticated";
+    deploymentExposure: "private" | "public";
+  },
 ) {
   const app = express();
   app.use(express.json());
@@ -1261,20 +1264,30 @@ describeEmbeddedPostgres("tool access service", () => {
     })).rejects.toThrow("Local stdio MCP connections must use an approved templateId");
   });
 
-  it("blocks private remote HTTP endpoints in authenticated public deployments", async () => {
+  it.each([
+    ["local_trusted", { deploymentMode: "local_trusted" as const, deploymentExposure: "private" as const }],
+    ["authenticated/private", { deploymentMode: "authenticated" as const, deploymentExposure: "private" as const }],
+    ["authenticated/public", { deploymentMode: "authenticated" as const, deploymentExposure: "public" as const }],
+  ])("always blocks link-local remote HTTP endpoints in %s before fetch", async (_label, deployment) => {
     const company = await createCompany(db);
-    const service = toolAccessService(db, { deploymentMode: "authenticated", deploymentExposure: "public" });
+    const service = toolAccessService(db, deployment);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("fetch should not be called"));
 
-    await expect(service.createConnection(company.id, {
-      name: "Metadata endpoint",
-      transport: "mcp_remote",
-      config: { url: "http://169.254.169.254/latest/meta-data" },
-      enabled: true,
-      status: "active",
-    })).rejects.toMatchObject({
-      status: 400,
-      details: { code: "remote_http_private_endpoint" },
-    });
+    try {
+      await expect(service.createConnection(company.id, {
+        name: "Metadata endpoint",
+        transport: "mcp_remote",
+        config: { url: "http://169.254.169.254/latest/meta-data" },
+        enabled: true,
+        status: "active",
+      })).rejects.toMatchObject({
+        status: 400,
+        details: { code: "remote_http_private_endpoint" },
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("creates profiles with entries, binds them to agents, and resolves effective allowed tools", async () => {
@@ -5022,12 +5035,13 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
   });
 
-  it("rejects OAuth metadata redirects to private endpoints", async () => {
+  it.each([
+    ["local_trusted", { deploymentMode: "local_trusted" as const, deploymentExposure: "private" as const }],
+    ["authenticated/private", { deploymentMode: "authenticated" as const, deploymentExposure: "private" as const }],
+    ["authenticated/public", { deploymentMode: "authenticated" as const, deploymentExposure: "public" as const }],
+  ])("rejects OAuth metadata redirects to link-local endpoints in %s", async (_label, deployment) => {
     const company = await createCompany(db);
-    const app = createRouteApp(db, undefined, undefined, {
-      deploymentMode: "authenticated",
-      deploymentExposure: "public",
-    });
+    const app = createRouteApp(db, undefined, undefined, deployment);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
       if (href === "https://8.8.8.8/mcp") {
