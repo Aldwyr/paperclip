@@ -7093,6 +7093,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   recorder?: WorkspaceOperationRecorder | null;
   serviceIndex?: number | null;
+  runtimeServiceId?: string | null;
   respectDesiredStates?: boolean;
 };
 
@@ -7124,6 +7125,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
   const refs: RuntimeServiceRef[] = [];
   const pendingReadiness: PendingRuntimeServiceReadiness[] = [];
   const startedServiceIds: string[] = [];
+  const requestedRuntimeServiceId = rawServices.length === 1 ? input.runtimeServiceId : null;
 
   for (const service of rawServices) {
     const { scopeType, scopeId } = resolveServiceScopeId({
@@ -7146,7 +7148,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
 
     if (reuseKey) {
       const existing = await findHealthyRunningRuntimeService(reuseKey);
-      if (existing) {
+      if (existing && (!requestedRuntimeServiceId || existing.id === requestedRuntimeServiceId)) {
         const prepared = options?.preparedProvisioning;
         if (prepared?.service === service && prepared.record.id !== existing.id && persistenceDb) {
           await persistenceDb
@@ -7188,6 +7190,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
           : undefined,
       allowFixedPortFallback: options?.allowFixedPortFallback,
       excludedPorts: options?.excludedPorts,
+      runtimeServiceId: requestedRuntimeServiceId ?? undefined,
       reuseKey,
       scopeType,
       scopeId,

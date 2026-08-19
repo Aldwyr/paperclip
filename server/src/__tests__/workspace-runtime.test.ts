@@ -4119,6 +4119,32 @@ describe("ensureRuntimeServicesForRun", () => {
     }
   });
 
+  it("preserves the selected persisted runtime id when starting one configured service", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-selected-id-"));
+    const workspace = buildWorkspace(workspaceRoot);
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "runtime-selected-id");
+    const runtimeServiceId = randomUUID();
+    const config = runtimeProvisionTestConfig({});
+
+    try {
+      const services = await startRuntimeServicesForWorkspaceControl({
+        ...runtimeProvisionStartInput({ workspace, config }),
+        runtimeServiceId,
+        serviceIndex: 0,
+      });
+
+      expect(services).toHaveLength(1);
+      expect(services[0]?.id).toBe(runtimeServiceId);
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({
+        executionWorkspaceId: "execution-workspace-1",
+        workspaceCwd: workspaceRoot,
+      });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
+
   it("leaves manual runtime services untouched during agent runs", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-manual-"));
     const workspace = buildWorkspace(workspaceRoot);

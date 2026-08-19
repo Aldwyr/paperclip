@@ -146,4 +146,36 @@ describe("selectConfiguredRuntimeServiceRows", () => {
       }),
     ]);
   });
+
+  it("selects the row for the configured port instead of newer history on another port", () => {
+    const previousPort = runtimeServiceRow({
+      port: 42013,
+      updatedAt: new Date("2026-07-31T10:00:00.000Z"),
+    });
+    const configuredPort = runtimeServiceRow({
+      port: 42001,
+      updatedAt: new Date("2026-07-30T10:00:00.000Z"),
+    });
+
+    const selected = selectConfiguredRuntimeServiceRows(
+      [previousPort, configuredPort],
+      {
+        services: [
+          {
+            name: "web",
+            command: "pnpm dev",
+            port: { type: "fixed", value: 42001 },
+          },
+        ],
+      },
+    );
+
+    expect(selected).toEqual([
+      expect.objectContaining({
+        id: configuredPort.id,
+        port: 42001,
+        configIndex: 0,
+      }),
+    ]);
+  });
 });

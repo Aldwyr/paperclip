@@ -1220,7 +1220,16 @@ async function loadEffectiveRuntimeServicesByExecutionWorkspace(
   return new Map(
     rows.map((row) => {
       if (!usesInheritedProjectRuntimeServices(row)) {
-        return [row.id, executionRuntimeServices.get(row.id) ?? []] as const;
+        const runtimeServiceRows = executionRuntimeServices.get(row.id) ?? [];
+        const workspaceRuntime = readExecutionWorkspaceConfig(
+          (row.metadata as Record<string, unknown> | null) ?? null,
+        )?.workspaceRuntime ?? null;
+        return [
+          row.id,
+          workspaceRuntime
+            ? selectConfiguredRuntimeServiceRows(runtimeServiceRows, workspaceRuntime)
+            : runtimeServiceRows,
+        ] as const;
       }
 
       const workspaceRuntime = projectRuntimeConfigByWorkspaceId.get(row.projectWorkspaceId!) ?? null;
