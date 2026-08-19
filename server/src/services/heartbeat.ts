@@ -72,6 +72,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext } from "../instrumentation.js";
 import { logger } from "../middleware/logger.js";
 import {
+  DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
   createGitRemoteAuthProvider,
   describeGitAuthFailure,
   scrubGitCredentialText,
@@ -798,6 +799,9 @@ type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
   | "resolveAdapterConfigForRuntime"
   | "resolveEnvBindings"
+  | "resolveInjectedEnvBindingForRuntime"
+  | "getByNameInsensitive"
+  | "listBindings"
   | "collectMissingRuntimeBindings"
   | "collectMissingAdapterConfigRuntimeBindings"
 >;
@@ -916,6 +920,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
     consumerScopes: Array<"agent" | "project" | "environment" | "routine">;
     reason: string;
     remediation: string;
+    fallbackSecretNames?: readonly string[];
+    fallbackInjectionEnvKey?: string;
   };
 }) {
   const executionRunConfig = stripForbiddenEnvFromAdapterConfig(input.executionRunConfig);
@@ -948,7 +954,28 @@ export async function resolveExecutionRunAdapterConfig(input: {
       && isConfiguredEnvBindingValue(routineEnv?.[key])
     ))
     : false;
-  if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured) {
+  let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> = null;
+  let fallbackAuthorizationBindingId: string | null = null;
+  if (
+    requiredScopedEnvBinding
+    && !requiredScopedBindingsConfigured
+    && requiredScopedEnvBinding.fallbackSecretNames?.length
+    && typeof input.secretsSvc.getByNameInsensitive === "function"
+  ) {
+    for (const secretName of requiredScopedEnvBinding.fallbackSecretNames) {
+      const candidate = await input.secretsSvc.getByNameInsensitive(input.companyId, secretName);
+      if (!candidate) continue;
+      if (lowTrustAllowedBindingIds !== undefined) {
+        const bindings = await input.secretsSvc.listBindings(input.companyId, candidate.id);
+        const bindingIds = new Set(bindings.map((binding) => binding.id));
+        fallbackAuthorizationBindingId = lowTrustAllowedBindingIds.find((id) => bindingIds.has(id)) ?? null;
+        if (!fallbackAuthorizationBindingId) continue;
+      }
+      fallbackSecret = candidate;
+      break;
+    }
+  }
+  if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured && !fallbackSecret) {
     throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
       configurationIncomplete: {
         reason: requiredScopedEnvBinding.reason,
@@ -1175,6 +1202,36 @@ export async function resolveExecutionRunAdapterConfig(input: {
       secretKeys.add(key);
     }
   }
+  const injectedEnvResolution = fallbackSecret && requiredScopedEnvBinding?.fallbackInjectionEnvKey
+    ? await input.secretsSvc.resolveInjectedEnvBindingForRuntime(
+        input.companyId,
+        requiredScopedEnvBinding.fallbackInjectionEnvKey,
+        {
+          type: "secret_ref",
+          secretId: fallbackSecret.id,
+          version: "latest",
+        },
+        {
+          consumerType: "run",
+          consumerId: input.heartbeatRunId ?? input.agentId ?? "push-capability-preflight",
+          actorType: "agent",
+          actorId: input.agentId ?? null,
+          responsibleUserId: input.responsibleUserId ?? null,
+          issueId: input.issueId ?? null,
+          heartbeatRunId: input.heartbeatRunId ?? null,
+        },
+        fallbackAuthorizationBindingId,
+      )
+    : { env: {}, secretKeys: new Set<string>(), manifest: [] };
+  if (Object.keys(injectedEnvResolution.env).length > 0) {
+    resolvedConfig.env = {
+      ...parseObject(resolvedConfig.env),
+      ...injectedEnvResolution.env,
+    };
+    for (const key of injectedEnvResolution.secretKeys) {
+      secretKeys.add(key);
+    }
+  }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
   // usable auth.json and an empty OPENAI_API_KEY would dispatch a run that
   // immediately fails with "no Codex credentials provisioned" (adapter_failed),
@@ -1220,6 +1277,19 @@ export async function resolveExecutionRunAdapterConfig(input: {
       );
     }
   }
+  if (requiredScopedEnvBinding) {
+    logger.info(
+      {
+        companyId: input.companyId,
+        agentId: input.agentId ?? null,
+        issueId: input.issueId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        tier: fallbackSecret ? "T3_well_known_company_secret" : "T1_env_binding",
+        selectedSecretName: fallbackSecret?.name ?? null,
+      },
+      "Push-capability preflight satisfied",
+    );
+  }
   return {
     resolvedConfig,
     secretKeys,
@@ -1228,6 +1298,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       ...(manifest ?? []),
       ...(projectEnvResolution.manifest ?? []),
       ...(routineEnvResolution.manifest ?? []),
+      ...(injectedEnvResolution.manifest ?? []),
     ],
   };
 }
@@ -14605,7 +14676,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             consumerScopes: ["agent", "project", "environment", "routine"],
             reason: "push_write_credential_missing",
             remediation:
-              "GitHub PR workflow requires GH_TOKEN or GITHUB_TOKEN bound at agent, project, environment, or routine scope.",
+              "GitHub PR workflow found no GH_TOKEN/GITHUB_TOKEN binding at agent, project, environment, or routine scope and no company secret named GITHUB_TOKEN, GH_TOKEN, or PAPERCLIP_GITHUB_TOKEN. Bind GH_TOKEN or GITHUB_TOKEN at one of those scopes, or configure one of the well-known company secrets.",
+            fallbackSecretNames: DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
+            fallbackInjectionEnvKey: "GH_TOKEN",
           }
         : undefined,
     });
