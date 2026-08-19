@@ -42,7 +42,7 @@ export function createLiveEventCursor(
 export function acceptLiveEvent(cursor: LiveEventCursor, event: PrpEvent): boolean {
   if (cursor.seenSourceEventIds.has(event.sourceEventId)) return false;
   cursor.seenSourceEventIds.add(event.sourceEventId);
-  cursor.cursor += 1;
+  cursor.cursor = Math.max(cursor.cursor, event.sourceSeq);
   return true;
 }
 
