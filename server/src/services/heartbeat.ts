@@ -463,6 +463,7 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participan
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
+const AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS = 2_000;
 // Keep this in sync with local adapters that require a git workspace before launch.
 const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "claude_local",
@@ -841,6 +842,72 @@ function hasGithubPrWorkflowSkill(desiredSkills: string[]) {
   });
 }
 
+export type AmbientHostPushCredential = "gh_cli" | "ssh_push_remote";
+
+/**
+ * Probe credentials that are already available to a local execution host without
+ * copying them into the dispatched run. In particular, do not pass the resolved
+ * run env to `gh`: an injected GH_TOKEN would override a working hosts.yml login.
+ */
+export async function probeAmbientHostPushCredential(
+  cwd: string | null | undefined,
+  deps: { execFile: typeof execFile } = { execFile },
+): Promise<AmbientHostPushCredential | null> {
+  try {
+    const result = await deps.execFile(
+      "gh",
+      ["auth", "token", "--hostname", "github.com"],
+      { timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS, windowsHide: true },
+    );
+    if (readNonEmptyString(result.stdout)) return "gh_cli";
+  } catch {
+    // A missing CLI, timeout, non-zero exit, or unreadable auth state is a tier miss.
+  }
+
+  const normalizedCwd = readNonEmptyString(cwd);
+  if (!normalizedCwd) return null;
+  const remoteNames = await deps.execFile(
+    "git",
+    ["remote"],
+    {
+      cwd: normalizedCwd,
+      timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    },
+  ).then((result) =>
+    result.stdout
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0),
+  ).catch(() => []);
+
+  for (const remoteName of remoteNames) {
+    const pushUrl = await deps.execFile(
+      "git",
+      ["remote", "get-url", "--push", remoteName],
+      {
+        cwd: normalizedCwd,
+        timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    ).then((result) => readNonEmptyString(result.stdout)).catch(() => null);
+    if (pushUrl && (/^ssh:\/\//i.test(pushUrl) || /^[^\s/@:]+@[^\s/:]+:.+/.test(pushUrl))) {
+      return "ssh_push_remote";
+    }
+  }
+  return null;
+}
+
+export function shouldProbeAmbientHostPushCredential(input: {
+  pushCapabilityPreflightRequired: boolean;
+  environmentDriver: string | null | undefined;
+  trustPreset?: TrustPresetResolution;
+}) {
+  return input.pushCapabilityPreflightRequired
+    && input.trustPreset?.kind !== "low_trust_review"
+    && !isRemoteExecutionEnvironmentDriver(input.environmentDriver);
+}
+
 export function requiresPushCapabilityPreflight(input: {
   adapterType: string;
   issueId: string | null | undefined;
@@ -922,6 +989,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
     remediation: string;
     fallbackSecretNames?: readonly string[];
     fallbackInjectionEnvKey?: string;
+    ambientHostCredential?: {
+      enabled: boolean;
+      checkoutCwd?: string | null;
+      probe?: typeof probeAmbientHostPushCredential;
+    };
   };
 }) {
   const executionRunConfig = stripForbiddenEnvFromAdapterConfig(input.executionRunConfig);
@@ -954,6 +1026,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
       && isConfiguredEnvBindingValue(routineEnv?.[key])
     ))
     : false;
+  const ambientHostCredential = requiredScopedEnvBinding
+    && !requiredScopedBindingsConfigured
+    && requiredScopedEnvBinding.ambientHostCredential?.enabled
+    ? await (
+        requiredScopedEnvBinding.ambientHostCredential.probe ?? probeAmbientHostPushCredential
+      )(requiredScopedEnvBinding.ambientHostCredential.checkoutCwd).catch(() => null)
+    : null;
   let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> | null = null;
   let fallbackAuthorization: {
     bindingId: string;
@@ -964,6 +1043,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   if (
     requiredScopedEnvBinding
     && !requiredScopedBindingsConfigured
+    && !ambientHostCredential
     && requiredScopedEnvBinding.fallbackSecretNames?.length
     && typeof input.secretsSvc.getByNameInsensitive === "function"
   ) {
@@ -999,7 +1079,12 @@ export async function resolveExecutionRunAdapterConfig(input: {
       break;
     }
   }
-  if (requiredScopedEnvBinding && !requiredScopedBindingsConfigured && !fallbackSecret) {
+  if (
+    requiredScopedEnvBinding
+    && !requiredScopedBindingsConfigured
+    && !ambientHostCredential
+    && !fallbackSecret
+  ) {
     throw new ConfigurationIncompleteFailure(`configuration incomplete: ${requiredScopedEnvBinding.remediation}`, {
       configurationIncomplete: {
         reason: requiredScopedEnvBinding.reason,
@@ -1302,13 +1387,19 @@ export async function resolveExecutionRunAdapterConfig(input: {
     }
   }
   if (requiredScopedEnvBinding) {
+    const tier = requiredScopedBindingsConfigured
+      ? "T1_env_binding"
+      : ambientHostCredential
+        ? "T2_ambient_host_credential"
+        : "T3_well_known_company_secret";
     logger.info(
       {
         companyId: input.companyId,
         agentId: input.agentId ?? null,
         issueId: input.issueId ?? null,
         heartbeatRunId: input.heartbeatRunId ?? null,
-        tier: fallbackSecret ? "T3_well_known_company_secret" : "T1_env_binding",
+        tier,
+        ambientCredentialKind: ambientHostCredential,
         selectedSecretName: fallbackSecret?.name ?? null,
       },
       "Push-capability preflight satisfied",
@@ -14677,6 +14768,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId,
       explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
     });
+    const ambientHostPushCredentialEnabled = shouldProbeAmbientHostPushCredential({
+      pushCapabilityPreflightRequired,
+      environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
+      trustPreset,
+    });
     const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
       agentId: agent.id,
@@ -14699,10 +14795,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             keys: [...PUSH_CAPABILITY_ENV_KEYS],
             consumerScopes: ["agent", "project", "environment", "routine"],
             reason: "push_write_credential_missing",
-            remediation:
-              "GitHub PR workflow found no GH_TOKEN/GITHUB_TOKEN binding at agent, project, environment, or routine scope and no company secret named GITHUB_TOKEN, GH_TOKEN, or PAPERCLIP_GITHUB_TOKEN. Bind GH_TOKEN or GITHUB_TOKEN at one of those scopes, or configure one of the well-known company secrets.",
+            remediation: ambientHostPushCredentialEnabled
+              ? "GitHub PR workflow found no GH_TOKEN/GITHUB_TOKEN binding at agent, project, environment, or routine scope, no ambient gh/ssh credential on host, and no company secret named GITHUB_TOKEN, GH_TOKEN, or PAPERCLIP_GITHUB_TOKEN. Bind GH_TOKEN or GITHUB_TOKEN at one of those scopes, authenticate gh or configure an SSH push remote on the local host, or configure one of the well-known company secrets."
+              : "GitHub PR workflow found no GH_TOKEN/GITHUB_TOKEN binding at agent, project, environment, or routine scope and no company secret named GITHUB_TOKEN, GH_TOKEN, or PAPERCLIP_GITHUB_TOKEN. Bind GH_TOKEN or GITHUB_TOKEN at one of those scopes, or configure one of the well-known company secrets.",
             fallbackSecretNames: DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
             fallbackInjectionEnvKey: "GH_TOKEN",
+            ambientHostCredential: {
+              enabled: ambientHostPushCredentialEnabled,
+              checkoutCwd:
+                reusableExistingExecutionWorkspace?.cwd
+                ?? executionRunConfig.cwd as string | null | undefined,
+            },
           }
         : undefined,
     });
