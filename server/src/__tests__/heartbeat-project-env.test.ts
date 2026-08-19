@@ -1026,6 +1026,55 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(resolveInjectedEnvBindingForRuntime).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["agent", "empty string", { executionRunConfig: { env: { GH_TOKEN: "" } } }],
+    ["agent", "empty plain binding", { executionRunConfig: { env: { GITHUB_TOKEN: { type: "plain", value: "" } } } }],
+    ["project", "empty string", { projectEnv: { GH_TOKEN: "" } }],
+    ["project", "empty plain binding", { projectEnv: { GITHUB_TOKEN: { type: "plain", value: "" } } }],
+    ["environment", "empty string", { environmentEnv: { GH_TOKEN: "" } }],
+    ["environment", "empty plain binding", { environmentEnv: { GITHUB_TOKEN: { type: "plain", value: "" } } }],
+    ["routine", "empty string", { routineEnv: { GH_TOKEN: "" } }],
+    ["routine", "empty plain binding", { routineEnv: { GITHUB_TOKEN: { type: "plain", value: "" } } }],
+  ])("fails closed for an explicit %s-scoped %s instead of injecting a company secret", async (_scope, _binding, scopeConfig) => {
+    const getByNameInsensitive = vi.fn().mockResolvedValue({ id: "secret-1", name: "GH_TOKEN" });
+    const resolveInjectedEnvBindingForRuntime = vi.fn();
+
+    await expect(resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      routineId: "routine-1",
+      executionRunConfig: { env: {} },
+      projectEnv: null,
+      ...scopeConfig,
+      requiredScopedEnvBinding: {
+        keys: ["GH_TOKEN", "GITHUB_TOKEN"],
+        consumerScopes: ["agent", "project", "environment", "routine"],
+        reason: "push_write_credential_missing",
+        remediation: "No GitHub credential found.",
+        fallbackSecretNames: ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"],
+        fallbackInjectionEnvKey: "GH_TOKEN",
+      },
+      secretsSvc: {
+        resolveAdapterConfigForRuntime: vi.fn(),
+        resolveEnvBindings: vi.fn(),
+        resolveInjectedEnvBindingForRuntime,
+        getByNameInsensitive,
+      } as any,
+    })).rejects.toMatchObject({
+      code: "configuration_incomplete",
+      resultJson: {
+        configurationIncomplete: {
+          reason: "push_write_credential_missing",
+        },
+      },
+    });
+    expect(getByNameInsensitive).not.toHaveBeenCalled();
+    expect(resolveInjectedEnvBindingForRuntime).not.toHaveBeenCalled();
+  });
+
   it("skips well-known-secret injection when a supported-scope binding exists", async () => {
     const getByNameInsensitive = vi.fn();
     const resolveInjectedEnvBindingForRuntime = vi.fn();
