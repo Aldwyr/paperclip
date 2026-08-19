@@ -1423,6 +1423,12 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   return mergeExecutionWorkspaceConfig(base, input.configSnapshot);
 }
 
+export function resolveExecutionWorkspaceBranchOwnership(
+  executionWorkspace: Pick<RealizedExecutionWorkspace, "created" | "branchCreatedByRuntime">,
+) {
+  return executionWorkspace.branchCreatedByRuntime;
+}
+
 export function stripWorkspaceRuntimeFromExecutionRunConfig(config: Record<string, unknown>) {
   const nextConfig = { ...config };
   delete nextConfig.workspaceRuntime;
@@ -14954,7 +14960,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Branch ownership, not worktree freshness: attaching a worktree to a
       // pre-existing branch reports created=true but must never make terminal
       // cleanup delete that operator-owned branch.
-      createdByRuntime: executionWorkspace.branchCreatedByRuntime,
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
       configSnapshot,
       shouldReuseExisting: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
       shouldRefreshConfigSnapshot: resolvedWorkspaceReusePolicy.shouldRefreshWorkspaceConfigSnapshot,
