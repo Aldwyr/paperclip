@@ -2,9 +2,22 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
 
+type BackendFactoryOptions = {
+  runnerInstanceId?: string;
+  onSpawn?: (meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+  }) => Promise<void>;
+};
+
 const state = vi.hoisted(() => ({
   execute: vi.fn(),
-  createBackend: vi.fn(() => ({ kind: "test" })),
+  createBackend: vi.fn(
+    (_input: NativeExecutionInputV1, _options: BackendFactoryOptions) => ({
+      kind: "test",
+    }),
+  ),
   cancel: vi.fn(),
   release: null as null | (() => void),
 }));

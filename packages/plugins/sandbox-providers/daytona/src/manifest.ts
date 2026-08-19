@@ -1,10 +1,16 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.daytona-sandbox-provider";
-// 0.1.2 adds `supportsSetupTokenLogin` to the driver. The version bump makes
-// the bundled-plugin boot reconcile refresh the persisted manifest for an
-// existing install, so the Claude setup-token login capability propagates.
-const PLUGIN_VERSION = "0.1.2";
+// The bundled-plugin boot reconcile refreshes the persisted manifest for an
+// existing install only when PLUGIN_VERSION changes. A manifest change without a
+// version bump never reaches an existing install. The reconcile also reads the
+// persisted manifest raw and does not re-run the validator, so it never
+// canonicalizes a renamed capability.
+//
+// 0.1.3 renamed the login transport flag from `supportsSetupTokenLogin` to the
+// neutral `supportsLoginPty`.
+// 0.1.4 adds the `concurrentSyncOperations` sandbox capability to the driver.
+const PLUGIN_VERSION = "0.1.4";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -31,8 +37,16 @@ const manifest: PaperclipPluginManifestV1 = {
       // emits incremental session output while the command runs. Declare the
       // opt-in capability so the host selects the session-output streaming path.
       // A generic one-shot provider that omits this key keeps the poll path.
+      //
+      // Daytona also runs file transfers into and out of the sandbox in parallel.
+      // Each concurrent sync hook call uses separate temporary state (random
+      // scratch names and per-mapping host temporary directories), and teardown
+      // waits for all active calls. Declare the opt-in capability so the host may
+      // schedule sync operations concurrently. The host resolves it `true` only
+      // when the worker also verifies both sync verbs.
       sandboxCapabilities: {
         incrementalSessionOutput: true,
+        concurrentSyncOperations: true,
       },
       supportsInteractiveSetup: true,
       interactiveSetupConnectionTypes: ["ssh"],
@@ -44,10 +58,10 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       templateIdentityPaths: ["apiUrl"],
       supportsTemplateDelete: true,
-      // Daytona hosts the Claude setup-token login on a real pseudo-terminal.
-      // It is the only bundled provider that implements the setup-token
-      // pseudo-terminal methods, so it advertises the capability.
-      supportsSetupTokenLogin: true,
+      // Daytona hosts an interactive login on a real pseudo-terminal. It is the
+      // only bundled provider that implements the login pseudo-terminal methods,
+      // so it advertises the capability.
+      supportsLoginPty: true,
       configSchema: {
         type: "object",
         properties: {
