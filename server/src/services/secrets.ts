@@ -4946,6 +4946,12 @@ export function secretService(db: Db) {
 
       let bindingContext: SecretBindingContext | undefined;
       if (authorization) {
+        if (authorization.configPath !== `env.${envKey}`) {
+          throw unprocessable(
+            "Secret binding does not authorize the injected environment key",
+            { code: "binding_not_allowed" },
+          );
+        }
         const authorizationBinding = await db
           .select()
           .from(companySecretBindings)

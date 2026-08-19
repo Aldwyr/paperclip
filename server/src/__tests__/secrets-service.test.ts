@@ -237,7 +237,7 @@ describeEmbeddedPostgres("secretService", () => {
       secretId: secret.id,
       targetType: "agent",
       targetId: "agent-1",
-      configPath: "access.GITHUB",
+      configPath: "env.GH_TOKEN",
     });
     const context = {
       consumerType: "run" as const,
@@ -255,7 +255,23 @@ describeEmbeddedPostgres("secretService", () => {
         bindingId: randomUUID(),
         targetType: "agent",
         targetId: "agent-1",
-        configPath: "access.GITHUB",
+        configPath: "env.GH_TOKEN",
+      },
+    )).rejects.toMatchObject({
+      status: 422,
+      details: { code: "binding_not_allowed" },
+    });
+
+    await expect(svc.resolveInjectedEnvBindingForRuntime(
+      companyId,
+      "GH_TOKEN",
+      { type: "secret_ref", secretId: secret.id, version: "latest" },
+      context,
+      {
+        bindingId: binding.id,
+        targetType: "agent",
+        targetId: "agent-1",
+        configPath: "env.GITHUB_TOKEN",
       },
     )).rejects.toMatchObject({
       status: 422,
@@ -271,7 +287,7 @@ describeEmbeddedPostgres("secretService", () => {
         bindingId: binding.id,
         targetType: "agent",
         targetId: "agent-1",
-        configPath: "access.GITHUB",
+        configPath: "env.GH_TOKEN",
       },
     );
     expect(resolved.manifest[0]).toMatchObject({

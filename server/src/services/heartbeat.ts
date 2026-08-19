@@ -1058,14 +1058,16 @@ export async function resolveExecutionRunAdapterConfig(input: {
           ["environment", input.environmentId],
           ["routine", input.routineId],
         ]);
-        const allowedConfigPaths = new Set(requiredScopedEnvBinding.keys.map((key) => `env.${key}`));
+        const injectionConfigPath = requiredScopedEnvBinding.fallbackInjectionEnvKey
+          ? `env.${requiredScopedEnvBinding.fallbackInjectionEnvKey}`
+          : null;
         const bindingsById = new Map(bindings.map((binding) => [binding.id, binding]));
         const authorizedBinding = lowTrustAllowedBindingIds
           .map((id) => bindingsById.get(id))
           .find((binding) =>
             binding
             && activeTargetIds.get(binding.targetType) === binding.targetId
-            && allowedConfigPaths.has(binding.configPath),
+            && binding.configPath === injectionConfigPath,
           );
         if (!authorizedBinding) continue;
         fallbackAuthorization = {
