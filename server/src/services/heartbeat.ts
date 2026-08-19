@@ -955,7 +955,12 @@ export async function resolveExecutionRunAdapterConfig(input: {
     ))
     : false;
   let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> = null;
-  let fallbackAuthorizationBindingId: string | null = null;
+  let fallbackAuthorization: {
+    bindingId: string;
+    targetType: "agent" | "project" | "environment" | "routine";
+    targetId: string;
+    configPath: string;
+  } | null = null;
   if (
     requiredScopedEnvBinding
     && !requiredScopedBindingsConfigured
@@ -967,9 +972,28 @@ export async function resolveExecutionRunAdapterConfig(input: {
       if (!candidate) continue;
       if (lowTrustAllowedBindingIds !== undefined) {
         const bindings = await input.secretsSvc.listBindings(input.companyId, candidate.id);
-        const bindingIds = new Set(bindings.map((binding) => binding.id));
-        fallbackAuthorizationBindingId = lowTrustAllowedBindingIds.find((id) => bindingIds.has(id)) ?? null;
-        if (!fallbackAuthorizationBindingId) continue;
+        const activeTargetIds = new Map<string, string | null | undefined>([
+          ["agent", input.agentId],
+          ["project", input.projectId],
+          ["environment", input.environmentId],
+          ["routine", input.routineId],
+        ]);
+        const allowedConfigPaths = new Set(requiredScopedEnvBinding.keys.map((key) => `env.${key}`));
+        const bindingsById = new Map(bindings.map((binding) => [binding.id, binding]));
+        const authorizedBinding = lowTrustAllowedBindingIds
+          .map((id) => bindingsById.get(id))
+          .find((binding) =>
+            binding
+            && activeTargetIds.get(binding.targetType) === binding.targetId
+            && allowedConfigPaths.has(binding.configPath),
+          );
+        if (!authorizedBinding) continue;
+        fallbackAuthorization = {
+          bindingId: authorizedBinding.id,
+          targetType: authorizedBinding.targetType as "agent" | "project" | "environment" | "routine",
+          targetId: authorizedBinding.targetId,
+          configPath: authorizedBinding.configPath,
+        };
       }
       fallbackSecret = candidate;
       break;
@@ -1220,7 +1244,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
           issueId: input.issueId ?? null,
           heartbeatRunId: input.heartbeatRunId ?? null,
         },
-        fallbackAuthorizationBindingId,
+        fallbackAuthorization,
       )
     : { env: {}, secretKeys: new Set<string>(), manifest: [] };
   if (Object.keys(injectedEnvResolution.env).length > 0) {

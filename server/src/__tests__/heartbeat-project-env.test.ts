@@ -730,7 +730,12 @@ describe("resolveExecutionRunAdapterConfig", () => {
         resolveEnvBindings: vi.fn(),
         resolveInjectedEnvBindingForRuntime,
         getByNameInsensitive: vi.fn().mockResolvedValue({ id: "secret-1", name: "gh_token" }),
-        listBindings: vi.fn().mockResolvedValue([{ id: "different-binding" }]),
+        listBindings: vi.fn().mockResolvedValue([{
+          id: "allowed-binding",
+          targetType: "project",
+          targetId: "other-project",
+          configPath: "env.GH_TOKEN",
+        }]),
       } as any,
     })).rejects.toMatchObject({
       code: "configuration_incomplete",
@@ -741,6 +746,71 @@ describe("resolveExecutionRunAdapterConfig", () => {
       },
     });
     expect(resolveInjectedEnvBindingForRuntime).not.toHaveBeenCalled();
+  });
+
+  it("injects a low-trust fallback only through an allowlisted binding for the active target and env path", async () => {
+    const resolveInjectedEnvBindingForRuntime = vi.fn().mockResolvedValue({
+      env: { GH_TOKEN: "resolved-token" },
+      secretKeys: new Set(["GH_TOKEN"]),
+      manifest: [{ secretId: "secret-1", bindingId: "allowed-binding", outcome: "success" }],
+    });
+    await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      issueId: "issue-1",
+      heartbeatRunId: "run-1",
+      executionRunConfig: { env: {} },
+      projectEnv: null,
+      trustPreset: {
+        kind: "low_trust_review",
+        preset: LOW_TRUST_REVIEW_PRESET,
+        boundary: {
+          mode: LOW_TRUST_REVIEW_PRESET,
+          companyId: "company-1",
+          issueIds: ["issue-1"],
+          allowedSecretBindingIds: ["allowed-binding"],
+        },
+        sourcePresets: {},
+      },
+      requiredScopedEnvBinding: {
+        keys: ["GH_TOKEN", "GITHUB_TOKEN"],
+        consumerScopes: ["agent", "project", "environment", "routine"],
+        reason: "push_write_credential_missing",
+        remediation: "No GitHub credential found.",
+        fallbackSecretNames: ["GITHUB_TOKEN", "GH_TOKEN", "PAPERCLIP_GITHUB_TOKEN"],
+        fallbackInjectionEnvKey: "GH_TOKEN",
+      },
+      secretsSvc: {
+        resolveAdapterConfigForRuntime: vi.fn().mockResolvedValue({
+          config: { env: {} },
+          secretKeys: new Set<string>(),
+          manifest: [],
+        }),
+        resolveEnvBindings: vi.fn(),
+        resolveInjectedEnvBindingForRuntime,
+        getByNameInsensitive: vi.fn().mockResolvedValue({ id: "secret-1", name: "gh_token" }),
+        listBindings: vi.fn().mockResolvedValue([{
+          id: "allowed-binding",
+          targetType: "agent",
+          targetId: "agent-1",
+          configPath: "env.GH_TOKEN",
+        }]),
+        collectMissingRuntimeBindings: vi.fn().mockResolvedValue([]),
+      } as any,
+    });
+
+    expect(resolveInjectedEnvBindingForRuntime).toHaveBeenCalledWith(
+      "company-1",
+      "GH_TOKEN",
+      expect.objectContaining({ type: "secret_ref", secretId: "secret-1" }),
+      expect.objectContaining({ consumerType: "run", consumerId: "run-1" }),
+      {
+        bindingId: "allowed-binding",
+        targetType: "agent",
+        targetId: "agent-1",
+        configPath: "env.GH_TOKEN",
+      },
+    );
   });
 
   it("skips well-known-secret injection when a supported-scope binding exists", async () => {

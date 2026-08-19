@@ -251,7 +251,12 @@ describeEmbeddedPostgres("secretService", () => {
       "GH_TOKEN",
       { type: "secret_ref", secretId: secret.id, version: "latest" },
       context,
-      randomUUID(),
+      {
+        bindingId: randomUUID(),
+        targetType: "agent",
+        targetId: "agent-1",
+        configPath: "access.GITHUB",
+      },
     )).rejects.toMatchObject({
       status: 422,
       details: { code: "binding_not_allowed" },
@@ -262,7 +267,12 @@ describeEmbeddedPostgres("secretService", () => {
       "GH_TOKEN",
       { type: "secret_ref", secretId: secret.id, version: "latest" },
       context,
-      binding.id,
+      {
+        bindingId: binding.id,
+        targetType: "agent",
+        targetId: "agent-1",
+        configPath: "access.GITHUB",
+      },
     );
     expect(resolved.manifest[0]).toMatchObject({
       configPath: "env.GH_TOKEN",

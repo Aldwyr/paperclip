@@ -4925,7 +4925,12 @@ export function secretService(db: Db) {
       envKey: string,
       rawBinding: unknown,
       context: Omit<SecretConsumerContext, "configPath" | "allowedBindingIds">,
-      authorizedBindingId?: string | null,
+      authorization?: {
+        bindingId: string;
+        targetType: SecretBindingTargetType;
+        targetId: string;
+        configPath: string;
+      } | null,
     ): Promise<{ env: Record<string, string>; secretKeys: Set<string>; manifest: RuntimeSecretManifestEntry[] }> => {
       if (!ENV_KEY_RE.test(envKey)) {
         throw unprocessable(`Invalid environment variable name: ${envKey}`);
@@ -4940,14 +4945,17 @@ export function secretService(db: Db) {
       }
 
       let bindingContext: SecretBindingContext | undefined;
-      if (authorizedBindingId) {
+      if (authorization) {
         const authorizationBinding = await db
           .select()
           .from(companySecretBindings)
           .where(and(
-            eq(companySecretBindings.id, authorizedBindingId),
+            eq(companySecretBindings.id, authorization.bindingId),
             eq(companySecretBindings.companyId, companyId),
             eq(companySecretBindings.secretId, binding.secretId),
+            eq(companySecretBindings.targetType, authorization.targetType),
+            eq(companySecretBindings.targetId, authorization.targetId),
+            eq(companySecretBindings.configPath, authorization.configPath),
           ))
           .then((rows) => rows[0] ?? null);
         if (!authorizationBinding) {
