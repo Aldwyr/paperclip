@@ -954,7 +954,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
       && isConfiguredEnvBindingValue(routineEnv?.[key])
     ))
     : false;
-  let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> = null;
+  let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> | null = null;
   let fallbackAuthorization: {
     bindingId: string;
     targetType: "agent" | "project" | "environment" | "routine";
