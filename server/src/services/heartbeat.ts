@@ -14940,6 +14940,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          recordedBranchOwnership:
+            existingExecutionWorkspace?.status !== "archived"
+            && existingExecutionWorkspace?.branchName
+              ? {
+                  branchName: existingExecutionWorkspace.branchName,
+                  createdByRuntime:
+                    existingExecutionWorkspace.metadata?.createdByRuntime === true,
+                }
+              : null,
           heartbeatRunId: run.id,
           enableWorkspaceBranchReconcileForward:
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,

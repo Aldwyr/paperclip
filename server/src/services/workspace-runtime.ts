@@ -3039,6 +3039,10 @@ export async function realizeExecutionWorkspace(input: {
   config: Record<string, unknown>;
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  recordedBranchOwnership?: {
+    branchName: string;
+    createdByRuntime: boolean;
+  } | null;
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
@@ -3204,7 +3208,15 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: reusablePath,
       warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
       created: false,
-      branchCreatedByRuntime: false,
+      // A fresh realization may still land on the worktree recorded by a
+      // previous heartbeat. Preserve that branch's ownership only when the
+      // recorded branch matches the checkout being reused. Exact-branch mode
+      // remains operator-owned by contract; every mismatch likewise fails
+      // safe and leaves the branch behind during terminal cleanup.
+      branchCreatedByRuntime:
+        !requestedExistingBranch
+        && input.recordedBranchOwnership?.branchName === effectiveBranchName
+        && input.recordedBranchOwnership.createdByRuntime === true,
       baseRefSha: refresh.baseRefSha ?? baseDrift.branchBaseRefSha ?? baseDrift.currentBaseRefSha,
       pendingForwardBranchReconcile,
     };

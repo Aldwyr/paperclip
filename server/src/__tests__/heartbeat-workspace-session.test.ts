@@ -1287,6 +1287,25 @@ describe("mergeExecutionWorkspaceMetadataForPersistence", () => {
     expect(metadata.createdByRuntime).toBe(false);
   });
 
+  it("does not downgrade recorded runtime ownership after worktree reuse", () => {
+    const executionWorkspace = {
+      created: false,
+      branchCreatedByRuntime: true,
+    };
+
+    const metadata = mergeExecutionWorkspaceMetadataForPersistence({
+      existingMetadata: { createdByRuntime: true },
+      source: "task_session",
+      createdByRuntime: resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+      configSnapshot: null,
+      shouldReuseExisting: false,
+      baseRef: "origin/main",
+      baseRefSha: null,
+    });
+
+    expect(metadata.createdByRuntime).toBe(true);
+  });
+
   it("merges config snapshot for newly realized workspaces", () => {
     expect(mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: null,
