@@ -823,7 +823,11 @@ function formatMissingBindingForOperator(missing: MissingRuntimeBinding): string
   return `secret ${secretLabel} not bound at ${missing.consumerType} ${missing.configPath}`;
 }
 
-function isConfiguredEnvBindingValue(binding: unknown) {
+function hasOwnEnvBinding(env: Record<string, unknown> | null, key: string) {
+  return env !== null && Object.prototype.hasOwnProperty.call(env, key);
+}
+
+function isUsableEnvBindingValue(binding: unknown) {
   const parsed = envBindingSchema.safeParse(binding);
   if (!parsed.success) return false;
   const value = parsed.data;
@@ -939,19 +943,34 @@ export async function resolveExecutionRunAdapterConfig(input: {
     assertLowTrustEnvConfigAllowed(routineEnv, "routine.env");
   }
   const requiredScopedEnvBinding = input.requiredScopedEnvBinding ?? null;
+  const requiredScopedBindingPresent = requiredScopedEnvBinding
+    ? requiredScopedEnvBinding.keys.some((key) => (
+      requiredScopedEnvBinding.consumerScopes.includes("agent")
+      && hasOwnEnvBinding(agentEnv, key)
+    ) || (
+      requiredScopedEnvBinding.consumerScopes.includes("project")
+      && hasOwnEnvBinding(projectEnv, key)
+    ) || (
+      requiredScopedEnvBinding.consumerScopes.includes("environment")
+      && hasOwnEnvBinding(environmentEnv, key)
+    ) || (
+      requiredScopedEnvBinding.consumerScopes.includes("routine")
+      && hasOwnEnvBinding(routineEnv, key)
+    ))
+    : false;
   const requiredScopedBindingsConfigured = requiredScopedEnvBinding
     ? requiredScopedEnvBinding.keys.some((key) => (
       requiredScopedEnvBinding.consumerScopes.includes("agent")
-      && isConfiguredEnvBindingValue(agentEnv[key])
+      && isUsableEnvBindingValue(agentEnv[key])
     ) || (
       requiredScopedEnvBinding.consumerScopes.includes("project")
-      && isConfiguredEnvBindingValue(projectEnv?.[key])
+      && isUsableEnvBindingValue(projectEnv?.[key])
     ) || (
       requiredScopedEnvBinding.consumerScopes.includes("environment")
-      && isConfiguredEnvBindingValue(environmentEnv?.[key])
+      && isUsableEnvBindingValue(environmentEnv?.[key])
     ) || (
       requiredScopedEnvBinding.consumerScopes.includes("routine")
-      && isConfiguredEnvBindingValue(routineEnv?.[key])
+      && isUsableEnvBindingValue(routineEnv?.[key])
     ))
     : false;
   let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> | null = null;
@@ -963,7 +982,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
   } | null = null;
   if (
     requiredScopedEnvBinding
-    && !requiredScopedBindingsConfigured
+    && !requiredScopedBindingPresent
     && requiredScopedEnvBinding.fallbackSecretNames?.length
     && typeof input.secretsSvc.getByNameInsensitive === "function"
   ) {
