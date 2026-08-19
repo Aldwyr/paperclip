@@ -479,7 +479,7 @@ describe("resolveExecutionRunAdapterConfig", () => {
       } as any,
     });
 
-    expect(probe).toHaveBeenCalledWith("/checkout");
+    expect(probe).toHaveBeenCalledWith("/checkout", { configuredPushUrls: undefined });
     expect(result.resolvedConfig.env).toEqual({ AGENT_ONLY: "agent-only" });
     expect(result.secretKeys).toEqual(new Set());
     expect(getByNameInsensitive).not.toHaveBeenCalled();

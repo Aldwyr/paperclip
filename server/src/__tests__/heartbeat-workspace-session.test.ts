@@ -24,6 +24,7 @@ import {
   preflightLowTrustWorkspaceIsolation,
   probeAmbientHostPushCredential,
   prioritizeProjectWorkspaceCandidatesForRun,
+  resolveAmbientHostCredentialCheckout,
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
@@ -1016,6 +1017,52 @@ describe("probeAmbientHostPushCredential", () => {
     await expect(probeAmbientHostPushCredential("/checkout", {
       execFile: execFileMock as unknown as typeof execFile,
     })).resolves.toBeNull();
+  });
+
+  it("accepts the selected fresh workspace SSH URL before its checkout exists", async () => {
+    const execFileMock = vi.fn(async (command: string) => {
+      if (command === "gh") throw Object.assign(new Error("not logged in"), { code: 1 });
+      throw Object.assign(new Error("checkout not realized"), { code: "ENOENT" });
+    });
+
+    await expect(probeAmbientHostPushCredential("/future/checkout", {
+      execFile: execFileMock as unknown as typeof execFile,
+      configuredPushUrls: ["git@github.com:example/repo.git"],
+    })).resolves.toBe("ssh_push_remote");
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("resolveAmbientHostCredentialCheckout", () => {
+  it("uses the preferred fresh project workspace instead of the static adapter cwd", () => {
+    expect(resolveAmbientHostCredentialCheckout({
+      adapterCwd: "/static/adapter",
+      preferredProjectWorkspaceId: "workspace-2",
+      projectWorkspaces: [
+        { id: "workspace-1", cwd: "/checkout/one", repoUrl: "https://github.com/example/one.git" },
+        { id: "workspace-2", cwd: "/__paperclip_repo_only__", repoUrl: "git@github.com:example/two.git" },
+      ],
+    })).toEqual({
+      checkoutCwd: "/static/adapter",
+      configuredPushUrls: ["git@github.com:example/two.git"],
+    });
+  });
+
+  it("prefers a reusable realized checkout over project and adapter paths", () => {
+    expect(resolveAmbientHostCredentialCheckout({
+      adapterCwd: "/static/adapter",
+      preferredProjectWorkspaceId: "workspace-1",
+      projectWorkspaces: [
+        { id: "workspace-1", cwd: "/project/checkout", repoUrl: "git@github.com:example/project.git" },
+      ],
+      reusableExecutionWorkspace: {
+        cwd: "/reused/checkout",
+        repoUrl: "ssh://git@github.com/example/reused.git",
+      },
+    })).toEqual({
+      checkoutCwd: "/reused/checkout",
+      configuredPushUrls: ["ssh://git@github.com/example/reused.git"],
+    });
   });
 });
 

@@ -855,10 +855,14 @@ export type AmbientHostPushCredential = "gh_cli" | "ssh_push_remote";
  */
 export async function probeAmbientHostPushCredential(
   cwd: string | null | undefined,
-  deps: { execFile: typeof execFile } = { execFile },
+  deps: {
+    execFile?: typeof execFile;
+    configuredPushUrls?: readonly string[];
+  } = {},
 ): Promise<AmbientHostPushCredential | null> {
+  const execFileImpl = deps.execFile ?? execFile;
   try {
-    const result = await deps.execFile(
+    const result = await execFileImpl(
       "gh",
       ["auth", "token", "--hostname", "github.com"],
       { timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS, windowsHide: true },
@@ -868,38 +872,73 @@ export async function probeAmbientHostPushCredential(
     // A missing CLI, timeout, non-zero exit, or unreadable auth state is a tier miss.
   }
 
+  const pushUrls: string[] = [];
   const normalizedCwd = readNonEmptyString(cwd);
-  if (!normalizedCwd) return null;
-  const remoteNames = await deps.execFile(
-    "git",
-    ["remote"],
-    {
-      cwd: normalizedCwd,
-      timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS,
-      windowsHide: true,
-    },
-  ).then((result) =>
-    result.stdout
-      .split(/\r?\n/)
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0),
-  ).catch(() => []);
-
-  for (const remoteName of remoteNames) {
-    const pushUrl = await deps.execFile(
+  if (normalizedCwd) {
+    const remoteNames = await execFileImpl(
       "git",
-      ["remote", "get-url", "--push", remoteName],
+      ["remote"],
       {
         cwd: normalizedCwd,
         timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS,
         windowsHide: true,
       },
-    ).then((result) => readNonEmptyString(result.stdout)).catch(() => null);
-    if (pushUrl && (/^ssh:\/\//i.test(pushUrl) || /^[^\s/@:]+@[^\s/:]+:.+/.test(pushUrl))) {
-      return "ssh_push_remote";
+    ).then((result) =>
+      result.stdout
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0),
+    ).catch(() => []);
+
+    for (const remoteName of remoteNames) {
+      const pushUrl = await execFileImpl(
+        "git",
+        ["remote", "get-url", "--push", remoteName],
+        {
+          cwd: normalizedCwd,
+          timeout: AMBIENT_GITHUB_CREDENTIAL_PROBE_TIMEOUT_MS,
+          windowsHide: true,
+        },
+      ).then((result) => readNonEmptyString(result.stdout)).catch(() => null);
+      if (pushUrl) pushUrls.push(pushUrl);
     }
   }
+
+  // A fresh workspace has no checkout to inspect yet. Its selected project-workspace URL becomes
+  // the clone's origin, so treat that URL as the future push remote. This remains deliberately
+  // network-free: the tier identifies SSH transport, while the eventual push remains the authority
+  // for key, agent, host, and repository authorization.
+  pushUrls.push(...(deps.configuredPushUrls ?? []));
+  if (pushUrls.some((pushUrl) => (
+    /^ssh:\/\//i.test(pushUrl) || /^[^\s/@:]+@[^\s/:]+:.+/.test(pushUrl)
+  ))) {
+    return "ssh_push_remote";
+  }
   return null;
+}
+
+export function resolveAmbientHostCredentialCheckout(input: {
+  adapterCwd: string | null | undefined;
+  preferredProjectWorkspaceId: string | null | undefined;
+  projectWorkspaces: Array<{ id: string; cwd: string | null; repoUrl: string | null }>;
+  reusableExecutionWorkspace?: { cwd: string | null; repoUrl: string | null } | null;
+}) {
+  const selectedProjectWorkspace = prioritizeProjectWorkspaceCandidatesForRun(
+    input.projectWorkspaces,
+    input.preferredProjectWorkspaceId,
+  )[0] ?? null;
+  const reusableCwd = readNonEmptyString(input.reusableExecutionWorkspace?.cwd);
+  const projectCwd = readNonEmptyString(selectedProjectWorkspace?.cwd);
+  const checkoutCwd = reusableCwd
+    ?? (projectCwd === REPO_ONLY_CWD_SENTINEL ? null : projectCwd)
+    ?? readNonEmptyString(input.adapterCwd);
+  const configuredPushUrl = readNonEmptyString(
+    input.reusableExecutionWorkspace?.repoUrl ?? selectedProjectWorkspace?.repoUrl,
+  );
+  return {
+    checkoutCwd,
+    configuredPushUrls: configuredPushUrl ? [configuredPushUrl] : [],
+  };
 }
 
 export function shouldProbeAmbientHostPushCredential(input: {
@@ -996,6 +1035,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     ambientHostCredential?: {
       enabled: boolean;
       checkoutCwd?: string | null;
+      configuredPushUrls?: readonly string[];
       probe?: typeof probeAmbientHostPushCredential;
     };
   };
@@ -1050,7 +1090,10 @@ export async function resolveExecutionRunAdapterConfig(input: {
     && requiredScopedEnvBinding.ambientHostCredential?.enabled
     ? await (
         requiredScopedEnvBinding.ambientHostCredential.probe ?? probeAmbientHostPushCredential
-      )(requiredScopedEnvBinding.ambientHostCredential.checkoutCwd).catch(() => null)
+      )(
+        requiredScopedEnvBinding.ambientHostCredential.checkoutCwd,
+        { configuredPushUrls: requiredScopedEnvBinding.ambientHostCredential.configuredPushUrls },
+      ).catch(() => null)
     : null;
   let fallbackSecret: Awaited<ReturnType<RuntimeConfigSecretResolver["getByNameInsensitive"]>> | null = null;
   let fallbackAuthorization: {
@@ -14794,6 +14837,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
       trustPreset,
     });
+    const ambientProjectWorkspaceRows = ambientHostPushCredentialEnabled
+      && requestedExecutionWorkspaceMode !== "agent_default"
+      && projectContext?.id
+      ? await db
+          .select({
+            id: projectWorkspaces.id,
+            cwd: projectWorkspaces.cwd,
+            repoUrl: projectWorkspaces.repoUrl,
+          })
+          .from(projectWorkspaces)
+          .where(and(
+            eq(projectWorkspaces.companyId, agent.companyId),
+            eq(projectWorkspaces.projectId, projectContext.id),
+          ))
+          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+      : [];
+    const ambientHostCredentialCheckout = resolveAmbientHostCredentialCheckout({
+      adapterCwd: executionRunConfig.cwd as string | null | undefined,
+      preferredProjectWorkspaceId: issueRef?.projectWorkspaceId,
+      projectWorkspaces: ambientProjectWorkspaceRows,
+      reusableExecutionWorkspace: reusableExistingExecutionWorkspace
+        ? {
+            cwd: reusableExistingExecutionWorkspace.cwd,
+            repoUrl: reusableExistingExecutionWorkspace.repoUrl,
+          }
+        : null,
+    });
     const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
       agentId: agent.id,
@@ -14823,9 +14893,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             fallbackInjectionEnvKey: "GH_TOKEN",
             ambientHostCredential: {
               enabled: ambientHostPushCredentialEnabled,
-              checkoutCwd:
-                reusableExistingExecutionWorkspace?.cwd
-                ?? executionRunConfig.cwd as string | null | undefined,
+              checkoutCwd: ambientHostCredentialCheckout.checkoutCwd,
+              configuredPushUrls: ambientHostCredentialCheckout.configuredPushUrls,
             },
           }
         : undefined,
