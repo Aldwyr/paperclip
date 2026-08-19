@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
-import { BOARD_API_KEY_SCOPE_PRESETS } from "@paperclipai/shared";
+import {
+  BOARD_API_KEY_SCOPE_PRESETS,
+  type BoardApiKeyScopeConfig,
+} from "@paperclipai/shared";
 import { boardAuthService } from "./board-auth.js";
 
 const COMPANY_ID = "11111111-1111-4111-8111-111111111111";
-const SCOPE_CONFIG = {
-  version: 1 as const,
-  kind: "scoped" as const,
+const SCOPE_CONFIG: BoardApiKeyScopeConfig = {
+  version: 1,
+  kind: "scoped",
   companyIds: [COMPANY_ID],
   permissions: [...BOARD_API_KEY_SCOPE_PRESETS.company_automation.permissions],
-  instanceCapabilities: [] as const,
+  instanceCapabilities: [],
 };
 
 afterEach(() => {
