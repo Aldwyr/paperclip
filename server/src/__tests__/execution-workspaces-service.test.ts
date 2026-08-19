@@ -3951,6 +3951,83 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   }, 30_000);
 
+  it("does not run close-readiness Git scans while listing workspaces", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const repoRoot = await createTempRepo();
+    tempDirs.add(repoRoot);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Git-free workspace list",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Git backed workspace",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: repoRoot,
+      providerRef: repoRoot,
+      repoUrl: "https://github.com/paperclipai/paperclip.git",
+      baseRef: "main",
+      branchName: "main",
+    });
+
+    const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fake-git-"));
+    tempDirs.add(fakeBin);
+    const gitMarkerPath = path.join(fakeBin, "git-called");
+    const fakeGitPath = path.join(fakeBin, "git");
+    await fs.writeFile(
+      fakeGitPath,
+      [
+        "#!/bin/sh",
+        "printf 'git invoked\\n' >> \"$PAPERCLIP_GIT_CALLED_MARKER\"",
+        "exit 99",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(fakeGitPath, 0o755);
+
+    const originalPath = process.env.PATH;
+    const originalMarker = process.env.PAPERCLIP_GIT_CALLED_MARKER;
+    const gitStatusSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+    process.env.PATH = originalPath ? `${fakeBin}:${originalPath}` : fakeBin;
+    process.env.PAPERCLIP_GIT_CALLED_MARKER = gitMarkerPath;
+
+    try {
+      const [workspace] = await svc.list(companyId);
+
+      expect(workspace).toMatchObject({
+        id: executionWorkspaceId,
+        deliveryState: "unknown",
+        cwd: repoRoot,
+        providerRef: repoRoot,
+      });
+      expect(gitStatusSpy).not.toHaveBeenCalled();
+      await expect(fs.access(gitMarkerPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      gitStatusSpy.mockRestore();
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalMarker === undefined) delete process.env.PAPERCLIP_GIT_CALLED_MARKER;
+      else process.env.PAPERCLIP_GIT_CALLED_MARKER = originalMarker;
+    }
+  }, 20_000);
+
   it("inherits only runtime-service rows matching the current project workspace configuration and reuse scopes", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

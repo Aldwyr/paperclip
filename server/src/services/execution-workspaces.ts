@@ -1248,6 +1248,10 @@ type WorkspaceOverviewIssueRow = WorkspaceOverviewLinkedIssue & {
   executionWorkspaceId: string;
 };
 
+type HydrateWorkspaceOptions = {
+  inspectCloseReadiness?: boolean;
+};
+
 export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServiceOptions = {}) {
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const resolvePullRequestDetails = opts.resolvePullRequestDetails ?? createPullRequestMergeDetailsResolver(db);
@@ -1465,8 +1469,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     }
   }
 
-  async function hydrateWorkspace(row: ExecutionWorkspaceRow, runtimeServices: WorkspaceRuntimeService[] = []) {
+  async function hydrateWorkspace(
+    row: ExecutionWorkspaceRow,
+    runtimeServices: WorkspaceRuntimeService[] = [],
+    options: HydrateWorkspaceOptions = {},
+  ) {
     const workspace = toExecutionWorkspace(row, runtimeServices);
+    if (options.inspectCloseReadiness === false) return workspace;
     const { git } = await inspectGitCloseReadiness(workspace);
     const assessment = await assessDelivery(row, git);
     return toExecutionWorkspace(row, runtimeServices, assessment.deliveryState);
@@ -2064,6 +2073,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         hydrateWorkspace(
           row,
           (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
+          { inspectCloseReadiness: false },
         ),
       ));
     },
