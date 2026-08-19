@@ -69,14 +69,18 @@ describe("createSingleFlight", () => {
     await (second as { settled: Promise<void> }).settled;
   });
 
-  it("releases the gate when work throws synchronously", async () => {
+  it("propagates a synchronous throw and leaves the gate free", async () => {
     const gate = createSingleFlight();
 
-    const first = gate.run(() => {
-      throw new Error("sync failure");
-    });
-    expect(first.started).toBe(true);
-    await (first as { settled: Promise<void> }).settled;
+    expect(() =>
+      gate.run(() => {
+        throw new Error("sync failure");
+      }),
+    ).toThrow("sync failure");
     expect(gate.busy).toBe(false);
+
+    const second = gate.run(async () => {});
+    expect(second.started).toBe(true);
+    await (second as { settled: Promise<void> }).settled;
   });
 });

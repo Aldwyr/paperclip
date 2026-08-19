@@ -39,14 +39,10 @@ export function createSingleFlight(now: () => number = Date.now) {
       }
       startedAtMs = now();
       // Invoke synchronously so the work starts on this tick, not a microtask
-      // later; a synchronous throw still releases the gate.
-      let invoked: Promise<unknown>;
-      try {
-        invoked = Promise.resolve(work());
-      } catch {
-        invoked = Promise.resolve();
-      }
-      const settled = invoked
+      // later. A synchronous throw means nothing was admitted: the gate stays
+      // free and the exception propagates to the caller's tick-level error
+      // handling instead of settling silently.
+      const settled = Promise.resolve(work())
         .then(
           () => undefined,
           () => undefined,
