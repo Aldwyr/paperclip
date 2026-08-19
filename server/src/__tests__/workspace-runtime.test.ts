@@ -4732,6 +4732,51 @@ describe("ensureRuntimeServicesForRun", () => {
     });
   });
 
+  it("contains shell spawn errors as runtime service start failures", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-spawn-error-"));
+    const workspace = buildWorkspace(workspaceRoot);
+    const shellPath = path.join(workspaceRoot, "not-executable-shell");
+    await fs.writeFile(shellPath, "#!/bin/sh\n", { mode: 0o600 });
+    const originalShell = process.env.SHELL;
+    process.env.SHELL = shellPath;
+
+    try {
+      await expect(startRuntimeServicesForWorkspaceControl({
+        actor: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+        issue: null,
+        workspace,
+        executionWorkspaceId: "execution-workspace-spawn-error",
+        config: {
+          workspaceRuntime: {
+            services: [
+              {
+                name: "web",
+                command: "pnpm dev",
+                port: { type: "auto" },
+                readiness: {
+                  type: "http",
+                  urlTemplate: "http://127.0.0.1:{{port}}",
+                  timeoutSec: 10,
+                  intervalMs: 100,
+                },
+                lifecycle: "shared",
+                reuseScope: "execution_workspace",
+              },
+            ],
+          },
+        },
+        adapterEnv: {},
+      })).rejects.toThrow(/Failed to start runtime service "web": spawn .*EACCES/);
+    } finally {
+      if (originalShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = originalShell;
+    }
+  });
+
   it("stops only the selected execution workspace runtime service", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-control-stop-"));
     const workspace = buildWorkspace(workspaceRoot);
