@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-const sql = fs.readFileSync(path.join(import.meta.dirname, "migrations/0227_parallel_venom.sql"), "utf8");
+const sql = fs.readFileSync(path.join(import.meta.dirname, "migrations/0227_third_devos.sql"), "utf8");
 
 describe("connection grants phase 2 migration", () => {
   it("renames workspace grants before restoring organization-only constraints", () => {
