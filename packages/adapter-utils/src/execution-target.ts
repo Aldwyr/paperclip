@@ -2402,6 +2402,35 @@ async function ensureSandboxRunLogDirectory(input: {
  * fails the handshake. The gate never dispatches a request; the broker does that
  * after readiness passes.
  */
+// The count of the pre-READY newline-scan work, in UTF-16 code units. Each
+// search adds the number of code units it can read. A test reads this count to
+// prove the scan work stays linear in the bytes received. Production code never
+// reads this count.
+let duplexReadinessNewlineScanUnits = 0;
+
+/**
+ * Find the first newline in `buffer` at or after index `from` and return its
+ * index, or -1. `String#indexOf` reads at most `buffer.length - from` code
+ * units, so the search from the end of the prior bytes keeps the pre-READY scan
+ * work linear in the bytes received. This helper counts that work for a test.
+ */
+function findNewlineFrom(buffer: string, from: number): number {
+  duplexReadinessNewlineScanUnits += buffer.length - from;
+  return buffer.indexOf("\n", from);
+}
+
+/**
+ * Test-only surface for the pre-READY readiness gate. A test reads the scan
+ * count to prove the newline search work stays linear in the bytes received.
+ * Production code does not use this object.
+ */
+export const __duplexReadinessTesting = {
+  readNewlineScanUnits: (): number => duplexReadinessNewlineScanUnits,
+  resetNewlineScanUnits: (): void => {
+    duplexReadinessNewlineScanUnits = 0;
+  },
+};
+
 interface DuplexReadinessGate {
   /** Resolves with the handshake outcome. It never rejects. */
   readonly ready: Promise<DuplexReadinessResult>;
@@ -2460,9 +2489,13 @@ function createDuplexReadinessGate(
       // never grows the buffer after the gate settles.
       return;
     }
+    // The prior bytes hold no newline, so a newline can only be inside the new
+    // chunk. Record the current length as the scan start, then search from it.
+    // The total scan work stays linear in the bytes received.
+    let searchFrom = buffer.length;
     buffer += chunk;
     for (;;) {
-      const newlineIndex = buffer.indexOf("\n");
+      const newlineIndex = findNewlineFrom(buffer, searchFrom);
       if (newlineIndex === -1) {
         // No READY line yet. The gate reads untrusted bytes, so bound the
         // pre-READY buffer. Past the cap with no newline, the stream cannot be a
@@ -2483,8 +2516,10 @@ function createDuplexReadinessGate(
       const line = buffer.slice(0, newlineIndex);
       const rest = buffer.slice(newlineIndex + 1);
       if (line.length === 0) {
-        // Skip a leading blank line, the same as the frame decoder.
+        // Skip a leading blank line, the same as the frame decoder. The `rest`
+        // is a fresh buffer, so search it from offset 0.
         buffer = rest;
+        searchFrom = 0;
         continue;
       }
       const decoded = decodeDuplexLine(line);

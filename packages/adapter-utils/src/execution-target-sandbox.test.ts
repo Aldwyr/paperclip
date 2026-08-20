@@ -14,6 +14,7 @@ import {
 } from "./sandbox-callback-bridge.js";
 
 import {
+  __duplexReadinessTesting,
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
   adapterExecutionTargetDuplexTelemetryRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
@@ -4044,6 +4045,62 @@ describe("sandbox adapter execution targets", () => {
       const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
       expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
       expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("bounds the pre-READY newline-scan work by the bytes received", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-scan-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // An adversarial provider sends many small newline-less chunks before the
+    // cap fires. Each chunk must scan only the new bytes, not the whole buffer,
+    // so the total newline-scan work stays linear in the bytes received. A
+    // per-chunk full rescan makes the work quadratic.
+    const readinessBufferCapBytes = DEFAULT_MAX_DUPLEX_FRAME_BYTES + 4_096;
+    const smallChunk = "x".repeat(64);
+    const chunkCount = Math.ceil(readinessBufferCapBytes / smallChunk.length) + 1;
+    const totalBytes = chunkCount * smallChunk.length;
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      for (let i = 0; i < chunkCount; i += 1) {
+        ctx.emitRaw(smallChunk);
+      }
+    });
+    const { recorder } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    __duplexReadinessTesting.resetNewlineScanUnits();
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-scan-bound",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      const scanUnits = __duplexReadinessTesting.readNewlineScanUnits();
+      // Linear scan work reads each byte one time, so the count stays near
+      // totalBytes. A per-chunk full rescan is quadratic (about
+      // totalBytes^2 / (2 * chunkSize)), far above this bound.
+      expect(scanUnits).toBeLessThanOrEqual(4 * totalBytes);
     } finally {
       await bridge?.stop();
       await api.close();
