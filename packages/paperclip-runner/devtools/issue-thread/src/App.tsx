@@ -974,6 +974,13 @@ export function App() {
             }
             onClose={closeEvidence}
             onJumpToThread={jumpToThread}
+            onInvokeTool={route.mode === "live" ? async (operationId, input) => {
+              setActionError(null);
+              const next = await capabilityLiveClient.invokeTool(snapshot.sessionId, operationId, input);
+              setSnapshot(next.view);
+              setSelectedTurnId(next.toolTurnId);
+              return next.toolResult;
+            } : undefined}
           />
         ) : null}
       </div>

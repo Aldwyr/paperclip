@@ -996,9 +996,9 @@ const BUILDERS: Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot
       threadAnchorId: "item-disposition-1",
     });
     snapshot.composer = {
-      state: "disabled",
-      helper: null,
-      reason: "Issue is done",
+      state: "ready",
+      helper: "This task is done. You can still continue the conversation.",
+      reason: null,
       pendingInteractionId: null,
     };
     return snapshot;

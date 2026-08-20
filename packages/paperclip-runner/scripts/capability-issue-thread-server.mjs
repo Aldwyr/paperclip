@@ -722,7 +722,19 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         return;
       }
 
-      if (route === "message") {
+      if (route === "tool") {
+        const invocation = await entry.session.invokeTool(
+          String(body.operationId ?? ""),
+          body.input ?? {},
+        );
+        const projected = payload(runner, entry);
+        send(response, 200, {
+          ...projected,
+          toolResult: invocation.result,
+          toolTurnId: projected.view.turns.at(-1)?.id ?? null,
+        });
+        return;
+      } else if (route === "message") {
         const message = String(body.message ?? "");
         if (Buffer.byteLength(message, "utf8") > MAX_MESSAGE_BYTES) {
           throw new RouteError(413, "message_too_large", "Message exceeds the server limit.");

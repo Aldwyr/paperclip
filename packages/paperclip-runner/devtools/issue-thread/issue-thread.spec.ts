@@ -362,10 +362,11 @@ test.describe("Capability issue thread", () => {
     await expect(page.getByTestId("replay-next-turn")).toBeDisabled();
   });
 
-  test("a terminal disposition disables the composer with a reason", async ({ page }) => {
+  test("a terminal disposition keeps the composer available", async ({ page }) => {
     await open(page, "disposition-terminal");
     await expect(page.locator('[data-thread-item="disposition"]')).toContainText("Done");
-    await expect(page.getByTestId("composer-reason")).toHaveText("Issue is done");
+    await expect(page.locator("#composer-input")).toBeEnabled();
+    await expect(page.getByText("This task is done. You can still continue the conversation.")).toBeVisible();
   });
 
   test("composer drafts survive a refresh", async ({ page }) => {

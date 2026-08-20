@@ -209,6 +209,12 @@ export interface CapabilityLiveTurnResult {
   snapshot: CapabilityLiveSessionSnapshot;
 }
 
+export interface CapabilityLiveToolInvocationResult {
+  turnId: string;
+  result: CapabilitySemanticToolResult;
+  snapshot: CapabilityLiveSessionSnapshot;
+}
+
 /**
  * Live turn events (track 7Q).
  *
@@ -1102,6 +1108,56 @@ export class CapabilityLiveSession {
     const result = await terminal;
     await this.#persist();
     return { ...result, snapshot: this.snapshot() };
+  }
+
+  /**
+   * Runs an operator-authored DevTools call through the exact dispatcher used
+   * by Codex. It receives a real turn id, durable call/result evidence, and a
+   * state-history entry so it is replayable as part of the conversation rather
+   * than an out-of-band API console.
+   */
+  async invokeTool(operationId: string, input: unknown): Promise<CapabilityLiveToolInvocationResult> {
+    if (this.#status === "closed" || this.#status === "failed") {
+      throw new Error("Capability live session is not connected");
+    }
+    if (this.#activeTurnId !== null || this.#turnWaiter !== null) {
+      throw new Error("Capability live session already has an active turn");
+    }
+    const turnId = `devtools-${randomUUID()}`;
+    const callId = `devtools-call-${randomUUID()}`;
+    const argumentsValue = jsonValue(input);
+    const beforeRevision = this.#port.snapshot().revision;
+    this.#appendTranscript("user", `DevTools invoked \`${operationId}\`.`, turnId);
+    this.#appendEvidence("tool_call", turnId, {
+      callId,
+      operationId,
+      input: argumentsValue,
+      beforeRevision,
+    });
+    const result = await this.#dispatcher.dispatch({
+      runId: this.#authority.runId,
+      callId,
+      operationId,
+      input: argumentsValue,
+    });
+    this.#recordStateRevision(turnId, operationId);
+    this.#appendEvidence("tool_result", turnId, {
+      callId,
+      operationId,
+      result: jsonValue(result),
+      beforeRevision,
+      afterRevision: result.stateRevision,
+    });
+    this.#appendTranscript(
+      "assistant",
+      result.ok
+        ? `DevTools call \`${operationId}\` completed at company state revision ${result.stateRevision}.`
+        : `DevTools call \`${operationId}\` was denied: ${result.denial.message}`,
+      turnId,
+    );
+    this.#recordTerminalFact(turnId, "completed");
+    await this.#persist();
+    return { turnId, result, snapshot: this.snapshot() };
   }
 
   #armTurnWaiter(): Promise<Omit<CapabilityLiveTurnResult, "snapshot">> {

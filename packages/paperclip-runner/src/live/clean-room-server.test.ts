@@ -672,6 +672,46 @@ describe("Capability clean-room chat server", () => {
     expect(after.view.evidence.state.length).toBeGreaterThan(0);
   });
 
+  it("invokes a DevTools tool as a durable conversation turn", async () => {
+    const opened = await call("/api/capability/ui/cleanroom/session");
+    const after = await call("/api/capability/ui/tool", {
+      sessionId: opened.sessionId,
+      operationId: "report_progress",
+      input: {
+        idempotencyKey: "devtools-report-1",
+        body: "Progress entered manually from DevTools.",
+      },
+    });
+
+    expect(after.toolResult).toMatchObject({ ok: true, operationId: "report_progress" });
+    expect(after.toolTurnId).toMatch(/^turn-/);
+    const turn = after.view.turns.find((candidate: { id: string }) => candidate.id === after.toolTurnId);
+    expect(turn).toBeDefined();
+    expect(turn.items.some((item: CapabilityThreadItem) => item.kind === "user_message")).toBe(true);
+    expect(turn.items.some((item: CapabilityThreadItem) => item.kind === "tool_activity" && item.operationId === "report_progress")).toBe(true);
+    expect(turn.items.some((item: CapabilityThreadItem) => item.kind === "durable_comment" && item.body === "Progress entered manually from DevTools.")).toBe(true);
+    expect(after.view.evidence.state.at(-1)?.toRevision).toBeGreaterThan(0);
+  });
+
+  it("continues the provider conversation after the task is finished", async () => {
+    const opened = await call("/api/capability/ui/cleanroom/session");
+    const finished = await call("/api/capability/ui/tool", {
+      sessionId: opened.sessionId,
+      operationId: "finish_task",
+      input: { idempotencyKey: "devtools-finish-1", summary: "The mock task is complete." },
+    });
+    expect(finished.view.issue.status).toBe("done");
+    expect(finished.view.composer.state).toBe("ready");
+
+    const continued = await call("/api/capability/ui/message", {
+      sessionId: opened.sessionId,
+      message: "Explain what was completed.",
+    });
+    expect(items(continued.view).some(
+      (item) => item.kind === "user_message" && item.body === "Explain what was completed.",
+    )).toBe(true);
+  });
+
   it("exposes full state history and can fork a retained revision", async () => {
     const opened = await call("/api/capability/ui/cleanroom/session");
     await call("/api/capability/ui/message", {
@@ -1070,7 +1110,7 @@ describe("Capability clean-room chat server", () => {
     }
 
     // Every mutation route, not only the ones that create sessions.
-    const mutations = ["message", "interrupt", "reconnect", "reset", "interaction"];
+    const mutations = ["message", "tool", "interrupt", "reconnect", "reset", "interaction"];
     for (const route of mutations) {
       expect(
         await status(`/api/capability/ui/${route}`, { sessionId: aliceRoom.sessionId, message: "hi" }, mallory),

@@ -6,6 +6,7 @@ import type {
   CapabilityEvidenceSectionId,
   CapabilityEvidenceToolRow,
   CapabilityIssueThreadSnapshot,
+  CapabilityJsonValue,
   CapabilityToolDisposition,
 } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
@@ -122,6 +123,7 @@ export interface EvidencePanelProps {
   onToggleSection: (section: CapabilityEvidenceSectionId) => void;
   onClose: () => void;
   onJumpToThread: (anchorId: string) => void;
+  onInvokeTool?: (operationId: string, input: CapabilityJsonValue) => Promise<CapabilityJsonValue>;
 }
 
 function sectionCount(
@@ -145,9 +147,29 @@ function sectionCount(
   return String(rows.length);
 }
 
-function ToolsBrowser({ records }: { records: CapabilityEvidenceModel["tools"] }) {
+function starterInput(schema: { properties?: Readonly<Record<string, { type?: string | readonly string[]; enum?: readonly CapabilityJsonValue[]; default?: CapabilityJsonValue }>>; required?: readonly string[] } | undefined): Record<string, CapabilityJsonValue> {
+  const result: Record<string, CapabilityJsonValue> = {};
+  for (const name of schema?.required ?? []) {
+    const property = schema?.properties?.[name];
+    if (property?.default !== undefined) result[name] = property.default;
+    else if (property?.enum?.[0] !== undefined) result[name] = property.enum[0];
+    else if (name === "idempotencyKey") result[name] = `devtools-${Date.now()}`;
+    else if (property?.type === "integer" || property?.type === "number") result[name] = 0;
+    else if (property?.type === "boolean") result[name] = false;
+    else if (property?.type === "array") result[name] = [];
+    else if (property?.type === "object") result[name] = {};
+    else result[name] = "";
+  }
+  return result;
+}
+
+function ToolsBrowser({ records, onInvoke }: { records: CapabilityEvidenceModel["tools"]; onInvoke?: (operationId: string, input: CapabilityJsonValue) => Promise<CapabilityJsonValue> }) {
   const [collapsed, setCollapsed] = useState<CapabilityToolDisposition[]>([]);
   const [selected, setSelected] = useState<CapabilityEvidenceToolRow | null>(null);
+  const [inputText, setInputText] = useState("{}");
+  const [invocationResult, setInvocationResult] = useState<CapabilityJsonValue | null>(null);
+  const [invocationError, setInvocationError] = useState<string | null>(null);
+  const [invoking, setInvoking] = useState(false);
   const rows = useMemo(() => {
     const unique = new Map<string, CapabilityEvidenceToolRow>();
     for (const record of records) {
@@ -156,6 +178,13 @@ function ToolsBrowser({ records }: { records: CapabilityEvidenceModel["tools"] }
     return [...unique.values()];
   }, [records]);
   const descriptor = selected === null ? undefined : capabilitySemanticToolDescriptor(selected.operationId);
+
+  useEffect(() => {
+    if (selected === null) return;
+    setInputText(JSON.stringify(starterInput(descriptor?.inputSchema), null, 2));
+    setInvocationResult(null);
+    setInvocationError(null);
+  }, [descriptor, selected]);
 
   useEffect(() => {
     if (selected === null) return;
@@ -219,6 +248,32 @@ function ToolsBrowser({ records }: { records: CapabilityEvidenceModel["tools"] }
               <h3 className="pit-tool-schema-title">Input schema</h3>
               <pre className="pit-code">{JSON.stringify(descriptor?.inputSchema ?? {}, null, 2)}</pre>
             </div>
+            {onInvoke !== undefined ? (
+              <div className="pit-tool-tester">
+                <h3 className="pit-tool-schema-title">Invoke in conversation</h3>
+                <p className="pit-muted">Runs through the real semantic dispatcher and records a turn, evidence, and company-state changes.</p>
+                <label className="pit-card-meta" htmlFor="tool-test-input">Parameters (JSON)</label>
+                <textarea id="tool-test-input" className="pit-tool-test-input" value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
+                <button type="button" className="pit-button" disabled={invoking} onClick={() => {
+                  let parsed: CapabilityJsonValue;
+                  try {
+                    parsed = JSON.parse(inputText) as CapabilityJsonValue;
+                  } catch (error) {
+                    setInvocationError(error instanceof Error ? error.message : String(error));
+                    return;
+                  }
+                  setInvoking(true);
+                  setInvocationError(null);
+                  setInvocationResult(null);
+                  void onInvoke(selected.operationId, parsed)
+                    .then(setInvocationResult)
+                    .catch((error) => setInvocationError(error instanceof Error ? error.message : String(error)))
+                    .finally(() => setInvoking(false));
+                }}>{invoking ? "Invoking…" : "Invoke as tool call"}</button>
+                {invocationError !== null ? <p className="pit-error" role="alert">{invocationError}</p> : null}
+                {invocationResult !== null ? <pre className="pit-code" data-testid="tool-test-result">{JSON.stringify(invocationResult, null, 2)}</pre> : null}
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -285,6 +340,7 @@ export function EvidencePanel(props: EvidencePanelProps) {
     onToggleSection,
     onClose,
     onJumpToThread,
+    onInvokeTool,
   } = props;
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const evidence = snapshot.evidence;
@@ -353,7 +409,7 @@ export function EvidencePanel(props: EvidencePanelProps) {
         open={isOpen("tools")}
         onToggle={() => onToggleSection("tools")}
       >
-        <ToolsBrowser records={filterByTurn(evidence.tools, selectedTurnId)} />
+        <ToolsBrowser records={filterByTurn(evidence.tools, selectedTurnId)} onInvoke={onInvokeTool} />
       </Section>
 
       <Section

@@ -1,5 +1,6 @@
 import type { CapabilityIssueThreadSnapshot } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
+import type { CapabilityJsonValue } from "../../../src/mock-core/capability-control-plane-types";
 import {
   CAPABILITY_TURN_STREAM_ACCEPT,
   CapabilityTurnStreamError,
@@ -48,6 +49,11 @@ export interface CapabilityLiveResponse {
   identity?: CapabilityCleanRoomIdentity;
   limits?: { maxTurns: number; maxMessageBytes: number };
   turns?: number;
+}
+
+export interface CapabilityToolTestResponse extends CapabilityLiveResponse {
+  toolResult: CapabilityJsonValue;
+  toolTurnId: string;
 }
 
 /**
@@ -136,6 +142,13 @@ export const capabilityLiveClient = {
   },
   fork(sessionId: string, revision: number): Promise<CapabilityLiveResponse> {
     return post("/devtools/fork", { sessionId, revision });
+  },
+  invokeTool(
+    sessionId: string,
+    operationId: string,
+    input: CapabilityJsonValue,
+  ): Promise<CapabilityToolTestResponse> {
+    return post("/tool", { sessionId, operationId, input }) as Promise<CapabilityToolTestResponse>;
   },
   async load(sessionId: string | null): Promise<CapabilityLiveResponse> {
     const query = sessionId === null ? "" : `?sessionId=${encodeURIComponent(sessionId)}`;

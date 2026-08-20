@@ -526,11 +526,19 @@ function composerModel(
       pendingInteractionId,
     };
   }
-  if (terminal || snapshot.status === "closed" || snapshot.status === "failed") {
+  if (snapshot.status === "closed" || snapshot.status === "failed") {
     return {
       state: "disabled",
       helper: null,
-      reason: terminal ? "Issue is done" : "Session is closed",
+      reason: "Session is closed",
+      pendingInteractionId: null,
+    };
+  }
+  if (terminal) {
+    return {
+      state: "ready",
+      helper: "This task is done. You can still continue the conversation.",
+      reason: null,
       pendingInteractionId: null,
     };
   }
