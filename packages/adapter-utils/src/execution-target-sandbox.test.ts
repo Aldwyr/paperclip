@@ -3281,6 +3281,18 @@ describe("sandbox adapter execution targets", () => {
     }
   }
 
+  it("pins the exact fixed duplex dimension-key set", () => {
+    // The dimension-key set is closed. This test locks the exact contract, so a
+    // new key never reaches a sink without an explicit change here.
+    expect([...DUPLEX_DIMENSION_KEYS]).toEqual([
+      "provider",
+      "transport",
+      "outcome",
+      "fallback_reason",
+      "loss_class",
+    ]);
+  });
+
   it("records a duplex request span with latency and the fixed dimension keys", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-obs-"));
     cleanupDirs.push(rootDir);
