@@ -21,7 +21,7 @@ import { createCapabilityCookieJar } from "./capability-cookie-jar.mjs";
 import { createCapabilityIssueThreadMiddleware } from "./capability-issue-thread-server.mjs";
 
 const { readCapabilityTurnStream, CAPABILITY_TURN_STREAM_ACCEPT } = await import(
-  new URL("../dist/index.js", import.meta.url).href
+  new URL("../dist/live/index.js", import.meta.url).href
 );
 
 const CREDENTIAL_PATTERNS = [
