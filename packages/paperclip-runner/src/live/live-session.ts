@@ -1346,10 +1346,11 @@ export class CapabilityLiveSession {
     ) {
       this.#activeTurnId = turnId;
     }
+    const terminalReplay = this.#isDurableTerminalReplay(turnId, request.params.arguments);
     if (
       threadId !== this.#providerThreadId ||
       turnId.length === 0 ||
-      turnId !== this.#activeTurnId ||
+      (turnId !== this.#activeTurnId && !terminalReplay) ||
       callId.length === 0
     ) {
       return {
@@ -1371,6 +1372,7 @@ export class CapabilityLiveSession {
       operationId,
       input: request.params.arguments,
     });
+    const replayDisposition = result.ok ? text(record(result.result).disposition) : "";
     this.#appendEvidence("tool_result", turnId, {
       callId,
       operationId,
@@ -1380,7 +1382,28 @@ export class CapabilityLiveSession {
     });
     this.#emit({ turnId, kind: "activity", reason: "tool_result" });
     await this.#persist();
+    if (terminalReplay && replayDisposition !== "duplicate") {
+      return {
+        success: false,
+        contentItems: [{ type: "inputText", text: "Terminal-turn replay did not resolve to a durable duplicate." }],
+      };
+    }
     return this.#codexToolResponse(result);
+  }
+
+  #isDurableTerminalReplay(turnId: string, input: unknown): boolean {
+    if (turnId.length === 0 || this.#activeTurnId !== null) return false;
+    const terminal = this.#terminalTurns.find((candidate) => candidate.turnId === turnId);
+    if (
+      terminal?.status !== "interrupted" ||
+      terminal.reconciledByAttemptId !== this.#currentAttemptId
+    ) return false;
+    const idempotencyKey = text(record(input).idempotencyKey);
+    if (idempotencyKey.length === 0) return false;
+    const scope = `${this.#authority.runId}:semantic-command`;
+    return this.#port.snapshot().idempotency.some(
+      (entry) => entry.scope === scope && entry.key === idempotencyKey,
+    );
   }
 
   #codexToolResponse(result: CapabilitySemanticToolResult): Record<string, unknown> {

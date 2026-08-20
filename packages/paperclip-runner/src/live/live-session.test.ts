@@ -132,6 +132,10 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     this.#handler = handler;
   }
 
+  invokeServerRequest(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
+    return this.#handler(request);
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
     this.notificationsQueue.close();
@@ -460,6 +464,95 @@ describe("Capability live runnerd and Codex session", () => {
       reasoningTokens: 5,
       costNanodollars: 2_500,
     });
+  });
+
+  it("replays only a durable duplicate after restore reconciles the provider turn as interrupted", async () => {
+    const state = providerState();
+    const store = new InMemoryCapabilityLiveSessionStore();
+    const firstService = new CapabilityLiveSessionService({
+      store,
+      transportFactory: fakeTransportFactory(state),
+    });
+    const first = await firstService.create({
+      runId: "run-terminal-replay",
+      sessionId: "session-terminal-replay",
+      attemptId: "attempt-terminal-killed",
+      turnTimeoutMs: 50,
+    });
+    state.holdAfterTool = true;
+    const killedTurn = first.sendMessage("Apply idempotent progress once.").then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(async () => {
+      expect((await store.load(first.id))?.mockState).toContain("progress-governed-once");
+    });
+    await state.transports[0]!.close();
+    await expect(killedTurn).resolves.toMatchObject({ message: expect.stringContaining("timed out") });
+    state.turns.set("turn-1", "interrupted");
+
+    const resumedService = new CapabilityLiveSessionService({
+      store,
+      transportFactory: fakeTransportFactory(state),
+    });
+    const resumed = await resumedService.resume({
+      sessionId: first.id,
+      attemptId: "attempt-terminal-resumed",
+      resumeOf: "attempt-terminal-killed",
+    });
+    expect(resumed.snapshot()).toMatchObject({
+      activeTurnId: null,
+      providerThreadId: state.threadId,
+      terminalTurns: [
+        {
+          turnId: "turn-1",
+          status: "interrupted",
+          reconciledByAttemptId: "attempt-terminal-resumed",
+        },
+      ],
+    });
+
+    const replay = await state.transports[1]!.invokeServerRequest({
+      id: "request-turn-1:deterministic-resume-replay",
+      method: "item/tool/call",
+      params: {
+        threadId: state.threadId,
+        turnId: "turn-1",
+        callId: "call-turn-1:deterministic-resume-replay",
+        tool: "report_progress",
+        arguments: {
+          idempotencyKey: "progress-governed-once",
+          body: "Progress persisted through the live Codex tool loop.",
+        },
+      },
+    });
+    expect(replay.success).toBe(true);
+    expect(String((replay.contentItems as Array<Record<string, unknown>>)[0]?.text)).toContain(
+      '\"disposition\":\"duplicate\"',
+    );
+    expect(resumed.mockState().comments).toHaveLength(1);
+    expect(resumed.mockState().idempotency).toHaveLength(1);
+    expect(resumed.snapshot().evidence.filter((entry) => entry.kind === "tool_result")).toHaveLength(2);
+
+    const rejected = await state.transports[1]!.invokeServerRequest({
+      id: "request-turn-1:new-key",
+      method: "item/tool/call",
+      params: {
+        threadId: state.threadId,
+        turnId: "turn-1",
+        callId: "call-turn-1:new-key",
+        tool: "report_progress",
+        arguments: {
+          idempotencyKey: "progress-new-effect",
+          body: "This effect must not be applied.",
+        },
+      },
+    });
+    expect(rejected.success).toBe(false);
+    expect(resumed.mockState().comments).toHaveLength(1);
+    expect(resumed.mockState().idempotency).toHaveLength(1);
+    expect(resumed.snapshot().evidence.filter((entry) => entry.kind === "tool_result")).toHaveLength(2);
+    await resumedService.shutdown(resumed.id, "terminal replay test complete");
   });
 
   it("fails closed for missing, corrupt, mismatched, and provider-drifted checkpoints", async () => {
