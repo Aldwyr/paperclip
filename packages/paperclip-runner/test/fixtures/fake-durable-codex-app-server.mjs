@@ -74,6 +74,14 @@ function handleRequest(message) {
           id: state.threadId,
           sessionId: state.sessionId,
           turns: Object.entries(state.turns).map(([turnId, status]) => ({ id: turnId, status })),
+          tokenUsage: {
+            total: {
+              inputTokens: state.nextTurn * 10,
+              cachedInputTokens: 0,
+              outputTokens: state.nextTurn * 2,
+              reasoningOutputTokens: 0,
+            },
+          },
         },
       },
     });

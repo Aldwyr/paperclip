@@ -90,6 +90,14 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
           id: this.state.threadId,
           sessionId: this.state.providerSessionId,
           turns: [...this.state.turns].map(([id, status]) => ({ id, status })),
+          tokenUsage: {
+            total: {
+              inputTokens: this.state.nextTurn * 100,
+              cachedInputTokens: this.state.nextTurn * 20,
+              outputTokens: this.state.nextTurn * 10,
+              reasoningOutputTokens: this.state.nextTurn * 2,
+            },
+          },
         },
       };
     }
@@ -460,10 +468,11 @@ describe("Capability live runnerd and Codex session", () => {
       { attemptId: "attempt-killed", status: "terminated" },
       { attemptId: "attempt-resumed", status: "succeeded" },
     ]);
-    expect(final?.usageLedger).toHaveLength(2);
+    expect(final?.usageLedger).toHaveLength(3);
     expect(final && reconcileCapabilityLiveUsage(final)).toEqual({
-      providerCalls: 2,
-      inputTokens: 180,
+      providerCalls: 3,
+      providerRequests: 0,
+      inputTokens: 280,
       outputTokens: 30,
       cachedInputTokens: 40,
       reasoningTokens: 5,
@@ -712,7 +721,7 @@ describe("Capability live runnerd and Codex session", () => {
         { attemptId: "attempt-real-killed", status: "terminated" },
         { attemptId: "attempt-real-resumed", status: "succeeded", resumeOf: "attempt-real-killed" },
       ]);
-      expect(final?.usageLedger).toHaveLength(1);
+      expect(final?.usageLedger).toHaveLength(2);
       expect(final?.terminalTurns).toEqual(expect.arrayContaining([
         expect.objectContaining({ turnId: "turn-1", status: "interrupted" }),
         expect.objectContaining({ turnId: "turn-2", status: "completed" }),

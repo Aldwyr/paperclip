@@ -121,6 +121,7 @@ export interface CapabilityLiveUsageReceipt {
   providerResponseId: string | null;
   turnId: string | null;
   providerCalls: number;
+  providerRequests: number;
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
@@ -142,6 +143,7 @@ export interface RecordCapabilityLiveUsageInput {
   providerResponseId?: string | null;
   turnId?: string | null;
   providerCalls?: number;
+  providerRequests?: number;
   inputTokens?: number;
   outputTokens?: number;
   cachedInputTokens?: number;
@@ -462,6 +464,7 @@ export function assertCapabilityLiveSessionSnapshot(
     }
     for (const name of [
       "providerCalls",
+      "providerRequests",
       "inputTokens",
       "outputTokens",
       "cachedInputTokens",
@@ -506,6 +509,7 @@ export function reconcileCapabilityLiveUsage(
   const unique = new Map((snapshot.usageLedger ?? []).map((receipt) => [receipt.receiptId, receipt]));
   return [...unique.values()].reduce((total, receipt) => ({
     providerCalls: total.providerCalls + receipt.providerCalls,
+    providerRequests: total.providerRequests + receipt.providerRequests,
     inputTokens: total.inputTokens + receipt.inputTokens,
     outputTokens: total.outputTokens + receipt.outputTokens,
     cachedInputTokens: total.cachedInputTokens + receipt.cachedInputTokens,
@@ -513,6 +517,7 @@ export function reconcileCapabilityLiveUsage(
     costNanodollars: total.costNanodollars + receipt.costNanodollars,
   }), {
     providerCalls: 0,
+    providerRequests: 0,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
@@ -804,6 +809,7 @@ export class CapabilityLiveSession {
   readonly #listeners = new Set<CapabilityLiveTurnListener>();
   #eventSeq = 0;
   #turnEventCount = 0;
+  readonly #rawUsageByTurn = new Map<string, { providerRequests: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number }>();
 
   private constructor(options: OpenSessionOptions & { snapshot?: CapabilityLiveSessionSnapshot }) {
     this.#port = options.port;
@@ -1020,6 +1026,7 @@ export class CapabilityLiveSession {
       providerResponseId: input.providerResponseId ?? null,
       turnId: input.turnId ?? this.#activeTurnId,
       providerCalls: nonNegativeInteger(input.providerCalls ?? 1, "provider_calls"),
+      providerRequests: nonNegativeInteger(input.providerRequests, "provider_requests"),
       inputTokens: nonNegativeInteger(input.inputTokens, "input_tokens"),
       outputTokens: nonNegativeInteger(input.outputTokens, "output_tokens"),
       cachedInputTokens: nonNegativeInteger(input.cachedInputTokens, "cached_input_tokens"),
@@ -1112,8 +1119,49 @@ export class CapabilityLiveSession {
     if (draft !== undefined && draft.turnId === null) draft.turnId = turnId;
     await this.#persist();
     const result = await terminal;
+    await this.#captureTurnUsage(result.turnId);
     await this.#persist();
     return { ...result, snapshot: this.snapshot() };
+  }
+
+  async #captureTurnUsage(turnId: string): Promise<void> {
+    if (this.#transport === null) throw new Error("capability_live_usage_transport_missing");
+    const captured = this.#rawUsageByTurn.get(turnId);
+    const read = captured === undefined ? await this.#transport.request("thread/read", {
+      threadId: this.#providerThreadId,
+      includeTurns: true,
+    }) : {};
+    const thread = record(read.thread);
+    const usage = record(thread.tokenUsage ?? read.tokenUsage);
+    const total = record(captured ?? usage.total ?? usage.totalTokenUsage ?? usage.total_token_usage);
+    const integer = (...names: string[]): number => {
+      for (const name of names) {
+        const value = total[name];
+        if (Number.isSafeInteger(value) && Number(value) >= 0) return Number(value);
+      }
+      return 0;
+    };
+    const cumulative = {
+      inputTokens: integer("inputTokens", "input_tokens"),
+      outputTokens: integer("outputTokens", "output_tokens"),
+      cachedInputTokens: integer("cachedInputTokens", "cached_input_tokens"),
+      reasoningTokens: integer("reasoningOutputTokens", "reasoningTokens", "reasoning_output_tokens"),
+    };
+    if (cumulative.inputTokens + cumulative.outputTokens === 0) {
+      throw new Error("capability_live_usage_missing");
+    }
+    const prior = reconcileCapabilityLiveUsage(this.snapshot());
+    await this.recordUsage({
+      receiptId: `${turnId}:usage`,
+      turnId,
+      providerCalls: 1,
+      providerRequests: captured?.providerRequests ?? 0,
+      inputTokens: Math.max(0, cumulative.inputTokens - prior.inputTokens),
+      outputTokens: Math.max(0, cumulative.outputTokens - prior.outputTokens),
+      cachedInputTokens: Math.max(0, cumulative.cachedInputTokens - prior.cachedInputTokens),
+      reasoningTokens: Math.max(0, cumulative.reasoningTokens - prior.reasoningTokens),
+      costNanodollars: 0,
+    });
   }
 
   /**
@@ -1380,7 +1428,7 @@ export class CapabilityLiveSession {
         approvalPolicy: "never",
         baseInstructions: LIVE_BASE_INSTRUCTIONS,
         dynamicTools: tools.map(dynamicToolSpec),
-        experimentalRawEvents: false,
+        experimentalRawEvents: true,
         persistExtendedHistory: true,
       });
       const thread = record(opened.thread);
@@ -1565,7 +1613,20 @@ export class CapabilityLiveSession {
       method: notification.method,
       params: jsonValue(params),
     });
-    if (notification.method === "turn/started") {
+    if (notification.method === "rawResponse/completed") {
+      const rawUsage = record(params.usage);
+      if (turnId.length > 0 && Object.keys(rawUsage).length > 0) {
+        const previous = this.#rawUsageByTurn.get(turnId) ?? { providerRequests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+        const value = (name: string): number => Number.isSafeInteger(rawUsage[name]) && Number(rawUsage[name]) >= 0 ? Number(rawUsage[name]) : 0;
+        this.#rawUsageByTurn.set(turnId, {
+          providerRequests: previous.providerRequests + 1,
+          inputTokens: previous.inputTokens + value("inputTokens"),
+          outputTokens: previous.outputTokens + value("outputTokens"),
+          cachedInputTokens: previous.cachedInputTokens + value("cachedInputTokens"),
+          reasoningTokens: previous.reasoningTokens + value("reasoningOutputTokens"),
+        });
+      }
+    } else if (notification.method === "turn/started") {
       if (turnId.length > 0) this.#activeTurnId = turnId;
       this.#emit({ turnId: turnId || this.#activeTurnId, kind: "activity", reason: "turn_started" });
     } else if (notification.method === "item/agentMessage/delta") {

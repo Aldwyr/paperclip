@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 import { projectCapabilityDevtools } from "../devtools/index.js";
 import { PAPERCLIP_RUNNER_BUILD_METADATA } from "../evals/build-metadata.js";
+import { estimateModelCostNanodollars } from "../evals/model-pricing.js";
 import { projectCapabilityIssueThread } from "../issue-thread/live-projection.js";
 import {
   CapabilityLiveSessionService,
@@ -18,7 +19,7 @@ interface EvalSessionRequest {
   prompt: string;
   model: string;
   runnerd: { path: string; sha256: string };
-  limits: { turnTimeoutMs: number; maxProviderCalls: number; maxCostNanodollars: number };
+  limits: { turnTimeoutMs: number; maxAgentTurns: number; maxEstimatedCostNanodollars: number };
   session: CreateCapabilityLiveSessionInput;
 }
 
@@ -57,9 +58,20 @@ try {
   const turn = await session.sendMessage(request.prompt);
   await session.completeAttempt(turn.status === "completed" ? "succeeded" : "failed", `turn_${turn.status}`);
   const snapshot = session.snapshot();
-  const usage = reconcileCapabilityLiveUsage(snapshot);
-  if (usage.providerCalls > request.limits.maxProviderCalls) throw new Error("provider call limit exceeded");
-  if (usage.costNanodollars > request.limits.maxCostNanodollars) throw new Error("cost limit exceeded");
+  const reconciled = reconcileCapabilityLiveUsage(snapshot);
+  if ((snapshot.usageLedger ?? []).length === 0) throw new Error("completed turn omitted usage accounting");
+  const estimate = estimateModelCostNanodollars(request.model, reconciled);
+  const usage = {
+    agentTurns: reconciled.providerCalls,
+    providerRequests: reconciled.providerRequests,
+    inputTokens: reconciled.inputTokens,
+    outputTokens: reconciled.outputTokens,
+    cachedInputTokens: reconciled.cachedInputTokens,
+    reasoningTokens: reconciled.reasoningTokens,
+    ...estimate,
+  };
+  if (usage.agentTurns > request.limits.maxAgentTurns) throw new Error("agent turn limit exceeded");
+  if (usage.estimatedCostNanodollars > request.limits.maxEstimatedCostNanodollars) throw new Error("estimated cost limit exceeded");
   await writeFile(outputPath, `${JSON.stringify({
     schema: "paperclip-runner/eval-session-artifact/v1",
     attemptId: request.attemptId,

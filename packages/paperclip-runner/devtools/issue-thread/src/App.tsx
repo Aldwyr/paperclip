@@ -77,6 +77,16 @@ interface EmbeddedEvalReport {
     finishedAt: string;
     initialRevision: number;
     finalRevision: number;
+    usage: {
+      agentTurns: number;
+      providerRequests: number | null;
+      inputTokens: number;
+      outputTokens: number;
+      cachedInputTokens: number;
+      reasoningTokens: number;
+      estimatedCostNanodollars: number;
+      pricingVersion: string;
+    } | null;
   };
   view: CapabilityIssueThreadSnapshot;
   devtools: CapabilityDevtoolsSnapshot;
