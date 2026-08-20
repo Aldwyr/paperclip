@@ -2221,7 +2221,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return null;
     },
 
-    getById: async (id: string) => {
+    getById: async (id: string, options: HydrateWorkspaceOptions = {}) => {
       const row = await db
         .select()
         .from(executionWorkspaces)
@@ -2239,6 +2239,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return hydrateWorkspace(
         row,
         (runtimeServicesByWorkspaceId.get(row.id) ?? []).map(toRuntimeService),
+        { inspectCloseReadiness: options.inspectCloseReadiness ?? false },
       );
     },
 

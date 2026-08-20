@@ -3951,7 +3951,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   }, 30_000);
 
-  it("does not run close-readiness Git scans while listing workspaces", async () => {
+  it("does not run close-readiness Git scans for workspace metadata reads", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const executionWorkspaceId = randomUUID();
@@ -4012,6 +4012,14 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       const [workspace] = await svc.list(companyId);
 
       expect(workspace).toMatchObject({
+        id: executionWorkspaceId,
+        deliveryState: "unknown",
+        cwd: repoRoot,
+        providerRef: repoRoot,
+      });
+
+      const byId = await svc.getById(executionWorkspaceId);
+      expect(byId).toMatchObject({
         id: executionWorkspaceId,
         deliveryState: "unknown",
         cwd: repoRoot,
