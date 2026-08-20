@@ -108,7 +108,9 @@ describe("GatewayActivityPanel", () => {
   function clickButton(text: string) {
     const button = [...container.querySelectorAll("button")].find((item) => item.textContent?.includes(text));
     expect(button, `button containing ${text}`).toBeTruthy();
-    return act(async () => button!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    return act(async () => {
+      button!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
   }
 
   it("filters by gateway and expands redacted call details", async () => {
