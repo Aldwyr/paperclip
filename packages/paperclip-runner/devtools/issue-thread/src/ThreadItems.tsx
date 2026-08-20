@@ -88,7 +88,7 @@ function ProgressItem({
       <div className="pit-activity-detail">
         <p>
           {item.eventCount} sanitized progress update{item.eventCount === 1 ? "" : "s"} observed.
-          Raw chain-of-thought and provider text are not exposed.
+          Raw output, chain-of-thought, and credential values are not exposed.
         </p>
       </div>
     </details>

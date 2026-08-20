@@ -219,6 +219,27 @@ describe("Capability evidence redaction", () => {
     }
   });
 
+  it("shows bounded structured shell commands while redacting credential values", () => {
+    const redacted = redactCapabilityEvidenceData("provider_event", {
+      method: "item/started",
+      params: {
+        item: {
+          type: "commandExecution",
+          source: "unifiedExecStartup",
+          command: "/bin/bash -lc 'curl -H \"Authorization: Bearer hidden-token\" --token pcp_1234567890 https://example.test && printf ok'",
+          aggregatedOutput: CANARY,
+        },
+      },
+    });
+
+    expect(redacted.event).toBe("command_started");
+    expect(redacted.command).toContain("/bin/bash -lc");
+    expect(redacted.command).toContain("printf ok");
+    expect(redacted.command).not.toContain("hidden-token");
+    expect(redacted.command).not.toContain("pcp_1234567890");
+    expect(JSON.stringify(redacted)).not.toContain(CANARY);
+  });
+
   it("collapses an unknown provider method rather than echoing it", () => {
     expect(redactCapabilityEvidenceData("provider_event", { method: `x/${CANARY}` })).toEqual({
       event: "other",

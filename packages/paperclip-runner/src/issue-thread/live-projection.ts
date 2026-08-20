@@ -772,6 +772,7 @@ export function projectCapabilityIssueThread(
       event: keyof typeof PROGRESS_EVENTS;
       at: string;
       count: number;
+      command: string;
     }
   >();
   for (const entry of snapshot.evidence) {
@@ -784,7 +785,7 @@ export function projectCapabilityIssueThread(
     const key = event.endsWith("_delta") ? `${entry.turnId}:${event}` : entry.id;
     const group = progressGroups.get(key);
     if (group === undefined) {
-      progressGroups.set(key, { id: entry.id, turnId: entry.turnId, event, at: entry.at, count: 1 });
+      progressGroups.set(key, { id: entry.id, turnId: entry.turnId, event, at: entry.at, count: 1, command: readString(entry.data.command) });
     } else {
       group.count += 1;
     }
@@ -799,7 +800,7 @@ export function projectCapabilityIssueThread(
       activity: copy.activity,
       status: running ? "running" : "complete",
       label: copy.label,
-      summary: running ? copy.running : copy.complete,
+      summary: group.command || (running ? copy.running : copy.complete),
       eventCount: group.count,
     });
   }

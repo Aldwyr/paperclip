@@ -130,8 +130,9 @@ While a turn runs, a live status rail appears immediately after send and tracks
 the newest safe Codex activity. Reasoning, planning, shell-command, file-change,
 MCP/dynamic-tool, assistant-stream, and Paperclip semantic-tool lifecycle events
 each trigger an interim frame. Discrete tools remain separate rows; only noisy
-text deltas are grouped. Raw provider text, command output, and chain of thought
-stay withheld.
+text deltas are grouped. Structured shell items show a bounded,
+credential-redacted command preview; raw command output, other provider
+payloads, and chain of thought stay withheld.
 
 ## Remote preview gateway
 

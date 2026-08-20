@@ -41,6 +41,7 @@ export type CapabilityEvidenceKind =
 
 /** Disposition copy is rendered, so it is bounded rather than unbounded. */
 const MAX_DISPOSITION_CHARS = 500;
+const MAX_COMMAND_CHARS = 2_000;
 const MAX_FIELD_NAMES = 32;
 const MAX_ENTITY_REFS = 64;
 
@@ -130,6 +131,21 @@ function clamp(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}…`;
 }
 
+function commandPreview(item: Record<string, unknown>): string | null {
+  // `unifiedExecStartup` is the Codex app-server's structured shell item. Do
+  // not start echoing arbitrary future provider item shapes just because they
+  // happen to grow a field named `command`.
+  if (asString(item.source) !== "unifiedExecStartup") return null;
+  let command = clamp(asString(item.command), MAX_COMMAND_CHARS);
+  if (command.length === 0) return null;
+  command = command
+    .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|pcp)_[a-z0-9._-]{8,}\b/gi, "[redacted]")
+    .replace(/((?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s]+)/gi, "$1[redacted]")
+    .replace(/(--(?:api-key|token|password|secret)\s+)(?:"[^"]*"|'[^']*'|[^\s]+)/gi, "$1[redacted]");
+  return command;
+}
+
 function copyFields(
   data: Record<string, unknown>,
   names: readonly string[],
@@ -210,10 +226,17 @@ export function redactCapabilityEvidenceData(
   data: Record<string, unknown>,
 ): Record<string, CapabilityJsonValue> {
   switch (kind) {
-    case "provider_event":
+    case "provider_event": {
+      const event = capabilityProviderEventCategory(asString(data.method), asRecord(data.params));
+      const item = asRecord(asRecord(data.params).item);
+      const command = event === "command_started" || event === "command_completed"
+        ? commandPreview(item)
+        : null;
       return {
-        event: capabilityProviderEventCategory(asString(data.method), asRecord(data.params)),
+        event,
+        ...(command === null ? {} : { command }),
       };
+    }
     case "diagnostic":
       // A provider diagnostic is operator surface, not board surface. Only the
       // fact that one was recorded survives.
@@ -343,6 +366,7 @@ export function capabilityEvidenceDetails(
   switch (kind) {
     case "provider_event":
       add("Event", data.event);
+      add("Command", data.command);
       break;
     case "diagnostic":
       add("Visibility", data.diagnostic);
