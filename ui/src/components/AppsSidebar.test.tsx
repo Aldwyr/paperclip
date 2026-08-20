@@ -116,6 +116,8 @@ describe("AppsSidebar", () => {
     expect(container.textContent).toContain("Developer");
     // The Developer boundary caption frames who the door is for (PAP-13241 §5).
     expect(container.textContent).toContain("Advanced setup for developers");
+    expect(container.textContent).not.toContain("Most teams");
+    expect(container.textContent).not.toMatch(/you (?:won'?t|will not) need this/i);
     // "Run your own" / "Paste a config" moved to the Connect-an-app page (PAP-10922);
     // assert their absence at the item level below.
 

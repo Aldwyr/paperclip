@@ -72,7 +72,7 @@ export function AppsSidebar() {
           Developer
         </div>
         <p className="px-3 pb-1.5 text-(length:--text-micro) leading-snug text-muted-foreground/70">
-          Advanced setup for developers. Most teams never open this.
+          Advanced setup for developers.
         </p>
         <div className="flex flex-col gap-0.5">
           <SidebarNavItem to="/apps/connections" label="Connections" icon={AppWindow} end />
