@@ -238,6 +238,7 @@ test.describe("Capability issue thread", () => {
     ).toBeVisible();
     await expect(panel.getByText("Agent tool — always")).toBeVisible();
     await expect(panel.getByText("Agent tool — granted")).toBeVisible();
+
   });
 
   test("tool exposure groups are deduplicated, foldable, and open catalog details", async ({ page }) => {
@@ -716,6 +717,16 @@ test.describe("Capability clean-room chat", () => {
     });
     await openCleanRoom(page);
     await page.getByTestId("evidence-toggle").click();
+    const panel = page.getByTestId("evidence-panel");
+    const tabs = panel.getByRole("tab");
+    await expect(tabs.first()).toHaveText(/Evidence/);
+    await expect(tabs.nth(1)).toHaveText(/Timeline/);
+    await expect(tabs.first()).toHaveAttribute("aria-selected", "true");
+    await expect(panel.locator("#evidence-turn-selector")).toBeVisible();
+    await panel.getByRole("tab", { name: /Timeline/ }).click();
+    await expect(panel.locator("#evidence-turn-selector")).toHaveCount(0);
+    await panel.getByRole("tab", { name: /Evidence/ }).click();
+    await expect(panel.locator("#evidence-turn-selector")).toBeVisible();
     await page.getByRole("tab", { name: /Documents/ }).click();
     await expect(page.getByRole("heading", { name: "Runner plan" })).toBeVisible();
     await expect(page.getByText("Inspectable from DevTools.")).toBeVisible();

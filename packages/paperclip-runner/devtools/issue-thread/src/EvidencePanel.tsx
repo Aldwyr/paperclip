@@ -9,7 +9,7 @@ import type {
   CapabilityToolDisposition,
 } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
-import { DevtoolsInspector } from "./DevtoolsInspector";
+import { DevtoolsInspector, type CapabilityDevtoolsTab } from "./DevtoolsInspector";
 import { Icon } from "./Icons";
 import { capabilitySemanticToolDescriptor } from "../../../src/semantic-tools/catalog";
 import {
@@ -271,6 +271,7 @@ function Section({
 }
 
 export function EvidencePanel(props: EvidencePanelProps) {
+  const [devtoolsTab, setDevtoolsTab] = useState<CapabilityDevtoolsTab>("evidence");
   const {
     snapshot,
     devtools,
@@ -331,11 +332,12 @@ export function EvidencePanel(props: EvidencePanelProps) {
           {devtools === null ? (
             <p className="pit-muted pit-devtools-loading">Loading company state…</p>
           ) : (
-            <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} />
+            <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} tab={devtoolsTab} onTabChange={setDevtoolsTab} />
           )}
         </>
       ) : null}
 
+      {devtoolsTab === "evidence" ? <div className="pit-evidence-browser">
       <div className="pit-evidence-filter">
         <label className="pit-card-meta" htmlFor="evidence-turn-selector">Evidence scope</label>
         <select className="pit-select" id="evidence-turn-selector" value={selectedTurnId} onChange={(event) => onSelectTurn(event.target.value as string | "all")}>
@@ -548,6 +550,7 @@ export function EvidencePanel(props: EvidencePanelProps) {
           </div>
         ))}
       </Section>
+      </div> : null}
     </aside>
   );
 }

@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { Icon } from "./Icons";
 
-type Tab = "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
+export type CapabilityDevtoolsTab = "evidence" | "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 function JsonTree({ value, name = "root" }: { value: Json; name?: string }) {
@@ -55,7 +55,8 @@ function download(snapshot: CapabilityDevtoolsSnapshot) {
   URL.revokeObjectURL(url);
 }
 
-const TABS: ReadonlyArray<{ id: Tab; glyph: string; label: string }> = [
+const TABS: ReadonlyArray<{ id: CapabilityDevtoolsTab; glyph: string; label: string }> = [
+  { id: "evidence", glyph: "◎", label: "Evidence" },
   { id: "timeline", glyph: "◫", label: "Timeline" },
   { id: "state", glyph: "{}", label: "State" },
   { id: "diff", glyph: "±", label: "Diff" },
@@ -85,8 +86,7 @@ function documentsOf(state: Json): Array<{ id: string; key: string; title: strin
   });
 }
 
-export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDevtoolsSnapshot; onFork: (revision: number) => void }) {
-  const [tab, setTab] = useState<Tab>("timeline");
+export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange }: { snapshot: CapabilityDevtoolsSnapshot; onFork: (revision: number) => void; tab: CapabilityDevtoolsTab; onTabChange: (tab: CapabilityDevtoolsTab) => void }) {
   const [query, setQuery] = useState("");
   const latest = snapshot.revisions.at(-1)!;
   const [revision, setRevision] = useState(latest.revision);
@@ -125,7 +125,7 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
       </div>
       <div className="pit-devtools-tabs" role="tablist" aria-label="Developer tools">
         {TABS.map(({ id, glyph, label }) => (
-          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => setTab(id)}><span className="pit-tab-glyph" aria-hidden="true">{glyph}</span>{label}</button>
+          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => onTabChange(id)}><span className="pit-tab-glyph" aria-hidden="true">{glyph}</span>{label}</button>
         ))}
       </div>
       {tab === "timeline" ? (
