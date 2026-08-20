@@ -80,6 +80,16 @@ const PROGRESS_EVENTS = {
     running: "File-change progress is arriving from Codex.",
     complete: "File-change activity completed.",
   },
+  reasoning_started: { activity: "thinking", label: "Thinking", running: "Codex started reasoning.", complete: "Reasoning started." },
+  reasoning_completed: { activity: "thinking", label: "Thinking", running: "Codex completed reasoning.", complete: "Reasoning completed." },
+  plan_started: { activity: "planning", label: "Planning", running: "Codex started planning.", complete: "Planning started." },
+  plan_completed: { activity: "planning", label: "Planning", running: "Codex completed planning.", complete: "Planning completed." },
+  command_started: { activity: "command", label: "Shell command", running: "Codex started a shell command.", complete: "Shell command started." },
+  command_completed: { activity: "command", label: "Shell command", running: "Codex completed a shell command.", complete: "Shell command completed." },
+  tool_started: { activity: "command", label: "Codex tool", running: "Codex started a tool call.", complete: "Tool call started." },
+  tool_completed: { activity: "command", label: "Codex tool", running: "Codex completed a tool call.", complete: "Tool call completed." },
+  file_change_started: { activity: "file_change", label: "File change", running: "Codex started a file change.", complete: "File change started." },
+  file_change_completed: { activity: "file_change", label: "File change", running: "Codex completed a file change.", complete: "File change completed." },
 } as const;
 
 export interface CapabilityLiveProjectionInput {
@@ -757,6 +767,7 @@ export function projectCapabilityIssueThread(
   const progressGroups = new Map<
     string,
     {
+      id: string;
       turnId: string;
       event: keyof typeof PROGRESS_EVENTS;
       at: string;
@@ -767,20 +778,23 @@ export function projectCapabilityIssueThread(
     if (entry.kind !== "provider_event" || entry.turnId === null) continue;
     const event = readString(entry.data.event) as keyof typeof PROGRESS_EVENTS;
     if (!(event in PROGRESS_EVENTS)) continue;
-    const key = `${entry.turnId}:${event}`;
+    // Deltas are a stream and stay grouped for readability. Lifecycle records
+    // are discrete Codex tools/items: retain one row per start/completion so a
+    // burst of shell commands never collapses into an opaque counter.
+    const key = event.endsWith("_delta") ? `${entry.turnId}:${event}` : entry.id;
     const group = progressGroups.get(key);
     if (group === undefined) {
-      progressGroups.set(key, { turnId: entry.turnId, event, at: entry.at, count: 1 });
+      progressGroups.set(key, { id: entry.id, turnId: entry.turnId, event, at: entry.at, count: 1 });
     } else {
       group.count += 1;
     }
   }
   for (const group of progressGroups.values()) {
     const copy = PROGRESS_EVENTS[group.event];
-    const running = snapshot.activeTurnId === group.turnId;
+    const running = snapshot.activeTurnId === group.turnId && !group.event.endsWith("_completed");
     turnFor(group.turnId, group.at).items.push({
       kind: "progress_activity",
-      id: `item-progress-${group.turnId}-${group.event}`,
+      id: `item-progress-${group.id}`,
       at: group.at,
       activity: copy.activity,
       status: running ? "running" : "complete",

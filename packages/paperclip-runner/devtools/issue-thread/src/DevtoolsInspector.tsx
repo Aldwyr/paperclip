@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
+import { Icon } from "./Icons";
 
-type Tab = "timeline" | "state" | "diff" | "protocol" | "runtime" | "authority";
+type Tab = "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 function JsonTree({ value, name = "root" }: { value: Json; name?: string }) {
@@ -54,6 +55,36 @@ function download(snapshot: CapabilityDevtoolsSnapshot) {
   URL.revokeObjectURL(url);
 }
 
+const TABS: ReadonlyArray<{ id: Tab; glyph: string; label: string }> = [
+  { id: "timeline", glyph: "◫", label: "Timeline" },
+  { id: "state", glyph: "{}", label: "State" },
+  { id: "diff", glyph: "±", label: "Diff" },
+  { id: "documents", glyph: "▤", label: "Documents" },
+  { id: "protocol", glyph: "⇄", label: "Protocol" },
+  { id: "runtime", glyph: ">_", label: "Runtime" },
+  { id: "authority", glyph: "◇", label: "Authority" },
+];
+
+function documentsOf(state: Json): Array<{ id: string; key: string; title: string; revisions: Array<{ id: string; revision: number; body: string; changeSummary: string | null; createdAt: string }> }> {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) return [];
+  const documents = state.documents;
+  if (!Array.isArray(documents)) return [];
+  return documents.flatMap((value) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
+    const revisions = Array.isArray(value.revisions) ? value.revisions.flatMap((candidate) => {
+      if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+      return [{
+        id: String(candidate.id ?? ""),
+        revision: Number(candidate.revision ?? 0),
+        body: String(candidate.body ?? ""),
+        changeSummary: candidate.changeSummary === null ? null : String(candidate.changeSummary ?? ""),
+        createdAt: String(candidate.createdAt ?? ""),
+      }];
+    }) : [];
+    return [{ id: String(value.id ?? ""), key: String(value.key ?? ""), title: String(value.title ?? "Untitled"), revisions }];
+  });
+}
+
 export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDevtoolsSnapshot; onFork: (revision: number) => void }) {
   const [tab, setTab] = useState<Tab>("timeline");
   const [query, setQuery] = useState("");
@@ -74,6 +105,11 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
   const protocol = snapshot.protocol.filter((entry) =>
     normalized.length === 0 || JSON.stringify(entry).toLowerCase().includes(normalized),
   );
+  const documents = useMemo(() => documentsOf(selected.state as Json), [selected.state]);
+  const [documentId, setDocumentId] = useState("");
+  const document = documents.find((entry) => entry.id === documentId) ?? documents[0] ?? null;
+  const [documentRevision, setDocumentRevision] = useState(0);
+  const visibleDocumentRevision = document?.revisions.find((entry) => entry.revision === documentRevision) ?? document?.revisions.at(-1) ?? null;
   useEffect(() => {
     if (following) setRevision(latest.revision);
   }, [following, latest.revision]);
@@ -81,15 +117,15 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
   return (
     <section className="pit-devtools" data-testid="devtools-inspector">
       <div className="pit-devtools-toolbar">
-        <label className="pit-card-meta" htmlFor="devtools-search">Filter</label>
+        <span className="pit-devtools-brand"><Icon name="activity" /> State monitor</span>
         <input id="devtools-search" className="pit-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="operation, entity, turn…" />
-        <button className="pit-button" type="button" aria-pressed={!following} onClick={() => setFollowing((value) => !value)}>{following ? "Pause" : "Follow latest"}</button>
-        <button className="pit-button" type="button" onClick={() => download(snapshot)}>Export</button>
-        <button className="pit-button" type="button" onClick={() => onFork(revision)}>Fork r{revision}</button>
+        <button className="pit-icon-button" type="button" aria-pressed={!following} onClick={() => setFollowing((value) => !value)} title={following ? "Pause live updates" : "Follow latest revision"} aria-label={following ? "Pause live updates" : "Follow latest revision"}><Icon name={following ? "pause" : "play"} /></button>
+        <button className="pit-icon-button" type="button" onClick={() => download(snapshot)} title="Export redacted snapshot" aria-label="Export redacted snapshot"><Icon name="download" /></button>
+        <button className="pit-button" type="button" onClick={() => onFork(revision)}><Icon name="branch" /> Fork r{revision}</button>
       </div>
       <div className="pit-devtools-tabs" role="tablist" aria-label="Developer tools">
-        {(["timeline", "state", "diff", "protocol", "runtime", "authority"] as const).map((id) => (
-          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => setTab(id)}>{id[0]!.toUpperCase() + id.slice(1)}</button>
+        {TABS.map(({ id, glyph, label }) => (
+          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => setTab(id)}><span className="pit-tab-glyph" aria-hidden="true">{glyph}</span>{label}</button>
         ))}
       </div>
       {tab === "timeline" ? (
@@ -102,7 +138,7 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
         </div>
       ) : null}
       {tab === "state" ? (
-        <div>
+        <div className="pit-devtools-pane">
           <label className="pit-card-meta" htmlFor="devtools-revision">Revision</label>
           <select id="devtools-revision" className="pit-select" value={revision} onChange={(event) => setRevision(Number(event.target.value))}>
             {snapshot.revisions.map((entry) => <option key={entry.revision} value={entry.revision}>r{entry.revision} · {entry.operationId}</option>)}
@@ -111,7 +147,7 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
         </div>
       ) : null}
       {tab === "diff" ? (
-        <div>
+        <div className="pit-devtools-pane">
           <div className="pit-button-row">
             <select className="pit-select" aria-label="Compare from revision" value={compareRevision} onChange={(event) => setCompareRevision(Number(event.target.value))}>
               {snapshot.revisions.map((entry) => <option key={entry.revision} value={entry.revision}>from r{entry.revision}</option>)}
@@ -124,9 +160,25 @@ export function DevtoolsInspector({ snapshot, onFork }: { snapshot: CapabilityDe
           {rows.length === 0 ? <p className="pit-muted">No changes between these revisions.</p> : null}
         </div>
       ) : null}
+      {tab === "documents" ? (
+        documents.length === 0 ? <div className="pit-devtools-empty"><span aria-hidden="true">▤</span><p>No documents exist at r{selected.revision}.</p></div> : (
+          <div className="pit-document-browser">
+            <div className="pit-document-sidebar">
+              {documents.map((entry) => <button type="button" key={entry.id} data-selected={entry.id === document?.id} onClick={() => { setDocumentId(entry.id); setDocumentRevision(0); }}><strong>{entry.key}</strong><span>{entry.title}</span><small>{entry.revisions.length} revision{entry.revisions.length === 1 ? "" : "s"}</small></button>)}
+            </div>
+            {document !== null && visibleDocumentRevision !== null ? (
+              <article className="pit-document-viewer">
+                <header><div><span className="pit-card-meta">{document.key}</span><h4>{document.title}</h4></div><select className="pit-select" aria-label="Document revision" value={visibleDocumentRevision.revision} onChange={(event) => setDocumentRevision(Number(event.target.value))}>{document.revisions.map((entry) => <option key={entry.id} value={entry.revision}>r{entry.revision}</option>)}</select></header>
+                {visibleDocumentRevision.changeSummary ? <p className="pit-document-summary">{visibleDocumentRevision.changeSummary}</p> : null}
+                <pre className="pit-document-body">{visibleDocumentRevision.body}</pre>
+              </article>
+            ) : null}
+          </div>
+        )
+      ) : null}
       {tab === "protocol" ? <div className="pit-devtools-list">{protocol.map((entry) => <details className="pit-runner-event" key={entry.id}><summary><strong>{entry.boundary}</strong> · {entry.event}</summary><JsonTree value={entry.detail as Json} /></details>)}</div> : null}
-      {tab === "runtime" ? <JsonTree value={snapshot.runtime as Json} /> : null}
-      {tab === "authority" ? <JsonTree value={snapshot.authority as Json} /> : null}
+      {tab === "runtime" ? <div className="pit-devtools-pane"><JsonTree value={snapshot.runtime as Json} /></div> : null}
+      {tab === "authority" ? <div className="pit-devtools-pane"><JsonTree value={snapshot.authority as Json} /></div> : null}
     </section>
   );
 }

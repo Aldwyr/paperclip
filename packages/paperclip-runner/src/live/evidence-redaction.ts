@@ -70,7 +70,24 @@ const PROVIDER_EVENT_CATEGORIES: Readonly<Record<string, string>> = Object.freez
  * progress events deserve an immediate browser frame without duplicating the
  * protocol-method allowlist.
  */
-export function capabilityProviderEventCategory(method: string): string {
+const PROVIDER_ITEM_CATEGORIES: Readonly<Record<string, string>> = Object.freeze({
+  commandExecution: "command",
+  fileChange: "file_change",
+  reasoning: "reasoning",
+  plan: "plan",
+  mcpToolCall: "tool",
+  dynamicToolCall: "tool",
+});
+
+export function capabilityProviderEventCategory(
+  method: string,
+  params?: Record<string, unknown>,
+): string {
+  if (method === "item/started" || method === "item/completed") {
+    const item = asRecord(params?.item);
+    const category = PROVIDER_ITEM_CATEGORIES[asString(item.type)];
+    if (category !== undefined) return `${category}_${method.endsWith("started") ? "started" : "completed"}`;
+  }
   return PROVIDER_EVENT_CATEGORIES[method] ?? "other";
 }
 
@@ -194,7 +211,9 @@ export function redactCapabilityEvidenceData(
 ): Record<string, CapabilityJsonValue> {
   switch (kind) {
     case "provider_event":
-      return { event: capabilityProviderEventCategory(asString(data.method)) };
+      return {
+        event: capabilityProviderEventCategory(asString(data.method), asRecord(data.params)),
+      };
     case "diagnostic":
       // A provider diagnostic is operator surface, not board surface. Only the
       // fact that one was recorded survives.

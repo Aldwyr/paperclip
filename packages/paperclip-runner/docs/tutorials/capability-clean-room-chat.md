@@ -101,7 +101,7 @@ same Codex thread once you answer.
 
 ## 4. Look at the evidence, when you want it
 
-Click `Evidence`. The drawer carries the same eight sections the scenario path
+Click `DevTools`. The drawer carries the same eight evidence sections the scenario path
 uses: tools exposed, calls and typed results, authorization decisions,
 control-plane actions, runner events, state diffs, traceability, and parity.
 Above those sections, the DevTools inspector provides six tabs:
@@ -109,12 +109,19 @@ Above those sections, the DevTools inspector provides six tabs:
 - **Timeline** selects any retained control-plane revision.
 - **State** browses the full mock company tree.
 - **Diff** compares any two revisions field by field.
+- **Documents** reads document bodies and switches between revisions.
 - **Protocol**, **Runtime**, and **Authority** show the surrounding scaffolding
   that explains why each mutation happened.
 
 Use **Pause** to stop following the newest revision, **Export** to download a
 redacted JSON snapshot, or **Fork rN** to replace this chat with a fresh live
 branch rooted at the selected mock-company revision.
+
+Drag the bright divider at the drawer's left edge to resize it (up to 960px), or
+focus that divider and use the arrow keys. As soon as you send a message, the
+live activity rail reports the current Codex stage; shell commands, built-in
+Codex tools, and Paperclip semantic calls also appear as individual activity
+rows while the turn is still open.
 
 Two things are worth finding on your first pass:
 

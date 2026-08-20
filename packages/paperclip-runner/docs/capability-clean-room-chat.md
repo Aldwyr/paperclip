@@ -108,14 +108,16 @@ provider, runner, or control-plane credential.
 
 ## DevTools state inspector
 
-Opening **Evidence** also opens a Redux-DevTools-style inspector over the live
+Opening **DevTools** opens a Redux-DevTools-style inspector over the live
 mock company. Its timeline starts at the pristine fixture, adds a revision for
 each successful semantic mutation, and lets the operator inspect or diff the
 complete browser-safe company scaffolding: company, actors, tasks, comments,
 documents, interactions, approvals, artifacts, work products, blockers,
 workspace services, budgets, runs, wakes, audit records, decisions,
 idempotency records, and configured faults. Separate tabs expose the protocol
-boundary records, runner/runtime facts, and effective authority.
+boundary records, runner/runtime facts, and effective authority. A dedicated
+**Documents** tab renders every mock document and lets the operator switch
+between its retained revisions without digging through raw JSON.
 
 **Pause** pins a revision while work continues, **Export** downloads the
 redacted DevTools snapshot, and **Fork rN** retires the current mock session and
@@ -123,6 +125,13 @@ starts a new executable branch from that retained state. Provider payloads,
 session checkpoints, artifact content references, working directories, and
 secret-shaped strings remain server-side or are withheld by the explicit
 browser projection.
+
+While a turn runs, a live status rail appears immediately after send and tracks
+the newest safe Codex activity. Reasoning, planning, shell-command, file-change,
+MCP/dynamic-tool, assistant-stream, and Paperclip semantic-tool lifecycle events
+each trigger an interim frame. Discrete tools remain separate rows; only noisy
+text deltas are grouped. Raw provider text, command output, and chain of thought
+stay withheld.
 
 ## Remote preview gateway
 

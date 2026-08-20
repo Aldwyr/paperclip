@@ -1495,7 +1495,7 @@ export class CapabilityLiveSession {
     const turn = record(params.turn);
     const item = record(params.item);
     const turnId = text(params.turnId, text(turn.id));
-    const providerEvent = capabilityProviderEventCategory(notification.method);
+    const providerEvent = capabilityProviderEventCategory(notification.method, params);
     this.#appendEvidence("provider_event", turnId || null, {
       method: notification.method,
       params: jsonValue(params),
@@ -1508,7 +1508,11 @@ export class CapabilityLiveSession {
         this.#turnWaiter.assistantText += text(params.delta);
         this.#publishAssistantProgress(turnId || this.#activeTurnId);
       }
-    } else if (providerEvent.endsWith("_delta")) {
+    } else if (
+      providerEvent.endsWith("_delta") ||
+      (providerEvent.endsWith("_started") && providerEvent !== "item_started") ||
+      (providerEvent.endsWith("_completed") && providerEvent !== "item_completed" && providerEvent !== "turn_completed")
+    ) {
       // Reasoning, planning, command-output, and file-change progress used to
       // be retained only for diagnostics. Emitting an activity frame here lets
       // the thread acknowledge that work immediately, while the redaction gate

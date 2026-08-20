@@ -203,6 +203,22 @@ describe("Capability evidence redaction", () => {
     }
   });
 
+  it("retains each known Codex tool lifecycle category without its payload", () => {
+    for (const [type, expected] of [
+      ["commandExecution", "command_started"],
+      ["fileChange", "file_change_started"],
+      ["mcpToolCall", "tool_started"],
+      ["dynamicToolCall", "tool_started"],
+    ] as const) {
+      const redacted = redactCapabilityEvidenceData("provider_event", {
+        method: "item/started",
+        params: { item: { type, command: `echo ${CANARY}`, output: CANARY } },
+      });
+      expect(redacted).toEqual({ event: expected });
+      expect(JSON.stringify(redacted)).not.toContain(CANARY);
+    }
+  });
+
   it("collapses an unknown provider method rather than echoing it", () => {
     expect(redactCapabilityEvidenceData("provider_event", { method: `x/${CANARY}` })).toEqual({
       event: "other",

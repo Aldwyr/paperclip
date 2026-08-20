@@ -9,6 +9,7 @@ import type {
 } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { DevtoolsInspector } from "./DevtoolsInspector";
+import { Icon } from "./Icons";
 import {
   CAPABILITY_EVIDENCE_SECTIONS,
   capabilityDispositionLabel,
@@ -230,44 +231,31 @@ export function EvidencePanel(props: EvidencePanelProps) {
       style={layout === "side" ? { width: `${width}px` } : undefined}
       aria-label="Evidence"
     >
-      <div className="pit-panel-head">
-        <div className="pit-header-controls">
-          <h2 className="pit-panel-title" tabIndex={-1} ref={headingRef}>
-            Evidence
-          </h2>
-          <button type="button" className="pit-button" onClick={onClose}>
-            Close
-          </button>
-        </div>
-        <label className="pit-card-meta" htmlFor="evidence-turn-selector">
-          Turn
-        </label>
-        <select
-          className="pit-select"
-          id="evidence-turn-selector"
-          value={selectedTurnId}
-          onChange={(event) => onSelectTurn(event.target.value as string | "all")}
-        >
-          {snapshot.turns.map((turn) => (
-            <option key={turn.id} value={turn.id}>
-              Turn {turn.ordinal}
-            </option>
-          ))}
-          <option value="all">All turns</option>
-        </select>
+      <div className="pit-panel-chrome">
+        <h2 className="pit-visually-hidden" tabIndex={-1} ref={headingRef}>Developer tools</h2>
+        <span className="pit-panel-kicker"><Icon name="activity" /> Paperclip DevTools</span>
+        <button type="button" className="pit-icon-button" onClick={onClose} aria-label="Close DevTools" title="Close DevTools">
+          <Icon name="close" />
+        </button>
       </div>
 
       {devtools !== undefined ? (
         <>
-          <h3 className="pit-evidence-heading">Company DevTools</h3>
           {devtools === null ? (
             <p className="pit-muted pit-devtools-loading">Loading company state…</p>
           ) : (
             <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} />
           )}
-          <h3 className="pit-evidence-heading">Evidence log</h3>
         </>
       ) : null}
+
+      <div className="pit-evidence-filter">
+        <label className="pit-card-meta" htmlFor="evidence-turn-selector">Evidence scope</label>
+        <select className="pit-select" id="evidence-turn-selector" value={selectedTurnId} onChange={(event) => onSelectTurn(event.target.value as string | "all")}>
+          {snapshot.turns.map((turn) => <option key={turn.id} value={turn.id}>Turn {turn.ordinal}</option>)}
+          <option value="all">All turns</option>
+        </select>
+      </div>
 
       <Section
         id="tools"

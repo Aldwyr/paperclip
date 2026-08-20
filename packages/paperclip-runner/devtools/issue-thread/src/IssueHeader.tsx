@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { CapabilityIssueThreadSnapshot } from "../../../src/issue-thread/types";
+import { Icon } from "./Icons";
 import { Chip, PriorityIcon, StatusBadge } from "./primitives";
 
 /**
@@ -61,17 +62,34 @@ export function IssueHeader(props: IssueHeaderProps) {
 
   return (
     <header className="pit-header" data-session-mode={snapshot.mode}>
-      <div className="pit-header-title-row">
-        <span className="pit-identifier">{snapshot.issue.identifier}</span>
-        <h1 className="pit-title">{snapshot.issue.title}</h1>
-        <StatusBadge status={snapshot.issue.status} />
-        <PriorityIcon priority={snapshot.issue.priority} />
-        {snapshot.issue.assignee !== null ? (
-          <span className="pit-assignee">{snapshot.issue.assignee}</span>
-        ) : null}
+      <div className="pit-header-primary">
+        <div className="pit-header-title-row">
+          <span className="pit-identifier">{snapshot.issue.identifier}</span>
+          <h1 className="pit-title">{snapshot.issue.title}</h1>
+          <StatusBadge status={snapshot.issue.status} />
+        </div>
+        <div className="pit-header-controls">
+          {chat ? (
+            <button type="button" className="pit-button" onClick={onNewChat} data-testid="new-chat-button">
+              <Icon name="spark" /> New chat
+            </button>
+          ) : (
+            <>
+              <label className="pit-visually-hidden" htmlFor="scenario-picker">Scenario</label>
+              <select className="pit-select pit-desktop-only" id="scenario-picker" value={snapshot.issue.fixtureProfile} onChange={(event) => onSelectScenario(event.target.value)} data-testid="scenario-picker">
+                {scenarios.map((scenario) => <option key={scenario} value={scenario}>{scenario}</option>)}
+              </select>
+              <button type="button" className="pit-button pit-desktop-only" onClick={onReplay} data-testid="replay-button"><Icon name="play" /> Replay</button>
+            </>
+          )}
+          <button type="button" className="pit-icon-button pit-desktop-only" data-variant="destructive" onClick={onReset} data-testid="reset-button" title={chat ? "Reset chat" : "Reset scenario"} aria-label={chat ? "Reset chat" : "Reset scenario"}><Icon name="reset" /></button>
+          <button type="button" className="pit-icon-button" data-variant="destructive" onClick={onStop} disabled={!turnActive} data-testid="stop-button" title="Stop turn" aria-label="Stop turn"><Icon name="stop" /></button>
+          <button type="button" className="pit-button pit-desktop-only" aria-expanded={evidenceOpen} onClick={onToggleEvidence} data-testid="evidence-toggle"><Icon name="evidence" /> DevTools{denialCount > 0 ? ` (${denialCount})` : ""}</button>
+        </div>
       </div>
 
-      <div className="pit-chip-row" data-testid="identity-chips">
+      <div className="pit-header-context">
+        <div className="pit-chip-row" data-testid="identity-chips">
         <Chip tone={snapshot.mode === "live" ? "live" : undefined} testId="agent-chip">
           {snapshot.identity.agentLabel}
           {snapshot.identity.replaySource !== null
@@ -97,68 +115,10 @@ export function IssueHeader(props: IssueHeaderProps) {
             Clean room {cleanRoomToken}
           </Chip>
         ) : null}
-      </div>
-
-      <div className="pit-header-controls">
-        <span className="pit-run-state">{snapshot.issue.runState}</span>
-
-        {chat ? (
-          <button
-            type="button"
-            className="pit-button"
-            onClick={onNewChat}
-            data-testid="new-chat-button"
-          >
-            New chat
-          </button>
-        ) : (
-          <>
-            <label className="pit-visually-hidden" htmlFor="scenario-picker">
-              Scenario
-            </label>
-            <select
-              className="pit-select pit-desktop-only"
-              id="scenario-picker"
-              value={snapshot.issue.fixtureProfile}
-              onChange={(event) => onSelectScenario(event.target.value)}
-              data-testid="scenario-picker"
-            >
-              {scenarios.map((scenario) => (
-                <option key={scenario} value={scenario}>
-                  {scenario}
-                </option>
-              ))}
-            </select>
-
-            <button
-              type="button"
-              className="pit-button pit-desktop-only"
-              onClick={onReplay}
-              data-testid="replay-button"
-            >
-              Replay
-            </button>
-          </>
-        )}
-        <button
-          type="button"
-          className="pit-button pit-desktop-only"
-          data-variant="destructive"
-          onClick={onReset}
-          data-testid="reset-button"
-        >
-          Reset
-        </button>
-        <button
-          type="button"
-          className="pit-button"
-          data-variant="destructive"
-          onClick={onStop}
-          disabled={!turnActive}
-          data-testid="stop-button"
-        >
-          Stop
-        </button>
+        </div>
+        <PriorityIcon priority={snapshot.issue.priority} />
+        {snapshot.issue.assignee !== null ? <span className="pit-assignee">{snapshot.issue.assignee}</span> : null}
+        <span className="pit-run-state" title={snapshot.issue.runState}>{snapshot.issue.runState}</span>
 
         <div className="pit-menu pit-mobile-only" ref={menuRef}>
           <button
@@ -222,16 +182,6 @@ export function IssueHeader(props: IssueHeaderProps) {
           ) : null}
         </div>
 
-        <button
-          type="button"
-          className="pit-button pit-desktop-only"
-          aria-expanded={evidenceOpen}
-          onClick={onToggleEvidence}
-          data-testid="evidence-toggle"
-        >
-          Evidence
-          {denialCount > 0 ? ` (${denialCount})` : ""}
-        </button>
       </div>
 
       <div className="pit-segmented" role="tablist" aria-label="Thread or evidence">

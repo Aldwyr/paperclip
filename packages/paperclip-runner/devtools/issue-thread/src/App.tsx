@@ -12,6 +12,7 @@ import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { capabilityDenialCount } from "../../../src/issue-thread/types";
 import { Composer } from "./Composer";
 import { EvidencePanel } from "./EvidencePanel";
+import { Icon } from "./Icons";
 import { IssueHeader } from "./IssueHeader";
 import { applyFakeInteractionResponse } from "./fake-store";
 import type { CapabilityInteractionResponse } from "./InteractionCard";
@@ -35,7 +36,7 @@ const PANEL_OPEN_KEY = "paperclip-runner.capability.panel.open";
 const CHAT_PANEL_OPEN_KEY = "paperclip-runner.capability.chat.panel.open";
 const PANEL_WIDTH_KEY = "paperclip-runner.capability.panel.width";
 const PANEL_MIN = 320;
-const PANEL_MAX = 640;
+const PANEL_MAX = 960;
 /** Play-all cadence for the replay strip (§6); slow enough to read a turn. */
 const REPLAY_STEP_MS = 800;
 /**
@@ -76,7 +77,7 @@ function scrollEvidenceIntoView(target: Element, block: "start" | "center"): voi
   target.scrollIntoView({ block });
   if (block !== "start") return;
   const panel = target.closest<HTMLElement>(".pit-panel");
-  const head = panel?.querySelector<HTMLElement>(".pit-panel-head");
+  const head = panel?.querySelector<HTMLElement>(".pit-panel-chrome");
   if (panel == null || head == null) return;
   panel.scrollTop = Math.max(0, panel.scrollTop - head.offsetHeight);
 }
@@ -95,6 +96,23 @@ function settledAnnouncement(snapshot: CapabilityIssueThreadSnapshot, interactio
     }
   }
   return SETTLED_ANNOUNCEMENT;
+}
+
+function currentTurnActivity(snapshot: CapabilityIssueThreadSnapshot): string {
+  const turn = snapshot.turns.at(-1);
+  if (turn === undefined) return "Dispatching turn to Codex";
+  const activity = [...turn.items].reverse().find((item) =>
+    item.kind === "tool_activity" || item.kind === "progress_activity" ||
+    (item.kind === "agent_message" && item.streaming),
+  );
+  if (activity?.kind === "tool_activity") {
+    return activity.status === "running"
+      ? `Paperclip tool · ${activity.operationId}`
+      : `Paperclip tool completed · ${activity.operationId}`;
+  }
+  if (activity?.kind === "progress_activity") return activity.summary;
+  if (activity?.kind === "agent_message") return "Receiving Codex response";
+  return "Waiting for Codex activity";
 }
 
 function useRoute(): CapabilityRoute {
@@ -299,13 +317,13 @@ export function App() {
   }, [snapshot]);
 
   useEffect(() => {
-    if (!panelOpen || snapshot === null || route.mode !== "live" || streamingTurn) return;
+    if (!panelOpen || snapshot === null || route.mode !== "live") return;
     let cancelled = false;
     void capabilityLiveClient.devtools(snapshot.sessionId)
       .then((next) => { if (!cancelled) setDevtools(next); })
       .catch((cause) => { if (!cancelled) setActionError(describe(cause)); });
     return () => { cancelled = true; };
-  }, [panelOpen, route.mode, snapshot?.renderedAt, snapshot?.sessionId, streamingTurn]);
+  }, [panelOpen, route.mode, snapshot?.renderedAt, snapshot?.sessionId]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -736,6 +754,15 @@ export function App() {
         </p>
       ) : null}
 
+      {streamingTurn ? (
+        <div className="pit-live-activity" role="status" aria-live="polite" data-testid="live-activity">
+          <span className="pit-live-activity-pulse" aria-hidden="true" />
+          <Icon name="terminal" />
+          <span>{currentTurnActivity(snapshot)}</span>
+          <span className="pit-live-activity-tail" aria-hidden="true">live</span>
+        </div>
+      ) : null}
+
       {replay !== null ? (
         <div className="pit-replay-strip" data-testid="replay-strip">
           <span>
@@ -875,6 +902,26 @@ export function App() {
             aria-valuemax={PANEL_MAX}
             aria-valuenow={panelWidth}
             tabIndex={0}
+            onPointerDown={(event) => {
+              const splitter = event.currentTarget;
+              splitter.setPointerCapture(event.pointerId);
+              const resize = (pointer: PointerEvent) => {
+                const next = Math.min(PANEL_MAX, Math.max(PANEL_MIN, window.innerWidth - pointer.clientX));
+                setPanelWidth(next);
+              };
+              const finish = () => {
+                splitter.removeEventListener("pointermove", resize);
+                splitter.removeEventListener("pointerup", finish);
+                splitter.removeEventListener("pointercancel", finish);
+                setPanelWidth((current) => {
+                  persistPanel(panelOpen, current);
+                  return current;
+                });
+              };
+              splitter.addEventListener("pointermove", resize);
+              splitter.addEventListener("pointerup", finish);
+              splitter.addEventListener("pointercancel", finish);
+            }}
             onKeyDown={(event) => {
               const step = event.shiftKey ? 64 : 16;
               if (event.key === "ArrowLeft") {

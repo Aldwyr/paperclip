@@ -256,6 +256,22 @@ test.describe("Capability issue thread", () => {
     await expect(splitter).not.toHaveAttribute("aria-valuenow", before ?? "");
   });
 
+  test("the splitter drag makes the DevTools panel wider", async ({ page }) => {
+    await open(page, "debug-panel-open", { panel: "tools" });
+    const splitter = page.getByRole("separator", { name: "Resize the evidence panel" });
+    const panel = page.getByTestId("evidence-panel");
+    const handle = await splitter.boundingBox();
+    const before = await panel.boundingBox();
+    expect(handle).not.toBeNull();
+    expect(before).not.toBeNull();
+    await page.mouse.move(handle!.x + handle!.width / 2, handle!.y + handle!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(handle!.x - 140, handle!.y + handle!.height / 2, { steps: 5 });
+    await page.mouse.up();
+    const after = await panel.boundingBox();
+    expect(after!.width).toBeGreaterThan(before!.width + 100);
+  });
+
   test("reset is confirmed, escapable, and clears the thread", async ({ page }) => {
     await open(page, "disposition-terminal");
     await page.getByTestId("reset-button").click();
@@ -398,7 +414,7 @@ test.describe("Capability issue thread", () => {
   test("opening Evidence moves focus to its heading", async ({ page }) => {
     await open(page, "thread-baseline");
     await page.getByTestId("evidence-toggle").click();
-    await expect(page.getByRole("heading", { name: "Evidence" })).toBeFocused();
+    await expect(page.getByRole("heading", { name: "Developer tools" })).toBeFocused();
   });
 
   test("Escape closes the desktop overlay sheet and returns focus to its toggle", async ({
@@ -412,7 +428,7 @@ test.describe("Capability issue thread", () => {
 
     const panel = page.getByTestId("evidence-panel");
     await expect(panel).toHaveAttribute("data-layout", "overlay");
-    await expect(page.getByRole("heading", { name: "Evidence" })).toBeFocused();
+    await expect(page.getByRole("heading", { name: "Developer tools" })).toBeFocused();
 
     await page.keyboard.press("Escape");
     await expect(panel).toHaveCount(0);
@@ -463,6 +479,28 @@ test.describe("Capability issue thread", () => {
  */
 
 const CLEAN_ROOM_API = "**/api/capability/ui/cleanroom/session*";
+const DEVTOOLS_API = "**/api/capability/ui/devtools?*";
+
+function devtoolsPayload() {
+  const state = {
+    company: { id: "company-1", name: "Mock Paperclip" },
+    actors: [], tasks: [], comments: [], interactions: [], approvals: [], artifacts: [],
+    workProducts: [], blockers: [], workspaceServices: [], budgets: [], runs: [], wakes: [],
+    audit: [], decisions: [], idempotency: [], faults: [],
+    documents: [{
+      id: "document-1",
+      key: "plan",
+      title: "Runner plan",
+      revisions: [{ id: "revision-1", revision: 1, body: "# Real document body\n\nInspectable from DevTools.", changeSummary: "Initial draft", createdAt: "2026-08-10T12:00:00.000Z" }],
+    }],
+  };
+  return {
+    schema: "paperclip.capability.devtools.v1",
+    currentRevision: 4,
+    revisions: [{ revision: 4, at: "2026-08-10T12:00:00.000Z", turnId: "turn-1", operationId: "write_document", state }],
+    protocol: [], runtime: {}, authority: {},
+  };
+}
 
 function cleanRoomView(identifier: string, withTurn: boolean) {
   const guard = {
@@ -654,6 +692,17 @@ test.describe("Capability clean-room chat", () => {
     await expect(page.locator(".pit-panel")).toBeVisible();
     await page.getByRole("button", { name: /Control plane/ }).click();
     await expect(page.getByText("Real Paperclip API requests: 0")).toBeVisible();
+  });
+
+  test("documents written to company state are readable in DevTools", async ({ page }) => {
+    await page.route(DEVTOOLS_API, async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(devtoolsPayload()) });
+    });
+    await openCleanRoom(page);
+    await page.getByTestId("evidence-toggle").click();
+    await page.getByRole("tab", { name: /Documents/ }).click();
+    await expect(page.getByRole("heading", { name: "Runner plan" })).toBeVisible();
+    await expect(page.getByText("Inspectable from DevTools.")).toBeVisible();
   });
 
   test("Runner events expand completely while stream deltas stay grouped", async ({ page }) => {
@@ -1018,11 +1067,14 @@ test.describe("Capability streamed live turn", () => {
 
     await page.locator("#composer-input").fill("Show progress while you inspect this issue.");
     await page.getByTestId("composer-send").click();
+    const liveActivity = page.getByTestId("live-activity");
+    await expect(liveActivity).toBeVisible();
 
     const progress = page.locator('[data-thread-item="progress_activity"][data-activity="thinking"]');
     await expect(progress).toBeVisible({ timeout: 30_000 });
     await expect(progress).toHaveAttribute("data-status", "running");
     await expect(progress).toContainText("Thinking");
+    await expect(liveActivity).toContainText(/Reasoning|Thinking|Codex/);
     await expect(page.locator('[data-thread-item="agent_message"]')).toHaveCount(0);
     await expect(page.locator("body")).not.toContainText(
       "PRIVATE reasoning text must never reach the browser.",
