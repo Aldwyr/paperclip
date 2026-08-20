@@ -20,8 +20,15 @@ describe("connection grants phase 2 migration", () => {
   });
 
   it("adds credential policy and the grant audience table", () => {
-    expect(sql).toContain(`CREATE TABLE "connection_grant_members"`);
-    expect(sql).toContain(`ADD COLUMN "credential_policy" text DEFAULT 'shared' NOT NULL`);
+    expect(sql).toContain(`CREATE TABLE IF NOT EXISTS "connection_grant_members"`);
+    expect(sql).toContain(`ADD COLUMN IF NOT EXISTS "credential_policy" text DEFAULT 'shared' NOT NULL`);
     expect(sql).toContain(`'shared', 'per_user', 'per_user_with_fallback'`);
+  });
+
+  it("is safe to replay when schema state is ahead of the migration journal", () => {
+    expect(sql).toContain(`DROP CONSTRAINT IF EXISTS "connection_grant_members_company_grant_fk"`);
+    expect(sql).toContain(`DROP CONSTRAINT IF EXISTS "tool_connections_credential_policy_check"`);
+    expect(sql).toContain(`CREATE UNIQUE INDEX IF NOT EXISTS "connection_grants_default_uq"`);
+    expect(sql).toContain(`IF NOT EXISTS (\n\t\tSELECT 1\n\t\tFROM pg_constraint`);
   });
 });
