@@ -254,6 +254,11 @@ describe("Apps routes", () => {
     expect(appSource).toContain('<Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />');
     expect(appSource).toContain('<Route path="apps/advanced/gateways" element={<GatewaysList />} />');
   });
+
+  it("redirects legacy Rules and Health links to the remaining developer surfaces", () => {
+    expect(appSource).toContain('if (tab === "runtime") return "/apps/connections";');
+    expect(appSource).toContain('if (tab === "policies") return "/apps/advanced/profiles";');
+  });
 });
 
 describe("Decisions routes", () => {

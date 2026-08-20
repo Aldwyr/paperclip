@@ -8,7 +8,6 @@ import { AppsSidebar } from "./AppsSidebar";
 
 const sidebarNavItemMock = vi.hoisted(() => vi.fn());
 const mockToolsApi = vi.hoisted(() => ({
-  listRuntimeSlots: vi.fn(),
   listActionRequests: vi.fn(),
 }));
 
@@ -89,12 +88,6 @@ describe("AppsSidebar", () => {
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
-    mockToolsApi.listRuntimeSlots.mockResolvedValue({
-      runtimeSlots: [
-        { id: "slot-1", status: "running" },
-        { id: "slot-2", status: "stopped" },
-      ],
-    });
     mockToolsApi.listActionRequests.mockResolvedValue({ actionRequests: [] });
   });
 
@@ -154,9 +147,8 @@ describe("AppsSidebar", () => {
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
       expect.objectContaining({ to: "/apps/advanced/profiles", label: "Profiles", end: true }),
     );
-    expect(sidebarNavItemMock).toHaveBeenCalledWith(
-      expect.objectContaining({ to: "/apps/advanced/runtime", label: "Health", end: true, liveCount: 1 }),
-    );
+    expect(sidebarNavItemMock).not.toHaveBeenCalledWith(expect.objectContaining({ label: "Rules" }));
+    expect(sidebarNavItemMock).not.toHaveBeenCalledWith(expect.objectContaining({ label: "Health" }));
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
       expect.objectContaining({ to: "/apps/advanced/audit", label: "Activity", end: true }),
     );

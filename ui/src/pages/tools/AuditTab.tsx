@@ -24,7 +24,6 @@ import {
 import { agentsApi } from "@/api/agents";
 import { AgentSelect } from "@/components/AgentMultiSelect";
 import { ToolsPageHeader, LoadingState, ErrorState, RelativeTime } from "./shared";
-import { advancedTabHref } from "./tool-tabs";
 
 const PAGE_SIZE = 50;
 const ALL = "__all";
@@ -214,9 +213,7 @@ function ActivityRow({
             {matchedRuleName ? (
               <>
                 {" "}
-                <Link to={advancedTabHref("policies")} className="text-primary hover:underline">
-                  {matchedRuleName}
-                </Link>
+                <span className="font-medium">{matchedRuleName}</span>
               </>
             ) : null}
           </p>

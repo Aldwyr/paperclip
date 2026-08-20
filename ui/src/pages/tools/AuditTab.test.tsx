@@ -138,17 +138,17 @@ describe("AuditTab", () => {
     expect(container.textContent).not.toContain("server-authoritative");
   });
 
-  it("expands a row to show the plain reason, the linked rule, and the Details collapse", async () => {
+  it("expands a row to show the plain reason, the matched rule, and the Details collapse", async () => {
     await render();
 
     await clickButton("used Send Email");
     await flushReact();
 
     expect(container.textContent).toContain("Blocked by a rule.");
-    const ruleLink = Array.from(container.querySelectorAll("a")).find((a) =>
+    expect(container.textContent).toContain("destructive actions");
+    expect(Array.from(container.querySelectorAll("a")).some((a) =>
       a.textContent?.includes("destructive actions"),
-    );
-    expect(ruleLink?.getAttribute("href")).toBe("/apps/advanced/policies");
+    )).toBe(false);
 
     // Raw tool name + reason code only appear once Details is opened.
     expect(container.textContent).not.toContain("mail:send_email");

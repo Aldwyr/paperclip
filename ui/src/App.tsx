@@ -404,6 +404,8 @@ function LegacyToolsRedirect() {
 function legacyToolsRedirectTarget(tab?: string) {
   if (!tab) return "/apps/advanced/profiles";
   if (tab === "applications" || tab === "connections" || tab === "overview" || tab === "examples") return "/apps/connections";
+  if (tab === "runtime") return "/apps/connections";
+  if (tab === "policies") return "/apps/advanced/profiles";
   return `/apps/advanced/${tab}`;
 }
 

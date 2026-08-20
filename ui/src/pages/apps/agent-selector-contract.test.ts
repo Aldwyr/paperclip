@@ -11,7 +11,6 @@ describe("Apps agent selector contract", () => {
     const permissions = source("./app-detail/PermissionsPanel.tsx");
     const tester = source("./app-detail/TestPanel.tsx");
     const profiles = source("../tools/ProfilesTab.tsx");
-    const policies = source("../tools/PoliciesTab.tsx");
     const audit = source("../tools/AuditTab.tsx");
 
     expect(appConnect).toContain("<AgentMultiSelect");
@@ -21,10 +20,6 @@ describe("Apps agent selector contract", () => {
     expect(profiles.match(/<AgentSelect/g)).toHaveLength(2);
     expect(profiles).not.toContain("<Select value={agentId}");
     expect(profiles).not.toContain("<Select value={targetAgentId}");
-
-    expect(policies.match(/<AgentSelect/g)).toHaveLength(2);
-    expect(policies).not.toContain("<Select value={agentId}");
-    expect(policies).not.toContain("<Select value={form.agentId}");
 
     expect(audit).toContain("<AgentSelect");
     expect(audit).not.toContain("<Select value={agent}");

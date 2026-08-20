@@ -5,8 +5,6 @@ import { cn } from "@/lib/utils";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { ProfilesIndex } from "./profiles/ProfilesIndex";
-import { PoliciesTab } from "./PoliciesTab";
-import { RuntimeTab } from "./RuntimeTab";
 import { AuditTab } from "./AuditTab";
 import { GatewaysTab } from "./GatewaysTab";
 import { PasteConfigTab } from "./PasteConfigTab";
@@ -24,10 +22,6 @@ function renderTab(tab: ToolTabKey, companyId: string) {
   switch (tab) {
     case "profiles":
       return <ProfilesIndex companyId={companyId} />;
-    case "policies":
-      return <PoliciesTab companyId={companyId} />;
-    case "runtime":
-      return <RuntimeTab companyId={companyId} />;
     case "audit":
       return <AuditTab companyId={companyId} />;
     case "gateways":
@@ -76,6 +70,14 @@ export function ToolsAccess() {
     params.tab === "examples"
   ) {
     return <Navigate to="/apps/connections" replace />;
+  }
+
+  if (params.tab === "runtime") {
+    return <Navigate to="/apps/connections" replace />;
+  }
+
+  if (params.tab === "policies") {
+    return <Navigate to="/apps/advanced/profiles" replace />;
   }
 
   if (advanced) {
