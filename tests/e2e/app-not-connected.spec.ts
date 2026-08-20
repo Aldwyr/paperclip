@@ -147,14 +147,29 @@ test.describe.serial("not-connected app page", () => {
     expect(appConns[0].status).not.toBe("archived");
   });
 
-  test("draft app connection stays on provider setup until setup finishes", async ({ page }) => {
-    await page.goto(`/${seed.prefix}/apps/app/${applicationId}`);
-    await expect(page).toHaveURL(new RegExp(`/${seed.prefix}/apps/app/${applicationId}/setup$`), { timeout: 20_000 });
+  test("draft app connection stays on provider setup until setup finishes", async ({ page, request }) => {
+    const draft = await request.post(`/api/companies/${seed.companyId}/tools/apps/connect`, {
+      data: {
+        link: `${mock.url}?draft=1`,
+        name: "Draft app",
+        credentialValues: { "credentials.authorization": "qa-token" },
+      },
+    });
+    expect(draft.ok(), `draft connect failed ${draft.status()}: ${await draft.text()}`).toBe(true);
+    const draftBody = await draft.json();
+    await request.delete(`/api/tool-connections/${draftBody.connectionId}`);
+    await request.patch(`/api/tool-applications/${draftBody.application.id}`, { data: { status: "active" } });
+
+    await page.goto(`/${seed.prefix}/apps/app/${draftBody.application.id}`);
+    await expect(page).toHaveURL(
+      new RegExp(`/${seed.prefix}/apps/app/${draftBody.application.id}/setup$`),
+      { timeout: 20_000 },
+    );
     await expect(page.getByText("Not connected", { exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Connect this app" })).toBeVisible();
 
     await page.goto(`/${seed.prefix}/apps/connections`);
-    const row = page.locator("tbody tr", { hasText: "Bla" });
+    const row = page.locator("tbody tr", { hasText: "Draft app" });
     await expect(row).toBeVisible({ timeout: 30_000 });
     await expect(row.getByRole("button", { name: "Connect" })).toBeVisible();
     await page.screenshot({ path: `${SCREENSHOT_DIR}/apps-nav-w6-03-reconnected-row.png`, fullPage: true });
