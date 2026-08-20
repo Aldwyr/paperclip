@@ -1828,6 +1828,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     };
   }
 
+  async function requestRemoteHttpEndpoint(endpoint: URL, init: RequestInit): Promise<Response> {
+    return options.remoteHttpRequest
+      ? options.remoteHttpRequest(endpoint.toString(), { ...init, redirect: "manual" })
+      : guardedRemoteHttpFetch(endpoint, init, remoteHttpFetchOptions());
+  }
+
   /**
    * Fetch an operator-supplied remote URL with the egress guard bound to the
    * connection itself.
@@ -1843,9 +1849,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const method = (init.method ?? "GET").toUpperCase();
     for (let redirectCount = 0; redirectCount <= MAX_REMOTE_HTTP_REDIRECTS; redirectCount += 1) {
       const endpoint = parseRemoteHttpEndpoint(currentUrl, (message, code) => badRequest(message, { code }));
-      const response = options.remoteHttpRequest
-        ? await options.remoteHttpRequest(endpoint.toString(), { ...init, redirect: "manual" })
-        : await guardedRemoteHttpFetch(endpoint, init, remoteHttpFetchOptions());
+      const response = await requestRemoteHttpEndpoint(endpoint, init);
       const location = REMOTE_HTTP_REDIRECT_STATUSES.has(response.status)
         ? response.headers?.get?.("location") ?? null
         : null;
@@ -3947,7 +3951,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     // Pinned to the address the guard approved: `config.url` is operator-supplied,
     // so a second DNS resolution here would reopen the rebinding window that
     // PAP-17098 closed for the OAuth endpoints.
-    const response = await guardedRemoteHttpFetch(remoteEndpoint(connection.config), {
+    const response = await requestRemoteHttpEndpoint(new URL(remoteEndpoint(connection.config)), {
       method: "POST",
       // MCP Streamable HTTP requires advertising that we accept both a JSON body
       // and an SSE stream; spec-compliant servers 406 without it (see mcp-http.ts).
@@ -3958,7 +3962,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         method: "tools/list",
         params: {},
       }),
-    }, remoteHttpFetchOptions());
+    });
     if (!response.ok) {
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (response.status === 401 && /bearer|oauth|authorization/i.test(authenticate)) {

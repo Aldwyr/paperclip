@@ -156,7 +156,12 @@ function createRouteApp(
     };
     next();
   });
-  app.use("/api", toolAccessRoutes(db, { toolGateway, ...deployment }));
+  app.use("/api", toolAccessRoutes(db, {
+    toolGateway,
+    remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+    remoteHttpRequest: async (url, init) => fetch(url, init),
+    ...deployment,
+  }));
   app.use(errorHandler);
   return app;
 }
