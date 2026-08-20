@@ -8,6 +8,7 @@ import type {
   CapabilityEvidenceSectionId,
   CapabilityIssueThreadSnapshot,
 } from "../../../src/issue-thread/types";
+import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { capabilityDenialCount } from "../../../src/issue-thread/types";
 import { Composer } from "./Composer";
 import { EvidencePanel } from "./EvidencePanel";
@@ -135,6 +136,7 @@ export function App() {
   }, [chat]);
 
   const [snapshot, setSnapshot] = useState<CapabilityIssueThreadSnapshot | null>(null);
+  const [devtools, setDevtools] = useState<CapabilityDevtoolsSnapshot | null>(null);
   const [identity, setIdentity] = useState<CapabilityCleanRoomIdentity | null>(null);
   /**
    * Which surface produced `snapshot`. A hash change commits the new route in
@@ -295,6 +297,15 @@ export function App() {
       cancelled = true;
     };
   }, [snapshot]);
+
+  useEffect(() => {
+    if (!panelOpen || snapshot === null || route.mode !== "live" || streamingTurn) return;
+    let cancelled = false;
+    void capabilityLiveClient.devtools(snapshot.sessionId)
+      .then((next) => { if (!cancelled) setDevtools(next); })
+      .catch((cause) => { if (!cancelled) setActionError(describe(cause)); });
+    return () => { cancelled = true; };
+  }, [panelOpen, route.mode, snapshot?.renderedAt, snapshot?.sessionId, streamingTurn]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -888,6 +899,19 @@ export function App() {
         {showPanel ? (
           <EvidencePanel
             snapshot={snapshot}
+            {...(route.mode === "live" ? { devtools } : {})}
+            onForkRevision={(revision) => {
+              abandonTurn();
+              setActionError(null);
+              void capabilityLiveClient.fork(snapshot.sessionId, revision)
+                .then((next) => {
+                  rememberSession(next.sessionId, chat ? "cleanroom" : "issue");
+                  setSnapshot(next.view);
+                  setIdentity(next.identity ?? null);
+                  setDevtools(null);
+                })
+                .catch((cause) => setActionError(describe(cause)));
+            }}
             layout={layout}
             width={panelWidth}
             selectedTurnId={selectedTurnId}

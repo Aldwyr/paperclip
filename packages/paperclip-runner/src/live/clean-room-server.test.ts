@@ -484,6 +484,7 @@ const sourceRunnerModuleLoaders: Record<string, () => Promise<unknown>> = {
     await import("../mock-core/capability-control-plane-types.js"),
   "mock-core/live-console-demo-server.js": async () =>
     await import("../mock-core/live-console-demo-server.js"),
+  "devtools/index.js": async () => await import("../devtools/index.js"),
 };
 
 async function loadSourceRunnerModule(relativePath: string): Promise<unknown> {
@@ -669,6 +670,48 @@ describe("Capability clean-room chat server", () => {
     }
     expect(after.view.evidence.calls[0]?.outcome).toBe("ok");
     expect(after.view.evidence.state.length).toBeGreaterThan(0);
+  });
+
+  it("exposes full state history and can fork a retained revision", async () => {
+    const opened = await call("/api/capability/ui/cleanroom/session");
+    await call("/api/capability/ui/message", {
+      sessionId: opened.sessionId,
+      message: "Read the issue and report progress.",
+    });
+
+    const inspectedResponse = await send(
+      jar,
+      `/api/capability/ui/devtools?sessionId=${opened.sessionId}`,
+    );
+    expect(inspectedResponse.status).toBe(200);
+    const inspected = await inspectedResponse.json() as {
+      schema: string;
+      revisions: Array<{ revision: number; operationId: string; state: Record<string, unknown> }>;
+    };
+    expect(inspected.schema).toBe("paperclip.capability.devtools.v1");
+    expect(inspected.revisions[0]?.operationId).toBe("fixture.seed");
+    expect(inspected.revisions.at(-1)?.state).toEqual(expect.objectContaining({
+      company: expect.any(Object),
+      actors: expect.any(Array),
+      tasks: expect.any(Array),
+      comments: expect.any(Array),
+      budgets: expect.any(Array),
+      audit: expect.any(Array),
+    }));
+
+    const forkResponse = await send(jar, "/api/capability/ui/devtools/fork", {
+      json: { sessionId: opened.sessionId, revision: inspected.revisions[0]!.revision },
+    });
+    expect(forkResponse.status).toBe(201);
+    const forked = await forkResponse.json() as CleanRoomPayload;
+    expect(forked.sessionId).not.toBe(opened.sessionId);
+    expect(forked.view.issue.identifier).toBe(opened.view.issue.identifier);
+    expect(forked.view.turns).toEqual([]);
+    expect(await status(
+      `/api/capability/ui/devtools?sessionId=${forked.sessionId}`,
+      undefined,
+      jar,
+    )).toBe(200);
   });
 
   it("returns a typed denial for an ungranted call and changes no mock state", async () => {

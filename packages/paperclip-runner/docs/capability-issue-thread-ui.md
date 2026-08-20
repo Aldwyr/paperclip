@@ -116,6 +116,10 @@ what the smoke scripts use for that.
   `Control plane (not exposed to the agent)` list, because what the model
   *cannot* call is first-class evidence. Every strip, denial, and card deep-links
   into the matching record, and each record links back to its thread anchor.
+  Live sessions additionally put a six-tab DevTools inspector above these
+  sections: revision timeline, complete browser-safe company state, structural
+  diff, protocol records, runtime, and authority. The inspector can pause live
+  following, export redacted JSON, and fork a retained revision.
 
 The panel is collapsed by default and resizable between 320px and 640px with a
 keyboard-operable splitter. Below 1100px it becomes an overlay sheet that

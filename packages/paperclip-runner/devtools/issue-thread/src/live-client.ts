@@ -1,4 +1,5 @@
 import type { CapabilityIssueThreadSnapshot } from "../../../src/issue-thread/types";
+import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import {
   CAPABILITY_TURN_STREAM_ACCEPT,
   CapabilityTurnStreamError,
@@ -126,6 +127,16 @@ async function postTurnStream(
 }
 
 export const capabilityLiveClient = {
+  async devtools(sessionId: string): Promise<CapabilityDevtoolsSnapshot> {
+    const response = await fetch(`${BASE}/devtools?sessionId=${encodeURIComponent(sessionId)}`, {
+      credentials: CREDENTIALS,
+    });
+    if (!response.ok) throw await readError(response, "/devtools");
+    return (await response.json()) as CapabilityDevtoolsSnapshot;
+  },
+  fork(sessionId: string, revision: number): Promise<CapabilityLiveResponse> {
+    return post("/devtools/fork", { sessionId, revision });
+  },
   async load(sessionId: string | null): Promise<CapabilityLiveResponse> {
     const query = sessionId === null ? "" : `?sessionId=${encodeURIComponent(sessionId)}`;
     const response = await fetch(`${BASE}/session${query}`, { credentials: CREDENTIALS });

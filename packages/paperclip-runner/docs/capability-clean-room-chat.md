@@ -106,6 +106,24 @@ The child environment is allowlisted by `createSanitizedCodexEnvironment`, so no
 `PAPERCLIP_*` value reaches runnerd or Codex, and the browser receives no
 provider, runner, or control-plane credential.
 
+## DevTools state inspector
+
+Opening **Evidence** also opens a Redux-DevTools-style inspector over the live
+mock company. Its timeline starts at the pristine fixture, adds a revision for
+each successful semantic mutation, and lets the operator inspect or diff the
+complete browser-safe company scaffolding: company, actors, tasks, comments,
+documents, interactions, approvals, artifacts, work products, blockers,
+workspace services, budgets, runs, wakes, audit records, decisions,
+idempotency records, and configured faults. Separate tabs expose the protocol
+boundary records, runner/runtime facts, and effective authority.
+
+**Pause** pins a revision while work continues, **Export** downloads the
+redacted DevTools snapshot, and **Fork rN** retires the current mock session and
+starts a new executable branch from that retained state. Provider payloads,
+session checkpoints, artifact content references, working directories, and
+secret-shaped strings remain server-side or are withheld by the explicit
+browser projection.
+
 ## Remote preview gateway
 
 The tailnet preview keeps the package server on loopback and exposes it through

@@ -7,6 +7,8 @@ import type {
   CapabilityIssueThreadSnapshot,
   CapabilityToolDisposition,
 } from "../../../src/issue-thread/types";
+import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
+import { DevtoolsInspector } from "./DevtoolsInspector";
 import {
   CAPABILITY_EVIDENCE_SECTIONS,
   capabilityDispositionLabel,
@@ -106,6 +108,8 @@ function RunnerEventGroup({ group }: { group: CapabilityRunnerEventGroup }) {
 
 export interface EvidencePanelProps {
   snapshot: CapabilityIssueThreadSnapshot;
+  devtools?: CapabilityDevtoolsSnapshot | null;
+  onForkRevision?: (revision: number) => void;
   layout: "side" | "overlay" | "segment";
   width: number;
   selectedTurnId: string | "all";
@@ -181,6 +185,8 @@ function Section({
 export function EvidencePanel(props: EvidencePanelProps) {
   const {
     snapshot,
+    devtools,
+    onForkRevision = () => undefined,
     layout,
     width,
     selectedTurnId,
@@ -250,6 +256,18 @@ export function EvidencePanel(props: EvidencePanelProps) {
           <option value="all">All turns</option>
         </select>
       </div>
+
+      {devtools !== undefined ? (
+        <>
+          <h3 className="pit-evidence-heading">Company DevTools</h3>
+          {devtools === null ? (
+            <p className="pit-muted pit-devtools-loading">Loading company state…</p>
+          ) : (
+            <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} />
+          )}
+          <h3 className="pit-evidence-heading">Evidence log</h3>
+        </>
+      ) : null}
 
       <Section
         id="tools"

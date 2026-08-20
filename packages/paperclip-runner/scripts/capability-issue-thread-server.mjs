@@ -117,7 +117,7 @@ async function importDistRunnerModule(relativePath) {
 }
 
 export async function loadCapabilityIssueThreadRunner(importModule = importDistRunnerModule) {
-  const [cleanRoom, liveSession, turnStream, issueThread, fixtureState, liveConsole] =
+  const [cleanRoom, liveSession, turnStream, issueThread, fixtureState, liveConsole, devtools] =
     await Promise.all([
       importModule("live/clean-room.js"),
       importModule("live/live-session.js"),
@@ -125,6 +125,7 @@ export async function loadCapabilityIssueThreadRunner(importModule = importDistR
       importModule("issue-thread/index.js"),
       importModule("mock-core/capability-control-plane-types.js"),
       importModule("mock-core/live-console-demo-server.js"),
+      importModule("devtools/index.js"),
     ]);
 
   // This package-owned server intentionally depends on private demo/live modules.
@@ -140,6 +141,7 @@ export async function loadCapabilityIssueThreadRunner(importModule = importDistR
     encodeCapabilityTurnStreamFrame: turnStream.encodeCapabilityTurnStreamFrame,
     projectCapabilityIssueThread: issueThread.projectCapabilityIssueThread,
     toCapabilityPublicThreadView: issueThread.toCapabilityPublicThreadView,
+    projectCapabilityDevtools: devtools.projectCapabilityDevtools,
   };
 }
 
@@ -646,6 +648,77 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
           : undefined;
       if (entry === undefined) {
         send(response, 404, { error: "unknown_session" });
+        return;
+      }
+
+      if (route === "devtools" && request.method === "GET") {
+        send(response, 200, runner.projectCapabilityDevtools(entry.session.snapshot()));
+        return;
+      }
+
+      if (route === "devtools/fork" && request.method === "POST") {
+        const snapshot = entry.session.snapshot();
+        const revision = Number(body.revision);
+        const seedState = JSON.parse(snapshot.config.seedState);
+        const selected = (snapshot.stateHistory ?? []).find((item) => item.revision === revision) ??
+          (seedState.revision === revision
+            ? { revision, state: snapshot.config.seedState }
+            : undefined);
+        if (selected === undefined) {
+          throw new RouteError(404, "unknown_revision", "The requested state revision is not retained.");
+        }
+        const seed = JSON.parse(selected.state);
+        seed.lifecycle = "stopped";
+        seed.activeRunId = null;
+        for (const task of seed.tasks ?? []) {
+          if (task.id !== snapshot.authority.taskId) continue;
+          task.checkoutRunId = null;
+          task.executionRunId = null;
+          if (["in_progress", "done", "cancelled"].includes(task.status)) {
+            task.status = "todo";
+            task.completedAt = null;
+          }
+        }
+        const forkDirectory = await createWorkingDirectory(
+          workingDirectoryRoot,
+          "capability-devtools-fork-",
+        );
+        const capability = mintCapability();
+        const capabilityHash = sha256(capability);
+        let fork;
+        try {
+          fork = await service.create({
+            seed,
+            workingDirectory: forkDirectory,
+            scenario: snapshot.config.scenario,
+            capabilities: snapshot.config.capabilities,
+            explicitClaims: snapshot.config.explicitClaims,
+            companyId: snapshot.authority.companyId,
+            actorId: snapshot.authority.actorId,
+            taskId: snapshot.authority.taskId,
+            turnTimeoutMs: snapshot.config.turnTimeoutMs,
+          });
+        } catch (error) {
+          await rm(forkDirectory, { recursive: true, force: true }).catch(() => undefined);
+          throw error;
+        }
+        await retire(service, entry.session.id, `forked from revision ${revision}`);
+        const forkEntry = {
+          ...entry,
+          session: fork,
+          workingDirectory: forkDirectory,
+          ownsWorkingDirectory: true,
+          turns: 0,
+          createdAt: Date.now(),
+          capabilityHash,
+          identity: entry.identity === null
+            ? null
+            : { ...entry.identity, token: randomBytes(4).toString("hex") },
+          connection: { state: "connected", attempt: 0 },
+        };
+        sessions.set(fork.id, forkEntry);
+        response.setHeader("set-cookie", capabilityCookie(request, entry.surface, capability));
+        send(response, 201, payload(runner, forkEntry));
         return;
       }
 

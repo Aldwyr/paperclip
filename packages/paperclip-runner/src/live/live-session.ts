@@ -127,6 +127,14 @@ export interface CapabilityLiveUsageReceipt {
   observedAt: string;
 }
 
+export interface CapabilityLiveStateRevision {
+  revision: number;
+  at: string;
+  turnId: string | null;
+  operationId: string;
+  state: string;
+}
+
 export interface RecordCapabilityLiveUsageInput {
   receiptId: string;
   providerResponseId?: string | null;
@@ -169,6 +177,8 @@ export interface CapabilityLiveSessionSnapshot {
   terminalTurns?: CapabilityLiveTurnTerminalFact[];
   /** Exact-once provider usage/cost receipts retained across every attempt. */
   usageLedger?: CapabilityLiveUsageReceipt[];
+  /** Bounded mock-control-plane snapshots for DevTools time travel and diffs. */
+  stateHistory?: CapabilityLiveStateRevision[];
 }
 
 export interface CreateCapabilityLiveSessionInput {
@@ -455,6 +465,30 @@ export function assertCapabilityLiveSessionSnapshot(
     }
     usageReceiptIds.add(receiptId);
   }
+  if (
+    snapshot.stateHistory !== undefined &&
+    (!Array.isArray(snapshot.stateHistory) || snapshot.stateHistory.length > 256)
+  ) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid stateHistory");
+  }
+  for (const value of snapshot.stateHistory ?? []) {
+    const revision = record(value);
+    if (
+      !Number.isSafeInteger(revision.revision) ||
+      Number(revision.revision) < 0 ||
+      text(revision.at).length === 0 ||
+      text(revision.operationId).length === 0 ||
+      (revision.turnId !== null && typeof revision.turnId !== "string") ||
+      typeof revision.state !== "string"
+    ) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid state revision");
+    }
+    try {
+      JSON.parse(revision.state);
+    } catch {
+      throw new Error("capability_live_checkpoint_corrupt: invalid state revision JSON");
+    }
+  }
 }
 
 export function reconcileCapabilityLiveUsage(
@@ -740,6 +774,7 @@ export class CapabilityLiveSession {
   readonly #attempts: CapabilityLiveAttemptSnapshot[];
   readonly #terminalTurns: CapabilityLiveTurnTerminalFact[];
   readonly #usageLedger: CapabilityLiveUsageReceipt[];
+  readonly #stateHistory: CapabilityLiveStateRevision[];
   #currentAttemptId: string;
   #transport: CodexAppServerTransport | null = null;
   #processEvidence: CapabilityRunnerdProcessEvidence | null = null;
@@ -787,6 +822,13 @@ export class CapabilityLiveSession {
     this.#currentAttemptId = initialAttemptId;
     this.#terminalTurns = structuredClone(options.snapshot?.terminalTurns ?? []);
     this.#usageLedger = structuredClone(options.snapshot?.usageLedger ?? []);
+    this.#stateHistory = structuredClone(options.snapshot?.stateHistory ?? [{
+      revision: this.#port.snapshot().revision,
+      at: this.#createdAt,
+      turnId: null,
+      operationId: "session.open",
+      state: this.#port.serialize(),
+    }]);
     this.#providerThreadId = options.snapshot?.providerThreadId ?? "";
     this.#providerSessionId = options.snapshot?.providerSessionId ?? null;
     this.#providerModel = options.snapshot?.providerModel === undefined
@@ -954,6 +996,7 @@ export class CapabilityLiveSession {
       currentAttemptId: this.#currentAttemptId,
       terminalTurns: structuredClone(this.#terminalTurns),
       usageLedger: structuredClone(this.#usageLedger),
+      stateHistory: structuredClone(this.#stateHistory),
     };
   }
 
@@ -1130,6 +1173,7 @@ export class CapabilityLiveSession {
       },
     });
     if (!outcome.ok) throw new Error(`${outcome.error.code}: ${outcome.error.message}`);
+    this.#recordStateRevision(null, "resolve_human_input");
     this.#appendEvidence("interaction", null, {
       interactionId: input.interactionId,
       interactionKind: interaction.kind,
@@ -1372,6 +1416,7 @@ export class CapabilityLiveSession {
       operationId,
       input: request.params.arguments,
     });
+    this.#recordStateRevision(turnId, operationId);
     const replayDisposition = result.ok ? text(record(result.result).disposition) : "";
     this.#appendEvidence("tool_result", turnId, {
       callId,
@@ -1584,6 +1629,21 @@ export class CapabilityLiveSession {
       data: redactCapabilityEvidenceData(kind, jsonValue(data) as Record<string, unknown>),
     });
     if (this.#evidence.length > 2_000) this.#evidence.splice(0, this.#evidence.length - 2_000);
+  }
+
+  #recordStateRevision(turnId: string | null, operationId: string): void {
+    const state = this.#port.snapshot();
+    if (this.#stateHistory.at(-1)?.revision === state.revision) return;
+    this.#stateHistory.push({
+      revision: state.revision,
+      at: this.#now().toISOString(),
+      turnId,
+      operationId,
+      state: this.#port.serialize(),
+    });
+    if (this.#stateHistory.length > 256) {
+      this.#stateHistory.splice(0, this.#stateHistory.length - 256);
+    }
   }
 
   #persist(): Promise<void> {

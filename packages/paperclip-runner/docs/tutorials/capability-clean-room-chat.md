@@ -104,6 +104,17 @@ same Codex thread once you answer.
 Click `Evidence`. The drawer carries the same eight sections the scenario path
 uses: tools exposed, calls and typed results, authorization decisions,
 control-plane actions, runner events, state diffs, traceability, and parity.
+Above those sections, the DevTools inspector provides six tabs:
+
+- **Timeline** selects any retained control-plane revision.
+- **State** browses the full mock company tree.
+- **Diff** compares any two revisions field by field.
+- **Protocol**, **Runtime**, and **Authority** show the surrounding scaffolding
+  that explains why each mutation happened.
+
+Use **Pause** to stop following the newest revision, **Export** to download a
+redacted JSON snapshot, or **Fork rN** to replace this chat with a fresh live
+branch rooted at the selected mock-company revision.
 
 Two things are worth finding on your first pass:
 
