@@ -198,7 +198,7 @@ export function scoreWorkspaceRuntimeServiceMatch(
     return -1;
   }
 
-  if (command.port !== null && runtimeService.port !== null && runtimeService.port !== command.port) {
+  if (command.port !== null && runtimeService.port != null && runtimeService.port !== command.port) {
     return -1;
   }
 
