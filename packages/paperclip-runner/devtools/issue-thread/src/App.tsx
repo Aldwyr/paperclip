@@ -50,6 +50,25 @@ const SETTLED_ANNOUNCEMENT = "The pending request is resolved.";
 const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts"];
 const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
 
+interface EmbeddedEvalCheck {
+  id: string;
+  passed: boolean;
+  detail: string;
+}
+
+interface EmbeddedEvalReport {
+  attemptId: string;
+  caseId: string;
+  disposition: string;
+  passed: boolean;
+  checks: EmbeddedEvalCheck[];
+  view: CapabilityIssueThreadSnapshot;
+}
+
+declare global {
+  interface Window { __PAPERCLIP_EVAL_REPORT__?: EmbeddedEvalReport }
+}
+
 interface StoredChatSession {
   sessionId: string;
   snapshot: CapabilityIssueThreadSnapshot;
@@ -174,15 +193,20 @@ function useLayout(): "side" | "overlay" | "segment" {
 }
 
 export function App() {
+  const embeddedEval = window.__PAPERCLIP_EVAL_REPORT__ ?? null;
   const route = useRoute();
   const chat = route.surface === "chat";
   const layout = useLayout();
 
   useEffect(() => {
+    if (embeddedEval !== null) {
+      document.title = `${embeddedEval.passed ? "✓" : "✕"} ${embeddedEval.caseId} · paperclip-runner eval`;
+      return;
+    }
     document.title = chat
       ? "🫧 Mock Paperclip · Issue thread"
       : "🧯 Mock Paperclip · Issue thread";
-  }, [chat]);
+  }, [chat, embeddedEval]);
 
   const [snapshot, setSnapshot] = useState<CapabilityIssueThreadSnapshot | null>(null);
   const [devtools, setDevtools] = useState<CapabilityDevtoolsSnapshot | null>(null);
@@ -244,7 +268,14 @@ export function App() {
     let cancelled = false;
     setSettled(false);
     setError(null);
-    if (chat) {
+    if (embeddedEval !== null) {
+      setIdentity(null);
+      setSnapshot({
+        ...embeddedEval.view,
+        composer: { state: "disabled", helper: null, reason: "Immutable eval recording", pendingInteractionId: null },
+      });
+      setSnapshotSurface("issue");
+    } else if (chat) {
       // The clean room has no fixture fallback: if real Codex and real runnerd
       // cannot start, the surface says so rather than rendering a canned thread.
       void (async () => {
@@ -283,7 +314,7 @@ export function App() {
       // into a thread that is no longer on screen.
       abandonTurn();
     };
-  }, [abandonTurn, chat, route.mode, route.shot, route.fixtureProfile, loadNonce]);
+  }, [abandonTurn, chat, embeddedEval, route.mode, route.shot, route.fixtureProfile, loadNonce]);
 
   /* ------------------------------------------------------- deep-link params */
 
@@ -794,10 +825,11 @@ export function App() {
       data-surface={route.surface}
       data-connection-state={snapshot.connection.state}
     >
-      {surfaceNav}
+      {embeddedEval === null ? surfaceNav : null}
 
       <IssueHeader
         snapshot={snapshot}
+        readOnly={embeddedEval !== null}
         scenarios={SCENARIOS}
         surface={route.surface}
         cleanRoomToken={identity?.token ?? null}
@@ -824,6 +856,23 @@ export function App() {
         onStop={stop}
         onSelectSegment={setSegment}
       />
+
+      {embeddedEval !== null ? (
+        <section className="pit-eval-summary" data-passed={embeddedEval.passed} data-testid="eval-summary">
+          <div className="pit-eval-summary-head">
+            <a href="../../index.html">← Eval suite</a>
+            <strong>{embeddedEval.passed ? "PASS" : embeddedEval.disposition.replaceAll("_", " ").toUpperCase()}</strong>
+            <code>{embeddedEval.attemptId}</code>
+          </div>
+          <div className="pit-eval-checks">
+            {embeddedEval.checks.map((check) => (
+              <span key={check.id} data-passed={check.passed} title={check.detail}>
+                {check.passed ? "✓" : "✕"} {check.id}
+              </span>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       {actionError !== null ? (
         <p className="pit-banner" data-tone="danger" role="alert" data-testid="action-error">

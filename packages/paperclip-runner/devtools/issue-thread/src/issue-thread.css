@@ -1229,6 +1229,31 @@ textarea {
   border-bottom-color: var(--pit-danger);
 }
 
+.pit-eval-summary {
+  border-block: 1px solid color-mix(in oklch, var(--pit-success) 45%, var(--pit-border));
+  background: color-mix(in oklch, var(--pit-success) 10%, var(--pit-surface-sunken));
+  padding: 10px 20px;
+}
+
+.pit-eval-summary[data-passed="false"] {
+  border-color: color-mix(in oklch, var(--pit-danger) 45%, var(--pit-border));
+  background: color-mix(in oklch, var(--pit-danger) 10%, var(--pit-surface-sunken));
+}
+
+.pit-eval-summary-head,
+.pit-eval-checks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.pit-eval-summary-head code { color: var(--pit-muted); }
+.pit-eval-checks { margin-top: 8px; }
+.pit-eval-checks span { padding: 3px 8px; border-radius: 999px; background: var(--pit-surface-raised); }
+.pit-eval-checks span[data-passed="true"] { color: var(--pit-success); }
+.pit-eval-checks span[data-passed="false"] { color: var(--pit-danger); }
+
 @keyframes pit-slide {
   from {
     transform: translateY(-0.5rem);

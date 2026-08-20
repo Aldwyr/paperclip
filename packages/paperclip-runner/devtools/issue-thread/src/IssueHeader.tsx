@@ -15,6 +15,8 @@ export interface IssueHeaderProps {
   scenarios: string[];
   /** `chat` is the clean room: no preset scenario, no recording to replay. */
   surface?: "issue" | "chat";
+  /** Immutable eval recordings use the same inspector without live controls. */
+  readOnly?: boolean;
   /** Clean-room tenant token, rendered so identity rotation is visible. */
   cleanRoomToken?: string | null;
   evidenceOpen: boolean;
@@ -33,6 +35,7 @@ export function IssueHeader(props: IssueHeaderProps) {
     snapshot,
     scenarios,
     surface = "issue",
+    readOnly = false,
     cleanRoomToken = null,
     evidenceOpen,
     denialCount,
@@ -67,7 +70,7 @@ export function IssueHeader(props: IssueHeaderProps) {
           <StatusBadge status={snapshot.issue.status} />
         </div>
         <div className="pit-header-controls">
-          {!chat ? (
+          {!chat && !readOnly ? (
             <>
               <label className="pit-visually-hidden" htmlFor="scenario-picker">Scenario</label>
               <select className="pit-select pit-desktop-only" id="scenario-picker" value={snapshot.issue.fixtureProfile} onChange={(event) => onSelectScenario(event.target.value)} data-testid="scenario-picker">
@@ -76,8 +79,8 @@ export function IssueHeader(props: IssueHeaderProps) {
               <button type="button" className="pit-button pit-desktop-only" onClick={onReplay} data-testid="replay-button"><Icon name="play" /> Replay</button>
             </>
           ) : null}
-          <button type="button" className="pit-icon-button pit-desktop-only" data-variant="destructive" onClick={onReset} data-testid="reset-button" title={chat ? "Reset chat" : "Reset scenario"} aria-label={chat ? "Reset chat" : "Reset scenario"}><Icon name="reset" /></button>
-          <button type="button" className="pit-icon-button" data-variant="destructive" onClick={onStop} disabled={!turnActive} data-testid="stop-button" title="Stop turn" aria-label="Stop turn"><Icon name="stop" /></button>
+          {!readOnly ? <button type="button" className="pit-icon-button pit-desktop-only" data-variant="destructive" onClick={onReset} data-testid="reset-button" title={chat ? "Reset chat" : "Reset scenario"} aria-label={chat ? "Reset chat" : "Reset scenario"}><Icon name="reset" /></button> : null}
+          {!readOnly ? <button type="button" className="pit-icon-button" data-variant="destructive" onClick={onStop} disabled={!turnActive} data-testid="stop-button" title="Stop turn" aria-label="Stop turn"><Icon name="stop" /></button> : null}
           <button type="button" className="pit-button pit-desktop-only" aria-expanded={evidenceOpen} onClick={onToggleEvidence} data-testid="evidence-toggle"><Icon name="evidence" /> DevTools{denialCount > 0 ? ` (${denialCount})` : ""}</button>
         </div>
       </div>

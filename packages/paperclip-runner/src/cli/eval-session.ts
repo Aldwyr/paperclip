@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 import { projectCapabilityDevtools } from "../devtools/index.js";
 import { PAPERCLIP_RUNNER_BUILD_METADATA } from "../evals/build-metadata.js";
+import { projectCapabilityIssueThread } from "../issue-thread/live-projection.js";
 import {
   CapabilityLiveSessionService,
   reconcileCapabilityLiveUsage,
@@ -68,6 +69,7 @@ try {
     turn,
     snapshot,
     devtools: projectCapabilityDevtools(snapshot),
+    issueThread: projectCapabilityIssueThread({ snapshot, mode: "replay", replaySource: "live" }),
     usage,
   }, null, 2)}\n`);
 } catch (error) {

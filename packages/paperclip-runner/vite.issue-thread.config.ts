@@ -9,6 +9,7 @@ import { capabilityIssueThreadServerPlugin } from "./scripts/capability-issue-th
 const packageRoot = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
+  base: "./",
   root: resolve(packageRoot, "devtools/issue-thread"),
   plugins: [react(), capabilityIssueThreadServerPlugin()],
   server: { host: "127.0.0.1" },

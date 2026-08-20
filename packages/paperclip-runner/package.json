@@ -44,6 +44,7 @@
   },
   "files": [
     "dist",
+    "dist-issue-thread",
     "protocol",
     "styles.css",
     "README.md"
