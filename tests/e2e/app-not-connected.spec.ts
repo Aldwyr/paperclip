@@ -127,7 +127,7 @@ test.describe.serial("not-connected app page", () => {
     await page.getByRole("button", { name: "Continue to install" }).click();
     await expect(page.getByRole("heading", { name: "Install Bla tools?" })).toBeVisible();
     await page.getByRole("button", { name: "Finish setup" }).click();
-    await expect(page.getByText(/Connected to .* it offers/)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("heading", { name: "Bla is ready." })).toBeVisible({ timeout: 30_000 });
 
     const apps = await request.get(`/api/companies/${seed.companyId}/tools/applications`);
     const appsBody = await apps.json();
