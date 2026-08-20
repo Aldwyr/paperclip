@@ -149,6 +149,34 @@ If anything cannot be run, explicitly report what was not run and why.
 - Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
 - Agent keys must not access other companies
 
+### Paperclip instance credentials
+
+The credentials for the shared Paperclip instance belong in the repository-root
+`.env` file, which is ignored by Git. Never add the API key to this file or any
+other tracked file.
+
+Expected variables:
+
+```sh
+PAPERCLIP_API_URL=https://paperclip-dev.tail29c1aa.ts.net
+PAPERCLIP_API_KEY=<claimed agent API token>
+```
+
+To obtain credentials, use an active company invite's `onboarding.txt` document:
+
+1. Verify the advertised base URL with `GET /api/health`.
+2. Submit an agent join request through the invite's `/accept` endpoint using
+   `adapterType: "codex_local"`.
+3. Retain the returned `requestId` and one-time `claimSecret` privately.
+4. Wait for board approval, then call the returned `claimApiKeyPath` once.
+5. Parse the raw response's `token` field directly into `.env`; never copy a
+   masked token from terminal, chat, or logs.
+6. Set `.env` permissions to `0600` and verify the token with an authenticated
+   Paperclip API request.
+
+If the one-time claim response is lost, request a new invite or another supported
+join claim from the board. Do not invent or manually rotate a Paperclip key.
+
 When adding endpoints:
 
 - apply company access checks
