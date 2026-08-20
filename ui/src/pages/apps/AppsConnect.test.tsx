@@ -739,10 +739,18 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
             riskLevel: "read",
           },
         ],
-        canMakeChanges: [],
+        canMakeChanges: [
+          {
+            catalogEntryId: "action-2",
+            toolName: "create_record",
+            title: "Create record",
+            description: "Create a record.",
+            riskLevel: "write",
+          },
+        ],
       },
       catalog: [],
-      suggestedDefaults: {},
+      suggestedDefaults: { askFirstRiskLevels: ["write", "destructive"] },
     });
     await render();
 
@@ -821,8 +829,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(finishAppMock).toHaveBeenCalledWith("company-1", "conn-1", {
-      enabledCatalogEntryIds: ["action-1"],
-      askFirstCatalogEntryIds: [],
+      enabledCatalogEntryIds: ["action-1", "action-2"],
+      askFirstCatalogEntryIds: ["action-2"],
       access: { agentIds: ["agent-1"] },
     });
     expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [

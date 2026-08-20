@@ -548,11 +548,21 @@ export function AppsConnect({ byoOnly = false }: { byoOnly?: boolean } = {}) {
       const enabledIds = Object.entries(enabled)
         .filter(([, on]) => on)
         .map(([id]) => id);
+      const askFirstRiskLevels = new Set(
+        Array.isArray(connectResult!.suggestedDefaults.askFirstRiskLevels)
+          ? connectResult!.suggestedDefaults.askFirstRiskLevels.filter(
+            (riskLevel): riskLevel is string => typeof riskLevel === "string",
+          )
+          : [],
+      );
+      const askFirstIds = connectResult!.actions.canMakeChanges
+        .filter((action) => enabled[action.catalogEntryId] && askFirstRiskLevels.has(action.riskLevel))
+        .map((action) => action.catalogEntryId);
       const selection: AppAccessSelection =
         access === "all" ? "all_agents" : { agentIds: Array.from(agentIds) };
       const result = await toolsApi.finishApp(selectedCompanyId!, connectResult!.connectionId, {
         enabledCatalogEntryIds: enabledIds,
-        askFirstCatalogEntryIds: [],
+        askFirstCatalogEntryIds: askFirstIds,
         access: selection,
       });
       const installState = installMode === "all"
