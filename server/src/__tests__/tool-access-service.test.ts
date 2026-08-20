@@ -6103,7 +6103,12 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(db.select().from(toolPolicies).where(and(
       eq(toolPolicies.companyId, company.id),
       eq(toolPolicies.enabled, true),
-    ))).resolves.toHaveLength(0);
+    ))).resolves.toEqual([
+      expect.objectContaining({
+        policyType: "require_approval",
+        selectors: { catalogEntryId: updateEntry.id },
+      }),
+    ]);
   });
 
   it("stops and restarts local stdio runtime slots through the board service", async () => {
