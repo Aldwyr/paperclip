@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { and, desc, eq, gte, ilike, inArray, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, toolApplications, toolConnections, toolInvocations } from "@paperclipai/db";
+import { agents, toolApplications, toolCallEvents, toolConnections, toolInvocations } from "@paperclipai/db";
 import { humanizeConnectionDisplayName, type PermissionKey } from "@paperclipai/shared";
 import {
   createToolMcpGatewaySchema,
@@ -13,19 +13,13 @@ import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
 
-const TOOL_GATEWAY_ACTIONS = [
-  "tool_gateway.session_created",
-  "tool_gateway.session_revoked",
-  "tool_gateway.session_rejected",
-  "tool_gateway.discovery",
-  "tool_gateway.call_allowed",
-  "tool_gateway.call_denied",
-  "tool_gateway.call_completed",
-  "tool_gateway.call_failed",
-  "tool_gateway.call_deferred",
-  "tool_gateway.approval_requested",
-  "tool_gateway.runtime_mcp_delivery",
-];
+const TOOL_ACTIVITY_EVENT_TYPES = [
+  "call_completed",
+  "call_failed",
+  "call_denied",
+  "approval_requested",
+  "approval_resolved",
+] as const;
 
 const TOOL_GATEWAY_WINDOWS: Record<string, number> = {
   "1h": 60 * 60 * 1000,
@@ -194,42 +188,53 @@ function decodeAuditCursor(value: string): { createdAt: Date; id: string } | nul
   }
 }
 
-function normalizedAuditOutcome(action: string, details: Record<string, unknown> | null | undefined) {
-  const decision = detailString(details, "decision");
-  if (action === "tool_gateway.call_completed" || action === "tool_gateway.call_allowed" || decision === "allow" || decision === "approved") return "allowed";
-  if (action === "tool_gateway.approval_requested" || decision === "require_approval") return "asked_first";
-  if (action === "tool_gateway.call_deferred" || decision === "defer_runtime") return "waiting";
-  if (action === "tool_gateway.call_failed") return "failed";
-  if (action === "tool_gateway.call_denied" || decision === "deny" || decision === "rate_limited") return "blocked";
+function toolActivityAction(eventType: string): string {
+  return `tool_gateway.${eventType}`;
+}
+
+function normalizedAuditOutcome(
+  eventType: string,
+  outcome: string,
+  decision: string | null,
+) {
+  if (eventType === "approval_requested") return "asked_first";
+  if (decision === "defer_runtime") return "waiting";
+  if (eventType === "call_denied" || outcome === "denied" || decision === "deny") return "blocked";
+  if (eventType === "call_failed" || ["failure", "timeout", "cancelled"].includes(outcome)) return "failed";
+  if (eventType === "call_completed" || eventType === "approval_resolved" || outcome === "success" || decision === "allow") return "allowed";
   return "unknown";
 }
 
 function outcomeCondition(outcome: string) {
   if (outcome === "allowed") {
     return or(
-      inArray(activityLog.action, ["tool_gateway.call_allowed", "tool_gateway.call_completed"]),
-      sql`${activityLog.details}->>'decision' in ('allow', 'approved')`,
+      eq(toolCallEvents.eventType, "call_completed"),
+      and(eq(toolCallEvents.eventType, "approval_resolved"), eq(toolCallEvents.outcome, "success")),
+      eq(toolCallEvents.decision, "allow"),
     );
   }
   if (outcome === "blocked" || outcome === "denied") {
     return or(
-      eq(activityLog.action, "tool_gateway.call_denied"),
-      sql`${activityLog.details}->>'decision' in ('deny', 'rate_limited')`,
+      eq(toolCallEvents.eventType, "call_denied"),
+      eq(toolCallEvents.outcome, "denied"),
+      eq(toolCallEvents.decision, "deny"),
     );
   }
   if (outcome === "asked_first" || outcome === "approval") {
-    return or(
-      eq(activityLog.action, "tool_gateway.approval_requested"),
-      sql`${activityLog.details}->>'decision' = 'require_approval'`,
-    );
+    return eq(toolCallEvents.eventType, "approval_requested");
   }
   if (outcome === "waiting" || outcome === "deferred") {
-    return or(
-      eq(activityLog.action, "tool_gateway.call_deferred"),
-      sql`${activityLog.details}->>'decision' = 'defer_runtime'`,
+    return eq(toolCallEvents.decision, "defer_runtime");
+  }
+  if (outcome === "failed") {
+    return and(
+      or(
+        eq(toolCallEvents.eventType, "call_failed"),
+        inArray(toolCallEvents.outcome, ["failure", "timeout", "cancelled"]),
+      ),
+      sql`${toolCallEvents.decision} is distinct from 'defer_runtime'`,
     );
   }
-  if (outcome === "failed") return eq(activityLog.action, "tool_gateway.call_failed");
   return null;
 }
 
@@ -644,12 +649,17 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       await assertBoardPermission(req, companyId, "tools:view_audit");
       const limitRaw = Number(req.query.limit ?? 100);
       const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, Math.floor(limitRaw))) : 100;
+      const gatewayFilter = typeof req.query.gateway === "string" ? req.query.gateway.trim() : null;
       const appFilter = typeof req.query.app === "string" ? req.query.app.trim() : null;
       const agentFilter = typeof req.query.agent === "string" ? req.query.agent.trim() : null;
       const outcomeFilter = typeof req.query.outcome === "string" ? req.query.outcome.trim() : null;
       const windowFilter = typeof req.query.window === "string" ? req.query.window.trim() : "24h";
       const searchRaw = typeof req.query.search === "string" ? req.query.search.trim() : null;
       const cursorRaw = typeof req.query.cursor === "string" ? req.query.cursor.trim() : null;
+      if (gatewayFilter && !uuidPattern.test(gatewayFilter)) {
+        res.status(400).json({ error: "gateway must be a gateway UUID" });
+        return;
+      }
       if (appFilter && !uuidPattern.test(appFilter)) {
         res.status(400).json({ error: "app must be an applicationId or connectionId UUID" });
         return;
@@ -669,29 +679,34 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       }
 
       const conditions = [
-        eq(activityLog.companyId, companyId),
-        inArray(activityLog.action, TOOL_GATEWAY_ACTIONS),
-        gte(activityLog.createdAt, new Date(Date.now() - TOOL_GATEWAY_WINDOWS[windowFilter])),
+        eq(toolCallEvents.companyId, companyId),
+        inArray(toolCallEvents.eventType, TOOL_ACTIVITY_EVENT_TYPES),
+        gte(toolCallEvents.createdAt, new Date(Date.now() - TOOL_GATEWAY_WINDOWS[windowFilter])),
       ];
       if (cursor) {
         conditions.push(or(
-          lt(activityLog.createdAt, cursor.createdAt),
-          and(eq(activityLog.createdAt, cursor.createdAt), lt(activityLog.id, cursor.id)),
+          lt(toolCallEvents.createdAt, cursor.createdAt),
+          and(eq(toolCallEvents.createdAt, cursor.createdAt), lt(toolCallEvents.id, cursor.id)),
+        )!);
+      }
+      if (gatewayFilter) {
+        conditions.push(or(
+          eq(toolCallEvents.gatewayId, gatewayFilter),
+          eq(toolInvocations.gatewayId, gatewayFilter),
         )!);
       }
       if (appFilter) {
         conditions.push(or(
+          eq(toolCallEvents.applicationId, appFilter),
+          eq(toolCallEvents.connectionId, appFilter),
           eq(toolInvocations.applicationId, appFilter),
           eq(toolInvocations.connectionId, appFilter),
-          sql`${activityLog.details}->>'applicationId' = ${appFilter}`,
-          sql`${activityLog.details}->>'connectionId' = ${appFilter}`,
         )!);
       }
       if (agentFilter) {
         conditions.push(or(
-          eq(activityLog.agentId, agentFilter),
+          eq(toolCallEvents.agentId, agentFilter),
           eq(toolInvocations.agentId, agentFilter),
-          sql`${activityLog.details}->>'agentId' = ${agentFilter}`,
         )!);
       }
       const outcomeWhere = outcomeFilter ? outcomeCondition(outcomeFilter) : null;
@@ -699,7 +714,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
 
       // Free-text search runs server-side: resolve the term against agent / app /
       // connection names first, then OR those matched IDs with direct matches on
-      // the action name, tool name, and reason code so paginating stays honest.
+      // the event type, tool name, and reason code so paginating stays honest.
       if (searchRaw) {
         const like = `%${searchRaw.replace(/[%_\\]/g, (ch) => `\\${ch}`)}%`;
         const [matchAgents, matchApps, matchConnections] = await Promise.all([
@@ -714,48 +729,56 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         const matchedAppIds = matchApps.map((r) => r.id);
         const matchedConnectionIds = matchConnections.map((r) => r.id);
         const searchClauses = [
-          ilike(activityLog.action, like),
+          ilike(toolCallEvents.eventType, like),
+          ilike(toolCallEvents.toolName, like),
+          ilike(toolCallEvents.reasonCode, like),
+          sql`${toolCallEvents.metadata}->>'upstreamToolName' ilike ${like}`,
           ilike(toolInvocations.toolName, like),
-          sql`${activityLog.details}->>'tool' ilike ${like}`,
-          sql`${activityLog.details}->>'toolName' ilike ${like}`,
-          sql`${activityLog.details}->>'upstreamToolName' ilike ${like}`,
-          sql`${activityLog.details}->>'reasonCode' ilike ${like}`,
         ];
         if (matchedAgentIds.length > 0) {
-          searchClauses.push(inArray(activityLog.agentId, matchedAgentIds));
+          searchClauses.push(inArray(toolCallEvents.agentId, matchedAgentIds));
           searchClauses.push(inArray(toolInvocations.agentId, matchedAgentIds));
-          for (const id of matchedAgentIds) searchClauses.push(sql`${activityLog.details}->>'agentId' = ${id}`);
         }
         if (matchedAppIds.length > 0) {
+          searchClauses.push(inArray(toolCallEvents.applicationId, matchedAppIds));
           searchClauses.push(inArray(toolInvocations.applicationId, matchedAppIds));
-          for (const id of matchedAppIds) searchClauses.push(sql`${activityLog.details}->>'applicationId' = ${id}`);
         }
         if (matchedConnectionIds.length > 0) {
+          searchClauses.push(inArray(toolCallEvents.connectionId, matchedConnectionIds));
           searchClauses.push(inArray(toolInvocations.connectionId, matchedConnectionIds));
-          for (const id of matchedConnectionIds) searchClauses.push(sql`${activityLog.details}->>'connectionId' = ${id}`);
         }
         conditions.push(or(...searchClauses)!);
       }
 
       const page = await db
         .select({
-          row: activityLog,
+          row: toolCallEvents,
           invocationId: toolInvocations.id,
           invocationAgentId: toolInvocations.agentId,
           invocationApplicationId: toolInvocations.applicationId,
           invocationConnectionId: toolInvocations.connectionId,
           invocationToolName: toolInvocations.toolName,
+          invocationStatus: toolInvocations.status,
+          invocationPolicyDecision: toolInvocations.policyDecision,
+          invocationApprovalState: toolInvocations.approvalState,
+          invocationArgumentsSummary: toolInvocations.argumentsSummary,
+          invocationResultSummary: toolInvocations.resultSummary,
+          invocationResultSizeBytes: toolInvocations.resultSizeBytes,
+          invocationErrorCode: toolInvocations.errorCode,
+          invocationErrorMessage: toolInvocations.errorMessage,
+          invocationStartedAt: toolInvocations.startedAt,
+          invocationCompletedAt: toolInvocations.completedAt,
         })
-        .from(activityLog)
+        .from(toolCallEvents)
         .leftJoin(
           toolInvocations,
           and(
             eq(toolInvocations.companyId, companyId),
-            sql`${toolInvocations.id}::text = ${activityLog.details}->>'invocationId'`,
+            eq(toolInvocations.id, toolCallEvents.invocationId),
           ),
         )
         .where(and(...conditions))
-        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .orderBy(desc(toolCallEvents.createdAt), desc(toolCallEvents.id))
         .limit(limit + 1);
 
       const hasMore = page.length > limit;
@@ -763,15 +786,14 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       const agentIds = [...new Set(visible.flatMap((item) => [
         item.row.agentId,
         item.invocationAgentId,
-        detailString(item.row.details, "agentId"),
       ]).filter((id): id is string => Boolean(id)))];
       const applicationIds = [...new Set(visible.flatMap((item) => [
+        item.row.applicationId,
         item.invocationApplicationId,
-        detailString(item.row.details, "applicationId"),
       ]).filter((id): id is string => Boolean(id)))];
       const connectionIds = [...new Set(visible.flatMap((item) => [
+        item.row.connectionId,
         item.invocationConnectionId,
-        detailString(item.row.details, "connectionId"),
       ]).filter((id): id is string => Boolean(id)))];
       const [agentRows, applicationRows, connectionRows] = await Promise.all([
         agentIds.length > 0
@@ -790,20 +812,49 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
 
       const events = visible.map((item) => {
         const row = item.row;
-        const details = row.details ?? null;
-        const agentId = row.agentId ?? item.invocationAgentId ?? detailString(details, "agentId");
-        const connectionId = item.invocationConnectionId ?? detailString(details, "connectionId");
+        const agentId = row.agentId ?? item.invocationAgentId;
+        const connectionId = row.connectionId ?? item.invocationConnectionId;
         const connection = connectionId ? connectionsById.get(connectionId) ?? null : null;
-        const applicationId = item.invocationApplicationId ?? detailString(details, "applicationId") ?? connection?.applicationId ?? null;
+        const applicationId = row.applicationId ?? item.invocationApplicationId ?? connection?.applicationId ?? null;
         const application = applicationId ? applicationsById.get(applicationId) ?? null : null;
-        const rawToolName = item.invocationToolName ?? detailString(details, "tool") ?? detailString(details, "toolName");
+        const rawToolName = row.toolName ?? item.invocationToolName;
         const appDisplayName = connection
           ? humanizeConnectionDisplayName(connection)
           : application
             ? humanizeConnectionDisplayName(application.name)
             : null;
+        const details = {
+          ...(row.metadata ?? {}),
+          invocationId: row.invocationId,
+          actionRequestId: row.actionRequestId,
+          gatewayId: row.gatewayId,
+          agentId,
+          issueId: row.issueId,
+          runId: row.runId,
+          applicationId,
+          connectionId,
+          tool: rawToolName,
+          toolName: rawToolName,
+          decision: row.decision,
+          matchedPolicyIds: row.matchedPolicyIds,
+          reasonCode: row.reasonCode,
+          argumentsSummary: row.argumentsSummary ?? row.requestSummary,
+          resultSummary: row.resultSummary,
+          latencyMs: row.latencyMs,
+          errorCode: row.errorCode,
+          errorMessage: row.errorMessage,
+        };
         return {
-          ...row,
+          id: row.id,
+          companyId: row.companyId,
+          action: toolActivityAction(row.eventType),
+          actorType: row.actorType,
+          actorId: row.actorId,
+          entityType: "tool_connection",
+          entityId: connectionId,
+          details,
+          createdAt: row.createdAt,
+          runId: row.runId,
           agentId,
           agentDisplayName: agentId ? agentsById.get(agentId)?.name ?? "Unknown agent" : null,
           applicationId,
@@ -812,7 +863,23 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           applicationDisplayName: application ? humanizeConnectionDisplayName(application.name) : null,
           connectionDisplayName: connection ? humanizeConnectionDisplayName(connection) : null,
           toolDisplayName: rawToolName ? humanizeConnectionDisplayName(rawToolName) : null,
-          normalizedOutcome: normalizedAuditOutcome(row.action, details),
+          normalizedOutcome: normalizedAuditOutcome(row.eventType, row.outcome, row.decision),
+          invocation: item.invocationId && item.invocationToolName && item.invocationStatus && item.invocationApprovalState
+            ? {
+                id: item.invocationId,
+                toolName: item.invocationToolName,
+                status: item.invocationStatus,
+                policyDecision: item.invocationPolicyDecision,
+                approvalState: item.invocationApprovalState,
+                argumentsSummary: item.invocationArgumentsSummary,
+                resultSummary: item.invocationResultSummary,
+                resultSizeBytes: item.invocationResultSizeBytes,
+                errorCode: item.invocationErrorCode,
+                errorMessage: item.invocationErrorMessage,
+                startedAt: item.invocationStartedAt,
+                completedAt: item.invocationCompletedAt,
+              }
+            : null,
         };
       });
 
