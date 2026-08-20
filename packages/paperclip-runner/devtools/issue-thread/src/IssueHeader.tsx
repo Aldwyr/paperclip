@@ -17,7 +17,6 @@ export interface IssueHeaderProps {
   surface?: "issue" | "chat";
   /** Clean-room tenant token, rendered so identity rotation is visible. */
   cleanRoomToken?: string | null;
-  onNewChat?: () => void;
   evidenceOpen: boolean;
   denialCount: number;
   segment: "thread" | "evidence";
@@ -35,7 +34,6 @@ export function IssueHeader(props: IssueHeaderProps) {
     scenarios,
     surface = "issue",
     cleanRoomToken = null,
-    onNewChat,
     evidenceOpen,
     denialCount,
     segment,
@@ -69,11 +67,7 @@ export function IssueHeader(props: IssueHeaderProps) {
           <StatusBadge status={snapshot.issue.status} />
         </div>
         <div className="pit-header-controls">
-          {chat ? (
-            <button type="button" className="pit-button" onClick={onNewChat} data-testid="new-chat-button">
-              <Icon name="spark" /> New chat
-            </button>
-          ) : (
+          {!chat ? (
             <>
               <label className="pit-visually-hidden" htmlFor="scenario-picker">Scenario</label>
               <select className="pit-select pit-desktop-only" id="scenario-picker" value={snapshot.issue.fixtureProfile} onChange={(event) => onSelectScenario(event.target.value)} data-testid="scenario-picker">
@@ -81,7 +75,7 @@ export function IssueHeader(props: IssueHeaderProps) {
               </select>
               <button type="button" className="pit-button pit-desktop-only" onClick={onReplay} data-testid="replay-button"><Icon name="play" /> Replay</button>
             </>
-          )}
+          ) : null}
           <button type="button" className="pit-icon-button pit-desktop-only" data-variant="destructive" onClick={onReset} data-testid="reset-button" title={chat ? "Reset chat" : "Reset scenario"} aria-label={chat ? "Reset chat" : "Reset scenario"}><Icon name="reset" /></button>
           <button type="button" className="pit-icon-button" data-variant="destructive" onClick={onStop} disabled={!turnActive} data-testid="stop-button" title="Stop turn" aria-label="Stop turn"><Icon name="stop" /></button>
           <button type="button" className="pit-button pit-desktop-only" aria-expanded={evidenceOpen} onClick={onToggleEvidence} data-testid="evidence-toggle"><Icon name="evidence" /> DevTools{denialCount > 0 ? ` (${denialCount})` : ""}</button>

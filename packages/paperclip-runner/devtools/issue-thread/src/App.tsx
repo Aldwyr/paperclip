@@ -23,7 +23,7 @@ import {
   type CapabilityCleanRoomIdentity,
 } from "./live-client";
 import { parseCapabilityRoute, capabilityRouteHref, type CapabilityRoute } from "./route";
-import { SurfaceNav } from "./SurfaceNav";
+import { SurfaceNav, type CapabilityChatHistoryItem } from "./SurfaceNav";
 import { TurnGroup } from "./ThreadItems";
 
 const PANEL_OPEN_KEY = "paperclip-runner.capability.panel.open";
@@ -48,6 +48,37 @@ const PENDING_ANNOUNCEMENT = "A request is waiting for your answer.";
 const ANSWERED_ANNOUNCEMENT = "Your answer was recorded.";
 const SETTLED_ANNOUNCEMENT = "The pending request is resolved.";
 const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts"];
+const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
+
+interface StoredChatSession {
+  sessionId: string;
+  snapshot: CapabilityIssueThreadSnapshot;
+  identity: CapabilityCleanRoomIdentity | null;
+  updatedAt: string;
+}
+
+function readChatHistory(): StoredChatSession[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(CHAT_HISTORY_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is StoredChatSession =>
+      typeof item === "object" && item !== null &&
+      typeof (item as StoredChatSession).sessionId === "string" &&
+      typeof (item as StoredChatSession).updatedAt === "string" &&
+      typeof (item as StoredChatSession).snapshot === "object",
+    ).slice(0, 12);
+  } catch {
+    return [];
+  }
+}
+
+function persistChatHistory(history: StoredChatSession[]): void {
+  try {
+    window.localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(history.slice(0, 12)));
+  } catch {
+    // History is a convenience; a blocked or full storage quota must not stop chat.
+  }
+}
 
 function readStoredNumber(key: string, fallback: number): number {
   try {
@@ -156,6 +187,9 @@ export function App() {
   const [snapshot, setSnapshot] = useState<CapabilityIssueThreadSnapshot | null>(null);
   const [devtools, setDevtools] = useState<CapabilityDevtoolsSnapshot | null>(null);
   const [identity, setIdentity] = useState<CapabilityCleanRoomIdentity | null>(null);
+  const [chatHistory, setChatHistory] = useState<StoredChatSession[]>(readChatHistory);
+  const [historicSessionId, setHistoricSessionId] = useState<string | null>(null);
+  const liveRoomRef = useRef<StoredChatSession | null>(null);
   /**
    * Which surface produced `snapshot`. A hash change commits the new route in
    * the same frame that still renders the old snapshot, so without this a
@@ -219,6 +253,7 @@ export function App() {
           if (cancelled) return;
           rememberSession(response.sessionId, "cleanroom");
           setIdentity(response.identity ?? null);
+          setHistoricSessionId(null);
           setSnapshot(response.view);
           setSnapshotSurface("chat");
         } catch (cause) {
@@ -318,12 +353,29 @@ export function App() {
 
   useEffect(() => {
     if (!panelOpen || snapshot === null || route.mode !== "live") return;
+    if (historicSessionId !== null) return;
     let cancelled = false;
     void capabilityLiveClient.devtools(snapshot.sessionId)
       .then((next) => { if (!cancelled) setDevtools(next); })
       .catch((cause) => { if (!cancelled) setActionError(describe(cause)); });
     return () => { cancelled = true; };
-  }, [panelOpen, route.mode, snapshot?.renderedAt, snapshot?.sessionId]);
+  }, [historicSessionId, panelOpen, route.mode, snapshot?.renderedAt, snapshot?.sessionId]);
+
+  useEffect(() => {
+    if (!chat || snapshot === null || historicSessionId !== null) return;
+    const record: StoredChatSession = {
+      sessionId: snapshot.sessionId,
+      snapshot,
+      identity,
+      updatedAt: snapshot.renderedAt,
+    };
+    liveRoomRef.current = record;
+    setChatHistory((current) => {
+      const next = [record, ...current.filter((item) => item.sessionId !== record.sessionId)].slice(0, 12);
+      persistChatHistory(next);
+      return next;
+    });
+  }, [chat, historicSessionId, identity, snapshot?.renderedAt, snapshot?.sessionId]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -517,7 +569,9 @@ export function App() {
   const adoptCleanRoom = useCallback((next: Awaited<ReturnType<typeof capabilityLiveClient.newCleanRoom>>) => {
     rememberSession(next.sessionId, "cleanroom");
     setIdentity(next.identity ?? null);
+    setHistoricSessionId(null);
     setSnapshot(next.view);
+    setDevtools(null);
     setActionError(null);
     setAnnouncement(
       `New clean-room chat started on ${next.view.issue.identifier}. The previous session was closed.`,
@@ -531,10 +585,38 @@ export function App() {
     abandonTurn();
     setAnnouncement("Starting a new clean-room chat…");
     void capabilityLiveClient
-      .newCleanRoom(snapshot?.sessionId ?? null)
+      .newCleanRoom(liveRoomRef.current?.sessionId ?? snapshot?.sessionId ?? null)
       .then(adoptCleanRoom)
       .catch((cause) => setActionError(describe(cause)));
   }, [abandonTurn, adoptCleanRoom, snapshot]);
+
+  const selectChatHistory = useCallback((sessionId: string) => {
+    const live = liveRoomRef.current;
+    if (live?.sessionId === sessionId) {
+      setSnapshot(live.snapshot);
+      setIdentity(live.identity);
+      setDevtools(null);
+      setHistoricSessionId(null);
+      setActionError(null);
+      return;
+    }
+    const archived = chatHistory.find((item) => item.sessionId === sessionId);
+    if (archived === undefined) return;
+    abandonTurn();
+    setSnapshot({
+      ...archived.snapshot,
+      composer: {
+        state: "disabled",
+        helper: null,
+        reason: "Historical session is read-only",
+        pendingInteractionId: null,
+      },
+    });
+    setIdentity(archived.identity);
+    setDevtools(null);
+    setHistoricSessionId(sessionId);
+    setActionError(null);
+  }, [abandonTurn, chatHistory]);
 
   const reset = useCallback(() => {
     setConfirmReset(false);
@@ -633,11 +715,27 @@ export function App() {
     () => (snapshot === null ? 0 : capabilityDenialCount(snapshot.evidence, null)),
     [snapshot],
   );
+  const historyItems: CapabilityChatHistoryItem[] = chatHistory.map((item) => ({
+    sessionId: item.sessionId,
+    identifier: item.snapshot.issue.identifier,
+    title: item.snapshot.issue.title,
+    updatedAt: item.updatedAt,
+    current: liveRoomRef.current?.sessionId === item.sessionId,
+  }));
+  const surfaceNav = (
+    <SurfaceNav
+      surface={route.surface}
+      history={historyItems}
+      activeSessionId={snapshot?.sessionId ?? null}
+      onNewChat={chat ? newChat : () => { window.location.hash = "#/chat"; }}
+      onSelectHistory={selectChatHistory}
+    />
+  );
 
   if (error !== null) {
     return (
       <div className="pit-app" data-thread-state="failed" data-surface={route.surface}>
-        <SurfaceNav surface={route.surface} />
+        {surfaceNav}
         <main className="pit-app-error">
           <p className="pit-composer-reason" role="alert" data-testid="surface-error">
             {chat
@@ -667,7 +765,7 @@ export function App() {
   if (snapshot === null) {
     return (
       <div className="pit-app" data-thread-state="loading" data-surface={route.surface}>
-        <SurfaceNav surface={route.surface} />
+        {surfaceNav}
         <main className="pit-app-error">
           <p className="pit-muted" role="status" data-testid="surface-loading">
             {chat
@@ -696,14 +794,13 @@ export function App() {
       data-surface={route.surface}
       data-connection-state={snapshot.connection.state}
     >
-      <SurfaceNav surface={route.surface} />
+      {surfaceNav}
 
       <IssueHeader
         snapshot={snapshot}
         scenarios={SCENARIOS}
         surface={route.surface}
         cleanRoomToken={identity?.token ?? null}
-        onNewChat={newChat}
         evidenceOpen={panelOpen}
         denialCount={denialCount}
         segment={segment}
@@ -946,7 +1043,7 @@ export function App() {
         {showPanel ? (
           <EvidencePanel
             snapshot={snapshot}
-            {...(route.mode === "live" ? { devtools } : {})}
+            {...(route.mode === "live" && historicSessionId === null ? { devtools } : {})}
             onForkRevision={(revision) => {
               abandonTurn();
               setActionError(null);
@@ -974,7 +1071,7 @@ export function App() {
             }
             onClose={closeEvidence}
             onJumpToThread={jumpToThread}
-            onInvokeTool={route.mode === "live" ? async (operationId, input) => {
+            onInvokeTool={route.mode === "live" && historicSessionId === null ? async (operationId, input) => {
               setActionError(null);
               const next = await capabilityLiveClient.invokeTool(snapshot.sessionId, operationId, input);
               setSnapshot(next.view);

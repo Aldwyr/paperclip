@@ -1,4 +1,5 @@
 import type { CapabilitySurface } from "./route";
+import { Icon } from "./Icons";
 
 /**
  * Top-level surface switch (Capability plan revision 5).
@@ -11,26 +12,46 @@ import type { CapabilitySurface } from "./route";
  * These are real anchors on purpose. The entry must survive a hard refresh, be
  * copyable, and open in a new tab, which a button handler would not give.
  */
-export function SurfaceNav({ surface }: { surface: CapabilitySurface }) {
+export interface CapabilityChatHistoryItem {
+  sessionId: string;
+  identifier: string;
+  title: string;
+  updatedAt: string;
+  current: boolean;
+}
+
+export function SurfaceNav({ surface, history = [], activeSessionId = null, onNewChat, onSelectHistory }: {
+  surface: CapabilitySurface;
+  history?: CapabilityChatHistoryItem[];
+  activeSessionId?: string | null;
+  onNewChat?: () => void;
+  onSelectHistory?: (sessionId: string) => void;
+}) {
   return (
-    <nav className="pit-surface-nav" aria-label="Capability surfaces" data-testid="surface-nav">
-      <a
-        className="pit-surface-link"
-        href="#/issue/hb-baseline"
-        aria-current={surface === "issue" ? "page" : undefined}
-        data-testid="surface-issue-link"
-      >
-        Scenario explorer
-      </a>
-      <a
-        className="pit-surface-link"
-        href="#/chat"
-        aria-current={surface === "chat" ? "page" : undefined}
-        data-testid="surface-chat-link"
-      >
-        New chat
-        <span className="pit-surface-note">· clean room</span>
-      </a>
-    </nav>
+    <aside className="pit-surface-nav" aria-label="Runner navigation" data-testid="surface-nav">
+      <div className="pit-sidebar-brand"><Icon name="activity" /><span>Runner lab</span></div>
+      <nav className="pit-sidebar-primary" aria-label="Capability surfaces">
+        <a className="pit-surface-link" href="#/issue/hb-baseline" aria-current={surface === "issue" ? "page" : undefined} data-testid="surface-issue-link">
+          <Icon name="timeline" /><span>Scenario explorer</span>
+        </a>
+        <button type="button" className="pit-surface-link" onClick={onNewChat} disabled={onNewChat === undefined} data-testid="surface-chat-link">
+          <Icon name="spark" /><span>New chat</span>
+        </button>
+      </nav>
+      {surface === "chat" ? (
+        <section className="pit-session-history" aria-labelledby="session-history-title">
+          <h2 id="session-history-title">Session history</h2>
+          <div className="pit-session-history-list">
+            {history.map((item) => (
+              <button type="button" key={item.sessionId} className="pit-session-history-item" data-selected={activeSessionId === item.sessionId} onClick={() => onSelectHistory?.(item.sessionId)}>
+                <span className="pit-session-history-title">{item.title}</span>
+                <span>{item.identifier}{item.current ? " · current" : ""}</span>
+              </button>
+            ))}
+            {history.length === 0 ? <p className="pit-muted">No chats yet.</p> : null}
+          </div>
+        </section>
+      ) : null}
+    </aside>
   );
 }

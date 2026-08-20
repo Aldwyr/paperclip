@@ -678,7 +678,7 @@ test.describe("Capability clean-room chat", () => {
     await open(page, "thread-baseline");
     const entry = page.getByTestId("surface-chat-link");
     await expect(entry).toBeVisible();
-    await expect(entry).toHaveAttribute("href", "#/chat");
+    await expect(entry).toHaveRole("button");
     await expect(entry).toContainText("New chat");
   });
 
@@ -821,9 +821,19 @@ test.describe("Capability clean-room chat", () => {
     await openCleanRoom(page, ["MCK-1000", "MCK-2000"]);
     await expect(page.locator(".pit-identifier")).toHaveText("MCK-1000");
 
-    await page.getByTestId("new-chat-button").click();
+    await page.getByTestId("surface-chat-link").click();
     await expect(page.locator(".pit-identifier")).toHaveText("MCK-2000");
     await expect(page.getByTestId("clean-room-empty")).toBeVisible();
+    const history = page.getByRole("region", { name: "Session history" });
+    await expect(history.getByRole("button")).toHaveCount(2);
+
+    await history.getByRole("button", { name: /MCK-1000/ }).click();
+    await expect(page.locator(".pit-identifier")).toHaveText("MCK-1000");
+    await expect(page.getByTestId("composer-reason")).toHaveText("Historical session is read-only");
+
+    await history.getByRole("button", { name: /MCK-2000.*current/ }).click();
+    await expect(page.locator(".pit-identifier")).toHaveText("MCK-2000");
+    await expect(page.locator("#composer-input")).toBeEnabled();
   });
 
   test("a failed live start reports the failure instead of a fixture", async ({ page }) => {

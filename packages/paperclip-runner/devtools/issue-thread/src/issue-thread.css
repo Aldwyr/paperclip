@@ -164,8 +164,11 @@ textarea {
  * composer stays pinned to the bottom of the thread column (§2.1).
  */
 .pit-app {
+  position: relative;
   display: flex;
   flex-direction: column;
+  box-sizing: border-box;
+  padding-left: 15rem;
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
@@ -184,35 +187,59 @@ textarea {
   border: 0;
 }
 
-/* ---------------------------------------------------------- surface nav */
+/* ------------------------------------------------------------- sidebar */
 
-/*
- * Two primary paths, one rail. The links wrap rather than scroll horizontally,
- * because the narrow layout must never introduce a horizontal scrollbar (§10).
- */
 .pit-surface-nav {
-  flex: none;
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 4;
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--pit-space-2);
-  padding: var(--pit-space-2) var(--pit-space-4);
+  flex-direction: column;
+  width: 15rem;
+  box-sizing: border-box;
+  padding: var(--pit-space-3);
   background: var(--pit-surface-sunken);
+  border-right: 1px solid var(--pit-border);
+  overflow: hidden;
+}
+
+.pit-sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--pit-space-2);
+  min-height: var(--pit-touch-target);
+  padding: 0 var(--pit-space-2);
+  color: var(--pit-foreground);
+  font-weight: 700;
+}
+
+.pit-sidebar-brand .pit-icon {
+  color: var(--pit-live);
+}
+
+.pit-sidebar-primary {
+  display: grid;
+  gap: var(--pit-space-1);
+  padding-bottom: var(--pit-space-4);
   border-bottom: 1px solid var(--pit-border);
 }
 
 .pit-surface-link {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  /* The label and its qualifier are separate flex items, so the space between
-     them has to be a gap: a leading space inside the qualifier collapses. */
-  gap: var(--pit-space-1);
+  gap: var(--pit-space-2);
+  width: 100%;
+  box-sizing: border-box;
   min-height: var(--pit-touch-target);
-  padding: 0 var(--pit-space-3);
-  border: 1px solid var(--pit-border);
+  padding: 0 var(--pit-space-2);
+  border: 1px solid transparent;
   border-radius: var(--pit-radius-md);
+  background: transparent;
   color: var(--pit-muted-foreground);
   font-size: var(--pit-text-xs);
   text-decoration: none;
+  text-align: left;
+  cursor: pointer;
 }
 
 .pit-surface-link:hover {
@@ -226,12 +253,62 @@ textarea {
   color: var(--pit-foreground);
 }
 
-.pit-surface-note {
-  color: var(--pit-faint-foreground);
+.pit-session-history {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  padding-top: var(--pit-space-4);
 }
 
-.pit-surface-link[aria-current="page"] .pit-surface-note {
-  color: var(--pit-muted-foreground);
+.pit-session-history h2 {
+  margin: 0 0 var(--pit-space-2);
+  padding: 0 var(--pit-space-2);
+  color: var(--pit-faint-foreground);
+  font-size: var(--pit-text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.pit-session-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pit-space-1);
+  overflow-y: auto;
+}
+
+.pit-session-history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  width: 100%;
+  padding: var(--pit-space-2);
+  border: 1px solid transparent;
+  border-radius: var(--pit-radius-md);
+  background: transparent;
+  color: var(--pit-faint-foreground);
+  font-size: var(--pit-text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.pit-session-history-item:hover,
+.pit-session-history-item[data-selected="true"] {
+  border-color: var(--pit-border);
+  background: var(--pit-surface);
+}
+
+.pit-session-history-item[data-selected="true"] {
+  border-color: var(--pit-accent);
+}
+
+.pit-session-history-title {
+  overflow: hidden;
+  color: var(--pit-foreground);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* A load failure and the pre-session wait share the centred single-column. */
@@ -1683,6 +1760,35 @@ textarea {
 }
 
 @media (max-width: 767px) {
+  .pit-app {
+    padding-left: 0;
+  }
+
+  .pit-surface-nav {
+    position: static;
+    width: auto;
+    flex: none;
+    padding: var(--pit-space-1) var(--pit-space-2);
+    border-right: 0;
+    border-bottom: 1px solid var(--pit-border);
+  }
+
+  .pit-sidebar-brand,
+  .pit-session-history {
+    display: none;
+  }
+
+  .pit-sidebar-primary {
+    display: flex;
+    gap: var(--pit-space-1);
+    padding: 0;
+    border: 0;
+  }
+
+  .pit-surface-link {
+    width: auto;
+  }
+
   .pit-desktop-only {
     display: none;
   }
