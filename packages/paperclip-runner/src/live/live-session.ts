@@ -1381,18 +1381,25 @@ export class CapabilityLiveSession {
       afterRevision: result.stateRevision,
     });
     this.#emit({ turnId, kind: "activity", reason: "tool_result" });
-    await this.#persist();
     if (terminalReplay && replayDisposition !== "duplicate") {
+      await this.#persist();
       return {
         success: false,
         contentItems: [{ type: "inputText", text: "Terminal-turn replay did not resolve to a durable duplicate." }],
       };
     }
+    if (terminalReplay) {
+      this.#recordTerminalFact(this.#durableReplayTurnId(turnId), "completed");
+    }
+    await this.#persist();
     return this.#codexToolResponse(result);
   }
 
   #isDurableTerminalReplay(turnId: string, input: unknown): boolean {
     if (turnId.length === 0 || this.#activeTurnId !== null) return false;
+    if (this.#terminalTurns.some(
+      (candidate) => candidate.turnId === this.#durableReplayTurnId(turnId),
+    )) return false;
     const terminal = this.#terminalTurns.find((candidate) => candidate.turnId === turnId);
     if (
       terminal?.status !== "interrupted" ||
@@ -1404,6 +1411,10 @@ export class CapabilityLiveSession {
     return this.#port.snapshot().idempotency.some(
       (entry) => entry.scope === scope && entry.key === idempotencyKey,
     );
+  }
+
+  #durableReplayTurnId(interruptedTurnId: string): string {
+    return `${interruptedTurnId}:durable-duplicate-replay`;
   }
 
   #codexToolResponse(result: CapabilitySemanticToolResult): Record<string, unknown> {

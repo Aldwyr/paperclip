@@ -532,7 +532,30 @@ describe("Capability live runnerd and Codex session", () => {
     );
     expect(resumed.mockState().comments).toHaveLength(1);
     expect(resumed.mockState().idempotency).toHaveLength(1);
-    expect(resumed.snapshot().evidence.filter((entry) => entry.kind === "tool_result")).toHaveLength(2);
+    const replayedSnapshot = resumed.snapshot();
+    expect(replayedSnapshot.terminalTurns).toEqual([
+      expect.objectContaining({ turnId: "turn-1", status: "interrupted" }),
+      expect.objectContaining({
+        turnId: "turn-1:durable-duplicate-replay",
+        status: "completed",
+        reconciledByAttemptId: "attempt-terminal-resumed",
+      }),
+    ]);
+    expect(replayedSnapshot.evidence.filter((entry) => entry.kind === "tool_result")).toHaveLength(2);
+    const receipts = replayedSnapshot.evidence.filter((entry) => entry.kind === "tool_result");
+    expect(receipts.map((entry) => (entry.data.result as Record<string, unknown>).ok)).toEqual([true, true]);
+    expect(receipts.map((entry) => (
+      ((entry.data.result as Record<string, unknown>).result as Record<string, unknown>).disposition
+    ))).toEqual(["applied", "duplicate"]);
+    expect(receipts.every((entry) => (
+      Number(entry.data.beforeRevision) <= Number(entry.data.afterRevision)
+    ))).toBe(true);
+    expect(receipts.every((entry) => (
+      Number((entry.data.result as Record<string, unknown>).stateRevision)
+        === Number(entry.data.afterRevision)
+    ))).toBe(true);
+    expect(receipts.at(-1)?.data.afterRevision).toBe(resumed.mockState().revision);
+    expect(state.transports[1]!.requests.some((request) => request.method === "turn/start")).toBe(false);
 
     const rejected = await state.transports[1]!.invokeServerRequest({
       id: "request-turn-1:new-key",
@@ -552,6 +575,11 @@ describe("Capability live runnerd and Codex session", () => {
     expect(resumed.mockState().comments).toHaveLength(1);
     expect(resumed.mockState().idempotency).toHaveLength(1);
     expect(resumed.snapshot().evidence.filter((entry) => entry.kind === "tool_result")).toHaveLength(2);
+    await resumed.completeAttempt("succeeded");
+    expect((await store.load(resumed.id))?.attempts).toMatchObject([
+      { attemptId: "attempt-terminal-killed", status: "terminated" },
+      { attemptId: "attempt-terminal-resumed", status: "succeeded" },
+    ]);
     await resumedService.shutdown(resumed.id, "terminal replay test complete");
   });
 

@@ -413,7 +413,11 @@ export class CapabilityMockControlPlaneAdapter implements CapabilityMockControlP
       this.#recordDecisionOnly(run.id, envelope.command.kind, "duplicate", "command_already_applied", [
         ...existing.result.entityRefs,
       ]);
-      return deepFreeze({ ...clone(existing.result), disposition: "duplicate" });
+      return deepFreeze({
+        ...clone(existing.result),
+        disposition: "duplicate",
+        stateRevision: this.#state.revision,
+      });
     }
     if (
       envelope.expectedRevision !== undefined &&

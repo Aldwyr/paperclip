@@ -214,6 +214,7 @@ describe("CapabilityMockControlPlaneAdapter", () => {
     });
     const replayed = await adapter.applyCommand(envelope);
     expect(replayed.disposition).toBe("duplicate");
+    expect(replayed.stateRevision).toBe(adapter.snapshot().revision);
     expect(adapter.snapshot().comments.filter((comment) => comment.body === "Exactly once.")).toHaveLength(1);
     expect(adapter.decisionRecords().map((decision) => decision.outcome)).toContain("faulted");
     expect(adapter.decisionRecords().map((decision) => decision.outcome)).toContain("duplicate");
