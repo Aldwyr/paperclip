@@ -2592,17 +2592,24 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
 
       for (const workspace of candidates) {
-        const executionWorkspace = toExecutionWorkspace(workspace);
-        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
-        if (!statusInspectionSucceeded) {
-          result.skippedUndelivered += 1;
-          continue;
-        }
-        const assessment = await assessDelivery(workspace, git);
         const reopenPending = metadataHasReopenPendingConsumption(
           workspace.metadata as Record<string, unknown> | null,
         );
-        if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
+        const issueTree = await listWorkspaceIssueTree(workspace);
+        const sourceIssue = issueTree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
+        const sourceIssueTerminal = Boolean(sourceIssue && TERMINAL_ISSUE_STATUSES.has(sourceIssue.status));
+        const subtreeTerminal = Boolean(
+          sourceIssue && issueTree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)),
+        );
+        let cooldownAnchor: Date | null = null;
+        for (const issue of issueTree) {
+          const terminalAt = issueTerminalTimestamp(issue);
+          if (terminalAt && (!cooldownAnchor || terminalAt.getTime() > cooldownAnchor.getTime())) {
+            cooldownAnchor = terminalAt;
+          }
+        }
+
+        if (!sourceIssueTerminal || !subtreeTerminal) {
           if (reopenPending) {
             // The source issue left the terminal state, so the reopen transition
             // committed. Clear the reopen-pending flag under the lifecycle lock so
@@ -2618,17 +2625,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedNonTerminalTree += 1;
           continue;
         }
-        if (assessment.workspaceDirty) {
-          result.skippedUndelivered += 1;
-          continue;
-        }
-        if (
-          assessment.deliveryState !== "merged_via_pr"
-          && assessment.deliveryState !== "merged_by_ancestry"
-        ) {
-          result.skippedUndelivered += 1;
-          continue;
-        }
         // Hold the archive during the cooldown window. The anchor is the most
         // recent terminal timestamp across the issue tree. A person can reopen
         // the work inside this window. A cooldown of 0 disables the check, so the
@@ -2640,8 +2636,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           : null;
         if (
           cooldownCutoff
-          && assessment.cooldownAnchor
-          && assessment.cooldownAnchor.getTime() > cooldownCutoff.getTime()
+          && cooldownAnchor
+          && cooldownAnchor.getTime() > cooldownCutoff.getTime()
         ) {
           result.skippedCooldown += 1;
           continue;
@@ -2703,6 +2699,28 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         if (await workspaceHasActiveRun(workspace)) {
           result.skippedActiveRun += 1;
+          continue;
+        }
+        const executionWorkspace = toExecutionWorkspace(workspace);
+        const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
+        if (!statusInspectionSucceeded) {
+          result.skippedUndelivered += 1;
+          continue;
+        }
+        const assessment = await assessDelivery(workspace, git);
+        if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) {
+          result.skippedNonTerminalTree += 1;
+          continue;
+        }
+        if (assessment.workspaceDirty) {
+          result.skippedUndelivered += 1;
+          continue;
+        }
+        if (
+          assessment.deliveryState !== "merged_via_pr"
+          && assessment.deliveryState !== "merged_by_ancestry"
+        ) {
+          result.skippedUndelivered += 1;
           continue;
         }
         result.eligible += 1;
