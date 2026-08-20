@@ -4266,15 +4266,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
       actor,
     });
-    if (refreshOptions.enableAllByDefault) {
-      await upsertAskFirstPolicies({
-        companyId: updatedConnection.companyId,
-        connection: updatedConnection,
-        askFirstEntries: [],
-        actor,
-      });
-    }
-
     await audit({
       companyId: connection.companyId,
       connectionId: connection.id,
