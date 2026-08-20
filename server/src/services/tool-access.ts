@@ -7238,6 +7238,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .select({
         companyId: toolOauthStates.companyId,
         connectionId: toolOauthStates.connectionId,
+        subjectUserId: toolOauthStates.subjectUserId,
       })
       .from(toolOauthStates)
       .where(eq(toolOauthStates.state, state))
@@ -7912,7 +7913,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       return connections;
     },
 
-    createConnection: async (companyId: string, input: CreateToolConnection): Promise<ToolConnection> => {
+    createConnection: async (companyId: string, input: CreateToolConnection, actor?: ActorInfo): Promise<ToolConnection> => {
       let applicationId = input.applicationId;
       let applicationNamespace = input.applicationName ?? input.name;
       const transport = input.transport;
@@ -7941,6 +7942,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
       await assertSecretRefs(companyId, [...(input.credentialRefs ?? []), ...(input.credentialSecretRefs ?? [])]);
       const connectionId = randomUUID();
+      const binding = actorBinding(actor);
       const [row] = await db.insert(toolConnections).values({
         id: connectionId,
         companyId,
@@ -7957,6 +7959,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         transportConfig: isGoogleSheetsConnectionConfig(config) ? config : input.transportConfig ?? config,
         credentialRefs: input.credentialRefs ?? [],
         credentialSecretRefs: input.credentialSecretRefs ?? [],
+        createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
+        createdByUserId: binding.actorType === "user" ? binding.actorId : null,
       }).returning();
       await ensureDefaultWorkspaceGrant(row);
       await syncCredentialBindings(row);
@@ -8005,6 +8009,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         createdByUserId: binding.actorType === "user" ? binding.actorId : null,
       }).returning();
       if (!grant) throw new Error("Failed to create connection installation");
+      await db.insert(toolAccessAuditEvents).values({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        actorType: binding.actorType ?? "system",
+        actorId: binding.actorId,
+        action: "connection_grant.created",
+        outcome: "success",
+        reasonCode: "grant_created",
+        details: { grantId: grant.id, kind: grant.kind, isDefault: grant.isDefault },
+      });
       return grant;
     },
 
@@ -8024,6 +8038,16 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         eq(connectionGrants.connectionId, connection.id),
       )).returning();
       if (!grant) throw notFound("Connection grant not found");
+      await db.insert(toolAccessAuditEvents).values({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        actorType: binding.actorType ?? "system",
+        actorId: binding.actorId,
+        action: "connection_grant.revoked",
+        outcome: "success",
+        reasonCode: "grant_revoked",
+        details: { grantId: grant.id, kind: grant.kind },
+      });
       return grant;
     },
 
@@ -8135,6 +8159,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
               .returning({ id: toolProfileBindings.id });
             if (binding) accessExtensions.push({ targetType: install.targetType, targetId: install.targetId, profileId: profile.id });
           }
+        }
+        if (removeIds.length > 0 || additions.length > 0) {
+          const binding = actorBinding(actor);
+          await tx.insert(toolAccessAuditEvents).values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            actorType: binding.actorType ?? "system",
+            actorId: binding.actorId,
+            action: "connection_installs.changed",
+            outcome: "success",
+            reasonCode: "installs_changed",
+            details: {
+              added: additions.map((install) => ({ targetType: install.targetType, targetId: install.targetId })),
+              removed: existing
+                .filter((install) => removeIds.includes(install.id))
+                .map((install) => ({ targetType: install.targetType, targetId: install.targetId })),
+            },
+          });
         }
       });
       for (const extension of accessExtensions) {
@@ -8947,6 +8989,29 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         await recordFailure(outcome, errorCode, details);
         throw new HttpError(status, message, { code: errorCode, path, ...details });
       };
+
+      const [install] = await db
+        .select({ id: toolConnectionInstalls.id })
+        .from(toolConnectionInstalls)
+        .where(and(
+          eq(toolConnectionInstalls.companyId, connection.companyId),
+          eq(toolConnectionInstalls.connectionId, connection.id),
+          sql`((${toolConnectionInstalls.targetType} = 'company' and ${toolConnectionInstalls.targetId} = ${connection.companyId}) or (${toolConnectionInstalls.targetType} = 'agent' and ${toolConnectionInstalls.targetId} = ${input.agentId}))`,
+        ))
+        .limit(1);
+      if (!install) {
+        await fail(
+          403,
+          `Connection ${connection.name} must be installed for this agent before it can mint a token`,
+          "denied",
+          "installation_required",
+          {
+            connection: { id: connection.id, uid: connection.uid, name: connection.name },
+            agentId: input.agentId,
+            remediation: { action: "install_connection", targetType: "agent", targetId: input.agentId },
+          },
+        );
+      }
 
       const subject = input.body.subject ?? { type: "app" as const };
       if (subject.type === "user" && subject.userId !== runContext.responsibleUserId) {
