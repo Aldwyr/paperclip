@@ -32,6 +32,7 @@ export type CapabilityEvidenceKind =
   | "session"
   | "provider_event"
   | "tool_exposure"
+  | "tool_discovery"
   | "tool_call"
   | "tool_result"
   | "interaction"
@@ -313,6 +314,15 @@ export function redactCapabilityEvidenceData(
           .sort(),
         scenarioId: clamp(asString(data.scenarioId), 120),
       };
+    case "tool_discovery":
+      return {
+        action: clamp(asString(data.action), 80),
+        query: clamp(asString(data.query), 500),
+        namespace: clamp(asString(data.namespace), 120),
+        operationIds: (Array.isArray(data.operationIds) ? data.operationIds : [])
+          .filter((id): id is string => typeof id === "string" && CATALOG_OPERATION_IDS.has(id))
+          .sort(),
+      };
     case "tool_call": {
       const operationId = asString(data.operationId);
       return {
@@ -373,6 +383,10 @@ export function capabilityEvidenceDetail(
     case "tool_exposure": {
       const ids = Array.isArray(data.operationIds) ? data.operationIds.length : 0;
       return `tool exposure · ${ids} operation${ids === 1 ? "" : "s"}`;
+    }
+    case "tool_discovery": {
+      const ids = Array.isArray(data.operationIds) ? data.operationIds.length : 0;
+      return `tool discovery · ${value("action") || "searched"} · ${ids} loaded`;
     }
     case "tool_call": {
       const fields = asRecord(data.input).fields;
@@ -448,6 +462,12 @@ export function capabilityEvidenceDetails(
       break;
     case "tool_exposure":
       add("Scenario", data.scenarioId);
+      addList("Operations", data.operationIds);
+      break;
+    case "tool_discovery":
+      add("Action", data.action);
+      add("Query", data.query);
+      add("Namespace", data.namespace);
       addList("Operations", data.operationIds);
       break;
     case "tool_call": {

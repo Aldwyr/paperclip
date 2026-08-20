@@ -96,7 +96,7 @@ function publicCompanyState(serialized: string): CapabilityJsonValue {
 }
 
 function boundary(kind: string): string {
-  if (kind === "tool_call" || kind === "tool_result") return "semantic tool";
+  if (kind === "tool_call" || kind === "tool_result" || kind === "tool_discovery") return "semantic tool";
   if (kind === "provider_event") return "Codex app-server";
   if (kind === "process") return "runnerd process";
   if (kind === "interaction") return "mock control plane";
@@ -157,6 +157,8 @@ export function projectCapabilityDevtools(snapshot: CapabilityLiveSessionSnapsho
       currentAttemptId: snapshot.currentAttemptId ?? null,
       terminalTurns: snapshot.terminalTurns ?? [],
       usageLedger: snapshot.usageLedger ?? [],
+      toolExposure: snapshot.config.toolExposure ?? "eager",
+      loadedOperationIds: snapshot.loadedOperationIds ?? [],
       createdAt: snapshot.createdAt,
       updatedAt: snapshot.updatedAt,
     }),
@@ -166,6 +168,7 @@ export function projectCapabilityDevtools(snapshot: CapabilityLiveSessionSnapsho
       effectiveCapabilities: snapshot.config.capabilities,
       explicitClaims: snapshot.config.explicitClaims,
       turnTimeoutMs: snapshot.config.turnTimeoutMs,
+      toolExposure: snapshot.config.toolExposure ?? "eager",
       workingDirectory: "[withheld]",
     }),
   };

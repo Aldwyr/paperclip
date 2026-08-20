@@ -84,6 +84,26 @@ describe("Capability semantic catalog and authorization", () => {
     expect(adapter.snapshot().revision).toBe(before);
   });
 
+  it("discovers only authorized optional tools and returns trusted schemas", async () => {
+    const claims = ["discovery:agents:read", "governance:approvals:read"];
+    const adapter = await running(claims);
+    const dispatcher = new CapabilitySemanticDispatcher(adapter, {
+      scenario: { id: "lazy-search", claims }, explicitClaims: claims,
+    });
+    const found = dispatcher.discoverTools(OPEN.identity.runId, "find company agents", { namespace: "discovery" });
+    expect(found.operations.map((tool) => tool.name)).toEqual(["list_agents", "get_agent"]);
+    expect(found.operations.every((tool) => tool.annotations.semanticContract === "paperclip.semantic-tool.v1")).toBe(true);
+    expect(JSON.stringify(found)).not.toContain("list_approvals");
+  });
+
+  it("does not disclose optional tools that current authority cannot invoke", async () => {
+    const adapter = await running();
+    const dispatcher = new CapabilitySemanticDispatcher(adapter);
+    const found = dispatcher.discoverTools(OPEN.identity.runId, "create child task approval secret admin");
+    expect(found.operations).toEqual([]);
+    expect(JSON.stringify(found.operations)).not.toMatch(/create_task|approval|secret|administer_company/);
+  });
+
   it("executes a granted optional operation through the mock port", async () => {
     const claim = "dependencies:write";
     const adapter = await running([claim], {

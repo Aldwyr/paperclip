@@ -19,6 +19,7 @@ import {
   containsProtectedSemanticData,
   redactSemanticValue,
 } from "./redaction.js";
+import { discoverCapabilityDefinitions } from "./discovery.js";
 import type {
   CapabilitySemanticAuthorizationDecision,
   CapabilitySemanticAuthorizationRecord,
@@ -87,6 +88,14 @@ export class CapabilitySemanticDispatcher {
       if (decision.allowed) definitions.push(toDefinition(descriptor));
     }
     return deepFreeze(definitions);
+  }
+
+  discoverTools(
+    runId: string,
+    query: string,
+    options: { namespace?: string; limit?: number } = {},
+  ) {
+    return discoverCapabilityDefinitions(query, this.#policyContext(runId), options);
   }
 
   authorizationRecords(): readonly CapabilitySemanticAuthorizationRecord[] {

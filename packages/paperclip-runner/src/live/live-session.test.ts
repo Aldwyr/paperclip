@@ -273,6 +273,24 @@ function providerState(): FakeProviderState {
 }
 
 describe("Capability live runnerd and Codex session", () => {
+  it("opens lazy sessions with core and discovery gateways instead of optional schemas", async () => {
+    const state = providerState();
+    const claim = "discovery:agents:read";
+    const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(state) });
+    const session = await service.create({
+      runId: "run-live-lazy", sessionId: "session-live-lazy", toolExposure: "lazy",
+      capabilities: [claim], explicitClaims: [claim], scenario: { id: "lazy", claims: [claim] },
+    });
+    const start = state.transports[0]!.requests.find((entry) => entry.method === "thread/start")!;
+    const names = (start.params.dynamicTools as Array<{ name: string }>).map((tool) => tool.name);
+    expect(names).toContain("get_task_context");
+    expect(names).toContain("discover_capabilities");
+    expect(names).toContain("invoke_discovered_capability");
+    expect(names).not.toContain("list_agents");
+    expect(session.snapshot().config.toolExposure).toBe("lazy");
+    await service.shutdown(session.id);
+  });
+
   it("returns typed mock results to the same multi-turn Codex thread without Paperclip network calls", async () => {
     const state = providerState();
     const fetchSpy = vi.spyOn(globalThis, "fetch");

@@ -17,6 +17,7 @@ import type {
 } from "../mock-core/capability-control-plane-types.js";
 import { CapabilityMockControlPlaneAdapter } from "../mock-core/capability-mock-control-plane-adapter.js";
 import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
+import { CAPABILITY_DISCOVERY_NAMESPACES, type CapabilityToolExposureMode } from "../semantic-tools/discovery.js";
 import type {
   CapabilitySemanticAuthorizationRecord,
   CapabilitySemanticScenarioPolicy,
@@ -44,6 +45,8 @@ const LIVE_BASE_INSTRUCTIONS = [
   "Do not discover skills, credentials, endpoints, or hidden control-plane capabilities.",
 ].join(" ");
 const CODEX_PERMISSION_PROFILE = "paperclip-runner-workspace-only";
+const DISCOVER_TOOL = "discover_capabilities";
+const INVOKE_DISCOVERED_TOOL = "invoke_discovered_capability";
 
 export type CapabilityLiveSessionStatus =
   | "starting"
@@ -95,6 +98,7 @@ export interface CapabilityLiveSessionConfigSnapshot {
   explicitClaims: string[];
   seedState: string;
   turnTimeoutMs: number;
+  toolExposure?: CapabilityToolExposureMode;
 }
 
 export type CapabilityLiveAttemptStatus = "running" | "succeeded" | "failed" | "terminated";
@@ -183,6 +187,7 @@ export interface CapabilityLiveSessionSnapshot {
   usageLedger?: CapabilityLiveUsageReceipt[];
   /** Bounded mock-control-plane snapshots for DevTools time travel and diffs. */
   stateHistory?: CapabilityLiveStateRevision[];
+  loadedOperationIds?: string[];
 }
 
 export interface CreateCapabilityLiveSessionInput {
@@ -199,6 +204,7 @@ export interface CreateCapabilityLiveSessionInput {
   sessionId?: string;
   attemptId?: string;
   turnTimeoutMs?: number;
+  toolExposure?: CapabilityToolExposureMode;
 }
 
 export interface ResumeCapabilityLiveSessionInput {
@@ -534,6 +540,18 @@ function dynamicToolSpec(definition: CapabilitySemanticToolDefinition): Record<s
   };
 }
 
+function discoveryToolSpecs(): Record<string, unknown>[] {
+  return [{
+    name: DISCOVER_TOOL,
+    description: `Search authorized optional Paperclip capabilities. Namespaces: ${CAPABILITY_DISCOVERY_NAMESPACES.map((item) => `${item.name} (${item.description})`).join("; ")}`,
+    inputSchema: { type: "object", properties: { query: { type: "string", minLength: 1, maxLength: 500 }, namespace: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 8 } }, required: ["query"], additionalProperties: false },
+  }, {
+    name: INVOKE_DISCOVERED_TOOL,
+    description: "Invoke one optional Paperclip operation returned by discover_capabilities. Authority is rechecked at invocation.",
+    inputSchema: { type: "object", properties: { operationId: { type: "string" }, input: { type: "object", additionalProperties: true } }, required: ["operationId", "input"], additionalProperties: false },
+  }];
+}
+
 function userInput(message: string): Record<string, unknown> {
   return { type: "text", text: message, text_elements: [] };
 }
@@ -608,6 +626,7 @@ export class CapabilityLiveSessionService {
         explicitClaims: authority.explicitClaims,
         seedState,
         turnTimeoutMs: input.turnTimeoutMs ?? 120_000,
+        toolExposure: input.toolExposure ?? "eager",
       },
       store: this.#store,
       transportFactory: this.#transportFactory,
@@ -742,6 +761,7 @@ export class CapabilityLiveSessionService {
       capabilities: config.capabilities,
       explicitClaims: config.explicitClaims,
       turnTimeoutMs: config.turnTimeoutMs,
+      toolExposure: config.toolExposure ?? "eager",
     });
   }
 
@@ -810,6 +830,7 @@ export class CapabilityLiveSession {
   #eventSeq = 0;
   #turnEventCount = 0;
   readonly #rawUsageByTurn = new Map<string, { providerRequests: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number }>();
+  readonly #loadedOperationIds = new Set<string>();
 
   private constructor(options: OpenSessionOptions & { snapshot?: CapabilityLiveSessionSnapshot }) {
     this.#port = options.port;
@@ -847,6 +868,7 @@ export class CapabilityLiveSession {
       operationId: "session.open",
       state: this.#port.serialize(),
     }]);
+    for (const operationId of options.snapshot?.loadedOperationIds ?? []) this.#loadedOperationIds.add(operationId);
     this.#providerThreadId = options.snapshot?.providerThreadId ?? "";
     this.#providerSessionId = options.snapshot?.providerSessionId ?? null;
     this.#providerModel = options.snapshot?.providerModel === undefined
@@ -1015,6 +1037,7 @@ export class CapabilityLiveSession {
       terminalTurns: structuredClone(this.#terminalTurns),
       usageLedger: structuredClone(this.#usageLedger),
       stateHistory: structuredClone(this.#stateHistory),
+      loadedOperationIds: [...this.#loadedOperationIds].sort(),
     };
   }
 
@@ -1360,10 +1383,14 @@ export class CapabilityLiveSession {
       capabilities: { experimentalApi: true, requestAttestation: false },
     });
     this.#transport.notify("initialized");
-    const tools = this.#dispatcher.listTools(this.#authority.runId);
+    const authorizedTools = this.#dispatcher.listTools(this.#authority.runId);
+    const tools = (this.#config.toolExposure ?? "eager") === "lazy"
+      ? authorizedTools.filter((tool) => tool.annotations.exposure === "always")
+      : authorizedTools;
     this.#appendEvidence("tool_exposure", null, {
       operationIds: tools.map((tool) => tool.name),
       scenarioId: this.#config.scenario.id,
+      toolExposure: this.#config.toolExposure ?? "eager",
     });
     if (resume) {
       const read = await this.#transport.request("thread/read", {
@@ -1427,7 +1454,10 @@ export class CapabilityLiveSession {
         runtimeWorkspaceRoots: [this.#config.workingDirectory],
         approvalPolicy: "never",
         baseInstructions: LIVE_BASE_INSTRUCTIONS,
-        dynamicTools: tools.map(dynamicToolSpec),
+        dynamicTools: [
+          ...tools.map(dynamicToolSpec),
+          ...((this.#config.toolExposure ?? "eager") === "lazy" ? discoveryToolSpecs() : []),
+        ],
         experimentalRawEvents: true,
         persistExtendedHistory: true,
       });
@@ -1515,25 +1545,55 @@ export class CapabilityLiveSession {
         contentItems: [{ type: "inputText", text: "Tool call was outside the active Capability thread and turn." }],
       };
     }
+    if (operationId === DISCOVER_TOOL) {
+      const args = record(request.params.arguments);
+      try {
+        const discovered = this.#dispatcher.discoverTools(
+          this.#authority.runId,
+          text(args.query),
+          { ...(text(args.namespace) ? { namespace: text(args.namespace) } : {}), ...(typeof args.limit === "number" ? { limit: args.limit } : {}) },
+        );
+        for (const operation of discovered.operations) this.#loadedOperationIds.add(operation.name);
+        this.#appendEvidence("tool_discovery", turnId, {
+          action: "loaded", query: discovered.query, namespace: discovered.namespace ?? "",
+          operationIds: discovered.operations.map((operation) => operation.name),
+        });
+        await this.#persist();
+        return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(discovered) }] };
+      } catch (error) {
+        this.#appendEvidence("tool_discovery", turnId, { action: "rejected", query: text(args.query), namespace: text(args.namespace), operationIds: [] });
+        return { success: false, contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : "Capability discovery failed." }] };
+      }
+    }
+    let semanticOperationId = operationId;
+    let semanticInput = request.params.arguments;
+    if (operationId === INVOKE_DISCOVERED_TOOL) {
+      const args = record(request.params.arguments);
+      semanticOperationId = text(args.operationId);
+      semanticInput = args.input;
+      if (!this.#loadedOperationIds.has(semanticOperationId)) {
+        return { success: false, contentItems: [{ type: "inputText", text: "Operation was not loaded by discover_capabilities." }] };
+      }
+    }
     const beforeRevision = this.#port.snapshot().revision;
     this.#appendEvidence("tool_call", turnId, {
       callId,
-      operationId,
-      input: jsonValue(request.params.arguments),
+      operationId: semanticOperationId,
+      input: jsonValue(semanticInput),
       beforeRevision,
     });
     this.#emit({ turnId, kind: "activity", reason: "tool_call" });
     const result = await this.#dispatcher.dispatch({
       runId: this.#authority.runId,
       callId,
-      operationId,
-      input: request.params.arguments,
+      operationId: semanticOperationId,
+      input: semanticInput,
     });
-    this.#recordStateRevision(turnId, operationId);
+    this.#recordStateRevision(turnId, semanticOperationId);
     const replayDisposition = result.ok ? text(record(result.result).disposition) : "";
     this.#appendEvidence("tool_result", turnId, {
       callId,
-      operationId,
+      operationId: semanticOperationId,
       result: jsonValue(result),
       beforeRevision,
       afterRevision: result.stateRevision,
