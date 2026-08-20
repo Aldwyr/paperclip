@@ -4585,6 +4585,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         })
         .where(eq(toolConnections.id, existing.id))
         .returning();
+      await ensureDefaultOrganizationGrant(updated);
       await syncCredentialBindings(updated);
       await ensureRuntimeSlot(updated);
       return { row: updated, created: false };
@@ -4605,6 +4606,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       credentialRefs: [],
       credentialSecretRefs: [],
     }).returning();
+    await ensureDefaultOrganizationGrant(created);
     await syncCredentialBindings(created);
     await ensureRuntimeSlot(created);
     return { row: created, created: true };
@@ -6568,6 +6570,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           createdByUserId: actor?.actorType === "user" ? actor.actorId ?? null : null,
         }).returning();
       }
+      await ensureDefaultOrganizationGrant(connectionRow);
       await syncCredentialBindings(connectionRow);
       await ensureRuntimeSlot(connectionRow);
 

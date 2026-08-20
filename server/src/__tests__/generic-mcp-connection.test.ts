@@ -366,6 +366,9 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     // this connection cannot be depending on gallery metadata for anything.
     expect(connection!.config).not.toHaveProperty("sourceTemplateKey");
     expect(connection!.config).not.toHaveProperty("connectionMethodKey");
+    await expect(service.listConnectionGrants(result.connectionId, company.id)).resolves.toMatchObject({
+      grants: [expect.objectContaining({ kind: "organization", isDefault: true, credentialSecretRefs: [] })],
+    });
     const [profile] = await db.select().from(toolProfiles).where(eq(
       toolProfiles.profileKey,
       `app:${result.connectionId}`,

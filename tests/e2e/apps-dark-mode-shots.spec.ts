@@ -137,7 +137,7 @@ test.describe.serial("dark-mode Apps surfaces", () => {
     await forceDark(page);
     await page.goto(`/${seed.prefix}/apps/connections`);
     await expect(page.getByRole("heading", { name: "Connections" })).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByText(/app needs attention/i).first()).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(/needs attention/i).first()).toBeVisible({ timeout: 30_000 });
     await page.screenshot({ path: `${SCREENSHOT_DIR}/apps-nav-02-attention-dark.png`, fullPage: true });
   });
 

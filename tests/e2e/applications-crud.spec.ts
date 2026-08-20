@@ -46,7 +46,7 @@ async function createConnection(
   const res = await request.post(`/api/companies/${companyId}/tools/connections`, {
     data: {
       transport: "mcp_remote",
-      config: { url: "https://fixture.example/mcp" },
+      config: { url: "http://localhost:65535/mcp" },
       enabled: true,
       status: "active",
       ...data,
