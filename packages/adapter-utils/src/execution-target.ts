@@ -2289,8 +2289,14 @@ async function reserveHostAssignedLoopbackPort(): Promise<number> {
  * host passes the assigned port and the per-open nonce only through the launch
  * environment, so the argument vector sets them as environment assignments in
  * front of the node command. No addressing data comes from the channel.
+ *
+ * The script uses `exec env NAME=value ... command`. A POSIX shell accepts an
+ * environment-assignment prefix only on a plain command, never on `exec`. The
+ * form `exec NAME=value command` exits with status 127. The `env` utility carries
+ * the assignments, and `exec` still replaces the shell with the gateway process,
+ * so the gateway keeps the process slot and the assigned environment.
  */
-function buildDuplexGatewayLaunchArgv(input: {
+export function buildDuplexGatewayLaunchArgv(input: {
   shellCommand: "bash" | "sh";
   remoteEntrypoint: string;
   nodeCommand?: string | null;
@@ -2300,7 +2306,7 @@ function buildDuplexGatewayLaunchArgv(input: {
     .map(([key, value]) => `${key}=${shellQuote(value)}`)
     .join(" ");
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  const script = `exec ${assignments} ${shellQuote(nodeCommand)} ${shellQuote(input.remoteEntrypoint)}`;
+  const script = `exec env ${assignments} ${shellQuote(nodeCommand)} ${shellQuote(input.remoteEntrypoint)}`;
   return [input.shellCommand, ...shellCommandArgs(script)];
 }
 
@@ -2396,11 +2402,19 @@ async function ensureSandboxRunLogDirectory(input: {
  * single exit listener of the channel while the host waits for a valid READY
  * frame. It resolves the handshake, then hands the channel to the broker.
  *
- * Readiness passes only when the first non-empty line is a valid versioned READY
- * frame with the matching nonce and no address data. Any earlier decode failure,
- * any earlier non-READY frame, a mismatched nonce, an early exit, or a timeout
- * fails the handshake. The gate never dispatches a request; the broker does that
- * after readiness passes.
+ * The gate authenticates readiness with the nonce and the strict READY schema,
+ * not with the line position. A PTY channel echoes the launch wrapper line before
+ * it sets raw mode, so the first line is often not the READY frame. The gate skips
+ * each pre-READY line that does not decode as a READY frame, then accepts the first
+ * line that decodes as a READY frame with the matching nonce. A line that decodes
+ * as a READY frame with a wrong nonce fails the handshake with a nonce mismatch. An
+ * early exit or a timeout also fails the handshake. The gate never dispatches a
+ * request; the broker does that after readiness passes.
+ *
+ * The skipped bytes stay in the capped buffer, so the O(1) cap and the readiness
+ * timeout still bound the wait. The gate enforces the cap on every pre-READY path
+ * and before it decodes a candidate line, so an over-cap prefix never reaches READY
+ * acceptance. The cap check has priority over READY acceptance on every path.
  */
 // The count of the pre-READY newline-scan work, in UTF-16 code units. Each
 // search adds the number of code units it can read. A test reads this count to
@@ -2506,12 +2520,12 @@ function createDuplexReadinessGate(
     for (;;) {
       const newlineIndex = findNewlineFrom(buffer, scanFrom);
       if (newlineIndex === -1) {
-        // No READY line yet. The whole buffer up to the end is now scanned.
+        // No complete line yet. The whole buffer up to the end is now scanned.
         scanFrom = buffer.length;
         // The gate reads untrusted bytes, so bound the pre-READY buffer. Past
         // the cap with no complete READY line, the stream cannot be a valid
-        // READY frame, so finish with protocol contamination. The retained blank
-        // lines count against the cap; that is acceptable and fail-closed.
+        // READY frame, so finish with protocol contamination. The retained
+        // skipped lines count against the cap; that is acceptable and fail-closed.
         //
         // Gate on buffer.length, the UTF-16 code-unit count, which is O(1).
         // Buffer.byteLength is O(n), so a byte check on every newline-less chunk
@@ -2526,30 +2540,50 @@ function createDuplexReadinessGate(
         return;
       }
       if (newlineIndex === lineStart) {
-        // Skip a leading blank line, the same as the frame decoder. Advance the
-        // line-start cursor past the newline without a buffer copy, then search
-        // the next line from the position after the newline.
+        // Skip a blank line, the same as the frame decoder. Advance the line-start
+        // cursor past the newline without a buffer copy, then search the next line
+        // from the position after the newline. Enforce the cap after the advance,
+        // so a blank-line flood past the cap fails closed before READY acceptance.
         lineStart = newlineIndex + 1;
         scanFrom = newlineIndex + 1;
+        if (lineStart > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
+          finish({ ok: false, reason: "protocol_contamination" });
+          return;
+        }
         continue;
+      }
+      // A complete non-blank candidate line spans `[lineStart, newlineIndex)`.
+      // Enforce the cap on the line's end offset before the decode, so an over-cap
+      // prefix never reaches READY acceptance on a completed line.
+      if (newlineIndex + 1 > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
+        finish({ ok: false, reason: "protocol_contamination" });
+        return;
       }
       // Slice only the single candidate line for the decode.
       const line = buffer.slice(lineStart, newlineIndex);
       const decoded = decodeDuplexLine(line);
-      if (!decoded.ok || decoded.frame.type !== "ready") {
-        // The first frame before READY must be a valid READY frame. Anything
-        // else is protocol contamination.
+      if (decoded.ok && decoded.frame.type === "ready") {
+        // A line that decodes as a READY frame authenticates by the nonce. A wrong
+        // nonce fails the handshake; the matching nonce passes it.
+        if (decoded.frame.nonce !== options.nonce) {
+          finish({ ok: false, reason: "nonce_mismatch" });
+          return;
+        }
+        // Hold the bytes that follow the READY line for the broker to replay.
+        pending = buffer.slice(newlineIndex + 1);
+        finish({ ok: true });
+        return;
+      }
+      // The line does not decode as a READY frame. A PTY echo line or any other
+      // pre-READY noise reaches here. Skip it and keep scanning; the nonce and the
+      // strict schema, not the line position, authenticate readiness. Enforce the
+      // cap after the advance, so a noise-line flood past the cap fails closed.
+      lineStart = newlineIndex + 1;
+      scanFrom = newlineIndex + 1;
+      if (lineStart > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
         finish({ ok: false, reason: "protocol_contamination" });
         return;
       }
-      if (decoded.frame.nonce !== options.nonce) {
-        finish({ ok: false, reason: "nonce_mismatch" });
-        return;
-      }
-      // Hold the bytes that follow the READY line for the broker to replay.
-      pending = buffer.slice(newlineIndex + 1);
-      finish({ ok: true });
-      return;
     }
   });
 

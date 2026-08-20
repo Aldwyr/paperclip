@@ -254,9 +254,12 @@ export function createDuplexTelemetry(options: DuplexTelemetryOptions = {}): Dup
           settled = true;
           // The channel-open span records the failed attempt on the duplex
           // transport; the counter and the event record the file-bridge fallback.
+          // The span carries `fallback_reason` on this fallback path only, so a
+          // reader can group the failed opens by reason. `fallback_reason` is a
+          // closed dimension key, so no new key reaches a sink.
           safeSpan({
             name: DUPLEX_SPAN_CHANNEL_OPEN,
-            dimensions: { provider, transport: "duplex", outcome: "error" },
+            dimensions: { provider, transport: "duplex", outcome: "error", fallback_reason: reason },
           });
           recordFallback(reason);
         },

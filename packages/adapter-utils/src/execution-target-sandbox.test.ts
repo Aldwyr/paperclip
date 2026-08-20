@@ -15,6 +15,7 @@ import {
 
 import {
   __duplexReadinessTesting,
+  buildDuplexGatewayLaunchArgv,
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
   adapterExecutionTargetDuplexTelemetryRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
@@ -4107,23 +4108,25 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 20000);
 
-  it("bounds the pre-READY blank-line scan work by the bytes received", async () => {
+  it("bounds the pre-READY skip scan work by the bytes received", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-blank-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
     await mkdir(remoteCwd, { recursive: true });
     const api = await startRecordingApiServer();
-    // An adversarial provider sends one pre-READY chunk of many blank lines and
-    // then an invalid line. The gate must skip each blank line in O(1), so the
-    // total newline-scan work stays linear in the bytes received. A per-line full
-    // rescan or a per-line buffer copy makes the work quadratic. The invalid line
-    // then drives protocol contamination and the file-bridge fallback.
+    // An adversarial provider sends one pre-READY chunk of many blank lines and a
+    // noise line, then a valid READY frame. The gate must skip each blank line and
+    // the noise line in O(1), so the total newline-scan work stays linear in the
+    // bytes received. A per-line full rescan or a per-line buffer copy makes the
+    // work quadratic. The READY frame then settles the gate ready.
     const blankLineCount = 15_000;
-    const contaminatedChunk = "\n".repeat(blankLineCount) + "invalid\n";
-    const totalBytes = contaminatedChunk.length;
+    const noisePrefix = "\n".repeat(blankLineCount) + "a non-frame echo line\n";
     const { runner, control } = makeDuplexSelectionRunner((ctx) => {
-      ctx.emitRaw(contaminatedChunk);
+      ctx.emitRaw(noisePrefix);
+      ctx.emitFrame({ version: 1, type: "ready", nonce: ctx.nonce });
     });
+    const readyLine = '{"version":1,"type":"ready","nonce":"<nonce>"}\n';
+    const totalBytes = noisePrefix.length + readyLine.length;
     const { recorder, counters } = createRecordingDuplexRecorder();
     const target: AdapterSandboxExecutionTarget = {
       kind: "remote",
@@ -4151,17 +4154,227 @@ describe("sandbox adapter execution targets", () => {
       expect(bridge).not.toBeNull();
       expect(control.openCount).toBe(1);
       const scanUnits = __duplexReadinessTesting.readNewlineScanUnits();
-      // Incremental blank-line handling reads each byte one time, so the count
-      // stays near totalBytes. A per-line full rescan is quadratic (about
+      // Incremental skip handling reads each byte one time, so the count stays
+      // near totalBytes. A per-line full rescan is quadratic (about
       // blankLineCount^2 / 2), far above this bound.
       expect(scanUnits).toBeLessThanOrEqual(4 * totalBytes);
-      // The invalid line drove protocol contamination, so the file bridge serves
-      // after the bounded cleanup.
+      // The gate skipped the noise and accepted the READY frame, so the duplex
+      // transport serves and no fallback fired.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback).toBeUndefined();
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("skips pre-READY noise lines, then accepts a valid READY frame and serves the duplex transport", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-noise-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // A PTY channel echoes the launch wrapper line before it sets raw mode, so the
+    // first line the host reads is a non-frame echo, not the READY frame. The gate
+    // must skip the echo line and a partial-JSON line, then accept the READY frame.
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw("sh -c exec env PAPERCLIP_BRIDGE_NONCE=... node gateway.mjs\n");
+      ctx.emitRaw('{"version":1,"type":"ready"}\n');
+      ctx.emitFrame({ version: 1, type: "ready", nonce: ctx.nonce });
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-noise-ready",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The gate skipped the echo and the partial frame, then accepted the READY
+      // frame, so the duplex transport serves and no fallback fired.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback).toBeUndefined();
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("settles a wrong-nonce READY frame as a nonce mismatch, even after a noise line", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-noise-nonce-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // The gate skips the echo line, then reads a READY frame that decodes cleanly
+    // but carries a wrong nonce. A wrong-nonce READY authenticates as a failure,
+    // not as noise, so the gate settles the handshake failed and falls back with
+    // the `ready_nonce_mismatch` reason.
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw("a non-frame echo line\n");
+      ctx.emitFrame({ version: 1, type: "ready", nonce: "00000000000000000000000000000000" });
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-noise-nonce",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The wrong nonce failed the handshake, so the file bridge serves.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("ready_nonce_mismatch");
+      // The bounded cleanup left no live provider session.
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("enforces the buffer cap on an over-cap blank prefix before it accepts a valid READY frame", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-capbypass-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // The cap must bound every pre-READY path, including a skipped blank line. An
+    // adversarial provider sends one chunk: an over-cap blank prefix followed by a
+    // valid nonce-bound READY frame. The gate must reject on the cap before READY
+    // acceptance, so it falls back to the file bridge with the contaminated reason
+    // and the bounded cleanup. Without the per-skip cap check the blank prefix
+    // reaches the valid READY line in the same chunk, and the duplex transport
+    // opens, which is the cap bypass. A single chunk keeps the trailing READY
+    // newline in the buffer, so the no-newline cap check never fires here; only the
+    // per-skip cap check stops the bypass.
+    const readinessBufferCapBytes = DEFAULT_MAX_DUPLEX_FRAME_BYTES + 4_096;
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      const readyLine = `${JSON.stringify({ version: 1, type: "ready", nonce: ctx.nonce })}\n`;
+      ctx.emitRaw("\n".repeat(readinessBufferCapBytes + 1) + readyLine);
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-cap-bypass",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      // A long readiness timeout, so the cap, not the timeout, drives the failure.
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The cap drove the failure before READY acceptance, so the file bridge serves.
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
       const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
       expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
       // The bounded cleanup left no live provider session.
       expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("records the channel-open span with the fallback_reason dimension on the fallback path", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-openspan-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // A wrong-nonce READY frame fails the handshake, so the gate falls back. The
+    // channel-open span records the failed attempt on the duplex transport and now
+    // carries the closed `fallback_reason` dimension, so a reader can group the
+    // failed opens by reason.
+    const { runner } = makeDuplexSelectionRunner((ctx) =>
+      ctx.emitFrame({ version: 1, type: "ready", nonce: "00000000000000000000000000000000" }),
+    );
+    const { recorder, spans } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-open-span",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const openSpan = spans.find((span) => span.name === DUPLEX_SPAN_CHANNEL_OPEN);
+      expect(openSpan).toBeDefined();
+      expect(openSpan?.dimensions).toMatchObject({
+        provider: "daytona",
+        transport: "duplex",
+        outcome: "error",
+        fallback_reason: "ready_nonce_mismatch",
+      });
+      // The span carries only closed dimension keys.
+      assertOnlyFixedDimensionKeys(openSpan?.dimensions);
     } finally {
       await bridge?.stop();
       await api.close();
@@ -4401,6 +4614,44 @@ describe("sandbox duplex gateway", () => {
       const dir = duplexCleanupDirs.pop();
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  it("launches the gateway with `exec env`, so a POSIX shell runs the environment-assignment prefix", async () => {
+    // A POSIX shell accepts an environment-assignment prefix only on a plain
+    // command, never on `exec`. The form `exec NAME=value command` exits with
+    // status 127, so the gateway never starts. The launch argv must use
+    // `exec env NAME=value command`. This test runs the generated script in a real
+    // `sh` against a stub entrypoint that echoes one launch env var, so it fails on
+    // the old `exec NAME=value` form and passes on the `exec env` form.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-launch-"));
+    duplexCleanupDirs.push(rootDir);
+    const stub = path.join(rootDir, "stub-entrypoint.sh");
+    // The stub stands in for the node gateway. It prints a READY frame that echoes
+    // the launch nonce, so the test proves the environment assignment reached the
+    // process the launch replaced the shell with.
+    await writeFile(
+      stub,
+      '#!/bin/sh\nprintf \'{"version":1,"type":"ready","nonce":"%s"}\\n\' "$PAPERCLIP_BRIDGE_NONCE"\n',
+      "utf8",
+    );
+    const argv = buildDuplexGatewayLaunchArgv({
+      shellCommand: "sh",
+      remoteEntrypoint: stub,
+      // Run the stub with `sh`, so the test needs no node runtime. The launch form
+      // is `exec env NAME=value 'sh' '<stub>'`, which exercises the exec-env fix.
+      nodeCommand: "sh",
+      env: { PAPERCLIP_BRIDGE_NONCE: "abc123def456", PAPERCLIP_BRIDGE_PORT: "40404" },
+    });
+    const [shell, ...shellArgs] = argv;
+    const { stdout } = await execFileAsync(shell, shellArgs, { encoding: "utf8" });
+    const decoded = decodeDuplexLine(stdout.trim());
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) {
+      expect(decoded.frame.type).toBe("ready");
+      if (decoded.frame.type === "ready") {
+        expect(decoded.frame.nonce).toBe("abc123def456");
+      }
     }
   });
 
