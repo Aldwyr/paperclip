@@ -1824,8 +1824,13 @@ textarea {
 }
 
 .pit-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
   min-height: var(--pit-touch-target);
-  gap: var(--pit-space-1);
+  line-height: 1;
+  gap: var(--pit-space-2);
   border: 0;
   border-bottom: var(--pit-space-1) solid transparent;
   border-radius: 0;
@@ -1840,10 +1845,15 @@ textarea {
   border-bottom-color: var(--pit-accent);
   background: var(--pit-accent-surface);
   color: var(--pit-foreground);
+  font-weight: 600;
 }
 
 .pit-tab-glyph {
-  font-family: var(--pit-font-mono);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--pit-space-4);
+  height: var(--pit-space-4);
   color: var(--pit-live);
 }
 

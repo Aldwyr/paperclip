@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
-import { Icon } from "./Icons";
+import { Icon, type IconName } from "./Icons";
 
 export type CapabilityDevtoolsTab = "evidence" | "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -55,15 +55,15 @@ function download(snapshot: CapabilityDevtoolsSnapshot) {
   URL.revokeObjectURL(url);
 }
 
-const TABS: ReadonlyArray<{ id: CapabilityDevtoolsTab; glyph: string; label: string }> = [
-  { id: "evidence", glyph: "◎", label: "Evidence" },
-  { id: "timeline", glyph: "◫", label: "Timeline" },
-  { id: "state", glyph: "{}", label: "State" },
-  { id: "diff", glyph: "±", label: "Diff" },
-  { id: "documents", glyph: "▤", label: "Documents" },
-  { id: "protocol", glyph: "⇄", label: "Protocol" },
-  { id: "runtime", glyph: ">_", label: "Runtime" },
-  { id: "authority", glyph: "◇", label: "Authority" },
+const TABS: ReadonlyArray<{ id: CapabilityDevtoolsTab; icon: IconName; label: string }> = [
+  { id: "evidence", icon: "evidence", label: "Evidence" },
+  { id: "timeline", icon: "timeline", label: "Timeline" },
+  { id: "state", icon: "state", label: "State" },
+  { id: "diff", icon: "diff", label: "Diff" },
+  { id: "documents", icon: "documents", label: "Documents" },
+  { id: "protocol", icon: "protocol", label: "Protocol" },
+  { id: "runtime", icon: "terminal", label: "Runtime" },
+  { id: "authority", icon: "authority", label: "Authority" },
 ];
 
 function documentsOf(state: Json): Array<{ id: string; key: string; title: string; revisions: Array<{ id: string; revision: number; body: string; changeSummary: string | null; createdAt: string }> }> {
@@ -124,8 +124,8 @@ export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange }: { snap
         <button className="pit-button" type="button" onClick={() => onFork(revision)}><Icon name="branch" /> Fork r{revision}</button>
       </div>
       <div className="pit-devtools-tabs" role="tablist" aria-label="Developer tools">
-        {TABS.map(({ id, glyph, label }) => (
-          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => onTabChange(id)}><span className="pit-tab-glyph" aria-hidden="true">{glyph}</span>{label}</button>
+        {TABS.map(({ id, icon, label }) => (
+          <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => onTabChange(id)}><span className="pit-tab-glyph"><Icon name={icon} /></span><span>{label}</span></button>
         ))}
       </div>
       {tab === "timeline" ? (

@@ -722,6 +722,15 @@ test.describe("Capability clean-room chat", () => {
     const tabs = panel.getByRole("tab");
     await expect(tabs.first()).toHaveText(/Evidence/);
     await expect(tabs.nth(1)).toHaveText(/Timeline/);
+    await expect(panel.locator(".pit-devtools-tabs .pit-icon")).toHaveCount(8);
+    const centerOffsets = await tabs.evaluateAll((elements) => elements.map((element) => {
+      const icon = element.querySelector(".pit-tab-glyph")?.getBoundingClientRect();
+      const label = element.querySelector(".pit-tab-glyph + span")?.getBoundingClientRect();
+      return icon === undefined || label === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.abs((icon.top + icon.height / 2) - (label.top + label.height / 2));
+    }));
+    expect(Math.max(...centerOffsets)).toBeLessThanOrEqual(1);
     await expect(tabs.first()).toHaveAttribute("aria-selected", "true");
     await expect(panel.locator("#evidence-turn-selector")).toBeVisible();
     await panel.getByRole("tab", { name: /Timeline/ }).click();
