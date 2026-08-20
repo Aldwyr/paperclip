@@ -497,7 +497,10 @@ function derivedRecordItems(
     items.push({
       kind: "interaction",
       id: `item-interaction-${interaction.id}`,
-      at: interaction.createdAt,
+      // Anchor the prompt to the tool call that created it. Mock timestamps can
+      // precede streamed provider activity, which used to hoist the card above
+      // the exchange instead of showing it inline where Codex asked.
+      at: pair.at,
       ...interactionCard(interaction, state),
     });
   }
@@ -772,7 +775,7 @@ export function projectCapabilityIssueThread(
       event: keyof typeof PROGRESS_EVENTS;
       at: string;
       count: number;
-      command: string;
+      details: Record<string, CapabilityJsonValue>;
     }
   >();
   for (const entry of snapshot.evidence) {
@@ -785,7 +788,7 @@ export function projectCapabilityIssueThread(
     const key = event.endsWith("_delta") ? `${entry.turnId}:${event}` : entry.id;
     const group = progressGroups.get(key);
     if (group === undefined) {
-      progressGroups.set(key, { id: entry.id, turnId: entry.turnId, event, at: entry.at, count: 1, command: readString(entry.data.command) });
+      progressGroups.set(key, { id: entry.id, turnId: entry.turnId, event, at: entry.at, count: 1, details: entry.data });
     } else {
       group.count += 1;
     }
@@ -800,8 +803,9 @@ export function projectCapabilityIssueThread(
       activity: copy.activity,
       status: running ? "running" : "complete",
       label: copy.label,
-      summary: group.command || (running ? copy.running : copy.complete),
+      summary: running ? copy.running : copy.complete,
       eventCount: group.count,
+      details: group.details,
     });
   }
 

@@ -296,6 +296,7 @@ function publicItem(item: CapabilityThreadItem, aliases: Aliases): CapabilityThr
         label: clamp(item.label),
         summary: clamp(item.summary),
         eventCount: item.eventCount,
+        details: item.details,
       };
     case "interaction":
       return {

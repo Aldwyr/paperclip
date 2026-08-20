@@ -1,4 +1,6 @@
 import { useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import type {
   CapabilityEvidenceSectionId,
@@ -12,6 +14,14 @@ import { Chip, StatusBadge, Timestamp, formatBytes } from "./primitives";
 const VISIBLE_STRIPS = 3;
 
 const STATUS_GLYPH = { ok: "✓", denied: "✕", running: "⏳" } as const;
+
+function MarkdownBody({ children }: { children: string }) {
+  return (
+    <div className="pit-card-body pit-markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+    </div>
+  );
+}
 
 export interface ThreadCallbacks {
   onOpenEvidence: (section: CapabilityEvidenceSectionId, recordId: string) => void;
@@ -86,10 +96,19 @@ function ProgressItem({
         <span className="pit-activity-caret" aria-hidden="true">›</span>
       </summary>
       <div className="pit-activity-detail">
-        <p>
-          {item.eventCount} sanitized progress update{item.eventCount === 1 ? "" : "s"} observed.
-          Raw output, chain-of-thought, and credential values are not exposed.
-        </p>
+        {Object.entries(item.details).map(([name, value]) =>
+          name === "withheld" ? null : (
+            <div className="pit-activity-field" key={name}>
+              <span>{name}</span>
+              <pre className="pit-code">{typeof value === "string" ? value : JSON.stringify(value, null, 2)}</pre>
+            </div>
+          ),
+        )}
+        {Array.isArray(item.details.withheld) ? (
+          <p className="pit-withheld-note">
+            Not available here: {item.details.withheld.join(", ")}.
+          </p>
+        ) : null}
       </div>
     </details>
   );
@@ -115,7 +134,7 @@ function ThreadItemView({
             <span className="pit-card-author">{item.author}</span>
             <Timestamp value={item.at} />
           </div>
-          <div className="pit-card-body">{item.body}</div>
+          <MarkdownBody>{item.body}</MarkdownBody>
         </article>
       );
 
@@ -138,7 +157,7 @@ function ThreadItemView({
               </Chip>
             ) : null}
           </div>
-          <div className="pit-card-body">{item.body}</div>
+          <MarkdownBody>{item.body}</MarkdownBody>
         </article>
       );
 

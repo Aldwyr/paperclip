@@ -237,6 +237,35 @@ describe("Capability evidence redaction", () => {
     expect(redacted.command).toContain("printf ok");
     expect(redacted.command).not.toContain("hidden-token");
     expect(redacted.command).not.toContain("pcp_1234567890");
+    expect(redacted.withheld).toEqual([
+      "command output (not retained by the browser evidence boundary)",
+    ]);
+    expect(JSON.stringify(redacted)).not.toContain(CANARY);
+  });
+
+  it("retains safe Codex tool details and identifies redacted credentials", () => {
+    const redacted = redactCapabilityEvidenceData("provider_event", {
+      method: "item/completed",
+      params: {
+        item: {
+          type: "dynamicToolCall",
+          tool: "paperclip_finish",
+          namespace: "paperclip",
+          status: "completed",
+          arguments: { summary: "Done", apiKey: CANARY },
+          result: { ok: true, note: "Recorded" },
+        },
+      },
+    });
+
+    expect(redacted).toMatchObject({
+      event: "tool_completed",
+      tool: "paperclip_finish",
+      namespace: "paperclip",
+      status: "completed",
+      arguments: { summary: "Done", apiKey: "[redacted]" },
+      result: { ok: true, note: "Recorded" },
+    });
     expect(JSON.stringify(redacted)).not.toContain(CANARY);
   });
 

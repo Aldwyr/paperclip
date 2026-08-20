@@ -41,7 +41,8 @@ export type CapabilityEvidenceKind =
 
 /** Disposition copy is rendered, so it is bounded rather than unbounded. */
 const MAX_DISPOSITION_CHARS = 500;
-const MAX_COMMAND_CHARS = 2_000;
+const MAX_COMMAND_CHARS = 64_000;
+const MAX_PROVIDER_VALUE_CHARS = 16_000;
 const MAX_FIELD_NAMES = 32;
 const MAX_ENTITY_REFS = 64;
 
@@ -146,6 +147,64 @@ function commandPreview(item: Record<string, unknown>): string | null {
   return command;
 }
 
+const SECRET_FIELD = /(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|credential)/i;
+
+function safeProviderValue(value: unknown, key = "", depth = 0): CapabilityJsonValue {
+  if (SECRET_FIELD.test(key)) return "[redacted]";
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") {
+    return clamp(
+      value
+        .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
+        .replace(/\b(?:sk|pcp)_[a-z0-9._-]{8,}\b/gi, "[redacted]"),
+      MAX_PROVIDER_VALUE_CHARS,
+    );
+  }
+  if (depth >= 5) return "[nested value omitted]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 64).map((entry) => safeProviderValue(entry, key, depth + 1));
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .slice(0, 64)
+        .map(([childKey, childValue]) => [childKey, safeProviderValue(childValue, childKey, depth + 1)]),
+    );
+  }
+  return String(value);
+}
+
+function providerActivityDetails(
+  event: string,
+  item: Record<string, unknown>,
+): Record<string, CapabilityJsonValue> {
+  const details: Record<string, CapabilityJsonValue> = {};
+  const command = event.startsWith("command_") ? commandPreview(item) : null;
+  if (command !== null) details.command = command;
+  for (const name of ["status", "exitCode", "durationMs"] as const) {
+    const value = item[name];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      details[name] = value;
+    }
+  }
+  if (event.startsWith("tool_")) {
+    const tool = asString(item.tool) || asString(item.name);
+    const namespace = asString(item.namespace);
+    if (tool) details.tool = clamp(tool, 240);
+    if (namespace) details.namespace = clamp(namespace, 240);
+    if ("arguments" in item) details.arguments = safeProviderValue(item.arguments, "arguments");
+    if (event === "tool_completed" && "result" in item) {
+      details.result = safeProviderValue(item.result, "result");
+    }
+  }
+  if (Object.keys(details).length > 0) {
+    details.withheld = event.startsWith("command_")
+      ? ["command output (not retained by the browser evidence boundary)"]
+      : ["provider-only reasoning and hidden chain-of-thought"];
+  }
+  return details;
+}
+
 function copyFields(
   data: Record<string, unknown>,
   names: readonly string[],
@@ -229,12 +288,9 @@ export function redactCapabilityEvidenceData(
     case "provider_event": {
       const event = capabilityProviderEventCategory(asString(data.method), asRecord(data.params));
       const item = asRecord(asRecord(data.params).item);
-      const command = event === "command_started" || event === "command_completed"
-        ? commandPreview(item)
-        : null;
       return {
         event,
-        ...(command === null ? {} : { command }),
+        ...providerActivityDetails(event, item),
       };
     }
     case "diagnostic":

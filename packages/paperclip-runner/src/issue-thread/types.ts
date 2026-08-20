@@ -206,6 +206,7 @@ export type CapabilityThreadItem =
       label: string;
       summary: string;
       eventCount: number;
+      details: Record<string, CapabilityJsonValue>;
     }
   | ({ kind: "interaction"; id: string; at: string } & CapabilityThreadInteractionCard)
   | {
