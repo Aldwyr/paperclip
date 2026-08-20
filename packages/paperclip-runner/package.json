@@ -4,6 +4,9 @@
   "private": true,
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "paperclip-runner-eval-session": "./dist/cli/eval-session.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -20,6 +23,10 @@
     "./live": {
       "types": "./dist/live/index.d.ts",
       "import": "./dist/live/index.js"
+    },
+    "./devtools": {
+      "types": "./dist/devtools/index.d.ts",
+      "import": "./dist/devtools/index.js"
     },
     "./browser": {
       "types": "./dist/browser/index.d.ts",

@@ -88,6 +88,8 @@ export interface CapabilityLiveAuthoritySnapshot {
 
 export interface CapabilityLiveSessionConfigSnapshot {
   workingDirectory: string;
+  /** Exact model requested by the caller; omitted only for legacy interactive sessions. */
+  requestedModel?: string;
   scenario: CapabilitySemanticScenarioPolicy;
   capabilities: string[];
   explicitClaims: string[];
@@ -184,6 +186,7 @@ export interface CapabilityLiveSessionSnapshot {
 export interface CreateCapabilityLiveSessionInput {
   seed?: CapabilityFixtureSeed | CapabilityFixtureState;
   workingDirectory?: string;
+  requestedModel?: string;
   scenario?: CapabilitySemanticScenarioPolicy;
   capabilities?: string[];
   explicitClaims?: string[];
@@ -592,6 +595,9 @@ export class CapabilityLiveSessionService {
       authority,
       config: {
         workingDirectory: input.workingDirectory ?? process.cwd(),
+        ...(input.requestedModel === undefined
+          ? {}
+          : { requestedModel: requireNonEmpty(input.requestedModel, "requested_model") }),
         scenario,
         capabilities,
         explicitClaims: authority.explicitClaims,
@@ -1342,6 +1348,7 @@ export class CapabilityLiveSession {
       }
       const resumed = await this.#transport.request("thread/resume", {
         threadId: this.#providerThreadId,
+        ...(this.#config.requestedModel === undefined ? {} : { model: this.#config.requestedModel }),
         cwd: this.#config.workingDirectory,
         config: createSkilllessCodexThreadConfig(this.#config.workingDirectory),
         permissions: CODEX_PERMISSION_PROFILE,
@@ -1366,6 +1373,7 @@ export class CapabilityLiveSession {
     } else {
       const opened = await this.#transport.request("thread/start", {
         cwd: this.#config.workingDirectory,
+        ...(this.#config.requestedModel === undefined ? {} : { model: this.#config.requestedModel }),
         config: createSkilllessCodexThreadConfig(this.#config.workingDirectory),
         permissions: CODEX_PERMISSION_PROFILE,
         runtimeWorkspaceRoots: [this.#config.workingDirectory],
@@ -1389,6 +1397,7 @@ export class CapabilityLiveSession {
       providerSessionId: this.#providerSessionId,
       mode: "live_codex",
       runner: "paperclip-runnerd",
+      requestedModel: this.#config.requestedModel ?? null,
       controlPlane: "mock",
     });
     this.#pump = this.#pumpNotifications();

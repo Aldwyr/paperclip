@@ -272,6 +272,7 @@ describe("Capability live runnerd and Codex session", () => {
     const session = await service.create({
       runId: "run-live-tool-loop",
       sessionId: "session-live-tool-loop",
+      requestedModel: "gpt-5.4-mini-2026-03-17",
     });
 
     const first = await session.sendMessage("Please report progress on this mock issue.");
@@ -281,6 +282,10 @@ describe("Capability live runnerd and Codex session", () => {
     expect(second.assistantText).toContain("stateRevision");
     expect(first.snapshot.providerThreadId).toBe(second.snapshot.providerThreadId);
     expect(first.snapshot.providerModel).toEqual({ id: "gpt-eval-test", provider: "openai" });
+    expect(first.snapshot.config.requestedModel).toBe("gpt-5.4-mini-2026-03-17");
+    expect(
+      state.transports[0]?.requests.find((entry) => entry.method === "thread/start")?.params.model,
+    ).toBe("gpt-5.4-mini-2026-03-17");
     expect(session.mockState().comments.at(-1)?.body).toBe(
       "Progress persisted through the live Codex tool loop.",
     );
