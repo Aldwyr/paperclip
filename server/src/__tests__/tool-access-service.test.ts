@@ -534,10 +534,10 @@ describeEmbeddedPostgres("tool access service", () => {
     ];
     for (const response of gatedResponses) {
       expect(response.status).toBe(404);
-      expect(response.body).toMatchObject({
+      expect(response.body).toEqual({
         error: "Feature unavailable",
         code: "feature_unavailable",
-        details: { code: "feature_unavailable", feature: "apps.access_profiles" },
+        feature: "apps.access_profiles",
       });
     }
 

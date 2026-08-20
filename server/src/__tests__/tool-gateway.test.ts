@@ -584,7 +584,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
 
     for (const response of responses) {
       expect(response.status).toBe(404);
-      expect(response.body).toMatchObject({
+      expect(response.body).toEqual({
         error: "Feature unavailable",
         code: "feature_unavailable",
         feature: "apps.named_mcp_gateways",
