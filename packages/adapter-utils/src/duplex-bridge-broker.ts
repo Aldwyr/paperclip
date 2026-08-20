@@ -20,6 +20,19 @@
  * answers before the gateway gives up. The broker asserts this order at
  * construction and fails a configuration that breaks it.
  *
+ * The provider controls the duplex transport directly, so the broker treats each
+ * request frame as untrusted. The broker bounds the work one channel can force:
+ *   - in-flight limit: the maximum number of pending forwards at one time. It
+ *     bounds the controllers, the timers, and the concurrent authenticated
+ *     forwards.
+ *   - lifetime limit: the maximum number of distinct requests over the channel
+ *     lifetime. It bounds the retained request-id memory, because the broker keeps
+ *     one id per distinct dispatched request for the no-replay guarantee.
+ * The broker checks each limit before it adds the id to the seen set, allocates
+ * the pending record, or calls the forward handler. On a limit it answers the
+ * refused request with one bounded terminal response and forwards nothing. The
+ * refusal preserves the no-replay and no-double-dispatch rules.
+ *
  * Loss is terminal. The broker detects loss through channel exit, a stream
  * write failure, a protocol failure, a heartbeat write failure, and a close
  * timeout. On loss the broker stops the heartbeat, aborts every in-flight
@@ -74,6 +87,24 @@ export const DEFAULT_DUPLEX_BROKER_HEARTBEAT_INTERVAL_MS = 5_000;
 /** The default deadline for an orderly channel close, in milliseconds. */
 export const DEFAULT_DUPLEX_BROKER_CLOSE_TIMEOUT_MS = 2_000;
 
+/**
+ * The default maximum number of in-flight requests. The broker holds this many
+ * pending forwards at one time. It refuses a further request until an in-flight
+ * request completes. The provider controls the transport, so this finite limit
+ * bounds the controllers, the timers, and the concurrent authenticated forwards
+ * a provider can force on the host.
+ */
+export const DEFAULT_DUPLEX_BROKER_MAX_IN_FLIGHT_REQUESTS = 64;
+
+/**
+ * The default maximum number of distinct requests over the channel lifetime. The
+ * broker forwards this many distinct request ids, then refuses each new distinct
+ * id and forwards nothing more. This limit bounds the retained request-id memory,
+ * because the broker keeps one id per distinct dispatched request for the no-replay
+ * guarantee.
+ */
+export const DEFAULT_DUPLEX_BROKER_MAX_LIFETIME_REQUESTS = 50_000;
+
 /** The result of one forward call. The broker turns it into one response frame. */
 export interface DuplexBrokerForwardResult {
   status: number;
@@ -123,6 +154,21 @@ export interface DuplexBrokerOptions {
   closeTimeoutMs?: number;
   /** The maximum size of one inbound frame, in bytes. Forwarded to the decoder. */
   maxFrameBytes?: number;
+  /**
+   * The maximum number of in-flight requests the broker holds at one time. The
+   * broker refuses a further request past this limit with a bounded terminal
+   * response and forwards nothing for it. The default is
+   * {@link DEFAULT_DUPLEX_BROKER_MAX_IN_FLIGHT_REQUESTS}.
+   */
+  maxInFlightRequests?: number;
+  /**
+   * The maximum number of distinct requests the broker dispatches over the
+   * channel lifetime. The broker refuses each new distinct request past this
+   * limit with a bounded terminal response and forwards nothing more. This limit
+   * bounds the retained request-id memory. The default is
+   * {@link DEFAULT_DUPLEX_BROKER_MAX_LIFETIME_REQUESTS}.
+   */
+  maxLifetimeRequests?: number;
   /** The clock the broker reads for the metric timestamps. The default is `Date.now`. */
   now?: () => number;
   /** The metrics sink for the per-request dispatch record. */
@@ -174,6 +220,33 @@ export function assertNestedDuplexBrokerBudgets(budgets: DuplexBrokerBudgets): v
   }
 }
 
+/** The resolved request limits the broker enforces. */
+export interface DuplexBrokerLimits {
+  /** The maximum number of in-flight requests the broker holds at one time. */
+  maxInFlightRequests: number;
+  /** The maximum number of distinct requests the broker dispatches over the channel lifetime. */
+  maxLifetimeRequests: number;
+}
+
+/**
+ * Assert the request limits. Each limit must be a finite positive integer, so the
+ * broker fails closed on a broken configuration instead of running with an
+ * unbounded or a zero limit. The function throws when a limit breaks the rule.
+ */
+export function assertDuplexBrokerLimits(limits: DuplexBrokerLimits): void {
+  const entries: ReadonlyArray<readonly [string, number]> = [
+    ["maxInFlightRequests", limits.maxInFlightRequests],
+    ["maxLifetimeRequests", limits.maxLifetimeRequests],
+  ];
+  for (const [name, value] of entries) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(
+        `Duplex broker ${name} must be a finite positive integer; got ${String(value)}.`,
+      );
+    }
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -198,6 +271,12 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     ...options.budgets,
   };
   assertNestedDuplexBrokerBudgets(budgets);
+
+  const limits: DuplexBrokerLimits = {
+    maxInFlightRequests: options.maxInFlightRequests ?? DEFAULT_DUPLEX_BROKER_MAX_IN_FLIGHT_REQUESTS,
+    maxLifetimeRequests: options.maxLifetimeRequests ?? DEFAULT_DUPLEX_BROKER_MAX_LIFETIME_REQUESTS,
+  };
+  assertDuplexBrokerLimits(limits);
 
   const channel = options.channel;
   const forwardRequest = options.forwardRequest;
@@ -302,11 +381,57 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     writeFrame(frame);
   };
 
+  const respondSaturated = (id: string, retryable: boolean): void => {
+    // Answer a refused request with a bounded terminal response. The broker made
+    // no controller, no timer, and no forward for this id, so the host API stays
+    // untouched. The response carries no route, no query, no body, and no token;
+    // it holds only the fixed error shape. The `unavailable` outcome tells the
+    // gateway this is not a delivered host response, so it never counts as one.
+    if (state !== "open") return;
+    const frame: DuplexResponseFrame = {
+      version: DUPLEX_FRAME_VERSION,
+      type: "response",
+      id,
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "x-paperclip-bridge-outcome": "unavailable",
+      },
+      body: JSON.stringify({
+        error: "Duplex broker capacity limit reached.",
+        outcome: "unavailable",
+        retryable,
+      }),
+      outcome: "unavailable",
+    };
+    writeFrame(frame);
+  };
+
   const dispatch = (frame: DuplexRequestFrame): void => {
     // Dispatch only while open. After loss or close the broker forwards nothing.
     if (state !== "open") return;
     // Forward one id one time. A repeated id never reaches the API twice.
     if (seenRequestIds.has(frame.id)) return;
+    // Bound the retained request-id memory. The broker keeps one id per distinct
+    // dispatched request for the no-replay guarantee, so the set can only grow.
+    // Once the broker reaches the lifetime limit, it refuses each new distinct id
+    // and forwards nothing more. The refusal is not retryable, because a resend
+    // never gets past the limit. This check runs before the id joins the set, so
+    // the set never grows past the limit.
+    if (seenRequestIds.size >= limits.maxLifetimeRequests) {
+      respondSaturated(frame.id, false);
+      return;
+    }
+    // Bound the in-flight request count. Once the broker holds the maximum number
+    // of pending forwards, it refuses a further request and forwards nothing for
+    // it. The broker does not add the id to the seen set, so the gateway can
+    // resend the request after an in-flight request completes. The refusal is
+    // retryable for that reason. This check bounds the controllers, the timers,
+    // and the concurrent forwards a provider can force.
+    if (pending.size >= limits.maxInFlightRequests) {
+      respondSaturated(frame.id, true);
+      return;
+    }
     seenRequestIds.add(frame.id);
 
     const record: DuplexBrokerRequestRecord = {
