@@ -585,7 +585,7 @@ async function migrationStatementAlreadyApplied(
     return triggerExists(sql, createTriggerMatch[1]);
   }
 
-  // These audited Runner D data repairs are followed by persistent database
+  // These audited paperclip-runner data repairs are followed by persistent database
   // invariants. Verify their postconditions instead of replaying them when a
   // restored database is missing only the migration-history row.
   if (

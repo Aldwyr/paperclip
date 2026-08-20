@@ -8,7 +8,7 @@ const vendorDist = resolve(vendorRoot, "paperclip-runner");
 
 await access(resolve(runnerDist, "index.js")).catch(() => {
   throw new Error(
-    "Runner D build output is missing. Run pnpm --filter @paperclipai/paperclip-runner build:typescript first.",
+    "paperclip-runner build output is missing. Run pnpm --filter @paperclipai/paperclip-runner build:typescript first.",
   );
 });
 
@@ -16,4 +16,4 @@ await rm(vendorDist, { recursive: true, force: true });
 await mkdir(vendorRoot, { recursive: true });
 await cp(runnerDist, vendorDist, { recursive: true });
 
-process.stdout.write("Vendored Runner D JavaScript into the server distribution.\n");
+process.stdout.write("Vendored paperclip-runner JavaScript into the server distribution.\n");
