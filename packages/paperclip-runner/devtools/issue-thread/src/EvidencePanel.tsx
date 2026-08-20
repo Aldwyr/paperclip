@@ -231,23 +231,26 @@ function ToolsBrowser({ records, onInvoke }: { records: CapabilityEvidenceModel[
 
       {selected !== null ? (
         <div className="pit-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
-          <div className="pit-dialog pit-tool-dialog" role="dialog" aria-modal="true" aria-labelledby="tool-dialog-title">
+          <div className="pit-dialog pit-tool-dialog" data-invokable={onInvoke !== undefined} role="dialog" aria-modal="true" aria-labelledby="tool-dialog-title">
             <header className="pit-tool-dialog-head">
               <div><span className="pit-card-meta">Semantic tool · v{descriptor?.version ?? 1}</span><h2 id="tool-dialog-title">{descriptor?.title ?? selected.operationId}</h2></div>
               <button type="button" className="pit-icon-button" aria-label="Close tool details" title="Close tool details" onClick={() => setSelected(null)}><Icon name="close" /></button>
             </header>
-            <code className="pit-tool-operation">{selected.operationId}</code>
-            <p>{descriptor?.description ?? selected.description}</p>
-            <dl className="pit-tool-facts">
-              <div><dt>Placement</dt><dd>{capabilityDispositionLabel(selected.disposition)}</dd></div>
-              <div><dt>Required claims</dt><dd>{descriptor?.requiredClaims.join(", ") || selected.grant || "None"}</dd></div>
-              <div><dt>Task modes</dt><dd>{descriptor?.allowedModes.join(", ") || "—"}</dd></div>
-              <div><dt>Actor roles</dt><dd>{descriptor?.allowedRoles?.join(", ") || "Any allowed role"}</dd></div>
-            </dl>
-            <div>
-              <h3 className="pit-tool-schema-title">Input schema</h3>
-              <pre className="pit-code">{JSON.stringify(descriptor?.inputSchema ?? {}, null, 2)}</pre>
-            </div>
+            <div className="pit-tool-dialog-grid" data-invokable={onInvoke !== undefined}>
+              <div className="pit-tool-reference">
+                <code className="pit-tool-operation">{selected.operationId}</code>
+                <p>{descriptor?.description ?? selected.description}</p>
+                <dl className="pit-tool-facts">
+                  <div><dt>Placement</dt><dd>{capabilityDispositionLabel(selected.disposition)}</dd></div>
+                  <div><dt>Required claims</dt><dd>{descriptor?.requiredClaims.join(", ") || selected.grant || "None"}</dd></div>
+                  <div><dt>Task modes</dt><dd>{descriptor?.allowedModes.join(", ") || "—"}</dd></div>
+                  <div><dt>Actor roles</dt><dd>{descriptor?.allowedRoles?.join(", ") || "Any allowed role"}</dd></div>
+                </dl>
+                <div>
+                  <h3 className="pit-tool-schema-title">Input schema</h3>
+                  <pre className="pit-code">{JSON.stringify(descriptor?.inputSchema ?? {}, null, 2)}</pre>
+                </div>
+              </div>
             {onInvoke !== undefined ? (
               <div className="pit-tool-tester">
                 <h3 className="pit-tool-schema-title">Invoke in conversation</h3>
@@ -274,6 +277,7 @@ function ToolsBrowser({ records, onInvoke }: { records: CapabilityEvidenceModel[
                 {invocationResult !== null ? <pre className="pit-code" data-testid="tool-test-result">{JSON.stringify(invocationResult, null, 2)}</pre> : null}
               </div>
             ) : null}
+            </div>
           </div>
         </div>
       ) : null}
