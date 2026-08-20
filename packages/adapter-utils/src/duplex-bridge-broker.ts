@@ -43,6 +43,7 @@
 
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
+  DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES,
   DUPLEX_FRAME_VERSION,
   DuplexFrameDecoder,
   encodeDuplexFrame,
@@ -102,6 +103,12 @@ export const DEFAULT_DUPLEX_BROKER_MAX_IN_FLIGHT_REQUESTS = 64;
  * id and forwards nothing more. This limit bounds the retained request-id memory,
  * because the broker keeps one id per distinct dispatched request for the no-replay
  * guarantee.
+ *
+ * The retained id memory has a hard ceiling. The codec bounds each id at
+ * `DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES` (256 bytes), so the worst-case retained id
+ * bytes are this count multiplied by that bound: 50,000 * 256 = 12,800,000 bytes
+ * (about 12.8 MB), plus the fixed per-entry overhead of the Set. This count is
+ * sized against that id bound to keep the ceiling small.
  */
 export const DEFAULT_DUPLEX_BROKER_MAX_LIFETIME_REQUESTS = 50_000;
 
@@ -410,6 +417,18 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
   const dispatch = (frame: DuplexRequestFrame): void => {
     // Dispatch only while open. After loss or close the broker forwards nothing.
     if (state !== "open") return;
+    // Bound the id byte size before any retention or work. The codec already
+    // rejects an over-limit id on the read path, so this guard is defense in depth
+    // for a frame that reaches dispatch by another path. The broker never adds the
+    // id to the seen set, never allocates a controller or a timer, and never
+    // forwards. It answers with the bounded terminal refusal, which carries no
+    // route, query, body, or token, and records no telemetry. The refusal is not
+    // retryable, because a resend of the same over-limit id never gets past this
+    // bound.
+    if (Buffer.byteLength(frame.id, "utf8") > DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES) {
+      respondSaturated(frame.id, false);
+      return;
+    }
     // Forward one id one time. A repeated id never reaches the API twice.
     if (seenRequestIds.has(frame.id)) return;
     // Bound the retained request-id memory. The broker keeps one id per distinct

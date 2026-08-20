@@ -7,6 +7,7 @@ import {
   type DuplexBrokerForwardResult,
 } from "./duplex-bridge-broker.js";
 import {
+  DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES,
   DUPLEX_FRAME_VERSION,
   DuplexFrameDecoder,
   encodeDuplexFrame,
@@ -315,6 +316,55 @@ describe("duplex bridge broker request limits", () => {
     }
     expect(capture.counters).toHaveLength(0);
     expect(broker.lossRecord).toBeNull();
+    expect(broker.state).toBe("open");
+  });
+
+  it("forwards nothing and fails the channel closed under a flood of over-limit ids", () => {
+    const harness = createFakeChannelHarness();
+    const broker = createDuplexBridgeBroker({
+      channel: harness.channel,
+      forwardRequest: controllableForward(harness),
+    });
+    brokers.push(broker);
+    broker.start();
+
+    // Send a sustained flood of distinct ids, each one byte over the id bound. The
+    // codec rejects each frame on the read path, so no over-limit id ever reaches
+    // the retained-id set or a forward.
+    const overLimitId = (index: number): string =>
+      `${"a".repeat(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES)}-${index}`;
+    for (let index = 0; index < 20; index += 1) {
+      harness.feed(requestFrame(overLimitId(index)));
+    }
+
+    // The broker forwarded nothing. The retained-id set never grew, because the
+    // set only grows on a dispatched forward, and the broker dispatched none.
+    expect(harness.forwards).toHaveLength(0);
+    // The first over-limit frame is a protocol failure, so the broker fails the
+    // whole channel closed. It stays lost for the rest of the flood.
+    expect(broker.state).toBe("lost");
+    expect(broker.lossRecord?.reason).toBe("protocol_failure");
+  });
+
+  it("forwards a maximal-size id exactly once and does not forward a resend (no-replay preserved)", () => {
+    const harness = createFakeChannelHarness();
+    const broker = createDuplexBridgeBroker({
+      channel: harness.channel,
+      forwardRequest: controllableForward(harness),
+    });
+    brokers.push(broker);
+    broker.start();
+
+    // An id at the maximum byte size is allowed. The broker forwards it one time.
+    const maxId = "a".repeat(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES);
+    harness.feed(requestFrame(maxId));
+    expect(harness.forwards.filter((forward) => forward.id === maxId)).toHaveLength(1);
+
+    // Deliver the response, then resend the same id. The broker retained the id,
+    // so the resend never reaches the forward a second time.
+    harness.resolveForward(maxId);
+    harness.feed(requestFrame(maxId));
+    expect(harness.forwards.filter((forward) => forward.id === maxId)).toHaveLength(1);
     expect(broker.state).toBe("open");
   });
 });

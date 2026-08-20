@@ -27,6 +27,20 @@ export const DUPLEX_FRAME_VERSION = 1;
  */
 export const DEFAULT_MAX_DUPLEX_FRAME_BYTES = 1_000_000;
 
+/**
+ * The maximum size of the frame `id` field, in bytes. The decoder rejects a
+ * request or a response frame that carries a longer id with an `id_too_large`
+ * protocol error. The read path returns the error; it never throws.
+ *
+ * The generated gateway builds each request id with `randomUUID()`, so a real id
+ * is 36 ASCII bytes. This bound of 256 bytes gives large headroom for that id and
+ * for any short future id scheme. The bound also caps the bytes the host broker
+ * retains per distinct request. The broker keeps one id per distinct dispatched
+ * request for the no-replay guarantee, so the id bound sets the per-id ceiling of
+ * that retained memory.
+ */
+export const DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES = 256;
+
 const NEWLINE_BYTE = 0x0a;
 const EMPTY = Buffer.alloc(0);
 
@@ -119,7 +133,8 @@ export type DuplexProtocolErrorCode =
   | "malformed_frame"
   | "unknown_type"
   | "version_mismatch"
-  | "frame_too_large";
+  | "frame_too_large"
+  | "id_too_large";
 
 /** A decode-time protocol error. The read path returns it; it never throws. */
 export interface DuplexProtocolError {
@@ -156,6 +171,11 @@ function isStringRecord(value: unknown): value is Record<string, string> {
     if (typeof entry !== "string") return false;
   }
   return true;
+}
+
+/** Return true when the id byte size is within {@link DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES}. */
+function idWithinLimit(id: string): boolean {
+  return Buffer.byteLength(id, "utf8") <= DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES;
 }
 
 /**
@@ -225,6 +245,12 @@ function validateRequest(frame: Record<string, unknown>): DuplexDecodeResult {
   ) {
     return fail("malformed_frame", "request frame has a missing or wrong-typed field");
   }
+  // Bound the id byte size at the protocol level. The host broker retains one id
+  // per distinct dispatched request, so an unbounded id is a memory-exhaustion
+  // path. Reject an over-limit id as a protocol error; the read path never throws.
+  if (!idWithinLimit(frame.id)) {
+    return fail("id_too_large", "request frame id exceeds the maximum size");
+  }
   return ok(frame as unknown as DuplexRequestFrame);
 }
 
@@ -238,6 +264,11 @@ function validateResponse(frame: Record<string, unknown>): DuplexDecodeResult {
     !RESPONSE_OUTCOMES.has(frame.outcome)
   ) {
     return fail("malformed_frame", "response frame has a missing or wrong-typed field");
+  }
+  // Apply the same id byte bound to the response id. The host echoes the request
+  // id on the response, so the same rule keeps both frame ids under one ceiling.
+  if (!idWithinLimit(frame.id)) {
+    return fail("id_too_large", "response frame id exceeds the maximum size");
   }
   return ok(frame as unknown as DuplexResponseFrame);
 }

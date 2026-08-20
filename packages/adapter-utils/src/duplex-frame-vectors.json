@@ -383,6 +383,36 @@
           "error": "version_mismatch"
         }
       ]
+    },
+    {
+      "name": "request-id-at-max-bytes",
+      "category": "idBoundValid",
+      "bytes": "{\"version\":1,\"type\":\"request\",\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"method\":\"GET\",\"path\":\"/\",\"query\":\"\",\"headers\":{},\"body\":\"\"}\n",
+      "roundTrip": true,
+      "expected": [
+        {
+          "frame": {
+            "version": 1,
+            "type": "request",
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "method": "GET",
+            "path": "/",
+            "query": "",
+            "headers": {},
+            "body": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "request-id-over-max-bytes",
+      "category": "idBoundInvalid",
+      "bytes": "{\"version\":1,\"type\":\"request\",\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"method\":\"GET\",\"path\":\"/\",\"query\":\"\",\"headers\":{},\"body\":\"\"}\n",
+      "expected": [
+        {
+          "error": "id_too_large"
+        }
+      ]
     }
   ]
 }

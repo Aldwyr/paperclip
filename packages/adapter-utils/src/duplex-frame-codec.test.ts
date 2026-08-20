@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_MAX_DUPLEX_FRAME_BYTES,
+  DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES,
   DUPLEX_FRAME_VERSION,
   DuplexFrameDecoder,
   decodeDuplexLine,
@@ -17,7 +18,14 @@ type ExpectedResult = { frame: DuplexFrame } | { error: string };
 
 interface Vector {
   name: string;
-  category: "valid" | "invalid" | "partial" | "oversized" | "versionMismatch";
+  category:
+    | "valid"
+    | "invalid"
+    | "partial"
+    | "oversized"
+    | "versionMismatch"
+    | "idBoundValid"
+    | "idBoundInvalid";
   bytes: string;
   splitByteOffsets?: number[];
   maxFrameBytes?: number;
@@ -240,5 +248,65 @@ describe("streaming decoder behavior", () => {
     expect(() => decoder.push(Buffer.from("this is not json\n", "utf8"))).not.toThrow();
     const results = decoder.push(Buffer.from("still not json\n", "utf8"));
     expect(results[0].ok).toBe(false);
+  });
+});
+
+describe("request id byte bound", () => {
+  // The id byte bound caps the memory the host broker retains per distinct
+  // request. The bound is 256 bytes; a UTF-8 id byte can differ from a character.
+  function requestWithId(id: string): string {
+    return JSON.stringify({
+      version: DUPLEX_FRAME_VERSION,
+      type: "request",
+      id,
+      method: "GET",
+      path: "/",
+      query: "",
+      headers: {},
+      body: "",
+    });
+  }
+
+  it("accepts an id at the maximum byte size", () => {
+    const id = "a".repeat(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES);
+    const result = decodeDuplexLine(requestWithId(id));
+    expect(result.ok).toBe(true);
+    if (result.ok && result.frame.type === "request") expect(result.frame.id).toBe(id);
+  });
+
+  it("rejects an over-limit id with an id_too_large protocol error and never throws", () => {
+    const id = "a".repeat(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES + 1);
+    expect(() => decodeDuplexLine(requestWithId(id))).not.toThrow();
+    const result = decodeDuplexLine(requestWithId(id));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("id_too_large");
+  });
+
+  it("measures the id in bytes, not characters, so a multi-byte id over the byte bound is rejected", () => {
+    // Each "😀" is four UTF-8 bytes. 65 code points make 260 bytes, one code point
+    // makes 4 bytes, so 65 stays over the 256-byte bound while the character count
+    // stays under it.
+    const id = "😀".repeat(65);
+    expect(id.length).toBeLessThan(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES);
+    const result = decodeDuplexLine(requestWithId(id));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("id_too_large");
+  });
+
+  it("applies the same bound to the response id", () => {
+    const id = "b".repeat(DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES + 1);
+    const result = decodeDuplexLine(
+      JSON.stringify({
+        version: DUPLEX_FRAME_VERSION,
+        type: "response",
+        id,
+        status: 200,
+        headers: {},
+        body: "",
+        outcome: "completed",
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("id_too_large");
   });
 });

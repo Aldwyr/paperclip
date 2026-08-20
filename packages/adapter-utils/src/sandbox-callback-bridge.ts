@@ -1745,6 +1745,7 @@ export async function startSandboxCallbackBridgeServer(input: {
  */
 const DUPLEX_GATEWAY_CODEC_SOURCE = `const DUPLEX_FRAME_VERSION = 1;
 const DEFAULT_MAX_DUPLEX_FRAME_BYTES = 1000000;
+const DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES = 256;
 const DUPLEX_NEWLINE_BYTE = 0x0a;
 const DUPLEX_EMPTY = Buffer.alloc(0);
 const DUPLEX_RESPONSE_OUTCOMES = new Set(["completed", "indeterminate", "unavailable"]);
@@ -1820,6 +1821,9 @@ function duplexValidateRequest(frame) {
   ) {
     return duplexFail("malformed_frame", "request frame has a missing or wrong-typed field");
   }
+  if (Buffer.byteLength(frame.id, "utf8") > DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES) {
+    return duplexFail("id_too_large", "request frame id exceeds the maximum size");
+  }
   return duplexOk(frame);
 }
 
@@ -1833,6 +1837,9 @@ function duplexValidateResponse(frame) {
     !DUPLEX_RESPONSE_OUTCOMES.has(frame.outcome)
   ) {
     return duplexFail("malformed_frame", "response frame has a missing or wrong-typed field");
+  }
+  if (Buffer.byteLength(frame.id, "utf8") > DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES) {
+    return duplexFail("id_too_large", "response frame id exceeds the maximum size");
   }
   return duplexOk(frame);
 }
