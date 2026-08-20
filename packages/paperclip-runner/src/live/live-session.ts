@@ -95,6 +95,50 @@ export interface CapabilityLiveSessionConfigSnapshot {
   turnTimeoutMs: number;
 }
 
+export type CapabilityLiveAttemptStatus = "running" | "succeeded" | "failed" | "terminated";
+
+export interface CapabilityLiveAttemptSnapshot {
+  attemptId: string;
+  resumeOf: string | null;
+  status: CapabilityLiveAttemptStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  failureCode: string | null;
+}
+
+export interface CapabilityLiveTurnTerminalFact {
+  turnId: string;
+  status: CapabilityLiveTurnResult["status"];
+  reconciledByAttemptId: string;
+  observedAt: string;
+}
+
+export interface CapabilityLiveUsageReceipt {
+  receiptId: string;
+  attemptId: string;
+  providerResponseId: string | null;
+  turnId: string | null;
+  providerCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  costNanodollars: number;
+  observedAt: string;
+}
+
+export interface RecordCapabilityLiveUsageInput {
+  receiptId: string;
+  providerResponseId?: string | null;
+  turnId?: string | null;
+  providerCalls?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  reasoningTokens?: number;
+  costNanodollars?: number;
+}
+
 export interface CapabilityLiveSessionSnapshot {
   schema: typeof LIVE_SESSION_SCHEMA;
   revision: number;
@@ -118,6 +162,13 @@ export interface CapabilityLiveSessionSnapshot {
     realPaperclipRequests: 0;
     childPaperclipEnvironmentKeys: string[];
   };
+  /** Governed worker attempts. A resumed worker is a new attempt, never a rewrite. */
+  attempts?: CapabilityLiveAttemptSnapshot[];
+  currentAttemptId?: string;
+  /** Provider terminal facts reconciled by the attempt that observed them. */
+  terminalTurns?: CapabilityLiveTurnTerminalFact[];
+  /** Exact-once provider usage/cost receipts retained across every attempt. */
+  usageLedger?: CapabilityLiveUsageReceipt[];
 }
 
 export interface CreateCapabilityLiveSessionInput {
@@ -131,7 +182,14 @@ export interface CreateCapabilityLiveSessionInput {
   taskId?: string;
   runId?: string;
   sessionId?: string;
+  attemptId?: string;
   turnTimeoutMs?: number;
+}
+
+export interface ResumeCapabilityLiveSessionInput {
+  sessionId: string;
+  attemptId: string;
+  resumeOf: string;
 }
 
 export interface CapabilityLiveTurnResult {
@@ -268,6 +326,158 @@ function jsonValue(value: unknown): CapabilityJsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as CapabilityJsonValue;
 }
 
+function nonNegativeInteger(value: number | undefined, name: string): number {
+  const normalized = value ?? 0;
+  if (!Number.isSafeInteger(normalized) || normalized < 0) {
+    throw new Error(`capability_live_usage_${name}_invalid`);
+  }
+  return normalized;
+}
+
+function requireNonEmpty(value: string, name: string): string {
+  if (value.trim().length === 0) throw new Error(`capability_live_${name}_required`);
+  return value;
+}
+
+function providerTurnStatus(value: unknown): CapabilityLiveTurnResult["status"] | null {
+  const status = text(value).toLowerCase();
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  if (status === "interrupted") return "interrupted";
+  if (status === "cancelled" || status === "canceled") return "cancelled";
+  return null;
+}
+
+/** Reject malformed or partially written checkpoints before any provider process starts. */
+export function assertCapabilityLiveSessionSnapshot(
+  value: unknown,
+): asserts value is CapabilityLiveSessionSnapshot {
+  const snapshot = record(value);
+  if (snapshot.schema !== LIVE_SESSION_SCHEMA) {
+    throw new Error("capability_live_checkpoint_corrupt: unsupported snapshot schema");
+  }
+  for (const name of ["sessionId", "providerThreadId", "mockState", "createdAt", "updatedAt"] as const) {
+    if (text(snapshot[name]).length === 0) {
+      throw new Error(`capability_live_checkpoint_corrupt: missing ${name}`);
+    }
+  }
+  if (!Number.isSafeInteger(snapshot.revision) || Number(snapshot.revision) < 1) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid revision");
+  }
+  const authority = record(snapshot.authority);
+  for (const name of ["runId", "companyId", "actorId", "taskId", "sessionId"] as const) {
+    if (text(authority[name]).length === 0) {
+      throw new Error(`capability_live_checkpoint_corrupt: missing authority.${name}`);
+    }
+  }
+  if (authority.sessionId !== snapshot.sessionId) {
+    throw new Error("capability_live_checkpoint_binding_mismatch");
+  }
+  if (typeof snapshot.mockState !== "string") {
+    throw new Error("capability_live_checkpoint_corrupt: invalid mockState");
+  }
+  try {
+    JSON.parse(snapshot.mockState);
+  } catch {
+    throw new Error("capability_live_checkpoint_corrupt: invalid mockState JSON");
+  }
+  if (snapshot.attempts !== undefined && !Array.isArray(snapshot.attempts)) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid attempts");
+  }
+  const attemptIds = new Set<string>();
+  for (const value of snapshot.attempts ?? []) {
+    const attempt = record(value);
+    const attemptId = text(attempt.attemptId);
+    if (
+      attemptId.length === 0 ||
+      attemptIds.has(attemptId) ||
+      !["running", "succeeded", "failed", "terminated"].includes(text(attempt.status)) ||
+      text(attempt.startedAt).length === 0
+    ) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid attempt");
+    }
+    const resumeOf = attempt.resumeOf === null ? null : text(attempt.resumeOf);
+    if (resumeOf !== null && !attemptIds.has(resumeOf)) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid attempt lineage");
+    }
+    attemptIds.add(attemptId);
+  }
+  if (
+    snapshot.currentAttemptId !== undefined &&
+    !attemptIds.has(text(snapshot.currentAttemptId))
+  ) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid current attempt");
+  }
+  if (snapshot.terminalTurns !== undefined && !Array.isArray(snapshot.terminalTurns)) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid terminalTurns");
+  }
+  const terminalTurnIds = new Set<string>();
+  for (const value of snapshot.terminalTurns ?? []) {
+    const terminal = record(value);
+    const turnId = text(terminal.turnId);
+    if (
+      turnId.length === 0 ||
+      terminalTurnIds.has(turnId) ||
+      !["completed", "failed", "interrupted", "cancelled"].includes(text(terminal.status)) ||
+      text(terminal.reconciledByAttemptId).length === 0 ||
+      text(terminal.observedAt).length === 0
+    ) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid terminal fact");
+    }
+    terminalTurnIds.add(turnId);
+  }
+  if (snapshot.usageLedger !== undefined && !Array.isArray(snapshot.usageLedger)) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid usageLedger");
+  }
+  const usageReceiptIds = new Set<string>();
+  for (const value of snapshot.usageLedger ?? []) {
+    const receipt = record(value);
+    const receiptId = text(receipt.receiptId);
+    if (
+      receiptId.length === 0 ||
+      usageReceiptIds.has(receiptId) ||
+      text(receipt.attemptId).length === 0 ||
+      text(receipt.observedAt).length === 0
+    ) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid usage receipt");
+    }
+    for (const name of [
+      "providerCalls",
+      "inputTokens",
+      "outputTokens",
+      "cachedInputTokens",
+      "reasoningTokens",
+      "costNanodollars",
+    ] as const) {
+      if (!Number.isSafeInteger(receipt[name]) || Number(receipt[name]) < 0) {
+        throw new Error("capability_live_checkpoint_corrupt: invalid usage receipt");
+      }
+    }
+    usageReceiptIds.add(receiptId);
+  }
+}
+
+export function reconcileCapabilityLiveUsage(
+  snapshot: CapabilityLiveSessionSnapshot,
+): Omit<CapabilityLiveUsageReceipt, "receiptId" | "attemptId" | "providerResponseId" | "turnId" | "observedAt"> {
+  const unique = new Map((snapshot.usageLedger ?? []).map((receipt) => [receipt.receiptId, receipt]));
+  return [...unique.values()].reduce((total, receipt) => ({
+    providerCalls: total.providerCalls + receipt.providerCalls,
+    inputTokens: total.inputTokens + receipt.inputTokens,
+    outputTokens: total.outputTokens + receipt.outputTokens,
+    cachedInputTokens: total.cachedInputTokens + receipt.cachedInputTokens,
+    reasoningTokens: total.reasoningTokens + receipt.reasoningTokens,
+    costNanodollars: total.costNanodollars + receipt.costNanodollars,
+  }), {
+    providerCalls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    reasoningTokens: 0,
+    costNanodollars: 0,
+  });
+}
+
 function dynamicToolSpec(definition: CapabilitySemanticToolDefinition): Record<string, unknown> {
   return {
     name: definition.name,
@@ -352,6 +562,7 @@ export class CapabilityLiveSessionService {
       transportFactory: this.#transportFactory,
       transportOptions: this.#transportOptions,
       now: this.#now,
+      attemptId: input.attemptId ?? runId,
     });
     this.#sessions.set(session.id, session);
     return session;
@@ -362,6 +573,7 @@ export class CapabilityLiveSessionService {
     if (live !== undefined) return live;
     const snapshot = await this.#store.load(sessionId);
     if (snapshot === null) throw new Error(`capability live session ${sessionId} was not found`);
+    assertCapabilityLiveSessionSnapshot(snapshot);
     const session = await CapabilityLiveSession.restore({
       snapshot,
       store: this.#store,
@@ -371,6 +583,92 @@ export class CapabilityLiveSessionService {
     });
     this.#sessions.set(session.id, session);
     return session;
+  }
+
+  /**
+   * Production worker-restart entrypoint. It records the killed attempt and its
+   * successor durably before runnerd/Codex is started, then restores only the
+   * provider thread named by that checkpoint.
+   */
+  async resume(input: ResumeCapabilityLiveSessionInput): Promise<CapabilityLiveSession> {
+    requireNonEmpty(input.attemptId, "attempt_id");
+    requireNonEmpty(input.resumeOf, "resume_of");
+    if (input.attemptId === input.resumeOf) throw new Error("capability_live_resume_cycle");
+    if (this.#sessions.has(input.sessionId)) {
+      throw new Error("capability_live_resume_requires_new_worker");
+    }
+    const snapshot = await this.#store.load(input.sessionId);
+    if (snapshot === null) {
+      throw new Error("capability_live_resume_checkpoint_missing: refusing to open a second provider session");
+    }
+    assertCapabilityLiveSessionSnapshot(snapshot);
+    const attempts = structuredClone(snapshot.attempts ?? [{
+      attemptId: snapshot.authority.runId,
+      resumeOf: null,
+      status: "running" as const,
+      startedAt: snapshot.createdAt,
+      finishedAt: null,
+      failureCode: null,
+    }]);
+    const currentAttemptId = snapshot.currentAttemptId ?? attempts.at(-1)?.attemptId;
+    if (currentAttemptId !== input.resumeOf) throw new Error("capability_live_resume_binding_mismatch");
+    if (attempts.some((attempt) => attempt.attemptId === input.attemptId)) {
+      throw new Error("capability_live_resume_attempt_exists");
+    }
+    const previous = attempts.find((attempt) => attempt.attemptId === input.resumeOf);
+    if (previous === undefined || previous.status !== "running") {
+      throw new Error("capability_live_resume_source_not_running");
+    }
+    const resumedAt = this.#now().toISOString();
+    previous.status = "terminated";
+    previous.finishedAt = resumedAt;
+    previous.failureCode = "worker_terminated";
+    attempts.push({
+      attemptId: input.attemptId,
+      resumeOf: input.resumeOf,
+      status: "running",
+      startedAt: resumedAt,
+      finishedAt: null,
+      failureCode: null,
+    });
+    const prepared: CapabilityLiveSessionSnapshot = {
+      ...snapshot,
+      revision: snapshot.revision + 1,
+      updatedAt: resumedAt,
+      status: "starting",
+      attempts,
+      currentAttemptId: input.attemptId,
+    };
+    await this.#store.save(prepared);
+    try {
+      const session = await CapabilityLiveSession.restore({
+        snapshot: prepared,
+        store: this.#store,
+        transportFactory: this.#transportFactory,
+        transportOptions: this.#transportOptions,
+        now: this.#now,
+      });
+      this.#sessions.set(session.id, session);
+      return session;
+    } catch (error) {
+      const failedAt = this.#now().toISOString();
+      const latest = await this.#store.load(input.sessionId) ?? prepared;
+      const failedAttempts = structuredClone(latest.attempts ?? []);
+      const failed = failedAttempts.find((attempt) => attempt.attemptId === input.attemptId);
+      if (failed !== undefined) {
+        failed.status = "failed";
+        failed.finishedAt = failedAt;
+        failed.failureCode = "provider_recovery_failed";
+      }
+      await this.#store.save({
+        ...latest,
+        revision: latest.revision + 1,
+        updatedAt: failedAt,
+        status: "failed",
+        attempts: failedAttempts,
+      });
+      throw error;
+    }
   }
 
   async reconnect(sessionId: string): Promise<CapabilityLiveSessionSnapshot> {
@@ -419,9 +717,10 @@ interface OpenSessionOptions {
   transportFactory: CapabilityLiveTransportFactory;
   transportOptions: CapabilityRunnerdCodexTransportOptions;
   now: () => Date;
+  attemptId: string;
 }
 
-interface RestoreSessionOptions extends Omit<OpenSessionOptions, "port" | "authority" | "config"> {
+interface RestoreSessionOptions extends Omit<OpenSessionOptions, "port" | "authority" | "config" | "attemptId"> {
   snapshot: CapabilityLiveSessionSnapshot;
 }
 
@@ -438,6 +737,10 @@ export class CapabilityLiveSession {
   readonly #transcript: CapabilityLiveTranscriptEntry[];
   readonly #evidence: CapabilityLiveEvidenceEntry[];
   readonly #priorAuthorizationRecords: CapabilitySemanticAuthorizationRecord[];
+  readonly #attempts: CapabilityLiveAttemptSnapshot[];
+  readonly #terminalTurns: CapabilityLiveTurnTerminalFact[];
+  readonly #usageLedger: CapabilityLiveUsageReceipt[];
+  #currentAttemptId: string;
   #transport: CodexAppServerTransport | null = null;
   #processEvidence: CapabilityRunnerdProcessEvidence | null = null;
   #providerThreadId = "";
@@ -472,6 +775,18 @@ export class CapabilityLiveSession {
     this.#transcript = structuredClone(options.snapshot?.transcript ?? []);
     this.#evidence = structuredClone(options.snapshot?.evidence ?? []);
     this.#priorAuthorizationRecords = structuredClone(options.snapshot?.authorizationRecords ?? []);
+    const initialAttemptId = options.snapshot?.currentAttemptId ?? options.attemptId;
+    this.#attempts = structuredClone(options.snapshot?.attempts ?? [{
+      attemptId: initialAttemptId,
+      resumeOf: null,
+      status: "running",
+      startedAt: this.#createdAt,
+      finishedAt: null,
+      failureCode: null,
+    }]);
+    this.#currentAttemptId = initialAttemptId;
+    this.#terminalTurns = structuredClone(options.snapshot?.terminalTurns ?? []);
+    this.#usageLedger = structuredClone(options.snapshot?.usageLedger ?? []);
     this.#providerThreadId = options.snapshot?.providerThreadId ?? "";
     this.#providerSessionId = options.snapshot?.providerSessionId ?? null;
     this.#providerModel = options.snapshot?.providerModel === undefined
@@ -484,7 +799,12 @@ export class CapabilityLiveSession {
 
   static async open(options: OpenSessionOptions): Promise<CapabilityLiveSession> {
     const session = new CapabilityLiveSession(options);
-    await session.#connect(false);
+    try {
+      await session.#connect(false);
+    } catch (error) {
+      await session.#abortConnect("initial provider connection failed");
+      throw error;
+    }
     return session;
   }
 
@@ -503,8 +823,14 @@ export class CapabilityLiveSession {
       authority: options.snapshot.authority,
       config: options.snapshot.config,
       snapshot: options.snapshot,
+      attemptId: options.snapshot.currentAttemptId ?? options.snapshot.authority.runId,
     });
-    await session.#connect(true);
+    try {
+      await session.#connect(true);
+    } catch (error) {
+      await session.#abortConnect("provider recovery failed");
+      throw error;
+    }
     return session;
   }
 
@@ -624,7 +950,63 @@ export class CapabilityLiveSession {
         realPaperclipRequests: 0,
         childPaperclipEnvironmentKeys: childKeys.filter((key) => key.startsWith("PAPERCLIP_")),
       },
+      attempts: structuredClone(this.#attempts),
+      currentAttemptId: this.#currentAttemptId,
+      terminalTurns: structuredClone(this.#terminalTurns),
+      usageLedger: structuredClone(this.#usageLedger),
     };
+  }
+
+  async recordUsage(input: RecordCapabilityLiveUsageInput): Promise<"committed" | "duplicate"> {
+    const receiptId = requireNonEmpty(input.receiptId, "usage_receipt_id");
+    const receipt: CapabilityLiveUsageReceipt = {
+      receiptId,
+      attemptId: this.#currentAttemptId,
+      providerResponseId: input.providerResponseId ?? null,
+      turnId: input.turnId ?? this.#activeTurnId,
+      providerCalls: nonNegativeInteger(input.providerCalls ?? 1, "provider_calls"),
+      inputTokens: nonNegativeInteger(input.inputTokens, "input_tokens"),
+      outputTokens: nonNegativeInteger(input.outputTokens, "output_tokens"),
+      cachedInputTokens: nonNegativeInteger(input.cachedInputTokens, "cached_input_tokens"),
+      reasoningTokens: nonNegativeInteger(input.reasoningTokens, "reasoning_tokens"),
+      costNanodollars: nonNegativeInteger(input.costNanodollars, "cost_nanodollars"),
+      observedAt: this.#now().toISOString(),
+    };
+    const existing = this.#usageLedger.find((candidate) => candidate.receiptId === receiptId);
+    if (existing !== undefined) {
+      const comparable = (value: CapabilityLiveUsageReceipt) => JSON.stringify({
+        ...value,
+        attemptId: undefined,
+        observedAt: undefined,
+      });
+      if (comparable(existing) !== comparable(receipt)) {
+        throw new Error("capability_live_usage_receipt_conflict");
+      }
+      return "duplicate";
+    }
+    this.#usageLedger.push(receipt);
+    await this.#persist();
+    return "committed";
+  }
+
+  async completeAttempt(
+    status: Exclude<CapabilityLiveAttemptStatus, "running" | "terminated">,
+    failureCode: string | null = null,
+  ): Promise<CapabilityLiveSessionSnapshot> {
+    const attempt = this.#attempts.find((candidate) => candidate.attemptId === this.#currentAttemptId);
+    if (attempt === undefined || attempt.status !== "running") {
+      throw new Error("capability_live_attempt_not_running");
+    }
+    if (status === "succeeded" && this.#activeTurnId !== null) {
+      throw new Error("capability_live_attempt_active_turn");
+    }
+    attempt.status = status;
+    attempt.finishedAt = this.#now().toISOString();
+    attempt.failureCode = status === "failed"
+      ? requireNonEmpty(failureCode ?? "attempt_failed", "attempt_failure_code")
+      : null;
+    await this.#persist();
+    return this.snapshot();
   }
 
   async sendMessage(message: string): Promise<CapabilityLiveTurnResult> {
@@ -643,21 +1025,7 @@ export class CapabilityLiveSession {
     // last transcript entry and the user message would never learn its turn.
     const userEntryId = this.#appendTranscript("user", value, null);
     let response: Record<string, unknown>;
-    const terminal = new Promise<Omit<CapabilityLiveTurnResult, "snapshot">>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const waiter = this.#turnWaiter;
-        this.#turnWaiter = null;
-        if (waiter !== null) {
-          this.#emit({
-            turnId: this.#activeTurnId,
-            kind: "error",
-            message: `Capability Codex turn timed out after ${this.#config.turnTimeoutMs}ms`,
-          });
-        }
-        reject(new Error(`Capability Codex turn timed out after ${this.#config.turnTimeoutMs}ms`));
-      }, this.#config.turnTimeoutMs);
-      this.#turnWaiter = { resolve, reject, timer, assistantText: "", draftId: null };
-    });
+    const terminal = this.#armTurnWaiter();
     try {
       response = await this.#transport.request("turn/start", {
         threadId: this.#providerThreadId,
@@ -689,6 +1057,45 @@ export class CapabilityLiveSession {
     if (draft !== undefined && draft.turnId === null) draft.turnId = turnId;
     await this.#persist();
     const result = await terminal;
+    await this.#persist();
+    return { ...result, snapshot: this.snapshot() };
+  }
+
+  #armTurnWaiter(): Promise<Omit<CapabilityLiveTurnResult, "snapshot">> {
+    if (this.#turnWaiter !== null) throw new Error("Capability live session already has a turn waiter");
+    return new Promise<Omit<CapabilityLiveTurnResult, "snapshot">>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const waiter = this.#turnWaiter;
+        this.#turnWaiter = null;
+        if (waiter !== null) {
+          this.#emit({
+            turnId: this.#activeTurnId,
+            kind: "error",
+            message: `Capability Codex turn timed out after ${this.#config.turnTimeoutMs}ms`,
+          });
+        }
+        reject(new Error(`Capability Codex turn timed out after ${this.#config.turnTimeoutMs}ms`));
+      }, this.#config.turnTimeoutMs);
+      this.#turnWaiter = { resolve, reject, timer, assistantText: "", draftId: null };
+    });
+  }
+
+  /** Interrupts and durably reconciles a checkpointed active turn after restart. */
+  async reconcileActiveTurn(
+    reason = "worker restarted while provider turn was active",
+  ): Promise<CapabilityLiveTurnResult | null> {
+    if (this.#activeTurnId === null) return null;
+    const turnId = this.#activeTurnId;
+    const terminal = this.#armTurnWaiter();
+    try {
+      await this.interrupt(reason);
+    } catch (error) {
+      this.#rejectTurn(error);
+      await terminal.catch(() => undefined);
+      throw error;
+    }
+    const result = await terminal;
+    if (result.turnId !== turnId) throw new Error("capability_live_provider_session_drift: terminal turn mismatch");
     await this.#persist();
     return { ...result, snapshot: this.snapshot() };
   }
@@ -811,7 +1218,27 @@ export class CapabilityLiveSession {
       });
       const thread = record(read.thread);
       if (text(thread.id) !== this.#providerThreadId) {
-        throw new Error("Codex reconnect read a different provider thread");
+        throw new Error("capability_live_provider_session_drift: thread/read identity mismatch");
+      }
+      const readSessionId = text(thread.sessionId);
+      if (
+        this.#providerSessionId !== null
+        && readSessionId.length > 0
+        && readSessionId !== this.#providerSessionId
+      ) {
+        throw new Error("capability_live_provider_session_drift: thread/read session mismatch");
+      }
+      if (this.#activeTurnId !== null) {
+        const turns = Array.isArray(thread.turns) ? thread.turns.map(record) : [];
+        const recoveredTurn = turns.find((turn) => text(turn.id) === this.#activeTurnId);
+        if (recoveredTurn === undefined) {
+          throw new Error("capability_live_provider_session_drift: checkpointed active turn missing");
+        }
+        const recoveredTerminal = providerTurnStatus(recoveredTurn.status);
+        if (recoveredTerminal !== null) {
+          this.#recordTerminalFact(this.#activeTurnId, recoveredTerminal);
+          this.#activeTurnId = null;
+        }
       }
       const resumed = await this.#transport.request("thread/resume", {
         threadId: this.#providerThreadId,
@@ -824,11 +1251,18 @@ export class CapabilityLiveSession {
       });
       const resumedThread = record(resumed.thread);
       if (text(resumedThread.id) !== this.#providerThreadId) {
-        throw new Error("Codex reconnect resumed a different provider thread");
+        throw new Error("capability_live_provider_session_drift: thread/resume identity mismatch");
       }
-      this.#providerSessionId = text(resumedThread.sessionId) || this.#providerSessionId;
+      const resumedSessionId = text(resumedThread.sessionId);
+      if (
+        this.#providerSessionId !== null
+        && resumedSessionId.length > 0
+        && resumedSessionId !== this.#providerSessionId
+      ) {
+        throw new Error("capability_live_provider_session_drift: thread/resume session mismatch");
+      }
+      this.#providerSessionId = resumedSessionId || this.#providerSessionId;
       this.#captureProviderModel(resumed);
-      this.#activeTurnId = null;
     } else {
       const opened = await this.#transport.request("thread/start", {
         cwd: this.#config.workingDirectory,
@@ -847,7 +1281,7 @@ export class CapabilityLiveSession {
       this.#providerSessionId = text(thread.sessionId) || text(record(initialized.user).sessionId) || null;
       this.#captureProviderModel(opened);
     }
-    this.#status = "idle";
+    this.#status = this.#activeTurnId === null ? "idle" : "running";
     this.#appendEvidence("session", null, {
       action: resume ? "resumed" : "started",
       sessionId: this.id,
@@ -883,6 +1317,11 @@ export class CapabilityLiveSession {
     });
   }
 
+  async #abortConnect(reason: string): Promise<void> {
+    await this.#disconnect(reason).catch(() => undefined);
+    await this.#port.stop().catch(() => undefined);
+  }
+
   async #handleServerRequest(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
     if (request.method !== "item/tool/call") {
       return {
@@ -894,6 +1333,19 @@ export class CapabilityLiveSession {
     const threadId = text(request.params.threadId);
     const turnId = text(request.params.turnId);
     const callId = text(request.params.callId, String(request.id));
+    // Codex may issue its first tool request immediately after writing the
+    // turn/start response, before the response and turn/started notification
+    // have crossed the two async readers. Bind that request only while this
+    // session is already waiting for the single turn it just started.
+    if (
+      this.#activeTurnId === null &&
+      this.#turnWaiter !== null &&
+      this.#status === "running" &&
+      threadId === this.#providerThreadId &&
+      turnId.length > 0
+    ) {
+      this.#activeTurnId = turnId;
+    }
     if (
       threadId !== this.#providerThreadId ||
       turnId.length === 0 ||
@@ -1011,15 +1463,36 @@ export class CapabilityLiveSession {
 
   #completeTurn(turnId: string, status: CapabilityLiveTurnResult["status"]): void {
     const waiter = this.#turnWaiter;
-    if (waiter === null) return;
+    if (waiter === null) {
+      this.#recordTerminalFact(turnId, status);
+      this.#activeTurnId = null;
+      this.#status = "idle";
+      this.#emit({ turnId, kind: "terminal", status, assistantText: "" });
+      return;
+    }
     clearTimeout(waiter.timer);
     this.#turnWaiter = null;
     const assistantText = waiter.assistantText.trim();
     this.#settleAssistantDraft(waiter, assistantText, turnId);
+    this.#recordTerminalFact(turnId, status);
     this.#activeTurnId = null;
     this.#status = "idle";
     this.#emit({ turnId, kind: "terminal", status, assistantText });
     waiter.resolve({ turnId, status, assistantText });
+  }
+
+  #recordTerminalFact(turnId: string, status: CapabilityLiveTurnResult["status"]): void {
+    const existing = this.#terminalTurns.find((terminal) => terminal.turnId === turnId);
+    if (existing !== undefined) {
+      if (existing.status !== status) throw new Error("capability_live_terminal_fact_conflict");
+      return;
+    }
+    this.#terminalTurns.push({
+      turnId,
+      status,
+      reconciledByAttemptId: this.#currentAttemptId,
+      observedAt: this.#now().toISOString(),
+    });
   }
 
   #rejectTurn(error: unknown): void {

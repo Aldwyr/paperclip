@@ -1,5 +1,7 @@
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use paperclip_runner_core::durable::{
@@ -90,8 +92,8 @@ fn run_codex_app_server_proxy(args: &[String]) -> Result<(), LocalRunnerError> {
     command
         .args(&codex_args)
         .env_clear()
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     for key in [
         "ALL_PROXY",
@@ -119,6 +121,40 @@ fn run_codex_app_server_proxy(args: &[String]) -> Result<(), LocalRunnerError> {
     let mut child = command.spawn().map_err(|error| {
         LocalRunnerError::invalid(format!("failed to start Codex app-server: {error}"))
     })?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| LocalRunnerError::invalid("failed to capture Codex app-server stdin"))?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LocalRunnerError::invalid("failed to capture Codex app-server stdout"))?;
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut line = Vec::new();
+        while stdin.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+            if child_stdin.write_all(&line).is_err() || child_stdin.flush().is_err() {
+                break;
+            }
+            line.clear();
+        }
+    });
+    let stdout_relay = thread::spawn(move || {
+        let mut stdout = io::stdout().lock();
+        let mut child_stdout = BufReader::new(&mut child_stdout);
+        let mut line = Vec::new();
+        let mut relayed = 0;
+        loop {
+            let bytes = child_stdout.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                return Ok::<u64, io::Error>(relayed);
+            }
+            stdout.write_all(&line)?;
+            stdout.flush()?;
+            relayed += bytes as u64;
+            line.clear();
+        }
+    });
     eprintln!(
         "paperclip-runnerd: native codex proxy started runner_pid={} codex_pid={}",
         std::process::id(),
@@ -127,6 +163,12 @@ fn run_codex_app_server_proxy(args: &[String]) -> Result<(), LocalRunnerError> {
     let status = child.wait().map_err(|error| {
         LocalRunnerError::invalid(format!("failed to wait for Codex app-server: {error}"))
     })?;
+    stdout_relay
+        .join()
+        .map_err(|_| LocalRunnerError::invalid("Codex app-server stdout relay panicked"))?
+        .map_err(|error| {
+            LocalRunnerError::invalid(format!("Codex app-server stdout relay failed: {error}"))
+        })?;
     eprintln!(
         "paperclip-runnerd: native codex proxy exited success={} code={}",
         status.success(),

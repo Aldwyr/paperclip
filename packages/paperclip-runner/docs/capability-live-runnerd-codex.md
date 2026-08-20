@@ -26,17 +26,41 @@ the separate skillless, network-disabled workspace permission profile.
 
 ## Stable session API
 
-Import the package root and construct `CapabilityLiveSessionService`:
+Production workers import the live entrypoint and bind a durable store to the
+attempt's immutable authority tuple:
 
 ```ts
-import { CapabilityLiveSessionService } from "@paperclipai/paperclip-runner/testing";
+import {
+  CapabilityLiveSessionService,
+  DurableCapabilityLiveSessionStore,
+} from "@paperclipai/paperclip-runner/live";
 
+const binding = { sessionId, runId, companyId, actorId, taskId };
+const store = new DurableCapabilityLiveSessionStore({ directory, binding });
 const service = new CapabilityLiveSessionService({ store });
-const session = await service.create({ workingDirectory });
+const session = await service.create({ ...binding, attemptId, workingDirectory });
 const turn = await session.sendMessage("Read the mock task and report progress.");
 await session.interrupt(); // only when a turn is active
 await service.stop(session.id);
 ```
+
+After a worker terminates, a new worker must construct a new service and use the
+production resume entrypoint. It must not call `create` again:
+
+```ts
+const resumed = await new CapabilityLiveSessionService({ store }).resume({
+  sessionId,
+  attemptId: resumeAttemptId,
+  resumeOf: killedAttemptId,
+});
+await resumed.reconcileActiveTurn();
+```
+
+`resume` first commits the killed attempt as `terminated` and the successor as
+`running`. Only then does it start runnerd, read the checkpointed provider
+thread, and resume that exact thread. A missing or corrupt checkpoint, authority
+binding mismatch, attempt-lineage mismatch, or provider thread/session drift
+fails closed. The killed attempt and its usage remain immutable.
 
 The handoff surface for later tracks is:
 
@@ -48,14 +72,23 @@ The handoff surface for later tracks is:
   Codex app-server, then reads and resumes the persisted provider thread.
 - `restore(sessionId)` recreates mock state, transcript, authority, authorization
   records, pending interactions, and the provider thread from a stored snapshot.
+- `resume({ sessionId, attemptId, resumeOf })` is the cross-worker production
+  path and records distinct linked attempts before provider recovery.
+- `recordUsage(receipt)` durably commits an attempt-bound, exactly-once provider
+  response receipt before the caller acknowledges that response. Reusing a
+  receipt with different contents fails closed.
+- `reconcileActiveTurn()` interrupts and records the terminal fact for a turn
+  that was active in the checkpoint when its worker terminated.
 - `interrupt(reason)` cancels only the active turn and retains session authority.
 - `service.stop(sessionId)` clears authority and reaps the process group;
   `reset` also deletes the old snapshot and restores the original clean mock
   seed under new run/session authority.
 
-Supply a durable implementation of `CapabilityLiveSessionStore` for refresh and
-server-restart survival. The included in-memory store is intended for tests and
-single-process consumers.
+`DurableCapabilityLiveSessionStore` writes a checksummed, revisioned checkpoint
+with atomic rename plus file and directory fsync. It persists provider identity,
+mock state and semantic idempotency receipts, attempt lineage, active and
+terminal turn facts, and the usage ledger. The included in-memory store remains
+limited to tests and single-process consumers.
 
 Every snapshot includes bounded transcript/evidence, serialized mock state,
 semantic authorization records, runner/Codex PIDs and exit state, and explicit

@@ -67,7 +67,7 @@ export function createCapabilityRunnerdCodexTransport(
   const diagnostic = (message: string) => {
     evidence.diagnostics.push(message);
     if (evidence.diagnostics.length > 64) evidence.diagnostics.shift();
-    const match = /capability codex proxy started runner_pid=(\d+) codex_pid=(\d+)/.exec(message);
+    const match = /(?:capability|native) codex proxy started runner_pid=(\d+) codex_pid=(\d+)/.exec(message);
     if (match) {
       evidence.runnerPid = Number(match[1]);
       evidence.codexPid = Number(match[2]);

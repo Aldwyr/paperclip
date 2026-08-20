@@ -16,3 +16,4 @@ export * from "./mock-core/capability-control-plane-types.js";
 export * from "./mock-core/capability-mock-control-plane-adapter.js";
 export * from "./protocol/conformance-fixture.js";
 export * from "./live/live-session.js";
+export * from "./live/durable-live-session-store.js";

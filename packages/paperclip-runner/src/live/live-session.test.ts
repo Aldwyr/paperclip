@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type {
   CodexAppServerTransport,
@@ -9,8 +15,11 @@ import type {
 import {
   InMemoryCapabilityLiveSessionStore,
   CapabilityLiveSessionService,
+  reconcileCapabilityLiveUsage,
   type CapabilityLiveTransportFactory,
 } from "./live-session.js";
+import { DurableCapabilityLiveSessionStore } from "./durable-live-session-store.js";
+import { defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
 
 class AsyncNotifications implements AsyncIterable<CodexRpcNotification> {
   #values: CodexRpcNotification[] = [];
@@ -46,6 +55,8 @@ interface FakeProviderState {
   nextTurn: number;
   lastToolResult: string;
   transports: FakeCapabilityCodexTransport[];
+  turns: Map<string, string>;
+  holdAfterTool: boolean;
 }
 
 class FakeCapabilityCodexTransport implements CodexAppServerTransport {
@@ -74,7 +85,13 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
       };
     }
     if (method === "thread/read") {
-      return { thread: { id: this.state.threadId, sessionId: this.state.providerSessionId, turns: [] } };
+      return {
+        thread: {
+          id: this.state.threadId,
+          sessionId: this.state.providerSessionId,
+          turns: [...this.state.turns].map(([id, status]) => ({ id, status })),
+        },
+      };
     }
     if (method === "thread/resume") {
       return {
@@ -86,6 +103,7 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     if (method === "turn/start") {
       const turnId = `turn-${++this.state.nextTurn}`;
       this.#activeTurnId = turnId;
+      this.state.turns.set(turnId, "inProgress");
       const input = Array.isArray(params.input) ? params.input[0] as Record<string, unknown> : {};
       const message = String(input.text ?? "");
       void this.#runTurn(turnId, message);
@@ -93,6 +111,7 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     }
     if (method === "turn/interrupt") {
       const turnId = String(params.turnId);
+      this.state.turns.set(turnId, "interrupted");
       this.notificationsQueue.push({
         method: "turn/completed",
         params: { threadId: this.state.threadId, turn: { id: turnId, status: "interrupted" } },
@@ -139,6 +158,9 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     await new Promise((resolve) => setTimeout(resolve, 0));
     let assistantText: string;
     if (message.includes("progress")) {
+      const idempotencyKey = message.includes("idempotent")
+        ? "progress-governed-once"
+        : `progress-${turnId}`;
       const result = await this.#toolCall({
         id: `request-${turnId}`,
         method: "item/tool/call",
@@ -148,12 +170,13 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
           callId: `call-${turnId}`,
           tool: "report_progress",
           arguments: {
-            idempotencyKey: `progress-${turnId}`,
+            idempotencyKey,
             body: "Progress persisted through the live Codex tool loop.",
           },
         },
       });
       this.state.lastToolResult = String((result.contentItems as Array<Record<string, unknown>>)[0]?.text);
+      if (this.state.holdAfterTool) await new Promise<never>(() => undefined);
       assistantText = `The typed result changed my response: ${this.state.lastToolResult}`;
     } else if (message.includes("semantic-interaction-result")) {
       assistantText = `Resumed the same provider thread with ${message}`;
@@ -191,6 +214,7 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
         item: { id: `message-${turnId}`, type: "agentMessage", text: assistantText },
       },
     });
+    this.state.turns.set(turnId, "completed");
     this.notificationsQueue.push({
       method: "turn/completed",
       params: { threadId: this.state.threadId, turn: { id: turnId, status: "completed" } },
@@ -231,6 +255,8 @@ function providerState(): FakeProviderState {
     nextTurn: 0,
     lastToolResult: "nothing yet",
     transports: [],
+    turns: new Map(),
+    holdAfterTool: false,
   };
 }
 
@@ -332,4 +358,241 @@ describe("Capability live runnerd and Codex session", () => {
     expect(stopped.process?.runnerExited).toBe(true);
     expect((await store.load(replacement.id))?.status).toBe("closed");
   });
+
+  it("durably resumes a distinct attempt, preserves partial usage, and deduplicates the semantic effect", async () => {
+    const state = providerState();
+    const directory = await mkdtemp(join(tmpdir(), "capability-live-durable-"));
+    const binding = {
+      sessionId: "session-governed-resume",
+      runId: "run-governed-resume",
+      companyId: "company-1",
+      actorId: "actor-1",
+      taskId: "task-1",
+    };
+    const firstStore = new DurableCapabilityLiveSessionStore({ directory, binding });
+    const firstService = new CapabilityLiveSessionService({
+      store: firstStore,
+      transportFactory: fakeTransportFactory(state),
+    });
+    const first = await firstService.create({
+      ...binding,
+      attemptId: "attempt-killed",
+      turnTimeoutMs: 500,
+    });
+    state.holdAfterTool = true;
+    const killedTurn = first.sendMessage("Apply idempotent progress once.");
+    await vi.waitFor(async () => {
+      expect((await firstStore.load(binding.sessionId))?.mockState).toContain(
+        "Progress persisted through the live Codex tool loop.",
+      );
+    });
+    await expect(first.recordUsage({
+      receiptId: "provider-response-1",
+      providerResponseId: "response-1",
+      turnId: "turn-1",
+      providerCalls: 1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cachedInputTokens: 40,
+      reasoningTokens: 5,
+      costNanodollars: 1_500,
+    })).resolves.toBe("committed");
+    await state.transports[0]?.close();
+    await expect(killedTurn).rejects.toThrow("timed out");
+
+    // A new service models worker termination: it owns no in-memory session.
+    const resumedService = new CapabilityLiveSessionService({
+      store: new DurableCapabilityLiveSessionStore({ directory, binding }),
+      transportFactory: fakeTransportFactory(state),
+    });
+    const resumed = await resumedService.resume({
+      sessionId: binding.sessionId,
+      attemptId: "attempt-resumed",
+      resumeOf: "attempt-killed",
+    });
+    expect(resumed.snapshot().providerThreadId).toBe(state.threadId);
+    expect(resumed.snapshot().attempts).toMatchObject([
+      { attemptId: "attempt-killed", status: "terminated", failureCode: "worker_terminated" },
+      { attemptId: "attempt-resumed", resumeOf: "attempt-killed", status: "running" },
+    ]);
+
+    await expect(resumed.reconcileActiveTurn()).resolves.toMatchObject({
+      turnId: "turn-1",
+      status: "interrupted",
+    });
+    state.holdAfterTool = false;
+
+    const duplicate = await resumed.sendMessage("Apply idempotent progress once.");
+    expect(duplicate.assistantText).toContain('"disposition":"duplicate"');
+    expect(resumed.mockState().comments).toHaveLength(1);
+    await expect(resumed.recordUsage({
+      receiptId: "provider-response-1",
+      providerResponseId: "response-1",
+      turnId: "turn-1",
+      providerCalls: 1,
+      inputTokens: 100,
+      outputTokens: 20,
+      cachedInputTokens: 40,
+      reasoningTokens: 5,
+      costNanodollars: 1_500,
+    })).resolves.toBe("duplicate");
+    await resumed.recordUsage({
+      receiptId: "provider-response-2",
+      providerResponseId: "response-2",
+      providerCalls: 1,
+      inputTokens: 80,
+      outputTokens: 10,
+      costNanodollars: 1_000,
+    });
+    await resumed.completeAttempt("succeeded");
+
+    const final = await firstStore.load(binding.sessionId);
+    expect(final?.attempts).toMatchObject([
+      { attemptId: "attempt-killed", status: "terminated" },
+      { attemptId: "attempt-resumed", status: "succeeded" },
+    ]);
+    expect(final?.usageLedger).toHaveLength(2);
+    expect(final && reconcileCapabilityLiveUsage(final)).toEqual({
+      providerCalls: 2,
+      inputTokens: 180,
+      outputTokens: 30,
+      cachedInputTokens: 40,
+      reasoningTokens: 5,
+      costNanodollars: 2_500,
+    });
+  });
+
+  it("fails closed for missing, corrupt, mismatched, and provider-drifted checkpoints", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "capability-live-fail-closed-"));
+    const binding = {
+      sessionId: "session-fail-closed",
+      runId: "run-fail-closed",
+      companyId: "company-1",
+      actorId: "actor-1",
+      taskId: "task-1",
+    };
+    const missingService = new CapabilityLiveSessionService({
+      store: new DurableCapabilityLiveSessionStore({ directory, binding }),
+      transportFactory: fakeTransportFactory(providerState()),
+    });
+    await expect(missingService.resume({
+      sessionId: binding.sessionId,
+      attemptId: "attempt-missing-resume",
+      resumeOf: "attempt-missing",
+    })).rejects.toThrow("capability_live_resume_checkpoint_missing");
+
+    const state = providerState();
+    const store = new DurableCapabilityLiveSessionStore({ directory, binding });
+    const firstService = new CapabilityLiveSessionService({
+      store,
+      transportFactory: fakeTransportFactory(state),
+    });
+    await firstService.create({ ...binding, attemptId: "attempt-original" });
+    const mismatched = new DurableCapabilityLiveSessionStore({
+      directory,
+      binding: { ...binding, taskId: "task-other" },
+    });
+    await expect(mismatched.load(binding.sessionId)).rejects.toThrow(
+      "capability_live_checkpoint_binding_mismatch",
+    );
+
+    state.providerSessionId = "codex-provider-drifted";
+    const driftedService = new CapabilityLiveSessionService({
+      store,
+      transportFactory: fakeTransportFactory(state),
+    });
+    await expect(driftedService.resume({
+      sessionId: binding.sessionId,
+      attemptId: "attempt-drifted",
+      resumeOf: "attempt-original",
+    })).rejects.toThrow("capability_live_provider_session_drift");
+    expect((await store.load(binding.sessionId))?.attempts?.at(-1)).toMatchObject({
+      attemptId: "attempt-drifted",
+      status: "failed",
+      failureCode: "provider_recovery_failed",
+    });
+
+    const checkpointFile = join(directory, `${createHash("sha256").update(binding.sessionId).digest("hex")}.json`);
+    const checkpoint = await readFile(checkpointFile, "utf8");
+    await writeFile(checkpointFile, checkpoint.replace('"snapshotSha256":"', '"snapshotSha256":"corrupt-'));
+    await expect(store.load(binding.sessionId)).rejects.toThrow("capability_live_checkpoint_corrupt");
+  });
+
+  it.skipIf(process.platform === "win32" || !existsSync(defaultCapabilityRunnerdBinary()))(
+    "terminates real runnerd after a durable receipt and resumes its exact provider thread",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "capability-live-real-runnerd-"));
+      const providerStatePath = join(directory, "provider-state.json");
+      const fixture = fileURLToPath(new URL("../../test/fixtures/fake-durable-codex-app-server.mjs", import.meta.url));
+      const binding = {
+        sessionId: "session-real-runnerd-resume",
+        runId: "run-real-runnerd-resume",
+        companyId: "company-1",
+        actorId: "actor-1",
+        taskId: "task-1",
+      };
+      const store = new DurableCapabilityLiveSessionStore({ directory, binding });
+      const transportOptions = {
+        codexCommand: process.execPath,
+        codexArgs: [fixture, providerStatePath],
+        closeGraceMs: 100,
+      };
+      const firstService = new CapabilityLiveSessionService({ store, transportOptions });
+      const first = await firstService.create({
+        ...binding,
+        attemptId: "attempt-real-killed",
+        turnTimeoutMs: 2_000,
+      });
+      const killedTurn = first.sendMessage("Apply the governed idempotent effect.");
+      await vi.waitFor(async () => {
+        const checkpoint = await store.load(binding.sessionId);
+        expect(checkpoint?.mockState).toContain("One durable governed effect.");
+        expect(checkpoint?.activeTurnId).toBe("turn-1");
+        expect(checkpoint?.process?.runnerProcessGroupId).not.toBeNull();
+        expect(checkpoint?.process?.codexPid).not.toBeNull();
+      });
+      await first.recordUsage({
+        receiptId: "real-response-1",
+        providerResponseId: "fixture-response-1",
+        turnId: "turn-1",
+        providerCalls: 1,
+        inputTokens: 10,
+        outputTokens: 2,
+        costNanodollars: 100,
+      });
+      const killedCheckpoint = await store.load(binding.sessionId);
+      const processGroupId = killedCheckpoint?.process?.runnerProcessGroupId;
+      expect(processGroupId).toBeTypeOf("number");
+      process.kill(-processGroupId!, "SIGKILL");
+      await expect(killedTurn).rejects.toThrow();
+
+      const resumedService = new CapabilityLiveSessionService({
+        store: new DurableCapabilityLiveSessionStore({ directory, binding }),
+        transportOptions,
+      });
+      const resumed = await resumedService.resume({
+        sessionId: binding.sessionId,
+        attemptId: "attempt-real-resumed",
+        resumeOf: "attempt-real-killed",
+      });
+      expect(resumed.snapshot().providerThreadId).toBe("thread-durable-runnerd");
+      await expect(resumed.reconcileActiveTurn()).resolves.toMatchObject({ status: "interrupted" });
+      const duplicate = await resumed.sendMessage("Apply the governed idempotent effect again.");
+      expect(duplicate.assistantText).toContain("duplicate");
+      expect(resumed.mockState().comments).toHaveLength(1);
+      await resumed.completeAttempt("succeeded");
+      const final = await store.load(binding.sessionId);
+      expect(final?.attempts).toMatchObject([
+        { attemptId: "attempt-real-killed", status: "terminated" },
+        { attemptId: "attempt-real-resumed", status: "succeeded", resumeOf: "attempt-real-killed" },
+      ]);
+      expect(final?.usageLedger).toHaveLength(1);
+      expect(final?.terminalTurns).toEqual(expect.arrayContaining([
+        expect.objectContaining({ turnId: "turn-1", status: "interrupted" }),
+        expect.objectContaining({ turnId: "turn-2", status: "completed" }),
+      ]));
+      await resumedService.shutdown(resumed.id, "test complete");
+    },
+    15_000,
+  );
 });
