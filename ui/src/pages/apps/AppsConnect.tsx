@@ -1485,7 +1485,7 @@ function LinkConnectStep({
 
         {showSimpleKeyQuestion && (
           <div>
-            <label className="text-sm font-medium text-foreground">Does it need a key?</label>
+            <label className="mr-2 text-sm font-medium text-foreground">Does it need a key?</label>
             <div className="mt-2 inline-flex rounded-lg border border-border bg-muted/50 p-1">
               <SegmentedOption
                 label="No"

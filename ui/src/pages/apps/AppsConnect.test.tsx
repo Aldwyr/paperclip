@@ -195,6 +195,9 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).toContain("Connect your own MCP server");
     expect(container.textContent).toContain("https://www.example.com/actions");
     expect(container.textContent).toContain("Does it need a key?");
+    expect(Array.from(container.querySelectorAll("label")).find(
+      (label) => label.textContent === "Does it need a key?",
+    )?.classList.contains("mr-2")).toBe(true);
     expect(buttonByText("No")).toBeTruthy();
     expect(buttonByText("Yes")).toBeTruthy();
 
