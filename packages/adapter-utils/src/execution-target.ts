@@ -32,6 +32,7 @@ import {
   SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   sandboxCallbackBridgeDirectories,
+  sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
   syncRemoteTextFileWithHashSkip,
@@ -45,10 +46,12 @@ import {
   createDuplexBridgeBroker,
   DEFAULT_DUPLEX_BROKER_BUDGETS,
   type DuplexBridgeBroker,
+  type DuplexBrokerBudgets,
   type DuplexBrokerForwardResult,
 } from "./duplex-bridge-broker.js";
 import {
   decodeDuplexLine,
+  DEFAULT_MAX_DUPLEX_FRAME_BYTES,
   type DuplexRequestFrame,
 } from "./duplex-frame-codec.js";
 import {
@@ -2312,6 +2315,32 @@ function duplexReadinessFallbackReason(reason: DuplexReadinessFailure): DuplexFa
 }
 
 /**
+ * The cap on the pre-READY readiness buffer, in bytes. The gate reads untrusted
+ * bytes before the READY line arrives, so it bounds the buffer. The cap is the
+ * codec frame-size bound plus one line of margin, so a legitimate maximum-size
+ * READY frame still fits. Past the cap with no newline, the stream cannot be a
+ * valid READY frame, so the gate finishes with protocol contamination.
+ */
+const DUPLEX_READINESS_BUFFER_CAP_BYTES = DEFAULT_MAX_DUPLEX_FRAME_BYTES + 4_096;
+
+/**
+ * Derive the nested broker budgets from one forward budget. The response budget
+ * and the gateway wait budget each add a fixed margin, so the nested budget
+ * order holds for any finite forward budget. The default forward budget (30 s)
+ * yields the historical 32 s response budget and 35 s gateway wait budget, so a
+ * caller that sets no forward budget sees no change.
+ */
+function deriveNestedDuplexBrokerBudgets(forwardTimeoutMs: number): DuplexBrokerBudgets {
+  const responseMargin =
+    DEFAULT_DUPLEX_BROKER_BUDGETS.responseBudgetMs - DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
+  const gatewayMargin =
+    DEFAULT_DUPLEX_BROKER_BUDGETS.gatewayWaitMs - DEFAULT_DUPLEX_BROKER_BUDGETS.responseBudgetMs;
+  const responseBudgetMs = forwardTimeoutMs + responseMargin;
+  const gatewayWaitMs = responseBudgetMs + gatewayMargin;
+  return { forwardTimeoutMs, responseBudgetMs, gatewayWaitMs };
+}
+
+/**
  * The duplex readiness gate. The gate owns the single data listener and the
  * single exit listener of the channel while the host waits for a valid READY
  * frame. It resolves the handshake, then hands the channel to the broker.
@@ -2374,10 +2403,24 @@ function createDuplexReadinessGate(
       pending += chunk;
       return;
     }
+    if (settled) {
+      // The handshake already failed. The channel is untrusted and can keep
+      // sending bytes until the host closes it. Drop them, so a failed handshake
+      // never grows the buffer after the gate settles.
+      return;
+    }
     buffer += chunk;
     for (;;) {
       const newlineIndex = buffer.indexOf("\n");
-      if (newlineIndex === -1) return;
+      if (newlineIndex === -1) {
+        // No READY line yet. The gate reads untrusted bytes, so bound the
+        // pre-READY buffer. Past the cap with no newline, the stream cannot be a
+        // valid READY frame, so finish with protocol contamination.
+        if (Buffer.byteLength(buffer, "utf8") > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
+          finish({ ok: false, reason: "protocol_contamination" });
+        }
+        return;
+      }
       const line = buffer.slice(0, newlineIndex);
       const rest = buffer.slice(newlineIndex + 1);
       if (line.length === 0) {
@@ -2742,9 +2785,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       channel = await openDuplexChannel({ command });
     } catch {
       // The channel never opened, so no request could carry the bridge token.
-      // Fall through to the file bridge below. The log line names no raw provider
-      // error, so no provider error rides a log line on the duplex path.
-      if (channel) await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+      // The open call is the last statement of the try, so `channel` is still
+      // null here; there is nothing to close. Fall through to the file bridge
+      // below. The log line names no raw provider error, so no provider error
+      // rides a log line on the duplex path.
       duplexChannelOpen.fallback("open_failed");
       await onLog(
         "stderr",
@@ -2769,61 +2813,92 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           `[paperclip] Sandbox duplex readiness failed (${readiness.reason}). Using the file bridge.\n`,
         );
       } else {
-        // Readiness passed. Start the broker on the handed-off channel. The
-        // broker enforces the same route allowlist as the file bridge, then
-        // forwards each request with the real token and the run id. The agent
-        // environment below receives the bridge URL and token only now, after
-        // readiness passed.
-        const broker: DuplexBridgeBroker = createDuplexBridgeBroker({
-          channel: gate.brokerChannel,
-          budgets: { forwardTimeoutMs },
-          forwardRequest: async (
-            request: DuplexRequestFrame,
-            options: { signal: AbortSignal },
-          ): Promise<DuplexBrokerForwardResult> => {
-            const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes(request);
-            if (denialReason) {
-              return {
-                status: 403,
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ error: denialReason }),
+        // Readiness passed. Construct the broker inside the guarded region, so a
+        // construction throw closes the channel within the cleanup budget and
+        // selects the file bridge. The broker enforces the same route allowlist
+        // as the file bridge, then forwards each request with the real token and
+        // the run id. The agent environment below receives the bridge URL and
+        // token only now, after readiness passed.
+        let broker: DuplexBridgeBroker | null = null;
+        try {
+          broker = createDuplexBridgeBroker({
+            channel: gate.brokerChannel,
+            // Derive the nested budgets from the forward budget, so any forward
+            // budget keeps the nested order the broker asserts at construction.
+            budgets: deriveNestedDuplexBrokerBudgets(forwardTimeoutMs),
+            forwardRequest: async (
+              request: DuplexRequestFrame,
+              options: { signal: AbortSignal },
+            ): Promise<DuplexBrokerForwardResult> => {
+              const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes(request);
+              if (denialReason) {
+                return {
+                  status: 403,
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ error: denialReason }),
+                };
+              }
+              // Apply the header allowlist on the host, next to the route check.
+              // The host is the trust boundary: the sandbox controls the frame
+              // headers, so the host drops every header outside the allowlist
+              // before the authenticated forward. The forward then applies the
+              // real token and the run id.
+              const sanitizedRequest = {
+                ...request,
+                headers: sanitizeSandboxCallbackBridgeHeaders(request.headers),
               };
-            }
-            // Suppress the per-request debug log on the duplex path, so no route
-            // or query rides a log line here.
-            return forwardBridgeRequest(request, options.signal, { suppressDebugLog: true });
-          },
-          // The duplex path emits only the fixed transport telemetry. It passes no
-          // free-form logger, so no raw provider error rides a log line here.
-          telemetry: duplexTelemetry,
-        });
-        broker.start();
-        duplexChannelOpen.ready();
-        await onLog(
-          "stdout",
-          "[paperclip] Sandbox duplex transport ready; serving the host-assigned origin.\n",
-        );
-        return {
-          env: {
-            PAPERCLIP_API_URL: sandboxOrigin,
-            PAPERCLIP_API_KEY: bridgeToken,
-            PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
-          },
-          runLogTail: null,
-          stop: async () => {
-            // Close the channel before lease release. The broker sends an orderly
-            // close and releases the route, then stops the child, so no live
-            // provider session remains when the caller releases the lease.
-            await broker.close();
-            broker.stop();
-            // A channel that did not reach the `closed` state may leave a live
-            // provider session, so record one session leak.
-            if (broker.state !== "closed") {
-              duplexTelemetry.recordSessionLeak();
-            }
-            await bridgeAsset.cleanup();
-          },
-        };
+              // Suppress the per-request debug log on the duplex path, so no route
+              // or query rides a log line here.
+              return forwardBridgeRequest(sanitizedRequest, options.signal, {
+                suppressDebugLog: true,
+              });
+            },
+            // The duplex path emits only the fixed transport telemetry. It passes no
+            // free-form logger, so no raw provider error rides a log line here.
+            telemetry: duplexTelemetry,
+          });
+        } catch {
+          // The broker construction failed, so no broker owns the channel. Close
+          // the channel within the cleanup budget, then select the file bridge.
+          // The log line names no raw error, so no raw error rides a log line on
+          // the duplex path.
+          await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+          duplexChannelOpen.fallback("open_failed");
+          await onLog(
+            "stderr",
+            "[paperclip] Could not start the sandbox duplex broker. Using the file bridge.\n",
+          );
+        }
+        if (broker) {
+          const activeBroker = broker;
+          activeBroker.start();
+          duplexChannelOpen.ready();
+          await onLog(
+            "stdout",
+            "[paperclip] Sandbox duplex transport ready; serving the host-assigned origin.\n",
+          );
+          return {
+            env: {
+              PAPERCLIP_API_URL: sandboxOrigin,
+              PAPERCLIP_API_KEY: bridgeToken,
+              PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
+            },
+            runLogTail: null,
+            stop: async () => {
+              // Close the channel before lease release. The broker sends an orderly
+              // close and releases the route, then stops the child, so no live
+              // provider session remains when the caller releases the lease.
+              await activeBroker.close();
+              activeBroker.stop();
+              // A channel that did not reach the `closed` state may leave a live
+              // provider session, so record one session leak.
+              if (activeBroker.state !== "closed") {
+                duplexTelemetry.recordSessionLeak();
+              }
+              await bridgeAsset.cleanup();
+            },
+          };
+        }
       }
     }
   }

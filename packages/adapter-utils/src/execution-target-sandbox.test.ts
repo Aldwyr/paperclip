@@ -45,6 +45,7 @@ import { runChildProcess } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
+  DEFAULT_MAX_DUPLEX_FRAME_BYTES,
   DUPLEX_FRAME_VERSION,
   decodeDuplexLine,
   encodeDuplexFrame,
@@ -2916,16 +2917,33 @@ describe("sandbox adapter execution targets", () => {
   // request never forwards.
   async function startRecordingApiServer(): Promise<{
     origin: string;
-    requests: Array<{ method: string; url: string; auth: string | null; runId: string | null }>;
+    requests: Array<{
+      method: string;
+      url: string;
+      auth: string | null;
+      runId: string | null;
+      headers: Record<string, string>;
+    }>;
     close: () => Promise<void>;
   }> {
-    const requests: Array<{ method: string; url: string; auth: string | null; runId: string | null }> = [];
+    const requests: Array<{
+      method: string;
+      url: string;
+      auth: string | null;
+      runId: string | null;
+      headers: Record<string, string>;
+    }> = [];
     const server = createServer((req, res) => {
+      const headers: Record<string, string> = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (typeof value === "string") headers[key] = value;
+      }
       requests.push({
         method: req.method ?? "GET",
         url: req.url ?? "/",
         auth: req.headers.authorization ?? null,
         runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
+        headers,
       });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
@@ -3750,6 +3768,225 @@ describe("sandbox adapter execution targets", () => {
       // The raw key reaches no sink.
       const telemetryDump = JSON.stringify({ spans, counters, events });
       expect(telemetryDump).not.toContain(PROVIDER_SENTINEL);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("caps the pre-READY readiness buffer and falls back with a contaminated reason", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-cap-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // The fake gateway sends a large pre-READY blob with no newline, then one
+    // more blob after the gate settles. The gate must cap the buffer, finish with
+    // protocol contamination, and drop the later blob. The blob is larger than
+    // the codec frame-size bound, so it passes the readiness buffer cap.
+    const oversizedBlob = "x".repeat(DEFAULT_MAX_DUPLEX_FRAME_BYTES * 2);
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw(oversizedBlob);
+      ctx.emitRaw(oversizedBlob);
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-cap",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      // A long readiness timeout, so the buffer cap, not the timeout, drives the
+      // failure.
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The cap drove the failure, so the file bridge serves after the bounded cleanup.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
+      // The bounded cleanup left no live provider session.
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("drops a frame header outside the allowlist on the host duplex forward path", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-hdr-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-hdr",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-hdr",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: {
+            // An allowlisted header the host must keep.
+            accept: "application/json",
+            // A header outside the allowlist the host must drop.
+            "x-injected-header": "attacker",
+            // A sandbox-supplied auth header the host must replace with the real token.
+            authorization: "Bearer bridge-token",
+          },
+          body: "",
+        }),
+      );
+      await waitForCondition(
+        () => api.requests.length >= 1,
+        "the broker to forward the duplex request",
+        4000,
+      );
+      const forwarded = api.requests[0];
+      // The allowlisted header reaches the host.
+      expect(forwarded.headers.accept).toBe("application/json");
+      // The header outside the allowlist never reaches the authenticated fetch.
+      expect(forwarded.headers["x-injected-header"]).toBeUndefined();
+      // The host applied the real token and the run id in place of the frame values.
+      expect(forwarded.auth).toBe("Bearer real-run-jwt");
+      expect(forwarded.runId).toBe("run-hdr");
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("selects the duplex transport for a large forward budget and starts the broker", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-budget-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    // A forward budget past the default response budget (32 s). Before the budget
+    // derivation, this made the nested budget assertion throw and leak the channel.
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-budget",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      forwardTimeoutMs: 60_000,
+    });
+    try {
+      // The broker started with derived nested budgets, so the duplex transport serves.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-budget",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: { authorization: "Bearer bridge-token" },
+          body: "",
+        }),
+      );
+      await waitForCondition(
+        () => control.written.length >= 1,
+        "the broker to write a duplex response frame",
+        4000,
+      );
+      expect(control.written[0]).toMatchObject({ type: "response", id: "req-budget", status: 200 });
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("falls back to the file bridge when the broker construction throws", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-ctor-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    // A non-finite forward budget makes the nested budget assertion throw at
+    // broker construction. Readiness passes first, so the guarded region must
+    // close the channel and select the file bridge instead of leaking it.
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-ctor",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      forwardTimeoutMs: Number.NaN,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // Readiness passed, then the broker construction threw; the file bridge serves.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      // The bounded cleanup left no live provider session.
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
     } finally {
       await bridge?.stop();
       await api.close();
