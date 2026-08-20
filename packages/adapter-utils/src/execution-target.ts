@@ -36,6 +36,7 @@ import {
   createSandboxRunLogTailFactory,
   type SandboxRunLogTailFactory,
 } from "./sandbox-run-log-stream.js";
+import { DEFAULT_DUPLEX_BROKER_BUDGETS } from "./duplex-bridge-broker.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -2194,6 +2195,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   hostApiUrl?: string | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   maxBodyBytes?: number | null;
+  // The deadline for one forward call, in milliseconds. This is the inner budget
+  // of the duplex broker's nested budget set. The default is the forward budget
+  // in `DEFAULT_DUPLEX_BROKER_BUDGETS` (30 s), so the current behavior does not
+  // change when the caller sets no option.
+  forwardTimeoutMs?: number | null;
   // Return the current-run parent-context token. The factory threads it into the
   // callback bridge worker, which reads it per request so each request
   // `sandbox.exec` span parents to the live run span. When it is absent, the
@@ -2218,6 +2224,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   if (hostApiToken.length === 0) {
     throw new Error("Sandbox bridge mode requires a host-side Paperclip API token.");
   }
+  // The forward budget for one relayed request. It stays at the broker's default
+  // forward budget (30 s) when the caller sets no option, so current behavior
+  // does not change.
+  const forwardTimeoutMs = input.forwardTimeoutMs ?? DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
 
   const runtimeRootDir =
     input.runtimeRootDir?.trim().length
@@ -2300,10 +2310,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         headers.set("authorization", `Bearer ${hostApiToken}`);
         headers.set("x-paperclip-run-id", input.runId);
         // Abort the forward when the worker aborts the request (its per-iteration
-        // timeout or watchdog fired), or after the 30s ceiling, whichever comes
+        // timeout or watchdog fired), or after the forward budget, whichever comes
         // first. The worker abort lets the bridge fail a hung forward fast
-        // instead of stranding the request until the 30s ceiling.
-        const timeoutSignal = AbortSignal.timeout(30_000);
+        // instead of stranding the request until the forward budget.
+        const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
         const forwardSignal = options?.signal
           ? AbortSignal.any([options.signal, timeoutSignal])
           : timeoutSignal;

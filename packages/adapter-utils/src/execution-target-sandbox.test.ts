@@ -40,6 +40,22 @@ import {
 import { createSandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
 import { runChildProcess } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
+import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
+import {
+  DUPLEX_FRAME_VERSION,
+  decodeDuplexLine,
+  encodeDuplexFrame,
+  type DuplexRequestFrame,
+  type DuplexResponseFrame,
+} from "./duplex-frame-codec.js";
+import {
+  assertNestedDuplexBrokerBudgets,
+  createDuplexBridgeBroker,
+  type DuplexBrokerForwardResult,
+  type DuplexBrokerLossRecord,
+  type DuplexBrokerRequestRecord,
+  type DuplexBrokerState,
+} from "./duplex-bridge-broker.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -3274,4 +3290,307 @@ describe("sandbox duplex gateway", () => {
 
     await gateway.stop();
   }, 20000);
+});
+
+/**
+ * A scripted fake duplex channel. The test drives the read path with
+ * `emitData`/`emitExit`, and reads the frames the broker wrote through `written`.
+ * The `writeError` and `closeBehavior` hooks let a test force a stream failure
+ * and a close timeout.
+ */
+function createFakeDuplexChannel(): {
+  channel: CommandManagedDuplexChannel;
+  emitData: (chunk: string) => void;
+  emitExit: (exit: { exitCode: number | null }) => void;
+  written: DuplexResponseFrame[];
+  writtenTypes: string[];
+  stopped: () => number;
+  setWriteError: (error: Error | null) => void;
+  setCloseBehavior: (behavior: "resolve" | "hang" | "reject") => void;
+} {
+  let dataListener: ((chunk: string) => void) | null = null;
+  let exitListener: ((exit: { exitCode: number | null }) => void) | null = null;
+  let writeError: Error | null = null;
+  let closeBehavior: "resolve" | "hang" | "reject" = "resolve";
+  let stopCount = 0;
+  const written: DuplexResponseFrame[] = [];
+  const writtenTypes: string[] = [];
+
+  const channel: CommandManagedDuplexChannel = {
+    write(data: string): void {
+      if (writeError) throw writeError;
+      const decoded = decodeDuplexLine(data.replace(/\n$/, ""));
+      if (decoded.ok) {
+        writtenTypes.push(decoded.frame.type);
+        if (decoded.frame.type === "response") written.push(decoded.frame);
+      }
+    },
+    onData(listener: (chunk: string) => void): void {
+      dataListener = listener;
+    },
+    onExit(listener: (exit: { exitCode: number | null }) => void): void {
+      exitListener = listener;
+    },
+    stop(): void {
+      stopCount += 1;
+    },
+    close(): Promise<void> {
+      if (closeBehavior === "resolve") return Promise.resolve();
+      if (closeBehavior === "reject") return Promise.reject(new Error("close rejected"));
+      return new Promise<void>(() => {});
+    },
+  };
+
+  return {
+    channel,
+    emitData: (chunk: string) => dataListener?.(chunk),
+    emitExit: (exit: { exitCode: number | null }) => exitListener?.(exit),
+    written,
+    writtenTypes,
+    stopped: () => stopCount,
+    setWriteError: (error: Error | null) => {
+      writeError = error;
+    },
+    setCloseBehavior: (behavior: "resolve" | "hang" | "reject") => {
+      closeBehavior = behavior;
+    },
+  };
+}
+
+/** Build one request frame line the fake channel can emit. */
+function requestFrameLine(overrides: Partial<DuplexRequestFrame> & { id: string }): string {
+  const frame: DuplexRequestFrame = {
+    version: DUPLEX_FRAME_VERSION,
+    type: "request",
+    id: overrides.id,
+    method: overrides.method ?? "POST",
+    path: overrides.path ?? "/api/issues/PAP-1/comments",
+    query: overrides.query ?? "",
+    headers: overrides.headers ?? { authorization: "Bearer bridge-token" },
+    body: overrides.body ?? JSON.stringify({ body: "hello" }),
+  };
+  return encodeDuplexFrame(frame);
+}
+
+/** Wait for the pending microtasks and macrotasks to settle. */
+function flushMacrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+describe("createDuplexBridgeBroker", () => {
+  it("forwards a decoded request to the handler and writes the handler response back", async () => {
+    const fake = createFakeDuplexChannel();
+    const received: DuplexRequestFrame[] = [];
+    // The forward handler owns the token replacement and the run attribution. The
+    // broker passes the decoded request straight through, so the sandbox request
+    // still carries only the bridge token here, and the handler applies the real
+    // token and the signed run identifier on the existing forward path.
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async (request): Promise<DuplexBrokerForwardResult> => {
+        received.push(request);
+        expect(request.headers.authorization).toBe("Bearer bridge-token");
+        expect(request.headers["x-paperclip-run-id"]).toBeUndefined();
+        return {
+          status: 201,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+
+    broker.start();
+    fake.emitData(requestFrameLine({ id: "req-1" }));
+    await flushMacrotasks();
+
+    expect(received).toHaveLength(1);
+    expect(received[0].id).toBe("req-1");
+    expect(fake.written).toHaveLength(1);
+    expect(fake.written[0]).toMatchObject({
+      type: "response",
+      id: "req-1",
+      status: 201,
+      outcome: "completed",
+    });
+    expect(JSON.parse(fake.written[0].body)).toEqual({ ok: true });
+
+    await broker.close();
+  });
+
+  it("moves through opening, open, closing, closed in order", async () => {
+    const fake = createFakeDuplexChannel();
+    const states: DuplexBrokerState[] = [];
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async () => ({ status: 200 }),
+      onStateChange: (state) => states.push(state),
+    });
+
+    expect(broker.state).toBe("opening");
+    broker.start();
+    expect(broker.state).toBe("open");
+    await broker.close();
+    expect(broker.state).toBe("closed");
+    expect(states).toEqual(["open", "closing", "closed"]);
+    expect(fake.writtenTypes).toContain("close");
+  });
+
+  it.each([
+    {
+      name: "channel exit",
+      reason: "channel_exit" as const,
+      trigger: (fake: ReturnType<typeof createFakeDuplexChannel>) =>
+        fake.emitExit({ exitCode: 1 }),
+    },
+    {
+      name: "protocol failure",
+      reason: "protocol_failure" as const,
+      trigger: (fake: ReturnType<typeof createFakeDuplexChannel>) =>
+        fake.emitData("this is not json\n"),
+    },
+    {
+      name: "stream failure",
+      reason: "stream_failure" as const,
+      trigger: (fake: ReturnType<typeof createFakeDuplexChannel>) => {
+        fake.setWriteError(new Error("broken pipe"));
+        fake.emitData(requestFrameLine({ id: "req-stream" }));
+      },
+    },
+  ])("enters lost on $name", async ({ reason, trigger }) => {
+    const fake = createFakeDuplexChannel();
+    const losses: DuplexBrokerLossRecord[] = [];
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async () => ({ status: 200 }),
+      onLoss: (record) => losses.push(record),
+    });
+    broker.start();
+
+    trigger(fake);
+    await flushMacrotasks();
+
+    expect(broker.state).toBe("lost");
+    expect(broker.lossRecord?.reason).toBe(reason);
+    expect(losses).toHaveLength(1);
+  });
+
+  it("enters lost on a close timeout", async () => {
+    const fake = createFakeDuplexChannel();
+    fake.setCloseBehavior("hang");
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async () => ({ status: 200 }),
+      closeTimeoutMs: 20,
+    });
+    broker.start();
+
+    await broker.close();
+
+    expect(broker.state).toBe("lost");
+    expect(broker.lossRecord?.reason).toBe("close_timeout");
+  });
+
+  it("stops the heartbeat, marks the run bridge ended, and dispatches nothing after loss", async () => {
+    const fake = createFakeDuplexChannel();
+    const forwarded: string[] = [];
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async (request) => {
+        forwarded.push(request.id);
+        return { status: 200 };
+      },
+    });
+    broker.start();
+
+    fake.emitExit({ exitCode: 1 });
+    await flushMacrotasks();
+    expect(broker.state).toBe("lost");
+    expect(broker.lossRecord).not.toBeNull();
+
+    // A request that arrives after loss reaches nothing. The broker never
+    // reconnects and never replays a request.
+    fake.emitData(requestFrameLine({ id: "after-loss" }));
+    await flushMacrotasks();
+    expect(forwarded).toEqual([]);
+  });
+
+  it("forwards one request id one time, so a repeated frame never reaches the API twice", async () => {
+    const fake = createFakeDuplexChannel();
+    const forwarded: string[] = [];
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async (request) => {
+        forwarded.push(request.id);
+        return { status: 200, body: "ok" };
+      },
+    });
+    broker.start();
+
+    fake.emitData(requestFrameLine({ id: "dup" }));
+    await flushMacrotasks();
+    fake.emitData(requestFrameLine({ id: "dup" }));
+    await flushMacrotasks();
+
+    expect(forwarded).toEqual(["dup"]);
+    expect(fake.written).toHaveLength(1);
+
+    await broker.close();
+  });
+
+  it("captures the dispatch-start point per request for metrics only", async () => {
+    const fake = createFakeDuplexChannel();
+    const records: DuplexBrokerRequestRecord[] = [];
+    let clock = 1000;
+    const broker = createDuplexBridgeBroker({
+      channel: fake.channel,
+      forwardRequest: async () => ({ status: 200 }),
+      now: () => clock,
+      onRequestRecord: (record) => records.push(record),
+    });
+    broker.start();
+
+    clock = 2500;
+    fake.emitData(requestFrameLine({ id: "metric-1", method: "GET", path: "/api/agents/me" }));
+    await flushMacrotasks();
+
+    expect(records).toEqual([
+      { id: "metric-1", method: "GET", path: "/api/agents/me", dispatchStartMs: 2500 },
+    ]);
+    // The record never reaches the channel. The broker writes only a response.
+    expect(fake.writtenTypes).not.toContain("request");
+
+    await broker.close();
+  });
+
+  it("rejects a configuration where an inner budget is not smaller than its outer budget", () => {
+    expect(() =>
+      assertNestedDuplexBrokerBudgets({
+        forwardTimeoutMs: 32_000,
+        responseBudgetMs: 32_000,
+        gatewayWaitMs: 35_000,
+      }),
+    ).toThrow(/forward budget/);
+    expect(() =>
+      assertNestedDuplexBrokerBudgets({
+        forwardTimeoutMs: 30_000,
+        responseBudgetMs: 35_000,
+        gatewayWaitMs: 35_000,
+      }),
+    ).toThrow(/response budget/);
+    expect(() =>
+      createDuplexBridgeBroker({
+        channel: createFakeDuplexChannel().channel,
+        forwardRequest: async () => ({ status: 200 }),
+        budgets: { forwardTimeoutMs: 40_000 },
+      }),
+    ).toThrow(/forward budget/);
+    // The default budget set holds the nested order.
+    expect(() =>
+      assertNestedDuplexBrokerBudgets({
+        forwardTimeoutMs: 30_000,
+        responseBudgetMs: 32_000,
+        gatewayWaitMs: 35_000,
+      }),
+    ).not.toThrow();
+  });
 });
