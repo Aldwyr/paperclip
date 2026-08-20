@@ -38,6 +38,7 @@ import type {
   AppDefinition,
   ToolAppsAttentionResponse,
   ToolConnectionActivityResponse,
+  ToolConnectionLifecycleEventType,
   ToolConnectionTestAgentsResponse,
   ToolConnectionTestCallResult,
   ToolConnectionTestCallStatus,
@@ -203,10 +204,12 @@ export interface ToolGatewayActivityEvent extends ToolGatewayAuditRow {
   applicationId: string | null;
   connectionId: string | null;
   agentDisplayName: string | null;
+  actorDisplayName?: string | null;
   appDisplayName: string | null;
   applicationDisplayName: string | null;
   connectionDisplayName: string | null;
   toolDisplayName: string | null;
+  lifecycleType?: ToolConnectionLifecycleEventType | null;
   normalizedOutcome: ToolAuditOutcome;
   invocation: {
     id: string;
@@ -229,7 +232,7 @@ export type ToolGatewayActivityResponse = {
   nextCursor: string | null;
 };
 
-export type ToolAuditWindow = "1h" | "24h" | "7d" | "30d";
+export type ToolAuditWindow = "1h" | "24h" | "7d" | "30d" | "all";
 
 export interface ListActivityParams {
   gateway?: string | null;

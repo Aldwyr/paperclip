@@ -133,9 +133,34 @@ describe("AuditTab", () => {
     expect(container.textContent).toContain("Gmail");
     expect(container.textContent).toContain("Blocked");
     expect(container.textContent).toContain("Recorded by Paperclip — entries can't be edited.");
+    expect(listActivityMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ window: "all" }));
     // Vocabulary gate: no raw tool ID or ops terms in the sentence list.
     expect(container.textContent).not.toContain("mail:send_email");
     expect(container.textContent).not.toContain("server-authoritative");
+  });
+
+  it("renders connection lifecycle rows from the per-connection activity source", async () => {
+    listActivityMock.mockResolvedValue({
+      events: [event({
+        id: "lifecycle-1",
+        action: "tool_connection.app_connected",
+        actorType: "user",
+        actorId: "user-1",
+        agentId: null,
+        agentDisplayName: null,
+        actorDisplayName: "Dotta",
+        lifecycleType: "app_connected",
+        normalizedOutcome: "unknown",
+        toolDisplayName: null,
+        details: { lifecycleType: "app_connected" },
+      })],
+      nextCursor: null,
+    });
+
+    await render();
+
+    expect(container.textContent).toContain("Dotta connected Gmail");
+    expect(container.textContent).not.toContain("RecordedDotta connected Gmail");
   });
 
   it("expands a row to show the plain reason, the matched rule, and the Details collapse", async () => {

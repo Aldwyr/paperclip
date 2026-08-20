@@ -102,7 +102,7 @@ describe("ToolsAccess", () => {
     expect(navigateMock).toHaveBeenCalledWith(expect.objectContaining({ to: target, replace: true }));
   });
 
-  it("uses Profiles as the developer surface entry point", async () => {
+  it("uses Profiles as the developer entry point without a second page shell", async () => {
     await render();
 
     expect(container.querySelector('a[href="/apps/advanced/profiles"]')?.textContent).toContain(
@@ -112,7 +112,8 @@ describe("ToolsAccess", () => {
     mockParams.tab = "profiles";
     await render();
 
-    expect(container.textContent).toContain("Developer tools");
+    expect(container.textContent).not.toContain("Developer tools");
     expect(container.textContent).toContain("Tool profiles");
+    expect(container.firstElementChild?.classList.contains("max-w-5xl")).toBe(true);
   });
 });

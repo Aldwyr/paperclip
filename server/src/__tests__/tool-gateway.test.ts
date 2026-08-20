@@ -3455,6 +3455,16 @@ rl.on("line", (line) => {
         createdAt: new Date(now - 500),
       },
     ]).returning();
+    const [connectedEvent] = await db.insert(activityLog).values({
+      companyId: company.id,
+      actorType: "system",
+      actorId: "system",
+      action: "tool_app.connected",
+      entityType: "tool_connection",
+      entityId: connection!.id,
+      details: { galleryKey: "mail" },
+      createdAt: new Date(now - 45 * 24 * 60 * 60 * 1000),
+    }).returning();
 
     const app = createGatewayRouteApp(db, createTestToolGatewayService(db), {
       type: "board",
@@ -3467,13 +3477,21 @@ rl.on("line", (line) => {
 
     const allActivity = await request(app)
       .get("/api/tool-gateway/audit")
-      .query({ companyId: company.id, window: "24h" });
+      .query({ companyId: company.id });
     expect(allActivity.status).toBe(200);
     expect(allActivity.body.events.map((event: { id: string }) => event.id)).toEqual([
       callEvents[2]!.id,
       callEvents[0]!.id,
       callEvents[1]!.id,
+      connectedEvent!.id,
     ]);
+    expect(allActivity.body.events.find((event: { id: string }) => event.id === connectedEvent!.id)).toMatchObject({
+      action: "tool_connection.app_connected",
+      connectionId: connection!.id,
+      applicationId: application!.id,
+      appDisplayName: "Mail",
+      lifecycleType: "app_connected",
+    });
 
     const firstPage = await request(app)
       .get("/api/tool-gateway/audit")

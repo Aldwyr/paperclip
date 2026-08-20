@@ -2,7 +2,11 @@ import { Router, type Request, type Response } from "express";
 import { and, desc, eq, gte, ilike, inArray, lt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, toolApplications, toolCallEvents, toolConnections, toolInvocations } from "@paperclipai/db";
-import { humanizeConnectionDisplayName, type PermissionKey } from "@paperclipai/shared";
+import {
+  humanizeConnectionDisplayName,
+  type PermissionKey,
+  type ToolConnectionLifecycleEventType,
+} from "@paperclipai/shared";
 import {
   createToolMcpGatewaySchema,
   createToolMcpGatewayTokenSchema,
@@ -12,6 +16,7 @@ import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } fr
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
+import { listConnectionLifecycleEvents } from "../services/tool-connection-activity.js";
 
 const TOOL_ACTIVITY_EVENT_TYPES = [
   "call_completed",
@@ -21,11 +26,12 @@ const TOOL_ACTIVITY_EVENT_TYPES = [
   "approval_resolved",
 ] as const;
 
-const TOOL_GATEWAY_WINDOWS: Record<string, number> = {
+const TOOL_GATEWAY_WINDOWS: Record<string, number | null> = {
   "1h": 60 * 60 * 1000,
   "24h": 24 * 60 * 60 * 1000,
   "7d": 7 * 24 * 60 * 60 * 1000,
   "30d": 30 * 24 * 60 * 60 * 1000,
+  all: null,
 };
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -653,7 +659,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       const appFilter = typeof req.query.app === "string" ? req.query.app.trim() : null;
       const agentFilter = typeof req.query.agent === "string" ? req.query.agent.trim() : null;
       const outcomeFilter = typeof req.query.outcome === "string" ? req.query.outcome.trim() : null;
-      const windowFilter = typeof req.query.window === "string" ? req.query.window.trim() : "24h";
+      const windowFilter = typeof req.query.window === "string" ? req.query.window.trim() : "all";
       const searchRaw = typeof req.query.search === "string" ? req.query.search.trim() : null;
       const cursorRaw = typeof req.query.cursor === "string" ? req.query.cursor.trim() : null;
       if (gatewayFilter && !uuidPattern.test(gatewayFilter)) {
@@ -669,7 +675,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         return;
       }
       if (!(windowFilter in TOOL_GATEWAY_WINDOWS)) {
-        res.status(400).json({ error: "window must be one of 1h, 24h, 7d, 30d" });
+        res.status(400).json({ error: "window must be one of 1h, 24h, 7d, 30d, all" });
         return;
       }
       const cursor = cursorRaw ? decodeAuditCursor(cursorRaw) : null;
@@ -678,11 +684,13 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         return;
       }
 
+      const windowMs = TOOL_GATEWAY_WINDOWS[windowFilter];
+      const windowStartedAt = windowMs === null ? null : new Date(Date.now() - windowMs);
       const conditions = [
         eq(toolCallEvents.companyId, companyId),
         inArray(toolCallEvents.eventType, TOOL_ACTIVITY_EVENT_TYPES),
-        gte(toolCallEvents.createdAt, new Date(Date.now() - TOOL_GATEWAY_WINDOWS[windowFilter])),
       ];
+      if (windowStartedAt) conditions.push(gte(toolCallEvents.createdAt, windowStartedAt));
       if (cursor) {
         conditions.push(or(
           lt(toolCallEvents.createdAt, cursor.createdAt),
@@ -715,6 +723,8 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
       // Free-text search runs server-side: resolve the term against agent / app /
       // connection names first, then OR those matched IDs with direct matches on
       // the event type, tool name, and reason code so paginating stays honest.
+      let matchedAgentIds: string[] = [];
+      let matchedConnectionIds: string[] = [];
       if (searchRaw) {
         const like = `%${searchRaw.replace(/[%_\\]/g, (ch) => `\\${ch}`)}%`;
         const [matchAgents, matchApps, matchConnections] = await Promise.all([
@@ -725,9 +735,22 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           db.select({ id: toolConnections.id }).from(toolConnections)
             .where(and(eq(toolConnections.companyId, companyId), ilike(toolConnections.name, like))),
         ]);
-        const matchedAgentIds = matchAgents.map((r) => r.id);
+        matchedAgentIds = matchAgents.map((r) => r.id);
         const matchedAppIds = matchApps.map((r) => r.id);
-        const matchedConnectionIds = matchConnections.map((r) => r.id);
+        matchedConnectionIds = matchConnections.map((r) => r.id);
+        if (matchedAppIds.length > 0) {
+          const appConnections = await db
+            .select({ id: toolConnections.id })
+            .from(toolConnections)
+            .where(and(
+              eq(toolConnections.companyId, companyId),
+              inArray(toolConnections.applicationId, matchedAppIds),
+            ));
+          matchedConnectionIds = [...new Set([
+            ...matchedConnectionIds,
+            ...appConnections.map((connection) => connection.id),
+          ])];
+        }
         const searchClauses = [
           ilike(toolCallEvents.eventType, like),
           ilike(toolCallEvents.toolName, like),
@@ -781,36 +804,112 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         .orderBy(desc(toolCallEvents.createdAt), desc(toolCallEvents.id))
         .limit(limit + 1);
 
-      const hasMore = page.length > limit;
-      const visible = hasMore ? page.slice(0, limit) : page;
+      let lifecycleConnectionIds: string[] | undefined;
+      if (gatewayFilter || outcomeFilter) {
+        lifecycleConnectionIds = [];
+      } else if (appFilter) {
+        lifecycleConnectionIds = (await db
+          .select({ id: toolConnections.id })
+          .from(toolConnections)
+          .where(and(
+            eq(toolConnections.companyId, companyId),
+            or(eq(toolConnections.id, appFilter), eq(toolConnections.applicationId, appFilter)),
+          )))
+          .map((row) => row.id);
+      }
+
+      const lifecycleEvents = await listConnectionLifecycleEvents(db, {
+        companyId,
+        connectionIds: lifecycleConnectionIds,
+        agentId: agentFilter,
+        since: windowStartedAt,
+        cursor,
+        search: searchRaw,
+        matchedAgentIds,
+        matchedConnectionIds,
+        limit: limit + 1,
+      });
+      const candidates = [
+        ...page.map((item) => ({ kind: "call" as const, id: item.row.id, createdAt: item.row.createdAt, item })),
+        ...lifecycleEvents.map((item) => ({ kind: "lifecycle" as const, id: item.id, createdAt: item.createdAt, item })),
+      ].sort((a, b) => {
+        const byTime = b.createdAt.getTime() - a.createdAt.getTime();
+        return byTime !== 0 ? byTime : b.id.localeCompare(a.id);
+      });
+      const hasMore = candidates.length > limit;
+      const visible = candidates.slice(0, limit);
       const agentIds = [...new Set(visible.flatMap((item) => [
-        item.row.agentId,
-        item.invocationAgentId,
+        item.kind === "call" ? item.item.row.agentId : item.item.agentId,
+        item.kind === "call" ? item.item.invocationAgentId : null,
       ]).filter((id): id is string => Boolean(id)))];
       const applicationIds = [...new Set(visible.flatMap((item) => [
-        item.row.applicationId,
-        item.invocationApplicationId,
+        item.kind === "call" ? item.item.row.applicationId : null,
+        item.kind === "call" ? item.item.invocationApplicationId : null,
       ]).filter((id): id is string => Boolean(id)))];
       const connectionIds = [...new Set(visible.flatMap((item) => [
-        item.row.connectionId,
-        item.invocationConnectionId,
+        item.kind === "call" ? item.item.row.connectionId : item.item.connectionId,
+        item.kind === "call" ? item.item.invocationConnectionId : null,
       ]).filter((id): id is string => Boolean(id)))];
-      const [agentRows, applicationRows, connectionRows] = await Promise.all([
+      const [agentRows, connectionRows] = await Promise.all([
         agentIds.length > 0
           ? db.select({ id: agents.id, name: agents.name }).from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, agentIds)))
-          : [],
-        applicationIds.length > 0
-          ? db.select({ id: toolApplications.id, name: toolApplications.name }).from(toolApplications).where(and(eq(toolApplications.companyId, companyId), inArray(toolApplications.id, applicationIds)))
           : [],
         connectionIds.length > 0
           ? db.select({ id: toolConnections.id, name: toolConnections.name, applicationId: toolConnections.applicationId }).from(toolConnections).where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, connectionIds)))
           : [],
       ]);
+      const allApplicationIds = [...new Set([
+        ...applicationIds,
+        ...connectionRows.map((row) => row.applicationId),
+      ])];
+      const applicationRows = allApplicationIds.length > 0
+        ? await db.select({ id: toolApplications.id, name: toolApplications.name }).from(toolApplications)
+          .where(and(eq(toolApplications.companyId, companyId), inArray(toolApplications.id, allApplicationIds)))
+        : [];
       const agentsById = new Map(agentRows.map((row) => [row.id, row]));
       const applicationsById = new Map(applicationRows.map((row) => [row.id, row]));
       const connectionsById = new Map(connectionRows.map((row) => [row.id, row]));
 
-      const events = visible.map((item) => {
+      const events = visible.map((candidate) => {
+        if (candidate.kind === "lifecycle") {
+          const lifecycle = candidate.item;
+          const connection = connectionsById.get(lifecycle.connectionId) ?? null;
+          const applicationId = connection?.applicationId ?? null;
+          const application = applicationId ? applicationsById.get(applicationId) ?? null : null;
+          const appDisplayName = connection
+            ? humanizeConnectionDisplayName(connection)
+            : application
+              ? humanizeConnectionDisplayName(application.name)
+              : null;
+          return {
+            id: lifecycle.id,
+            companyId,
+            action: `tool_connection.${lifecycle.type}`,
+            actorType: lifecycle.actorType,
+            actorId: lifecycle.actorId,
+            entityType: "tool_connection",
+            entityId: lifecycle.connectionId,
+            details: { ...(lifecycle.details ?? {}), lifecycleType: lifecycle.type },
+            createdAt: lifecycle.createdAt,
+            runId: null,
+            agentId: lifecycle.agentId,
+            agentDisplayName: lifecycle.agentId
+              ? agentsById.get(lifecycle.agentId)?.name ?? "Unknown agent"
+              : null,
+            actorDisplayName: lifecycle.actorDisplayName,
+            applicationId,
+            connectionId: lifecycle.connectionId,
+            appDisplayName,
+            applicationDisplayName: application ? humanizeConnectionDisplayName(application.name) : null,
+            connectionDisplayName: connection ? humanizeConnectionDisplayName(connection) : null,
+            toolDisplayName: null,
+            lifecycleType: lifecycle.type,
+            normalizedOutcome: "unknown" as const,
+            invocation: null,
+          };
+        }
+
+        const item = candidate.item;
         const row = item.row;
         const agentId = row.agentId ?? item.invocationAgentId;
         const connectionId = row.connectionId ?? item.invocationConnectionId;
@@ -857,12 +956,14 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
           runId: row.runId,
           agentId,
           agentDisplayName: agentId ? agentsById.get(agentId)?.name ?? "Unknown agent" : null,
+          actorDisplayName: agentId ? agentsById.get(agentId)?.name ?? "Unknown agent" : null,
           applicationId,
           connectionId,
           appDisplayName,
           applicationDisplayName: application ? humanizeConnectionDisplayName(application.name) : null,
           connectionDisplayName: connection ? humanizeConnectionDisplayName(connection) : null,
           toolDisplayName: rawToolName ? humanizeConnectionDisplayName(rawToolName) : null,
+          lifecycleType: null as ToolConnectionLifecycleEventType | null,
           normalizedOutcome: normalizedAuditOutcome(row.eventType, row.outcome, row.decision),
           invocation: item.invocationId && item.invocationToolName && item.invocationStatus && item.invocationApprovalState
             ? {
@@ -883,7 +984,7 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
         };
       });
 
-      const last = visible.at(-1)?.row;
+      const last = visible.at(-1);
       res.json({
         events,
         nextCursor: hasMore && last ? encodeAuditCursor({ createdAt: last.createdAt, id: last.id }) : null,
