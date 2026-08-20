@@ -3993,6 +3993,63 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 20000);
 
+  it("caps the pre-READY buffer under many small newline-less chunks", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-cap-small-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // An adversarial provider controls the chunk size. It sends many small
+    // newline-less chunks that together pass the cap. The gate must scan each
+    // chunk in O(1) of the buffer length, so the pre-READY window stays bounded.
+    // The gate caps the buffer, finishes with protocol contamination, and falls
+    // back to the file bridge.
+    const readinessBufferCapBytes = DEFAULT_MAX_DUPLEX_FRAME_BYTES + 4_096;
+    const smallChunk = "x".repeat(64);
+    const chunkCount = Math.ceil(readinessBufferCapBytes / smallChunk.length) + 1;
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      for (let i = 0; i < chunkCount; i += 1) {
+        ctx.emitRaw(smallChunk);
+      }
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-cap-small",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      // A long readiness timeout, so the buffer cap, not the timeout, drives the
+      // failure.
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      // The cap drove the failure, so the file bridge serves after the bounded cleanup.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
   it("drops a frame header outside the allowlist on the host duplex forward path", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-hdr-"));
     cleanupDirs.push(rootDir);

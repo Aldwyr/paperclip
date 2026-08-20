@@ -352,8 +352,12 @@ field.
 
 ### Dimension keys
 
-Every span attribute, counter label, and event field uses only these closed keys.
-A test asserts the exact set, so a new key never reaches a sink by accident.
+Counters carry no dimension labels. The guarded counter store keys each counter
+on `(companyId, metric)` with no label column, so the `fallback_reason` and
+`loss_class` values fold into the counter metric name instead. The full closed
+dimension set below rides only the spans and the `sandbox.duplex.transport`
+event, which use only these closed keys. A test asserts the exact set, so a new
+key never reaches a sink by accident.
 
 | Key | Type | Optional | Value set |
 | --- | --- | --- | --- |

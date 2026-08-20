@@ -2467,7 +2467,15 @@ function createDuplexReadinessGate(
         // No READY line yet. The gate reads untrusted bytes, so bound the
         // pre-READY buffer. Past the cap with no newline, the stream cannot be a
         // valid READY frame, so finish with protocol contamination.
-        if (Buffer.byteLength(buffer, "utf8") > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
+        //
+        // Gate on buffer.length, the UTF-16 code-unit count, which is O(1).
+        // Buffer.byteLength is O(n), so a byte check on every newline-less chunk
+        // makes the pre-READY window quadratic in the bytes received. The UTF-8
+        // byte length is greater than or equal to the UTF-16 code-unit count for
+        // every string, so this check never fires before the byte cap is truly
+        // exceeded. It can fire late by at most a factor of 3, so peak buffer
+        // memory stays bounded near 3 MB.
+        if (buffer.length > DUPLEX_READINESS_BUFFER_CAP_BYTES) {
           finish({ ok: false, reason: "protocol_contamination" });
         }
         return;
