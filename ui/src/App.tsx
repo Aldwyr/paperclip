@@ -148,11 +148,9 @@ function boardRoutes() {
           <Route path="apps/gateways" element={<GatewaysList />} />
           <Route path="apps/gateways/:gatewayId" element={<Navigate to="overview" replace />} />
           <Route path="apps/gateways/:gatewayId/:tab" element={<GatewayDetail />} />
-          <Route path="apps/advanced/gateways" element={<AdvancedToolsRoute />} />
         </Route>
         <Route path="apps/advanced" element={<AdvancedToolsRoute />} />
         <Route element={<HostFeatureGate feature="apps.access_profiles" />}>
-          <Route path="apps/advanced/profiles" element={<AdvancedToolsRoute />} />
           <Route path="apps/advanced/profiles/new" element={<ProfileWizardRoute mode="new" />} />
           <Route path="apps/advanced/profiles/:profileId/edit" element={<ProfileWizardRoute mode="edit" />} />
           <Route path="apps/advanced/profiles/:profileId" element={<ProfileDetailRoute />} />
