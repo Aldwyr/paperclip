@@ -473,6 +473,10 @@ type ToolAccessServiceOptions = {
   catalogCacheTtlMs?: number;
   /** Test seam for deciding whether an OAuth client metadata URL is publicly resolvable. */
   oauthClientMetadataLookup?: RemoteHttpEndpointLookup;
+  /** Test seam for deterministic remote endpoint resolution. Production uses DNS. */
+  remoteHttpEndpointLookup?: RemoteHttpEndpointLookup;
+  /** Test seam for protocol fixtures. Production uses the DNS-pinned transport. */
+  remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -1807,7 +1811,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const endpoint = parseRemoteHttpEndpoint(value, (message, code) => badRequest(message, { code }));
     await assertPublicRemoteHttpEndpoint(
       endpoint,
-      { allowPrivateNetwork: allowPrivateRemoteEndpoints() },
+      {
+        allowPrivateNetwork: allowPrivateRemoteEndpoints(),
+        lookup: options.remoteHttpEndpointLookup,
+      },
       (message, code) => badRequest(message, { code }),
     );
     return endpoint.toString();
@@ -1816,6 +1823,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   function remoteHttpFetchOptions(): GuardedRemoteHttpFetchOptions {
     return {
       allowPrivateNetwork: allowPrivateRemoteEndpoints(),
+      lookup: options.remoteHttpEndpointLookup,
       error: (message, code) => badRequest(message, { code }),
     };
   }
@@ -1835,7 +1843,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const method = (init.method ?? "GET").toUpperCase();
     for (let redirectCount = 0; redirectCount <= MAX_REMOTE_HTTP_REDIRECTS; redirectCount += 1) {
       const endpoint = parseRemoteHttpEndpoint(currentUrl, (message, code) => badRequest(message, { code }));
-      const response = await guardedRemoteHttpFetch(endpoint, init, remoteHttpFetchOptions());
+      const response = options.remoteHttpRequest
+        ? await options.remoteHttpRequest(endpoint.toString(), { ...init, redirect: "manual" })
+        : await guardedRemoteHttpFetch(endpoint, init, remoteHttpFetchOptions());
       const location = REMOTE_HTTP_REDIRECT_STATUSES.has(response.status)
         ? response.headers?.get?.("location") ?? null
         : null;
