@@ -51,6 +51,11 @@ import {
   decodeDuplexLine,
   type DuplexRequestFrame,
 } from "./duplex-frame-codec.js";
+import {
+  createDuplexTelemetry,
+  type DuplexFallbackReason,
+  type DuplexTelemetryRecorder,
+} from "./duplex-telemetry.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -2289,6 +2294,24 @@ type DuplexReadinessResult =
   | { ok: false; reason: DuplexReadinessFailure };
 
 /**
+ * Map a readiness failure to the fixed fallback reason. Each readiness failure
+ * maps to exactly one reason from the closed telemetry set, so the fallback
+ * counter and the transport event carry only an approved value.
+ */
+function duplexReadinessFallbackReason(reason: DuplexReadinessFailure): DuplexFallbackReason {
+  switch (reason) {
+    case "protocol_contamination":
+      return "contaminated";
+    case "nonce_mismatch":
+      return "ready_nonce_mismatch";
+    case "timeout":
+      return "ready_timeout";
+    case "channel_exit":
+      return "ready_invalid";
+  }
+}
+
+/**
  * The duplex readiness gate. The gate owns the single data listener and the
  * single exit listener of the channel while the host waits for a valid READY
  * frame. It resolves the handshake, then hands the channel to the broker.
@@ -2481,6 +2504,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // request's execs group under one wrapper span. When it is absent, the request
   // work runs under the run parent with no wrapper span.
   runtimeSpan?: RuntimeSpanRunner;
+  // The injected recorder for the fixed duplex observability surface. The factory
+  // binds it to a provider-scoped telemetry facade, which records the channel-open
+  // span, the request span, the guarded counters, and the transport event. The
+  // default is a no-op recorder, so the surface stays inert until the host injects
+  // a real recorder.
+  duplexTelemetryRecorder?: DuplexTelemetryRecorder | null;
 }): Promise<AdapterExecutionTargetPaperclipBridgeHandle | null> {
   if (!adapterExecutionTargetUsesPaperclipBridge(input.target)) {
     return null;
@@ -2539,6 +2568,17 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
 
+  // The provider-scoped telemetry facade for the fixed duplex observability
+  // surface. It maps the raw provider key through the allowlist one time, so no
+  // raw plugin key reaches a span, a counter, or the event. The default recorder
+  // is a no-op, so the facade is inert until the host injects a real recorder.
+  const duplexProviderKey =
+    "providerKey" in target ? target.providerKey ?? undefined : undefined;
+  const duplexTelemetry = createDuplexTelemetry({
+    recorder: input.duplexTelemetryRecorder ?? undefined,
+    providerKey: duplexProviderKey,
+  });
+
   // PAPERCLIP_BRIDGE_DEBUG opts into verbose stdout logs of every bridge proxy
   // request/response. The query string is logged verbatim, so callers who pass
   // auth tokens or other sensitive values as query parameters should be aware
@@ -2554,9 +2594,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   const forwardBridgeRequest = async (
     request: { method: string; path: string; query: string; headers: Record<string, string>; body: string },
     signal?: AbortSignal,
+    options?: { suppressDebugLog?: boolean },
   ): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
     const method = request.method.trim().toUpperCase() || "GET";
-    if (bridgeDebugEnabled) {
+    // The per-request debug log prints the method, the path, and the query. The
+    // duplex path suppresses it, so no route or query rides a log line there. The
+    // file path keeps the existing behavior.
+    const emitDebugLog = bridgeDebugEnabled && options?.suppressDebugLog !== true;
+    if (emitDebugLog) {
       await onLog(
         "stdout",
         `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
@@ -2580,7 +2625,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
       signal: forwardSignal,
     });
-    if (bridgeDebugEnabled) {
+    if (emitDebugLog) {
       await onLog(
         "stdout",
         `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
@@ -2605,7 +2650,19 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     "effectiveCapabilities" in target &&
     target.effectiveCapabilities?.duplexCommandStream === true;
   const openDuplexChannel = runner.openDuplexChannel?.bind(runner);
+  // Record the pre-attempt fallback for a file-bridge selection that opens no
+  // channel. `gate_off` marks the kill switch off; `capability_absent` marks the
+  // capability or the runner method absent. A later channel-open failure records
+  // its own fallback through the channel-open attempt below.
+  if (!duplexRequested) {
+    duplexTelemetry.recordFallback("gate_off");
+  } else if (!capabilityGranted || typeof openDuplexChannel !== "function") {
+    duplexTelemetry.recordFallback("capability_absent");
+  }
   if (duplexRequested && capabilityGranted && typeof openDuplexChannel === "function") {
+    // Begin the channel-open attempt. The block reports exactly one terminal:
+    // `ready` on success, or `fallback(reason)` on an open or a readiness failure.
+    const duplexChannelOpen = duplexTelemetry.startChannelOpen();
     const readinessTimeoutMs =
       typeof input.duplexReadinessTimeoutMs === "number" &&
       Number.isFinite(input.duplexReadinessTimeoutMs) &&
@@ -2658,13 +2715,15 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         env: gatewayEnv,
       });
       channel = await openDuplexChannel({ command });
-    } catch (error) {
+    } catch {
       // The channel never opened, so no request could carry the bridge token.
-      // Fall through to the file bridge below.
+      // Fall through to the file bridge below. The log line names no raw provider
+      // error, so no provider error rides a log line on the duplex path.
       if (channel) await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+      duplexChannelOpen.fallback("open_failed");
       await onLog(
         "stderr",
-        `[paperclip] Could not open the sandbox duplex channel: ${error instanceof Error ? error.message : String(error)}. Using the file bridge.\n`,
+        "[paperclip] Could not open the sandbox duplex channel. Using the file bridge.\n",
       );
       channel = null;
     }
@@ -2675,8 +2734,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       if (!readiness.ok) {
         // Fail closed. Close the partial channel inside a bounded budget, then
         // select the file bridge. The broker never started, so no request that
-        // carries the bridge token reached the channel or any endpoint.
+        // carries the bridge token reached the channel or any endpoint. The reason
+        // is a fixed enum, so it rides the log line and the fallback telemetry
+        // with no raw value.
         await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+        duplexChannelOpen.fallback(duplexReadinessFallbackReason(readiness.reason));
         await onLog(
           "stderr",
           `[paperclip] Sandbox duplex readiness failed (${readiness.reason}). Using the file bridge.\n`,
@@ -2702,13 +2764,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
                 body: JSON.stringify({ error: denialReason }),
               };
             }
-            return forwardBridgeRequest(request, options.signal);
+            // Suppress the per-request debug log on the duplex path, so no route
+            // or query rides a log line here.
+            return forwardBridgeRequest(request, options.signal, { suppressDebugLog: true });
           },
-          logger: (message) => {
-            void onLog("stderr", `[paperclip] ${message}\n`);
-          },
+          // The duplex path emits only the fixed transport telemetry. It passes no
+          // free-form logger, so no raw provider error rides a log line here.
+          telemetry: duplexTelemetry,
         });
         broker.start();
+        duplexChannelOpen.ready();
         await onLog(
           "stdout",
           "[paperclip] Sandbox duplex transport ready; serving the host-assigned origin.\n",
@@ -2726,6 +2791,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             // provider session remains when the caller releases the lease.
             await broker.close();
             broker.stop();
+            // A channel that did not reach the `closed` state may leave a live
+            // provider session, so record one session leak.
+            if (broker.state !== "closed") {
+              duplexTelemetry.recordSessionLeak();
+            }
             await bridgeAsset.cleanup();
           },
         };

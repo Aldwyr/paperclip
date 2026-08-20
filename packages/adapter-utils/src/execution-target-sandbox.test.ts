@@ -59,6 +59,20 @@ import {
   type DuplexBrokerRequestRecord,
   type DuplexBrokerState,
 } from "./duplex-bridge-broker.js";
+import {
+  DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL,
+  DUPLEX_COUNTER_FALLBACK_TOTAL,
+  DUPLEX_COUNTER_LOSS_TOTAL,
+  DUPLEX_DIMENSION_KEYS,
+  DUPLEX_SPAN_CHANNEL_OPEN,
+  DUPLEX_SPAN_REQUEST,
+  DUPLEX_TRANSPORT_EVENT,
+  type DuplexTelemetryCounterRecord,
+  type DuplexTelemetryDimensions,
+  type DuplexTelemetryEventRecord,
+  type DuplexTelemetryRecorder,
+  type DuplexTelemetrySpanRecord,
+} from "./duplex-telemetry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -3222,6 +3236,490 @@ describe("sandbox adapter execution targets", () => {
       expect(control.written[0]).toMatchObject({ type: "response", id: "req-forbidden", status: 403 });
       // The route allowlist rejected the request, so it never forwarded.
       expect(api.requests).toHaveLength(0);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  // One recording telemetry recorder. It captures every span, counter, and event
+  // the fixed duplex surface produces, so a test asserts the exact names,
+  // dimensions, and values. An optional `failEvery` flag makes every method throw,
+  // so a test proves a telemetry failure never breaks the request path.
+  function createRecordingDuplexRecorder(options: { failEvery?: boolean } = {}): {
+    recorder: DuplexTelemetryRecorder;
+    spans: DuplexTelemetrySpanRecord[];
+    counters: DuplexTelemetryCounterRecord[];
+    events: DuplexTelemetryEventRecord[];
+  } {
+    const spans: DuplexTelemetrySpanRecord[] = [];
+    const counters: DuplexTelemetryCounterRecord[] = [];
+    const events: DuplexTelemetryEventRecord[] = [];
+    const recorder: DuplexTelemetryRecorder = {
+      recordSpan(record) {
+        if (options.failEvery) throw new Error("telemetry sink down");
+        spans.push(record);
+      },
+      incrementCounter(record) {
+        if (options.failEvery) throw new Error("telemetry sink down");
+        counters.push(record);
+      },
+      emitEvent(record) {
+        if (options.failEvery) throw new Error("telemetry sink down");
+        events.push(record);
+      },
+    };
+    return { recorder, spans, counters, events };
+  }
+
+  // Every dimension key a record carries must be one of the fixed keys. The set is
+  // closed, so a new key never reaches a sink by accident.
+  function assertOnlyFixedDimensionKeys(dimensions: DuplexTelemetryDimensions | undefined): void {
+    expect(dimensions).toBeDefined();
+    for (const key of Object.keys(dimensions ?? {})) {
+      expect(DUPLEX_DIMENSION_KEYS).toContain(key as (typeof DUPLEX_DIMENSION_KEYS)[number]);
+    }
+  }
+
+  it("records a duplex request span with latency and the fixed dimension keys", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-obs-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const { recorder, spans, counters, events } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-obs",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-obs",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: { authorization: "Bearer bridge-token" },
+          body: "",
+        }),
+      );
+      await waitForCondition(
+        () => control.written.length >= 1,
+        "the broker to write a duplex response frame",
+        4000,
+      );
+
+      // The channel-open surface: the span, the counter, and the transport event.
+      const openSpan = spans.find((span) => span.name === DUPLEX_SPAN_CHANNEL_OPEN);
+      expect(openSpan).toBeDefined();
+      expect(openSpan?.dimensions).toMatchObject({ provider: "daytona", transport: "duplex", outcome: "ok" });
+      expect(counters.some((c) => c.metric === DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL)).toBe(true);
+      expect(
+        events.some(
+          (e) =>
+            e.name === DUPLEX_TRANSPORT_EVENT &&
+            e.dimensions.transport === "duplex" &&
+            e.dimensions.outcome === "ok",
+        ),
+      ).toBe(true);
+
+      // The request span carries a numeric latency and only the fixed keys.
+      const requestSpan = spans.find((span) => span.name === DUPLEX_SPAN_REQUEST);
+      expect(requestSpan).toBeDefined();
+      expect(typeof requestSpan?.latencyMs).toBe("number");
+      expect(requestSpan?.latencyMs).toBeGreaterThanOrEqual(0);
+      expect(requestSpan?.dimensions).toMatchObject({ provider: "daytona", transport: "duplex", outcome: "ok" });
+      assertOnlyFixedDimensionKeys(requestSpan?.dimensions);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("increments the fallback counter with an approved reason when the capability is absent", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-fb-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner } = makeDuplexSelectionRunner();
+    const { recorder, counters, events } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(false),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-fb",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback).toBeDefined();
+      const approvedReasons = [
+        "gate_off",
+        "capability_absent",
+        "open_failed",
+        "ready_invalid",
+        "ready_nonce_mismatch",
+        "ready_timeout",
+        "contaminated",
+      ];
+      expect(approvedReasons).toContain(fallback?.dimensions.fallback_reason);
+      expect(fallback?.dimensions).toMatchObject({ transport: "file", outcome: "error" });
+      assertOnlyFixedDimensionKeys(fallback?.dimensions);
+      // The transport event mirrors the fallback.
+      expect(
+        events.some(
+          (e) => e.name === DUPLEX_TRANSPORT_EVENT && e.dimensions.transport === "file",
+        ),
+      ).toBe(true);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it.each([
+    { name: "before any dispatch", dispatchFirst: false, expectedClass: "pre_dispatch" },
+    { name: "after a dispatch", dispatchFirst: true, expectedClass: "post_dispatch" },
+  ])("increments the loss counter with the loss class $name", async ({ dispatchFirst, expectedClass }) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-loss-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-loss",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      if (dispatchFirst) {
+        control.emitData(
+          encodeDuplexFrame({
+            version: DUPLEX_FRAME_VERSION,
+            type: "request",
+            id: "req-loss",
+            method: "GET",
+            path: "/api/agents/me",
+            query: "",
+            headers: { authorization: "Bearer bridge-token" },
+            body: "",
+          }),
+        );
+        await waitForCondition(
+          () => control.written.length >= 1,
+          "the broker to write a duplex response frame",
+          4000,
+        );
+      }
+      // A malformed frame is a protocol failure. The broker records a terminal loss.
+      control.emitData("@@@ not a duplex frame @@@\n");
+      await waitForCondition(
+        () => counters.some((c) => c.metric === DUPLEX_COUNTER_LOSS_TOTAL),
+        "the broker to record a loss counter",
+        4000,
+      );
+      const loss = counters.find((c) => c.metric === DUPLEX_COUNTER_LOSS_TOTAL);
+      expect(loss?.dimensions.loss_class).toBe(expectedClass);
+      expect(loss?.dimensions).toMatchObject({ transport: "duplex", outcome: "error" });
+      assertOnlyFixedDimensionKeys(loss?.dimensions);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("keeps serving the request path when the telemetry recorder throws", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-guard-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const { recorder } = createRecordingDuplexRecorder({ failEvery: true });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-guard",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      // The throwing recorder never blocked the duplex selection.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-guard",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: { authorization: "Bearer bridge-token" },
+          body: "",
+        }),
+      );
+      await waitForCondition(
+        () => control.written.length >= 1,
+        "the broker to write a duplex response frame",
+        4000,
+      );
+      // The request path still delivered a real host response.
+      expect(control.written[0]).toMatchObject({ type: "response", id: "req-guard", status: 200 });
+      expect(api.requests).toHaveLength(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("keeps sentinel route, query, body, tokens, and provider errors off the duplex telemetry and logs", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-redact-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+
+    const ROUTE_SENTINEL = "sentinelroute8f21";
+    const QUERY_SENTINEL = "sentinelquery3d90";
+    const BODY_SENTINEL = "sentinelbodya17c";
+    const BRIDGE_TOKEN_SENTINEL = "sentinelbridgetok55e2";
+    const AGENT_TOKEN_SENTINEL = "sentinelagenttoke91b4";
+    const PROVIDER_ERROR_SENTINEL = "sentinelprovidererr7a3d";
+    const sentinels = [
+      ROUTE_SENTINEL,
+      QUERY_SENTINEL,
+      BODY_SENTINEL,
+      BRIDGE_TOKEN_SENTINEL,
+      AGENT_TOKEN_SENTINEL,
+      PROVIDER_ERROR_SENTINEL,
+    ];
+
+    // A runner whose channel throws a provider error on the response write, so the
+    // broker records a stream-failure loss carrying the sentinel message.
+    const base = createLocalSandboxRunner();
+    const control = { emitData: (_chunk: string) => {} };
+    const openDuplexChannel = async (openInput: {
+      command: readonly string[];
+    }): Promise<CommandManagedDuplexChannel> => {
+      const joined = openInput.command.join(" ");
+      const nonce = /PAPERCLIP_BRIDGE_NONCE='([^']*)'/.exec(joined)?.[1] ?? "";
+      let dataListener: ((chunk: string) => void) | null = null;
+      const channel: CommandManagedDuplexChannel = {
+        write(_data: string): void {
+          // Every response write fails with a provider error carrying the sentinel.
+          throw new Error(`provider write failed: ${PROVIDER_ERROR_SENTINEL}`);
+        },
+        onData(listener: (chunk: string) => void): void {
+          dataListener = listener;
+          control.emitData = (chunk) => dataListener?.(chunk);
+          setImmediate(() => dataListener?.(`${JSON.stringify({ version: 1, type: "ready", nonce })}\n`));
+        },
+        onExit(_listener: (exit: { exitCode: number | null }) => void): void {},
+        stop(): void {},
+        close(): Promise<void> {
+          return Promise.resolve();
+        },
+      };
+      return channel;
+    };
+    const runner = { ...base, openDuplexChannel };
+
+    const logLines: string[] = [];
+    const { recorder, spans, counters, events } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const previousDebug = process.env.PAPERCLIP_BRIDGE_DEBUG;
+    process.env.PAPERCLIP_BRIDGE_DEBUG = "1";
+    let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+    try {
+      bridge = await startAdapterExecutionTargetPaperclipBridge({
+        runId: "run-redact",
+        target,
+        runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+        adapterKey: "codex",
+        hostApiToken: AGENT_TOKEN_SENTINEL,
+        hostApiUrl: api.origin,
+        enableSandboxDuplexBridge: true,
+        duplexTelemetryRecorder: recorder,
+        onLog: async (_stream, chunk) => {
+          logLines.push(chunk);
+        },
+      });
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+
+      // A request that carries the sentinel route, query, body, and bridge token.
+      // The response write then fails with the sentinel provider error.
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-redact",
+          method: "GET",
+          path: `/api/${ROUTE_SENTINEL}`,
+          query: `secret=${QUERY_SENTINEL}`,
+          headers: { authorization: `Bearer ${BRIDGE_TOKEN_SENTINEL}` },
+          body: BODY_SENTINEL,
+        }),
+      );
+      // Give the forward and the failing response write time to run and record a loss.
+      await waitForCondition(
+        () => counters.some((c) => c.metric === DUPLEX_COUNTER_LOSS_TOTAL),
+        "the broker to record a loss counter after the failed write",
+        4000,
+      );
+
+      // Serialize every telemetry record and every log line, then assert that no
+      // sentinel reaches any of them on the duplex path.
+      const telemetryDump = JSON.stringify({ spans, counters, events });
+      const logDump = logLines.join("");
+      for (const sentinel of sentinels) {
+        expect(telemetryDump).not.toContain(sentinel);
+        expect(logDump).not.toContain(sentinel);
+      }
+    } finally {
+      if (previousDebug === undefined) delete process.env.PAPERCLIP_BRIDGE_DEBUG;
+      else process.env.PAPERCLIP_BRIDGE_DEBUG = previousDebug;
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("maps a sentinel provider key to the constant other across every sink", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-prov-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner, control } = makeDuplexSelectionRunner();
+    const { recorder, spans, counters, events } = createRecordingDuplexRecorder();
+    const PROVIDER_SENTINEL = "sentinel-plugin-provider-key-9c2a";
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: PROVIDER_SENTINEL,
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-prov",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      control.emitData(
+        encodeDuplexFrame({
+          version: DUPLEX_FRAME_VERSION,
+          type: "request",
+          id: "req-prov",
+          method: "GET",
+          path: "/api/agents/me",
+          query: "",
+          headers: { authorization: "Bearer bridge-token" },
+          body: "",
+        }),
+      );
+      await waitForCondition(
+        () => spans.some((s) => s.name === DUPLEX_SPAN_REQUEST),
+        "the broker to record a request span",
+        4000,
+      );
+
+      // Every recorded provider dimension is the constant `other`, never the key.
+      const allDimensions = [
+        ...spans.map((s) => s.dimensions),
+        ...counters.map((c) => c.dimensions),
+        ...events.map((e) => e.dimensions),
+      ];
+      expect(allDimensions.length).toBeGreaterThan(0);
+      for (const dimensions of allDimensions) {
+        expect(dimensions.provider).toBe("other");
+      }
+      // The raw key reaches no sink.
+      const telemetryDump = JSON.stringify({ spans, counters, events });
+      expect(telemetryDump).not.toContain(PROVIDER_SENTINEL);
     } finally {
       await bridge?.stop();
       await api.close();

@@ -1,0 +1,290 @@
+/**
+ * The fixed observability surface for the sandbox duplex transport.
+ *
+ * This module owns the one closed contract for every duplex telemetry sink: the
+ * span names, the counter names, the one event name, the dimension keys, and the
+ * enum values. Each name and value is a literal constant here, so the surface
+ * never drifts and a test asserts the exact set.
+ *
+ * The module also owns the provider allowlist. The `provider` dimension carries
+ * one approved public value, `daytona`. Any other plugin key maps to the constant
+ * `other`. The map runs inside this module before every sink, so a raw plugin key
+ * never reaches a span attribute, a counter label, or an event field.
+ *
+ * The module stays free of `@opentelemetry/api` and of the database. The host
+ * injects a {@link DuplexTelemetryRecorder}; the default is a no-op recorder, so
+ * the whole surface stays inert until the host binds a real recorder. Every
+ * recorder call sits inside an error swallow, so a telemetry failure never breaks
+ * the request path.
+ */
+
+/** The span for one duplex channel-open attempt. */
+export const DUPLEX_SPAN_CHANNEL_OPEN = "sandbox.duplex.channel_open";
+/** The span for one duplex request. It carries the request latency. */
+export const DUPLEX_SPAN_REQUEST = "sandbox.duplex.request";
+
+/** The one duplex transport event. The host emits it at each transport boundary. */
+export const DUPLEX_TRANSPORT_EVENT = "sandbox.duplex.transport";
+
+/** The guarded counter for one successful channel open. */
+export const DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL = "sandbox_duplex_channel_open_total";
+/** The guarded counter for one fallback to the file bridge. */
+export const DUPLEX_COUNTER_FALLBACK_TOTAL = "sandbox_duplex_fallback_total";
+/** The guarded counter for one terminal channel loss. */
+export const DUPLEX_COUNTER_LOSS_TOTAL = "sandbox_duplex_loss_total";
+/** The guarded counter for one leaked provider session on teardown. */
+export const DUPLEX_COUNTER_SESSION_LEAK_TOTAL = "sandbox_duplex_session_leak_total";
+
+/**
+ * The closed dimension-key set. Every span attribute, counter label, and event
+ * field uses only these keys. A test asserts the exact set, so a new key never
+ * reaches a sink by accident.
+ */
+export const DUPLEX_DIMENSION_KEYS = [
+  "provider",
+  "transport",
+  "outcome",
+  "fallback_reason",
+  "loss_class",
+] as const;
+
+/** One dimension key from the closed set. */
+export type DuplexDimensionKey = (typeof DUPLEX_DIMENSION_KEYS)[number];
+
+/** The transport a record is about. */
+export type DuplexTransportValue = "duplex" | "file";
+
+/** The outcome of a record. */
+export type DuplexOutcomeValue = "ok" | "error";
+
+/** The reason the host selected the file bridge instead of the duplex transport. */
+export type DuplexFallbackReason =
+  | "gate_off"
+  | "capability_absent"
+  | "open_failed"
+  | "ready_invalid"
+  | "ready_nonce_mismatch"
+  | "ready_timeout"
+  | "contaminated";
+
+/** The class of a terminal loss, relative to the first request dispatch. */
+export type DuplexLossClass = "pre_dispatch" | "post_dispatch";
+
+/** The one approved public provider value. */
+export const DUPLEX_APPROVED_PROVIDER = "daytona";
+/** The constant for any provider key outside the allowlist. */
+export const DUPLEX_PROVIDER_OTHER = "other";
+
+/** The `provider` dimension value after the allowlist map. */
+export type DuplexProviderValue = typeof DUPLEX_APPROVED_PROVIDER | typeof DUPLEX_PROVIDER_OTHER;
+
+/** The host-owned closed provider allowlist. It holds one approved public value. */
+const APPROVED_PROVIDERS: ReadonlySet<string> = new Set<string>([DUPLEX_APPROVED_PROVIDER]);
+
+/**
+ * Map a raw provider key to the closed `provider` dimension value. Return the key
+ * when the allowlist holds it. Return `other` for any other value, so a raw
+ * plugin key never reaches a sink. A missing key also maps to `other`.
+ */
+export function normalizeDuplexProvider(key: string | null | undefined): DuplexProviderValue {
+  return typeof key === "string" && APPROVED_PROVIDERS.has(key)
+    ? (key as DuplexProviderValue)
+    : DUPLEX_PROVIDER_OTHER;
+}
+
+/**
+ * The dimension bag a sink reads. Only the closed keys appear. The optional keys
+ * are present only when the record defines them, so a span or a counter never
+ * carries an empty dimension.
+ */
+export interface DuplexTelemetryDimensions {
+  provider: DuplexProviderValue;
+  transport: DuplexTransportValue;
+  outcome?: DuplexOutcomeValue;
+  fallback_reason?: DuplexFallbackReason;
+  loss_class?: DuplexLossClass;
+}
+
+/** One span record the host records. The request span carries a latency. */
+export interface DuplexTelemetrySpanRecord {
+  name: string;
+  dimensions: DuplexTelemetryDimensions;
+  /** The request latency in milliseconds. Only the request span sets it. */
+  latencyMs?: number;
+}
+
+/** One counter increment the host records. */
+export interface DuplexTelemetryCounterRecord {
+  metric: string;
+  dimensions: DuplexTelemetryDimensions;
+}
+
+/** One event the host emits. */
+export interface DuplexTelemetryEventRecord {
+  name: string;
+  dimensions: DuplexTelemetryDimensions;
+}
+
+/**
+ * The injected low-level recorder. The host binds it to the existing telemetry
+ * pipeline: the span to the OTel tracer, the counter to the guarded counter
+ * store, and the event to the run-events bridge. The default is a no-op recorder.
+ * The recorder receives only already-mapped dimensions, so the raw provider key
+ * never reaches it.
+ */
+export interface DuplexTelemetryRecorder {
+  recordSpan(record: DuplexTelemetrySpanRecord): void;
+  incrementCounter(record: DuplexTelemetryCounterRecord): void;
+  emitEvent(record: DuplexTelemetryEventRecord): void;
+}
+
+/** A no-op recorder. Every method does nothing, so the surface stays inert. */
+export const NOOP_DUPLEX_TELEMETRY_RECORDER: DuplexTelemetryRecorder = {
+  recordSpan() {},
+  incrementCounter() {},
+  emitEvent() {},
+};
+
+/** One channel-open attempt. The caller reports exactly one terminal. */
+export interface DuplexChannelOpenAttempt {
+  /**
+   * The channel opened and readiness passed. Record the channel-open span with
+   * the `ok` outcome, increment the channel-open counter, and emit the transport
+   * event for the duplex transport.
+   */
+  ready(): void;
+  /**
+   * The channel did not open or readiness failed. Record the channel-open span
+   * with the `error` outcome, increment the fallback counter, and emit the
+   * transport event for the file bridge.
+   */
+  fallback(reason: DuplexFallbackReason): void;
+}
+
+/**
+ * The bound telemetry facade the call sites use. It carries the normalized
+ * provider, so a call site never passes a raw key. It maps each semantic event to
+ * the fixed names and dimensions, then calls the recorder inside an error swallow.
+ */
+export interface DuplexTelemetry {
+  /** Begin a channel-open attempt. The caller reports `ready` or `fallback`. */
+  startChannelOpen(): DuplexChannelOpenAttempt;
+  /**
+   * Record a fallback to the file bridge with no channel-open attempt. Use it for
+   * `gate_off` and `capability_absent`, where the host opens no channel.
+   */
+  recordFallback(reason: DuplexFallbackReason): void;
+  /** Record one duplex request span with its latency and outcome. */
+  recordRequest(record: { latencyMs: number; outcome: DuplexOutcomeValue }): void;
+  /** Record one terminal channel loss. */
+  recordLoss(lossClass: DuplexLossClass): void;
+  /** Record one leaked provider session on teardown. */
+  recordSessionLeak(): void;
+}
+
+/** The options for {@link createDuplexTelemetry}. */
+export interface DuplexTelemetryOptions {
+  /** The injected recorder. The default is the no-op recorder. */
+  recorder?: DuplexTelemetryRecorder | null;
+  /** The raw provider key. The facade maps it through the allowlist one time. */
+  providerKey?: string | null;
+}
+
+/**
+ * Build the bound telemetry facade. The facade normalizes the provider key one
+ * time, then reuses the mapped value for every record. Every recorder call sits
+ * inside a `try/catch`, so a throwing recorder never breaks the request path. A
+ * missing recorder yields a facade whose methods do nothing.
+ */
+export function createDuplexTelemetry(options: DuplexTelemetryOptions = {}): DuplexTelemetry {
+  const recorder = options.recorder ?? NOOP_DUPLEX_TELEMETRY_RECORDER;
+  const provider = normalizeDuplexProvider(options.providerKey);
+
+  const safeSpan = (record: DuplexTelemetrySpanRecord): void => {
+    try {
+      recorder.recordSpan(record);
+    } catch {
+      // Observability must not break the request path.
+    }
+  };
+  const safeCounter = (record: DuplexTelemetryCounterRecord): void => {
+    try {
+      recorder.incrementCounter(record);
+    } catch {
+      // Observability must not break the request path.
+    }
+  };
+  const safeEvent = (record: DuplexTelemetryEventRecord): void => {
+    try {
+      recorder.emitEvent(record);
+    } catch {
+      // Observability must not break the request path.
+    }
+  };
+
+  const recordFallback = (reason: DuplexFallbackReason): void => {
+    const dimensions: DuplexTelemetryDimensions = {
+      provider,
+      transport: "file",
+      outcome: "error",
+      fallback_reason: reason,
+    };
+    safeCounter({ metric: DUPLEX_COUNTER_FALLBACK_TOTAL, dimensions });
+    safeEvent({ name: DUPLEX_TRANSPORT_EVENT, dimensions });
+  };
+
+  return {
+    startChannelOpen(): DuplexChannelOpenAttempt {
+      let settled = false;
+      return {
+        ready(): void {
+          if (settled) return;
+          settled = true;
+          const dimensions: DuplexTelemetryDimensions = {
+            provider,
+            transport: "duplex",
+            outcome: "ok",
+          };
+          safeSpan({ name: DUPLEX_SPAN_CHANNEL_OPEN, dimensions });
+          safeCounter({ metric: DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL, dimensions });
+          safeEvent({ name: DUPLEX_TRANSPORT_EVENT, dimensions });
+        },
+        fallback(reason: DuplexFallbackReason): void {
+          if (settled) return;
+          settled = true;
+          // The channel-open span records the failed attempt on the duplex
+          // transport; the counter and the event record the file-bridge fallback.
+          safeSpan({
+            name: DUPLEX_SPAN_CHANNEL_OPEN,
+            dimensions: { provider, transport: "duplex", outcome: "error" },
+          });
+          recordFallback(reason);
+        },
+      };
+    },
+    recordFallback,
+    recordRequest(record: { latencyMs: number; outcome: DuplexOutcomeValue }): void {
+      safeSpan({
+        name: DUPLEX_SPAN_REQUEST,
+        dimensions: { provider, transport: "duplex", outcome: record.outcome },
+        latencyMs: record.latencyMs,
+      });
+    },
+    recordLoss(lossClass: DuplexLossClass): void {
+      const dimensions: DuplexTelemetryDimensions = {
+        provider,
+        transport: "duplex",
+        outcome: "error",
+        loss_class: lossClass,
+      };
+      safeCounter({ metric: DUPLEX_COUNTER_LOSS_TOTAL, dimensions });
+      safeEvent({ name: DUPLEX_TRANSPORT_EVENT, dimensions });
+    },
+    recordSessionLeak(): void {
+      safeCounter({
+        metric: DUPLEX_COUNTER_SESSION_LEAK_TOTAL,
+        dimensions: { provider, transport: "duplex", outcome: "error" },
+      });
+    },
+  };
+}

@@ -38,6 +38,7 @@ import {
   type DuplexResponseFrame,
   type DuplexResponseOutcome,
 } from "./duplex-frame-codec.js";
+import type { DuplexOutcomeValue, DuplexTelemetry } from "./duplex-telemetry.js";
 
 /** The lifecycle states of the broker. The broker moves through them in order. */
 export type DuplexBrokerState = "opening" | "open" | "lost" | "closing" | "closed";
@@ -132,6 +133,13 @@ export interface DuplexBrokerOptions {
   onStateChange?: (state: DuplexBrokerState) => void;
   /** The sink for a diagnostic message. The broker never writes diagnostics to the channel. */
   logger?: (message: string) => void;
+  /**
+   * The fixed observability facade. The broker records one request span per
+   * delivered request and one loss record per terminal loss. The facade maps each
+   * record to the fixed names and dimensions, so no route, query, body, token, or
+   * raw error rides a span or a counter. The default records nothing.
+   */
+  telemetry?: DuplexTelemetry;
 }
 
 /** The broker handle the factory returns. */
@@ -176,6 +184,8 @@ interface PendingRequest {
   responded: boolean;
   forwardTimer: ReturnType<typeof setTimeout>;
   responseTimer: ReturnType<typeof setTimeout>;
+  /** The point the broker started to dispatch the request. It sets the span latency. */
+  dispatchStartMs: number;
 }
 
 /**
@@ -235,12 +245,18 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     // Loss is terminal. Record it one time and stop every activity.
     if (stopped) return;
     stopped = true;
+    // Classify the loss relative to the first dispatch. A loss after the broker
+    // dispatched a request is `post_dispatch`; a loss before any dispatch is
+    // `pre_dispatch`. The class rides the fixed loss counter, never the raw
+    // message.
+    const lossClass = seenRequestIds.size > 0 ? "post_dispatch" : "pre_dispatch";
     clearHeartbeat();
     clearPending();
     lossRecord = { reason, message, atMs: now() };
     setState("lost");
     options.logger?.(`Duplex broker lost the channel (${reason}): ${message}`);
     options.onLoss?.(lossRecord);
+    options.telemetry?.recordLoss(lossClass);
   };
 
   const writeFrame = (frame: DuplexFrame): boolean => {
@@ -257,6 +273,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     id: string,
     result: DuplexBrokerForwardResult,
     outcome: DuplexResponseOutcome,
+    telemetryOutcome: DuplexOutcomeValue,
   ): void => {
     const entry = pending.get(id);
     if (!entry || entry.responded) return;
@@ -267,6 +284,12 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
     // Do not write on a lost or closed channel. The gateway answers its own
     // outstanding request on loss, so a late write would go to a dead channel.
     if (state !== "open") return;
+    // Record the request span for the delivered request. The span carries the
+    // latency and the outcome only; no route, query, body, or token rides it.
+    options.telemetry?.recordRequest({
+      latencyMs: now() - entry.dispatchStartMs,
+      outcome: telemetryOutcome,
+    });
     const frame: DuplexResponseFrame = {
       version: DUPLEX_FRAME_VERSION,
       type: "response",
@@ -317,11 +340,18 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
           }),
         },
         "indeterminate",
+        "error",
       );
     }, budgets.responseBudgetMs);
     forwardTimer.unref?.();
     responseTimer.unref?.();
-    pending.set(frame.id, { controller, responded: false, forwardTimer, responseTimer });
+    pending.set(frame.id, {
+      controller,
+      responded: false,
+      forwardTimer,
+      responseTimer,
+      dispatchStartMs: record.dispatchStartMs,
+    });
 
     forwardRequest(frame, { signal: controller.signal }).then(
       (result) => {
@@ -332,7 +362,10 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
           result.headers?.["x-paperclip-bridge-outcome"] === "indeterminate"
             ? "indeterminate"
             : "completed";
-        respond(frame.id, result, outcome);
+        // The host delivered a real response, so the request span outcome is `ok`.
+        // A host application status (200, a 4xx, a 5xx) is still a delivered
+        // response; only a broker-synthesized failure below is `error`.
+        respond(frame.id, result, outcome, "ok");
       },
       (error) => {
         if (controller.signal.aborted) {
@@ -354,6 +387,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
               }),
             },
             "indeterminate",
+            "error",
           );
           return;
         }
@@ -368,6 +402,7 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
             body: JSON.stringify({ error: errorMessage(error) }),
           },
           "completed",
+          "error",
         );
       },
     );
