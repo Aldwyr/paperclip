@@ -258,6 +258,18 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * The safe HTTP methods. RFC 7231 section 4.2.1 defines this set. A safe method
+ * does not change host state, so the host applies no mutation for it. A caller
+ * can retry a safe method after a forward failure without a double-apply risk.
+ */
+const SAFE_BRIDGE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "TRACE"]);
+
+/** Report whether the method is safe, so a forward failure stays retryable. */
+function isSafeBridgeMethod(method: string): boolean {
+  return SAFE_BRIDGE_METHODS.has(method.trim().toUpperCase());
+}
+
 /** The internal bookkeeping for one in-flight request. */
 interface PendingRequest {
   controller: AbortController;
@@ -535,20 +547,46 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
           );
           return;
         }
-        // A rejection here means the forward never received a host response, so
-        // the host did not start a mutation and a retry is safe. The forward
-        // handler owns the post-response case: it converts a response-read
-        // failure into a resolved indeterminate result, so a possibly-committed
-        // mutation never reaches this branch. Return a 502 with the completed
-        // outcome, so the gateway passes it through as a retryable status.
+        // The forward rejected before the host delivered a response. This
+        // rejection does not prove that the host applied no mutation. A fetch
+        // can reject after the request bytes reach the host and the host
+        // commits, but before the response headers arrive. A safe method never
+        // changes host state, so a retry stays safe for it. For any other
+        // method the host may have committed, so the outcome is indeterminate.
+        if (isSafeBridgeMethod(frame.method)) {
+          // The method is safe, so a retry cannot double-apply a mutation.
+          // Return a 502 with the completed outcome, so the gateway passes it
+          // through as a retryable status.
+          respond(
+            frame.id,
+            {
+              status: 502,
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ error: errorMessage(error) }),
+            },
+            "completed",
+            "error",
+          );
+          return;
+        }
+        // The method may mutate host state, so a retry with a new request id
+        // could apply the mutation twice. Return a non-retryable 504 and mark
+        // the outcome indeterminate, so the gateway maps it to a terminal 409.
         respond(
           frame.id,
           {
-            status: 502,
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ error: errorMessage(error) }),
+            status: 504,
+            headers: {
+              "content-type": "application/json",
+              "x-paperclip-bridge-outcome": "indeterminate",
+            },
+            body: JSON.stringify({
+              error: errorMessage(error),
+              outcome: "indeterminate",
+              retryable: false,
+            }),
           },
-          "completed",
+          "indeterminate",
           "error",
         );
       },

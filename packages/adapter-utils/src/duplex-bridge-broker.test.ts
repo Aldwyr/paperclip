@@ -57,12 +57,12 @@ interface FakeChannelHarness {
 }
 
 /** Build one valid request frame with distinctive, secret-looking fields. */
-function requestFrame(id: string): DuplexRequestFrame {
+function requestFrame(id: string, method = "POST"): DuplexRequestFrame {
   return {
     version: DUPLEX_FRAME_VERSION,
     type: "request",
     id,
-    method: "POST",
+    method,
     path: `/api/issues/${id}`,
     query: "?secret-query=leak",
     headers: { authorization: "Bearer super-secret-provider-token" },
@@ -418,5 +418,75 @@ describe("duplex bridge broker request limits", () => {
     harness.feed(requestFrame("commit-1"));
     expect(harness.forwards.filter((entry) => entry.id === "commit-1")).toHaveLength(1);
     expect(broker.state).toBe("open");
+  });
+
+  it("maps a forward rejection for a mutating method to a non-retryable indeterminate response and retains the id", async () => {
+    const harness = createFakeChannelHarness();
+    const broker = createDuplexBridgeBroker({
+      channel: harness.channel,
+      forwardRequest: controllableForward(harness),
+    });
+    brokers.push(broker);
+    broker.start();
+
+    // The forward rejects before the host delivers a response. A fetch can
+    // reject after the request reaches the host and the host commits, but
+    // before the response headers arrive. The broker did not abort the
+    // forward, so a POST must return a non-retryable indeterminate response.
+    // A retryable status would let a caller repeat a committed mutation.
+    harness.feed(requestFrame("mutate-1", "POST"));
+    const forward = harness.forwards.find((entry) => entry.id === "mutate-1" && !entry.settled);
+    if (!forward) throw new Error("The broker did not forward the request.");
+    forward.settled = true;
+    forward.reject(new Error("fetch failed before the response headers arrived"));
+    // The broker answers inside the forward rejection microtask, so let it settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(harness.responses).toHaveLength(1);
+    const response = harness.responses[0]!;
+    expect(response.status).toBe(504);
+    expect(response.outcome).toBe("indeterminate");
+    expect(response.headers["x-paperclip-bridge-outcome"]).toBe("indeterminate");
+    expect(JSON.parse(response.body)).toEqual({
+      error: "fetch failed before the response headers arrived",
+      outcome: "indeterminate",
+      retryable: false,
+    });
+
+    // The broker delivered a response, so it retained the id. A resend never
+    // reaches the forward a second time, so a caller that ignores the
+    // non-retryable status still cannot repeat the mutation through the broker.
+    harness.feed(requestFrame("mutate-1", "POST"));
+    expect(harness.forwards.filter((entry) => entry.id === "mutate-1")).toHaveLength(1);
+    expect(broker.state).toBe("open");
+  });
+
+  it("maps a forward rejection for a safe method to a retryable response", async () => {
+    const harness = createFakeChannelHarness();
+    const broker = createDuplexBridgeBroker({
+      channel: harness.channel,
+      forwardRequest: controllableForward(harness),
+    });
+    brokers.push(broker);
+    broker.start();
+
+    // A safe method never changes host state, so a retry cannot double-apply a
+    // mutation. A forward rejection for a GET stays retryable: the broker
+    // returns a 502 with the completed outcome, so the gateway passes it through.
+    harness.feed(requestFrame("read-1", "GET"));
+    const forward = harness.forwards.find((entry) => entry.id === "read-1" && !entry.settled);
+    if (!forward) throw new Error("The broker did not forward the request.");
+    forward.settled = true;
+    forward.reject(new Error("fetch failed before the response headers arrived"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(harness.responses).toHaveLength(1);
+    const response = harness.responses[0]!;
+    expect(response.status).toBe(502);
+    expect(response.outcome).toBe("completed");
+    expect(response.headers["x-paperclip-bridge-outcome"]).toBeUndefined();
+    expect(JSON.parse(response.body)).toEqual({
+      error: "fetch failed before the response headers arrived",
+    });
   });
 });
