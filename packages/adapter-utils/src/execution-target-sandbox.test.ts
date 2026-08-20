@@ -15,12 +15,14 @@ import {
 
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetToRemoteSpec,
   adapterExecutionTargetUsesPaperclipBridge,
   ensureAdapterExecutionTargetCommandResolvable,
   formatAdapterExecutionTimeoutErrorMessage,
   formatAdapterExecutionTimeoutStartLogLine,
+  parseAdapterExecutionTarget,
   postedIssueCommentLogMarker,
   resolveAdapterExecutionTargetTimeout,
   resolveAdapterExecutionTargetTimeoutSec,
@@ -4080,5 +4082,66 @@ describe("createDuplexBridgeBroker", () => {
         gatewayWaitMs: 35_000,
       }),
     ).not.toThrow();
+  });
+});
+
+describe("sandbox target spec parse: enableSandboxDuplexBridge", () => {
+  // The minimal serialized sandbox target the host stamps and the adapter parses.
+  // A test overrides one field per case to prove the fail-closed parse.
+  function serializedSandboxTarget(overrides: Record<string, unknown>): Record<string, unknown> {
+    return {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd: "/work",
+      ...overrides,
+    };
+  }
+
+  it("reads the kill switch as a grant when the stamped field is true", () => {
+    const parsed = parseAdapterExecutionTarget(serializedSandboxTarget({ enableSandboxDuplexBridge: true }));
+    expect(parsed?.kind).toBe("remote");
+    if (parsed?.kind !== "remote" || parsed.transport !== "sandbox") {
+      throw new Error("expected a sandbox execution target");
+    }
+    expect(parsed.enableSandboxDuplexBridge).toBe(true);
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(parsed)).toBe(true);
+  });
+
+  it("parses an absent field as no grant", () => {
+    const parsed = parseAdapterExecutionTarget(serializedSandboxTarget({}));
+    if (parsed?.kind !== "remote" || parsed.transport !== "sandbox") {
+      throw new Error("expected a sandbox execution target");
+    }
+    expect(parsed.enableSandboxDuplexBridge).toBe(false);
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(parsed)).toBe(false);
+  });
+
+  it("parses a false field as no grant", () => {
+    const parsed = parseAdapterExecutionTarget(serializedSandboxTarget({ enableSandboxDuplexBridge: false }));
+    if (parsed?.kind !== "remote" || parsed.transport !== "sandbox") {
+      throw new Error("expected a sandbox execution target");
+    }
+    expect(parsed.enableSandboxDuplexBridge).toBe(false);
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(parsed)).toBe(false);
+  });
+
+  it("fails closed on a non-boolean field", () => {
+    // A string "true" is not the literal boolean true, so the parse never reads
+    // it as a grant. This keeps a malformed round-trip on the file bridge.
+    const parsed = parseAdapterExecutionTarget(serializedSandboxTarget({ enableSandboxDuplexBridge: "true" }));
+    if (parsed?.kind !== "remote" || parsed.transport !== "sandbox") {
+      throw new Error("expected a sandbox execution target");
+    }
+    expect(parsed.enableSandboxDuplexBridge).toBe(false);
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(parsed)).toBe(false);
+  });
+
+  it("returns false from the reader for a non-sandbox target", () => {
+    const localTarget = parseAdapterExecutionTarget({ kind: "local", environmentId: "env-1", leaseId: "lease-1" });
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(localTarget)).toBe(false);
+    expect(adapterExecutionTargetEnablesSandboxDuplexBridge(null)).toBe(false);
   });
 });

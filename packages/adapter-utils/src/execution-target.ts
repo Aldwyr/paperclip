@@ -144,6 +144,14 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * narrowing, then attaches it here. Absent when no snapshot was resolved.
    */
   readonly effectiveCapabilities?: EffectiveSandboxCapabilities | null;
+  /**
+   * Per-run duplex bridge kill switch. The host stamps it on the same seam as
+   * `effectiveCapabilities`. `true` selects the duplex transport only when the
+   * capability `duplexCommandStream` is also `true`; any other value keeps the
+   * file bridge. The value stays on the host and never enters the sandbox
+   * environment. Absent means no grant.
+   */
+  readonly enableSandboxDuplexBridge?: boolean;
   shellCommand?: "bash" | "sh" | null;
   environmentId?: string | null;
   leaseId?: string | null;
@@ -331,6 +339,22 @@ export function adapterExecutionTargetUsesManagedHome(
   target: AdapterExecutionTarget | null | undefined,
 ): boolean {
   return target?.kind === "remote" && target.transport === "sandbox";
+}
+
+/**
+ * Read the per-run duplex bridge kill switch off a target. Only a sandbox
+ * target with `enableSandboxDuplexBridge` set to `true` returns `true`. Every
+ * other target and every other value returns `false`, so the caller fails
+ * closed to the file bridge.
+ */
+export function adapterExecutionTargetEnablesSandboxDuplexBridge(
+  target: AdapterExecutionTarget | null | undefined,
+): boolean {
+  return (
+    target?.kind === "remote" &&
+    target.transport === "sandbox" &&
+    target.enableSandboxDuplexBridge === true
+  );
 }
 
 export function adapterExecutionTargetRemoteCwd(
@@ -1158,6 +1182,9 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
       remoteCwd,
       timeoutMs: typeof parsed.timeoutMs === "number" ? parsed.timeoutMs : null,
       streamRunLogs: typeof parsed.streamRunLogs === "boolean" ? parsed.streamRunLogs : null,
+      // Fail closed: only the literal `true` reads as a grant. An absent field
+      // or any other value parses as no grant, so a round-trip never invents one.
+      enableSandboxDuplexBridge: parsed.enableSandboxDuplexBridge === true,
       ...(effectiveCapabilities ? { effectiveCapabilities } : {}),
     };
   }
