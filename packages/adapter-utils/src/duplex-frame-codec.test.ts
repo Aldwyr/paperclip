@@ -128,6 +128,49 @@ describe("round-trip", () => {
   }
 });
 
+describe("ready frame schema", () => {
+  // READY is a liveness signal, not an address source. The strict schema holds
+  // exactly the frame version and the nonce.
+  it("accepts a READY frame that carries exactly the version and the nonce", () => {
+    const result = decodeDuplexLine(
+      JSON.stringify({ version: DUPLEX_FRAME_VERSION, type: "ready", nonce: "a1b2c3d4e5f6a7b8" }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.frame).toEqual({
+        version: DUPLEX_FRAME_VERSION,
+        type: "ready",
+        nonce: "a1b2c3d4e5f6a7b8",
+      });
+    }
+  });
+
+  it.each([
+    { name: "an absent nonce", frame: { version: DUPLEX_FRAME_VERSION, type: "ready" } },
+    {
+      name: "a wrong-typed nonce",
+      frame: { version: DUPLEX_FRAME_VERSION, type: "ready", nonce: 42 },
+    },
+    {
+      name: "an extra address field",
+      frame: {
+        version: DUPLEX_FRAME_VERSION,
+        type: "ready",
+        nonce: "a1b2c3d4e5f6a7b8",
+        address: "http://127.0.0.1:47215",
+      },
+    },
+    {
+      name: "an extra port field",
+      frame: { version: DUPLEX_FRAME_VERSION, type: "ready", nonce: "a1b2c3d4e5f6a7b8", port: 47215 },
+    },
+  ])("rejects a READY frame with $name", ({ frame }) => {
+    const result = decodeDuplexLine(JSON.stringify(frame));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("malformed_frame");
+  });
+});
+
 describe("streaming decoder behavior", () => {
   it("emits nothing until a full line arrives, then the complete frame", () => {
     const decoder = new DuplexFrameDecoder();

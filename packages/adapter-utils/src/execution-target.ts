@@ -2,10 +2,11 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
+  type CommandManagedDuplexChannel,
   type CommandManagedRuntimeAsset,
   type CommandManagedRuntimeRunner,
 } from "./command-managed-runtime.js";
@@ -23,20 +24,33 @@ export type {
   SandboxAdditionalSource,
 } from "./sandbox-managed-runtime.js";
 import {
+  authorizeSandboxCallbackBridgeRequestWithRoutes,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
+  SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
+  SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   sandboxCallbackBridgeDirectories,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
   syncRemoteTextFileWithHashSkip,
+  syncSandboxCallbackBridgeEntrypoint,
 } from "./sandbox-callback-bridge.js";
 import {
   createSandboxRunLogTailFactory,
   type SandboxRunLogTailFactory,
 } from "./sandbox-run-log-stream.js";
-import { DEFAULT_DUPLEX_BROKER_BUDGETS } from "./duplex-bridge-broker.js";
+import {
+  createDuplexBridgeBroker,
+  DEFAULT_DUPLEX_BROKER_BUDGETS,
+  type DuplexBridgeBroker,
+  type DuplexBrokerForwardResult,
+} from "./duplex-bridge-broker.js";
+import {
+  decodeDuplexLine,
+  type DuplexRequestFrame,
+} from "./duplex-frame-codec.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
   ensureCommandResolvable,
@@ -2185,6 +2199,226 @@ child.on("close", (code, signal) => void writeEvent({ type: "exit", code, signal
 ${PROCESS_SESSION_STDIN_POLL_TAIL}`;
 }
 
+/** The default deadline for the duplex readiness handshake, in milliseconds. */
+const DEFAULT_DUPLEX_READINESS_TIMEOUT_MS = 10_000;
+
+/** The default bounded budget to close a partial duplex channel, in milliseconds. */
+const DEFAULT_DUPLEX_CLEANUP_BUDGET_MS = 2_000;
+
+/**
+ * Reserve a loopback port the host assigns to the duplex gateway. The host binds
+ * an ephemeral listener on `127.0.0.1`, reads the port the operating system
+ * chose, then closes the listener. The number is very likely free when the
+ * gateway binds it a moment later. The gateway binds exactly this port or exits
+ * nonzero, so a taken port fails closed to the file bridge and never steers the
+ * endpoint.
+ */
+async function reserveHostAssignedLoopbackPort(): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close(() => reject(new Error("Could not reserve a loopback port for the duplex gateway.")));
+        return;
+      }
+      const reserved = address.port;
+      probe.close(() => resolve(reserved));
+    });
+  });
+}
+
+/**
+ * Build the argument vector that launches the duplex gateway in the sandbox. The
+ * host passes the assigned port and the per-open nonce only through the launch
+ * environment, so the argument vector sets them as environment assignments in
+ * front of the node command. No addressing data comes from the channel.
+ */
+function buildDuplexGatewayLaunchArgv(input: {
+  shellCommand: "bash" | "sh";
+  remoteEntrypoint: string;
+  nodeCommand?: string | null;
+  env: Record<string, string>;
+}): string[] {
+  const assignments = Object.entries(input.env)
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(" ");
+  const nodeCommand = input.nodeCommand?.trim() || "node";
+  const script = `exec ${assignments} ${shellQuote(nodeCommand)} ${shellQuote(input.remoteEntrypoint)}`;
+  return [input.shellCommand, ...shellCommandArgs(script)];
+}
+
+/** The reason the duplex readiness handshake did not pass. */
+type DuplexReadinessFailure =
+  | "protocol_contamination"
+  | "nonce_mismatch"
+  | "channel_exit"
+  | "timeout";
+
+/** The outcome of the duplex readiness handshake. */
+type DuplexReadinessResult =
+  | { ok: true }
+  | { ok: false; reason: DuplexReadinessFailure };
+
+/**
+ * The duplex readiness gate. The gate owns the single data listener and the
+ * single exit listener of the channel while the host waits for a valid READY
+ * frame. It resolves the handshake, then hands the channel to the broker.
+ *
+ * Readiness passes only when the first non-empty line is a valid versioned READY
+ * frame with the matching nonce and no address data. Any earlier decode failure,
+ * any earlier non-READY frame, a mismatched nonce, an early exit, or a timeout
+ * fails the handshake. The gate never dispatches a request; the broker does that
+ * after readiness passes.
+ */
+interface DuplexReadinessGate {
+  /** Resolves with the handshake outcome. It never rejects. */
+  readonly ready: Promise<DuplexReadinessResult>;
+  /**
+   * The channel view the broker consumes after readiness passes. It replays the
+   * bytes that followed the READY frame, then forwards each later chunk and the
+   * exit. The gate keeps one real data listener, so the broker never double-binds
+   * the channel.
+   */
+  readonly brokerChannel: CommandManagedDuplexChannel;
+}
+
+function createDuplexReadinessGate(
+  channel: CommandManagedDuplexChannel,
+  options: { nonce: string; timeoutMs: number },
+): DuplexReadinessGate {
+  let settled = false;
+  let readyOk = false;
+  // The raw bytes the host reads before the READY frame completes.
+  let buffer = "";
+  // The bytes that followed the READY frame, held until the broker binds.
+  let pending = "";
+  // The exit that arrived after READY but before the broker bound, if any.
+  let pendingExit: { exitCode: number | null } | null = null;
+  let dataSink: ((chunk: string) => void) | null = null;
+  let exitSink: ((exit: { exitCode: number | null }) => void) | null = null;
+  let resolveReady!: (result: DuplexReadinessResult) => void;
+  const ready = new Promise<DuplexReadinessResult>((resolve) => {
+    resolveReady = resolve;
+  });
+
+  const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), options.timeoutMs);
+  timer.unref?.();
+
+  function finish(result: DuplexReadinessResult): void {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (result.ok) readyOk = true;
+    resolveReady(result);
+  }
+
+  channel.onData((chunk) => {
+    if (dataSink) {
+      dataSink(chunk);
+      return;
+    }
+    if (readyOk) {
+      // READY already passed; hold the bytes until the broker binds.
+      pending += chunk;
+      return;
+    }
+    buffer += chunk;
+    for (;;) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) return;
+      const line = buffer.slice(0, newlineIndex);
+      const rest = buffer.slice(newlineIndex + 1);
+      if (line.length === 0) {
+        // Skip a leading blank line, the same as the frame decoder.
+        buffer = rest;
+        continue;
+      }
+      const decoded = decodeDuplexLine(line);
+      if (!decoded.ok || decoded.frame.type !== "ready") {
+        // The first frame before READY must be a valid READY frame. Anything
+        // else is protocol contamination.
+        finish({ ok: false, reason: "protocol_contamination" });
+        return;
+      }
+      if (decoded.frame.nonce !== options.nonce) {
+        finish({ ok: false, reason: "nonce_mismatch" });
+        return;
+      }
+      pending = rest;
+      finish({ ok: true });
+      return;
+    }
+  });
+
+  channel.onExit((exit) => {
+    if (exitSink) {
+      exitSink(exit);
+      return;
+    }
+    if (readyOk) {
+      // The channel exited after READY but before the broker bound. Hold the
+      // exit so the broker still learns of the loss.
+      pendingExit = exit;
+      return;
+    }
+    finish({ ok: false, reason: "channel_exit" });
+  });
+
+  const brokerChannel: CommandManagedDuplexChannel = {
+    write: (data: string) => channel.write(data),
+    onData: (listener: (chunk: string) => void) => {
+      dataSink = listener;
+      if (pending.length > 0) {
+        const replay = pending;
+        pending = "";
+        listener(replay);
+      }
+    },
+    onExit: (listener: (exit: { exitCode: number | null }) => void) => {
+      exitSink = listener;
+      if (pendingExit) {
+        const exit = pendingExit;
+        pendingExit = null;
+        listener(exit);
+      }
+    },
+    stop: () => channel.stop(),
+    close: () => channel.close(),
+  };
+
+  return { ready, brokerChannel };
+}
+
+/**
+ * Close a partial duplex channel inside a bounded budget, then stop the child.
+ * The host runs this on any readiness failure, so a failed duplex attempt leaves
+ * no live provider session before the fallback to the file bridge.
+ */
+async function closeDuplexChannelWithinBudget(
+  channel: CommandManagedDuplexChannel,
+  budgetMs: number,
+): Promise<void> {
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, budgetMs);
+      timer.unref?.();
+    });
+    await Promise.race([channel.close().catch(() => undefined), budget]);
+    if (timer !== undefined) clearTimeout(timer);
+  } catch {
+    // Best effort: the stop below still removes the child.
+  } finally {
+    try {
+      channel.stop();
+    } catch {
+      // The channel is already gone; nothing more to do.
+    }
+  }
+}
+
 export async function startAdapterExecutionTargetPaperclipBridge(input: {
   runId: string;
   target: AdapterExecutionTarget | null | undefined;
@@ -2200,6 +2434,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // in `DEFAULT_DUPLEX_BROKER_BUDGETS` (30 s), so the current behavior does not
   // change when the caller sets no option.
   forwardTimeoutMs?: number | null;
+  // The first strict gate for the duplex transport. The host selects duplex only
+  // when this is exactly `true` and the resolved capability
+  // `duplexCommandStream` is exactly `true`. Any other value of either gate
+  // selects the file bridge. The caller reads this from the experimental instance
+  // setting `enableSandboxDuplexBridge`. The default is the file bridge.
+  enableSandboxDuplexBridge?: boolean | null;
+  // The deadline for the duplex readiness handshake, in milliseconds. On a
+  // timeout the host closes the partial channel and selects the file bridge. The
+  // default is `DEFAULT_DUPLEX_READINESS_TIMEOUT_MS`.
+  duplexReadinessTimeoutMs?: number | null;
   // Return the current-run parent-context token. The factory threads it into the
   // callback bridge worker, which reads it per request so each request
   // `sandbox.exec` span parents to the live run span. When it is absent, the
@@ -2267,6 +2511,201 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   );
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
+
+  // PAPERCLIP_BRIDGE_DEBUG opts into verbose stdout logs of every bridge proxy
+  // request/response. The query string is logged verbatim, so callers who pass
+  // auth tokens or other sensitive values as query parameters should be aware
+  // those values appear in the host process's stdout when this flag is enabled.
+  // Only intended for active debugging in trusted environments.
+  const bridgeDebugEnabled = isBridgeDebugEnabled(process.env);
+
+  // One forward of a relayed sandbox request onto the existing Paperclip API
+  // path. The forward applies the real host token and the signed run id, so the
+  // token replacement and the run attribution stay in one place for both the
+  // file bridge and the duplex broker. The sandbox request carries only the
+  // bridge token; the real agent token never leaves the host.
+  const forwardBridgeRequest = async (
+    request: { method: string; path: string; query: string; headers: Record<string, string>; body: string },
+    signal?: AbortSignal,
+  ): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
+    const method = request.method.trim().toUpperCase() || "GET";
+    if (bridgeDebugEnabled) {
+      await onLog(
+        "stdout",
+        `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+      );
+    }
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(request.headers)) {
+      if (value.trim().length === 0) continue;
+      headers.set(key, value);
+    }
+    headers.set("authorization", `Bearer ${hostApiToken}`);
+    headers.set("x-paperclip-run-id", input.runId);
+    // Abort the forward when the caller aborts the request (its per-iteration
+    // timeout or watchdog fired, or the broker's forward budget ended), or after
+    // the forward budget here, whichever comes first.
+    const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
+    const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
+      method,
+      headers,
+      ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
+      signal: forwardSignal,
+    });
+    if (bridgeDebugEnabled) {
+      await onLog(
+        "stdout",
+        `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+      );
+    }
+    const responseBody = await readBridgeForwardResponseBody(response, maxBodyBytes);
+    const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
+    if (commentMarker) await onLog("stdout", commentMarker);
+    return {
+      status: response.status,
+      headers: buildBridgeResponseHeaders(response),
+      body: responseBody,
+    };
+  };
+
+  // Two strict gates guard the duplex transport. Select duplex only when the
+  // experimental setting is exactly `true`, the resolved capability
+  // `duplexCommandStream` is exactly `true`, and the runner exposes the duplex
+  // channel. Any other value of either gate selects the file bridge below.
+  const duplexRequested = input.enableSandboxDuplexBridge === true;
+  const capabilityGranted =
+    "effectiveCapabilities" in target &&
+    target.effectiveCapabilities?.duplexCommandStream === true;
+  const openDuplexChannel = runner.openDuplexChannel?.bind(runner);
+  if (duplexRequested && capabilityGranted && typeof openDuplexChannel === "function") {
+    const readinessTimeoutMs =
+      typeof input.duplexReadinessTimeoutMs === "number" &&
+      Number.isFinite(input.duplexReadinessTimeoutMs) &&
+      input.duplexReadinessTimeoutMs > 0
+        ? Math.trunc(input.duplexReadinessTimeoutMs)
+        : DEFAULT_DUPLEX_READINESS_TIMEOUT_MS;
+
+    // The host assigns the loopback port before it opens the channel. It passes
+    // the port and one random per-open nonce to the gateway only through the
+    // launch environment. It builds the sandbox-facing origin from its own
+    // stored port. No field of any channel frame contributes to the endpoint.
+    //
+    // Provider-boundary rationale (a security-review condition): the Daytona SDK
+    // surface the plugin uses (`sandbox.process` sessions, PTY, and exec;
+    // `sandbox.fs`) exposes no listener identity that the provider control plane
+    // binds to a launched process. No channel-supplied address can be attested,
+    // so this design uses zero channel-supplied addressing data. The only actor
+    // that can pre-bind the host-assigned loopback port before the agent starts
+    // is the provider itself, which already delivers the agent launch
+    // environment. The gateway bind-or-exit contract fails closed. This is an
+    // accepted provider-untrusted residual, not endpoint authentication: the
+    // nonce is a liveness signal, because a compromised channel can read the
+    // launch environment; the endpoint stays safe because it never derives from
+    // the channel.
+    const assignedPort = await reserveHostAssignedLoopbackPort();
+    const nonce = randomBytes(16).toString("hex");
+    const sandboxOrigin = `http://127.0.0.1:${assignedPort}`;
+
+    let channel: CommandManagedDuplexChannel | null = null;
+    try {
+      const assetSync = await syncSandboxCallbackBridgeEntrypoint({
+        runner,
+        remoteCwd: target.remoteCwd,
+        assetRemoteDir,
+        bridgeAsset,
+        timeoutMs: bridgeTimeoutMs,
+        shellCommand,
+      });
+      const gatewayEnv: Record<string, string> = {
+        PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
+        PAPERCLIP_BRIDGE_TOKEN: bridgeToken,
+        PAPERCLIP_BRIDGE_HOST: "127.0.0.1",
+        PAPERCLIP_BRIDGE_PORT: String(assignedPort),
+        PAPERCLIP_BRIDGE_NONCE: nonce,
+        PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(maxBodyBytes),
+      };
+      const command = buildDuplexGatewayLaunchArgv({
+        shellCommand,
+        remoteEntrypoint: assetSync.remoteEntrypoint,
+        env: gatewayEnv,
+      });
+      channel = await openDuplexChannel({ command });
+    } catch (error) {
+      // The channel never opened, so no request could carry the bridge token.
+      // Fall through to the file bridge below.
+      if (channel) await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+      await onLog(
+        "stderr",
+        `[paperclip] Could not open the sandbox duplex channel: ${error instanceof Error ? error.message : String(error)}. Using the file bridge.\n`,
+      );
+      channel = null;
+    }
+
+    if (channel) {
+      const gate = createDuplexReadinessGate(channel, { nonce, timeoutMs: readinessTimeoutMs });
+      const readiness = await gate.ready;
+      if (!readiness.ok) {
+        // Fail closed. Close the partial channel inside a bounded budget, then
+        // select the file bridge. The broker never started, so no request that
+        // carries the bridge token reached the channel or any endpoint.
+        await closeDuplexChannelWithinBudget(channel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+        await onLog(
+          "stderr",
+          `[paperclip] Sandbox duplex readiness failed (${readiness.reason}). Using the file bridge.\n`,
+        );
+      } else {
+        // Readiness passed. Start the broker on the handed-off channel. The
+        // broker enforces the same route allowlist as the file bridge, then
+        // forwards each request with the real token and the run id. The agent
+        // environment below receives the bridge URL and token only now, after
+        // readiness passed.
+        const broker: DuplexBridgeBroker = createDuplexBridgeBroker({
+          channel: gate.brokerChannel,
+          budgets: { forwardTimeoutMs },
+          forwardRequest: async (
+            request: DuplexRequestFrame,
+            options: { signal: AbortSignal },
+          ): Promise<DuplexBrokerForwardResult> => {
+            const denialReason = authorizeSandboxCallbackBridgeRequestWithRoutes(request);
+            if (denialReason) {
+              return {
+                status: 403,
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ error: denialReason }),
+              };
+            }
+            return forwardBridgeRequest(request, options.signal);
+          },
+          logger: (message) => {
+            void onLog("stderr", `[paperclip] ${message}\n`);
+          },
+        });
+        broker.start();
+        await onLog(
+          "stdout",
+          "[paperclip] Sandbox duplex transport ready; serving the host-assigned origin.\n",
+        );
+        return {
+          env: {
+            PAPERCLIP_API_URL: sandboxOrigin,
+            PAPERCLIP_API_KEY: bridgeToken,
+            PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
+          },
+          runLogTail: null,
+          stop: async () => {
+            // Close the channel before lease release. The broker sends an orderly
+            // close and releases the route, then stops the child, so no live
+            // provider session remains when the caller releases the lease.
+            await broker.close();
+            broker.stop();
+            await bridgeAsset.cleanup();
+          },
+        };
+      }
+    }
+  }
+
   let server: Awaited<ReturnType<typeof startSandboxCallbackBridgeServer>> | null = null;
   let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | null = null;
   try {
@@ -2276,13 +2715,6 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       shellCommand,
     });
-    // PAPERCLIP_BRIDGE_DEBUG opts into verbose stdout logs of every bridge
-    // proxy request/response. The query string is logged verbatim, so callers
-    // who pass auth tokens or other sensitive values as query parameters
-    // should be aware those values appear in the host process's stdout when
-    // this flag is enabled. Only intended for active debugging in trusted
-    // environments.
-    const bridgeDebugEnabled = isBridgeDebugEnabled(process.env);
     // `startSandboxCallbackBridgeWorker` keeps its awaited queue-directory
     // setup on the active `bridge.paperclip` step, and runs each request under
     // the run parent context (see `runWithRuntimeParent` inside that function).
@@ -2294,50 +2726,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
-      handleRequest: async (request, options) => {
-        const method = request.method.trim().toUpperCase() || "GET";
-        if (bridgeDebugEnabled) {
-          await onLog(
-            "stdout",
-            `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
-          );
-        }
-        const headers = new Headers();
-        for (const [key, value] of Object.entries(request.headers)) {
-          if (value.trim().length === 0) continue;
-          headers.set(key, value);
-        }
-        headers.set("authorization", `Bearer ${hostApiToken}`);
-        headers.set("x-paperclip-run-id", input.runId);
-        // Abort the forward when the worker aborts the request (its per-iteration
-        // timeout or watchdog fired), or after the forward budget, whichever comes
-        // first. The worker abort lets the bridge fail a hung forward fast
-        // instead of stranding the request until the forward budget.
-        const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
-        const forwardSignal = options?.signal
-          ? AbortSignal.any([options.signal, timeoutSignal])
-          : timeoutSignal;
-        const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), {
-          method,
-          headers,
-          ...(method === "GET" || method === "HEAD" ? {} : { body: request.body }),
-          signal: forwardSignal,
-        });
-        if (bridgeDebugEnabled) {
-          await onLog(
-            "stdout",
-            `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
-          );
-        }
-        const responseBody = await readBridgeForwardResponseBody(response, maxBodyBytes);
-        const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
-        if (commentMarker) await onLog("stdout", commentMarker);
-        return {
-          status: response.status,
-          headers: buildBridgeResponseHeaders(response),
-          body: responseBody,
-        };
-      },
+      handleRequest: async (request, options) => forwardBridgeRequest(request, options?.signal),
     });
     server = await startSandboxCallbackBridgeServer({
       runner,

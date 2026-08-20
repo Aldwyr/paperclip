@@ -67,13 +67,18 @@ export interface DuplexResponseFrame {
 }
 
 /**
- * The READY control frame. The gateway sends it one time after it validates its
- * local listener address. The `address` field carries that validated address.
+ * The READY control frame. The gateway sends it one time after it binds the
+ * host-assigned listener port. READY is a liveness signal, not an address
+ * source. The frame carries exactly the frame version and the `nonce` string.
+ * The gateway echoes the nonce the host passed through the launch environment,
+ * so the host correlates the READY frame with this channel open. The frame
+ * carries no address data; the host builds the endpoint from its own stored
+ * port, never from the channel.
  */
 export interface DuplexReadyFrame {
   version: number;
   type: "ready";
-  address: string;
+  nonce: string;
 }
 
 /** The heartbeat control frame. Each side sends it on an interval to prove liveness. */
@@ -238,8 +243,17 @@ function validateResponse(frame: Record<string, unknown>): DuplexDecodeResult {
 }
 
 function validateReady(frame: Record<string, unknown>): DuplexDecodeResult {
-  if (typeof frame.address !== "string") {
-    return fail("malformed_frame", "ready frame has a missing or wrong-typed address");
+  // READY carries a liveness nonce, not an address. The schema is strict: a valid
+  // READY frame holds exactly `version`, `type`, and `nonce`. The decoder rejects
+  // an absent nonce, a wrong-typed nonce, or any extra field, so a READY frame
+  // that smuggles an `address`, a `port`, a `host`, or a URL never decodes.
+  if (typeof frame.nonce !== "string") {
+    return fail("malformed_frame", "ready frame has a missing or wrong-typed nonce");
+  }
+  for (const key of Object.keys(frame)) {
+    if (key !== "version" && key !== "type" && key !== "nonce") {
+      return fail("malformed_frame", "ready frame has an unexpected field");
+    }
   }
   return ok(frame as unknown as DuplexReadyFrame);
 }
