@@ -886,7 +886,6 @@ export function App() {
           {embeddedEval.navigation.previous ? <a href={embeddedEval.navigation.previous.href}>← {embeddedEval.navigation.previous.label}</a> : <span />}
           <strong>{embeddedEval.passed ? "PASS" : "FAIL"} · {embeddedEval.attemptId}</strong>
           {embeddedEval.navigation.next ? <a href={embeddedEval.navigation.next.href}>{embeddedEval.navigation.next.label} →</a> : <span />}
-          <button type="button" className="pit-button" aria-expanded={panelOpen} onClick={() => setPanelOpen((open) => !open)}><Icon name="evidence" /> {panelOpen ? "Close DevTools" : "Open DevTools"}</button>
         </nav>
       ) : null}
 
@@ -1125,7 +1124,7 @@ export function App() {
           <EvidencePanel
             snapshot={snapshot}
             evalReport={embeddedEval}
-            {...(route.mode === "live" && historicSessionId === null ? { devtools } : {})}
+            {...(embeddedEval !== null || (route.mode === "live" && historicSessionId === null) ? { devtools } : {})}
             onForkRevision={(revision) => {
               abandonTurn();
               setActionError(null);
