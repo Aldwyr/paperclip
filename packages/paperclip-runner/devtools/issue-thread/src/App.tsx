@@ -24,7 +24,7 @@ import {
 } from "./live-client";
 import { parseCapabilityRoute, capabilityRouteHref, type CapabilityRoute } from "./route";
 import { SurfaceNav, type CapabilityChatHistoryItem } from "./SurfaceNav";
-import { TurnGroup } from "./ThreadItems";
+import { TurnGroup, type EvalAssertion } from "./ThreadItems";
 
 const PANEL_OPEN_KEY = "paperclip-runner.capability.panel.open";
 /**
@@ -54,6 +54,7 @@ interface EmbeddedEvalCheck {
   id: string;
   passed: boolean;
   detail: string;
+  anchor: { kind: "item" | "turn" | "run"; id: string };
 }
 
 interface EmbeddedEvalReport {
@@ -62,6 +63,18 @@ interface EmbeddedEvalReport {
   disposition: string;
   passed: boolean;
   checks: EmbeddedEvalCheck[];
+  run: {
+    model: string;
+    provider: string;
+    sessionId: string;
+    fixtureDigest: string;
+    runnerPackageDigest: string;
+    runnerdDigest: string;
+    startedAt: string;
+    finishedAt: string;
+    initialRevision: number;
+    finalRevision: number;
+  };
   view: CapabilityIssueThreadSnapshot;
 }
 
@@ -824,6 +837,7 @@ export function App() {
       data-session-mode={snapshot.mode}
       data-surface={route.surface}
       data-connection-state={snapshot.connection.state}
+      data-eval-view={embeddedEval !== null}
     >
       {embeddedEval === null ? surfaceNav : null}
 
@@ -864,6 +878,13 @@ export function App() {
             <strong>{embeddedEval.passed ? "PASS" : embeddedEval.disposition.replaceAll("_", " ").toUpperCase()}</strong>
             <code>{embeddedEval.attemptId}</code>
           </div>
+          <dl className="pit-eval-run-facts">
+            <div><dt>Model</dt><dd>{embeddedEval.run.provider}/{embeddedEval.run.model}</dd></div>
+            <div><dt>Session</dt><dd>{embeddedEval.run.sessionId}</dd></div>
+            <div><dt>Duration</dt><dd>{Math.max(0, new Date(embeddedEval.run.finishedAt).getTime() - new Date(embeddedEval.run.startedAt).getTime())} ms</dd></div>
+            <div><dt>Runner</dt><dd>{embeddedEval.run.runnerPackageDigest.slice(0, 20)}…</dd></div>
+            <div><dt>runnerd</dt><dd>{embeddedEval.run.runnerdDigest.slice(0, 20)}…</dd></div>
+          </dl>
           <div className="pit-eval-checks">
             {embeddedEval.checks.map((check) => (
               <span key={check.id} data-passed={check.passed} title={check.detail}>
@@ -974,6 +995,18 @@ export function App() {
               }}
             >
               <div className="pit-thread">
+                {embeddedEval !== null ? (
+                  <>
+                    <div className="pit-eval-boundary" data-phase="fixture">
+                      <strong>Fixture state</strong>
+                      <span>{embeddedEval.run.fixtureDigest} · revision {embeddedEval.run.initialRevision}</span>
+                    </div>
+                    <div className="pit-eval-boundary" data-phase="execution">
+                      <strong>Eval execution begins</strong>
+                      <span>Everything below this line was produced or observed during the run.</span>
+                    </div>
+                  </>
+                ) : null}
                 {snapshot.turns.length === 0 ? (
                   <section className="pit-empty-thread" data-testid="clean-room-empty">
                     <h2>Start a clean-room chat</h2>
@@ -1001,9 +1034,29 @@ export function App() {
                         onRespond: respond,
                         focusInteractionId,
                       }}
+                      assertions={Object.fromEntries(embeddedEval?.checks
+                        .filter((check) => check.anchor.kind === "item")
+                        .map((check) => [check.anchor.id, [{ id: check.id, passed: check.passed, detail: check.detail } satisfies EvalAssertion]]) ?? [])}
+                      terminalAssertions={embeddedEval?.checks
+                        .filter((check) => check.anchor.kind === "turn" && check.anchor.id === turn.id)
+                        .map((check) => ({ id: check.id, passed: check.passed, detail: check.detail })) ?? []}
                     />
                   ))
                 )}
+                {embeddedEval !== null ? (
+                  <div className="pit-eval-boundary" data-phase="post-run">
+                    <strong>Post-run state</strong>
+                    <span>Final mock control-plane revision {embeddedEval.run.finalRevision}</span>
+                    <div className="pit-inline-assertions">
+                      {embeddedEval.checks.filter((check) => check.anchor.kind === "run").map((check) => (
+                        <div key={check.id} data-passed={check.passed}>
+                          <strong>{check.passed ? "✓ PASS" : "✕ FAIL"} · {check.id}</strong>
+                          <span>{check.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </div>
             {showJump ? (

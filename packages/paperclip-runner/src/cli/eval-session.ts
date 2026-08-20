@@ -69,7 +69,7 @@ try {
     turn,
     snapshot,
     devtools: projectCapabilityDevtools(snapshot),
-    issueThread: projectCapabilityIssueThread({ snapshot, mode: "replay", replaySource: "live" }),
+    issueThread: projectCapabilityIssueThread({ snapshot, mode: "live", replaySource: "live" }),
     usage,
   }, null, 2)}\n`);
 } catch (error) {

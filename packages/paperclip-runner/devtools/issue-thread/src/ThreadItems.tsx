@@ -10,6 +10,26 @@ import type {
 import { InteractionCard, type CapabilityInteractionResponse } from "./InteractionCard";
 import { Chip, StatusBadge, Timestamp, formatBytes } from "./primitives";
 
+export interface EvalAssertion {
+  id: string;
+  passed: boolean;
+  detail: string;
+}
+
+function EvalAssertions({ assertions }: { assertions: EvalAssertion[] }) {
+  if (assertions.length === 0) return null;
+  return (
+    <div className="pit-inline-assertions" aria-label="Eval assertions">
+      {assertions.map((assertion) => (
+        <div key={assertion.id} data-passed={assertion.passed}>
+          <strong>{assertion.passed ? "✓ PASS" : "✕ FAIL"} · {assertion.id}</strong>
+          <span>{assertion.detail}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Progressive disclosure budget from contract §3 (T4). */
 const VISIBLE_STRIPS = 3;
 
@@ -349,9 +369,13 @@ function ThreadItemView({
 export function TurnGroup({
   turn,
   callbacks,
+  assertions = {},
+  terminalAssertions = [],
 }: {
   turn: CapabilityThreadTurn;
   callbacks: ThreadCallbacks;
+  assertions?: Record<string, EvalAssertion[]>;
+  terminalAssertions?: EvalAssertion[];
 }) {
   const [showAllStrips, setShowAllStrips] = useState(false);
   const stripIndexes = turn.items
@@ -375,11 +399,12 @@ export function TurnGroup({
           </span>
         ) : null}
       </h2>
-      {turn.items.map((item, index) =>
-        hiddenStripIndexes.has(index) ? null : (
-          <ThreadItemView key={item.id} item={item} callbacks={callbacks} />
-        ),
-      )}
+      {turn.items.map((item, index) => hiddenStripIndexes.has(index) ? null : (
+        <div className="pit-eval-item" key={item.id}>
+          <ThreadItemView item={item} callbacks={callbacks} />
+          <EvalAssertions assertions={assertions[item.id] ?? []} />
+        </div>
+      ))}
       {hiddenStripIndexes.size > 0 ? (
         <button
           type="button"
@@ -389,6 +414,7 @@ export function TurnGroup({
           {hiddenStripIndexes.size} more…
         </button>
       ) : null}
+      <EvalAssertions assertions={terminalAssertions} />
     </section>
   );
 }
