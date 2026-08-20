@@ -72,8 +72,10 @@ export type ToolConnectionAuthKind = "oauth" | "api_key" | "none";
 export type ToolConnectionOwnership = "platform_shared" | "platform_provisioned" | "customer" | "dcr";
 export type ToolConnectionStatus = "draft" | "active" | "disabled" | "archived";
 export type ToolConnectionInstallTargetType = "company" | "agent";
-export type ConnectionGrantKind = "workspace" | "user";
+export type ConnectionGrantKind = "organization" | "user";
 export type ConnectionGrantStatus = "active" | "revoked" | "expired" | "needs_reauthorization";
+export type ToolConnectionCredentialPolicy = "shared" | "per_user" | "per_user_with_fallback";
+export type ConnectionGrantMemberSubjectType = "user";
 export type ToolCredentialPlacement = "header" | "env";
 
 export interface McpConnectionCredentialRef {
@@ -132,6 +134,7 @@ export interface ToolConnection {
   ownership: ToolConnectionOwnership;
   transport: ToolConnectionTransport;
   authKind: ToolConnectionAuthKind;
+  credentialPolicy: ToolConnectionCredentialPolicy;
   status?: ToolConnectionStatus;
   transportConfig: Record<string, unknown>;
   config?: Record<string, unknown>;
@@ -172,6 +175,16 @@ export interface ConnectionGrant {
   lastUsedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  members?: ConnectionGrantMember[];
+}
+
+export interface ConnectionGrantMember {
+  id: string;
+  companyId: string;
+  grantId: string;
+  subjectType: ConnectionGrantMemberSubjectType;
+  subjectId: string;
+  createdAt: Date;
 }
 
 export interface ToolConnectionInstall {
@@ -240,6 +253,7 @@ export type ConnectionTokenSubject = { type: "app" } | { type: "user"; userId: s
 
 export const CONNECTION_RECOVERABLE_ERROR_CODES = [
   "user_authorization_required",
+  "grant_audience_denied",
   "grant_revoked",
   "needs_reauthorization",
   "installation_required",

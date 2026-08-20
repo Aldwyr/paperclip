@@ -4,6 +4,7 @@ import { and, asc, desc, eq, gte, inArray, isNull, lt, max, ne, sql } from "driz
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  connectionGrantMembers,
   connectionGrants,
   connectionTokenIssuances,
   authUsers,
@@ -1070,6 +1071,7 @@ function toConnection(row: typeof toolConnections.$inferSelect): ToolConnection 
     ownership: row.ownership,
     transport: row.transport,
     authKind: row.authKind,
+    credentialPolicy: row.credentialPolicy,
     status: row.status,
     enabled: row.enabled,
     config: row.config ?? {},
@@ -3186,14 +3188,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return row;
   }
 
-  async function ensureDefaultWorkspaceGrant(connection: typeof toolConnections.$inferSelect) {
+  async function ensureDefaultOrganizationGrant(connection: typeof toolConnections.$inferSelect) {
     const [existing] = await db
       .select()
       .from(connectionGrants)
       .where(and(
         eq(connectionGrants.companyId, connection.companyId),
         eq(connectionGrants.connectionId, connection.id),
-        eq(connectionGrants.kind, "workspace"),
+        eq(connectionGrants.kind, "organization"),
         eq(connectionGrants.isDefault, true),
       ))
       .limit(1);
@@ -3203,7 +3205,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .values({
         companyId: connection.companyId,
         connectionId: connection.id,
-        kind: "workspace",
+        kind: "organization",
         credentialSecretRefs: connection.credentialSecretRefs,
         status: "active",
         isDefault: true,
@@ -7953,6 +7955,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         ownership: input.ownership ?? "customer",
         transport,
         authKind: input.authKind ?? "none",
+        credentialPolicy: input.credentialPolicy ?? (input.authKind === "oauth" ? "per_user" : "shared"),
         status: input.status ?? "draft",
         enabled: input.enabled ?? false,
         config,
@@ -7962,7 +7965,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
         createdByUserId: binding.actorType === "user" ? binding.actorId : null,
       }).returning();
-      await ensureDefaultWorkspaceGrant(row);
+      await ensureDefaultOrganizationGrant(row);
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
       return toConnection(row);
@@ -7993,14 +7996,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       if (input.isDefault) {
         await db.update(connectionGrants).set({ isDefault: false, updatedAt: new Date() }).where(and(
           eq(connectionGrants.connectionId, connection.id),
-          eq(connectionGrants.kind, "workspace"),
+          eq(connectionGrants.kind, "organization"),
         ));
       }
       const binding = actorBinding(actor);
       const [grant] = await db.insert(connectionGrants).values({
         companyId: connection.companyId,
         connectionId: connection.id,
-        kind: "workspace",
+        kind: "organization",
         providerTenant: input.providerTenant,
         credentialSecretRefs: input.credentialSecretRefs ?? [],
         status: "active",
@@ -8211,6 +8214,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           transportConfig: isGoogleSheetsConnectionConfig(config) ? config : input.transportConfig ?? config,
           credentialRefs: input.credentialRefs ?? existing.credentialRefs,
           credentialSecretRefs: input.credentialSecretRefs ?? existing.credentialSecretRefs,
+          credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
           updatedAt: new Date(),
         })
         .where(eq(toolConnections.id, connectionId))
@@ -9013,47 +9017,51 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         );
       }
 
-      const subject = input.body.subject ?? { type: "app" as const };
-      if (subject.type === "user" && subject.userId !== runContext.responsibleUserId) {
+      const requestedSubject = input.body.subject;
+      if (requestedSubject?.type === "user" && requestedSubject.userId !== runContext.responsibleUserId) {
         await fail(403, "The agent run cannot act as the requested user", "denied", "subject_not_permitted", {
           connection: { uid: connection.uid },
-          subject,
+          subject: requestedSubject,
         });
       }
 
-      let grant: typeof connectionGrants.$inferSelect;
-      if (subject.type === "user") {
-        const conditions = [
+      const actingUserId = runContext.responsibleUserId;
+      const subject = connection.credentialPolicy === "shared" || !actingUserId
+        ? { type: "app" as const }
+        : { type: "user" as const, userId: actingUserId };
+      let grant: typeof connectionGrants.$inferSelect | undefined;
+      if (connection.credentialPolicy !== "shared" && actingUserId) {
+        [grant] = await db.select().from(connectionGrants).where(and(
           eq(connectionGrants.companyId, connection.companyId),
           eq(connectionGrants.connectionId, connection.id),
           eq(connectionGrants.kind, "user"),
-          eq(connectionGrants.subjectUserId, subject.userId),
-        ];
-        if (input.body.grantId) conditions.push(eq(connectionGrants.id, input.body.grantId));
-        [grant] = await db.select().from(connectionGrants).where(and(...conditions)).limit(1);
-        if (!grant) {
-          await fail(409, "User authorization is required", "denied", "user_authorization_required", {
-            connection: { uid: connection.uid },
-            subject,
-            remediation: { action: "start_authorization" },
-          });
-        }
-      } else if (input.body.grantId) {
-        [grant] = await db.select().from(connectionGrants).where(and(
-          eq(connectionGrants.id, input.body.grantId),
-          eq(connectionGrants.companyId, connection.companyId),
-          eq(connectionGrants.connectionId, connection.id),
-          eq(connectionGrants.kind, "workspace"),
+          eq(connectionGrants.subjectUserId, actingUserId),
         )).limit(1);
-        if (!grant) {
-          await fail(409, "The requested installation is not available", "denied", "installation_required", {
+      }
+      if (!grant && connection.credentialPolicy === "per_user") {
+        await fail(409, "User authorization is required", "denied", "user_authorization_required", {
+          connection: { uid: connection.uid },
+          subject: actingUserId ? { type: "user", userId: actingUserId } : { type: "app" },
+          remediation: { action: "start_authorization" },
+        });
+      }
+      if (!grant) {
+        grant = await ensureDefaultOrganizationGrant(connection);
+      }
+
+      if (grant.kind === "organization") {
+        const audience = await db.select({ subjectId: connectionGrantMembers.subjectId }).from(connectionGrantMembers).where(and(
+          eq(connectionGrantMembers.companyId, connection.companyId),
+          eq(connectionGrantMembers.grantId, grant.id),
+          eq(connectionGrantMembers.subjectType, "user"),
+        ));
+        if (audience.length > 0 && (!actingUserId || !audience.some((member) => member.subjectId === actingUserId))) {
+          await fail(403, "The acting user is not in this grant's audience", "denied", "grant_audience_denied", {
             connection: { uid: connection.uid },
             subject,
-            remediation: { action: "add_installation" },
+            grantId: grant.id,
           });
         }
-      } else {
-        grant = await ensureDefaultWorkspaceGrant(connection);
       }
 
       if (grant.status !== "active") {

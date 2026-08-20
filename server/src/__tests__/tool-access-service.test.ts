@@ -9,6 +9,7 @@ import {
   companies,
   companyMemberships,
   companySecretBindings,
+  connectionGrantMembers,
   connectionGrants,
   connectionTokenIssuances,
   companySecrets,
@@ -800,20 +801,70 @@ describeEmbeddedPostgres("tool access service", () => {
       subject: { type: "user", userId: "someone-else" },
     });
 
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
     const missing = await request(app)
       .post(`/api/agents/me/connections/${encodeURIComponent(connection.uid)}/token`)
       .send({ subject: { type: "user", userId: "user-for-run" } });
     expect(missing.status).toBe(409);
     expect(missing.body).toMatchObject({ code: "user_authorization_required", remediation: { action: "start_authorization" } });
 
-    const service = toolAccessService(db);
-    const grant = await service.addConnectionInstallation(connection.id, { isDefault: false });
-    await service.revokeConnectionGrant(connection.id, grant.id);
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: "user-for-run",
+      status: "revoked",
+      isDefault: false,
+    }).returning();
     const revoked = await request(app)
       .post(`/api/agents/me/connections/${connection.id}/token`)
-      .send({ grantId: grant.id });
+      .send({});
     expect(revoked.status).toBe(409);
     expect(revoked.body).toMatchObject({ code: "grant_revoked", grantId: grant.id });
+  });
+
+  it("enforces organization grant audiences at token mint time", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { connection } = await createBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    const [grant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "organization",
+      credentialSecretRefs: connection.credentialSecretRefs,
+      status: "active",
+      isDefault: true,
+    }).returning();
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: grant!.id,
+      subjectType: "user",
+      subjectId: "user-for-run",
+    });
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ token: "audience-token", expires_in: 600 }),
+    } as Response);
+
+    const allowed = await request(app).post(`/api/agents/me/connections/${connection.id}/token`).send({});
+    expect(allowed.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await db.delete(connectionGrantMembers).where(eq(connectionGrantMembers.grantId, grant!.id));
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: grant!.id,
+      subjectType: "user",
+      subjectId: "sales-user",
+    });
+    const denied = await request(app).post(`/api/agents/me/connections/${connection.id}/token`).send({});
+    expect(denied.status).toBe(403);
+    expect(denied.body).toMatchObject({ code: "grant_audience_denied", grantId: grant!.id });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("returns daily connection usage buckets", async () => {

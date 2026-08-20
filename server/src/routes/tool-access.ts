@@ -224,10 +224,10 @@ export function toolAccessRoutes(
         eq(connectionGrants.connectionId, connection.id),
         eq(connectionGrants.status, "active"),
         or(
-          eq(connectionGrants.kind, "workspace"),
+          eq(connectionGrants.kind, "organization"),
           req.actor.userId
             ? and(eq(connectionGrants.kind, "user"), eq(connectionGrants.subjectUserId, req.actor.userId))
-            : eq(connectionGrants.kind, "workspace"),
+            : eq(connectionGrants.kind, "organization"),
         ),
       ))
       .limit(1);

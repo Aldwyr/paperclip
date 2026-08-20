@@ -12,6 +12,7 @@ import {
   companySecretVersions,
   companyMemberships,
   companies,
+  connectionGrants,
   createDb,
   heartbeatRuns,
   issueThreadInteractions,
@@ -214,6 +215,14 @@ async function createRemoteMcpTool(
     credentialRefs: input.credentialRefs ?? [],
     credentialSecretRefs: input.credentialSecretRefs ?? [],
   }).returning();
+  await db.insert(connectionGrants).values({
+    companyId,
+    connectionId: connection.id,
+    kind: "organization",
+    credentialSecretRefs: connection.credentialSecretRefs,
+    status: "active",
+    isDefault: true,
+  });
   if (input.credentialRefs?.length || input.credentialSecretRefs?.length) {
     await db.insert(companySecretBindings).values([
       ...(input.credentialRefs ?? []).map((ref) => ({
@@ -1624,6 +1633,61 @@ rl.on("line", (line) => {
         activity: await db.select().from(activityLog),
       });
       expect(persisted).not.toContain(credentialValue);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("creates a personal authorization card and resumes after the user grant exists", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await db.update(heartbeatRuns).set({ responsibleUserId: "carol" }).where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "connected" }] },
+      },
+    }));
+    try {
+      const { connection } = await createRemoteMcpTool(db, company.id, {
+        url: fake.url,
+        toolName: "whoami",
+        riskLevel: "read",
+      });
+      await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.providerType === "mcp_remote_http")!;
+
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "user_authorization_required" });
+      const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issue.id));
+      expect(interaction).toMatchObject({
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "human_only",
+        title: `Connect your ${connection.name}`,
+      });
+      expect(interaction!.payload).toMatchObject({
+        prompt: `Connect your ${connection.name} account to continue`,
+        target: { key: `connection:${connection.uid}:user:carol` },
+      });
+
+      await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: connection.id,
+        kind: "user",
+        subjectUserId: "carol",
+        credentialSecretRefs: [],
+        status: "active",
+        isDefault: false,
+      });
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      expect(result).toMatchObject({ status: "completed", result: { content: "connected" } });
+      expect(fake.requests).toHaveLength(1);
     } finally {
       await fake.close();
     }
