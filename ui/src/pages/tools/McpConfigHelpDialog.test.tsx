@@ -149,7 +149,9 @@ describe("Paste a config — MCP config help", () => {
     await flushReact();
     await flushReact();
 
-    expect(document.body.textContent).toContain("select the text above and copy it");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("select the text above and copy it");
+    });
   });
 
   it("makes no connection or import request when opened or copied", async () => {
