@@ -1266,16 +1266,21 @@ textarea {
 .pit-eval-run-facts dt { color: var(--pit-muted-foreground); font-size: var(--pit-text-xs); }
 .pit-eval-run-facts dd { margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--pit-font-mono); font-size: var(--pit-text-xs); }
 .pit-eval-boundary { display: grid; gap: 3px; margin: 14px 0; padding: 10px 12px; border-block: 1px solid var(--pit-border-strong); background: var(--pit-surface-sunken); }
-.pit-eval-boundary[data-phase="execution"] { border-color: var(--pit-live); }
+.pit-eval-boundary[data-phase="execution"] { display: flex; margin: 4px 0; padding: 7px 0; border: 0; border-top: 2px solid var(--pit-live); background: transparent; color: var(--pit-live); }
 .pit-eval-boundary[data-phase="post-run"] { border-color: var(--pit-accent); }
 .pit-eval-boundary span { color: var(--pit-muted-foreground); font-family: var(--pit-font-mono); font-size: var(--pit-text-xs); overflow-wrap: anywhere; }
 .pit-eval-item { display: contents; }
 .pit-inline-assertions { display: grid; gap: 6px; margin: 6px 0 12px; }
-.pit-inline-assertions > div { display: flex; align-items: baseline; gap: 10px; padding: 7px 10px; border-left: 3px solid var(--pit-danger); background: var(--pit-danger-surface); font-size: var(--pit-text-xs); }
-.pit-inline-assertions > div[data-passed="true"] { border-left-color: var(--pit-success); background: var(--pit-success-surface); }
-.pit-inline-assertions > div strong { color: var(--pit-danger); white-space: nowrap; }
-.pit-inline-assertions > div[data-passed="true"] strong { color: var(--pit-success); }
-.pit-inline-assertions > div span { color: var(--pit-muted-foreground); }
+.pit-inline-assertions > button { display: flex; align-items: baseline; gap: 10px; width: 100%; padding: 7px 10px; border: 0; border-left: 3px solid var(--pit-danger); background: var(--pit-danger-surface); color: inherit; text-align: left; cursor: pointer; font-size: var(--pit-text-xs); }
+.pit-inline-assertions > button[data-passed="true"] { border-left-color: var(--pit-success); background: var(--pit-success-surface); }
+.pit-inline-assertions > button strong { color: var(--pit-danger); white-space: nowrap; }
+.pit-inline-assertions > button[data-passed="true"] strong { color: var(--pit-success); }
+.pit-inline-assertions > button span { color: var(--pit-muted-foreground); }
+.pit-inline-assertions > button:hover { filter: brightness(1.12); }
+.pit-eval-inspector .pit-eval-run-facts { grid-template-columns: minmax(0, 1fr); }
+.pit-eval-inspector .pit-eval-run-facts dd { white-space: normal; overflow-wrap: anywhere; }
+.pit-eval-check-dialog { width: min(42rem, 100%); }
+.pit-eval-check-dialog .pit-code { max-height: 22rem; overflow: auto; }
 @media(max-width:900px){.pit-eval-run-facts{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 @keyframes pit-slide {

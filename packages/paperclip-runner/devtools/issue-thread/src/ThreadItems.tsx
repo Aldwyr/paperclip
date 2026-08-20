@@ -12,21 +12,37 @@ import { Chip, StatusBadge, Timestamp, formatBytes } from "./primitives";
 
 export interface EvalAssertion {
   id: string;
+  title: string;
+  description: string;
   passed: boolean;
   detail: string;
+  definition: Record<string, unknown>;
 }
 
-function EvalAssertions({ assertions }: { assertions: EvalAssertion[] }) {
+export function EvalAssertions({ assertions }: { assertions: EvalAssertion[] }) {
+  const [selected, setSelected] = useState<EvalAssertion | null>(null);
   if (assertions.length === 0) return null;
   return (
-    <div className="pit-inline-assertions" aria-label="Eval assertions">
-      {assertions.map((assertion) => (
-        <div key={assertion.id} data-passed={assertion.passed}>
-          <strong>{assertion.passed ? "✓ PASS" : "✕ FAIL"} · {assertion.id}</strong>
-          <span>{assertion.detail}</span>
+    <>
+      <div className="pit-inline-assertions" aria-label="Eval assertions">
+        {assertions.map((assertion) => (
+          <button type="button" key={assertion.id} data-passed={assertion.passed} onClick={() => setSelected(assertion)}>
+            <strong>{assertion.passed ? "✓ PASS" : "✕ FAIL"} · {assertion.title}</strong>
+            <span>{assertion.detail}</span>
+          </button>
+        ))}
+      </div>
+      {selected !== null ? (
+        <div className="pit-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
+          <div className="pit-dialog pit-eval-check-dialog" role="dialog" aria-modal="true" aria-labelledby="eval-check-title">
+            <header className="pit-tool-dialog-head"><div><span className="pit-card-meta">Eval assertion · {selected.id}</span><h2 id="eval-check-title">{selected.title}</h2></div><button type="button" className="pit-icon-button" aria-label="Close assertion" onClick={() => setSelected(null)}>×</button></header>
+            <p>{selected.description}</p>
+            <p className="pit-card-meta">Observed result</p><p>{selected.detail}</p>
+            <p className="pit-card-meta">Original case definition</p><pre className="pit-code">{JSON.stringify(selected.definition, null, 2)}</pre>
+          </div>
         </div>
-      ))}
-    </div>
+      ) : null}
+    </>
   );
 }
 

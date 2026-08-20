@@ -24,7 +24,7 @@ import {
 } from "./live-client";
 import { parseCapabilityRoute, capabilityRouteHref, type CapabilityRoute } from "./route";
 import { SurfaceNav, type CapabilityChatHistoryItem } from "./SurfaceNav";
-import { TurnGroup, type EvalAssertion } from "./ThreadItems";
+import { EvalAssertions, TurnGroup, type EvalAssertion } from "./ThreadItems";
 
 const PANEL_OPEN_KEY = "paperclip-runner.capability.panel.open";
 /**
@@ -52,8 +52,11 @@ const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
 
 interface EmbeddedEvalCheck {
   id: string;
+  title: string;
+  description: string;
   passed: boolean;
   detail: string;
+  definition: Record<string, unknown>;
   anchor: { kind: "item" | "turn" | "run"; id: string };
 }
 
@@ -76,6 +79,7 @@ interface EmbeddedEvalReport {
     finalRevision: number;
   };
   view: CapabilityIssueThreadSnapshot;
+  devtools: CapabilityDevtoolsSnapshot;
 }
 
 declare global {
@@ -238,9 +242,8 @@ export function App() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [loadNonce, setLoadNonce] = useState(0);
   const [settled, setSettled] = useState(false);
-  const [panelOpen, setPanelOpen] = useState(() =>
-    readStoredFlag(route.surface === "chat" ? CHAT_PANEL_OPEN_KEY : PANEL_OPEN_KEY, false),
-  );
+  const [panelOpen, setPanelOpen] = useState(() => embeddedEval !== null ||
+    readStoredFlag(route.surface === "chat" ? CHAT_PANEL_OPEN_KEY : PANEL_OPEN_KEY, false));
   const [panelWidth, setPanelWidth] = useState(() => readStoredNumber(PANEL_WIDTH_KEY, 384));
   const [segment, setSegment] = useState<"thread" | "evidence">(route.segment);
   const [openSections, setOpenSections] = useState<CapabilityEvidenceSectionId[]>(["tools"]);
@@ -287,6 +290,7 @@ export function App() {
         ...embeddedEval.view,
         composer: { state: "disabled", helper: null, reason: "Immutable eval recording", pendingInteractionId: null },
       });
+      setDevtools(embeddedEval.devtools);
       setSnapshotSurface("issue");
     } else if (chat) {
       // The clean room has no fixture fallback: if real Codex and real runnerd
@@ -871,30 +875,6 @@ export function App() {
         onSelectSegment={setSegment}
       />
 
-      {embeddedEval !== null ? (
-        <section className="pit-eval-summary" data-passed={embeddedEval.passed} data-testid="eval-summary">
-          <div className="pit-eval-summary-head">
-            <a href="../../index.html">← Eval suite</a>
-            <strong>{embeddedEval.passed ? "PASS" : embeddedEval.disposition.replaceAll("_", " ").toUpperCase()}</strong>
-            <code>{embeddedEval.attemptId}</code>
-          </div>
-          <dl className="pit-eval-run-facts">
-            <div><dt>Model</dt><dd>{embeddedEval.run.provider}/{embeddedEval.run.model}</dd></div>
-            <div><dt>Session</dt><dd>{embeddedEval.run.sessionId}</dd></div>
-            <div><dt>Duration</dt><dd>{Math.max(0, new Date(embeddedEval.run.finishedAt).getTime() - new Date(embeddedEval.run.startedAt).getTime())} ms</dd></div>
-            <div><dt>Runner</dt><dd>{embeddedEval.run.runnerPackageDigest.slice(0, 20)}…</dd></div>
-            <div><dt>runnerd</dt><dd>{embeddedEval.run.runnerdDigest.slice(0, 20)}…</dd></div>
-          </dl>
-          <div className="pit-eval-checks">
-            {embeddedEval.checks.map((check) => (
-              <span key={check.id} data-passed={check.passed} title={check.detail}>
-                {check.passed ? "✓" : "✕"} {check.id}
-              </span>
-            ))}
-          </div>
-        </section>
-      ) : null}
-
       {actionError !== null ? (
         <p className="pit-banner" data-tone="danger" role="alert" data-testid="action-error">
           <span aria-hidden="true">⚠</span>
@@ -996,16 +976,7 @@ export function App() {
             >
               <div className="pit-thread">
                 {embeddedEval !== null ? (
-                  <>
-                    <div className="pit-eval-boundary" data-phase="fixture">
-                      <strong>Fixture state</strong>
-                      <span>{embeddedEval.run.fixtureDigest} · revision {embeddedEval.run.initialRevision}</span>
-                    </div>
-                    <div className="pit-eval-boundary" data-phase="execution">
-                      <strong>Eval execution begins</strong>
-                      <span>Everything below this line was produced or observed during the run.</span>
-                    </div>
-                  </>
+                  <div className="pit-eval-boundary" data-phase="execution"><strong>Eval execution</strong></div>
                 ) : null}
                 {snapshot.turns.length === 0 ? (
                   <section className="pit-empty-thread" data-testid="clean-room-empty">
@@ -1036,10 +1007,10 @@ export function App() {
                       }}
                       assertions={Object.fromEntries(embeddedEval?.checks
                         .filter((check) => check.anchor.kind === "item")
-                        .map((check) => [check.anchor.id, [{ id: check.id, passed: check.passed, detail: check.detail } satisfies EvalAssertion]]) ?? [])}
+                        .map((check) => [check.anchor.id, [{ ...check } satisfies EvalAssertion]]) ?? [])}
                       terminalAssertions={embeddedEval?.checks
                         .filter((check) => check.anchor.kind === "turn" && check.anchor.id === turn.id)
-                        .map((check) => ({ id: check.id, passed: check.passed, detail: check.detail })) ?? []}
+                        .map((check) => ({ ...check })) ?? []}
                     />
                   ))
                 )}
@@ -1047,14 +1018,7 @@ export function App() {
                   <div className="pit-eval-boundary" data-phase="post-run">
                     <strong>Post-run state</strong>
                     <span>Final mock control-plane revision {embeddedEval.run.finalRevision}</span>
-                    <div className="pit-inline-assertions">
-                      {embeddedEval.checks.filter((check) => check.anchor.kind === "run").map((check) => (
-                        <div key={check.id} data-passed={check.passed}>
-                          <strong>{check.passed ? "✓ PASS" : "✕ FAIL"} · {check.id}</strong>
-                          <span>{check.detail}</span>
-                        </div>
-                      ))}
-                    </div>
+                    <EvalAssertions assertions={embeddedEval.checks.filter((check) => check.anchor.kind === "run")} />
                   </div>
                 ) : null}
               </div>
@@ -1145,6 +1109,7 @@ export function App() {
         {showPanel ? (
           <EvidencePanel
             snapshot={snapshot}
+            evalReport={embeddedEval}
             {...(route.mode === "live" && historicSessionId === null ? { devtools } : {})}
             onForkRevision={(revision) => {
               abandonTurn();

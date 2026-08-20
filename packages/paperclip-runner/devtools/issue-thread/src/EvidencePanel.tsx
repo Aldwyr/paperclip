@@ -10,7 +10,7 @@ import type {
   CapabilityToolDisposition,
 } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
-import { DevtoolsInspector, type CapabilityDevtoolsTab } from "./DevtoolsInspector";
+import { DevtoolsInspector, type CapabilityDevtoolsTab, type EvalInspectorReport } from "./DevtoolsInspector";
 import { Icon } from "./Icons";
 import { capabilitySemanticToolDescriptor } from "../../../src/semantic-tools/catalog";
 import {
@@ -113,6 +113,7 @@ function RunnerEventGroup({ group }: { group: CapabilityRunnerEventGroup }) {
 export interface EvidencePanelProps {
   snapshot: CapabilityIssueThreadSnapshot;
   devtools?: CapabilityDevtoolsSnapshot | null;
+  evalReport?: EvalInspectorReport | null;
   onForkRevision?: (revision: number) => void;
   layout: "side" | "overlay" | "segment";
   width: number;
@@ -330,10 +331,11 @@ function Section({
 }
 
 export function EvidencePanel(props: EvidencePanelProps) {
-  const [devtoolsTab, setDevtoolsTab] = useState<CapabilityDevtoolsTab>("evidence");
+  const [devtoolsTab, setDevtoolsTab] = useState<CapabilityDevtoolsTab>(props.evalReport ? "eval" : "evidence");
   const {
     snapshot,
     devtools,
+    evalReport,
     onForkRevision = () => undefined,
     layout,
     width,
@@ -392,7 +394,7 @@ export function EvidencePanel(props: EvidencePanelProps) {
           {devtools === null ? (
             <p className="pit-muted pit-devtools-loading">Loading company state…</p>
           ) : (
-            <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} tab={devtoolsTab} onTabChange={setDevtoolsTab} />
+            <DevtoolsInspector snapshot={devtools} onFork={onForkRevision} tab={devtoolsTab} onTabChange={setDevtoolsTab} evalReport={evalReport} />
           )}
         </>
       ) : null}

@@ -2,9 +2,19 @@ import { useEffect, useMemo, useState } from "react";
 
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { Icon, type IconName } from "./Icons";
+import { EvalAssertions, type EvalAssertion } from "./ThreadItems";
 
-export type CapabilityDevtoolsTab = "evidence" | "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
+export type CapabilityDevtoolsTab = "eval" | "evidence" | "timeline" | "state" | "diff" | "documents" | "protocol" | "runtime" | "authority";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+export interface EvalInspectorReport {
+  attemptId: string;
+  caseId: string;
+  disposition: string;
+  passed: boolean;
+  checks: EvalAssertion[];
+  run: { model: string; provider: string; sessionId: string; fixtureDigest: string; runnerPackageDigest: string; runnerdDigest: string; startedAt: string; finishedAt: string; initialRevision: number; finalRevision: number };
+}
 
 function JsonTree({ value, name = "root" }: { value: Json; name?: string }) {
   if (value === null || typeof value !== "object") {
@@ -86,7 +96,7 @@ function documentsOf(state: Json): Array<{ id: string; key: string; title: strin
   });
 }
 
-export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange }: { snapshot: CapabilityDevtoolsSnapshot; onFork: (revision: number) => void; tab: CapabilityDevtoolsTab; onTabChange: (tab: CapabilityDevtoolsTab) => void }) {
+export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange, evalReport }: { snapshot: CapabilityDevtoolsSnapshot; onFork: (revision: number) => void; tab: CapabilityDevtoolsTab; onTabChange: (tab: CapabilityDevtoolsTab) => void; evalReport?: EvalInspectorReport | null }) {
   const [query, setQuery] = useState("");
   const latest = snapshot.revisions.at(-1)!;
   const [revision, setRevision] = useState(latest.revision);
@@ -124,10 +134,25 @@ export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange }: { snap
         <button className="pit-button" type="button" onClick={() => onFork(revision)}><Icon name="branch" /> Fork r{revision}</button>
       </div>
       <div className="pit-devtools-tabs" role="tablist" aria-label="Developer tools">
-        {TABS.map(({ id, icon, label }) => (
+        {([...(evalReport ? [{ id: "eval" as const, icon: "evidence" as const, label: "Eval" }] : []), ...TABS]).map(({ id, icon, label }) => (
           <button key={id} type="button" role="tab" aria-selected={tab === id} className="pit-tab" onClick={() => onTabChange(id)}><span className="pit-tab-glyph"><Icon name={icon} /></span><span>{label}</span></button>
         ))}
       </div>
+      {tab === "eval" && evalReport ? (
+        <div className="pit-devtools-pane pit-eval-inspector">
+          <div className="pit-eval-summary-head"><a href="../../index.html">← Eval suite</a><strong>{evalReport.passed ? "PASS" : evalReport.disposition.replaceAll("_", " ").toUpperCase()}</strong><code>{evalReport.attemptId}</code></div>
+          <dl className="pit-eval-run-facts">
+            <div><dt>Model</dt><dd>{evalReport.run.provider}/{evalReport.run.model}</dd></div>
+            <div><dt>Session</dt><dd>{evalReport.run.sessionId}</dd></div>
+            <div><dt>Duration</dt><dd>{Math.max(0, new Date(evalReport.run.finishedAt).getTime() - new Date(evalReport.run.startedAt).getTime())} ms</dd></div>
+            <div><dt>Fixture</dt><dd>{evalReport.run.fixtureDigest}</dd></div>
+            <div><dt>State</dt><dd>r{evalReport.run.initialRevision} → r{evalReport.run.finalRevision}</dd></div>
+            <div><dt>Runner</dt><dd>{evalReport.run.runnerPackageDigest}</dd></div>
+            <div><dt>runnerd</dt><dd>{evalReport.run.runnerdDigest}</dd></div>
+          </dl>
+          <h3>Assertions</h3><EvalAssertions assertions={evalReport.checks} />
+        </div>
+      ) : null}
       {tab === "timeline" ? (
         <div className="pit-devtools-list">
           {revisions.map((entry) => (
