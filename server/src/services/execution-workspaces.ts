@@ -107,6 +107,14 @@ export const EXECUTION_WORKSPACE_REOPEN_FAILED_REASON = "reopen_failed";
 // consumer is gone, not a hard deadline on the request.
 export const STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS = 5 * 60 * 1000;
 
+// A terminal workspace that is clean but not delivered can stay in the active
+// candidate set for a long time. Rechecking that same Git state every scheduler
+// tick does not make archive safer; it only burns subprocesses. Keep cleanup
+// eventual by trying again after this short backoff, or sooner when the row's
+// lifecycle state changes.
+export const TERMINAL_WORKSPACE_REAPER_GIT_BACKOFF_MS = 10 * 60 * 1000;
+const TERMINAL_WORKSPACE_REAPER_GIT_BACKOFF_MAX_ENTRIES = 2000;
+
 // The metadata key that holds the workspace lifecycle generation. The generation
 // is a monotonic integer. Every archive and every reopen increases it by one. A
 // destructive cleanup captures the generation it archived at, then re-reads the
@@ -1295,6 +1303,66 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // removes the upper bound and makes the scan chase newer churn again. This
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
+  const terminalSweepGitBackoffByWorkspaceId = new Map<string, {
+    updatedAtMs: number;
+    lifecycleGeneration: number;
+    cooldownAnchorMs: number | null;
+    skipUntilMs: number;
+  }>();
+
+  function pruneTerminalSweepGitBackoff(nowMs: number) {
+    if (terminalSweepGitBackoffByWorkspaceId.size < TERMINAL_WORKSPACE_REAPER_GIT_BACKOFF_MAX_ENTRIES) return;
+    for (const [workspaceId, entry] of terminalSweepGitBackoffByWorkspaceId) {
+      if (entry.skipUntilMs <= nowMs) {
+        terminalSweepGitBackoffByWorkspaceId.delete(workspaceId);
+      }
+    }
+    while (terminalSweepGitBackoffByWorkspaceId.size >= TERMINAL_WORKSPACE_REAPER_GIT_BACKOFF_MAX_ENTRIES) {
+      const oldestWorkspaceId = terminalSweepGitBackoffByWorkspaceId.keys().next().value;
+      if (!oldestWorkspaceId) break;
+      terminalSweepGitBackoffByWorkspaceId.delete(oldestWorkspaceId);
+    }
+  }
+
+  function rememberTerminalSweepGitBackoff(
+    workspace: ExecutionWorkspaceRow,
+    cooldownAnchor: Date | null,
+  ) {
+    const nowMs = now().getTime();
+    pruneTerminalSweepGitBackoff(nowMs);
+    terminalSweepGitBackoffByWorkspaceId.set(workspace.id, {
+      updatedAtMs: workspace.updatedAt.getTime(),
+      lifecycleGeneration: readExecutionWorkspaceLifecycleGeneration(
+        workspace.metadata as Record<string, unknown> | null,
+      ),
+      cooldownAnchorMs: cooldownAnchor?.getTime() ?? null,
+      skipUntilMs: nowMs + TERMINAL_WORKSPACE_REAPER_GIT_BACKOFF_MS,
+    });
+  }
+
+  function shouldSkipTerminalSweepGitInspection(
+    workspace: ExecutionWorkspaceRow,
+    cooldownAnchor: Date | null,
+  ): boolean {
+    const entry = terminalSweepGitBackoffByWorkspaceId.get(workspace.id);
+    if (!entry) return false;
+    const nowMs = now().getTime();
+    if (entry.skipUntilMs <= nowMs) {
+      terminalSweepGitBackoffByWorkspaceId.delete(workspace.id);
+      return false;
+    }
+    if (
+      entry.updatedAtMs !== workspace.updatedAt.getTime()
+      || entry.lifecycleGeneration !== readExecutionWorkspaceLifecycleGeneration(
+        workspace.metadata as Record<string, unknown> | null,
+      )
+      || entry.cooldownAnchorMs !== (cooldownAnchor?.getTime() ?? null)
+    ) {
+      terminalSweepGitBackoffByWorkspaceId.delete(workspace.id);
+      return false;
+    }
+    return true;
+  }
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -2701,9 +2769,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedActiveRun += 1;
           continue;
         }
+        if (shouldSkipTerminalSweepGitInspection(workspace, cooldownAnchor)) {
+          result.skippedUndelivered += 1;
+          continue;
+        }
         const executionWorkspace = toExecutionWorkspace(workspace);
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
         if (!statusInspectionSucceeded) {
+          rememberTerminalSweepGitBackoff(workspace, cooldownAnchor);
           result.skippedUndelivered += 1;
           continue;
         }
@@ -2713,6 +2786,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           continue;
         }
         if (assessment.workspaceDirty) {
+          rememberTerminalSweepGitBackoff(workspace, cooldownAnchor);
           result.skippedUndelivered += 1;
           continue;
         }
@@ -2720,9 +2794,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           assessment.deliveryState !== "merged_via_pr"
           && assessment.deliveryState !== "merged_by_ancestry"
         ) {
+          rememberTerminalSweepGitBackoff(workspace, cooldownAnchor);
           result.skippedUndelivered += 1;
           continue;
         }
+        terminalSweepGitBackoffByWorkspaceId.delete(workspace.id);
         result.eligible += 1;
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures

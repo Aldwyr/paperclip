@@ -693,6 +693,34 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     }
   }, 20_000);
 
+  it("backs off Git inspection for unchanged undelivered terminal reaper candidates", async () => {
+    await seedTerminalWorkspace();
+    const gitStatusSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+
+    try {
+      const firstSweep = await svc.sweepTerminalWorkspaces();
+
+      expect(firstSweep).toMatchObject({
+        checked: 1,
+        archived: 0,
+        skippedUndelivered: 1,
+      });
+      expect(gitStatusSpy).toHaveBeenCalledTimes(1);
+
+      gitStatusSpy.mockClear();
+      const secondSweep = await svc.sweepTerminalWorkspaces();
+
+      expect(secondSweep).toMatchObject({
+        checked: 1,
+        archived: 0,
+        skippedUndelivered: 1,
+      });
+      expect(gitStatusSpy).not.toHaveBeenCalled();
+    } finally {
+      gitStatusSpy.mockRestore();
+    }
+  }, 20_000);
+
   it("skips a sweep that starts while another sweep runs", async () => {
     // The scheduler can start a second sweep before the first one finishes. The
     // sweeps share the cursor and the boundary. A concurrent sweep must skip
