@@ -135,6 +135,7 @@ function boardRoutes() {
         <Route path="apps" element={<Browse />} />
         <Route path="apps/browse" element={<Navigate to="/apps" replace />} />
         <Route path="apps/connections" element={<Connections />} />
+        <Route path="apps/byo" element={<AppsConnect byoOnly />} />
         <Route path="apps/connect" element={<AppsConnectEntryRoute />} />
         <Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />
         <Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />

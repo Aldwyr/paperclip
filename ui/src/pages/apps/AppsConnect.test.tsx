@@ -173,13 +173,13 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     vi.clearAllMocks();
   });
 
-  async function render(queryClient?: QueryClient) {
+  async function render(queryClient?: QueryClient, byoOnly = false) {
     const root = createRoot(container);
     const client = queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
-          <AppsConnect />
+          <AppsConnect byoOnly={byoOnly} />
         </QueryClientProvider>,
       );
     });
@@ -187,6 +187,23 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
     return root;
   }
+
+  it("shows only the paste-first connection choices on the BYO page", async () => {
+    await render(undefined, true);
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Connect your own MCP server");
+    expect(text).toContain("More ways to connect");
+    expect(text).toContain("Run your own");
+    expect(text).toContain("Paste a config");
+    expect(text).not.toContain("Search apps…");
+    expect(text).not.toContain("Pick the app you want your agents to use.");
+    expect(text).not.toContain("Zapier");
+
+    const urlInput = container.querySelector<HTMLInputElement>('input[aria-label="MCP server URL"]');
+    expect(urlInput).toBeTruthy();
+    expect(document.activeElement).toBe(urlInput);
+  });
 
   it("an unrecognized URL routes to a frame with the URL, defaulted Name, and a Yes/No toggle", async () => {
     await render();
