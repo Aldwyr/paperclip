@@ -39,6 +39,42 @@ export const CAPABILITY_DISCOVERY_NAMESPACES = Object.freeze([
   { name: "continuation", description: "Schedule a bounded continuation wake." },
 ]);
 
+export const CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS = Object.freeze([{
+  name: "discover_capabilities",
+  title: "Discover optional capabilities",
+  description: `Search authorized optional Paperclip capabilities. Namespaces: ${CAPABILITY_DISCOVERY_NAMESPACES.map((item) => `${item.name} (${item.description})`).join("; ")}`,
+  inputSchema: {
+    type: "object", properties: {
+      query: { type: "string", minLength: 1, maxLength: 500 },
+      namespace: { type: "string" },
+      limit: { type: "integer", minimum: 1, maximum: 8 },
+    }, required: ["query"], additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object", properties: {
+      schema: { const: "paperclip.capability-discovery.v1" },
+      query: { type: "string" }, namespace: { type: ["string", "null"] },
+      operations: { type: "array", items: { type: "object", additionalProperties: true } },
+      truncated: { type: "boolean" },
+    }, required: ["schema", "query", "namespace", "operations", "truncated"], additionalProperties: false,
+  },
+}, {
+  name: "invoke_discovered_capability",
+  title: "Invoke a discovered capability",
+  description: "Invoke one optional Paperclip operation returned by discover_capabilities. Authority is rechecked at invocation.",
+  inputSchema: {
+    type: "object", properties: {
+      operationId: { type: "string" }, input: { type: "object", additionalProperties: true },
+    }, required: ["operationId", "input"], additionalProperties: false,
+  },
+  outputSchema: {
+    type: "object", properties: {
+      success: { type: "boolean" },
+      contentItems: { type: "array", items: { type: "object", additionalProperties: true } },
+    }, required: ["success", "contentItems"], additionalProperties: false,
+  },
+}] as const);
+
 export function capabilityToolNamespace(operationId: CapabilitySemanticOperationId): string {
   return NAMESPACE[operationId];
 }

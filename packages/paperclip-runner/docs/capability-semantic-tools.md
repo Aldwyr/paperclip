@@ -5,13 +5,15 @@ is a frozen set of JSON-schema descriptors — no HTTP method, path, or provider
 detail. Provider-specific shapes are produced only by *bindings*, so every
 provider sees the same operation set.
 
-The operation list, placement, required claims, and task-mode policy are
-single-sourced from `src/catalog/canonical-operations.ts`
-(`CAPABILITY_CANONICAL_OPERATIONS`); this catalog is a projection of it that adds
-the scenario presentation (titles, descriptions, input schemas, mock mappings,
-and redaction). See [catalog reconciliation](../spec/capability/catalog-reconciliation.md).
+Each protocol action is single-sourced in its own module under
+`src/protocol-actions/`. That module owns the action's policy metadata,
+documentation, examples, and its live and scenario JSON-schema presentations.
+`src/catalog/canonical-operations.ts`, `src/semantic-tools/catalog.ts`, and
+`src/tools/capability-semantic-tool-catalog.ts` are compatibility projections;
+do not add action definitions to them. See
+[catalog reconciliation](../spec/capability/catalog-reconciliation.md).
 
-Sources: `src/catalog/canonical-operations.ts`,
+Sources: `src/protocol-actions/`, `src/catalog/canonical-operations.ts`,
 `src/tools/capability-semantic-tool-catalog.ts`,
 `src/tools/capability-semantic-tool-types.ts`, `src/tools/capability-tool-bindings.ts`,
 barrel `src/tools/index.ts`.

@@ -17,7 +17,7 @@ import type {
 } from "../mock-core/capability-control-plane-types.js";
 import { CapabilityMockControlPlaneAdapter } from "../mock-core/capability-mock-control-plane-adapter.js";
 import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
-import { CAPABILITY_DISCOVERY_NAMESPACES, type CapabilityToolExposureMode } from "../semantic-tools/discovery.js";
+import { CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS, type CapabilityToolExposureMode } from "../semantic-tools/discovery.js";
 import type {
   CapabilitySemanticAuthorizationRecord,
   CapabilitySemanticScenarioPolicy,
@@ -541,15 +541,9 @@ function dynamicToolSpec(definition: CapabilitySemanticToolDefinition): Record<s
 }
 
 function discoveryToolSpecs(): Record<string, unknown>[] {
-  return [{
-    name: DISCOVER_TOOL,
-    description: `Search authorized optional Paperclip capabilities. Namespaces: ${CAPABILITY_DISCOVERY_NAMESPACES.map((item) => `${item.name} (${item.description})`).join("; ")}`,
-    inputSchema: { type: "object", properties: { query: { type: "string", minLength: 1, maxLength: 500 }, namespace: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 8 } }, required: ["query"], additionalProperties: false },
-  }, {
-    name: INVOKE_DISCOVERED_TOOL,
-    description: "Invoke one optional Paperclip operation returned by discover_capabilities. Authority is rechecked at invocation.",
-    inputSchema: { type: "object", properties: { operationId: { type: "string" }, input: { type: "object", additionalProperties: true } }, required: ["operationId", "input"], additionalProperties: false },
-  }];
+  return CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS.map(({ name, description, inputSchema }) => ({
+    name, description, inputSchema,
+  }));
 }
 
 function userInput(message: string): Record<string, unknown> {
