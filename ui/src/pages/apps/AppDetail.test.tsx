@@ -25,6 +25,7 @@ const listUserDirectoryMock = vi.hoisted(() => vi.fn());
 const getSessionMock = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockParams = vi.hoisted(() => ({ connectionId: "conn-1", tab: "setup" as string | undefined }));
+const mockSearchParams = vi.hoisted(() => ({ value: new URLSearchParams() }));
 const navigateComponentMock = vi.hoisted(() => vi.fn());
 const navigateTopLevelMock = vi.hoisted(() => vi.fn());
 
@@ -80,7 +81,7 @@ vi.mock("@/lib/browserNavigation", () => ({
 vi.mock("@/lib/router", () => ({
   useParams: () => mockParams,
   useNavigate: () => mockNavigate,
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [mockSearchParams.value, vi.fn()],
   Navigate: ({ to, replace }: { to: string; replace?: boolean }) => {
     navigateComponentMock({ to, replace });
     return <div data-navigate-to={to} />;
@@ -189,6 +190,7 @@ describe("AppDetail", () => {
     document.body.appendChild(container);
     mockParams.connectionId = "conn-1";
     mockParams.tab = "setup";
+    mockSearchParams.value = new URLSearchParams();
     getConnectionMock.mockResolvedValue(connection());
     getConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
     listGalleryMock.mockResolvedValue({
@@ -396,6 +398,20 @@ describe("AppDetail", () => {
 
     expect(container.textContent).toContain("Loading MCP actions, this may take a minute.");
     expect(container.querySelector(".animate-spin")).toBeTruthy();
+  });
+
+  it("confirms a successful connection on Test and clears the one-time URL flag", async () => {
+    mockParams.tab = "test";
+    mockSearchParams.value = new URLSearchParams("success=1");
+
+    await renderAppDetail();
+
+    expect(pushToastMock).toHaveBeenCalledWith({
+      title: "GitHub connected",
+      body: "The connection is ready. You can test an action below.",
+      tone: "success",
+    });
+    expect(mockNavigate).toHaveBeenCalledWith("/apps/conn-1/test", { replace: true });
   });
 
   it("hides secret URL parameters in setup technical details", async () => {

@@ -2904,6 +2904,59 @@ describeEmbeddedPostgres("tool access service", () => {
     ]);
   });
 
+  it("serves persisted MCP actions until the cache expires and then refreshes them", async () => {
+    const company = await createCompany(db);
+    let currentTime = new Date("2026-08-20T12:00:00.000Z");
+    let tools = [
+      {
+        name: "cached_read",
+        description: "Read the cached value.",
+        annotations: { readOnlyHint: true },
+      },
+    ];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: "paperclip-catalog-refresh",
+      result: { tools },
+    }));
+    const service = toolAccessService(db, {
+      now: () => currentTime,
+      catalogCacheTtlMs: 60_000,
+    });
+    const connected = await service.connectGalleryApp(company.id, {
+      link: "https://cache.example.test/mcp",
+      name: "Cached actions",
+    }, { actorType: "user", actorId: "board" });
+    const discoveryCallsAfterConnect = fetchMock.mock.calls.length;
+
+    const cached = await service.listCatalog(connected.connectionId);
+
+    expect(cached.map((entry) => entry.toolName)).toContain("cached_read");
+    expect(fetchMock).toHaveBeenCalledTimes(discoveryCallsAfterConnect);
+
+    tools = [
+      ...tools,
+      {
+        name: "fresh_read",
+        description: "Read a newly discovered value.",
+        annotations: { readOnlyHint: true },
+      },
+    ];
+    currentTime = new Date(currentTime.getTime() + 60_001);
+
+    const refreshed = await service.listCatalog(connected.connectionId);
+
+    expect(refreshed.map((entry) => entry.toolName)).toContain("fresh_read");
+    expect(fetchMock).toHaveBeenCalledTimes(discoveryCallsAfterConnect + 1);
+
+    currentTime = new Date(currentTime.getTime() + 60_001);
+    fetchMock.mockRejectedValueOnce(new Error("temporary MCP outage"));
+
+    await expect(service.listCatalog(connected.connectionId)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ toolName: "fresh_read" })]),
+    );
+  });
+
   it("requires an explicit PostHog method and projects validated project filters", async () => {
     const company = await createCompany(db);
     const service = toolAccessService(db);
@@ -3469,7 +3522,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     expect(redirectCallbackRes.status).toBe(303);
     expect(redirectCallbackRes.headers.location).toBe(
-      `/${company.issuePrefix}/apps/${redirectConnectRes.body.connectionId}/setup?oauth=connected`,
+      `/${company.issuePrefix}/apps/${redirectConnectRes.body.connectionId}/test?success=1`,
     );
     expect(fetchMock).toHaveBeenCalledTimes(6);
     await expect(db.select().from(toolOauthStates)).resolves.toHaveLength(0);

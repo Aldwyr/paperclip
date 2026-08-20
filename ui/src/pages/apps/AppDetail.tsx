@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Pencil } from "lucide-react";
 import type {
@@ -11,7 +11,7 @@ import {
   humanizeConnectionDisplayName,
   isToolConnectionAttentionHealth as isAttentionHealthStatus,
 } from "@paperclipai/shared";
-import { Navigate, useParams, useNavigate } from "@/lib/router";
+import { Navigate, useParams, useNavigate, useSearchParams } from "@/lib/router";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useToast } from "@/context/ToastContext";
@@ -62,6 +62,7 @@ export { DangerZone, connectionAddress, connectionTransportLabel };
 export function AppDetail() {
   const { connectionId = "", tab } = useParams<{ connectionId: string; tab?: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const { pushToast } = useToast();
   const { selectedCompany, selectedCompanyId } = useCompany();
@@ -138,6 +139,23 @@ export function AppDetail() {
   const appName = connection
     ? connectionDisplayNameForOwner(connection, baseAppName, owner)
     : "App";
+  const successNoticeShownFor = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (
+      activeTab !== "test"
+      || searchParams.get("success") !== "1"
+      || !connection
+      || successNoticeShownFor.current === connection.id
+    ) return;
+    successNoticeShownFor.current = connection.id;
+    pushToast({
+      title: `${appName} connected`,
+      body: "The connection is ready. You can test an action below.",
+      tone: "success",
+    });
+    navigate(appTabHref(connection.id, "test"), { replace: true });
+  }, [activeTab, appName, connection, navigate, pushToast, searchParams]);
 
   useEffect(() => {
     if (!activeTab) return;

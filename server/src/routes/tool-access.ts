@@ -146,14 +146,18 @@ export function toolAccessRoutes(
     return new URL("/api/tools/oauth/callback", configured).toString();
   }
 
-  async function oauthSetupPath(companyId: string, connectionId: string) {
+  async function oauthAppPath(
+    companyId: string,
+    connectionId: string,
+    tab: "setup" | "test",
+  ) {
     const [company] = await db
       .select({ issuePrefix: companies.issuePrefix })
       .from(companies)
       .where(eq(companies.id, companyId))
       .limit(1);
     if (!company) throw new Error("OAuth callback connection belongs to a missing company");
-    return `/${company.issuePrefix}/apps/${connectionId}/setup`;
+    return `/${company.issuePrefix}/apps/${connectionId}/${tab}`;
   }
   const access = accessService(db);
 
@@ -429,7 +433,7 @@ export function toolAccessRoutes(
         oauth: callbackErrorCode === "oauth_authorization_denied" ? "denied" : "failed",
       });
       if (callbackErrorCode) params.set("code", callbackErrorCode);
-      const setupPath = await oauthSetupPath(pendingState.companyId, pendingState.connectionId);
+      const setupPath = await oauthAppPath(pendingState.companyId, pendingState.connectionId, "setup");
       res.redirect(303, `${setupPath}?${params.toString()}`);
       return;
     }
@@ -446,8 +450,8 @@ export function toolAccessRoutes(
       },
     });
     if (acceptsHtml) {
-      const setupPath = await oauthSetupPath(result.connection.companyId, result.connection.id);
-      res.redirect(303, `${setupPath}?oauth=connected`);
+      const testPath = await oauthAppPath(result.connection.companyId, result.connection.id, "test");
+      res.redirect(303, `${testPath}?success=1`);
       return;
     }
     res.json(result);

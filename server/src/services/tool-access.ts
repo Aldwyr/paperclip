@@ -449,7 +449,7 @@ function sameOAuthIssuer(a: string | null | undefined, b: string | null | undefi
 
 const oauthRegistrationFlights = new Map<string, Promise<unknown>>();
 
-async function oauthSingleFlight<T>(
+async function singleFlight<T>(
   flights: Map<string, Promise<unknown>>,
   key: string,
   operation: () => Promise<T>,
@@ -470,6 +470,8 @@ type ToolAccessServiceOptions = {
   deploymentExposure?: DeploymentExposure;
   trustedLocalStdioRuntimeHost?: string | null;
   now?: () => Date;
+  /** How long persisted remote MCP action discovery remains fresh. */
+  catalogCacheTtlMs?: number;
   /** Test seam for deciding whether an OAuth client metadata URL is publicly resolvable. */
   oauthClientMetadataLookup?: RemoteHttpEndpointLookup;
 };
@@ -1832,9 +1834,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   const policySvc = toolAccessPolicyService(db);
   const now = options.now ?? (() => new Date());
   const runtimeSupervisor = createToolRuntimeSupervisor(db, options);
-  // This map only removes duplicate work inside one service instance. The
-  // database refresh lease below is the cross-process serialization boundary.
+  // These maps remove duplicate work inside one service instance. OAuth also
+  // uses the database refresh lease below as its cross-process boundary.
   const oauthRefreshFlights = new Map<string, Promise<unknown>>();
+  const catalogRefreshFlights = new Map<string, Promise<unknown>>();
+  const catalogCacheTtlMs = Math.max(0, options.catalogCacheTtlMs ?? 15 * 60 * 1000);
 
   function allowPrivateRemoteEndpoints() {
     return options.deploymentMode !== "authenticated" || options.deploymentExposure !== "public";
@@ -4135,7 +4139,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     refreshOptions: { enableAllByDefault?: boolean } = {},
   ): Promise<ToolCatalogRefreshResult> {
     const connection = await getConnectionRow(connectionId);
-    const now = new Date();
+    const refreshedAt = now();
     let descriptors: McpToolDescriptor[];
     try {
       descriptors = await discoverTools(connection);
@@ -4204,14 +4208,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             status,
             versionHash: hash,
             schemaHash,
-            lastSeenAt: now,
+            lastSeenAt: refreshedAt,
             quarantinedAt: status === "quarantined"
-              ? shouldQuarantine ? now : existing.quarantinedAt
+              ? shouldQuarantine ? refreshedAt : existing.quarantinedAt
               : null,
             quarantineReason: status === "quarantined"
               ? shouldQuarantine ? "pending_review" : existing.quarantineReason
               : null,
-            updatedAt: now,
+            updatedAt: refreshedAt,
           })
           .where(eq(toolCatalogEntries.id, existing.id))
           .returning();
@@ -4235,9 +4239,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           status,
           versionHash: hash,
           schemaHash,
-          firstSeenAt: now,
-          lastSeenAt: now,
-          quarantinedAt: shouldQuarantine ? now : null,
+          firstSeenAt: refreshedAt,
+          lastSeenAt: refreshedAt,
+          quarantinedAt: shouldQuarantine ? refreshedAt : null,
           quarantineReason: shouldQuarantine ? "pending_review" : null,
         }).returning();
         updatedEntries.push(toCatalogEntry(created));
@@ -4257,11 +4261,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         transportConfig: normalizedTransportConfig,
         healthStatus: "ok",
         healthMessage: "Tool catalog refreshed.",
-        healthCheckedAt: now,
-        lastHealthAt: now,
-        lastCatalogRefreshAt: now,
+        healthCheckedAt: refreshedAt,
+        lastHealthAt: refreshedAt,
+        lastCatalogRefreshAt: refreshedAt,
         lastError: null,
-        updatedAt: now,
+        updatedAt: refreshedAt,
       })
       .where(eq(toolConnections.id, connection.id))
       .returning();
@@ -4270,7 +4274,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       await ensureRuntimeSlot(updatedConnection);
       await db
         .update(toolRuntimeSlots)
-        .set({ healthStatus: "ok", healthMessage: "Approved stdio template is ready.", lastHealthCheckAt: now, updatedAt: now })
+        .set({
+          healthStatus: "ok",
+          healthMessage: "Approved stdio template is ready.",
+          lastHealthCheckAt: refreshedAt,
+          updatedAt: refreshedAt,
+        })
         .where(eq(toolRuntimeSlots.connectionId, connection.id));
     }
 
@@ -5890,7 +5899,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }
 
     const key = `${input.connection.id}:${input.redirectUri}`;
-    return oauthSingleFlight(oauthRegistrationFlights, key, async () => {
+    return singleFlight(oauthRegistrationFlights, key, async () => {
       const latest = await getConnectionRow(input.connection.id, input.connection.companyId);
       const latestConfigured = configuredOAuthClientForConnection(latest, input.endpoints.provider);
       if (latestConfigured.clientId) {
@@ -6361,7 +6370,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (typeof oauth.tokenUrl !== "string" || typeof oauth.provider !== "string") return connection;
     const expiresAtMs = oauthExpiresAtMs(connection);
     if (expiresAtMs && expiresAtMs > Date.now() + 60_000) return connection;
-    return oauthSingleFlight(oauthRefreshFlights, connection.id, async () => {
+    return singleFlight(oauthRefreshFlights, connection.id, async () => {
       const lease = await acquireOAuthRefreshLease(connection);
       if (!lease.leaseId) return lease.connection;
       try {
@@ -8355,11 +8364,37 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     listCatalog: async (connectionId: string, companyId?: string): Promise<ToolCatalogEntry[]> => {
       const connection = await getConnectionRow(connectionId, companyId);
-      const rows = await db
+      let rows = await db
         .select()
         .from(toolCatalogEntries)
         .where(eq(toolCatalogEntries.connectionId, connection.id))
         .orderBy(desc(toolCatalogEntries.updatedAt));
+      const cacheExpired = connection.transport === "mcp_remote"
+        && connection.status !== "archived"
+        && (
+          rows.length === 0
+          || !connection.lastCatalogRefreshAt
+          || connection.lastCatalogRefreshAt.getTime() <= now().getTime() - catalogCacheTtlMs
+        );
+      if (cacheExpired) {
+        try {
+          await singleFlight(
+            catalogRefreshFlights,
+            connection.id,
+            () => refreshCatalog(connection.id, { actorType: "system", actorId: "tool_catalog_cache" }),
+          );
+          rows = await db
+            .select()
+            .from(toolCatalogEntries)
+            .where(eq(toolCatalogEntries.connectionId, connection.id))
+            .orderBy(desc(toolCatalogEntries.updatedAt));
+        } catch (error) {
+          // A stale catalog remains useful when the remote server is temporarily
+          // unavailable. Empty caches still fail so callers never mistake “no
+          // actions discovered” for a successful lookup.
+          if (rows.length === 0) throw error;
+        }
+      }
       return rows.map((row) => toCatalogEntryForConnection(row, connection));
     },
 
