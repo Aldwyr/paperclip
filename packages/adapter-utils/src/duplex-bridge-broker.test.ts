@@ -367,4 +367,56 @@ describe("duplex bridge broker request limits", () => {
     expect(harness.forwards.filter((forward) => forward.id === maxId)).toHaveLength(1);
     expect(broker.state).toBe("open");
   });
+
+  it("maps a forward that resolves with the indeterminate marker to a non-retryable response and retains the id", async () => {
+    const harness = createFakeChannelHarness();
+    const broker = createDuplexBridgeBroker({
+      channel: harness.channel,
+      forwardRequest: controllableForward(harness),
+    });
+    brokers.push(broker);
+    broker.start();
+
+    // The forward handler resolves with a 504 that carries the indeterminate
+    // marker. This is the shape the host forward returns for a response-read
+    // failure after the host commit. The broker must keep the marker and the
+    // non-retryable body, so the gateway maps it to a non-retryable status and a
+    // caller never repeats a possibly-committed mutation.
+    harness.feed(requestFrame("commit-1"));
+    const forward = harness.forwards.find((entry) => entry.id === "commit-1" && !entry.settled);
+    if (!forward) throw new Error("The broker did not forward the request.");
+    forward.settled = true;
+    forward.resolve({
+      status: 504,
+      headers: {
+        "content-type": "application/json",
+        "x-paperclip-bridge-outcome": "indeterminate",
+      },
+      body: JSON.stringify({
+        error: "Bridge response body exceeded the configured size limit of 32 bytes.",
+        outcome: "indeterminate",
+        retryable: false,
+      }),
+    });
+    // The broker answers inside the forward `then` microtask, so let it settle.
+    await Promise.resolve();
+
+    expect(harness.responses).toHaveLength(1);
+    const response = harness.responses[0]!;
+    expect(response.status).toBe(504);
+    expect(response.outcome).toBe("indeterminate");
+    expect(response.headers["x-paperclip-bridge-outcome"]).toBe("indeterminate");
+    expect(JSON.parse(response.body)).toEqual({
+      error: "Bridge response body exceeded the configured size limit of 32 bytes.",
+      outcome: "indeterminate",
+      retryable: false,
+    });
+
+    // The broker delivered a response, so it retained the id. A resend never
+    // reaches the forward a second time, so a caller that ignores the
+    // non-retryable status still cannot repeat the mutation through the broker.
+    harness.feed(requestFrame("commit-1"));
+    expect(harness.forwards.filter((entry) => entry.id === "commit-1")).toHaveLength(1);
+    expect(broker.state).toBe("open");
+  });
 });

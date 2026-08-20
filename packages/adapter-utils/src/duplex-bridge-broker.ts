@@ -535,9 +535,12 @@ export function createDuplexBridgeBroker(options: DuplexBrokerOptions): DuplexBr
           );
           return;
         }
-        // A plain forward failure did not start a host mutation, so a retry is
-        // safe. Return a 502 with the completed outcome, so the gateway passes it
-        // through as a retryable status.
+        // A rejection here means the forward never received a host response, so
+        // the host did not start a mutation and a retry is safe. The forward
+        // handler owns the post-response case: it converts a response-read
+        // failure into a resolved indeterminate result, so a possibly-committed
+        // mutation never reaches this branch. Return a 502 with the completed
+        // outcome, so the gateway passes it through as a retryable status.
         respond(
           frame.id,
           {

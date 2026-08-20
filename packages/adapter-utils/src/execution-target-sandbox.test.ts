@@ -2495,7 +2495,14 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
-  it("fails oversized host responses with a 502 before returning them to the sandbox client", async () => {
+  it("fails an oversized host response with a non-retryable 409 so a committed mutation never repeats", async () => {
+    // The host receives the request and commits the mutation, then sends a
+    // response body over the size limit. The forward reads the body after the
+    // fetch resolves, so the read failure happens after the host commit. The
+    // forward must return a non-retryable 504 with the indeterminate outcome, not
+    // a retryable 502. The in-sandbox server maps the indeterminate 504 to a
+    // non-retryable 409. A retryable status would repeat the mutation with a new
+    // request id outside the broker deduplication set.
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-limit-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -2503,7 +2510,10 @@ describe("sandbox adapter execution targets", () => {
     await mkdir(runtimeRootDir, { recursive: true });
 
     const requests: Array<{ method: string; url: string; auth: string | null; runId: string | null }> = [];
-    const largeBody = "x".repeat(64);
+    // The host body sits over the size limit, so the forward read fails. The
+    // limit stays above the small indeterminate marker the forward returns, so the
+    // marker still reaches the server for the 504-to-409 map.
+    const largeBody = "x".repeat(1024);
     const apiServer = createServer((req, res) => {
       requests.push({
         method: req.method ?? "GET",
@@ -2511,7 +2521,7 @@ describe("sandbox adapter execution targets", () => {
         auth: req.headers.authorization ?? null,
         runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
       });
-      res.writeHead(200, {
+      res.writeHead(201, {
         "content-type": "application/json",
         "content-length": String(Buffer.byteLength(largeBody, "utf8")),
       });
@@ -2544,23 +2554,31 @@ describe("sandbox adapter execution targets", () => {
       adapterKey: "codex",
       hostApiToken: "real-run-jwt",
       hostApiUrl: `http://127.0.0.1:${address.port}`,
-      maxBodyBytes: 32,
+      maxBodyBytes: 512,
     });
     try {
-      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
+      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/issues/issue-1/comments`, {
+        method: "POST",
         headers: {
           authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
-          accept: "application/json",
+          "content-type": "application/json",
         },
+        body: JSON.stringify({ body: "Status update." }),
       });
 
-      expect(response.status).toBe(502);
+      // The indeterminate 504 maps to a non-retryable 409, so the caller does not
+      // retry the committed mutation.
+      expect(response.status).toBe(409);
+      expect(response.headers.get("x-paperclip-bridge-outcome")).toBe("indeterminate");
       await expect(response.json()).resolves.toEqual({
-        error: "Bridge response body exceeded the configured size limit of 32 bytes.",
+        error: "Bridge response body exceeded the configured size limit of 512 bytes.",
+        outcome: "indeterminate",
+        retryable: false,
       });
+      // The host ran the mutation exactly once. It never receives a retry.
       expect(requests).toEqual([{
-        method: "GET",
-        url: "/api/agents/me",
+        method: "POST",
+        url: "/api/issues/issue-1/comments",
         auth: "Bearer real-run-jwt",
         runId: "run-bridge-limit",
       }]);
