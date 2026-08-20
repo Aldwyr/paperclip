@@ -51,6 +51,7 @@ import type {
   CreateToolMcpGatewayToken,
   UpdateToolMcpGateway,
   CreateToolTrustRuleFromActionRequest,
+  ToolRedactedValueSummary,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -207,6 +208,20 @@ export interface ToolGatewayActivityEvent extends ToolGatewayAuditRow {
   connectionDisplayName: string | null;
   toolDisplayName: string | null;
   normalizedOutcome: ToolAuditOutcome;
+  invocation: {
+    id: string;
+    toolName: string;
+    status: string;
+    policyDecision: string | null;
+    approvalState: string;
+    argumentsSummary: ToolRedactedValueSummary | null;
+    resultSummary: ToolRedactedValueSummary | null;
+    resultSizeBytes: number | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+    startedAt: string | null;
+    completedAt: string | null;
+  } | null;
 }
 
 export type ToolGatewayActivityResponse = {
@@ -217,6 +232,7 @@ export type ToolGatewayActivityResponse = {
 export type ToolAuditWindow = "1h" | "24h" | "7d" | "30d";
 
 export interface ListActivityParams {
+  gateway?: string | null;
   app?: string | null;
   agent?: string | null;
   outcome?: string | null;
@@ -447,6 +463,7 @@ export const toolsApi = {
    */
   listActivity: (companyId: string, params: ListActivityParams = {}) => {
     const search = new URLSearchParams({ companyId });
+    if (params.gateway) search.set("gateway", params.gateway);
     if (params.app) search.set("app", params.app);
     if (params.agent) search.set("agent", params.agent);
     if (params.outcome) search.set("outcome", params.outcome);

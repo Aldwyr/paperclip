@@ -24,6 +24,7 @@ import { AppsToolsPanel } from "./panels/AppsToolsPanel";
 import { TokensPanel } from "./panels/TokensPanel";
 import { GatewayActivityPanel } from "./panels/GatewayActivityPanel";
 import { GatewayAdvancedPanel } from "./panels/GatewayAdvancedPanel";
+import { CopyableGatewayUrl } from "./CopyableGatewayUrl";
 
 export function GatewayDetail() {
   const { gatewayId = "", tab } = useParams<{ gatewayId: string; tab?: string }>();
@@ -163,14 +164,6 @@ export function GatewayDetail() {
     );
   }
 
-  const endpointHost = (() => {
-    try {
-      return `${new URL(window.location.origin).host}${gateway.endpointPath}`;
-    } catch {
-      return gateway.endpointPath;
-    }
-  })();
-
   return (
     <div className="max-w-4xl space-y-5 pb-12">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -181,7 +174,7 @@ export function GatewayDetail() {
             </Link>
           </div>
           <h1 className="mt-1 text-2xl font-bold tracking-tight">{gateway.name}</h1>
-          <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{endpointHost}</p>
+          <CopyableGatewayUrl endpointPath={gateway.endpointPath} className="mt-1 max-w-xl" />
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={() => setEditing(true)}>
