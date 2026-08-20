@@ -4107,6 +4107,67 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 20000);
 
+  it("bounds the pre-READY blank-line scan work by the bytes received", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-blank-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    // An adversarial provider sends one pre-READY chunk of many blank lines and
+    // then an invalid line. The gate must skip each blank line in O(1), so the
+    // total newline-scan work stays linear in the bytes received. A per-line full
+    // rescan or a per-line buffer copy makes the work quadratic. The invalid line
+    // then drives protocol contamination and the file-bridge fallback.
+    const blankLineCount = 15_000;
+    const contaminatedChunk = "\n".repeat(blankLineCount) + "invalid\n";
+    const totalBytes = contaminatedChunk.length;
+    const { runner, control } = makeDuplexSelectionRunner((ctx) => {
+      ctx.emitRaw(contaminatedChunk);
+    });
+    const { recorder, counters } = createRecordingDuplexRecorder();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    __duplexReadinessTesting.resetNewlineScanUnits();
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-blank-scan",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexReadinessTimeoutMs: 5_000,
+      duplexTelemetryRecorder: recorder,
+    });
+    try {
+      expect(bridge).not.toBeNull();
+      expect(control.openCount).toBe(1);
+      const scanUnits = __duplexReadinessTesting.readNewlineScanUnits();
+      // Incremental blank-line handling reads each byte one time, so the count
+      // stays near totalBytes. A per-line full rescan is quadratic (about
+      // blankLineCount^2 / 2), far above this bound.
+      expect(scanUnits).toBeLessThanOrEqual(4 * totalBytes);
+      // The invalid line drove protocol contamination, so the file bridge serves
+      // after the bounded cleanup.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((c) => c.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("contaminated");
+      // The bounded cleanup left no live provider session.
+      expect(control.closeCount + control.stopCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
   it("drops a frame header outside the allowlist on the host duplex forward path", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-hdr-"));
     cleanupDirs.push(rootDir);
