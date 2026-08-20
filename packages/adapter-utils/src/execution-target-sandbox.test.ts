@@ -15,6 +15,7 @@ import {
 
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
+  adapterExecutionTargetDuplexTelemetryRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetToRemoteSpec,
@@ -3039,6 +3040,170 @@ describe("sandbox adapter execution targets", () => {
     // Teardown closed the channel before lease release, then stopped the child.
     expect(control.closeCount).toBeGreaterThanOrEqual(1);
     expect(control.stopCount).toBeGreaterThanOrEqual(1);
+  }, 20000);
+
+  it("streams run logs on the duplex path under the same gate and log line as the file path", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-runlog-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner } = makeDuplexSelectionRunner();
+    const logs: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      streamRunLogs: true,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-duplex-log",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      onLog: async (stream, chunk) => {
+        logs.push({ stream, chunk });
+      },
+    });
+    try {
+      // The duplex transport served, and it still streams run logs with the same
+      // gate and the same log line as the file path.
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      expect(bridge?.runLogTail).toBeTruthy();
+      expect(combinedStream(logs, "stdout")).toContain("Sandbox run log streaming enabled");
+      const wrapped = bridge!.runLogTail!.create().wrapCommand("agent-cli", ["--message", "hello world"]);
+      expect(wrapped.args.join("\n")).toContain("tee -a");
+      expect(wrapped.args.join("\n")).toContain("agent-cli");
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("returns no run-log tail on the duplex path when streaming is opted out", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-runlog-off-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner } = makeDuplexSelectionRunner();
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      streamRunLogs: false,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-duplex-log-off",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      expect(bridge?.runLogTail ?? null).toBeNull();
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("routes duplex channel-open and fallback records to a recorder attached on the server seam", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-duplex-recorder-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+
+    const counters: DuplexTelemetryCounterRecord[] = [];
+    const recorder: DuplexTelemetryRecorder = {
+      recordSpan() {},
+      incrementCounter(record) {
+        counters.push(record);
+      },
+      emitEvent() {},
+    };
+
+    // A channel open reaches the recorder on the duplex success path. The host
+    // attaches the recorder to the sandbox target on the same seam as the
+    // runner; the caller reads it with the accessor and passes it to the bridge.
+    const openTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner: makeDuplexSelectionRunner().runner,
+      effectiveCapabilities: duplexCapabilities(true),
+      duplexTelemetryRecorder: recorder,
+    };
+    const openBridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-duplex-open",
+      target: openTarget,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      duplexTelemetryRecorder: adapterExecutionTargetDuplexTelemetryRecorder(openTarget),
+    });
+    try {
+      expect(openBridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("duplex_v1");
+      const open = counters.find((record) => record.metric === DUPLEX_COUNTER_CHANNEL_OPEN_TOTAL);
+      expect(open?.dimensions.transport).toBe("duplex");
+      expect(open?.dimensions.provider).toBe("daytona");
+    } finally {
+      await openBridge?.stop();
+    }
+
+    // A fallback reaches the same recorder. The kill switch off records a
+    // gate_off fallback with the file transport.
+    counters.length = 0;
+    const fallbackTarget: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner: makeDuplexSelectionRunner().runner,
+      effectiveCapabilities: duplexCapabilities(true),
+      duplexTelemetryRecorder: recorder,
+    };
+    const fallbackBridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-duplex-fallback",
+      target: fallbackTarget,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: false,
+      duplexTelemetryRecorder: adapterExecutionTargetDuplexTelemetryRecorder(fallbackTarget),
+    });
+    try {
+      expect(fallbackBridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const fallback = counters.find((record) => record.metric === DUPLEX_COUNTER_FALLBACK_TOTAL);
+      expect(fallback?.dimensions.fallback_reason).toBe("gate_off");
+      expect(fallback?.dimensions.transport).toBe("file");
+    } finally {
+      await fallbackBridge?.stop();
+      await api.close();
+    }
   }, 20000);
 
   it.each([

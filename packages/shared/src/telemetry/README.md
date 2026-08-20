@@ -314,10 +314,11 @@ canonical contract. The code owner is
 each enum value as a literal constant, so the surface never drifts.
 
 The surface is opt-in. The host injects a recorder that binds the span to the
-OTel tracer, the counter to the guarded counter store, and the event to the
-run-events bridge. The default recorder is a no-op, so the whole surface stays
-inert until the host binds a real recorder. Every recorder call sits inside an
-error swallow, so a telemetry failure never breaks the request path.
+OTel tracer, the counter to the guarded counter store in
+`server/src/services/tool-runtime-metrics.ts`, and the event to the run-events
+bridge. The default recorder is a no-op, so the whole surface stays inert until
+the host binds a real recorder. Every recorder call sits inside an error swallow,
+so a telemetry failure never breaks the request path.
 
 The surface carries no user content. No route, no query, no request body, no
 token, and no raw identifier rides a span, a counter, or an event. Each record

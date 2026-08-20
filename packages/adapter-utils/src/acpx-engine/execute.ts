@@ -15,6 +15,7 @@ import type {
 import {
   adapterExecutionTargetSessionIdentity,
   describeAdapterExecutionTarget,
+  adapterExecutionTargetDuplexTelemetryRecorder,
   adapterExecutionTargetEnablesSandboxDuplexBridge,
   formatAdapterExecutionTimeoutErrorMessage,
   formatAdapterExecutionTimeoutStartLogLine,
@@ -2040,6 +2041,7 @@ async function buildRuntime(input: {
           timeoutSec,
           hostApiToken: env.PAPERCLIP_API_KEY,
           enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(remoteTarget),
+          duplexTelemetryRecorder: adapterExecutionTargetDuplexTelemetryRecorder(remoteTarget),
           onLog: input.ctx.onLog,
           getRuntimeParentContext: input.getRuntimeParentContext,
           runtimeSpan: input.runtimeSpan,

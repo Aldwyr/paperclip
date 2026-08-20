@@ -173,6 +173,13 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * set to `false` to explicitly opt out back to batch-at-end delivery.
    */
   streamRunLogs?: boolean | null;
+  /**
+   * The injected duplex telemetry recorder for this run. The host attaches it on
+   * the same seam as `runner`, so this live object stays on the host and never
+   * enters the sandbox environment. The bridge binds it to the fixed duplex
+   * observability surface. Absent means the safe no-op default.
+   */
+  duplexTelemetryRecorder?: DuplexTelemetryRecorder | null;
 }
 
 export type AdapterExecutionTarget =
@@ -363,6 +370,19 @@ export function adapterExecutionTargetEnablesSandboxDuplexBridge(
     target.transport === "sandbox" &&
     target.enableSandboxDuplexBridge === true
   );
+}
+
+/**
+ * Read the injected duplex telemetry recorder off a target. Only a sandbox
+ * target with a recorder attached returns it. Every other target returns null,
+ * so the bridge falls back to the safe no-op recorder.
+ */
+export function adapterExecutionTargetDuplexTelemetryRecorder(
+  target: AdapterExecutionTarget | null | undefined,
+): DuplexTelemetryRecorder | null {
+  return target?.kind === "remote" && target.transport === "sandbox"
+    ? target.duplexTelemetryRecorder ?? null
+    : null;
 }
 
 export function adapterExecutionTargetRemoteCwd(
@@ -2341,6 +2361,37 @@ function deriveNestedDuplexBrokerBudgets(forwardTimeoutMs: number): DuplexBroker
 }
 
 /**
+ * Create the run-log directory on the sandbox before the tail starts. The file
+ * bridge worker creates this directory on the file path. The duplex path starts
+ * no worker, so the host creates the directory here. The tail then reads a real
+ * directory from its first tick.
+ *
+ * This step is best effort. The broker already serves the duplex transport when
+ * the host reaches it, and the tail wrap command runs its own `mkdir -p` as a
+ * backstop. So a create failure must not tear down a working duplex transport;
+ * the host swallows it and still builds the tail. The log line names no raw
+ * error, so no raw error rides a log line here.
+ */
+async function ensureSandboxRunLogDirectory(input: {
+  runner: CommandManagedRuntimeRunner;
+  remoteCwd: string;
+  logsDir: string;
+  shellCommand: "bash" | "sh";
+  timeoutMs: number | null | undefined;
+}): Promise<void> {
+  try {
+    await input.runner.execute({
+      command: input.shellCommand,
+      args: shellCommandArgs(`mkdir -p ${shellQuote(input.logsDir)}`),
+      cwd: input.remoteCwd,
+      timeoutMs: input.timeoutMs ?? undefined,
+    });
+  } catch {
+    // Best effort: the tail wrap command creates the directory before it writes.
+  }
+}
+
+/**
  * The duplex readiness gate. The gate owns the single data listener and the
  * single exit listener of the channel while the host waits for a valid READY
  * frame. It resolves the handshake, then hands the channel to the broker.
@@ -2877,13 +2928,34 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             "stdout",
             "[paperclip] Sandbox duplex transport ready; serving the host-assigned origin.\n",
           );
+          // Stream run logs on the duplex path with the same gate and the same
+          // log line as the file path. The duplex path starts no file-bridge
+          // worker, so create the log directory before the tail starts.
+          let duplexRunLogTail: SandboxRunLogTailFactory | null = null;
+          if (target.transport === "sandbox" && target.streamRunLogs !== false) {
+            const duplexLogsDir = sandboxCallbackBridgeDirectories(queueDir).logsDir;
+            await ensureSandboxRunLogDirectory({
+              runner,
+              remoteCwd: target.remoteCwd,
+              logsDir: duplexLogsDir,
+              shellCommand,
+              timeoutMs: bridgeTimeoutMs,
+            });
+            duplexRunLogTail = createSandboxRunLogTailFactory({
+              runner,
+              remoteCwd: target.remoteCwd,
+              logsDir: duplexLogsDir,
+              shellCommand,
+            });
+            await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
+          }
           return {
             env: {
               PAPERCLIP_API_URL: sandboxOrigin,
               PAPERCLIP_API_KEY: bridgeToken,
               PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE,
             },
-            runLogTail: null,
+            runLogTail: duplexRunLogTail,
             stop: async () => {
               // Close the channel before lease release. The broker sends an orderly
               // close and releases the route, then stops the child, so no live
