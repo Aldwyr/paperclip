@@ -470,7 +470,10 @@ export const toolsApi = {
     if (params.app) search.set("app", params.app);
     if (params.agent) search.set("agent", params.agent);
     if (params.outcome) search.set("outcome", params.outcome);
-    if (params.window) search.set("window", params.window);
+    // Omitting the window is the API's canonical all-time request. This also
+    // keeps the page usable during a rolling restart against an older server
+    // that does not recognize the newer explicit `all` value.
+    if (params.window && params.window !== "all") search.set("window", params.window);
     if (params.search) search.set("search", params.search);
     if (params.cursor) search.set("cursor", params.cursor);
     search.set("limit", String(params.limit ?? 50));

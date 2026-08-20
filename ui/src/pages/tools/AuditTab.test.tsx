@@ -125,14 +125,14 @@ describe("AuditTab", () => {
     });
   }
 
-  it("renders humanized sentences, the outcome chip, and the footer note", async () => {
+  it("renders humanized sentences and the outcome chip without the old footer note", async () => {
     await render();
 
     expect(container.textContent).toContain("Fable");
     expect(container.textContent).toContain("Send Email");
     expect(container.textContent).toContain("Gmail");
     expect(container.textContent).toContain("Blocked");
-    expect(container.textContent).toContain("Recorded by Paperclip — entries can't be edited.");
+    expect(container.textContent).not.toContain("Recorded by Paperclip — entries can't be edited.");
     expect(listActivityMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ window: "all" }));
     // Vocabulary gate: no raw tool ID or ops terms in the sentence list.
     expect(container.textContent).not.toContain("mail:send_email");
