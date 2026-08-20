@@ -177,6 +177,11 @@ textarea {
 
 .pit-app[data-eval-view="true"] { padding-left: 0; }
 
+.pit-eval-nav { display: grid; grid-template-columns:auto auto minmax(0,1fr) auto auto; align-items:center; gap:12px; min-height:var(--pit-touch-target); padding:0 var(--pit-space-4); border-bottom:1px solid var(--pit-border-strong); background:var(--pit-surface-sunken); font-size:var(--pit-text-xs); }
+.pit-eval-nav strong { text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pit-eval-nav a { color:var(--pit-live); white-space:nowrap; }
+@media(max-width:800px){.pit-eval-nav{grid-template-columns:auto 1fr auto}.pit-eval-nav>a:not(:first-child),.pit-eval-nav>span{display:none}.pit-eval-nav strong{text-align:left}}
+
 .pit-visually-hidden {
   position: absolute;
   width: 1px;

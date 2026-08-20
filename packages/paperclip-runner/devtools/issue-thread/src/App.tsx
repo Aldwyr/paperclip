@@ -80,6 +80,7 @@ interface EmbeddedEvalReport {
   };
   view: CapabilityIssueThreadSnapshot;
   devtools: CapabilityDevtoolsSnapshot;
+  navigation: { suiteHref: string; previous: { label: string; href: string } | null; next: { label: string; href: string } | null };
 }
 
 declare global {
@@ -268,6 +269,10 @@ export function App() {
    */
   const turnGenerationRef = useRef(0);
   const turnAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (embeddedEval !== null) setPanelOpen(true);
+  }, [embeddedEval]);
 
   /** Abandons any open turn stream: the server sees the disconnect and stops. */
   const abandonTurn = useCallback(() => {
@@ -874,6 +879,16 @@ export function App() {
         onStop={stop}
         onSelectSegment={setSegment}
       />
+
+      {embeddedEval !== null ? (
+        <nav className="pit-eval-nav" aria-label="Eval result navigation">
+          <a href={embeddedEval.navigation.suiteHref}>← All results</a>
+          {embeddedEval.navigation.previous ? <a href={embeddedEval.navigation.previous.href}>← {embeddedEval.navigation.previous.label}</a> : <span />}
+          <strong>{embeddedEval.passed ? "PASS" : "FAIL"} · {embeddedEval.attemptId}</strong>
+          {embeddedEval.navigation.next ? <a href={embeddedEval.navigation.next.href}>{embeddedEval.navigation.next.label} →</a> : <span />}
+          <button type="button" className="pit-button" aria-expanded={panelOpen} onClick={() => setPanelOpen((open) => !open)}><Icon name="evidence" /> {panelOpen ? "Close DevTools" : "Open DevTools"}</button>
+        </nav>
+      ) : null}
 
       {actionError !== null ? (
         <p className="pit-banner" data-tone="danger" role="alert" data-testid="action-error">
