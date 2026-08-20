@@ -108,7 +108,7 @@ test.describe.serial("applications lifecycle", () => {
 
     await connectedRow.getByRole("button", { name: /^(Edit|Reconnect)$/ }).click();
     await expect(page).toHaveURL(
-      new RegExp(`/${seed.prefix}/apps/app/${connected.applicationId}/setup$`),
+      new RegExp(`/${seed.prefix}/apps/${connected.id}/setup$`),
       { timeout: 20_000 },
     );
 
