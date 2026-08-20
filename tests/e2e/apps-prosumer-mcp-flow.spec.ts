@@ -159,9 +159,9 @@ test.describe.serial("prosumer MCP flow prosumer MCP flow", () => {
     await linkInput.fill(mock.url);
     await page.getByRole("button", { name: "Continue" }).click();
 
-    // LinkKey step shows the "Connect with a link" heading. Mock doesn't
+    // LinkKey step keeps the BYO connection heading. Mock doesn't
     // require a key — leave the default "No" answer.
-    await expect(page.getByRole("heading", { name: "Connect with a link" })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole("heading", { name: "Connect your own MCP server" })).toBeVisible({ timeout: 15_000 });
     await page.screenshot({ path: `${SCREENSHOT_DIR}/prosumer-mcp-02-key-step.png`, fullPage: true });
 
     // Submit (button label is "Check link").
