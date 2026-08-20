@@ -3535,7 +3535,7 @@ export async function createManagedMcpRunConfig(input: {
   }))))
     .filter(({ connectionIds }) =>
       connectionIds.size > 0
-      && [...connectionIds].every((connectionId) => installedConnectionIds.has(connectionId)))
+      && [...connectionIds].some((connectionId) => installedConnectionIds.has(connectionId)))
     .map(({ gateway }) => gateway);
   if (gateways.length === 0) return null;
 
