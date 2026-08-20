@@ -1,15 +1,17 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type {
   CapabilityEvidenceModel,
   CapabilityEvidenceRunnerRecord,
   CapabilityEvidenceSectionId,
+  CapabilityEvidenceToolRow,
   CapabilityIssueThreadSnapshot,
   CapabilityToolDisposition,
 } from "../../../src/issue-thread/types";
 import type { CapabilityDevtoolsSnapshot } from "../../../src/devtools";
 import { DevtoolsInspector } from "./DevtoolsInspector";
 import { Icon } from "./Icons";
+import { capabilitySemanticToolDescriptor } from "../../../src/semantic-tools/catalog";
 import {
   CAPABILITY_EVIDENCE_SECTIONS,
   capabilityDispositionLabel,
@@ -127,6 +129,10 @@ function sectionCount(
   section: CapabilityEvidenceSectionId,
   turnId: string | "all",
 ): string {
+  if (section === "tools") {
+    const records = filterByTurn(evidence.tools, turnId);
+    return String(new Set(records.flatMap((record) => record.rows.map((row) => row.operationId))).size);
+  }
   if (section === "parity") {
     const rows = filterByTurn(evidence.parity, turnId);
     const passing = rows.filter((row) => row.verdict === "pass").length;
@@ -137,6 +143,87 @@ function sectionCount(
     turnId,
   );
   return String(rows.length);
+}
+
+function ToolsBrowser({ records }: { records: CapabilityEvidenceModel["tools"] }) {
+  const [collapsed, setCollapsed] = useState<CapabilityToolDisposition[]>([]);
+  const [selected, setSelected] = useState<CapabilityEvidenceToolRow | null>(null);
+  const rows = useMemo(() => {
+    const unique = new Map<string, CapabilityEvidenceToolRow>();
+    for (const record of records) {
+      for (const row of record.rows) unique.set(row.operationId, row);
+    }
+    return [...unique.values()];
+  }, [records]);
+  const descriptor = selected === null ? undefined : capabilitySemanticToolDescriptor(selected.operationId);
+
+  useEffect(() => {
+    if (selected === null) return;
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") setSelected(null); };
+    document.addEventListener("keydown", close);
+    return () => document.removeEventListener("keydown", close);
+  }, [selected]);
+
+  return (
+    <>
+      <div className="pit-tool-groups">
+        {DISPOSITION_ORDER.map((disposition) => {
+          const group = rows.filter((row) => row.disposition === disposition);
+          if (group.length === 0) return null;
+          const folded = collapsed.includes(disposition);
+          const title = disposition === "control_plane_owned"
+            ? "Control plane (not exposed to the agent)"
+            : capabilityDispositionLabel(disposition);
+          return (
+            <section className="pit-tool-group" data-group={disposition} key={disposition}>
+              <h4>
+                <button type="button" className="pit-tool-group-toggle" aria-expanded={!folded} onClick={() => setCollapsed((current) => current.includes(disposition) ? current.filter((entry) => entry !== disposition) : [...current, disposition])}>
+                  <span aria-hidden="true">{folded ? "›" : "⌄"}</span>
+                  <span>{title}</span>
+                  <span className="pit-section-count">{group.length}</span>
+                </button>
+              </h4>
+              {!folded ? (
+                <div className="pit-tool-group-rows">
+                  {group.map((row) => (
+                    <button type="button" className="pit-tool-row" key={row.operationId} data-disposition={disposition} onClick={() => setSelected(row)}>
+                      <span className="pit-record-title">{row.operationId}</span>
+                      <span className="pit-tool-row-description">{row.description}</span>
+                      {row.grant !== null && disposition === "optional_agent_tool" ? <span className="pit-grant">{row.grant}</span> : null}
+                      <span className="pit-activity-caret" aria-hidden="true">›</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          );
+        })}
+      </div>
+
+      {selected !== null ? (
+        <div className="pit-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
+          <div className="pit-dialog pit-tool-dialog" role="dialog" aria-modal="true" aria-labelledby="tool-dialog-title">
+            <header className="pit-tool-dialog-head">
+              <div><span className="pit-card-meta">Semantic tool · v{descriptor?.version ?? 1}</span><h2 id="tool-dialog-title">{descriptor?.title ?? selected.operationId}</h2></div>
+              <button type="button" className="pit-icon-button" aria-label="Close tool details" title="Close tool details" onClick={() => setSelected(null)}><Icon name="close" /></button>
+            </header>
+            <code className="pit-tool-operation">{selected.operationId}</code>
+            <p>{descriptor?.description ?? selected.description}</p>
+            <dl className="pit-tool-facts">
+              <div><dt>Placement</dt><dd>{capabilityDispositionLabel(selected.disposition)}</dd></div>
+              <div><dt>Required claims</dt><dd>{descriptor?.requiredClaims.join(", ") || selected.grant || "None"}</dd></div>
+              <div><dt>Task modes</dt><dd>{descriptor?.allowedModes.join(", ") || "—"}</dd></div>
+              <div><dt>Actor roles</dt><dd>{descriptor?.allowedRoles?.join(", ") || "Any allowed role"}</dd></div>
+            </dl>
+            <div>
+              <h3 className="pit-tool-schema-title">Input schema</h3>
+              <pre className="pit-code">{JSON.stringify(descriptor?.inputSchema ?? {}, null, 2)}</pre>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 function filterByTurn<T extends { turnId: string }>(
@@ -264,35 +351,7 @@ export function EvidencePanel(props: EvidencePanelProps) {
         open={isOpen("tools")}
         onToggle={() => onToggleSection("tools")}
       >
-        {filterByTurn(evidence.tools, selectedTurnId).map((record) => (
-          <div key={record.id}>
-            {DISPOSITION_ORDER.map((disposition) => {
-              const rows = record.rows.filter((row) => row.disposition === disposition);
-              if (rows.length === 0) return null;
-              return (
-                <div key={disposition}>
-                  <p className="pit-tool-group-label" data-group={disposition}>
-                    {disposition === "control_plane_owned"
-                      ? "Control plane (not exposed to the agent)"
-                      : capabilityDispositionLabel(disposition)}
-                  </p>
-                  {rows.map((row) => (
-                    <p
-                      className="pit-tool-row"
-                      key={row.operationId}
-                      data-disposition={disposition}
-                    >
-                      <span className="pit-record-title">{row.operationId}</span>
-                      {row.grant !== null && disposition === "optional_agent_tool" ? (
-                        <span className="pit-grant">{row.grant}</span>
-                      ) : null}
-                    </p>
-                  ))}
-                </div>
-              );
-            })}
-          </div>
-        ))}
+        <ToolsBrowser records={filterByTurn(evidence.tools, selectedTurnId)} />
       </Section>
 
       <Section

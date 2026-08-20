@@ -119,6 +119,11 @@ boundary records, runner/runtime facts, and effective authority. A dedicated
 **Documents** tab renders every mock document and lets the operator switch
 between its retained revisions without digging through raw JSON.
 
+The Evidence log consolidates repeated tool-exposure snapshots into one
+deduplicated catalog. Its Always, Granted, and Control-plane groups fold
+independently; selecting a tool opens its catalog title, description, placement,
+required claims, allowed task modes and roles, and full input schema.
+
 **Pause** pins a revision while work continues, **Export** downloads the
 redacted DevTools snapshot, and **Fork rN** retires the current mock session and
 starts a new executable branch from that retained state. Provider payloads,

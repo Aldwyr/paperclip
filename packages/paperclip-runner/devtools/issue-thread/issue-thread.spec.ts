@@ -240,6 +240,22 @@ test.describe("Capability issue thread", () => {
     await expect(panel.getByText("Agent tool — granted")).toBeVisible();
   });
 
+  test("tool exposure groups are deduplicated, foldable, and open catalog details", async ({ page }) => {
+    await open(page, "debug-panel-open", { panel: "tools" });
+    const panel = page.getByTestId("evidence-panel");
+    const always = panel.getByRole("button", { name: /Agent tool — always/ });
+    await expect(always).toHaveCount(1);
+    await always.click();
+    await expect(panel.getByRole("button", { name: /get_task_context/ })).toHaveCount(0);
+    await always.click();
+    await panel.getByRole("button", { name: /get_task_context/ }).click();
+    const dialog = page.getByRole("dialog", { name: "Get active task context" });
+    await expect(dialog).toContainText("Read the active mock task, actor, wake, ancestors, budget, and interaction results.");
+    await expect(dialog).toContainText("Input schema");
+    await dialog.getByRole("button", { name: "Close tool details" }).click();
+    await expect(dialog).toHaveCount(0);
+  });
+
   test("Evidence records link back to their thread anchor", async ({ page }) => {
     await open(page, "debug-panel-open", { panel: "calls" });
     const panel = page.getByTestId("evidence-panel");
