@@ -2414,6 +2414,7 @@ export function createToolGatewayService(
   }
 
   async function resolveCredentialHeaders(
+    session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     grant: typeof connectionGrants.$inferSelect,
   ): Promise<Record<string, string>> {
@@ -2424,10 +2425,15 @@ export function createToolGatewayService(
       if (!grantRef) continue;
       try {
         const value = await secrets.resolveSecretValue(connection.companyId, grantRef.secretId, grantRef.versionSelector ?? "latest", {
-          consumerType: "tool_connection",
-          consumerId: connection.id,
-          configPath: `credentials.${ref.name}`,
-          actorType: "system",
+          accessContext: {
+            consumerType: "tool_connection",
+            consumerId: connection.id,
+            configPath: `credentials.${ref.name}`,
+            actorType: "system",
+            actorId: session.agentId,
+            issueId: session.issueId,
+            heartbeatRunId: session.runId,
+          },
         });
         headers[ref.key] = `${ref.prefix ?? ""}${value}`;
       } catch {
@@ -2448,10 +2454,15 @@ export function createToolGatewayService(
           oauthAccessRef.secretId,
           oauthAccessRef.versionSelector ?? "latest",
           {
-            consumerType: "tool_connection",
-            consumerId: connection.id,
-            configPath: oauthAccessRef.configPath,
-            actorType: "system",
+            accessContext: {
+              consumerType: "tool_connection",
+              consumerId: connection.id,
+              configPath: oauthAccessRef.configPath,
+              actorType: "system",
+              actorId: session.agentId,
+              issueId: session.issueId,
+              heartbeatRunId: session.runId,
+            },
           },
         );
         headers.Authorization = `Bearer ${value}`;
@@ -2482,12 +2493,7 @@ export function createToolGatewayService(
   ): Promise<ConnectedCredentialVersionSnapshot> {
     const versionSelector = input.versionSelector ?? "latest";
     try {
-      const resolvedVersion = await secrets.resolveSecretVersion(connection.companyId, input.secretId, versionSelector, {
-        consumerType: "tool_connection",
-        consumerId: connection.id,
-        configPath: input.configPath,
-        actorType: "system",
-      });
+      const resolvedVersion = await secrets.resolveSecretVersion(connection.companyId, input.secretId, versionSelector);
       return {
         refHash: input.refHash,
         versionSelector: String(versionSelector),
@@ -2791,9 +2797,12 @@ export function createToolGatewayService(
     };
   }
 
-  function localStdioEnvironment(connection: typeof toolConnections.$inferSelect, template: LocalStdioRuntimeTemplate): NodeJS.ProcessEnv {
-    const config = asRecord(connection.config) ?? {};
-    const configEnv = asRecord(config.env) ?? {};
+  async function localStdioEnvironment(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+    template: LocalStdioRuntimeTemplate,
+    grant: typeof connectionGrants.$inferSelect,
+  ): Promise<NodeJS.ProcessEnv> {
     const env: NodeJS.ProcessEnv = {};
     for (const key of ["PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"]) {
       const value = process.env[key];
@@ -2802,9 +2811,33 @@ export function createToolGatewayService(
       }
     }
     for (const key of template.envKeys) {
-      const configured = configEnv[key];
-      if (typeof configured === "string") {
-        env[key] = configured;
+      const grantRef = grant.credentialSecretRefs.find((ref) => ref.configPath === `env.${key}`);
+      if (!grantRef) continue;
+      try {
+        env[key] = await secrets.resolveSecretValue(
+          connection.companyId,
+          grantRef.secretId,
+          grantRef.versionSelector ?? "latest",
+          {
+            accessContext: {
+              consumerType: "tool_connection",
+              consumerId: connection.id,
+              configPath: grantRef.configPath,
+              actorType: "system",
+              actorId: session.agentId,
+              issueId: session.issueId,
+              heartbeatRunId: session.runId,
+            },
+          },
+        );
+      } catch {
+        await markRemoteConnectionHealth(connection, "missing_secret", "A configured local stdio credential could not be resolved.");
+        throw new ToolGatewayHttpError(
+          422,
+          "A configured local stdio credential could not be resolved.",
+          "local_stdio_missing_secret",
+          { connectionId: connection.id, credential: grantRef.configPath },
+        );
       }
     }
     return env;
@@ -2818,6 +2851,7 @@ export function createToolGatewayService(
     connection: typeof toolConnections.$inferSelect;
     entry: typeof toolCatalogEntries.$inferSelect;
     template: LocalStdioRuntimeTemplate;
+    env: NodeJS.ProcessEnv;
     parameters: unknown;
     timeoutMs: number;
   }): Promise<unknown> {
@@ -2830,7 +2864,7 @@ export function createToolGatewayService(
       );
     }
     const child = spawn(input.template.command, input.template.args, {
-      env: localStdioEnvironment(input.connection, input.template),
+      env: input.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -3244,7 +3278,7 @@ export function createToolGatewayService(
     // during tools/list. Credentials remain authoritative on collisions.
     const credentialHeaders = {
       ...projectedConnectionHeaders(connection),
-      ...await resolveCredentialHeaders(connection, grant),
+      ...await resolveCredentialHeaders(session, connection, grant),
     };
     const { headers, summary: headerSummary } = buildRemoteHeaders({
       session,
@@ -3385,8 +3419,9 @@ export function createToolGatewayService(
     ms: number,
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedLocalStdioTool(session, tool);
-    await resolveConnectionGrant(session, connection);
+    const grant = await resolveConnectionGrant(session, connection);
     const template = await resolveLocalStdioRuntimeTemplate(connection);
+    const env = await localStdioEnvironment(session, connection, template, grant);
     const result = await runtimeSupervisor.useConnectionSlot(
       {
         companyId: session.companyId,
@@ -3410,6 +3445,7 @@ export function createToolGatewayService(
           connection,
           entry,
           template,
+          env,
           parameters,
           timeoutMs: ms,
         });

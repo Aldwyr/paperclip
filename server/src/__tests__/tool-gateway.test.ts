@@ -12,6 +12,7 @@ import {
   companySecretVersions,
   companyMemberships,
   companies,
+  connectionGrantMembers,
   connectionGrants,
   createDb,
   heartbeatRuns,
@@ -285,6 +286,11 @@ async function createLocalStdioMcpTool(
     healthStatus?: "unknown" | "healthy" | "degraded" | "failed" | "unchecked" | "ok" | "error" | "missing_secret";
     catalogStatus?: "active" | "disabled" | "quarantined" | "removed";
     riskLevel?: "read" | "write" | "destructive";
+    credentialPolicy?: "shared" | "per_user" | "per_user_with_fallback";
+    credentialSecretRefs?: typeof toolConnections.$inferInsert["credentialSecretRefs"];
+    stdioScript?: string;
+    envKeys?: string[];
+    connectionConfig?: Record<string, unknown>;
   } = {},
 ) {
   const applicationKey = input.applicationKey ?? `local-app-${randomUUID().slice(0, 8)}`;
@@ -342,9 +348,31 @@ rl.on("line", (line) => {
     status: input.connectionStatus ?? "active",
     enabled: input.connectionEnabled ?? true,
     healthStatus: input.healthStatus ?? "ok",
+    credentialPolicy: input.credentialPolicy ?? "shared",
     config: { templateId: templateKey, ...(input.connectionConfig ?? {}) },
     transportConfig: { templateId: templateKey, ...(input.connectionConfig ?? {}) },
+    credentialSecretRefs: input.credentialSecretRefs ?? [],
   }).returning();
+  await db.insert(connectionGrants).values({
+    companyId,
+    connectionId: connection.id,
+    kind: "organization",
+    credentialSecretRefs: connection.credentialSecretRefs,
+    status: "active",
+    isDefault: true,
+  });
+  if (input.credentialSecretRefs?.length) {
+    await db.insert(companySecretBindings).values(input.credentialSecretRefs.map((ref) => ({
+      companyId,
+      secretId: ref.secretId,
+      targetType: "tool_connection" as const,
+      targetId: connection.id,
+      configPath: ref.configPath,
+      versionSelector: String(ref.versionSelector ?? "latest"),
+      required: ref.required ?? true,
+      label: ref.label ?? null,
+    }))).onConflictDoNothing();
+  }
   const [catalogEntry] = await db.insert(toolCatalogEntries).values({
     companyId,
     applicationId: application!.id,
@@ -1285,13 +1313,26 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       const company = await createCompany(db);
       const agent = await createAgent(db, company.id);
       const { run } = await createIssueAndRun(db, company.id, agent.id);
+      const allowedToken = await secretService(db).create(company.id, {
+        name: `Local stdio token ${randomUUID()}`,
+        key: `local_stdio_token_${randomUUID().replace(/-/g, "")}`,
+        provider: "local_encrypted",
+        value: "allowed-token",
+      });
       const localTool = await createLocalStdioMcpTool(db, company.id, {
         applicationKey: "local-env-demo",
         connectionName: "Local Env Demo",
         toolName: "inspect_env",
         title: "Inspect env",
         envKeys: ["ALLOWED_TOKEN"],
-        connectionConfig: { env: { ALLOWED_TOKEN: "allowed-token", EXTRA_CONFIG: "extra-value", NODE_OPTIONS: "--trace-warnings" } },
+        credentialSecretRefs: [{
+          secretId: allowedToken.id,
+          versionSelector: "latest",
+          configPath: "env.ALLOWED_TOKEN",
+          required: true,
+          label: "Allowed token",
+        }],
+        connectionConfig: { env: { ALLOWED_TOKEN: "connection-level-token", EXTRA_CONFIG: "extra-value", NODE_OPTIONS: "--trace-warnings" } },
         stdioScript: `
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -1359,6 +1400,135 @@ rl.on("line", (line) => {
       if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
       else process.env.DATABASE_URL = previousDatabaseUrl;
     }
+  });
+
+  it("passes only the selected grant identity to local stdio MCP processes", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    await db.update(heartbeatRuns).set({ responsibleUserId: "alice" }).where(eq(heartbeatRuns.id, run.id));
+    const values = {
+      organization: `organization-${randomUUID()}`,
+      alice: `alice-${randomUUID()}`,
+      bob: `bob-${randomUUID()}`,
+    };
+    const organizationSecret = await secretService(db).create(company.id, {
+      name: `Organization stdio token ${randomUUID()}`,
+      key: `organization_stdio_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: values.organization,
+    });
+    const aliceSecret = await secretService(db).create(company.id, {
+      name: `Alice stdio token ${randomUUID()}`,
+      key: `alice_stdio_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: values.alice,
+    });
+    const bobSecret = await secretService(db).create(company.id, {
+      name: `Bob stdio token ${randomUUID()}`,
+      key: `bob_stdio_${randomUUID().replace(/-/g, "")}`,
+      provider: "local_encrypted",
+      value: values.bob,
+    });
+    const localTool = await createLocalStdioMcpTool(db, company.id, {
+      applicationKey: "local-grant-identity",
+      toolName: "identity",
+      title: "Grant identity",
+      envKeys: ["IDENTITY_TOKEN"],
+      credentialSecretRefs: [{
+        secretId: organizationSecret.id,
+        versionSelector: "latest",
+        configPath: "env.IDENTITY_TOKEN",
+        required: true,
+        label: "Organization identity",
+      }],
+      connectionConfig: { env: { IDENTITY_TOKEN: "legacy-connection-identity" } },
+      stdioScript: `
+const readline = require("node:readline");
+const identities = ${JSON.stringify(values)};
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "identity-stdio", version: "0.0.0" } } }) + "\\n");
+    return;
+  }
+  if (message.method === "tools/call") {
+    const identity = Object.entries(identities).find(([, value]) => value === process.env.IDENTITY_TOKEN)?.[0] ?? "unknown";
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: identity }], structuredContent: { identity } } }) + "\\n");
+  }
+});
+`,
+    });
+    const grantRef = (secretId: string, label: string) => ({
+      secretId,
+      versionSelector: "latest" as const,
+      configPath: "env.IDENTITY_TOKEN",
+      required: true,
+      label,
+    });
+    const [aliceGrant] = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: localTool.connection.id,
+      kind: "user",
+      subjectUserId: "alice",
+      credentialSecretRefs: [grantRef(aliceSecret.id, "Alice identity")],
+      status: "active",
+      isDefault: false,
+    }).returning();
+    await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: localTool.connection.id,
+      kind: "user",
+      subjectUserId: "bob",
+      credentialSecretRefs: [grantRef(bobSecret.id, "Bob identity")],
+      status: "active",
+      isDefault: false,
+    });
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const gateway = createTestToolGatewayService(db, { runtimeSupervisor: { idleTtlMs: 10_000 } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.connectionId === localTool.connection.id)!;
+    const executeIdentity = async () => {
+      const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      return (result.result as { data?: { structuredContent?: { identity?: string } } }).data?.structuredContent?.identity;
+    };
+
+    expect(await executeIdentity()).toBe("organization");
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, localTool.connection.id));
+    expect(await executeIdentity()).toBe("alice");
+    await db.update(toolConnections).set({ credentialPolicy: "per_user_with_fallback" }).where(eq(toolConnections.id, localTool.connection.id));
+    expect(await executeIdentity()).toBe("alice");
+    await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, aliceGrant.id));
+    expect(await executeIdentity()).toBe("organization");
+
+    await db.delete(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id));
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, localTool.connection.id));
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .rejects.toMatchObject({ status: 409, reasonCode: "user_authorization_required" });
+    expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id))).toHaveLength(0);
+
+    const [organizationGrant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, localTool.connection.id),
+      eq(connectionGrants.kind, "organization"),
+    ));
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: organizationGrant.id,
+      subjectType: "user",
+      subjectId: "sales-user",
+    });
+    await db.update(toolConnections).set({ credentialPolicy: "shared" }).where(eq(toolConnections.id, localTool.connection.id));
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .rejects.toMatchObject({ status: 403, reasonCode: "grant_audience_denied" });
+    expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id))).toHaveLength(0);
+
+    await db.delete(connectionGrantMembers).where(eq(connectionGrantMembers.grantId, organizationGrant.id));
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, localTool.connection.id));
+    await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, run.id));
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .rejects.toMatchObject({ status: 409, reasonCode: "user_authorization_required" });
+    expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id))).toHaveLength(0);
   });
 
   it("keeps connected remote MCP gateway names collision-safe and excludes inactive catalog sources", async () => {
