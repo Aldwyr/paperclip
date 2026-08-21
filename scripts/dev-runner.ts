@@ -496,6 +496,22 @@ async function buildPluginSdk() {
   }
 }
 
+async function buildPaperclipRunner() {
+  console.log("[paperclip] building paperclip runner...");
+  const result = await runPnpm(
+    ["--filter", "@paperclipai/paperclip-runner", "build:typescript"],
+    { stdio: "inherit" },
+  );
+  if (result.signal) {
+    exitForSignal(result.signal);
+    return;
+  }
+  if (result.code !== 0) {
+    console.error("[paperclip] paperclip runner build failed");
+    process.exit(result.code);
+  }
+}
+
 async function markChildAsCurrent() {
   previousSnapshot = collectWatchedSnapshot();
   dirtyPaths = new Set();
@@ -558,6 +574,7 @@ async function stopChildForRestart() {
 }
 
 async function startServerChild() {
+  await buildPaperclipRunner();
   await buildPluginSdk();
 
   const serverScript = mode === "watch" ? "dev:watch" : "dev";
