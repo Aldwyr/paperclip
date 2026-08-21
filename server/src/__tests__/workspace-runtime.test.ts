@@ -36,6 +36,7 @@ import {
   realizeExecutionWorkspace,
   refreshRemoteTrackingBaseRef,
   releaseRuntimeServicesForRun,
+  UnresolvedWorkspaceBaseRefError,
   resetRuntimeServicesForTests,
   resolveRuntimeProvisionCommand,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
@@ -249,6 +250,26 @@ async function advanceRemoteMaster(sourceRepo: string, remotePath: string, fileN
   await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
   await runGit(sourceRepo, ["push", remotePath, "master"]);
   return readGit(sourceRepo, ["rev-parse", "master"]);
+}
+
+// Push a branch to the bare remote without leaving a local ref or a
+// remote-tracking ref in `repoRoot`. This reproduces a remote-only feature
+// branch: the clone was made before the push, so `repoRoot` learns the branch
+// only after an authenticated fetch of `origin/<branch>`.
+async function pushRemoteOnlyBranch(
+  sourceRepo: string,
+  remotePath: string,
+  branch: string,
+  fileName: string,
+) {
+  await runGit(sourceRepo, ["checkout", "-B", branch]);
+  await fs.writeFile(path.join(sourceRepo, fileName), `${fileName}\n`, "utf8");
+  await runGit(sourceRepo, ["add", fileName]);
+  await runGit(sourceRepo, ["commit", "-m", `Add ${fileName}`]);
+  await runGit(sourceRepo, ["push", remotePath, branch]);
+  const sha = await readGit(sourceRepo, ["rev-parse", branch]);
+  await runGit(sourceRepo, ["checkout", "master"]);
+  return sha;
 }
 
 function realizeWorktreeForTest(repoRoot: string, repoRef: string | null) {
@@ -1016,6 +1037,111 @@ describe("realizeExecutionWorkspace", () => {
     expect(reused.warnings).toEqual([
       expect.stringContaining("is behind origin/master by 1 commit"),
     ]);
+  });
+
+  it("bases a fresh worktree on a remote-only branch supplied as fix/foo", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const remoteSha = await pushRemoteOnlyBranch(sourceRepo, remotePath, "fix/foo", "remote-only.txt");
+
+    // The clone never learned the branch: no local ref and no remote-tracking ref.
+    await expect(readGit(repoRoot, ["rev-parse", "--verify", "fix/foo"])).rejects.toThrow();
+    await expect(readGit(repoRoot, ["rev-parse", "--verify", "origin/fix/foo"])).rejects.toThrow();
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "fix/foo");
+
+    expect(workspace.created).toBe(true);
+    expect(workspace.repoRef).toBe("origin/fix/foo");
+    expect(workspace.baseRefSha).toBe(remoteSha);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(remoteSha);
+  });
+
+  it("bases a fresh worktree on a remote-only branch supplied as origin/fix/foo", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const remoteSha = await pushRemoteOnlyBranch(sourceRepo, remotePath, "fix/bar", "remote-only.txt");
+
+    await expect(readGit(repoRoot, ["rev-parse", "--verify", "origin/fix/bar"])).rejects.toThrow();
+
+    const workspace = await realizeWorktreeForTest(repoRoot, "origin/fix/bar");
+
+    expect(workspace.created).toBe(true);
+    expect(workspace.repoRef).toBe("origin/fix/bar");
+    expect(workspace.baseRefSha).toBe(remoteSha);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(remoteSha);
+  });
+
+  it("stops before git worktree add when the base ref is absent on origin", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+
+    const error = await realizeWorktreeForTest(repoRoot, "fix/does-not-exist").then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
+    const unresolved = error as UnresolvedWorkspaceBaseRefError;
+    expect(unresolved.requestedRef).toBe("fix/does-not-exist");
+    expect(unresolved.recoveryIdentityRef).toBe("origin/fix/does-not-exist");
+    expect(unresolved.attemptedRefs).toEqual(["origin/fix/does-not-exist"]);
+    // No worktree directory was created for the fresh-create path.
+    await expect(
+      fs.stat(path.join(repoRoot, ".paperclip", "worktrees", "PAP-447-add-worktree-support")),
+    ).rejects.toThrow();
+  });
+
+  it("gives equivalent spellings of one absent remote ref the same recovery identity", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+
+    // The unqualified form and the remote-tracking form name the same remote
+    // branch. Both must map to one `recoveryIdentityRef`, so recovery does not
+    // treat a spelling change as a new blocker.
+    const unqualified = await realizeWorktreeForTest(repoRoot, "fix/absent").then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    const remoteTracking = await realizeWorktreeForTest(repoRoot, "origin/fix/absent").then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    // The full remote-tracking spelling names the same branch as well. It must
+    // map to the same canonical recovery identity, not to its raw spelling.
+    const fullRemoteTracking = await realizeWorktreeForTest(repoRoot, "refs/remotes/origin/fix/absent").then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(unqualified).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
+    expect(remoteTracking).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
+    expect(fullRemoteTracking).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
+    const unqualifiedError = unqualified as UnresolvedWorkspaceBaseRefError;
+    const remoteTrackingError = remoteTracking as UnresolvedWorkspaceBaseRefError;
+    const fullRemoteTrackingError = fullRemoteTracking as UnresolvedWorkspaceBaseRefError;
+    // Each error keeps its own operator spelling for the human notice.
+    expect(unqualifiedError.requestedRef).toBe("fix/absent");
+    expect(remoteTrackingError.requestedRef).toBe("origin/fix/absent");
+    expect(fullRemoteTrackingError.requestedRef).toBe("refs/remotes/origin/fix/absent");
+    // All three share one canonical recovery identity.
+    expect(unqualifiedError.recoveryIdentityRef).toBe("origin/fix/absent");
+    expect(remoteTrackingError.recoveryIdentityRef).toBe("origin/fix/absent");
+    expect(fullRemoteTrackingError.recoveryIdentityRef).toBe("origin/fix/absent");
+  });
+
+  it("surfaces an authenticated fetch failure as an unresolved base ref, not a crash", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    // Point origin at a path that no repository backs. The authenticated fetch
+    // fails, so the ref never resolves and the resolver reports the fetch error.
+    await runGit(repoRoot, ["remote", "set-url", "origin", path.join(os.tmpdir(), "paperclip-missing-remote.git")]);
+
+    const error = await realizeWorktreeForTest(repoRoot, "fix/unreachable").then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
+    const unresolved = error as UnresolvedWorkspaceBaseRefError;
+    expect(unresolved.requestedRef).toBe("fix/unreachable");
+    expect(unresolved.fetchError).toEqual(
+      expect.stringContaining("Could not refresh base ref origin/fix/unreachable"),
+    );
   });
 
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
@@ -7477,14 +7603,26 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-pnpm-reconcile-${randomUUID()}`;
 
-    const portProbe = net.createServer();
-    await new Promise<void>((resolve) => portProbe.listen(0, "127.0.0.1", resolve));
-    const address = portProbe.address();
-    const port = typeof address === "object" && address ? address.port : null;
-    await new Promise<void>((resolve, reject) => {
-      portProbe.close((error) => error ? reject(error) : resolve());
-    });
-    if (!port) throw new Error("Failed to reserve pnpm reconciliation test port");
+    // Reserve a port outside the runtime exposure app-port range (42000-42999).
+    // The reconciler stores this port on the row. A port inside that range makes
+    // the reconciler treat the row as an exposure reservation and report drift,
+    // so the live service never reaches the adoption path this test verifies.
+    const reservePort = async () => {
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const probe = net.createServer();
+        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+        const address = probe.address();
+        const candidate = typeof address === "object" && address ? address.port : null;
+        await new Promise<void>((resolve, reject) => {
+          probe.close((error) => error ? reject(error) : resolve());
+        });
+        if (candidate && candidate <= 55_535 && (candidate < 42_000 || candidate > 42_999)) {
+          return candidate;
+        }
+      }
+      throw new Error("Failed to reserve pnpm reconciliation test port outside the broker range");
+    };
+    const port = await reservePort();
 
     const companyId = randomUUID();
     const projectId = randomUUID();
