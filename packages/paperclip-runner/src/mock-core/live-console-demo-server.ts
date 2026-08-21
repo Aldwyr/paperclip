@@ -683,7 +683,9 @@ export class LiveConsoleDemoServer {
         if (!output.overflow) response.write(`data: ${output.serialized}\n\n`);
       }
       entry.subscribers.add(response);
-      request.once("close", () => entry.subscribers.delete(response));
+      const unsubscribe = () => entry.subscribers.delete(response);
+      request.once("close", unsubscribe);
+      response.once("close", unsubscribe);
       return;
     }
     if (request.method !== "POST") {
@@ -823,7 +825,13 @@ export class LiveConsoleDemoServer {
       if (entry.events.length >= MAX_BROWSER_EVENTS) entry.events.shift();
       entry.events.push(event);
       const serialized = `data: ${output.serialized}\n\n`;
-      for (const subscriber of entry.subscribers) subscriber.write(serialized);
+      for (const subscriber of entry.subscribers) {
+        if (subscriber.destroyed || subscriber.writableEnded) {
+          entry.subscribers.delete(subscriber);
+          continue;
+        }
+        subscriber.write(serialized);
+      }
     }
   }
 

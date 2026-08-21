@@ -659,9 +659,17 @@ fn authenticate_transport(
     Ok(())
 }
 
-fn send_outbox(client: &mut WsClient, state: &DurableRunnerState) -> Result<(), DurableRunnerError> {
+fn send_outbox(
+    client: &mut WsClient,
+    state: &DurableRunnerState,
+    sent_source_seq: &mut u64,
+) -> Result<(), DurableRunnerError> {
     for event in &state.outbox {
+        if event.source_seq <= *sent_source_seq {
+            continue;
+        }
         client.send_json(&event.envelope)?;
+        *sent_source_seq = event.source_seq;
     }
     Ok(())
 }

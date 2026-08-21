@@ -308,6 +308,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
       taskId: "task-31",
       actorId: "actor-1",
       companyId: "company-1",
+      ...(options.requestedModel === undefined ? {} : { requestedModel: options.requestedModel }),
     });
     const entry = {
       session,
@@ -364,7 +365,10 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
     const { identity, input } = runner.createCapabilityCleanRoomSessionInput({ workingDirectory });
     let session;
     try {
-      session = await service.create(input);
+      session = await service.create({
+        ...input,
+        ...(options.requestedModel === undefined ? {} : { requestedModel: options.requestedModel }),
+      });
     } catch (error) {
       await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
       throw error;
@@ -505,6 +509,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
       });
     } catch (error) {
       finished = true;
+      options.onTurnError?.(error, entry.session.id, entry.session.snapshot());
       // The code identifies the failure; the underlying message stays server
       // side because it can quote provider text (track 7U).
       write({
@@ -697,6 +702,9 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
             actorId: snapshot.authority.actorId,
             taskId: snapshot.authority.taskId,
             turnTimeoutMs: snapshot.config.turnTimeoutMs,
+            ...(snapshot.config.requestedModel === undefined
+              ? {}
+              : { requestedModel: snapshot.config.requestedModel }),
           });
         } catch (error) {
           await rm(forkDirectory, { recursive: true, force: true }).catch(() => undefined);

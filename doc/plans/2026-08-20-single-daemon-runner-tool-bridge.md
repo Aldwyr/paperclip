@@ -1,7 +1,7 @@
 # Single-daemon sandbox runner and tool bridge
 
 Date: 2026-08-20
-Status: implemented; provider reliability follow-up remains
+Status: implemented and production-readiness verified
 
 ## Target
 
@@ -112,11 +112,17 @@ labeled a reference/legacy path and cannot be reported as production topology.
 - The fake Codex boundary integration and the complete Rust suite pass.
 - Real GPT-5.4-mini single- and multi-call cases pass with final assistant text,
   token counts, estimated cost, state effects, and ordered evidence preserved.
-- The 35-case final roster produced 24 passes, two model/eval behavior findings,
-  and nine provider/runner shutdown timeouts. Previously timed-out multi-step
-  cases passed individually after the command-delivery race fix. These are kept
-  as reliability findings rather than rewritten as semantic failures.
-
-The older `CapabilityLiveSessionService` remains a runner-lab/reference API. It
-is no longer used by the live eval CLI and must not be described as the sandbox
-runtime. Removal or consolidation with the lab UI is a separate deletion task.
+- The external mock control plane, eval CLI, and runner lab all use authenticated
+  durable PRP to the Rust runner. `CapabilityLiveSessionService` is external
+  orchestration only; its default transport starts runnerd, never a TypeScript
+  sandbox dispatcher.
+- Reconnect restores the same Codex provider thread; interrupt, suspend, stop,
+  revocation, ACK replay, bounded delivery, and process-group cleanup have
+  deterministic coverage.
+- The final GPT-5.4-mini roster (`20260820-production-readiness-final`) passed
+  35/35 on first attempts with zero infrastructure retries. The two findings in
+  the preceding run were retained and classified as underspecified prompts,
+  corrected, gated individually, and then rerun in the complete roster.
+- A two-turn issue-thread smoke passed through mock Paperclip -> PRP -> runnerd
+  -> GPT-5.4-mini, including semantic tools, durable state, usage accounting,
+  credential isolation, and session isolation.

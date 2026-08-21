@@ -69,12 +69,15 @@ interface EmbeddedEvalReport {
   run: {
     model: string;
     provider: string;
+    configuration: string;
     sessionId: string;
     fixtureDigest: string;
     runnerPackageDigest: string;
     runnerdDigest: string;
+    runnerBuild: string;
     startedAt: string;
     finishedAt: string;
+    durationMs: number;
     initialRevision: number;
     finalRevision: number;
     usage: {

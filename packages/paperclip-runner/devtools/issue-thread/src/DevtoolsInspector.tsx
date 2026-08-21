@@ -13,7 +13,7 @@ export interface EvalInspectorReport {
   disposition: string;
   passed: boolean;
   checks: EvalAssertion[];
-  run: { model: string; provider: string; sessionId: string; fixtureDigest: string; runnerPackageDigest: string; runnerdDigest: string; startedAt: string; finishedAt: string; initialRevision: number; finalRevision: number; usage: { agentTurns: number; providerRequests: number | null; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number; estimatedCostNanodollars: number; pricingVersion: string } | null };
+  run: { model: string; provider: string; configuration: string; sessionId: string; fixtureDigest: string; runnerPackageDigest: string; runnerdDigest: string; runnerBuild: string; startedAt: string; finishedAt: string; durationMs: number; initialRevision: number; finalRevision: number; usage: { agentTurns: number; providerRequests: number | null; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number; estimatedCostNanodollars: number; pricingVersion: string } | null };
 }
 
 function JsonTree({ value, name = "root" }: { value: Json; name?: string }) {
@@ -143,8 +143,9 @@ export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange, evalRepo
           <div className="pit-eval-summary-head"><a href="../../index.html">← Eval suite</a><strong>{evalReport.passed ? "PASS" : evalReport.disposition.replaceAll("_", " ").toUpperCase()}</strong><code>{evalReport.attemptId}</code></div>
           <dl className="pit-eval-run-facts">
             <div><dt>Model</dt><dd>{evalReport.run.provider}/{evalReport.run.model}</dd></div>
+            <div><dt>Configuration</dt><dd>{evalReport.run.configuration}</dd></div>
             <div><dt>Session</dt><dd>{evalReport.run.sessionId}</dd></div>
-            <div><dt>Duration</dt><dd>{Math.max(0, new Date(evalReport.run.finishedAt).getTime() - new Date(evalReport.run.startedAt).getTime())} ms</dd></div>
+            <div><dt>Duration</dt><dd>{evalReport.run.durationMs} ms</dd></div>
             <div><dt>Fixture</dt><dd>{evalReport.run.fixtureDigest}</dd></div>
             <div><dt>State</dt><dd>r{evalReport.run.initialRevision} → r{evalReport.run.finalRevision}</dd></div>
             <div><dt>Tokens</dt><dd>{evalReport.run.usage === null ? "unknown" : `${evalReport.run.usage.inputTokens} in · ${evalReport.run.usage.outputTokens} out · ${evalReport.run.usage.cachedInputTokens} cached`}</dd></div>
@@ -152,6 +153,7 @@ export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange, evalRepo
             <div><dt>Provider requests</dt><dd>{evalReport.run.usage?.providerRequests ?? "unavailable"}</dd></div>
             <div><dt>Estimated cost</dt><dd>{evalReport.run.usage === null ? "unknown" : `$${(evalReport.run.usage.estimatedCostNanodollars / 1_000_000_000).toFixed(6)} · ${evalReport.run.usage.pricingVersion}`}</dd></div>
             <div><dt>Runner</dt><dd>{evalReport.run.runnerPackageDigest}</dd></div>
+            <div><dt>Runner build</dt><dd>{evalReport.run.runnerBuild}</dd></div>
             <div><dt>runnerd</dt><dd>{evalReport.run.runnerdDigest}</dd></div>
           </dl>
           <h3>Assertions</h3><EvalAssertions assertions={evalReport.checks} />

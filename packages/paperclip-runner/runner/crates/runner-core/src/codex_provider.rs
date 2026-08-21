@@ -38,13 +38,19 @@ pub struct CodexProvider {
     process: SupervisedProcess,
     next_request_id: u64,
     thread_id: String,
+    session_id: Option<String>,
     pending_tool_requests: BTreeMap<String, Value>,
 }
 
 impl CodexProvider {
+    pub fn process_id(&self) -> u32 {
+        self.process.id()
+    }
+
     pub fn start(
         config: &CodexProviderConfig,
         tools: impl Iterator<Item = AuthorizedTool>,
+        resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
         let mut provider = Self {
             process: SupervisedProcess::spawn(
@@ -55,9 +61,10 @@ impl CodexProvider {
             )?,
             next_request_id: 1,
             thread_id: String::new(),
+            session_id: None,
             pending_tool_requests: BTreeMap::new(),
         };
-        provider.request("initialize", json!({
+        let initialized = provider.request("initialize", json!({
             "clientInfo": { "name": "paperclip-runnerd", "title": "Paperclip Runner", "version": "1" },
             "capabilities": { "experimentalApi": true, "requestAttestation": false }
         }))?;
@@ -71,25 +78,55 @@ impl CodexProvider {
                 })
             })
             .collect::<Vec<_>>();
-        let opened = provider.request(
-            "thread/start",
-            json!({
-                "cwd": config.cwd,
-                "model": config.model,
-                "approvalPolicy": "never",
-                "baseInstructions": config.instructions,
-                "dynamicTools": dynamic_tools,
-                "experimentalRawEvents": true,
-                "persistExtendedHistory": true,
-            }),
-        )?;
+        let opened = if let Some(thread_id) = resume_thread_id {
+            provider.request(
+                "thread/resume",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": config.cwd,
+                    "model": config.model,
+                    "approvalPolicy": "never",
+                    "baseInstructions": config.instructions,
+                    "dynamicTools": dynamic_tools,
+                    "experimentalRawEvents": true,
+                    "persistExtendedHistory": true,
+                }),
+            )?
+        } else {
+            provider.request(
+                "thread/start",
+                json!({
+                    "cwd": config.cwd,
+                    "model": config.model,
+                    "approvalPolicy": "never",
+                    "baseInstructions": config.instructions,
+                    "dynamicTools": dynamic_tools,
+                    "experimentalRawEvents": true,
+                    "persistExtendedHistory": true,
+                }),
+            )?
+        };
         provider.thread_id = opened
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| LocalRunnerError::invalid("Codex thread/start omitted thread.id"))?
             .to_owned();
+        provider.session_id = opened
+            .pointer("/thread/sessionId")
+            .and_then(Value::as_str)
+            .or_else(|| initialized.pointer("/user/sessionId").and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         Ok(provider)
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
@@ -103,6 +140,22 @@ impl CodexProvider {
                 "runtimeWorkspaceRoots": [cwd],
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }),
+        )
+    }
+
+    pub fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
+        let thread_id = self.thread_id.clone();
+        self.request(
+            "turn/interrupt",
+            json!({ "threadId": thread_id, "turnId": turn_id }),
+        )
+    }
+
+    pub fn read_thread(&mut self) -> Result<Value, LocalRunnerError> {
+        let thread_id = self.thread_id.clone();
+        self.request(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": true }),
         )
     }
 
@@ -167,6 +220,14 @@ impl CodexProvider {
                 "contentItems": [{"type": "inputText", "text": serde_json::to_string(&result.result).unwrap_or_else(|_| "null".to_owned())}]
             }
         }))
+    }
+
+    /// Stops the provider process group at an explicit runner lifecycle boundary.
+    ///
+    /// `Drop` remains the last-resort cleanup path, but runner shutdown must not
+    /// depend on an implicit destructor firing after the durable transport loop.
+    pub fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+        self.process.terminate_group().map(|_| ())
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LocalRunnerError> {

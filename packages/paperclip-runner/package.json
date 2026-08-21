@@ -88,6 +88,8 @@
     "check:package-boundaries": "node scripts/check-package-boundaries.mjs",
     "check:clean-consumers": "node scripts/check-clean-consumers.mjs",
     "generate:capability-inventory": "node scripts/generate-capability-inventory.mjs",
+    "generate:protocol-coverage": "pnpm run build:typescript && node scripts/generate-protocol-coverage.mjs",
+    "check:protocol-coverage": "node scripts/generate-protocol-coverage.mjs --check",
     "check:capability-inventory": "node scripts/check-capability-inventory.mjs",
     "test:capability-inventory": "node scripts/check-capability-inventory.test.mjs",
     "test:capability-evals": "vitest run src/conformance/capability-eval-suite.test.ts",

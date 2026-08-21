@@ -25,6 +25,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             response_schema: json!({"type": "object"}),
         }]
         .into_iter(),
+        None,
     )
     .unwrap();
     provider.start_turn("Inspect the task.", "/tmp").unwrap();

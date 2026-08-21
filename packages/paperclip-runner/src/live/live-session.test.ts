@@ -228,6 +228,21 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
     });
     this.state.turns.set(turnId, "completed");
     this.notificationsQueue.push({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: this.state.threadId,
+        turnId,
+        tokenUsage: {
+          total: {
+            inputTokens: this.state.nextTurn * 100,
+            cachedInputTokens: this.state.nextTurn * 20,
+            outputTokens: this.state.nextTurn * 10,
+            reasoningOutputTokens: this.state.nextTurn * 2,
+          },
+        },
+      },
+    });
+    this.notificationsQueue.push({
       method: "turn/completed",
       params: { threadId: this.state.threadId, turn: { id: turnId, status: "completed" } },
     });
@@ -307,6 +322,10 @@ describe("Capability live runnerd and Codex session", () => {
     expect(first.assistantText).toContain("stateRevision");
     expect(second.assistantText).toContain("stateRevision");
     expect(first.snapshot.providerThreadId).toBe(second.snapshot.providerThreadId);
+    expect(second.snapshot.usageLedger.slice(-2)).toMatchObject([
+      { providerRequests: 1, inputTokens: 100, outputTokens: 10 },
+      { providerRequests: 1, inputTokens: 100, outputTokens: 10 },
+    ]);
     expect(first.snapshot.providerModel).toEqual({ id: "gpt-eval-test", provider: "openai" });
     expect(first.snapshot.config.requestedModel).toBe("gpt-5.4-mini-2026-03-17");
     expect(
@@ -489,7 +508,7 @@ describe("Capability live runnerd and Codex session", () => {
     expect(final?.usageLedger).toHaveLength(3);
     expect(final && reconcileCapabilityLiveUsage(final)).toEqual({
       providerCalls: 3,
-      providerRequests: 0,
+      providerRequests: 1,
       inputTokens: 280,
       outputTokens: 30,
       cachedInputTokens: 40,
@@ -693,6 +712,7 @@ describe("Capability live runnerd and Codex session", () => {
       const firstService = new CapabilityLiveSessionService({ store, transportOptions });
       const first = await firstService.create({
         ...binding,
+        workingDirectory: directory,
         attemptId: "attempt-real-killed",
         turnTimeoutMs: 2_000,
       });
@@ -701,7 +721,7 @@ describe("Capability live runnerd and Codex session", () => {
         const checkpoint = await store.load(binding.sessionId);
         expect(checkpoint?.mockState).toContain("One durable governed effect.");
         expect(checkpoint?.activeTurnId).toBe("turn-1");
-        expect(checkpoint?.process?.runnerProcessGroupId).not.toBeNull();
+        expect(checkpoint?.process?.runnerPid).not.toBeNull();
         expect(checkpoint?.process?.codexPid).not.toBeNull();
       });
       await first.recordUsage({
@@ -714,9 +734,9 @@ describe("Capability live runnerd and Codex session", () => {
         costNanodollars: 100,
       });
       const killedCheckpoint = await store.load(binding.sessionId);
-      const processGroupId = killedCheckpoint?.process?.runnerProcessGroupId;
-      expect(processGroupId).toBeTypeOf("number");
-      process.kill(-processGroupId!, "SIGKILL");
+      const runnerPid = killedCheckpoint?.process?.runnerPid;
+      expect(runnerPid).toBeTypeOf("number");
+      process.kill(runnerPid!, "SIGKILL");
       await expect(killedTurn).rejects.toThrow();
 
       const resumedService = new CapabilityLiveSessionService({

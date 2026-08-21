@@ -407,7 +407,7 @@ async function readEventStreamReplay(url: string, sessionId: string): Promise<st
   if (reader === undefined) throw new Error("event stream response did not include a body");
   let result = "";
   try {
-    while (!result.includes("data:")) {
+    while (!result.includes('"tokenBudget":4096')) {
       const chunk = await reader.read();
       if (chunk.done) break;
       result += new TextDecoder().decode(chunk.value, { stream: true });

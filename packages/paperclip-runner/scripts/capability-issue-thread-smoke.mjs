@@ -57,7 +57,18 @@ function assert(condition, message) {
 
 async function main() {
   const asJson = process.argv.includes("--json");
-  const middleware = createCapabilityIssueThreadMiddleware({ bindHost: "127.0.0.1" });
+  let turnError = null;
+  let turnErrorMethods = [];
+  const middleware = createCapabilityIssueThreadMiddleware({
+    bindHost: "127.0.0.1",
+    requestedModel: "gpt-5.4-mini",
+    onTurnError: (error, _sessionId, snapshot) => {
+      turnError = error;
+      turnErrorMethods = snapshot.evidence
+        .filter((entry) => entry.kind === "provider_event")
+        .map((entry) => entry.data);
+    },
+  });
   const server = createServer((request, response) => {
     middleware(request, response, () => {
       response.statusCode = 404;
@@ -89,6 +100,11 @@ async function main() {
       sessionId,
       message:
         "Call get_task_context, then call report_progress with a one-sentence status. Do not ask me anything.",
+    }).catch((error) => {
+      if (turnError instanceof Error) {
+        throw new Error("live issue-thread turn failed", { cause: turnError });
+      }
+      throw error;
     });
     assertions.turnStreamed = first.frames >= 2;
     const firstItems = first.view.turns.flatMap((turn) => turn.items);
@@ -106,6 +122,11 @@ async function main() {
     const second = await runTurn(jar, {
       sessionId,
       message: "Summarise the mock task in one line.",
+    }).catch((error) => {
+      if (turnError instanceof Error) {
+        throw new Error(`live issue-thread second turn failed; provider methods=${JSON.stringify(turnErrorMethods)}`, { cause: turnError });
+      }
+      throw error;
     });
     assertions.multiTurnThread = second.view.turns.length > first.view.turns.length;
     assertions.composerReady = second.view.composer.state === "ready";

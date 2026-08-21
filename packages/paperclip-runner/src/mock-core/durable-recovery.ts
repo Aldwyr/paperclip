@@ -183,14 +183,14 @@ interface MockCoreOptions {
   connectionLeaseTtlMs?: number;
 }
 
-interface RunnerProcessResult {
+export interface RunnerProcessResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 }
 
-interface RunnerProcessHandle {
+export interface RunnerProcessHandle {
   child: ChildProcessWithoutNullStreams;
   completion: Promise<RunnerProcessResult>;
 }
@@ -1342,7 +1342,7 @@ function runnerEnvironment(ticket: string): NodeJS.ProcessEnv {
   return environment;
 }
 
-function spawnRunner(options: {
+export function spawnRunner(options: {
   connectUrl: string;
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
@@ -1406,7 +1406,7 @@ function spawnRunner(options: {
   return { child, completion };
 }
 
-async function waitForProcess(
+export async function waitForProcess(
   handle: RunnerProcessHandle,
   timeoutMs = 15_000,
 ): Promise<RunnerProcessResult> {
@@ -1617,6 +1617,57 @@ export interface DurableEvalSessionInput {
   toolExposure?: "eager" | "lazy";
 }
 
+export type DurableEvalInfrastructureFailureClass =
+  | "provider_turn_timeout"
+  | "runner_shutdown_timeout"
+  | "runner_exit_failure";
+
+export class DurableEvalInfrastructureError extends Error {
+  readonly failureClass: DurableEvalInfrastructureFailureClass;
+  readonly retryable: boolean;
+  readonly diagnostics: Record<string, unknown>;
+
+  constructor(
+    failureClass: DurableEvalInfrastructureFailureClass,
+    message: string,
+    retryable: boolean,
+    diagnostics: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "DurableEvalInfrastructureError";
+    this.failureClass = failureClass;
+    this.retryable = retryable;
+    this.diagnostics = diagnostics;
+  }
+}
+
+function evalLifecycleDiagnostics(
+  core: DurableRecoveryMockCore,
+  handle: RunnerProcessHandle,
+): Record<string, unknown> {
+  const commands = core.store.state.commands.map((command) => ({
+    commandId: command.commandId,
+    type: command.type,
+    status: command.status,
+    deliveryCount: core.store.state.commandDeliveryCounts[command.commandId] ?? 0,
+  }));
+  const events = core.store.state.committedEvents.slice(-20).map((event) => ({
+    sourceSeq: event.sourceSeq,
+    eventType: event.eventType,
+    priority: event.priority,
+    deliveryCount: event.deliveryCount,
+  }));
+  return {
+    runnerPid: handle.child.pid ?? null,
+    runnerExitCode: handle.child.exitCode,
+    runnerSignal: handle.child.signalCode,
+    connectionCount: core.store.state.connectionCount,
+    ackedSourceSeq: core.store.state.ackedSourceSeq,
+    commands,
+    recentEvents: events,
+  };
+}
+
 /** Production-topology eval: the only Paperclip process in the sandbox is runnerd. */
 export async function runDurableEvalSession(input: DurableEvalSessionInput): Promise<Record<string, unknown>> {
   const identity = {
@@ -1722,11 +1773,33 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
     if (!core.store.state.committedEvents.some((event) => event.eventType === "turn.completed")) {
-      throw new Error(`durable provider turn timed out after ${input.turnTimeoutMs}ms (state: ${root})`);
+      throw new DurableEvalInfrastructureError(
+        "provider_turn_timeout",
+        `durable provider turn timed out after ${input.turnTimeoutMs}ms`,
+        true,
+        evalLifecycleDiagnostics(core, handle),
+      );
     }
     core.queueCommand("runner.shutdown", {}, undefined, true);
-    const exited = await waitForProcess(handle, 30_000);
-    if (exited.code !== 0) throw new Error(`runnerd exited ${String(exited.code)}: ${exited.stderr}`);
+    let exited: RunnerProcessResult;
+    try {
+      exited = await waitForProcess(handle, 30_000);
+    } catch (error) {
+      throw new DurableEvalInfrastructureError(
+        "runner_shutdown_timeout",
+        `runnerd did not exit within 30000ms after runner.shutdown: ${error instanceof Error ? error.message : String(error)}`,
+        true,
+        evalLifecycleDiagnostics(core, handle),
+      );
+    }
+    if (exited.code !== 0) {
+      throw new DurableEvalInfrastructureError(
+        "runner_exit_failure",
+        `runnerd exited ${String(exited.code)}: ${exited.stderr}`,
+        false,
+        { ...evalLifecycleDiagnostics(core, handle), stderr: exited.stderr.slice(-16_384) },
+      );
+    }
     const records = core.store.state.committedEvents.map((committed) => committed.envelope.payload as Record<string, unknown>);
     const evidence: Array<Record<string, unknown>> = [{
       id: "exposure-1", kind: "tool_exposure", at: new Date().toISOString(), turnId: null,

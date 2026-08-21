@@ -483,6 +483,7 @@ export function validateJsonSchema(schema: CapabilityJsonSchema, value: Capabili
 }
 
 function matchesType(type: NonNullable<CapabilityJsonSchema["type"]>, value: CapabilityJsonValue): boolean {
+  if (Array.isArray(type)) return type.some((candidate) => matchesType(candidate, value));
   switch (type) {
     case "null": return value === null;
     case "array": return Array.isArray(value);

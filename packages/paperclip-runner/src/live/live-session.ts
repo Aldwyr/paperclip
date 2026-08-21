@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import type {
   CodexAppServerTransport,
@@ -824,6 +825,7 @@ export class CapabilityLiveSession {
   #eventSeq = 0;
   #turnEventCount = 0;
   readonly #rawUsageByTurn = new Map<string, { providerRequests: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number }>();
+  #latestCumulativeUsage: Record<string, unknown> = {};
   readonly #loadedOperationIds = new Set<string>();
 
   private constructor(options: OpenSessionOptions & { snapshot?: CapabilityLiveSessionSnapshot }) {
@@ -1143,6 +1145,14 @@ export class CapabilityLiveSession {
 
   async #captureTurnUsage(turnId: string): Promise<void> {
     if (this.#transport === null) throw new Error("capability_live_usage_transport_missing");
+    // Codex can emit rawResponse/completed immediately after turn/completed.
+    // Give the notification pump a short bounded window before falling back to
+    // cumulative thread usage, otherwise a fast second turn can be mislabeled
+    // as missing accounting even though its receipt is already in flight.
+    const usageDeadline = Date.now() + 500;
+    while (!this.#rawUsageByTurn.has(turnId) && Date.now() < usageDeadline) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
     const captured = this.#rawUsageByTurn.get(turnId);
     const read = captured === undefined ? await this.#transport.request("thread/read", {
       threadId: this.#providerThreadId,
@@ -1150,7 +1160,10 @@ export class CapabilityLiveSession {
     }) : {};
     const thread = record(read.thread);
     const usage = record(thread.tokenUsage ?? read.tokenUsage);
-    const total = record(captured ?? usage.total ?? usage.totalTokenUsage ?? usage.total_token_usage);
+    const cumulativeNotification = Object.keys(this.#latestCumulativeUsage).length > 0
+      ? this.#latestCumulativeUsage
+      : undefined;
+    const total = record(captured ?? cumulativeNotification ?? usage.total ?? usage.totalTokenUsage ?? usage.total_token_usage);
     const integer = (...names: string[]): number => {
       for (const name of names) {
         const value = total[name];
@@ -1165,18 +1178,32 @@ export class CapabilityLiveSession {
       reasoningTokens: integer("reasoningOutputTokens", "reasoningTokens", "reasoning_output_tokens"),
     };
     if (cumulative.inputTokens + cumulative.outputTokens === 0) {
-      throw new Error("capability_live_usage_missing");
+      throw new Error(`capability_live_usage_missing:${JSON.stringify({
+        captured: captured !== undefined,
+        readKeys: Object.keys(read).sort(),
+        threadKeys: Object.keys(thread).sort(),
+        usageKeys: Object.keys(usage).sort(),
+        totalKeys: Object.keys(total).sort(),
+      })}`);
     }
     const prior = reconcileCapabilityLiveUsage(this.snapshot());
+    const delta = captured === undefined
+      ? {
+          inputTokens: Math.max(0, cumulative.inputTokens - prior.inputTokens),
+          outputTokens: Math.max(0, cumulative.outputTokens - prior.outputTokens),
+          cachedInputTokens: Math.max(0, cumulative.cachedInputTokens - prior.cachedInputTokens),
+          reasoningTokens: Math.max(0, cumulative.reasoningTokens - prior.reasoningTokens),
+        }
+      : cumulative;
     await this.recordUsage({
       receiptId: `${turnId}:usage`,
       turnId,
       providerCalls: 1,
-      providerRequests: captured?.providerRequests ?? 0,
-      inputTokens: Math.max(0, cumulative.inputTokens - prior.inputTokens),
-      outputTokens: Math.max(0, cumulative.outputTokens - prior.outputTokens),
-      cachedInputTokens: Math.max(0, cumulative.cachedInputTokens - prior.cachedInputTokens),
-      reasoningTokens: Math.max(0, cumulative.reasoningTokens - prior.reasoningTokens),
+      providerRequests: captured?.providerRequests ?? 1,
+      inputTokens: delta.inputTokens,
+      outputTokens: delta.outputTokens,
+      cachedInputTokens: delta.cachedInputTokens,
+      reasoningTokens: delta.reasoningTokens,
       costNanodollars: 0,
     });
   }
@@ -1352,8 +1379,18 @@ export class CapabilityLiveSession {
 
   async #connect(resume: boolean): Promise<void> {
     this.#status = "starting";
+    const identityDigest = createHash("sha256").update(this.id).digest("hex").slice(0, 20);
     const transportBundle = this.#transportFactory({
       ...this.#transportOptions,
+      stateDirectory: resolve(this.#config.workingDirectory, ".paperclip-runner-prp", identityDigest),
+      prpIdentity: {
+        runnerInstanceId: `runner_lab_${identityDigest}`,
+        environmentLeaseId: `lease_lab_${identityDigest}`,
+        runId: this.#authority.runId,
+        normalizedSessionId: this.id,
+        turnId: `turn_lab_${identityDigest}`,
+        itemId: `item_lab_${identityDigest}`,
+      },
       onDiagnostic: (message) => {
         this.#transportOptions.onDiagnostic?.(message);
         this.#appendEvidence("diagnostic", this.#activeTurnId, {
@@ -1663,24 +1700,47 @@ export class CapabilityLiveSession {
     const item = record(params.item);
     const turnId = text(params.turnId, text(turn.id));
     const providerEvent = capabilityProviderEventCategory(notification.method, params);
+    if (notification.method === "thread/tokenUsage/updated") {
+      const tokenUsage = record(params.tokenUsage);
+      this.#latestCumulativeUsage = record(
+        tokenUsage.total ?? tokenUsage.totalTokenUsage ?? tokenUsage.total_token_usage ?? tokenUsage,
+      );
+    }
     this.#appendEvidence("provider_event", turnId || null, {
       method: notification.method,
       params: jsonValue(params),
     });
-    if (notification.method === "rawResponse/completed") {
+    if (notification.method === "rawResponse/completed" || notification.method === "turn/completed") {
       const rawUsage = record(params.usage);
-      if (turnId.length > 0 && Object.keys(rawUsage).length > 0) {
-        const previous = this.#rawUsageByTurn.get(turnId) ?? { providerRequests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+      // Current Codex builds may omit turnId from rawResponse/completed. Turns
+      // are serialized by this session, so the active or just-terminal turn is
+      // the unambiguous owner of that usage receipt.
+      const usageTurnId = turnId || this.#activeTurnId || this.#terminalTurns.at(-1)?.turnId || "";
+      if (usageTurnId.length > 0 && Object.keys(rawUsage).length > 0) {
+        const previous = this.#rawUsageByTurn.get(usageTurnId);
         const value = (name: string): number => Number.isSafeInteger(rawUsage[name]) && Number(rawUsage[name]) >= 0 ? Number(rawUsage[name]) : 0;
-        this.#rawUsageByTurn.set(turnId, {
-          providerRequests: previous.providerRequests + 1,
-          inputTokens: previous.inputTokens + value("inputTokens"),
-          outputTokens: previous.outputTokens + value("outputTokens"),
-          cachedInputTokens: previous.cachedInputTokens + value("cachedInputTokens"),
-          reasoningTokens: previous.reasoningTokens + value("reasoningOutputTokens"),
-        });
+        if (notification.method === "rawResponse/completed") {
+          const base = previous ?? { providerRequests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+          this.#rawUsageByTurn.set(usageTurnId, {
+            providerRequests: base.providerRequests + 1,
+            inputTokens: base.inputTokens + value("inputTokens"),
+            outputTokens: base.outputTokens + value("outputTokens"),
+            cachedInputTokens: base.cachedInputTokens + value("cachedInputTokens"),
+            reasoningTokens: base.reasoningTokens + value("reasoningOutputTokens"),
+          });
+        } else if (previous === undefined) {
+          // Some provider versions publish only a terminal per-turn receipt.
+          this.#rawUsageByTurn.set(usageTurnId, {
+            providerRequests: 1,
+            inputTokens: value("inputTokens"),
+            outputTokens: value("outputTokens"),
+            cachedInputTokens: value("cachedInputTokens"),
+            reasoningTokens: value("reasoningOutputTokens"),
+          });
+        }
       }
-    } else if (notification.method === "turn/started") {
+    }
+    if (notification.method === "turn/started") {
       if (turnId.length > 0) this.#activeTurnId = turnId;
       this.#emit({ turnId: turnId || this.#activeTurnId, kind: "activity", reason: "turn_started" });
     } else if (notification.method === "item/agentMessage/delta") {

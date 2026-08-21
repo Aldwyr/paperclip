@@ -139,6 +139,7 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
       return { turn: { id: turnId, status: "inProgress" } };
     }
     if (method === "turn/interrupt") {
+      this.#usage(String(params.turnId));
       this.queue.push({
         method: "turn/completed",
         params: {
@@ -198,6 +199,7 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
           item: { id: `message-${turnId}`, type: "agentMessage", text: assistantText },
         },
       });
+      this.#usage(turnId);
       this.queue.push({
         method: "turn/completed",
         params: { threadId: this.state.threadId, turn: { id: turnId, status: "completed" } },
@@ -242,6 +244,7 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
         item: { id: `message-${turnId}`, type: "agentMessage", text: assistantText },
       },
     });
+    this.#usage(turnId);
     this.queue.push({
       method: "turn/completed",
       params: { threadId: this.state.threadId, turn: { id: turnId, status: "completed" } },
@@ -295,6 +298,7 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
         item: { id: `message-${turnId}`, type: "agentMessage", text: reply },
       },
     });
+    this.#usage(turnId);
     this.queue.push({
       method: "turn/completed",
       params: { threadId: this.state.threadId, turn: { id: turnId, status: "completed" } },
@@ -316,6 +320,22 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
     const result = await this.#handler(request);
     const items = result.contentItems as Array<Record<string, unknown>>;
     return `The typed result drove this reply: ${String(items[0]?.text)}`;
+  }
+
+  #usage(turnId: string): void {
+    this.queue.push({
+      method: "rawResponse/completed",
+      params: {
+        threadId: this.state.threadId,
+        turnId,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 2,
+          cachedInputTokens: 0,
+          reasoningOutputTokens: 0,
+        },
+      },
+    });
   }
 }
 

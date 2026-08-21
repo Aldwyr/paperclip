@@ -178,6 +178,8 @@ pub struct DurableRunnerState {
     pub provider_tool_bridge: ProviderToolBridge,
     #[serde(default)]
     pub codex_provider_config: Option<CodexProviderConfig>,
+    #[serde(default)]
+    pub codex_provider_thread_id: Option<String>,
 }
 
 impl DurableRunnerState {
@@ -209,6 +211,7 @@ impl DurableRunnerState {
             stop_after_flush: false,
             provider_tool_bridge: ProviderToolBridge::default(),
             codex_provider_config: None,
+            codex_provider_thread_id: None,
         }
     }
 
@@ -1324,6 +1327,16 @@ fn execute_command_effect(
             state.lifecycle = "terminal".to_owned();
             Ok(("completed".to_owned(), 1, "turn completed".to_owned()))
         }
+        "turn.interrupt" => Ok((
+            "completed".to_owned(),
+            1,
+            "provider turn interruption requested".to_owned(),
+        )),
+        "provider.thread.read" => Ok((
+            "completed".to_owned(),
+            1,
+            "provider thread read requested".to_owned(),
+        )),
         "runner.drain" => {
             state.lifecycle = "draining".to_owned();
             enqueue_event(
@@ -1350,6 +1363,23 @@ fn execute_command_effect(
                 "completed".to_owned(),
                 1,
                 "runner will stop after durable flush".to_owned(),
+            ))
+        }
+        "runner.suspend" => {
+            state.stop_after_flush = true;
+            state.lifecycle = "suspending".to_owned();
+            enqueue_event(
+                state,
+                config,
+                "runner.suspending",
+                0,
+                json!({ "afterDurableFlush": true, "resumable": true }),
+                None,
+            )?;
+            Ok((
+                "completed".to_owned(),
+                1,
+                "runner will suspend after durable flush".to_owned(),
             ))
         }
         unsupported => Ok((

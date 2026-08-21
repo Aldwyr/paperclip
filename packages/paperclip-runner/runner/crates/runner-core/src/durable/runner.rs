@@ -9,14 +9,37 @@ pub fn run_durable_runner(
     }
     let store = DurableStateStore::new(&config.state_dir)?;
     let (mut state, recovered) = store.load_or_create(&config)?;
-    let mut provider = start_configured_provider(&state)?;
     if recovered && state.lifecycle == "revoked" {
-        // Revocation is durable and terminal. Dropping the fresh bootstrap capability before
-        // destination resolution guarantees a restarted daemon cannot authenticate, reconnect,
-        // advance cursors, or rewrite the preserved operator-recovery state.
+        // Revocation is durable and terminal. Do not normalize, rewrite, start
+        // a provider, resolve a destination, or consume the fresh bootstrap.
         drop(bootstrap_ticket);
         return Ok(());
     }
+    if recovered && state.lifecycle == "suspended" {
+        state.stop_after_flush = false;
+        state.lifecycle = "ready".to_owned();
+        state.record_diagnostic("resuming an explicitly suspended durable runner");
+    }
+    let mut provider = start_configured_provider(&mut state)?;
+    if recovered {
+        if let Some(runtime) = provider.as_ref() {
+            enqueue_event(
+                &mut state,
+                &config,
+                "provider.started",
+                0,
+                json!({
+                    "provider": "codex",
+                    "pid": runtime.process_id(),
+                    "threadId": runtime.thread_id(),
+                    "sessionId": runtime.session_id(),
+                    "resumed": true,
+                }),
+                None,
+            )?;
+        }
+    }
+    store.save(&state)?;
     // Resolve once before authentication. Reconnects use only this validated,
     // concrete address set, so DNS cannot redirect a retry.
     let target = ResolvedWsTarget::resolve(&config.connect_url)?;
@@ -163,6 +186,7 @@ pub fn run_durable_runner(
             };
         state.recoverable_failure = None;
         store.save(&state)?;
+        let mut sent_source_seq = state.acked_source_seq;
 
         let initial_delivery = (|| -> Result<(), DurableRunnerError> {
             if let Some(commands) = payload.get("pendingCommands").and_then(Value::as_array) {
@@ -184,7 +208,7 @@ pub fn run_durable_runner(
                     }
                 }
             }
-            send_outbox(&mut client, &state)
+            send_outbox(&mut client, &state, &mut sent_source_seq)
         })();
         if let Err(error) = initial_delivery {
             state.record_diagnostic(error.to_string());
@@ -198,11 +222,13 @@ pub fn run_durable_runner(
         let disconnected = loop {
             poll_provider(&mut provider, &mut state, &store, &config)?;
             if provider.is_some() {
-                send_outbox(&mut client, &state)?;
+                send_outbox(&mut client, &state, &mut sent_source_seq)?;
             }
             if (state.stop_after_flush || state.lifecycle == "revoked") && state.outbox.is_empty() {
                 state.lifecycle = if state.lifecycle == "revoked" {
                     "revoked".to_owned()
+                } else if state.lifecycle == "suspending" {
+                    "suspended".to_owned()
                 } else {
                     "stopped".to_owned()
                 };
@@ -282,7 +308,7 @@ pub fn run_durable_runner(
                                 Ok(processed) => {
                                     let delivery = client
                                         .send_json(&command_result_envelope(&state, &processed))
-                                        .and_then(|()| send_outbox(&mut client, &state));
+                                        .and_then(|()| send_outbox(&mut client, &state, &mut sent_source_seq));
                                     if let Err(error) = delivery {
                                         state.record_diagnostic(error.to_string());
                                         if state.lifecycle == "revoked" {
@@ -327,7 +353,11 @@ pub fn run_durable_runner(
                                 "connection lease revoked; flushing durable events",
                             );
                             store.save(&state)?;
-                            if let Err(error) = send_outbox(&mut client, &state) {
+                            // A revoke may race the ACK for the last delivered event. Replay
+                            // only the still-unacknowledged suffix once as part of the bounded
+                            // revoke drain, rather than on every transport poll.
+                            sent_source_seq = state.acked_source_seq;
+                            if let Err(error) = send_outbox(&mut client, &state, &mut sent_source_seq) {
                                 state.record_diagnostic(error.to_string());
                                 store.save(&state)?;
                                 connection_lease_token.take();
@@ -383,16 +413,26 @@ pub fn run_durable_runner(
 }
 
 fn start_configured_provider(
-    state: &DurableRunnerState,
+    state: &mut DurableRunnerState,
 ) -> Result<Option<crate::codex_provider::CodexProvider>, DurableRunnerError> {
-    let Some(provider_config) = &state.codex_provider_config else {
+    let Some(provider_config) = state.codex_provider_config.clone() else {
         return Ok(None);
     };
+    let resume_thread_id = state.codex_provider_thread_id.clone();
+    let tools = state
+        .provider_tool_bridge
+        .authorized_tools()
+        .cloned()
+        .collect::<Vec<_>>();
     crate::codex_provider::CodexProvider::start(
-        provider_config,
-        state.provider_tool_bridge.authorized_tools().cloned(),
+        &provider_config,
+        tools.into_iter(),
+        resume_thread_id.as_deref(),
     )
-    .map(Some)
+    .map(|provider| {
+        state.codex_provider_thread_id = Some(provider.thread_id().to_owned());
+        Some(provider)
+    })
     .map_err(|error| {
         DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
     })
@@ -418,6 +458,23 @@ fn process_command_and_provider(
         Some("run.prepare") => {
             if provider.is_none() {
                 *provider = start_configured_provider(state)?;
+                if let Some(runtime) = provider.as_ref() {
+                    enqueue_event(
+                        state,
+                        config,
+                        "provider.started",
+                        0,
+                        json!({
+                            "provider": "codex",
+                            "pid": runtime.process_id(),
+                            "threadId": runtime.thread_id(),
+                            "sessionId": runtime.session_id(),
+                            "resumed": state.reconnect_count > 0,
+                        }),
+                        None,
+                    )?;
+                    store.save(state)?;
+                }
             }
         }
         Some("turn.start") => {
@@ -457,6 +514,50 @@ fn process_command_and_provider(
                         "failed to return tool result to Codex: {error}"
                     ))
                 })?;
+        }
+        Some("turn.interrupt") => {
+            let turn_id = command
+                .pointer("/payload/turnId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("turn.interrupt payload.turnId is required")
+                })?;
+            provider
+                .as_mut()
+                .ok_or_else(|| DurableRunnerError::invalid("turn.interrupt requires a provider"))?
+                .interrupt_turn(turn_id)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("Codex turn.interrupt failed: {error}"))
+                })?;
+        }
+        Some("provider.thread.read") => {
+            let response = provider
+                .as_mut()
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("provider.thread.read requires a provider")
+                })?
+                .read_thread()
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("Codex thread/read failed: {error}"))
+                })?;
+            enqueue_event(
+                state,
+                config,
+                "provider.rpc_result",
+                0,
+                json!({ "commandId": command_id, "method": "thread/read", "result": response }),
+                None,
+            )?;
+            store.save(state)?;
+        }
+        Some("runner.shutdown") | Some("runner.suspend") => {
+            if let Some(mut runtime) = provider.take() {
+                runtime.shutdown().map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to stop Codex provider during runner shutdown: {error}"
+                    ))
+                })?;
+            }
         }
         _ => {}
     }

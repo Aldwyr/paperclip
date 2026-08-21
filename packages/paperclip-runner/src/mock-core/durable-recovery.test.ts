@@ -21,6 +21,7 @@ import {
   DurableRecoveryMockCore,
   durableRecoveryInternals,
   runDurableRecoveryRecovery,
+  runDurableToolBridgeConformance,
 } from "./durable-recovery.js";
 
 async function upgradeSocket(url: string): Promise<Socket> {
@@ -365,6 +366,19 @@ async function runRunnerProcess(options: {
 }
 
 describe.sequential("Durable transport and recovery", () => {
+  it("repeatedly completes the provider bridge and explicit runner shutdown", async () => {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const result = await runDurableToolBridgeConformance();
+      expect(result, `bridge attempt ${attempt + 1}`).toMatchObject({
+        operationId: "get_task_context",
+        toolInputCommitted: true,
+        toolResultCompleted: true,
+        providerTurnCompleted: true,
+        runnerExitCode: 0,
+      });
+    }
+  }, 30_000);
+
   it("accepts a short-lived bootstrap ticket once and rejects its reuse", async () => {
     const scratch =
       process.env.PAPERCLIP_RUN_SCRATCH_DIR ??

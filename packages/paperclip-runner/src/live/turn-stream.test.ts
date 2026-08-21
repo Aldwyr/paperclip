@@ -103,6 +103,7 @@ class GatedTransport implements CodexAppServerTransport {
       return { turn: { id: "turn-1", status: "inProgress" } };
     }
     if (method === "turn/interrupt") {
+      this.queue.push({ method: "rawResponse/completed", params: { threadId: "provider-thread", turnId: String(params.turnId), usage: { inputTokens: 3, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 } } });
       this.queue.push({
         method: "turn/completed",
         params: { threadId: "provider-thread", turn: { id: String(params.turnId), status: "interrupted" } },
@@ -150,6 +151,7 @@ class GatedTransport implements CodexAppServerTransport {
         item: { id: "message-1", type: "agentMessage", text: FINAL_TEXT },
       },
     });
+    this.queue.push({ method: "rawResponse/completed", params: { threadId: "provider-thread", turnId, usage: { inputTokens: 3, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 } } });
     this.queue.push({
       method: "turn/completed",
       params: { threadId: "provider-thread", turn: { id: turnId, status: "completed" } },
