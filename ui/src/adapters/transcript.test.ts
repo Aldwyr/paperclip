@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { buildTranscript, type RunLogChunk } from "./transcript";
+import { appendTranscriptEntry, buildTranscript, type RunLogChunk } from "./transcript";
 import { grokLocalUIAdapter } from "./grok-local";
-import type { UIAdapterModule } from "./types";
+import type { TranscriptEntry, UIAdapterModule } from "./types";
 
 describe("buildTranscript", () => {
   const ts = "2026-03-20T13:00:00.000Z";
@@ -197,6 +197,17 @@ describe("buildTranscript", () => {
     expect(entries).toEqual([
       { kind: "assistant", ts, text: "Hello world", delta: true },
       { kind: "system", ts, text: "stop_reason=EndTurn session=sess-1" },
+    ]);
+  });
+
+  it("never coalesces adjacent assistant deltas across progress and final channels", () => {
+    const entries: TranscriptEntry[] = [];
+    appendTranscriptEntry(entries, { kind: "assistant", ts, text: "Checking.", delta: true, channel: "progress" });
+    appendTranscriptEntry(entries, { kind: "assistant", ts, text: "Done.", delta: true, channel: "final" });
+
+    expect(entries).toEqual([
+      { kind: "assistant", ts, text: "Checking.", delta: true, channel: "progress" },
+      { kind: "assistant", ts, text: "Done.", delta: true, channel: "final" },
     ]);
   });
 });

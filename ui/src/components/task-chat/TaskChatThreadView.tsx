@@ -80,6 +80,7 @@ function renderItem(
       return (
         <TaskChatBubble
           item={item}
+          animateEntry={!item.attachedTurn?.standaloneHeader}
           actions={item.attachedTurn?.standaloneHeader ? actions : item.attachedTurn ? undefined : actions}
           queuedAction={renderQueuedAction?.(item)}
           beforeTurn={item.attachedTurn?.standaloneHeader ? turn : undefined}

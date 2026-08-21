@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Brain } from "lucide-react";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { cn } from "@/lib/utils";
 import type { TaskChatItem, TaskChatMessageItem, TaskChatThinkingItem, TaskChatToolItem } from "./task-chat-model";
+import { TaskChatBubble } from "./TaskChatBubble";
 import { TaskChatLiveRunPill } from "./TaskChatLiveRunPill";
 import { TaskChatLiveTail } from "./TaskChatLiveTail";
 import { paperclipRunnerHistoryItems } from "./transcript-adapter";
@@ -42,12 +43,15 @@ function CurrentActivity({ items }: { items: readonly TaskChatItem[] }) {
 }
 
 export function TaskChatRunnerTurn({
+  runId,
   items,
   status,
   startedAtMs,
   finishedAtMs,
   toolSummary,
 }: {
+  /** Stable identity used to clear replay-latched final text for the next turn. */
+  runId?: string | null;
   items: readonly TaskChatItem[];
   status: string;
   startedAtMs: number | null;
@@ -57,7 +61,18 @@ export function TaskChatRunnerTurn({
   const [open, setOpen] = useState(false);
   const historyItems = paperclipRunnerHistoryItems(items);
   const progress = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && Boolean(item.interstitial));
-  const final = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
+  const observedFinal = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
+  // A reconnect/replay can briefly rebuild the transcript without the final
+  // item (or with an earlier, shorter prefix). Once durable answer text is on
+  // screen it must be monotonic for the lifetime of this mounted turn.
+  const finalRef = useRef<{ runId?: string | null; item?: TaskChatMessageItem }>({ runId });
+  if (finalRef.current.runId !== runId) {
+    finalRef.current = { runId };
+  }
+  if (observedFinal && (!finalRef.current.item || observedFinal.text.length >= finalRef.current.item.text.length)) {
+    finalRef.current.item = observedFinal;
+  }
+  const final = finalRef.current.item;
 
   if (status === "queued") {
     return (
@@ -96,8 +111,8 @@ export function TaskChatRunnerTurn({
         </div>
       ) : null}
       {final ? (
-        <div className="tc-enter-bubble px-1 py-2 text-sm text-foreground" data-testid="task-chat-final-response">
-          <MarkdownBody softBreaks linkIssueReferences>{final.text}</MarkdownBody>
+        <div data-testid="task-chat-final-response">
+          <TaskChatBubble item={final} />
         </div>
       ) : null}
     </div>

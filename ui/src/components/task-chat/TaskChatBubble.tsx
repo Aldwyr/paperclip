@@ -20,6 +20,8 @@ import type { TaskChatMessageItem } from "./task-chat-model";
 
 interface TaskChatBubbleProps {
   item: TaskChatMessageItem;
+  /** Disable the entrance animation when replacing an already-visible live response. */
+  animateEntry?: boolean;
   /** Action shown beside the queued state for an interruptible message. */
   queuedAction?: ReactNode;
   /**
@@ -65,7 +67,14 @@ function galleryItemForImage(src: string, name?: string): GalleryMediaItem {
   };
 }
 
-export function TaskChatBubble({ item, queuedAction, attachedTurn, beforeTurn, actions }: TaskChatBubbleProps) {
+export function TaskChatBubble({
+  item,
+  animateEntry = true,
+  queuedAction,
+  attachedTurn,
+  beforeTurn,
+  actions,
+}: TaskChatBubbleProps) {
   // Clicking an embedded image opens the full-screen lightbox (with download);
   // arrow keys walk across the other images in the same bubble.
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
@@ -97,7 +106,7 @@ export function TaskChatBubble({ item, queuedAction, attachedTurn, beforeTurn, a
     ? -1
     : Math.max(0, galleryItems.findIndex((galleryItem) => galleryItem.contentPath === lightboxSrc));
   return (
-    <div className={cn("tc-enter-bubble flex w-full flex-col gap-1", isHuman ? "items-end" : "items-start")}>
+    <div className={cn("flex w-full flex-col gap-1", animateEntry && "tc-enter-bubble", isHuman ? "items-end" : "items-start")}>
       {beforeTurn ? <div className="w-full pb-1">{beforeTurn}</div> : null}
       {!isHuman && item.authorName ? (
         <span className="flex items-center gap-2 px-1">

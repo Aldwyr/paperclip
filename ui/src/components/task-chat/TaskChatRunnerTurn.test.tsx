@@ -22,9 +22,9 @@ describe("TaskChatRunnerTurn", () => {
     container.remove();
   });
 
-  const render = (items: TaskChatItem[], status = "running") => act(() => root.render(
+  const render = (items: TaskChatItem[], status = "running", runId = "run-1") => act(() => root.render(
     <ThemeProvider>
-      <TaskChatRunnerTurn items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} />
+      <TaskChatRunnerTurn runId={runId} items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} />
     </ThemeProvider>,
   ));
 
@@ -48,10 +48,33 @@ describe("TaskChatRunnerTurn", () => {
   it("streams the final response in its durable slot and hides current activity", () => {
     render([
       { id: "p1", kind: "message", author: "agent", text: "Checking.", interstitial: true, channel: "progress" },
-      { id: "f1", kind: "message", author: "agent", text: "Completed successfully.", channel: "final", streaming: true },
+      { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "Completed successfully.", channel: "final", streaming: true },
     ]);
     expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain("Completed successfully.");
+    expect(container.querySelector('[data-testid="task-chat-agent-avatar"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
+  });
+
+  it("keeps final text mounted through a transient replay gap", () => {
+    render([
+      { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "Completed successfully.", channel: "final", streaming: true },
+    ]);
+    render([{ id: "t1", kind: "tool", name: "Paperclip_finish", status: "completed" }]);
+
+    expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent)
+      .toContain("Completed successfully.");
+    expect(container.querySelectorAll('[data-testid="task-chat-final-response"]')).toHaveLength(1);
+  });
+
+  it("clears replay-latched final text when the next run takes over the lane", () => {
+    render([
+      { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "First answer.", channel: "final" },
+    ], "running", "run-1");
+    render([], "running", "run-2");
+
+    expect(container.textContent).not.toContain("First answer.");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent)
+      .toContain("Thinking");
   });
 
   it("omits runner lifecycle and token noise while preserving useful history", () => {

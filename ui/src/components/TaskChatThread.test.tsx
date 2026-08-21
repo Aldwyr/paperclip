@@ -580,6 +580,56 @@ describe("TaskChatThread mobile composer dock (PAP-495)", () => {
 });
 
 describe("TaskChatThread live transcript", () => {
+  it("keeps a persisted runner reply hidden while the live turn still owns that response", () => {
+    transcriptState.transcriptByRun.set("run-runner", [
+      {
+        kind: "assistant",
+        ts: "2026-08-21T15:44:20.000Z",
+        text: "Completed the requested streaming test.",
+        channel: "final",
+        delta: true,
+      },
+    ]);
+    const comment = {
+      id: "comment-runner",
+      companyId: "company-1",
+      issueId: "issue-1",
+      authorType: "agent" as const,
+      authorAgentId: "agent-1",
+      authorUserId: null,
+      body: "Completed the requested streaming test.",
+      presentation: null,
+      metadata: null,
+      runId: "run-runner",
+      createdAt: new Date("2026-08-21T15:44:22.000Z"),
+      updatedAt: new Date("2026-08-21T15:44:22.000Z"),
+    };
+
+    render(
+      <TaskChatThread
+        comments={[comment]}
+        onAdd={async () => {}}
+        issueStatus="in_progress"
+        activeRun={{
+          id: "run-runner",
+          status: "running",
+          invocationSource: "issue",
+          triggerDetail: null,
+          startedAt: "2026-08-21T15:44:00.000Z",
+          finishedAt: null,
+          createdAt: "2026-08-21T15:44:00.000Z",
+          agentId: "agent-1",
+          agentName: "Runner",
+          adapterType: "paperclip_runner",
+        }}
+      />,
+    );
+
+    expect(container.textContent?.match(/Completed the requested streaming test\./g)).toHaveLength(1);
+    expect(container.querySelectorAll('[data-testid="task-chat-agent-bubble"]')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="task-chat-live-transcript"]')).not.toBeNull();
+  });
+
   it("renders in-flight output through TaskChatLiveTail, dropping the debug plumbing (PAP-463 C1)", () => {
     // Interleave the exact noise the old RunTranscriptView tail surfaced (init
     // row, stdout/stderr/system dumps) with real content. Only the streamed

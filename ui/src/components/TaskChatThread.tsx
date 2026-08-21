@@ -250,6 +250,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return (liveRuns ?? []).find((r) => isLiveIssueRun(r, issueStatus)) ?? null;
   }, [activeRun, issueStatus, liveRuns]);
 
+  // The live runner turn remains the sole owner of its response until the
+  // canonical comment and settled activity are both ready. This state is
+  // established in a layout effect so the live lane never disappears for a
+  // paint between `liveRun` ending and the persistence handoff beginning.
+  const [settlingRun, setSettlingRun] = useState<{ id: string; startedAtMs: number | null } | null>(null);
+  const prevLiveRunRef = useRef<typeof liveRun>(null);
+  useLayoutEffect(() => {
+    if (liveRun) {
+      prevLiveRunRef.current = liveRun;
+      setSettlingRun((current) => (current && current.id !== liveRun.id ? null : current));
+      return;
+    }
+    const prev = prevLiveRunRef.current;
+    prevLiveRunRef.current = null;
+    if (!prev) return;
+    setSettlingRun({
+      id: prev.id,
+      startedAtMs: (prev.startedAt ? toMs(prev.startedAt) : null) ?? toMs(prev.createdAt),
+    });
+  }, [liveRun]);
+
+  const heldPaperclipRunnerRunId = liveRun?.adapterType === "paperclip_runner"
+    ? liveRun.id
+    : settlingRun && runs.find((run) => run.id === settlingRun.id)?.adapterType === "paperclip_runner"
+      ? settlingRun.id
+      : null;
+
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
   const liveSeenRef = useRef<Set<string>>(new Set());
@@ -283,6 +310,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // two lists stay index-aligned.
     const visibleComments = comments.filter((comment) => !comment.deletedAt);
     visibleComments.forEach((comment, index) => {
+      // The live/settling runner lane already renders this run's final answer.
+      // Keep a just-persisted duplicate out of the backbone until the complete
+      // canonical bubble + Worked header can replace that lane atomically.
+      if (comment.runId === heldPaperclipRunnerRunId) return;
       const item = commentItems[index];
       if (!item) return;
       entries.push({ ms: toMs(comment.createdAt), order: 1, id: item.id, item });
@@ -339,7 +370,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
-  }, [comments, commentItems, interactions, timelineEvents, linkedRuns, liveRuns, planDocument]);
+  }, [comments, commentItems, interactions, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId]);
 
   // Boolean gate (stable across the host's per-render brief objects) so the
   // heavy assembly memo doesn't recompute on every parent render.
@@ -475,32 +506,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     };
   }, [orderedEntries, runs, liveRun, transcriptByRun, linkedRunMetaById, lastCommentIdByRun, hasBrief]);
 
-  // PAP-462 B4: the moment a run settles, `liveRun` flips to null — but its
-  // settled turn (or reply comment) can take seconds to arrive on the next
-  // comment refetch. Without a handoff the whole transcript unmounts that frame,
-  // blinking out already-streamed output before its settled form renders. Snapshot
-  // the just-settled run so its now-static transcript stays mounted through the gap.
-  const [settlingRun, setSettlingRun] = useState<{ id: string; startedAtMs: number | null } | null>(null);
-  const prevLiveRunRef = useRef<typeof liveRun>(null);
-  // Layout effect (not passive): snapshot the settled run before the browser
-  // paints the `liveRun === null` frame, so the tail never blinks empty for a
-  // frame between the run stopping and this snapshot committing.
-  useLayoutEffect(() => {
-    if (liveRun) {
-      prevLiveRunRef.current = liveRun;
-      // A fresh live run supersedes any lingering settled remnant.
-      setSettlingRun((current) => (current && current.id !== liveRun.id ? null : current));
-      return;
-    }
-    const prev = prevLiveRunRef.current;
-    prevLiveRunRef.current = null;
-    if (!prev) return;
-    setSettlingRun({
-      id: prev.id,
-      startedAtMs: (prev.startedAt ? toMs(prev.startedAt) : null) ?? toMs(prev.createdAt),
-    });
-  }, [liveRun]);
-
   // Hand off once the settled turn or its reply comment is in the thread; a
   // stopped run that yields neither is released by the backstop timeout so the
   // tail never lingers indefinitely.
@@ -509,7 +514,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const settlingIsPaperclipRunner = settlingRun != null &&
     runs.find((run) => run.id === settlingRun.id)?.adapterType === "paperclip_runner";
   const settledRunRendered = settlingRun != null &&
-    (settlingHasComment || (!settlingIsPaperclipRunner && settledRunIds.has(settlingRun.id)));
+    (settlingIsPaperclipRunner
+      ? settlingHasComment && settledRunIds.has(settlingRun.id)
+      : settlingHasComment || settledRunIds.has(settlingRun.id));
   useEffect(() => {
     if (!settlingRun) return;
     if (settledRunRendered) {
@@ -756,6 +763,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                   <div data-testid="task-chat-live-transcript">
                     {paperclipRunnerTail || optimisticRunnerStartup ? (
                       <TaskChatRunnerTurn
+                        runId={tailRunId}
                         items={tailItems}
                         status={optimisticRunnerStartup ? "queued" : tailStatus}
                         startedAtMs={tailStartedAtMs}
