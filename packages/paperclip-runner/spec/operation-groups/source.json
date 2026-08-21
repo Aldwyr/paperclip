@@ -20,6 +20,7 @@
     "issue": "Issue-status decision proposal outcome and application evidence."
   },
   "prpCommandFamilyDescriptions": {
+    "semantic_tool": "Returns an authorized, correlated Paperclip tool result to the provider through runnerd.",
     "run": "Prepare or cancel a run.",
     "session": "Open, snapshot, or close a normalized provider session.",
     "turn": "Start, steer, interrupt, or stop a model turn.",

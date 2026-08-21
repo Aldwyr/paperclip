@@ -7,8 +7,8 @@ import { projectCapabilityDevtools } from "../devtools/index.js";
 import { PAPERCLIP_RUNNER_BUILD_METADATA } from "../evals/build-metadata.js";
 import { estimateModelCostNanodollars } from "../evals/model-pricing.js";
 import { projectCapabilityIssueThread } from "../issue-thread/live-projection.js";
+import { runDurableEvalSession } from "../mock-core/durable-recovery.js";
 import {
-  CapabilityLiveSessionService,
   reconcileCapabilityLiveUsage,
   type CreateCapabilityLiveSessionInput,
 } from "../live/live-session.js";
@@ -44,20 +44,22 @@ if (actualDigest !== request.runnerd.sha256.replace(/^sha256:/, "")) {
   throw new Error(`runnerd digest mismatch: expected ${request.runnerd.sha256}, got sha256:${actualDigest}`);
 }
 
-const service = new CapabilityLiveSessionService({ transportOptions: { runnerBinary: runnerdPath } });
-let sessionId: string | null = null;
 try {
-  const session = await service.create({
-    ...request.session,
+  const execution = await runDurableEvalSession({
     attemptId: request.attemptId,
-    runId: request.session.runId ?? request.attemptId,
-    requestedModel: request.model,
+    prompt: request.prompt,
+    model: request.model,
+    runnerBinaryPath: runnerdPath,
+    seed: request.session.seed ?? {},
+    actorId: request.session.actorId ?? "",
+    taskId: request.session.taskId ?? "",
+    capabilities: request.session.capabilities ?? [],
+    explicitClaims: request.session.explicitClaims ?? [],
     turnTimeoutMs: request.limits.turnTimeoutMs,
+    toolExposure: request.session.toolExposure,
   });
-  sessionId = session.id;
-  const turn = await session.sendMessage(request.prompt);
-  await session.completeAttempt(turn.status === "completed" ? "succeeded" : "failed", `turn_${turn.status}`);
-  const snapshot = session.snapshot();
+  const turn = execution.turn as Record<string, unknown>;
+  const snapshot = execution.snapshot as Parameters<typeof reconcileCapabilityLiveUsage>[0];
   const reconciled = reconcileCapabilityLiveUsage(snapshot);
   if ((snapshot.usageLedger ?? []).length === 0) throw new Error("completed turn omitted usage accounting");
   const estimate = estimateModelCostNanodollars(request.model, reconciled);
@@ -94,6 +96,4 @@ try {
     requestedModel: request.model,
   }, null, 2)}\n`);
   process.exitCode = 2;
-} finally {
-  if (sessionId !== null) await service.shutdown(sessionId).catch(() => undefined);
 }

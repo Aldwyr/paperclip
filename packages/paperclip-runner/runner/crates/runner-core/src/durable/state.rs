@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::codex_provider::CodexProviderConfig;
 use crate::process_supervisor::SupervisedProcess;
+use crate::provider_bridge::{AuthorizedToolSet, ProviderToolBridge, ToolResult};
 
 const STATE_SCHEMA: &str = "paperclip.runner.durable.state.v1";
 const PROTOCOL: &str = "paperclip.runner";
@@ -92,7 +94,9 @@ pub fn capture_bootstrap_ticket() -> Result<Option<BootstrapTicket>, DurableRunn
             value
                 .into_string()
                 .map(|value| BootstrapTicket(SensitiveString::new(value)))
-                .map_err(|_| DurableRunnerError::invalid("runner bootstrap ticket is not valid UTF-8"))
+                .map_err(|_| {
+                    DurableRunnerError::invalid("runner bootstrap ticket is not valid UTF-8")
+                })
         })
         .transpose()
 }
@@ -170,6 +174,10 @@ pub struct DurableRunnerState {
     pub unrecoverable_outcome: Option<String>,
     pub harness_generation: u64,
     pub stop_after_flush: bool,
+    #[serde(default)]
+    pub provider_tool_bridge: ProviderToolBridge,
+    #[serde(default)]
+    pub codex_provider_config: Option<CodexProviderConfig>,
 }
 
 impl DurableRunnerState {
@@ -199,6 +207,8 @@ impl DurableRunnerState {
             unrecoverable_outcome: None,
             harness_generation: 1,
             stop_after_flush: false,
+            provider_tool_bridge: ProviderToolBridge::default(),
+            codex_provider_config: None,
         }
     }
 
@@ -316,18 +326,24 @@ impl DurableStateStore {
 
     pub fn save(&self, state: &DurableRunnerState) -> Result<(), DurableRunnerError> {
         let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
-            DurableRunnerError::invalid(format!("failed to serialize durable runner state: {error}"))
+            DurableRunnerError::invalid(format!(
+                "failed to serialize durable runner state: {error}"
+            ))
         })?;
         let (temporary, mut file) = create_private_temporary_file(&self.path)?;
         let result = (|| -> Result<(), DurableRunnerError> {
             file.write_all(&bytes)
                 .and_then(|_| file.sync_all())
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("failed to commit durable runner state: {error}"))
+                    DurableRunnerError::invalid(format!(
+                        "failed to commit durable runner state: {error}"
+                    ))
                 })?;
             drop(file);
             fs::rename(&temporary, &self.path).map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to replace durable runner state: {error}"))
+                DurableRunnerError::invalid(format!(
+                    "failed to replace durable runner state: {error}"
+                ))
             })?;
             sync_parent_directory(&self.path)?;
             Ok(())
@@ -426,7 +442,9 @@ fn random_suffix() -> Result<String, DurableRunnerError> {
         File::open("/dev/urandom")
             .and_then(|mut source| source.read_exact(&mut bytes))
             .map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to obtain state-file randomness: {error}"))
+                DurableRunnerError::invalid(format!(
+                    "failed to obtain state-file randomness: {error}"
+                ))
             })?;
     }
     #[cfg(windows)]
@@ -466,7 +484,9 @@ fn random_suffix() -> Result<String, DurableRunnerError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn create_private_temporary_file(destination: &Path) -> Result<(PathBuf, File), DurableRunnerError> {
+fn create_private_temporary_file(
+    destination: &Path,
+) -> Result<(PathBuf, File), DurableRunnerError> {
     let parent = destination
         .parent()
         .ok_or_else(|| DurableRunnerError::invalid("durable state path has no parent directory"))?;
@@ -540,9 +560,9 @@ fn create_private_temporary_file(destination: &Path) -> Result<(PathBuf, File), 
 fn sync_parent_directory(path: &Path) -> Result<(), DurableRunnerError> {
     #[cfg(unix)]
     {
-        let parent = path
-            .parent()
-            .ok_or_else(|| DurableRunnerError::invalid("durable state path has no parent directory"))?;
+        let parent = path.parent().ok_or_else(|| {
+            DurableRunnerError::invalid("durable state path has no parent directory")
+        })?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| {
@@ -595,6 +615,31 @@ fn validate_state_binding(
 
 fn redaction_key(key: &str) -> bool {
     let lowered = key.to_ascii_lowercase().replace('-', "_");
+    // Token *counts* are accounting facts, not credentials. Keep the known
+    // Codex usage vocabulary observable while continuing to redact bearer,
+    // session, access, and other credential-shaped token fields.
+    if [
+        "tokenusage",
+        "token_usage",
+        "inputtokens",
+        "input_tokens",
+        "outputtokens",
+        "output_tokens",
+        "cachedinputtokens",
+        "cached_input_tokens",
+        "reasoningoutputtokens",
+        "reasoning_output_tokens",
+        "reasoningtokens",
+        "reasoning_tokens",
+        "cachewriteinputtokens",
+        "cache_write_input_tokens",
+        "totaltokens",
+        "total_tokens",
+    ]
+    .contains(&lowered.as_str())
+    {
+        return false;
+    }
     [
         "authorization",
         "password",
@@ -830,7 +875,9 @@ fn compact_processed_commands(state: &mut DurableRunnerState) -> Result<(), Dura
             .values()
             .min_by_key(|command| command.controller_seq)
             .map(|command| command.command_id.clone())
-            .ok_or_else(|| DurableRunnerError::invalid("processed command compaction lost its cursor"))?;
+            .ok_or_else(|| {
+                DurableRunnerError::invalid("processed command compaction lost its cursor")
+            })?;
         state.processed_commands.remove(&oldest);
         add_compacted_command(state, &oldest)?;
     }
@@ -930,7 +977,9 @@ fn enqueue_event(
     item_id: Option<&str>,
 ) -> Result<(), DurableRunnerError> {
     if priority > 2 {
-        return Err(DurableRunnerError::invalid("event priority must be P0, P1, or P2"));
+        return Err(DurableRunnerError::invalid(
+            "event priority must be P0, P1, or P2",
+        ));
     }
 
     if priority == 2 {
@@ -975,8 +1024,8 @@ fn enqueue_event(
 
     let source_seq = state.next_source_seq;
     let envelope = event_envelope(state, source_seq, event_type, priority, payload, item_id);
-    let bytes =
-        serde_json::to_vec(&envelope).map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+    let bytes = serde_json::to_vec(&envelope)
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
     let byte_size = bytes.len();
     let projected = state.outbox_bytes().saturating_add(byte_size);
     let non_p0_limit = config
@@ -1045,6 +1094,38 @@ fn execute_command_effect(
     }
     match command_type {
         "run.prepare" => {
+            if let Some(value) = payload.get("authorizedTools") {
+                let tool_set: AuthorizedToolSet =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.prepare authorizedTools is invalid: {error}"
+                        ))
+                    })?;
+                state
+                    .provider_tool_bridge
+                    .prepare(tool_set)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.prepare tool contract rejected: {error}"
+                        ))
+                    })?;
+            }
+            if let Some(value) = payload.get("provider") {
+                let provider: CodexProviderConfig =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.prepare provider is invalid: {error}"
+                        ))
+                    })?;
+                if let Some(existing) = &state.codex_provider_config {
+                    if existing != &provider {
+                        return Err(DurableRunnerError::invalid(
+                            "provider configuration changed across a durable session",
+                        ));
+                    }
+                }
+                state.codex_provider_config = Some(provider);
+            }
             state.lifecycle = "ready".to_owned();
             enqueue_event(
                 state,
@@ -1055,6 +1136,35 @@ fn execute_command_effect(
                 None,
             )?;
             Ok(("completed".to_owned(), 1, "run prepared".to_owned()))
+        }
+        "semantic_tool.result" => {
+            let result: ToolResult = serde_json::from_value(payload.clone()).map_err(|error| {
+                DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}"))
+            })?;
+            state
+                .provider_tool_bridge
+                .apply_result(result.clone())
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!("semantic tool result rejected: {error}"))
+                })?;
+            let item_id = state.item_id.clone();
+            enqueue_event(
+                state,
+                config,
+                "mcp_app.tool_result",
+                0,
+                json!({ "semantic_tool": {
+                    "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
+                    "phase": "result", "operationId": result.operation_id,
+                    "callId": result.call_id, "result": result.result,
+                }}),
+                Some(&item_id),
+            )?;
+            Ok((
+                "completed".to_owned(),
+                1,
+                "semantic tool result delivered to provider".to_owned(),
+            ))
         }
         "session.open" => {
             enqueue_event(
@@ -1154,6 +1264,13 @@ fn execute_command_effect(
                 json!({ "turnId": state.turn_id, "sameSession": true }),
                 None,
             )?;
+            if state.codex_provider_config.is_some() {
+                return Ok((
+                    "completed".to_owned(),
+                    1,
+                    "provider turn started".to_owned(),
+                ));
+            }
             enqueue_event(
                 state,
                 config,

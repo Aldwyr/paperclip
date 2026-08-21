@@ -6,7 +6,7 @@ Status: canonical explanatory contract for the Paperclip runner V1 surface.
 
 This document keeps three independent meanings of **group** separate. PRP families describe wire evidence and controller commands; capability placement decides who owns an operation; behavioral eval groups organize the 106 scenario corpus. None of the three axes can be used as a substitute for another.
 
-The generated totals are **65 PRP events in 15 event families**, **13 controller commands in 6 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
+The generated totals are **65 PRP events in 15 event families**, **14 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
 
 ## Axis 1: PRP v1 event and command families
 
@@ -41,6 +41,7 @@ PRP records ordered, replayable execution evidence. It is not the model's Paperc
 | `turn` | Start, steer, interrupt, or stop a model turn. | `turn.start`<br>`turn.steer`<br>`turn.interrupt`<br>`turn.stop` | 4 |
 | `request` | Resolve a pending runtime request. | `request.resolve` | 1 |
 | `interaction` | Acknowledge delivery of an interaction response. | `interaction.receipt` | 1 |
+| `semantic_tool` | Returns an authorized, correlated Paperclip tool result to the provider through runnerd. | `semantic_tool.result` | 1 |
 | `runner` | Drain or shut down the runner process. | `runner.drain`<br>`runner.shutdown` | 2 |
 
 ## Axis 2: capability placement

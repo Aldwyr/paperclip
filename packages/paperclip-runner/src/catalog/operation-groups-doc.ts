@@ -100,7 +100,7 @@ export interface OperationGroupsInput {
 }
 
 const EXPECTED_EVENT_COUNT = 65;
-const EXPECTED_COMMAND_COUNT = 13;
+const EXPECTED_COMMAND_COUNT = 14;
 const EXPECTED_SCENARIO_COUNT = 106;
 const EXPECTED_BEHAVIOR_GROUP_COUNT = 16;
 
@@ -279,7 +279,7 @@ export function renderOperationGroupsDocument(input: OperationGroupsInput): stri
     "",
     "This document keeps three independent meanings of **group** separate. PRP families describe wire evidence and controller commands; capability placement decides who owns an operation; behavioral eval groups organize the 106 scenario corpus. None of the three axes can be used as a substitute for another.",
     "",
-    "The generated totals are **65 PRP events in 15 event families**, **13 controller commands in 6 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.",
+    "The generated totals are **65 PRP events in 15 event families**, **14 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.",
     "",
     "## Axis 1: PRP v1 event and command families",
     "",

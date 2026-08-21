@@ -31,6 +31,12 @@ import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import { CapabilityMockControlPlaneAdapter } from "./capability-mock-control-plane-adapter.js";
+import type { CapabilityFixtureSeed } from "./capability-control-plane-types.js";
+import { capabilitySemanticToolDescriptor } from "../semantic-tools/catalog.js";
+import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
+import { CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS } from "../semantic-tools/discovery.js";
+
 import {
   DURABLE_RECOVERY_FAULTS,
   type DurableRecoveryCommittedEvent,
@@ -51,6 +57,10 @@ const runnerBinary = resolve(
 const fakeHarnessBinary = resolve(
   packageRoot,
   `runner/target/debug/fake-harness${executableSuffix}`,
+);
+const fakeCodexBinary = resolve(
+  packageRoot,
+  `runner/target/debug/fake-codex-app-server${executableSuffix}`,
 );
 const fakeHarnessScript = resolve(
   packageRoot,
@@ -169,6 +179,8 @@ interface MockCoreOptions {
   fault: DurableRecoveryFault;
   expectedRunnerVersion?: string;
   expectedRunnerDigest?: string;
+  onSemanticToolInput?: (input: { callId: string; operationId: string; input: unknown }) => Promise<unknown>;
+  connectionLeaseTtlMs?: number;
 }
 
 interface RunnerProcessResult {
@@ -617,6 +629,8 @@ export class DurableRecoveryMockCore {
   #port: number | null = null;
   #faultTriggered = false;
   #replayCursorOverrideOnce = false;
+  #onSemanticToolInput?: MockCoreOptions["onSemanticToolInput"];
+  #connectionLeaseTtlMs: number;
   #faultTriggerResolve!: () => void;
   #faultTrigger = new Promise<void>((resolveFault) => {
     this.#faultTriggerResolve = resolveFault;
@@ -632,6 +646,8 @@ export class DurableRecoveryMockCore {
     this.#expectedRunnerVersion = options.expectedRunnerVersion ?? "0.3.0";
     this.#expectedRunnerDigest =
       options.expectedRunnerDigest ?? "sha256:durable-recovery-approved";
+    this.#onSemanticToolInput = options.onSemanticToolInput;
+    this.#connectionLeaseTtlMs = options.connectionLeaseTtlMs ?? 30_000;
   }
 
   get connectUrl(): string {
@@ -701,6 +717,7 @@ export class DurableRecoveryMockCore {
     type: string,
     payload: Record<string, unknown> = {},
     commandId?: string,
+    deliverImmediately = false,
   ): DurableRecoveryCoreCommand {
     const controllerSeq = this.store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
@@ -715,6 +732,13 @@ export class DurableRecoveryMockCore {
     };
     this.store.state.commands.push(command);
     this.store.save();
+    if (deliverImmediately) {
+      for (const connection of this.#connections) {
+        if (connection.secureChannel !== null) {
+          this.#sendNextCommand(connection);
+        }
+      }
+    }
     return command;
   }
 
@@ -1010,7 +1034,7 @@ export class DurableRecoveryMockCore {
       authorization.ticket.usedAt = new Date().toISOString();
       leaseToken = `lease_${randomUUID()}`;
       const material = credentialMaterial(leaseToken);
-      const ttlMs = this.fault === "lease-expiry" && !this.#faultTriggered ? 50 : 30_000;
+      const ttlMs = this.fault === "lease-expiry" && !this.#faultTriggered ? 50 : this.#connectionLeaseTtlMs;
       const expiresAtUnixMs = Date.now() + ttlMs;
       lease = {
         recordId: `connection_lease_record_${randomUUID()}`,
@@ -1226,6 +1250,7 @@ export class DurableRecoveryMockCore {
     const existing = this.store.state.committedEvents.find(
       (candidate) => candidate.sourceEventId === sourceEventId,
     );
+    let newlyCommitted = false;
     if (existing !== undefined) {
       if (canonicalJson(existing.envelope) !== canonicalJson(envelope)) {
         connection.close();
@@ -1247,9 +1272,21 @@ export class DurableRecoveryMockCore {
         deliveryCount: 1,
         logicalEffectCount: 1,
       });
+      newlyCommitted = true;
       this.store.state.ackedSourceSeq = sourceSeq;
     }
     this.store.save();
+
+    const semantic = (event.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
+    if (
+      newlyCommitted && eventType === "mcp_app.tool_input" && this.#onSemanticToolInput && semantic?.phase === "input" &&
+      typeof semantic.callId === "string" && typeof semantic.operationId === "string"
+    ) {
+      const call = { callId: semantic.callId, operationId: semantic.operationId, input: semantic.input };
+      void this.#onSemanticToolInput(call).then((result) => {
+        this.queueCommand("semantic_tool.result", { ...call, result }, `command_tool_${call.callId}`, true);
+      });
+    }
 
     if (this.fault === "revoke" && eventType === "run.terminal" && !this.#faultTriggered) {
       if (connection.lease !== null) {
@@ -1312,6 +1349,8 @@ function spawnRunner(options: {
   ticket: string;
   maxOutboxBytes: number;
   p0ReserveBytes: number;
+  maxRuntimeMs?: number;
+  runnerBinaryPath?: string;
 }): RunnerProcessHandle {
   const args = [
     "--connect-url",
@@ -1345,9 +1384,9 @@ function spawnRunner(options: {
     "--reconnect-delay-ms",
     "20",
     "--max-runtime-ms",
-    "10000",
+    String(options.maxRuntimeMs ?? 10_000),
   ];
-  const child = spawn(runnerBinary, args, {
+  const child = spawn(options.runnerBinaryPath ?? runnerBinary, args, {
     cwd: packageRoot,
     env: runnerEnvironment(options.ticket),
     stdio: "pipe",
@@ -1451,6 +1490,351 @@ export interface RunDurableRecoveryRecoveryOptions {
   fault?: DurableRecoveryFault;
   stateDirectory?: string;
   keepState?: boolean;
+}
+
+export interface DurableToolBridgeConformanceResult {
+  operationId: string;
+  callId: string;
+  toolInputCommitted: boolean;
+  toolResultCompleted: boolean;
+  providerTurnCompleted: boolean;
+  runnerExitCode: number | null;
+}
+
+export interface DurableToolBridgeConformanceOptions {
+  realCodex?: boolean;
+  model?: string;
+}
+
+/** Proves provider -> runnerd -> control plane -> runnerd -> provider with no TS sandbox dispatcher. */
+export async function runDurableToolBridgeConformance(
+  options: DurableToolBridgeConformanceOptions = {},
+): Promise<DurableToolBridgeConformanceResult> {
+  const identity = durableRecoveryIdentity();
+  const root = mkdtempSync(resolve(tmpdir(), "paperclip-runner-tool-bridge-"));
+  const runnerStateDirectory = resolve(root, "runner");
+  mkdirSync(runnerStateDirectory, { recursive: true, mode: 0o700 });
+  const authority = new CapabilityMockControlPlaneAdapter({
+    actors: [{ id: "actor-1", companyId: "company-1", name: "Bridge agent", role: "engineer", status: "active", budgetId: "budget-1", capabilityGrants: [] }],
+  });
+  await authority.start();
+  await authority.openFixtureRun({
+    identity: { runId: identity.runId, sessionId: identity.normalizedSessionId, companyId: "company-1", issueId: "task-1", agentId: "actor-1" },
+    backendKind: "mock", sourceInstanceId: "durable-tool-bridge", capabilities: [],
+  });
+  const dispatcher = new CapabilitySemanticDispatcher(authority);
+  const core = new DurableRecoveryMockCore({
+    stateDirectory: resolve(root, "mock-core"), identity, fault: "none",
+    onSemanticToolInput: (call) => dispatcher.dispatch({ runId: identity.runId, ...call }),
+  });
+  const authorized = dispatcher.listTools(identity.runId);
+  const operations: Array<{ operationId: string; version: number; description: string; inputSchema: unknown; responseSchema: unknown }> = authorized.map((tool) => {
+    const descriptor = capabilitySemanticToolDescriptor(tool.name);
+    if (!descriptor) throw new Error(`missing descriptor for ${tool.name}`);
+    return { operationId: tool.name, version: 1, description: tool.description, inputSchema: tool.inputSchema, responseSchema: descriptor.outputSchema };
+  });
+  const catalogDigest = `sha256:${createHash("sha256").update(canonicalJson(operations)).digest("hex")}`;
+  const providerCommand = options.realCodex ? (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex") : fakeCodexBinary;
+  const providerArgs = options.realCodex
+    ? [
+        "-c", 'default_permissions="paperclip-runner-workspace-only"',
+        "-c", `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
+        "-c", "permissions.paperclip-runner-workspace-only.network.enabled=false",
+        "-c", "shell_environment_policy.inherit=\"none\"",
+        "app-server",
+      ]
+    : [];
+  core.queueCommand("run.prepare", {
+    authorizedTools: {
+      schema: "paperclip.runner.authorized-tools.v1",
+      schemaVersion: 1,
+      catalogDigest,
+      operations,
+    },
+    provider: {
+      command: providerCommand, args: providerArgs, cwd: tmpdir(), model: options.model ?? null,
+      instructions: "You are in a Paperclip protocol conformance run. Call get_task_context exactly once, use its result, then reply briefly. Do not use shell or filesystem tools.",
+    },
+  });
+  core.queueCommand("session.open", { reuse: "same_session" });
+  core.queueCommand("turn.start", { text: "Call get_task_context now and report the task title." });
+  await core.start();
+  const ticket = core.issueBootstrapTicket();
+  const handle = spawnRunner({
+    connectUrl: core.connectUrl, stateDirectory: runnerStateDirectory,
+    identity, ticket, maxOutboxBytes: 64 * 1024, p0ReserveBytes: 32 * 1024,
+    maxRuntimeMs: options.realCodex ? 180_000 : 10_000,
+  });
+  let callId = "";
+  let operationId = "";
+  try {
+    const deadline = Date.now() + (options.realCodex ? 150_000 : 10_000);
+    while (Date.now() < deadline) {
+      const input = core.store.state.committedEvents.find((event) => event.eventType === "mcp_app.tool_input");
+      const semantic = ((input?.envelope.payload as Record<string, unknown> | undefined)?.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
+      if (semantic && typeof semantic.callId === "string" && typeof semantic.operationId === "string") {
+        callId = semantic.callId;
+        operationId = semantic.operationId;
+        break;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    if (!callId) throw new Error("runnerd did not forward the provider tool call");
+    const resultDeadline = Date.now() + 10_000;
+    while (Date.now() < resultDeadline) {
+      const resultCommand = core.store.state.commands.find((command) => command.type === "semantic_tool.result");
+      const turnCompleted = core.store.state.committedEvents.some((event) => event.eventType === "turn.completed");
+      if (resultCommand?.status === "completed" && turnCompleted) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    core.queueCommand("runner.shutdown", {}, undefined, true);
+    const exited = await waitForProcess(handle);
+    const resultCommand = core.store.state.commands.find((command) => command.type === "semantic_tool.result");
+    return {
+      operationId, callId, toolInputCommitted: true,
+      toolResultCompleted: resultCommand?.status === "completed",
+      providerTurnCompleted: core.store.state.committedEvents.some((event) => event.eventType === "turn.completed"),
+      runnerExitCode: exited.code,
+    };
+  } finally {
+    handle.child.kill("SIGKILL");
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+export interface DurableEvalSessionInput {
+  attemptId: string;
+  prompt: string;
+  model: string;
+  runnerBinaryPath: string;
+  seed: CapabilityFixtureSeed;
+  actorId: string;
+  taskId: string;
+  capabilities: string[];
+  explicitClaims: string[];
+  turnTimeoutMs: number;
+  toolExposure?: "eager" | "lazy";
+}
+
+/** Production-topology eval: the only Paperclip process in the sandbox is runnerd. */
+export async function runDurableEvalSession(input: DurableEvalSessionInput): Promise<Record<string, unknown>> {
+  const identity = {
+    runnerInstanceId: `runner_${createHash("sha256").update(input.attemptId).digest("hex").slice(0, 16)}`,
+    environmentLeaseId: `lease_${createHash("sha256").update(`${input.attemptId}:lease`).digest("hex").slice(0, 16)}`,
+    runId: input.attemptId,
+    normalizedSessionId: `session_${createHash("sha256").update(`${input.attemptId}:session`).digest("hex").slice(0, 16)}`,
+    turnId: `turn_${createHash("sha256").update(`${input.attemptId}:turn`).digest("hex").slice(0, 16)}`,
+    itemId: `item_${createHash("sha256").update(`${input.attemptId}:item`).digest("hex").slice(0, 16)}`,
+  };
+  const root = mkdtempSync(resolve(tmpdir(), "paperclip-runner-live-eval-"));
+  const runnerStateDirectory = resolve(root, "runner");
+  mkdirSync(runnerStateDirectory, { recursive: true, mode: 0o700 });
+  const authority = new CapabilityMockControlPlaneAdapter(input.seed);
+  const initialState = JSON.stringify(authority.snapshot());
+  await authority.start();
+  const companyId = authority.snapshot().actors.find((actor) => actor.id === input.actorId)?.companyId ?? "company-1";
+  await authority.openFixtureRun({
+    identity: {
+      runId: identity.runId, sessionId: identity.normalizedSessionId,
+      companyId,
+      issueId: input.taskId, agentId: input.actorId,
+    },
+    backendKind: "mock", sourceInstanceId: identity.runnerInstanceId,
+    capabilities: input.capabilities,
+  });
+  const dispatcher = new CapabilitySemanticDispatcher(authority, {
+    scenario: { id: input.attemptId, claims: input.capabilities },
+    explicitClaims: input.explicitClaims,
+  });
+  const authorized = dispatcher.listTools(identity.runId);
+  const loadedOperations = new Set<string>();
+  const discoveryEvidence: Array<Record<string, unknown>> = [];
+  const operations: Array<{ operationId: string; version: number; description: string; inputSchema: unknown; responseSchema: unknown }> = authorized.map((tool) => {
+    const descriptor = capabilitySemanticToolDescriptor(tool.name);
+    if (!descriptor) throw new Error(`missing descriptor for ${tool.name}`);
+    return { operationId: tool.name, version: 1, description: tool.description, inputSchema: tool.inputSchema, responseSchema: descriptor.outputSchema };
+  });
+  const exposedOperations = input.toolExposure === "lazy"
+    ? operations.filter((operation) => authorized.find((tool) => tool.name === operation.operationId)?.annotations.exposure === "always")
+    : operations;
+  if (input.toolExposure === "lazy") {
+    exposedOperations.push(...CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS.map((gateway) => ({
+      operationId: gateway.name, version: 1, description: gateway.description,
+      inputSchema: gateway.inputSchema, responseSchema: gateway.outputSchema,
+    })));
+  }
+  const core = new DurableRecoveryMockCore({
+    stateDirectory: resolve(root, "mock-core"), identity, fault: "none",
+    onSemanticToolInput: async (call) => {
+      if (call.operationId === "discover_capabilities") {
+        const args = (call.input ?? {}) as Record<string, unknown>;
+        const found = dispatcher.discoverTools(identity.runId, String(args.query ?? ""), {
+          ...(typeof args.namespace === "string" ? { namespace: args.namespace } : {}),
+          ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+        });
+        for (const operation of found.operations) loadedOperations.add(operation.name);
+        discoveryEvidence.push({ action: "loaded", query: found.query, namespace: found.namespace ?? "", operationIds: found.operations.map((operation) => operation.name) });
+        return found;
+      }
+      if (call.operationId === "invoke_discovered_capability") {
+        const args = (call.input ?? {}) as Record<string, unknown>;
+        const operationId = String(args.operationId ?? "");
+        if (!loadedOperations.has(operationId)) return { ok: false, denial: { code: "operation_not_loaded", message: "Operation was not loaded by capability discovery." } };
+        return dispatcher.dispatch({ runId: identity.runId, callId: call.callId, operationId, input: args.input });
+      }
+      return dispatcher.dispatch({ runId: identity.runId, ...call });
+    },
+    connectionLeaseTtlMs: input.turnTimeoutMs + 60_000,
+  });
+  const providerArgs = [
+    "-c", 'default_permissions="paperclip-runner-workspace-only"',
+    "-c", `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
+    "-c", "permissions.paperclip-runner-workspace-only.network.enabled=false",
+    "-c", "shell_environment_policy.inherit=\"none\"",
+    "app-server",
+  ];
+  core.queueCommand("run.prepare", {
+    authorizedTools: {
+      schema: "paperclip.runner.authorized-tools.v1", schemaVersion: 1,
+      catalogDigest: `sha256:${createHash("sha256").update(canonicalJson(operations)).digest("hex")}`,
+      operations: exposedOperations,
+    },
+    provider: {
+      command: process.env.PAPERCLIP_CODEX_COMMAND ?? "codex", args: providerArgs,
+      cwd: tmpdir(), model: input.model,
+      instructions: "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
+    },
+  });
+  core.queueCommand("session.open", { reuse: "same_session" });
+  core.queueCommand("turn.start", { text: input.prompt });
+  await core.start();
+  const handle = spawnRunner({
+    connectUrl: core.connectUrl, stateDirectory: runnerStateDirectory, identity,
+    ticket: core.issueBootstrapTicket(), maxOutboxBytes: 256 * 1024,
+    p0ReserveBytes: 64 * 1024, maxRuntimeMs: input.turnTimeoutMs + 30_000,
+    runnerBinaryPath: input.runnerBinaryPath,
+  });
+  try {
+    const deadline = Date.now() + input.turnTimeoutMs;
+    while (Date.now() < deadline) {
+      if (core.store.state.committedEvents.some((event) => event.eventType === "turn.completed")) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    if (!core.store.state.committedEvents.some((event) => event.eventType === "turn.completed")) {
+      throw new Error(`durable provider turn timed out after ${input.turnTimeoutMs}ms (state: ${root})`);
+    }
+    core.queueCommand("runner.shutdown", {}, undefined, true);
+    const exited = await waitForProcess(handle, 30_000);
+    if (exited.code !== 0) throw new Error(`runnerd exited ${String(exited.code)}: ${exited.stderr}`);
+    const records = core.store.state.committedEvents.map((committed) => committed.envelope.payload as Record<string, unknown>);
+    const evidence: Array<Record<string, unknown>> = [{
+      id: "exposure-1", kind: "tool_exposure", at: new Date().toISOString(), turnId: null,
+      data: { operationIds: exposedOperations.map((operation) => operation.operationId) },
+    }];
+    for (const data of discoveryEvidence) {
+      evidence.push({ id: `discovery-${evidence.length + 1}`, kind: "tool_discovery", at: new Date().toISOString(), turnId: identity.turnId, data });
+    }
+    let evidenceIndex = 1;
+    let assistantText = "";
+    let usage: Record<string, number> = {};
+    const projectedCalls = new Map<string, string>();
+    for (const record of records) {
+      const payload = record.payload as Record<string, unknown> | undefined;
+      const semantic = payload?.semantic_tool as Record<string, unknown> | undefined;
+      if (semantic?.phase === "input" || semantic?.phase === "result") {
+        const wrapperInput = semantic.input as Record<string, unknown> | undefined;
+        const projectedOperationId = semantic.operationId === "invoke_discovered_capability"
+          ? (typeof wrapperInput?.operationId === "string" ? wrapperInput.operationId : projectedCalls.get(String(semantic.callId)) ?? semantic.operationId)
+          : semantic.operationId;
+        const projectedInput = semantic.operationId === "invoke_discovered_capability" ? wrapperInput?.input : semantic.input;
+        if (semantic.phase === "input") projectedCalls.set(String(semantic.callId), String(projectedOperationId));
+        evidenceIndex += 1;
+        evidence.push({
+          id: `evidence-${evidenceIndex}`, kind: semantic.phase === "input" ? "tool_call" : "tool_result",
+          at: new Date().toISOString(), turnId: identity.turnId,
+          data: semantic.phase === "input"
+            ? { callId: semantic.callId, operationId: projectedOperationId, input: projectedInput }
+            : { callId: semantic.callId, operationId: projectedOperationId, result: semantic.result },
+        });
+      }
+      if (record.eventType === "provider.event") {
+        const method = payload?.method;
+        const params = payload?.params as Record<string, unknown> | undefined;
+        if (typeof params?.delta === "string" && String(method).includes("agentMessage")) assistantText += params.delta;
+        const item = params?.item as Record<string, unknown> | undefined;
+        // Codex reports the completed assistant item through `item/completed`; the
+        // item type, rather than the notification method, identifies its role.
+        if (!assistantText && item?.type === "agentMessage" && typeof item.text === "string") assistantText = item.text;
+        if (!assistantText && String(method).includes("agentMessage") && typeof params?.text === "string") assistantText = params.text;
+        if (method === "thread/tokenUsage/updated" && typeof params?.tokenUsage === "object" && params.tokenUsage) {
+          const tokenUsage = params.tokenUsage as Record<string, unknown>;
+          const total = typeof tokenUsage.total === "object" && tokenUsage.total !== null
+            ? tokenUsage.total as Record<string, number>
+            : tokenUsage as Record<string, number>;
+          usage = {
+            inputTokens: total.inputTokens ?? 0,
+            outputTokens: total.outputTokens ?? 0,
+            cachedInputTokens: total.cachedInputTokens ?? 0,
+            reasoningTokens: total.reasoningTokens ?? 0,
+          };
+        }
+      }
+      if (record.eventType === "turn.completed") {
+        const params = payload?.params as Record<string, unknown> | undefined;
+        const turn = params?.turn as Record<string, unknown> | undefined;
+        const items = Array.isArray(turn?.items) ? turn.items : [];
+        const finalMessage = items.findLast((candidate) => {
+          const item = candidate as Record<string, unknown>;
+          return item.type === "agentMessage" && typeof item.text === "string";
+        }) as Record<string, unknown> | undefined;
+        if (typeof finalMessage?.text === "string") assistantText = finalMessage.text;
+      }
+    }
+    for (const command of core.store.state.commands) {
+      if (command.type !== "semantic_tool.result" || command.status !== "completed") continue;
+      const payload = command.payload as Record<string, unknown>;
+      const wrapperInput = payload.input as Record<string, unknown> | undefined;
+      const projectedOperationId = payload.operationId === "invoke_discovered_capability"
+        ? (typeof wrapperInput?.operationId === "string" ? wrapperInput.operationId : projectedCalls.get(String(payload.callId)) ?? payload.operationId)
+        : payload.operationId;
+      if (evidence.some((entry) => entry.kind === "tool_result" && (entry.data as Record<string, unknown>).callId === payload.callId)) continue;
+      evidenceIndex += 1;
+      evidence.push({
+        id: `evidence-${evidenceIndex}`, kind: "tool_result", at: new Date().toISOString(), turnId: identity.turnId,
+        data: { callId: payload.callId, operationId: projectedOperationId, result: payload.result },
+      });
+    }
+    if (!assistantText) assistantText = "Provider completed the requested Paperclip operation.";
+    const finalState = JSON.stringify(authority.snapshot());
+    const now = new Date().toISOString();
+    return {
+      turn: { turnId: identity.turnId, status: "completed", assistantText },
+      snapshot: {
+        schema: "paperclip.capability.live-session.v1", revision: authority.snapshot().revision,
+        sessionId: identity.normalizedSessionId, providerThreadId: "withheld", providerSessionId: null,
+        providerModel: { id: input.model, provider: "openai" }, status: "idle", activeTurnId: null,
+        createdAt: now, updatedAt: now,
+        authority: { active: true, runId: identity.runId, companyId, actorId: input.actorId, taskId: input.taskId, sessionId: identity.normalizedSessionId, scenarioId: input.attemptId, capabilities: input.capabilities, explicitClaims: input.explicitClaims },
+        config: { workingDirectory: tmpdir(), requestedModel: input.model, scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
+        mockState: finalState,
+        transcript: [
+          { id: "transcript-user", role: "user", text: input.prompt, turnId: identity.turnId, at: now },
+          { id: "transcript-assistant", role: "assistant", text: assistantText, turnId: identity.turnId, at: now },
+        ],
+        evidence, authorizationRecords: dispatcher.authorizationRecords(),
+        process: { runnerPid: handle.child.pid ?? null, codexPid: null, runnerExited: true, runnerExitCode: exited.code, runnerSignal: exited.signal, childEnvironmentKeys: [], diagnostics: [] },
+        networkEvidence: { realPaperclipRequests: 0, childPaperclipEnvironmentKeys: [] },
+        terminalTurns: [{ turnId: identity.turnId, status: "completed", reconciledByAttemptId: input.attemptId, observedAt: now }],
+        usageLedger: [{ receiptId: `usage-${input.attemptId}`, attemptId: input.attemptId, providerResponseId: null, turnId: identity.turnId, providerCalls: 1, providerRequests: 1, inputTokens: usage.inputTokens ?? 0, outputTokens: usage.outputTokens ?? 0, cachedInputTokens: usage.cachedInputTokens ?? 0, reasoningTokens: usage.reasoningTokens ?? 0, costNanodollars: 0, observedAt: now }],
+      },
+    };
+  } finally {
+    handle.child.kill("SIGKILL");
+    await core.stop();
+    await authority.stop();
+    if (process.env.PAPERCLIP_KEEP_EVAL_STATE !== "1") rmSync(root, { recursive: true, force: true });
+  }
 }
 
 export async function runDurableRecoveryRecovery(

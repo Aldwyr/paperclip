@@ -9,6 +9,7 @@ pub fn run_durable_runner(
     }
     let store = DurableStateStore::new(&config.state_dir)?;
     let (mut state, recovered) = store.load_or_create(&config)?;
+    let mut provider = start_configured_provider(&state)?;
     if recovered && state.lifecycle == "revoked" {
         // Revocation is durable and terminal. Dropping the fresh bootstrap capability before
         // destination resolution guarantees a restarted daemon cannot authenticate, reconnect,
@@ -166,7 +167,13 @@ pub fn run_durable_runner(
         let initial_delivery = (|| -> Result<(), DurableRunnerError> {
             if let Some(commands) = payload.get("pendingCommands").and_then(Value::as_array) {
                 for command in commands {
-                    match process_command(&mut state, &store, &config, command) {
+                    match process_command_and_provider(
+                        &mut state,
+                        &store,
+                        &config,
+                        &mut provider,
+                        command,
+                    ) {
                         Ok(processed) => {
                             client.send_json(&command_result_envelope(&state, &processed))?
                         }
@@ -189,6 +196,10 @@ pub fn run_durable_runner(
 
         let mut revoke_deadline: Option<Instant> = None;
         let disconnected = loop {
+            poll_provider(&mut provider, &mut state, &store, &config)?;
+            if provider.is_some() {
+                send_outbox(&mut client, &state)?;
+            }
             if (state.stop_after_flush || state.lifecycle == "revoked") && state.outbox.is_empty() {
                 state.lifecycle = if state.lifecycle == "revoked" {
                     "revoked".to_owned()
@@ -251,7 +262,9 @@ pub fn run_durable_runner(
                             let acked = message
                                 .pointer("/payload/ackedSourceSeq")
                                 .and_then(Value::as_u64)
-                                .ok_or_else(|| DurableRunnerError::invalid("ACK cursor is required"))?;
+                                .ok_or_else(|| {
+                                    DurableRunnerError::invalid("ACK cursor is required")
+                                })?;
                             state.apply_ack(acked)?;
                             store.save(&state)?;
                         }
@@ -259,7 +272,13 @@ pub fn run_durable_runner(
                             let command = message.get("payload").ok_or_else(|| {
                                 DurableRunnerError::invalid("command payload is required")
                             })?;
-                            match process_command(&mut state, &store, &config, command) {
+                            match process_command_and_provider(
+                                &mut state,
+                                &store,
+                                &config,
+                                &mut provider,
+                                command,
+                            ) {
                                 Ok(processed) => {
                                     let delivery = client
                                         .send_json(&command_result_envelope(&state, &processed))
@@ -288,7 +307,9 @@ pub fn run_durable_runner(
                                 .pointer("/payload/revocationEpoch")
                                 .and_then(Value::as_u64)
                                 .ok_or_else(|| {
-                                    DurableRunnerError::invalid("revoke revocation epoch is required")
+                                    DurableRunnerError::invalid(
+                                        "revoke revocation epoch is required",
+                                    )
                                 })?;
                             if revocation_epoch <= connection.revocation_epoch {
                                 return Err(DurableRunnerError::invalid(
@@ -361,6 +382,162 @@ pub fn run_durable_runner(
     }
 }
 
+fn start_configured_provider(
+    state: &DurableRunnerState,
+) -> Result<Option<crate::codex_provider::CodexProvider>, DurableRunnerError> {
+    let Some(provider_config) = &state.codex_provider_config else {
+        return Ok(None);
+    };
+    crate::codex_provider::CodexProvider::start(
+        provider_config,
+        state.provider_tool_bridge.authorized_tools().cloned(),
+    )
+    .map(Some)
+    .map_err(|error| {
+        DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
+    })
+}
+
+fn process_command_and_provider(
+    state: &mut DurableRunnerState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    provider: &mut Option<crate::codex_provider::CodexProvider>,
+    command: &Value,
+) -> Result<ProcessedCommand, DurableRunnerError> {
+    let command_id = command
+        .get("commandId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let fresh = !state.processed_commands.contains_key(command_id);
+    let processed = process_command(state, store, config, command)?;
+    if !fresh || processed.status != "completed" {
+        return Ok(processed);
+    }
+    match command.get("type").and_then(Value::as_str) {
+        Some("run.prepare") => {
+            if provider.is_none() {
+                *provider = start_configured_provider(state)?;
+            }
+        }
+        Some("turn.start") => {
+            let Some(runtime) = provider.as_mut() else {
+                // The deterministic recovery harness remains the provider for
+                // legacy transport conformance runs with no provider config.
+                return Ok(processed);
+            };
+            let text = command
+                .pointer("/payload/text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("turn.start payload.text is required")
+                })?;
+            let cwd = state
+                .codex_provider_config
+                .as_ref()
+                .map(|value| value.cwd.as_str())
+                .unwrap_or(".");
+            runtime.start_turn(text, cwd).map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn.start failed: {error}"))
+            })?;
+        }
+        Some("semantic_tool.result") => {
+            let result: crate::provider_bridge::ToolResult =
+                serde_json::from_value(command["payload"].clone()).map_err(|error| {
+                    DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}"))
+                })?;
+            provider
+                .as_mut()
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("semantic tool result requires a provider")
+                })?
+                .deliver_tool_result(&result)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to return tool result to Codex: {error}"
+                    ))
+                })?;
+        }
+        _ => {}
+    }
+    Ok(processed)
+}
+
+fn poll_provider(
+    provider: &mut Option<crate::codex_provider::CodexProvider>,
+    state: &mut DurableRunnerState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+) -> Result<(), DurableRunnerError> {
+    let Some(runtime) = provider.as_mut() else {
+        return Ok(());
+    };
+    while let Some(event) = runtime
+        .poll()
+        .map_err(|error| DurableRunnerError::invalid(format!("Codex provider failed: {error}")))?
+    {
+        match event {
+            crate::codex_provider::CodexProviderEvent::ToolCall {
+                call_id,
+                operation_id,
+                input,
+            } => {
+                let call = state
+                    .provider_tool_bridge
+                    .begin_call(call_id, operation_id, input)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!("provider tool call rejected: {error}"))
+                    })?;
+                enqueue_event(
+                    state,
+                    config,
+                    "mcp_app.tool_input",
+                    0,
+                    json!({
+                        "semantic_tool": {
+                            "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
+                            "phase": "input", "operationId": call.operation_id,
+                            "callId": call.call_id, "input": call.input,
+                        }
+                    }),
+                    Some(&config.item_id),
+                )?;
+                store.save(state)?;
+            }
+            crate::codex_provider::CodexProviderEvent::Notification { method, params } => {
+                let event_type = if method == "turn/completed" {
+                    "turn.completed"
+                } else {
+                    "provider.event"
+                };
+                // Streaming deltas and startup chatter are intentionally coalescible,
+                // but terminal items and accounting must survive pressure intact.
+                let priority = match method.as_str() {
+                    "turn/completed" | "thread/tokenUsage/updated" => 0,
+                    "item/completed" => 1,
+                    _ => 2,
+                };
+                enqueue_event(
+                    state,
+                    config,
+                    event_type,
+                    priority,
+                    json!({"method": method, "params": params}),
+                    Some(&config.item_id),
+                )?;
+                store.save(state)?;
+            }
+            crate::codex_provider::CodexProviderEvent::Exited => {
+                state.recoverable_failure = Some("provider_exited".to_owned());
+                state.lifecycle = "recoverable_failure".to_owned();
+                store.save(state)?;
+                return Err(DurableRunnerError::invalid("Codex provider exited"));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +545,16 @@ mod tests {
     use std::sync::{mpsc, Mutex};
 
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn usage_counts_remain_observable_while_credential_tokens_are_redacted() {
+        let sanitized = crate::durable::sanitize_value(&json!({
+            "tokenUsage": { "total": { "inputTokens": 12, "outputTokens": 3 } },
+            "accessToken": "secret-value",
+        }));
+        assert_eq!(sanitized.pointer("/tokenUsage/total/inputTokens"), Some(&json!(12)));
+        assert_eq!(sanitized.pointer("/accessToken"), Some(&json!("[REDACTED]")));
+    }
 
     fn config(root: &Path) -> DurableRunnerConfig {
         DurableRunnerConfig {
@@ -661,11 +848,11 @@ mod tests {
             request.extend_from_slice(&frame);
             wire_sender.send(request).unwrap();
         });
-        let target =
-            resolve_ws_target_with(&format!("ws://{address}/durable_runner/connect"), |_host, _port| {
-                Ok(vec![address])
-            })
-            .unwrap();
+        let target = resolve_ws_target_with(
+            &format!("ws://{address}/durable_runner/connect"),
+            |_host, _port| Ok(vec![address]),
+        )
+        .unwrap();
         let mut client = WsClient::connect(&target, config.max_frame_bytes).unwrap();
         let error = authenticate_transport(
             &mut client,
@@ -993,14 +1180,16 @@ mod tests {
 
     #[test]
     fn destination_validation_accepts_only_concrete_loopback_answers() {
-        let target =
-            resolve_ws_target_with("ws://localhost:3100/durable_runner/connect", |_host, _port| {
+        let target = resolve_ws_target_with(
+            "ws://localhost:3100/durable_runner/connect",
+            |_host, _port| {
                 Ok(vec![
                     "127.42.0.9:3100".parse().unwrap(),
                     "[::1]:3100".parse().unwrap(),
                 ])
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(target.addresses.len(), 2);
         assert!(target
             .addresses

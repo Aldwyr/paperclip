@@ -234,6 +234,7 @@ export const commandSchema = {
         "turn.stop",
         "request.resolve",
         "interaction.receipt",
+        "semantic_tool.result",
         "session.snapshot",
         "session.close",
         "run.cancel",

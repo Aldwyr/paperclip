@@ -207,8 +207,24 @@ impl SupervisedProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
+        for key in [
+            "PATH",
+            "PATHEXT",
+            "SystemRoot",
+            "WINDIR",
+            "HOME",
+            "CODEX_HOME",
+            "LANG",
+            "LC_ALL",
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
         }
         #[cfg(unix)]
         command.process_group(0);
