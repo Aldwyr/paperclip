@@ -11,6 +11,7 @@ const CONNECTABLE_APP_SLUGS = new Set([
   "linear",
   "google-sheets",
   "context7",
+  "composio",
 ]);
 
 export const CONNECTABLE_APP_DEFINITIONS = APP_DEFINITIONS.filter((app) =>

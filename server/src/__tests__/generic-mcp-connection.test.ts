@@ -36,6 +36,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { toolAccessService } from "../services/tool-access.js";
+import { ComposioApiError, type ComposioClient } from "../services/composio.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
@@ -475,6 +476,61 @@ describeEmbeddedPostgres("generic remote MCP connections", () => {
     expect(JSON.stringify(connection!.credentialRefs)).not.toContain("fixture-key-123");
     expect(JSON.stringify(result.connection)).not.toContain("fixture-key-123");
     expect(connection!.credentialSecretRefs.map((ref) => ref.configPath)).toEqual(["credentials.authorization"]);
+  });
+
+  it("stores and validates a Composio API key without returning plaintext", async () => {
+    const company = await createCompany(db);
+    const validatedKeys: string[] = [];
+    const service = toolAccessService(db, {
+      composioClientFactory: (apiKey) => ({
+        validateApiKey: async () => { validatedKeys.push(apiKey); },
+      }) as unknown as ComposioClient,
+    });
+
+    const result = await service.connectGalleryApp(company.id, {
+      galleryKey: "composio",
+      connectionMethodKey: "api-key",
+      credentialValues: { "credentials.apiKey": "ak_composio_fixture" },
+    });
+
+    expect(validatedKeys).toEqual(["ak_composio_fixture"]);
+    expect(result.catalog).toEqual([]);
+    expect(result.actions).toEqual({ readOnly: [], canMakeChanges: [] });
+    expect(result.connection).toMatchObject({
+      transport: "rest_api",
+      authKind: "api_key",
+      healthStatus: "ok",
+    });
+    expect(result.connection.healthMessage).toContain("returned its toolkits");
+
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, result.connectionId));
+    expect(connection!.credentialSecretRefs.map((ref) => ref.configPath)).toEqual(["credentials.apiKey"]);
+    expect(connection!.credentialRefs).toEqual([
+      expect.objectContaining({ placement: "header", key: "x-api-key", prefix: null }),
+    ]);
+    expect(JSON.stringify({ result, connection })).not.toContain("ak_composio_fixture");
+  });
+
+  it("rejects an invalid Composio key and removes the draft and secret", async () => {
+    const company = await createCompany(db);
+    const service = toolAccessService(db, {
+      composioClientFactory: () => ({
+        validateApiKey: async () => { throw new ComposioApiError("Composio rejected the API key.", 401); },
+      }) as unknown as ComposioClient,
+    });
+
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "composio",
+      connectionMethodKey: "api-key",
+      credentialValues: { "credentials.apiKey": "bad_composio_fixture" },
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "composio_api_key_rejected" },
+    });
+
+    await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
+    await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
+    await expect(db.select().from(companySecrets)).resolves.toHaveLength(0);
   });
 
   it("stores custom header values as secrets and shows only header names", async () => {

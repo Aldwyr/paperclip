@@ -151,6 +151,7 @@ import {
 import { recordToolRuntimeAuditWriteFailure, TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC } from "./tool-runtime-metrics.js";
 import { createToolRuntimeSupervisor, ToolRuntimeSupervisorError } from "./tool-runtime-supervisor.js";
 import { listConnectionLifecycleEvents } from "./tool-connection-activity.js";
+import { ComposioApiError, createComposioClient, type ComposioClient } from "./composio.js";
 
 type ActorInfo = {
   actorType?: "agent" | "user" | "system" | "plugin";
@@ -483,6 +484,8 @@ type ToolAccessServiceOptions = {
   remoteHttpEndpointLookup?: RemoteHttpEndpointLookup;
   /** Test seam for protocol fixtures. Production uses the DNS-pinned transport. */
   remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
+  /** Test seam for Composio without live vendor traffic. */
+  composioClientFactory?: (apiKey: string) => ComposioClient;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -702,6 +705,7 @@ const APPROVED_STDIO_TEMPLATES: Record<string, {
 };
 
 const GOOGLE_SHEETS_GALLERY_KEY = "google-sheets";
+const COMPOSIO_GALLERY_KEY = "composio";
 const GOOGLE_SHEETS_TEMPLATE_ID = "paperclip.google-sheets";
 const GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS_ENV = "GOOGLE_SHEETS_ALLOWED_SPREADSHEET_IDS";
 const CONNECTION_TOKEN_MINT_TOOL_NAME = "connection_token.mint";
@@ -1717,11 +1721,19 @@ function isOAuthEndpointRejection(error: unknown): boolean {
 
 function healthFailureHttpStatus(failure: { status: ToolConnectionHealthStatus; code: string }): number {
   if (failure.status === "missing_secret") return 422;
+  if (failure.code === "composio_api_key_rejected") return 422;
   if (failure.code.endsWith("_endpoint_rejected")) return 422;
   return 502;
 }
 
 function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStatus; message: string; code: string } {
+  if (error instanceof ComposioApiError) {
+    return {
+      status: "error",
+      message: error.message,
+      code: error.status === 401 || error.status === 403 ? "composio_api_key_rejected" : "composio_request_failed",
+    };
+  }
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
     if (typeof code === "string" && code.startsWith("remote_http_")) {
@@ -4132,8 +4144,26 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     }));
   }
 
+  function isComposioConnection(connection: typeof toolConnections.$inferSelect): boolean {
+    return asRecord(connection.config).sourceTemplateKey === COMPOSIO_GALLERY_KEY;
+  }
+
+  async function validateComposioConnection(connection: typeof toolConnections.$inferSelect) {
+    const headers = await resolveCredentialHeaders(connection);
+    const apiKey = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-api-key")?.[1];
+    if (!apiKey) {
+      throw unprocessable("The Composio API key secret is missing.", { code: "secret_missing" });
+    }
+    const client = options.composioClientFactory?.(apiKey) ?? createComposioClient({ apiKey });
+    await client.validateApiKey();
+  }
+
   async function discoverTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
     if (connection.transport === "mcp_remote") return remoteTools(connection);
+    if (isComposioConnection(connection)) {
+      await validateComposioConnection(connection);
+      return [];
+    }
     await resolveCredentialHeaders(connection);
     return localTools(connection);
   }
@@ -4170,13 +4200,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     try {
       if (connection.transport === "mcp_remote") {
         await remoteTools(connection);
+      } else if (isComposioConnection(connection)) {
+        await validateComposioConnection(connection);
       } else {
         await resolveCredentialHeaders(connection);
         await stdioTemplateId(connection.companyId, connection.config);
       }
-      const updated = await updateConnectionHealth(connection, "ok", connection.transport === "local_stdio"
-        ? "Approved stdio template is ready."
-        : "Remote MCP server responded to tools/list.");
+      const updated = await updateConnectionHealth(
+        connection,
+        "ok",
+        isComposioConnection(connection)
+          ? "Composio accepted the API key and returned its toolkits."
+          : connection.transport === "local_stdio"
+            ? "Approved stdio template is ready."
+            : "Remote MCP server responded to tools/list.",
+      );
       const runtimeSlot = await ensureRuntimeSlot(updated);
       await audit({
         companyId: connection.companyId,
@@ -6799,8 +6837,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         };
       }
 
+      let health: ToolConnectionHealthCheckResult;
       try {
-        await checkConnectionHealth(connectionRow.id, actor);
+        health = await checkConnectionHealth(connectionRow.id, actor);
       } catch (error) {
         if (!galleryEntry && error instanceof HttpError && asRecord(error.details).code === "oauth_challenge") {
           const [oauthConnection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionRow.id));
@@ -6837,6 +6876,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           };
         }
         throw error;
+      }
+      if (galleryEntry?.slug === COMPOSIO_GALLERY_KEY) {
+        const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationRow.id));
+        return {
+          connectionId: health.connection.id,
+          application: toApplication(application),
+          connection: health.connection,
+          catalog: [],
+          actions: { readOnly: [], canMakeChanges: [] },
+          suggestedDefaults: recommendedDefaultsForApp(galleryEntry, method?.key),
+        };
       }
       const refresh = await refreshCatalog(connectionRow.id, actor, { enableAllByDefault: true });
       const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationRow.id));

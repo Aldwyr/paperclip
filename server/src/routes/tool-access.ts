@@ -48,6 +48,7 @@ import { getActorInfo, assertBoard, assertCompanyAccess, getAccessibleResource, 
 import { badRequest, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { accessService, googleSheetsRobotEmailFromEnv, logActivity, toolAccessPolicyService, toolAccessService } from "../services/index.js";
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
+import type { ComposioClient } from "../services/composio.js";
 import {
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
   oauthClientIdMetadataDocument,
@@ -134,6 +135,7 @@ export function toolAccessRoutes(
     /** Test-only seams forwarded to the tool access service. */
     remoteHttpEndpointLookup?: NonNullable<Parameters<typeof toolAccessService>[1]>["remoteHttpEndpointLookup"];
     remoteHttpRequest?: NonNullable<Parameters<typeof toolAccessService>[1]>["remoteHttpRequest"];
+    composioClientFactory?: (apiKey: string) => ComposioClient;
   } = {},
 ) {
   const router = Router();
