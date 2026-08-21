@@ -315,6 +315,7 @@ export function accessService(db: Db) {
         .select()
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
 
@@ -467,6 +468,7 @@ export function accessService(db: Db) {
         .select()
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
       if (existing.principalType !== "user") {
@@ -874,6 +876,7 @@ export function accessService(db: Db) {
         .select()
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!existing) return null;
 

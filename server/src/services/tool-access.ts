@@ -7648,17 +7648,111 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       code: input.code,
       resource: endpoints.resource,
     });
-    const [existingUserGrant] = stateRow.subjectUserId
-      ? await db.select().from(connectionGrants).where(and(
+    if (stateRow.subjectUserId) {
+      return db.transaction(async (tx) => {
+        // Serialize callback persistence with suspension/removal. Those paths
+        // lock this same membership row before sweeping personal credentials.
+        const [membership] = await tx.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+          eq(companyMemberships.companyId, connection.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, stateRow.subjectUserId!),
+          eq(companyMemberships.status, "active"),
+        )).limit(1).for("update");
+        if (!membership) {
+          throw forbidden("Your company membership is no longer active. Ask a company owner to restore access before you authorize this connection again.");
+        }
+
+        const [existingUserGrant] = await tx.select().from(connectionGrants).where(and(
           eq(connectionGrants.companyId, connection.companyId),
           eq(connectionGrants.connectionId, connection.id),
           eq(connectionGrants.kind, "user"),
-          eq(connectionGrants.subjectUserId, stateRow.subjectUserId),
-        )).limit(1)
-      : [undefined];
-    const subjectCredentialSecretRefs = stateRow.subjectUserId
-      ? existingUserGrant?.credentialSecretRefs ?? []
-      : connection.credentialSecretRefs;
+          eq(connectionGrants.subjectUserId, stateRow.subjectUserId!),
+        )).limit(1);
+        const subjectCredentialSecretRefs = existingUserGrant?.credentialSecretRefs ?? [];
+        const accessRef = await createOrRotateOAuthSecret({
+          companyId: connection.companyId,
+          connection,
+          configPath: "oauth.access_token",
+          label: "OAuth access token",
+          value: token.accessToken,
+          actor: input.actor,
+          existingRefs: subjectCredentialSecretRefs,
+          ownerUserId: stateRow.subjectUserId!,
+        });
+        const nextCredentialSecretRefs = [
+          ...subjectCredentialSecretRefs.filter((ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token"),
+          accessRef,
+        ];
+        if (token.refreshToken) {
+          nextCredentialSecretRefs.push(await createOrRotateOAuthSecret({
+            companyId: connection.companyId,
+            connection,
+            configPath: "oauth.refresh_token",
+            label: "OAuth refresh token",
+            value: token.refreshToken,
+            actor: input.actor,
+            existingRefs: subjectCredentialSecretRefs,
+            ownerUserId: stateRow.subjectUserId!,
+          }));
+        } else {
+          const existingRefreshRef = subjectCredentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
+          if (existingRefreshRef) nextCredentialSecretRefs.push(existingRefreshRef);
+        }
+
+        const grantValues = {
+          credentialSecretRefs: nextCredentialSecretRefs,
+          status: "active" as const,
+          revokedAt: null,
+          revokedByAgentId: null,
+          revokedByUserId: null,
+          updatedAt: new Date(),
+        };
+        if (existingUserGrant) {
+          await tx.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, existingUserGrant.id));
+        } else {
+          await tx.insert(connectionGrants).values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            kind: "user",
+            subjectUserId: stateRow.subjectUserId!,
+            ...grantValues,
+            isDefault: false,
+            createdByUserId: stateRow.subjectUserId!,
+          });
+        }
+        if (stateRow.interactionId) {
+          await tx.update(issueThreadInteractions).set({
+            status: "accepted",
+            result: { version: 1, outcome: "accepted" },
+            resolvedByUserId: stateRow.subjectUserId!,
+            resolvedAt: new Date(),
+            updatedAt: new Date(),
+          }).where(and(
+            eq(issueThreadInteractions.id, stateRow.interactionId),
+            eq(issueThreadInteractions.companyId, connection.companyId),
+          ));
+        }
+        const [application] = await tx.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
+        if (!application) throw new Error("OAuth connection application was not found");
+        const catalog = (await tx.select().from(toolCatalogEntries).where(and(
+          eq(toolCatalogEntries.companyId, connection.companyId),
+          eq(toolCatalogEntries.connectionId, connection.id),
+        ))).map(toCatalogEntry);
+        return {
+          connectionId: connection.id,
+          application: toApplication(application),
+          connection: toConnection(connection),
+          catalog,
+          actions: groupedActions(catalog),
+          suggestedDefaults: galleryEntry
+            ? recommendedDefaultsForApp(galleryEntry, connectionMethodForConnection(galleryEntry, connection).key)
+            : { access: "all_agents", askFirstRiskLevels: ["write", "destructive"] },
+          auth: null,
+        };
+      });
+    }
+
+    const subjectCredentialSecretRefs = connection.credentialSecretRefs;
     const accessRef = await createOrRotateOAuthSecret({
       companyId: connection.companyId,
       connection,
@@ -7666,8 +7760,6 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       label: "OAuth access token",
       value: token.accessToken,
       actor: input.actor,
-      existingRefs: stateRow.subjectUserId ? subjectCredentialSecretRefs : undefined,
-      ownerUserId: stateRow.subjectUserId ?? undefined,
     });
     const nextCredentialSecretRefs = [
       ...subjectCredentialSecretRefs.filter((ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token"),
@@ -7681,66 +7773,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         label: "OAuth refresh token",
         value: token.refreshToken,
         actor: input.actor,
-        existingRefs: stateRow.subjectUserId ? subjectCredentialSecretRefs : undefined,
-        ownerUserId: stateRow.subjectUserId ?? undefined,
       }));
     } else {
       const existingRefreshRef = subjectCredentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
       if (existingRefreshRef) nextCredentialSecretRefs.push(existingRefreshRef);
     }
     const expiresAt = token.expiresIn ? new Date(Date.now() + token.expiresIn * 1000).toISOString() : null;
-    if (stateRow.subjectUserId) {
-      const grantValues = {
-        credentialSecretRefs: nextCredentialSecretRefs,
-        status: "active" as const,
-        revokedAt: null,
-        revokedByAgentId: null,
-        revokedByUserId: null,
-        updatedAt: new Date(),
-      };
-      if (existingUserGrant) {
-        await db.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, existingUserGrant.id));
-      } else {
-        await db.insert(connectionGrants).values({
-          companyId: connection.companyId,
-          connectionId: connection.id,
-          kind: "user",
-          subjectUserId: stateRow.subjectUserId,
-          ...grantValues,
-          isDefault: false,
-          createdByUserId: stateRow.subjectUserId,
-        });
-      }
-      if (stateRow.interactionId) {
-        await db.update(issueThreadInteractions).set({
-          status: "accepted",
-          result: { version: 1, outcome: "accepted" },
-          resolvedByUserId: stateRow.subjectUserId,
-          resolvedAt: new Date(),
-          updatedAt: new Date(),
-        }).where(and(
-          eq(issueThreadInteractions.id, stateRow.interactionId),
-          eq(issueThreadInteractions.companyId, connection.companyId),
-        ));
-      }
-      const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
-      if (!application) throw new Error("OAuth connection application was not found");
-      const catalog = (await db.select().from(toolCatalogEntries).where(and(
-        eq(toolCatalogEntries.companyId, connection.companyId),
-        eq(toolCatalogEntries.connectionId, connection.id),
-      ))).map(toCatalogEntry);
-      return {
-        connectionId: connection.id,
-        application: toApplication(application),
-        connection: toConnection(connection),
-        catalog,
-        actions: groupedActions(catalog),
-        suggestedDefaults: galleryEntry
-          ? recommendedDefaultsForApp(galleryEntry, connectionMethodForConnection(galleryEntry, connection).key)
-          : { access: "all_agents", askFirstRiskLevels: ["write", "destructive"] },
-        auth: null,
-      };
-    }
     const nextConfig = {
       ...connection.config,
       oauth: {
@@ -9512,6 +9550,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         : { type: "user" as const, userId: actingUserId };
       let grant: typeof connectionGrants.$inferSelect | undefined;
       if (connection.credentialPolicy !== "shared" && actingUserId) {
+        const [membership] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+          eq(companyMemberships.companyId, connection.companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, actingUserId),
+          eq(companyMemberships.status, "active"),
+        )).limit(1);
+        if (!membership) {
+          await fail(403, "The personal grant owner is not an active company member", "denied", "grant_owner_membership_inactive", {
+            connection: { id: connection.id, uid: connection.uid, name: connection.name },
+            subject: { type: "user", userId: actingUserId },
+            remediation: { action: "restore_membership_or_reconnect" },
+          });
+        }
         [grant] = await db.select().from(connectionGrants).where(and(
           eq(connectionGrants.companyId, connection.companyId),
           eq(connectionGrants.connectionId, connection.id),
