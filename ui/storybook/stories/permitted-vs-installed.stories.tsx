@@ -10,7 +10,7 @@ import type {
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentToolsTab } from "@/pages/AgentToolsTab";
 import { PermissionsPanel } from "@/pages/apps/app-detail/PermissionsPanel";
-import { InstallStep } from "@/pages/apps/AppsConnect";
+import { AccessStep } from "@/pages/apps/AppsConnect";
 import type { AccessDraft } from "@/pages/apps/app-detail/types";
 import type { InstallState } from "@/lib/tool-installs";
 
@@ -257,18 +257,23 @@ export const AgentToolsInstalledApps: Story = {
   render: () => <SeededAgentTools />,
 };
 
-// --- Surface 3: Connect flow Install step (InstallStep) --------------------
+// --- Surface 3: Connect flow Access step (AccessStep) ---------------------
+//
+// The separate "who can use it" + "install tools" pair is gone: one Access step
+// asks both questions before any credential is entered (PAP-17835).
 
-function SeededInstallStep({
-  access,
-  accessAgentIds,
-  initialMode,
-  initialInstall,
+function SeededAccessStep({
+  authKind,
+  initialGrantKind,
+  initialChoice,
+  initialAgentIds,
+  capabilities = { canSetCompanyInstall: true, editableAgentIds: AGENT_IDS },
 }: {
-  access: "all" | "specific";
-  accessAgentIds: Set<string>;
-  initialMode: "none" | "specific" | "all";
-  initialInstall: Set<string>;
+  authKind: "oauth" | "api_key" | "none";
+  initialGrantKind: "user" | "organization";
+  initialChoice: "specific" | "all";
+  initialAgentIds: Set<string>;
+  capabilities?: { canSetCompanyInstall: boolean; editableAgentIds: string[] };
 }) {
   const client = useMemo(() => {
     const c = new QueryClient({
@@ -277,49 +282,66 @@ function SeededInstallStep({
     c.setQueryData(queryKeys.agents.list(COMPANY), AGENTS);
     return c;
   }, []);
-  const [mode, setMode] = useState(initialMode);
-  const [ids, setIds] = useState(initialInstall);
+  const [grantKind, setGrantKind] = useState(initialGrantKind);
+  const [choice, setChoice] = useState(initialChoice);
+  const [ids, setIds] = useState(initialAgentIds);
   return (
     <QueryClientProvider client={client}>
       <div className="bg-background p-6">
-        <InstallStep
+        <AccessStep
           appName="Gmail"
+          providerName="Gmail"
           companyId={COMPANY}
-          access={access}
-          accessAgentIds={accessAgentIds}
-          installMode={mode}
-          setInstallMode={setMode}
+          authKind={authKind}
+          grantKind={grantKind}
+          setGrantKind={setGrantKind}
+          installChoice={choice}
+          setInstallChoice={setChoice}
           installAgentIds={ids}
           setInstallAgentIds={setIds}
-          submitting={false}
+          capabilities={capabilities}
+          submitLabel={authKind === "oauth" ? "Continue to Gmail" : "Save and continue"}
           onBack={() => {}}
-          onFinish={() => {}}
+          onContinue={() => {}}
         />
       </div>
     </QueryClientProvider>
   );
 }
 
-export const ConnectInstallSpecific: Story = {
-  name: "3 · Connect — Install step (specific + auto-extend)",
+export const ConnectAccessJustMePickedAgents: Story = {
+  name: "3 · Connect Access — Just me + Agents I pick",
   render: () => (
-    <SeededInstallStep
-      access="specific"
-      accessAgentIds={new Set(["a-sage", "a-atlas"])}
-      initialMode="specific"
-      initialInstall={new Set(["a-sage", "a-orion"])}
+    <SeededAccessStep
+      authKind="oauth"
+      initialGrantKind="user"
+      initialChoice="specific"
+      initialAgentIds={new Set(["a-sage", "a-atlas"])}
     />
   ),
 };
 
-export const ConnectInstallAll: Story = {
-  name: "3 · Connect — Install step (all agents)",
+export const ConnectAccessOrganizationAnyAgent: Story = {
+  name: "3 · Connect Access — Whole organization + Any agent",
   render: () => (
-    <SeededInstallStep
-      access="all"
-      accessAgentIds={new Set()}
-      initialMode="all"
-      initialInstall={new Set()}
+    <SeededAccessStep
+      authKind="api_key"
+      initialGrantKind="organization"
+      initialChoice="all"
+      initialAgentIds={new Set()}
+    />
+  ),
+};
+
+/** `authKind: none` has no identity to choose, so the question is not asked. */
+export const ConnectAccessNoIdentityRequired: Story = {
+  name: "3 · Connect Access — no identity required",
+  render: () => (
+    <SeededAccessStep
+      authKind="none"
+      initialGrantKind="organization"
+      initialChoice="specific"
+      initialAgentIds={new Set(["a-sage"])}
     />
   ),
 };
