@@ -89,6 +89,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
         galleryEntry({ key: "slack", name: "Slack", tagline: "Post messages to channels." }),
         galleryEntry({ key: "notion", name: "Notion", tagline: "Read and update workspace content." }),
         galleryEntry({ key: "composio", name: "Composio", tagline: "Connect hosted toolkits." }),
+        galleryEntry({ key: "gmail", name: "Gmail", tagline: "Search and draft email." }),
         galleryEntry({ key: "acme", name: "Acme CRM", tagline: "Sync deals and contacts." }),
       ],
     });
@@ -137,7 +138,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(text).not.toContain("review its actions before enabling it");
   });
 
-  it("enables Notion, Zapier, and custom URLs while fading unfinished integrations", async () => {
+  it("enables Notion, Zapier, Gmail, and custom URLs while fading unfinished integrations", async () => {
     await renderBrowse();
 
     const zapierTiles = Array.from(
@@ -152,6 +153,9 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     const composioTiles = Array.from(
       container.querySelectorAll<HTMLButtonElement>('button[aria-label="Connect for Composio"]'),
     );
+    const gmailTiles = Array.from(
+      container.querySelectorAll<HTMLButtonElement>('button[aria-label="Connect for Gmail"]'),
+    );
     const tile = container.querySelector<HTMLButtonElement>(
       'button[aria-label="Coming soon for Acme CRM"]',
     );
@@ -165,6 +169,8 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(notionTiles.every((button) => !button.disabled)).toBe(true);
     expect(composioTiles).toHaveLength(1);
     expect(composioTiles[0]?.disabled).toBe(false);
+    expect(gmailTiles).toHaveLength(1);
+    expect(gmailTiles[0]?.disabled).toBe(false);
     expect(githubTiles.every((button) => button.disabled)).toBe(true);
     expect(tile?.disabled).toBe(true);
     expect(byoCard?.disabled).toBe(false);
@@ -185,6 +191,11 @@ describe("Browse store door (PAP-13254 door 1)", () => {
       composioTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(navigateMock).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=composio&stage=setup");
+
+    await act(async () => {
+      gmailTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=gmail&stage=access");
 
     await act(async () => {
       byoCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

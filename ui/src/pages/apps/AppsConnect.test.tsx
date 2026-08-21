@@ -439,6 +439,18 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(document.body.textContent).not.toContain("The whole organization");
   });
 
+  it("opens a brokered Gmail deep link at the access step", async () => {
+    mockParams.appKey = "gmail";
+    mockSearch.value = "byo=1&appKey=gmail&stage=access";
+    listGalleryMock.mockResolvedValue({ apps: [GMAIL] });
+
+    await render();
+
+    expect(document.body.textContent).toContain("Who is this credential for?");
+    expect(document.body.textContent).toContain("Just me.");
+    expect(mockNavigate).not.toHaveBeenCalledWith("/apps/connect", { replace: true });
+  });
+
   /**
    * Design §"Question 2": a member who may create a personal grant but cannot
    * configure a company-wide install sees **Any agent** disabled with the

@@ -523,7 +523,8 @@ export function AppsConnect({ byoOnly = false }: { byoOnly?: boolean } = {}) {
     const method = requestedEntry ? getAvailableConnectionMethod(requestedEntry) : null;
     const methods = requestedEntry ? getAvailableConnectionMethods(requestedEntry) : [];
     const directOAuth = method?.auth === "oauth" && isMcpDirectOAuthConnectSlug(requestedEntry?.slug);
-    const unsupportedOAuth = methods.length === 1 && method?.auth === "oauth" && !directOAuth;
+    const brokeredOAuth = method?.oauthStrategy === "paperclip_id_connector";
+    const unsupportedOAuth = methods.length === 1 && method?.auth === "oauth" && !brokeredOAuth && !directOAuth;
     if (!requestedEntry || unsupportedOAuth || requestedEntry.availability?.available === false) {
       setEntry(null);
       setStep("gallery");
