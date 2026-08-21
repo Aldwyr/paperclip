@@ -2637,6 +2637,7 @@ function connectionAuthorizationStatusClasses(
 function RequestConnectionAuthorizationCard({
   interaction,
   state,
+  isAddressee,
   providerName,
   addresseeLabel,
   requestingAgentLabel,
@@ -2646,6 +2647,8 @@ function RequestConnectionAuthorizationCard({
 }: {
   interaction: RequestConfirmationInteraction;
   state: ConnectionAuthorizationCardState;
+  /** Is the signed-in reader the person the server addressed? */
+  isAddressee: boolean;
   providerName: string;
   addresseeLabel: string;
   requestingAgentLabel: string | null;
@@ -2681,16 +2684,21 @@ function RequestConnectionAuthorizationCard({
   }
 
   // One body, composed here rather than split between the header summary and a
-  // payload prompt that repeats the title. The closing sentence is the only
-  // reader-dependent part, and it is the consent boundary — so it belongs to
-  // the card, not to the server-authored summary.
-  const lead = interaction.summary?.trim()
-    || `${requestingAgentLabel ?? "An agent"} needs your ${providerName} identity for work running as you.`;
-  const consentSentence = state === "actionable"
-    ? "No one else can complete this step."
-    : state === "waiting"
-      ? `Only ${addresseeLabel} can complete this step.`
-      : null;
+  // payload prompt that repeats the title.
+  //
+  // The server's summary is written in the second person ("needs *your* Gmail
+  // identity for work running as *you*") because the server addressed one
+  // person. Shown to a teammate it names the wrong account, so a reader who is
+  // not the addressee gets the same fact stated about them. Caught by rendering
+  // the card, not by reading it.
+  const agentLabel = requestingAgentLabel ?? "An agent";
+  const lead = isAddressee
+    ? interaction.summary?.trim()
+      || `${agentLabel} needs your ${providerName} identity for work running as you.`
+    : `${agentLabel} ${state === "connected" ? "needed" : "needs"} ${addresseeLabel}'s ${providerName} identity for work running as them.`;
+  // Only the actionable state needs the consent boundary spelled out; the other
+  // states carry it in their own status line.
+  const consentSentence = state === "actionable" ? "No one else can complete this step." : null;
 
   return (
     <div className="space-y-4">
@@ -2748,7 +2756,7 @@ function RequestConnectionAuthorizationCard({
           Icon={Clock}
           testId="connection-authorization-waiting"
           headline={`Waiting for ${addresseeLabel}`}
-          detail={`${providerName} can only be connected by the person whose account it is.`}
+          detail={`Only ${addresseeLabel} can connect their own ${providerName} account.`}
         />
       ) : state === "connected" ? (
         <ConnectionAuthorizationStatusLine
@@ -2757,7 +2765,11 @@ function RequestConnectionAuthorizationCard({
           headline={`${providerName} connected`}
           detail={
             <>
-              Connected by <span className="font-medium text-foreground">{resolvedByLabel ?? addresseeLabel}</span>
+              Connected by{" "}
+              <span className="font-medium text-foreground">
+                {/* "You" is display-cased for a badge; this is mid-sentence. */}
+                {(resolvedByLabel ?? addresseeLabel) === "You" ? "you" : resolvedByLabel ?? addresseeLabel}
+              </span>
               {resolvedByAgent ? <ResolvedByAgentChip /> : null}
               {interaction.resolvedAt ? ` on ${formatDateTime(interaction.resolvedAt)}` : ""}
             </>
@@ -3881,12 +3893,13 @@ export function IssueThreadInteractionCard({
   const isSecretProposal =
     interaction.kind === "request_confirmation" && isSecretProposalConfirmation(interaction);
   const connectionAuthorization = connectionAuthorizationPayload(interaction);
+  const isConnectionAddressee =
+    connectionAuthorization && interaction.kind === "request_confirmation"
+      ? isConnectionAuthorizationAddressee({ interaction, currentUserId })
+      : false;
   const connectionAuthorizationState =
     connectionAuthorization && interaction.kind === "request_confirmation"
-      ? connectionAuthorizationCardState({
-          interaction,
-          isAddressee: isConnectionAuthorizationAddressee({ interaction, currentUserId }),
-        })
+      ? connectionAuthorizationCardState({ interaction, isAddressee: isConnectionAddressee })
       : null;
   const toolActionState =
     isToolAction && interaction.kind === "request_confirmation"
@@ -4122,6 +4135,7 @@ export function IssueThreadInteractionCard({
             <RequestConnectionAuthorizationCard
               interaction={interaction}
               state={connectionAuthorizationState}
+              isAddressee={isConnectionAddressee}
               providerName={connectionAuthorization.providerName}
               addresseeLabel={addresseeLabel ?? "the addressed person"}
               requestingAgentLabel={connectionAuthorization.requestingAgentName ?? null}

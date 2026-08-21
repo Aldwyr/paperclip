@@ -179,8 +179,14 @@ export function describeResolverAudience({
   const requestedPolicy = facts.requestedResolverPolicy;
   const hasAddressee = facts.hasAddressee;
   const isUserAddressee = facts.isUserAddressee === true;
-  const addressee = addresseeLabel?.trim() || (isUserAddressee ? "the addressed user" : "the addressed agent");
-  const creator = creatorLabel?.trim() || "the agent that created it";
+  // `formatAssigneeUserLabel` returns the display-cased "You" for the signed-in
+  // reader, which is right for a badge and wrong mid-sentence ("Only You can
+  // respond."). Every use below is inside a sentence.
+  const midSentence = (label: string) => (label === "You" ? "you" : label);
+  const addressee = midSentence(
+    addresseeLabel?.trim() || (isUserAddressee ? "the addressed user" : "the addressed agent"),
+  );
+  const creator = midSentence(creatorLabel?.trim() || "the agent that created it");
 
   const summary = isUserAddressee
     ? `Only ${addressee} can respond.`

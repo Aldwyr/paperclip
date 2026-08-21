@@ -1296,8 +1296,15 @@ describe("IssueThreadInteractionCard connection-authorization card", () => {
       .toContain("Waiting for Carol");
     expect(host.querySelector('[data-testid="interaction-status-badge"]')?.textContent)
       .toContain("Waiting for Carol");
-    expect(host.querySelector('[data-testid="connection-authorization-body"]')?.textContent)
-      .toContain("Only Carol can complete this step.");
+    // The server's summary is second-person ("your Gmail identity", "as you")
+    // because it addressed one person. A teammate must not be told the agent
+    // wants *their* account.
+    const body = host.querySelector('[data-testid="connection-authorization-body"]')?.textContent;
+    expect(body).toBe(
+      "Outreach Agent needs Carol's Gmail identity for work running as them.",
+    );
+    expect(host.querySelector('[data-testid="connection-authorization-waiting"]')?.textContent)
+      .toContain("Only Carol can connect their own Gmail account.");
 
     // Omitted, not disabled — and the authorization URL is not even in the DOM
     // for someone who may not use it.
@@ -1328,6 +1335,8 @@ describe("IssueThreadInteractionCard connection-authorization card", () => {
     expect(connected?.textContent).toContain("Gmail connected");
     expect(connected?.textContent).toContain("Connected by Carol");
     expect(connected?.textContent).toMatch(/on .*2026/);
+    expect(host.querySelector('[data-testid="connection-authorization-body"]')?.textContent)
+      .toBe("Outreach Agent needed Carol's Gmail identity for work running as them.");
 
     // A resolved card never re-offers the spent authorization target.
     expect(host.innerHTML).not.toContain("accounts.google.com");
