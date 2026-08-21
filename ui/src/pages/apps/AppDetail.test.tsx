@@ -21,6 +21,9 @@ const finishAppMock = vi.hoisted(() => vi.fn());
 const putConnectionInstallsMock = vi.hoisted(() => vi.fn());
 const refreshCatalogMock = vi.hoisted(() => vi.fn());
 const startOAuthMock = vi.hoisted(() => vi.fn());
+const listConnectionGrantsMock = vi.hoisted(() => vi.fn());
+const createConnectionGrantDelegationMock = vi.hoisted(() => vi.fn());
+const revokeConnectionGrantDelegationMock = vi.hoisted(() => vi.fn());
 const listUserDirectoryMock = vi.hoisted(() => vi.fn());
 const getSessionMock = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
@@ -50,6 +53,14 @@ vi.mock("@/api/tools", () => ({
     archiveConnection: vi.fn(),
     refreshCatalog: (connectionId: string) => refreshCatalogMock(connectionId),
     startOAuth: (connectionId: string) => startOAuthMock(connectionId),
+    listConnectionGrants: (connectionId: string) => listConnectionGrantsMock(connectionId),
+    createConnectionGrantDelegation: (connectionId: string, grantId: string, agentId: string) =>
+      createConnectionGrantDelegationMock(connectionId, grantId, agentId),
+    revokeConnectionGrantDelegation: (
+      connectionId: string,
+      grantId: string,
+      delegationId: string,
+    ) => revokeConnectionGrantDelegationMock(connectionId, grantId, delegationId),
     reconnectConnection: vi.fn(),
   },
 }));
@@ -265,6 +276,16 @@ describe("AppDetail", () => {
       authorizationUrl: "https://example.test/oauth",
       expiresAt: "2026-07-10T00:00:00.000Z",
     });
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-1" },
+      grants: [],
+    });
+    createConnectionGrantDelegationMock.mockResolvedValue({
+      id: "delegation-1",
+      grantId: "grant-user",
+      agentId: "agent-1",
+    });
+    revokeConnectionGrantDelegationMock.mockResolvedValue({});
     listUserDirectoryMock.mockResolvedValue({ users: [] });
     getSessionMock.mockResolvedValue({
       user: { id: "user-1", name: "Dotta", image: null },
@@ -992,5 +1013,61 @@ describe("AppDetail", () => {
     const body = String(pushToastMock.mock.calls.at(-1)?.[0]?.body ?? "");
     expect(body.length).toBeGreaterThan(0);
     expect(body).not.toContain(authorizationUrl);
+  });
+
+  it("lets the personal grant owner delegate autonomous access to a named agent", async () => {
+    getConnectionMock.mockResolvedValue(connection({ credentialPolicy: "per_user" }));
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-1" },
+      grants: [{
+        id: "grant-user",
+        companyId: "company-1",
+        connectionId: "conn-1",
+        kind: "user",
+        subjectUserId: "user-1",
+        providerTenant: null,
+        credentialSecretRefs: [],
+        status: "active",
+        isDefault: false,
+        createdByAgentId: null,
+        createdByUserId: "user-1",
+        revokedAt: null,
+        revokedByAgentId: null,
+        revokedByUserId: null,
+        lastUsedAt: null,
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+        updatedAt: new Date("2026-01-01T00:00:00Z"),
+        delegations: [],
+      }],
+    });
+
+    await renderAppDetail();
+
+    const trigger = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Allow autonomous access");
+    expect(trigger).toBeTruthy();
+
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const agentCheckbox = document.body.querySelector<HTMLElement>('[aria-label="Allow Coder"]');
+    expect(agentCheckbox).toBeTruthy();
+    await act(async () => {
+      agentCheckbox?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      Array.from(document.body.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Save")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(createConnectionGrantDelegationMock).toHaveBeenCalledWith(
+      "conn-1",
+      "grant-user",
+      "agent-1",
+    );
   });
 });

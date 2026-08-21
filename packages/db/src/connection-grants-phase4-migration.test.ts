@@ -36,12 +36,12 @@ describe("connection grants phase 4 migration", () => {
     expect(migrationSql).toContain(`ON CONFLICT DO NOTHING`);
   });
 
-  it("fails ambiguous personal-secret ownership closed with reauthorization guidance", () => {
-    expect(migrationSql).toContain(`Cannot migrate personal connection credential`);
-    expect(migrationSql).toContain(`Reauthorize the affected personal connection grants`);
-    expect(migrationSql).toContain(`count(DISTINCT g."subject_user_id") <> 1`);
-    expect(migrationSql).toContain(`other_g."kind" <> 'user'`);
-    expect(migrationSql).toContain(`jsonb_array_elements(c."credential_secret_refs")`);
+  it("remediates ambiguous personal-secret ownership without assigning an arbitrary owner", () => {
+    expect(migrationSql).toContain(`phase4_ambiguous_personal_secrets`);
+    expect(migrationSql).toContain(`count(DISTINCT g."subject_user_id") AS "owner_count"`);
+    expect(migrationSql).toContain(`organization_grant."kind" <> 'user'`);
+    expect(migrationSql).toContain(`"status" = 'needs_reauthorization'`);
+    expect(migrationSql).toContain(`"health_status" = 'missing_secret'`);
   });
 });
 
@@ -109,7 +109,7 @@ describeEmbeddedPostgres("connection grants phase 4 executable migration", () =>
           )
         `;
       }
-      return { companyId, secretId, ownerUserId: input.ownerUserIds[0]! };
+      return { companyId, connectionId, secretId, ownerUserId: input.ownerUserIds[0]! };
     }
 
     try {
@@ -133,20 +133,56 @@ describeEmbeddedPostgres("connection grants phase 4 executable migration", () =>
 
       const ambiguous = await seedLegacyCredential({ ownerUserIds: ["alice", "bob"] });
       await rewindMigration();
-      await expect(applyPendingMigrations(database.connectionString)).rejects.toThrow(
-        /legacy ownership is ambiguous/,
-      );
+      await expect(applyPendingMigrations(database.connectionString)).resolves.toBeUndefined();
+      expect(await sql<{
+        status: string;
+        is_default: boolean;
+        credential_secret_refs: unknown[];
+      }[]>`
+        SELECT "status", "is_default", "credential_secret_refs"
+        FROM "connection_grants"
+        WHERE "company_id" = ${ambiguous.companyId}
+      `).toEqual([
+        { status: "needs_reauthorization", is_default: false, credential_secret_refs: [] },
+        { status: "needs_reauthorization", is_default: false, credential_secret_refs: [] },
+      ]);
+      expect(await sql<{ scope: string; owner_user_id: string | null }[]>`
+        SELECT "scope", "owner_user_id"
+        FROM "company_secrets"
+        WHERE "id" = ${ambiguous.secretId}
+      `).toEqual([{ scope: "company", owner_user_id: null }]);
 
-      await sql`DELETE FROM "company_secrets" WHERE "company_id" = ${ambiguous.companyId}`;
-      await sql`DELETE FROM "companies" WHERE "id" = ${ambiguous.companyId}`;
-      await seedLegacyCredential({
+      const mixed = await seedLegacyCredential({
         ownerUserIds: ["carol"],
         includeOrganizationGrant: true,
         includeConnectionReference: true,
       });
-      await expect(applyPendingMigrations(database.connectionString)).rejects.toThrow(
-        /legacy ownership is ambiguous/,
-      );
+      await rewindMigration();
+      await expect(applyPendingMigrations(database.connectionString)).resolves.toBeUndefined();
+      expect(await sql<{
+        status: string;
+        enabled: boolean;
+        health_status: string;
+        credential_secret_refs: unknown[];
+      }[]>`
+        SELECT "status", "enabled", "health_status", "credential_secret_refs"
+        FROM "tool_connections"
+        WHERE "id" = ${mixed.connectionId}
+      `).toEqual([{
+        status: "draft",
+        enabled: false,
+        health_status: "missing_secret",
+        credential_secret_refs: [],
+      }]);
+      expect(await sql<{ status: string; credential_secret_refs: unknown[] }[]>`
+        SELECT "status", "credential_secret_refs"
+        FROM "connection_grants"
+        WHERE "company_id" = ${mixed.companyId}
+        ORDER BY "kind"
+      `).toEqual([
+        { status: "needs_reauthorization", credential_secret_refs: [] },
+        { status: "needs_reauthorization", credential_secret_refs: [] },
+      ]);
     } finally {
       await sql.end();
     }

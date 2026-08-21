@@ -53,6 +53,8 @@ import type {
   UpdateToolMcpGateway,
   CreateToolTrustRuleFromActionRequest,
   ToolRedactedValueSummary,
+  ConnectionGrant,
+  ConnectionGrantDelegation,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -75,6 +77,10 @@ export type ToolPoliciesResponse = { policies: ToolPolicy[] };
 export type ToolProfilesResponse = { profiles: ToolProfileWithDetails[] };
 export type ToolGalleryResponse = { apps: AppDefinition[] };
 export type ToolMcpGatewaysResponse = { gateways: ToolMcpGatewayWithTokens[] };
+export type ConnectionGrantsResponse = {
+  connection: { id: string; uid: string };
+  grants: ConnectionGrant[];
+};
 export type CreateGatewayTokenInput = Omit<CreateToolMcpGatewayToken, "expiresAt"> & {
   expiresAt?: string | Date | null;
 };
@@ -306,6 +312,21 @@ export const toolsApi = {
       `/tool-connections/${connectionId}/installs`,
       { installs },
     ),
+  // --- Identity grants ---
+  listConnectionGrants: (connectionId: string) =>
+    api.get<ConnectionGrantsResponse>(`/tool-connections/${connectionId}/grants`),
+  createConnectionGrantDelegation: (connectionId: string, grantId: string, agentId: string) =>
+    api.post<ConnectionGrantDelegation>(
+      `/tool-connections/${connectionId}/grants/${grantId}/delegations`,
+      { agentId },
+    ),
+  revokeConnectionGrantDelegation: (
+    connectionId: string,
+    grantId: string,
+    delegationId: string,
+  ) => api.delete<ConnectionGrantDelegation>(
+    `/tool-connections/${connectionId}/grants/${grantId}/delegations/${delegationId}`,
+  ),
   createConnection: (companyId: string, input: CreateToolConnectionInput) =>
     api.post<ToolConnection>(`/companies/${companyId}/tools/connections`, input),
   updateConnection: (connectionId: string, input: UpdateToolConnectionInput) =>

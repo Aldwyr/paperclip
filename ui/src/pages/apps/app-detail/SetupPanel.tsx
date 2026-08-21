@@ -1,5 +1,6 @@
 import { useState } from "react";
-import type { ToolCatalogEntry, ToolConnection } from "@paperclipai/shared";
+import type { ConnectionGrant, ToolCatalogEntry, ToolConnection } from "@paperclipai/shared";
+import { AgentMultiSelect, type AgentMultiSelectOption } from "@/components/AgentMultiSelect";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ToggleSwitch } from "@/components/ui/toggle-switch";
@@ -16,6 +17,12 @@ export function SetupPanel({
   configUpdateDisabled,
   onStartOAuth,
   oauthStartDisabled,
+  personalGrant,
+  agents = [],
+  delegationLoading = false,
+  delegationError = false,
+  delegationPending = false,
+  onReplaceDelegations,
 }: Pick<
   AppDetailSectionProps,
   "connection" | "galleryEntry"
@@ -26,6 +33,12 @@ export function SetupPanel({
   configUpdateDisabled: boolean;
   onStartOAuth: () => void;
   oauthStartDisabled: boolean;
+  personalGrant?: ConnectionGrant;
+  agents?: AgentMultiSelectOption[];
+  delegationLoading?: boolean;
+  delegationError?: boolean;
+  delegationPending?: boolean;
+  onReplaceDelegations?: (grant: ConnectionGrant, agentIds: string[]) => void;
 }) {
   const description = galleryEntry?.description ?? null;
   const oauth = connection.config?.oauth;
@@ -58,8 +71,73 @@ export function SetupPanel({
           onStart={onStartOAuth}
         />
       )}
+      {connection.credentialPolicy === "per_user" && onReplaceDelegations && (
+        <PersonalDelegationSection
+          grant={personalGrant}
+          agents={agents}
+          loading={delegationLoading}
+          error={delegationError}
+          pending={delegationPending}
+          onReplace={onReplaceDelegations}
+        />
+      )}
       <AppLifecycleSection connection={connection} disabled={appToggleDisabled} onToggle={onToggleApp} />
     </div>
+  );
+}
+
+function PersonalDelegationSection({
+  grant,
+  agents,
+  loading,
+  error,
+  pending,
+  onReplace,
+}: {
+  grant?: ConnectionGrant;
+  agents: AgentMultiSelectOption[];
+  loading: boolean;
+  error: boolean;
+  pending: boolean;
+  onReplace: (grant: ConnectionGrant, agentIds: string[]) => void;
+}) {
+  if (loading) {
+    return <p id="personal-identity" className="text-sm text-muted-foreground">Loading autonomous access…</p>;
+  }
+  if (error) {
+    return <p id="personal-identity" className="text-sm text-destructive">Couldn’t load autonomous access.</p>;
+  }
+  if (!grant || grant.status !== "active") return null;
+
+  const delegatedAgentIds = new Set((grant.delegations ?? []).map((delegation) => delegation.agentId));
+  const delegationCount = delegatedAgentIds.size;
+
+  return (
+    <section id="personal-identity" className="flex flex-wrap items-start justify-between gap-4">
+      <div className="min-w-0 flex-1">
+        <h2 className="text-sm font-bold text-foreground">Your identity</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          Select the named agents that may use your identity in autonomous runs.
+        </p>
+      </div>
+      <AgentMultiSelect
+        agents={agents}
+        selectedAgentIds={delegatedAgentIds}
+        pending={pending}
+        disabled={pending}
+        triggerFullWidth={false}
+        triggerSize="sm"
+        triggerLabel={delegationCount === 0
+          ? "Allow autonomous access"
+          : `${delegationCount} ${delegationCount === 1 ? "agent" : "agents"} allowed`}
+        headerContent={(
+          <p className="text-xs text-muted-foreground">
+            Only selected agents can use this personal identity without you present.
+          </p>
+        )}
+        onSave={(next) => onReplace(grant, [...next])}
+      />
+    </section>
   );
 }
 

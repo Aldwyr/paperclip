@@ -2353,7 +2353,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         key: `connection:${input.connection.uid}:delegation:${input.ownerUserId}:${input.agentId}`,
         revisionId: input.connection.updatedAt.toISOString(),
         label: `Delegate ${input.connection.name}`,
-        href: `/${company?.issuePrefix ?? ""}/apps/${input.connection.id}/setup`,
+        href: `/${company?.issuePrefix ?? ""}/apps/${input.connection.id}/setup#personal-identity`,
       },
     };
     const [existing] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(

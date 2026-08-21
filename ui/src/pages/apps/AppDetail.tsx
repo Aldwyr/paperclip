@@ -76,6 +76,11 @@ export function AppDetail() {
     queryFn: () => toolsApi.getConnection(connectionId),
     enabled: !!connectionId && !!activeTab,
   });
+  const grantsQuery = useQuery({
+    queryKey: queryKeys.tools.connectionGrants(connectionId),
+    queryFn: () => toolsApi.listConnectionGrants(connectionId),
+    enabled: !!connectionId && activeTab === "setup",
+  });
   const installsQuery = useQuery({
     queryKey: queryKeys.tools.connectionInstalls(connectionId),
     queryFn: () => toolsApi.getConnectionInstalls(connectionId),
@@ -104,7 +109,9 @@ export function AppDetail() {
   const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? "__none__"),
     queryFn: () => agentsApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && (activeTab === "permissions" || activeTab === "activity"),
+    enabled: !!selectedCompanyId && (
+      activeTab === "setup" || activeTab === "permissions" || activeTab === "activity"
+    ),
   });
   const activityQuery = useQuery({
     queryKey: queryKeys.tools.connectionActivity(connectionId),
@@ -120,7 +127,7 @@ export function AppDetail() {
   const sessionQuery = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
-    enabled: activeTab === "activity",
+    enabled: activeTab === "setup" || activeTab === "activity",
   });
 
   const connection = connectionQuery.data;
@@ -299,6 +306,53 @@ export function AppDetail() {
       }),
   });
 
+  const invalidateGrants = () => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionGrants(connectionId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.tools.connection(connectionId) });
+  };
+
+  const replaceDelegations = useMutation({
+    mutationFn: async ({
+      grantId,
+      currentDelegations,
+      agentIds,
+    }: {
+      grantId: string;
+      currentDelegations: Array<{ id: string; agentId: string }>;
+      agentIds: string[];
+    }) => {
+      const desired = new Set(agentIds);
+      const existing = new Map(currentDelegations.map((delegation) => [delegation.agentId, delegation]));
+      await Promise.all([
+        ...currentDelegations
+          .filter((delegation) => !desired.has(delegation.agentId))
+          .map((delegation) => toolsApi.revokeConnectionGrantDelegation(
+            connectionId,
+            grantId,
+            delegation.id,
+          )),
+        ...agentIds
+          .filter((agentId) => !existing.has(agentId))
+          .map((agentId) => toolsApi.createConnectionGrantDelegation(connectionId, grantId, agentId)),
+      ]);
+    },
+    onSuccess: () => {
+      invalidateGrants();
+      pushToast({
+        title: "Autonomous access saved",
+        body: "Only the agents you selected can use your identity in autonomous runs.",
+        tone: "success",
+      });
+    },
+    onError: (error) => {
+      invalidateGrants();
+      pushToast({
+        title: "Couldn't save autonomous access",
+        body: error instanceof Error ? error.message : "Please try again.",
+        tone: "error",
+      });
+    },
+  });
   const removeApp = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
     onSuccess: () => {
@@ -472,6 +526,18 @@ export function AppDetail() {
             onUpdateConfig={(config) => updateConfig.mutate(config)}
             oauthStartDisabled={startOAuth.isPending}
             onStartOAuth={() => startOAuth.mutate()}
+            personalGrant={(grantsQuery.data?.grants ?? []).find((grant) =>
+              grant.kind === "user" && grant.subjectUserId === sessionQuery.data?.user?.id
+            )}
+            agents={agents}
+            delegationLoading={grantsQuery.isLoading || sessionQuery.isLoading || agentsQuery.isLoading}
+            delegationError={grantsQuery.isError || sessionQuery.isError || agentsQuery.isError}
+            delegationPending={replaceDelegations.isPending}
+            onReplaceDelegations={(grant, agentIds) => replaceDelegations.mutate({
+              grantId: grant.id,
+              currentDelegations: grant.delegations ?? [],
+              agentIds,
+            })}
           />
           <AdvancedPanel
             connection={connection}

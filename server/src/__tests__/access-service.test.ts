@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
@@ -476,6 +476,47 @@ describeEmbeddedPostgres("access service", () => {
     expect(await db.select().from(companySecrets).where(eq(companySecrets.id, secret.id))).toHaveLength(0);
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
       .toEqual([expect.objectContaining({ status: "revoked", credentialSecretRefs: [] })]);
+  });
+
+  it("destroys every owned personal secret on suspension, including unreferenced secrets", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `member-${randomUUID()}`,
+      status: "active",
+      membershipRole: "member",
+    }).returning().then((rows) => rows[0]!);
+    const definition = await db.insert(userSecretDefinitions).values({
+      companyId: company.id,
+      key: `oauth-${randomUUID()}`,
+      name: "Personal OAuth token",
+    }).returning().then((rows) => rows[0]!);
+    const ownedSecrets = await db.insert(companySecrets).values({
+      companyId: company.id,
+      scope: "user",
+      ownerUserId: member.principalId,
+      userSecretDefinitionId: definition.id,
+      key: `oauth-${randomUUID()}`,
+      name: "Orphaned personal credential",
+    }).returning();
+    const otherUserSecret = await db.insert(companySecrets).values({
+      companyId: company.id,
+      scope: "user",
+      ownerUserId: "another-user",
+      userSecretDefinitionId: definition.id,
+      key: `oauth-${randomUUID()}`,
+      name: "Another user's credential",
+    }).returning().then((rows) => rows[0]!);
+
+    await accessService(db).updateMember(company.id, member.id, { status: "suspended" });
+
+    expect(await db.select().from(companySecrets).where(inArray(
+      companySecrets.id,
+      ownedSecrets.map((secret) => secret.id),
+    ))).toHaveLength(0);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, otherUserSecret.id)))
+      .toHaveLength(1);
   });
 
   it("allows owner and admin role-default grants to manage environments", async () => {
