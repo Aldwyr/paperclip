@@ -6,9 +6,12 @@ import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { persistActivity, publishActivity } from "../activity-log.js";
 
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
+  "request_human_input",
   "list_documents", "read_document", "list_document_revisions",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -110,6 +113,7 @@ export class PaperclipRunnerToolAuthority {
         return { approval, tasks: tasks.map((row) => row.issue) };
       }
       case "report_progress": return this.#reportProgress(call.callId, call.arguments);
+      case "request_human_input": return this.#requestHumanInput(input, context.issue);
       default: throw new Error("paperclip_runner_tool_not_bound");
     }
   }
@@ -177,6 +181,63 @@ export class PaperclipRunnerToolAuthority {
       }).where(eq(heartbeatRuns.id, this.binding.runId));
       return result;
     });
+  }
+
+  async #requestHumanInput(input: Record<string, unknown>, issue: typeof issues.$inferSelect): Promise<unknown> {
+    const interactionKind = requiredString(input.interactionKind);
+    const kind = ({
+      confirmation: "request_confirmation",
+      checkbox: "request_checkbox_confirmation",
+      questions: "ask_user_questions",
+      suggest_tasks: "suggest_tasks",
+      item_verdicts: "request_item_verdicts",
+    } as const)[interactionKind as "confirmation"];
+    if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
+    const suppliedPayload = record(input.payload);
+    if (input.targetRevisionId && suppliedPayload.target === undefined) {
+      throw new Error("paperclip_runner_interaction_target_incomplete");
+    }
+    const prompt = requiredString(input.prompt);
+    const interaction = await issueThreadInteractionService(this.db).create(issue, {
+      kind,
+      idempotencyKey: requiredString(input.idempotencyKey),
+      sourceRunId: this.binding.runId,
+      title: requiredString(input.title),
+      summary: prompt,
+      continuationPolicy: requiredString(input.continuationPolicy),
+      payload: {
+        ...suppliedPayload,
+        version: 1,
+        prompt,
+        ...(kind === "request_confirmation" ? {
+          detailsMarkdown: suppliedPayload.detailsMarkdown ?? "",
+          acceptLabel: suppliedPayload.acceptLabel ?? "Confirm",
+          rejectLabel: suppliedPayload.rejectLabel ?? "Request changes",
+          rejectRequiresReason: suppliedPayload.rejectRequiresReason ?? false,
+          supersedeOnUserComment: suppliedPayload.supersedeOnUserComment ?? true,
+        } : {}),
+      },
+    } as never, { agentId: this.binding.agentId, userId: null });
+    const activity = await persistActivity(this.db, {
+      companyId: this.binding.companyId,
+      actorType: "agent",
+      actorId: this.binding.agentId,
+      agentId: this.binding.agentId,
+      runId: this.binding.runId,
+      issueId: this.binding.issueId,
+      action: "issue.thread_interaction_created",
+      entityType: "issue",
+      entityId: this.binding.issueId,
+      details: {
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        interactionStatus: interaction.status,
+        continuationPolicy: interaction.continuationPolicy,
+        source: "paperclip_runner_protocol",
+      },
+    });
+    publishActivity(activity.publication);
+    return { interaction, disposition: "applied" };
   }
 }
 

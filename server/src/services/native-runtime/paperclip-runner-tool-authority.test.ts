@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
@@ -53,9 +53,10 @@ describe("PaperclipRunnerToolAuthority", () => {
 
   it("advertises only real bindings and reads the bound task", async () => {
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
-    expect(authority.definitions()).toHaveLength(12);
+    expect(authority.definitions()).toHaveLength(13);
     expect(authority.definitions().map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "get_task_context", "get_task_history", "search_tasks", "report_progress",
+      "request_human_input",
       "list_documents", "read_document", "list_document_revisions",
       "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
     ]));
@@ -81,6 +82,31 @@ describe("PaperclipRunnerToolAuthority", () => {
       ...call,
       arguments: { body: "Changed", idempotencyKey: "progress-1" },
     })).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+  });
+
+  it("creates checkbox interactions through the real interaction service", async () => {
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    await expect(authority.execute({
+      tool: "request_human_input",
+      callId: "ask-checkbox",
+      arguments: {
+        idempotencyKey: "favorite-animals",
+        interactionKind: "checkbox",
+        title: "Favorite zoo animals",
+        prompt: "Which zoo animals are your favorites?",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          options: [
+            { id: "giraffes", label: "Giraffes" },
+            { id: "lions", label: "Lions" },
+          ],
+        },
+      },
+    })).resolves.toMatchObject({
+      interaction: { kind: "request_checkbox_confirmation", status: "pending" },
+    });
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId)))
+      .toHaveLength(1);
   });
 
   it("fails closed once the run is no longer active", async () => {
