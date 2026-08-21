@@ -87,6 +87,7 @@ export function accessService(db: Db) {
       const [grantRefs, connectionRefs] = await Promise.all([
         tx.select({
           id: connectionGrants.id,
+          status: connectionGrants.status,
           credentialSecretRefs: connectionGrants.credentialSecretRefs,
         }).from(connectionGrants).where(eq(connectionGrants.companyId, companyId)),
         tx.select({
@@ -99,7 +100,14 @@ export function accessService(db: Db) {
           (ref) => !removedSecretIds.has(ref.secretId),
         );
         if (credentialSecretRefs.length !== grant.credentialSecretRefs.length) {
-          await tx.update(connectionGrants).set({ credentialSecretRefs, updatedAt: now })
+          await tx.update(connectionGrants).set({
+            credentialSecretRefs,
+            ...(grant.status === "revoked" ? {} : {
+              status: "needs_reauthorization" as const,
+              isDefault: false,
+            }),
+            updatedAt: now,
+          })
             .where(eq(connectionGrants.id, grant.id));
         }
       }
@@ -108,7 +116,15 @@ export function accessService(db: Db) {
           (ref) => !removedSecretIds.has(ref.secretId),
         );
         if (credentialSecretRefs.length !== connection.credentialSecretRefs.length) {
-          await tx.update(toolConnections).set({ credentialSecretRefs, updatedAt: now })
+          await tx.update(toolConnections).set({
+            credentialSecretRefs,
+            status: "draft",
+            enabled: false,
+            healthStatus: "missing_secret",
+            healthMessage: "Personal credential owner no longer has company access. Reauthorize this connection.",
+            lastError: "oauth_reauthorization_required",
+            updatedAt: now,
+          })
             .where(eq(toolConnections.id, connection.id));
         }
       }

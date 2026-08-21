@@ -275,6 +275,8 @@ describeEmbeddedPostgres("access service", () => {
       transport: "mcp_remote",
       authKind: "oauth",
       credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
     }).returning().then((rows) => rows[0]!);
     const definition = await db.insert(userSecretDefinitions).values({
       companyId: company.id,
@@ -329,9 +331,19 @@ describeEmbeddedPostgres("access service", () => {
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
       .toEqual([expect.objectContaining({ status: "revoked", credentialSecretRefs: [] })]);
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, organizationGrant.id)))
-      .toEqual([expect.objectContaining({ credentialSecretRefs: [] })]);
+      .toEqual([expect.objectContaining({
+        status: "needs_reauthorization",
+        isDefault: false,
+        credentialSecretRefs: [],
+      })]);
     expect(await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id)))
-      .toEqual([expect.objectContaining({ credentialSecretRefs: [] })]);
+      .toEqual([expect.objectContaining({
+        status: "draft",
+        enabled: false,
+        healthStatus: "missing_secret",
+        lastError: "oauth_reauthorization_required",
+        credentialSecretRefs: [],
+      })]);
     expect(await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.reasonCode, "membership_removed")))
       .toHaveLength(1);
   });
