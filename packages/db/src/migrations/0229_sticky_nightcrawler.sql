@@ -19,56 +19,104 @@ ALTER TABLE "connection_grant_delegations" ADD CONSTRAINT "connection_grant_dele
 CREATE INDEX IF NOT EXISTS "connection_grant_delegations_company_agent_idx" ON "connection_grant_delegations" USING btree ("company_id","agent_id");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "connection_grant_delegations_grant_agent_uq" ON "connection_grant_delegations" USING btree ("grant_id","agent_id");
 --> statement-breakpoint
-DO $$
-DECLARE
-	ambiguous_secret record;
-BEGIN
+-- A legacy company-scoped credential can only become user-scoped when exactly
+-- one personal owner references it and no organization grant or connection
+-- also references it. Ambiguous rows fail closed in-place: remove every live
+-- reference, require reauthorization, and disable affected connections. This
+-- keeps the instance bootable while ensuring the credential is never assigned
+-- to an arbitrary user.
+DROP TABLE IF EXISTS "phase4_ambiguous_personal_secrets";
+--> statement-breakpoint
+CREATE TEMP TABLE "phase4_ambiguous_personal_secrets" ON COMMIT DROP AS
+WITH personal_secret_owners AS (
 	SELECT
 		s."id" AS "secret_id",
-		count(DISTINCT g."subject_user_id") AS "personal_owner_count",
-		count(*) FILTER (WHERE other_g."id" IS NOT NULL) AS "organization_reference_count",
-		count(*) FILTER (WHERE c."id" IS NOT NULL) AS "connection_reference_count"
-	INTO ambiguous_secret
+		s."company_id",
+		count(DISTINCT g."subject_user_id") AS "owner_count"
 	FROM "company_secrets" s
 	JOIN "connection_grants" g
 		ON g."company_id" = s."company_id"
 		AND g."kind" = 'user'
 	CROSS JOIN LATERAL jsonb_array_elements(g."credential_secret_refs") personal_ref
-	LEFT JOIN "connection_grants" other_g
-		ON other_g."company_id" = s."company_id"
-		AND other_g."kind" <> 'user'
-		AND EXISTS (
+	WHERE s."scope" = 'company'
+		AND s."id"::text = personal_ref ->> 'secretId'
+	GROUP BY s."id", s."company_id"
+)
+	SELECT owners."secret_id", owners."company_id"
+	FROM personal_secret_owners owners
+	WHERE owners."owner_count" <> 1
+		OR EXISTS (
 			SELECT 1
-			FROM jsonb_array_elements(other_g."credential_secret_refs") other_ref
-			WHERE other_ref ->> 'secretId' = s."id"::text
+			FROM "connection_grants" organization_grant
+			CROSS JOIN LATERAL jsonb_array_elements(organization_grant."credential_secret_refs") organization_ref
+			WHERE organization_grant."company_id" = owners."company_id"
+				AND organization_grant."kind" <> 'user'
+				AND organization_ref ->> 'secretId' = owners."secret_id"::text
 		)
-	LEFT JOIN "tool_connections" c
-		ON c."company_id" = s."company_id"
-		AND EXISTS (
+		OR EXISTS (
 			SELECT 1
-			FROM jsonb_array_elements(c."credential_secret_refs") connection_ref
-			WHERE connection_ref ->> 'secretId' = s."id"::text
+			FROM "tool_connections" connection
+			CROSS JOIN LATERAL jsonb_array_elements(connection."credential_secret_refs") connection_ref
+			WHERE connection."company_id" = owners."company_id"
+				AND connection_ref ->> 'secretId' = owners."secret_id"::text
+		);
+--> statement-breakpoint
+WITH ambiguous_secrets AS (
+	SELECT "secret_id", "company_id" FROM "phase4_ambiguous_personal_secrets"
+)
+UPDATE "connection_grants" grant_row
+SET
+	"credential_secret_refs" = COALESCE((
+		SELECT jsonb_agg(ref)
+		FROM jsonb_array_elements(grant_row."credential_secret_refs") ref
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM ambiguous_secrets ambiguous
+			WHERE ambiguous."company_id" = grant_row."company_id"
+				AND ref ->> 'secretId' = ambiguous."secret_id"::text
 		)
-	WHERE s."id"::text = personal_ref ->> 'secretId'
-		AND s."scope" = 'company'
-	GROUP BY s."id"
-	HAVING count(DISTINCT g."subject_user_id") <> 1
-		OR count(*) FILTER (WHERE other_g."id" IS NOT NULL) > 0
-		OR count(*) FILTER (WHERE c."id" IS NOT NULL) > 0
-	LIMIT 1;
-
-	IF FOUND THEN
-		RAISE EXCEPTION 'Cannot migrate personal connection credential %: legacy ownership is ambiguous', ambiguous_secret."secret_id"
-			USING ERRCODE = '23514',
-				DETAIL = format(
-					'personal owners=%s, organization grant references=%s, connection references=%s',
-					ambiguous_secret."personal_owner_count",
-					ambiguous_secret."organization_reference_count",
-					ambiguous_secret."connection_reference_count"
-				),
-				HINT = 'Reauthorize the affected personal connection grants with one credential per user before retrying this migration.';
-	END IF;
-END $$;
+	), '[]'::jsonb),
+	"status" = 'needs_reauthorization',
+	"is_default" = false,
+	"updated_at" = now()
+WHERE EXISTS (
+	SELECT 1
+	FROM jsonb_array_elements(grant_row."credential_secret_refs") ref
+	JOIN ambiguous_secrets ambiguous
+		ON ambiguous."company_id" = grant_row."company_id"
+		AND ref ->> 'secretId' = ambiguous."secret_id"::text
+);
+--> statement-breakpoint
+WITH ambiguous_secrets AS (
+	SELECT "secret_id", "company_id" FROM "phase4_ambiguous_personal_secrets"
+)
+UPDATE "tool_connections" connection_row
+SET
+	"credential_secret_refs" = COALESCE((
+		SELECT jsonb_agg(ref)
+		FROM jsonb_array_elements(connection_row."credential_secret_refs") ref
+		WHERE NOT EXISTS (
+			SELECT 1
+			FROM ambiguous_secrets ambiguous
+			WHERE ambiguous."company_id" = connection_row."company_id"
+				AND ref ->> 'secretId' = ambiguous."secret_id"::text
+		)
+	), '[]'::jsonb),
+	"status" = 'draft',
+	"enabled" = false,
+	"health_status" = 'missing_secret',
+	"health_message" = 'Legacy personal credential ownership was ambiguous. Reauthorize this connection.',
+	"last_error" = 'oauth_reauthorization_required',
+	"updated_at" = now()
+WHERE EXISTS (
+	SELECT 1
+	FROM jsonb_array_elements(connection_row."credential_secret_refs") ref
+	JOIN ambiguous_secrets ambiguous
+		ON ambiguous."company_id" = connection_row."company_id"
+		AND ref ->> 'secretId' = ambiguous."secret_id"::text
+);
+--> statement-breakpoint
+DROP TABLE IF EXISTS "phase4_ambiguous_personal_secrets";
 --> statement-breakpoint
 INSERT INTO "user_secret_definitions" (
 	"company_id", "key", "name", "description", "provider", "managed_mode",

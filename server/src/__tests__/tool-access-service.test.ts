@@ -912,6 +912,67 @@ describeEmbeddedPostgres("tool access service", () => {
       ]));
   });
 
+  it("enforces delegation owner and manager permissions through the HTTP routes", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    await grantBoardUser(db, company.id, "alice", [], "member");
+    await grantBoardUser(db, company.id, "mallory", [], "member");
+    await grantBoardUser(db, company.id, "manager", ["tools:manage_connections"], "operator");
+    const { connection } = await createBrokerConnection(db, company.id);
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: "alice",
+      status: "active",
+      isDefault: false,
+    }).returning().then((rows) => rows[0]!);
+
+    const nonOwner = await request(createRouteApp(
+      db,
+      boardSessionActor(company.id, "member", "mallory"),
+    ))
+      .post(`/api/tool-connections/${connection.id}/grants/${grant.id}/delegations`)
+      .send({ agentId: agent.id });
+    expect(nonOwner.status).toBe(403);
+
+    const created = await request(createRouteApp(
+      db,
+      boardSessionActor(company.id, "member", "alice"),
+    ))
+      .post(`/api/tool-connections/${connection.id}/grants/${grant.id}/delegations`)
+      .send({ agentId: agent.id });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({ grantId: grant.id, agentId: agent.id });
+
+    const unrelatedRevoke = await request(createRouteApp(
+      db,
+      boardSessionActor(company.id, "member", "mallory"),
+    )).delete(
+      `/api/tool-connections/${connection.id}/grants/${grant.id}/delegations/${created.body.id}`,
+    );
+    expect(unrelatedRevoke.status).toBe(403);
+
+    const managerRevoke = await request(createRouteApp(
+      db,
+      boardSessionActor(company.id, "operator", "manager"),
+    )).delete(
+      `/api/tool-connections/${connection.id}/grants/${grant.id}/delegations/${created.body.id}`,
+    );
+    expect(managerRevoke.status).toBe(200);
+    expect(await db.select().from(connectionGrantDelegations).where(eq(
+      connectionGrantDelegations.id,
+      created.body.id,
+    ))).toHaveLength(0);
+    expect(await db.select().from(toolAccessAuditEvents).where(eq(
+      toolAccessAuditEvents.connectionId,
+      connection.id,
+    ))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "connection_grant.delegated", actorId: "alice" }),
+      expect.objectContaining({ action: "connection_grant.delegation_revoked", actorId: "manager" }),
+    ]));
+  });
+
   it("serializes delegation creation behind membership removal so reauthorization cannot revive stale consent", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
@@ -1038,6 +1099,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(inactiveOwner.status).toBe(403);
     expect(inactiveOwner.body).toMatchObject({
       code: "grant_owner_membership_inactive",
+      remediation: { action: "restore_membership_or_reconnect" },
     });
     expect(inactiveOwner.body.error).toContain("not an active company member");
   });
@@ -3785,7 +3847,7 @@ describeEmbeddedPostgres("tool access service", () => {
       issueId: issue.id,
       kind: "request_confirmation",
       status: "pending",
-      title: "Connect your account",
+      title: "Connect your Slack to continue",
     });
     expect(interaction.payload).toMatchObject({ target: { href: started.authorizationUrl } });
 

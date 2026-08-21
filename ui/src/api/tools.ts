@@ -54,6 +54,7 @@ import type {
   CreateToolTrustRuleFromActionRequest,
   ToolRedactedValueSummary,
   ConnectionGrant,
+  ConnectionGrantDelegation,
   ConnectionGrantsResponse,
 } from "@paperclipai/shared";
 import { api } from "./client";
@@ -313,6 +314,18 @@ export const toolsApi = {
   // the UI never rebuilds the permission matrix from `membershipRole`.
   listConnectionGrants: (connectionId: string) =>
     api.get<ConnectionGrantsResponse>(`/tool-connections/${connectionId}/grants`),
+  createConnectionGrantDelegation: (connectionId: string, grantId: string, agentId: string) =>
+    api.post<ConnectionGrantDelegation>(
+      `/tool-connections/${connectionId}/grants/${grantId}/delegations`,
+      { agentId },
+    ),
+  revokeConnectionGrantDelegation: (
+    connectionId: string,
+    grantId: string,
+    delegationId: string,
+  ) => api.delete<ConnectionGrantDelegation>(
+    `/tool-connections/${connectionId}/grants/${grantId}/delegations/${delegationId}`,
+  ),
   revokeConnectionGrant: (connectionId: string, grantId: string) =>
     api.delete<ConnectionGrant>(`/tool-connections/${connectionId}/grants/${grantId}`),
   // An empty `memberUserIds` is the canonical "all organization members".

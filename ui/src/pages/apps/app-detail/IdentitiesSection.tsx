@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { InlineBanner } from "@/components/InlineBanner";
 import { MemberMultiSelect } from "@/components/MemberMultiSelect";
+import { AgentMultiSelect } from "@/components/AgentMultiSelect";
 import { RadioCardGroup } from "@/components/ui/radio-card";
 import {
   Dialog,
@@ -85,6 +86,9 @@ export function IdentitiesSection({
   providerName,
   credentialPolicy,
   grantsQuery,
+  agents,
+  agentsLoading,
+  agentsError,
   loading,
   error,
   onConnectAsMe,
@@ -94,16 +98,27 @@ export function IdentitiesSection({
   onReplaceAudience,
   connectPending,
   revokePending,
+  delegationPending,
   audiencePending,
   audienceError,
   audienceGrantId,
   onOpenAudience,
   onCloseAudience,
+  onReplaceDelegations,
 }: {
   appName: string;
   providerName: string;
   credentialPolicy: ToolConnectionCredentialPolicy;
   grantsQuery: ConnectionGrantsResponse | undefined;
+  agents: Array<{
+    id: string;
+    name: string;
+    title?: string | null;
+    icon?: string | null;
+    status: string;
+  }>;
+  agentsLoading: boolean;
+  agentsError: boolean;
   loading: boolean;
   error: boolean;
   onConnectAsMe: () => void;
@@ -113,6 +128,7 @@ export function IdentitiesSection({
   onReplaceAudience: (grant: ConnectionGrant, memberUserIds: string[]) => void;
   connectPending: boolean;
   revokePending: boolean;
+  delegationPending: boolean;
   audiencePending: boolean;
   audienceError: string | null;
   /**
@@ -123,6 +139,7 @@ export function IdentitiesSection({
   audienceGrantId: string | null;
   onOpenAudience: (grantId: string) => void;
   onCloseAudience: () => void;
+  onReplaceDelegations: (grant: ConnectionGrant, agentIds: string[]) => void;
 }) {
   const [revokeTarget, setRevokeTarget] = useState<ConnectionGrant | null>(null);
   const [othersExpanded, setOthersExpanded] = useState(false);
@@ -163,6 +180,14 @@ export function IdentitiesSection({
   return (
     <section>
       <IdentitiesHeading />
+
+      {agentsError ? (
+        <div className="mt-3">
+          <InlineBanner tone="warning" compact>
+            We couldn't load agents for autonomous access. Reload the page to try again.
+          </InlineBanner>
+        </div>
+      ) : null}
 
       <div className="mt-4 divide-y divide-border">
         {/* Organization identity — always visible, including when missing, so the
@@ -209,6 +234,7 @@ export function IdentitiesSection({
             a personal identity is consent-bound to the person who granted it. */}
         {capabilities?.canConnectAsCurrentUser || myGrant ? (
           <IdentityRow
+            id="personal-identity"
             title="Your identity"
             secondary={myGrant ? grantAccountLabel(myGrant, { subjectLabel: myLabel }) : null}
             status={myGrant?.status ?? null}
@@ -226,6 +252,28 @@ export function IdentitiesSection({
                       <Button size="sm" variant="outline" onClick={() => setRevokeTarget(myGrant)}>
                         Revoke
                       </Button>
+                    ) : null}
+                    {myGrant.status === "active" ? (
+                      <AgentMultiSelect
+                        agents={agents.filter((agent) => agent.status !== "terminated")}
+                        loading={agentsLoading}
+                        selectedAgentIds={new Set(
+                          (myGrant.delegations ?? []).map((delegation) => delegation.agentId),
+                        )}
+                        pending={delegationPending}
+                        triggerLabel={(myGrant.delegations?.length ?? 0) === 0
+                          ? "Allow autonomous access"
+                          : `${myGrant.delegations?.length ?? 0} ${myGrant.delegations?.length === 1 ? "agent" : "agents"} allowed for autonomous runs`}
+                        triggerSize="sm"
+                        triggerFullWidth={false}
+                        showSelectionPreview={false}
+                        headerContent={(
+                          <p className="mt-2 text-xs text-muted-foreground">
+                            Select the named agents that may use your identity in autonomous runs.
+                          </p>
+                        )}
+                        onSave={(agentIds) => onReplaceDelegations(myGrant, [...agentIds])}
+                      />
                     ) : null}
                   </>
                 ) : capabilities?.canConnectAsCurrentUser ? (
@@ -324,12 +372,14 @@ function IdentitiesHeading() {
 }
 
 function IdentityRow({
+  id,
   title,
   secondary,
   status,
   detail,
   actions,
 }: {
+  id?: string;
   title: string;
   secondary: string | null;
   status: ConnectionGrant["status"] | null;
@@ -337,7 +387,7 @@ function IdentityRow({
   actions: ReactNode;
 }) {
   return (
-    <div className="flex flex-col gap-2 py-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+    <div id={id} className="flex flex-col gap-2 py-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold text-foreground">{title}</span>

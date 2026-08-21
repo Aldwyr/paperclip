@@ -23,6 +23,8 @@ const refreshCatalogMock = vi.hoisted(() => vi.fn());
 const startOAuthMock = vi.hoisted(() => vi.fn());
 const listConnectionGrantsMock = vi.hoisted(() => vi.fn());
 const revokeConnectionGrantMock = vi.hoisted(() => vi.fn());
+const createConnectionGrantDelegationMock = vi.hoisted(() => vi.fn());
+const revokeConnectionGrantDelegationMock = vi.hoisted(() => vi.fn());
 const replaceConnectionGrantMembersMock = vi.hoisted(() => vi.fn());
 const startPersonalAuthorizationMock = vi.hoisted(() => vi.fn());
 const listUserDirectoryMock = vi.hoisted(() => vi.fn());
@@ -57,6 +59,13 @@ vi.mock("@/api/tools", () => ({
     listConnectionGrants: (connectionId: string) => listConnectionGrantsMock(connectionId),
     revokeConnectionGrant: (connectionId: string, grantId: string) =>
       revokeConnectionGrantMock(connectionId, grantId),
+    createConnectionGrantDelegation: (connectionId: string, grantId: string, agentId: string) =>
+      createConnectionGrantDelegationMock(connectionId, grantId, agentId),
+    revokeConnectionGrantDelegation: (
+      connectionId: string,
+      grantId: string,
+      delegationId: string,
+    ) => revokeConnectionGrantDelegationMock(connectionId, grantId, delegationId),
     replaceConnectionGrantMembers: (connectionId: string, grantId: string, memberUserIds: string[]) =>
       replaceConnectionGrantMembersMock(connectionId, grantId, memberUserIds),
     startPersonalAuthorization: (companyId: string, connectionId: string, input: unknown) =>
@@ -335,6 +344,12 @@ describe("AppDetail", () => {
       authorizationUrl: "https://example.test/oauth",
       expiresAt: "2026-07-10T00:00:00.000Z",
     });
+    createConnectionGrantDelegationMock.mockResolvedValue({
+      id: "delegation-1",
+      grantId: "grant-user",
+      agentId: "agent-1",
+    });
+    revokeConnectionGrantDelegationMock.mockResolvedValue({});
     listUserDirectoryMock.mockResolvedValue({ users: [] });
     getSessionMock.mockResolvedValue({
       user: { id: "user-1", name: "Dotta", image: null },
@@ -1132,6 +1147,44 @@ describe("AppDetail", () => {
       returnTo: "/apps/conn-1/setup",
     });
     expect(navigateTopLevelMock).toHaveBeenCalledWith("https://accounts.example.test/authorize");
+  });
+
+  it("lets the personal identity owner grant a named agent autonomous access", async () => {
+    mockParams.tab = "setup";
+    getConnectionMock.mockResolvedValue(perUserConnection());
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-1" },
+      grants: [personalGrant({ delegations: [] })],
+      capabilities: fullCapabilities(),
+      currentUserId: "user-1",
+      members: [{ userId: "user-1", name: "Dotta", email: "dotta@example.com" }],
+    });
+
+    await renderAppDetail();
+
+    expect(findButton("Allow autonomous access")).toBeTruthy();
+    await act(async () => {
+      findButton("Allow autonomous access")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const agentCheckbox = document.querySelector<HTMLInputElement>('button[role="checkbox"][aria-label="Allow Coder"]');
+    expect(agentCheckbox).toBeTruthy();
+    await act(async () => {
+      agentCheckbox?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await act(async () => {
+      Array.from(document.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Save")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(createConnectionGrantDelegationMock).toHaveBeenCalledWith(
+      "conn-1",
+      "grant-user",
+      "agent-1",
+    );
   });
 
   it("keeps a viewer read-only across identities and installs", async () => {

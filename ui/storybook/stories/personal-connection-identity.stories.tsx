@@ -146,10 +146,14 @@ function IdentitiesHarness({
         providerName="Gmail"
         credentialPolicy={credentialPolicy}
         grantsQuery={loading || error ? undefined : response}
+        agents={[{ id: "agent-1", name: "Outreach agent", title: "Growth", status: "active" }]}
+        agentsLoading={false}
+        agentsError={false}
         loading={loading}
         error={error}
         connectPending={false}
         revokePending={false}
+        delegationPending={false}
         audiencePending={false}
         audienceError={audienceError}
         audienceGrantId={openAudience}
@@ -159,6 +163,7 @@ function IdentitiesHarness({
         onConnectOrganization={() => {}}
         onReconnectOrganization={() => {}}
         onRevokeGrant={() => {}}
+        onReplaceDelegations={() => {}}
         onReplaceAudience={() => {}}
       />
     </div>

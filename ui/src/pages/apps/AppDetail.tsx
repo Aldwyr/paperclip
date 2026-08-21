@@ -106,7 +106,9 @@ export function AppDetail() {
   const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId ?? "__none__"),
     queryFn: () => agentsApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && (activeTab === "permissions" || activeTab === "activity"),
+    enabled: !!selectedCompanyId && (
+      activeTab === "setup" || activeTab === "permissions" || activeTab === "activity"
+    ),
   });
   const activityQuery = useQuery({
     queryKey: queryKeys.tools.connectionActivity(connectionId),
@@ -364,6 +366,49 @@ export function AppDetail() {
       }),
   });
 
+  const replaceDelegations = useMutation({
+    mutationFn: async ({
+      grantId,
+      currentDelegations,
+      agentIds,
+    }: {
+      grantId: string;
+      currentDelegations: Array<{ id: string; agentId: string }>;
+      agentIds: string[];
+    }) => {
+      const desired = new Set(agentIds);
+      const existing = new Map(currentDelegations.map((delegation) => [delegation.agentId, delegation]));
+      await Promise.all([
+        ...currentDelegations
+          .filter((delegation) => !desired.has(delegation.agentId))
+          .map((delegation) => toolsApi.revokeConnectionGrantDelegation(
+            connectionId,
+            grantId,
+            delegation.id,
+          )),
+        ...agentIds
+          .filter((agentId) => !existing.has(agentId))
+          .map((agentId) => toolsApi.createConnectionGrantDelegation(connectionId, grantId, agentId)),
+      ]);
+    },
+    onSuccess: () => {
+      invalidateGrants();
+      pushToast({
+        title: "Autonomous access saved",
+        body: "Only the agents you selected can use your identity in autonomous runs.",
+        tone: "success",
+      });
+    },
+    onError: (error) => {
+      invalidateGrants();
+      pushToast({
+        title: "Couldn't save autonomous access",
+        body: error instanceof Error ? error.message : "Please try again.",
+        tone: "error",
+      });
+    },
+  });
+
   // A denied or conflicting audience save keeps the dialog open with the
   // selection intact, so the error is surfaced inline rather than as a toast.
   const [audienceError, setAudienceError] = useState<string | null>(null);
@@ -565,10 +610,14 @@ export function AppDetail() {
                 providerName={providerName}
                 credentialPolicy={connection.credentialPolicy}
                 grantsQuery={grantsQuery.data}
+                agents={agents}
+                agentsLoading={agentsQuery.isLoading}
+                agentsError={agentsQuery.isError}
                 loading={grantsQuery.isLoading}
                 error={grantsQuery.isError}
                 connectPending={startPersonalAuth.isPending || startOAuth.isPending}
                 revokePending={revokeGrant.isPending}
+                delegationPending={replaceDelegations.isPending}
                 audiencePending={replaceAudience.isPending}
                 audienceError={audienceError}
                 audienceGrantId={audienceOpenGrantId}
@@ -586,6 +635,11 @@ export function AppDetail() {
                 onConnectOrganization={() => startOAuth.mutate()}
                 onReconnectOrganization={() => startOAuth.mutate()}
                 onRevokeGrant={(grant) => revokeGrant.mutate(grant.id)}
+                onReplaceDelegations={(grant, agentIds) => replaceDelegations.mutate({
+                  grantId: grant.id,
+                  currentDelegations: grant.delegations ?? [],
+                  agentIds,
+                })}
                 onReplaceAudience={(grant, memberUserIds) =>
                   replaceAudience.mutate({ grantId: grant.id, memberUserIds })}
               />
