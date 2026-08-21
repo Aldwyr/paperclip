@@ -585,11 +585,17 @@ export function accessService(db: Db) {
     companyIds: string[],
     options: { actorUserId?: string | null } = {},
   ) {
-    const existing = await listUserCompanyAccess(userId);
-    const existingByCompany = new Map(existing.map((row) => [row.companyId, row]));
     const target = new Set(companyIds);
 
     await db.transaction(async (tx) => {
+      // Serialize every company-access removal/reactivation with personal OAuth
+      // completion, which locks the same membership row before writing secrets.
+      const existing = await tx
+        .select()
+        .from(companyMemberships)
+        .where(and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, userId)))
+        .for("update");
+      const existingByCompany = new Map(existing.map((row) => [row.companyId, row]));
       const toArchive = existing.filter((row) => !target.has(row.companyId) && row.status !== "archived");
       if (toArchive.length > 0 && options.actorUserId && options.actorUserId === userId) {
         throw conflict("You cannot remove yourself");
