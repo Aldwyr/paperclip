@@ -7216,6 +7216,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       const [interaction] = existingInteraction
         ? await db.update(issueThreadInteractions).set({
             status: "pending",
+            requestedResolverPolicy: "human_only",
+            effectiveResolverPolicy: "human_only",
+            resolverPolicyProvenance: "explicit",
+            effectiveResolverPolicySource: "requested",
+            addresseeUserId: input.subjectUserId,
             payload,
             result: null,
             resolvedAt: null,
@@ -7231,6 +7236,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             effectiveResolverPolicy: "human_only",
             resolverPolicyProvenance: "explicit",
             effectiveResolverPolicySource: "requested",
+            addresseeUserId: input.subjectUserId,
             idempotencyKey,
             sourceRunId: binding.actorType === "agent" ? input.actor.sessionId ?? null : null,
             title: "Connect your account",

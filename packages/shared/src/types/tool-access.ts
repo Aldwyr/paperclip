@@ -253,6 +253,7 @@ export type ConnectionTokenSubject = { type: "app" } | { type: "user"; userId: s
 
 export const CONNECTION_RECOVERABLE_ERROR_CODES = [
   "user_authorization_required",
+  "organization_authorization_required",
   "grant_audience_denied",
   "grant_revoked",
   "needs_reauthorization",
