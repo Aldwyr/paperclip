@@ -25,6 +25,7 @@ describeEmbeddedPostgres("connections v3 schema core migration", () => {
     cleanups.push(async () => sql.end());
 
     await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${await migrationHash()}`;
+    await sql`DROP TABLE IF EXISTS "connection_grant_delegations"`;
     await sql`DROP TABLE IF EXISTS "connection_grant_members"`;
     await sql`DROP TABLE IF EXISTS "connection_grants"`;
     await sql`DROP INDEX IF EXISTS "tool_connections_company_uid_uq"`;
