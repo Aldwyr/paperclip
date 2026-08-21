@@ -3567,6 +3567,26 @@
       "id": "state-reconstruction",
       "requirement": "fixture and post-run state reconstruction",
       "deterministicOwner": "src/scenarios/scenario-explorer.test.ts; src/live/live-session.test.ts"
+    },
+    {
+      "id": "paperclip-adapter-selection",
+      "requirement": "paperclip_runner is selectable without changing legacy adapter behavior",
+      "deterministicOwner": "server/src/services/native-runtime/runtime-mode.test.ts; server/src/__tests__/heartbeat-native-runner-selection.test.ts"
+    },
+    {
+      "id": "real-control-plane-binding",
+      "requirement": "advertised runner tools re-authorize the live company, issue, agent, and run before using real Paperclip services",
+      "deterministicOwner": "server/src/services/native-runtime/paperclip-runner-tool-authority.test.ts"
+    },
+    {
+      "id": "real-control-plane-idempotency",
+      "requirement": "real service mutations are replay-safe and reject conflicting idempotency-key reuse",
+      "deterministicOwner": "server/src/services/native-runtime/paperclip-runner-tool-authority.test.ts"
+    },
+    {
+      "id": "paperclip-thread-projection",
+      "requirement": "committed PRP reasoning and semantic tool items render in the existing Paperclip task chat",
+      "deterministicOwner": "ui/src/adapters/paperclip-runner/index.test.ts; server/src/services/native-runtime/paperclip-control-plane-port.test.ts"
     }
   ]
 }
