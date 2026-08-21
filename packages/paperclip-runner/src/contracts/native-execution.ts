@@ -36,6 +36,8 @@ export interface NativeExecutionInputV1 {
     identifier: string;
     title: string;
     description: string | null;
+    /** Redacted, server-authored task markdown including the current wake comment. */
+    prompt: string;
     workMode: "standard";
   };
   workspace: {
@@ -140,7 +142,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
   const binding = record(input.binding, "input.binding");
   exactKeys(binding, ["companyId", "runId", "issueId", "agentId", "executionWorkspaceId"], "input.binding");
   const task = record(input.task, "input.task");
-  exactKeys(task, ["identifier", "title", "description", "workMode"], "input.task");
+  exactKeys(task, ["identifier", "title", "description", "prompt", "workMode"], "input.task");
   const workspace = record(input.workspace, "input.workspace");
   exactKeys(workspace, ["cwd", "repoUrl", "repoRef", "branchName"], "input.workspace");
   const session = record(input.session, "input.session");
@@ -204,6 +206,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
       identifier: text(task.identifier, "input.task.identifier"),
       title: text(task.title, "input.task.title"),
       description: nullableText(task.description, "input.task.description"),
+      prompt: text(task.prompt, "input.task.prompt"),
       workMode: "standard",
     },
     workspace: {

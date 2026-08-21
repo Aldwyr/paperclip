@@ -5,7 +5,7 @@ import type { StrictCompletionContractInput } from "../../vendor/paperclip-runne
 import { nativeSha256 } from "./canonical.js";
 
 export const NATIVE_COMPLETION_CONTRACT_SCHEMA = "paperclip.completion-contract.v1";
-export const NATIVE_COMPLETION_POLICY_VERSION = "phase6-v1";
+export const NATIVE_COMPLETION_POLICY_VERSION = "phase6-v2";
 
 export async function ensureNativeCompletionContract(input: {
   db: Db;
@@ -54,8 +54,12 @@ export async function ensureNativeCompletionContract(input: {
     revision: (latest?.revision ?? 0) + 1,
     schemaVersion: NATIVE_COMPLETION_CONTRACT_SCHEMA,
     policyVersion: NATIVE_COMPLETION_POLICY_VERSION,
-    risk: "standard",
-    completionAuthority: "server_arbiter",
+    // Completing an ordinary issue changes workflow state only; governed side
+    // effects remain independently authorized by their tools and approval
+    // gates. Accept a schema-valid completion claim so a successful one-shot
+    // task does not manufacture an endless evidence-retry loop.
+    risk: "low",
+    completionAuthority: "agent_claim_policy",
     incompleteCriteriaPolicy: "preserve_non_terminal",
     contractJson: contract as unknown as Record<string, unknown>,
     canonicalSha256,

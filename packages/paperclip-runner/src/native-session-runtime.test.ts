@@ -54,7 +54,13 @@ const input: NativeExecutionInputV1 = {
     agentId: identity.agentId,
     executionWorkspaceId: "workspace-recovery",
   },
-  task: { identifier: "PAP-RECOVERY", title: "Recover native work", description: null, workMode: "standard" },
+  task: {
+    identifier: "PAP-RECOVERY",
+    title: "Recover native work",
+    description: null,
+    prompt: "# PAP-RECOVERY: Recover native work",
+    workMode: "standard",
+  },
   workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
   session: { normalizedSessionId: identity.sessionId, driverKind: "codex_app_server", protocolVersion: 1 },
   completionContract: {

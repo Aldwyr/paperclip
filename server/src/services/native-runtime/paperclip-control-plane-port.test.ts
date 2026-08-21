@@ -358,6 +358,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       companyId: identity.companyId,
       runId: taskRunId,
       issue: { id: taskIssueId, identifier: "P6C-2", title: "Complete one native task", description: null, workMode: "standard" },
+      taskPrompt: "# P6C-2: Complete one native task",
       agentId: identity.agentId,
       workspace: { id: "workspace-phase6", cwd: process.cwd(), repoUrl: null, repoRef: null, branchName: null },
       normalizedSessionId: sessionId,

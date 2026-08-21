@@ -15895,6 +15895,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             companyId: agent.companyId,
             runId: run.id,
             issue: issueRef,
+            taskPrompt: readNonEmptyString(context.paperclipTaskMarkdown)
+              ?? `# ${issueRef.identifier ?? issueRef.id}: ${issueRef.title}`,
             agentId: agent.id,
             workspace: {
               // Projectless paperclip_runner tasks still have a resolved local cwd. Bind that

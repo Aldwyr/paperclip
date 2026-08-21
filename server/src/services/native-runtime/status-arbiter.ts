@@ -135,12 +135,22 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
-  const complete =
+  const evidenceComplete =
     input.assessment.reportedDisposition === "done" &&
     input.assessment.objectiveSatisfied &&
     input.assessment.allCriteriaSatisfied &&
     input.assessment.verificationPassed &&
     !input.assessment.hasBlockingRemainingWork;
+  const policyClaimComplete =
+    input.completionClaimPolicyAccepted === true &&
+    input.assessment.reportedDisposition === "done" &&
+    input.assessment.contractRevisionMatches &&
+    input.assessment.criterionAssessments.length > 0 &&
+    input.assessment.criterionAssessments.every((entry) => entry.claimStatus === "satisfied") &&
+    input.assessment.verificationAssessments.length > 0 &&
+    input.assessment.verificationAssessments.every((entry) => entry.claimStatus === "passed") &&
+    !input.assessment.hasBlockingRemainingWork;
+  const complete = evidenceComplete || policyClaimComplete;
   if (complete) {
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,

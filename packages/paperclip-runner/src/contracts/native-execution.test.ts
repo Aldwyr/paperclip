@@ -11,7 +11,13 @@ const input: NativeExecutionInputV1 = {
     agentId: "agent-1",
     executionWorkspaceId: "workspace-1",
   },
-  task: { identifier: "PAP-1", title: "Safe task", description: null, workMode: "standard" },
+  task: {
+    identifier: "PAP-1",
+    title: "Safe task",
+    description: null,
+    prompt: "# PAP-1: Safe task\n\nPlease address the latest comment.",
+    workMode: "standard",
+  },
   workspace: { cwd: "/safe/workspace", repoUrl: null, repoRef: null, branchName: null },
   session: { normalizedSessionId: null, driverKind: "codex_app_server", protocolVersion: 1 },
   completionContract: {
@@ -43,6 +49,7 @@ describe("NativeExecutionInputV1", () => {
     expect(serialized).not.toContain("run-1");
     expect(serialized).not.toContain("opaque-binding");
     expect(model.task.title).toBe("Safe task");
+    expect(model.task.prompt).toContain("latest comment");
   });
 
   it("rejects unknown context or environment escape hatches", () => {

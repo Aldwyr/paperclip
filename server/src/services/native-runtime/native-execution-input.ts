@@ -16,6 +16,7 @@ export function buildNativeExecutionInput(input: {
     description: string | null;
     workMode: string;
   };
+  taskPrompt: string;
   agentId: string;
   workspace: {
     id: string;
@@ -49,6 +50,7 @@ export function buildNativeExecutionInput(input: {
       identifier: input.issue.identifier ?? input.issue.id,
       title: input.issue.title,
       description: input.issue.description,
+      prompt: input.taskPrompt,
       workMode: "standard",
     },
     workspace: {

@@ -55,6 +55,35 @@ describe("native status authority", () => {
       reasonCode: "completion_evidence_incomplete",
       effects: [expect.objectContaining({ kind: "enqueue_continuation" })],
     }));
+    const claimOnly = assessment({
+      objectiveSatisfied: false,
+      allCriteriaSatisfied: false,
+      verificationPassed: false,
+      criterionAssessments: [{
+        criterionId: "objective",
+        claimStatus: "satisfied",
+        outcome: "missing",
+        evidenceRefs: [],
+        reasonCode: "criterion_evidence_missing",
+      }],
+      verificationAssessments: [{
+        commandOrCheck: "Answered the question",
+        claimStatus: "passed",
+        outcome: "unverifiable",
+        evidenceRef: null,
+        reasonCode: "verification_has_no_durable_reference",
+      }],
+      acceptedEvidenceRefs: [],
+      missingRequirements: ["objective"],
+    });
+    expect(arbitrate({ assessment: claimOnly })).toEqual(expect.objectContaining({
+      toStatus: "in_progress",
+      reasonCode: "completion_evidence_incomplete",
+    }));
+    expect(arbitrate({ assessment: claimOnly, completionClaimPolicyAccepted: true })).toEqual(expect.objectContaining({
+      toStatus: "done",
+      reasonCode: "completion_claim_policy_accepted",
+    }));
   });
 
   it("creates explicit liveness paths for review, continuation, cancellation, and governance", () => {
