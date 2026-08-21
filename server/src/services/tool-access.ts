@@ -7350,7 +7350,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             addresseeUserId: input.subjectUserId,
             idempotencyKey,
             sourceRunId: binding.actorType === "agent" ? input.actor.sessionId ?? null : null,
-            title: "Connect your account",
+            title: `Connect your ${connection.name} to continue`,
             summary: `Connect ${connection.name} to continue`,
             createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
             payload,
