@@ -92,9 +92,13 @@ describe("canonical semantic-catalog reconciliation authority", () => {
       expect(["none", "required", "recommended"]).toContain(operation.idempotency);
       expect(typeof operation.redacts).toBe("boolean");
       expect(["live_codex", "scenario_mock", "test_only"]).toContain(operation.realBindingStatus);
-      expect(operation.realServiceBinding).toBe("unbound");
+      if (operation.prpBindingStatus === "bound") {
+        expect(operation.realServiceBinding).not.toBe("unbound");
+      } else {
+        expect(operation.realServiceBinding).toBe("unbound");
+      }
       expect(operation.prpEvidence.length).toBeGreaterThan(0);
-      expect(operation.prpBindingStatus).toBe("audit_pending");
+      expect(["audit_pending", "bound"]).toContain(operation.prpBindingStatus);
       // Scenario-surface ops carry a mock mapping; live-only ops resolve inline.
       if (operation.surfaces.includes("scenario")) {
         expect(operation.mockCommandMapping).not.toBeNull();

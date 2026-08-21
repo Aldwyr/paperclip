@@ -6,8 +6,9 @@ This roster is the implementation ledger for binding the canonical Paperclip Run
 
 - Canonical protocol actions: **41**
 - Actions in the Codex semantic catalog: **28**
-- Actions with a real Paperclip service binding: **0**
-- Actions audited end-to-end over production PRP: **0**
+- Actions advertised by the production Paperclip authority: **13**
+- Actions with a real Paperclip service binding: **13**
+- Actions audited through the shared Paperclip-server PRP route: **13 service bindings; route smoke audit pending**
 - Existing semantic conformance bridge: five route-backed test operations (`report_progress`, `write_document`, confirmation-only `request_human_input`, `set_dependencies`, and `finish_task`). It is test-only and is not a production binding.
 
 The generated action metadata currently says `realServiceBinding: unbound` and `prpBindingStatus: audit_pending` for every action. `realBindingStatus: live_codex` means only that a Codex scenario exercised the mock semantic implementation; it must not be interpreted as a production Paperclip binding.
@@ -16,15 +17,15 @@ The generated action metadata currently says `realServiceBinding: unbound` and `
 
 | Group | Actions | Real authority target | Status |
 | --- | --- | --- | --- |
-| Active task reads | `get_task_context`, `get_task_history`, `search_tasks` | issue, comment, project, and assignment services | unbound |
-| Task mutations | `report_progress`, `answer_status_question`, `finish_task`, `block_task`, `request_review`, `set_dependencies`, `create_task` | issue/comment services and native status arbiter | unbound |
-| Documents and deliverables | `list_documents`, `read_document`, `list_document_revisions`, `write_document`, `register_deliverable` | document and attachment services | unbound |
-| Human interaction | `request_human_input` | interaction service and continuation scheduler | unbound |
-| Agents | `list_agents`, `get_agent` | agent service with company scope | unbound |
-| Approvals | `list_approvals`, `get_approval`, `get_approval_context`, `request_approval`, `decide_approval`, `comment_on_approval` | approval service | unbound |
+| Active task reads | `get_task_context`, `get_task_history`, `search_tasks` | issue, comment, project, and assignment services | bound; run/issue/agent/company assignment checked on every call |
+| Task mutations | `report_progress`, `answer_status_question`, `finish_task`, `block_task`, `request_review`, `set_dependencies`, `create_task` | issue/comment services and native status arbiter | `report_progress` bound with durable run receipt; remaining actions withheld pending mutation/status-arbiter audit |
+| Documents and deliverables | `list_documents`, `read_document`, `list_document_revisions`, `write_document`, `register_deliverable` | document and attachment services | three reads bound; mutations withheld pending idempotency audit |
+| Human interaction | `request_human_input` | interaction service and continuation scheduler | bound for confirmation, checkbox, questions, suggested tasks, and item verdicts |
+| Agents | `list_agents`, `get_agent` | agent service with company scope | bound with credential/config redaction and company checks |
+| Approvals | `list_approvals`, `get_approval`, `get_approval_context`, `request_approval`, `decide_approval`, `comment_on_approval` | approval service | three reads bound; mutations withheld. `decide_approval` is board-user-only in the current product and must not be agent-advertised |
 | Workspace | `get_workspace_runtime`, `control_workspace_service` | workspace runtime service | unbound |
 | Scheduling | `schedule_wake` | wakeup service | unbound |
-| Discovery | tool search and tool schema lookup | authorized catalog projection | mock implementation only |
+| Discovery | tool search and tool schema lookup | authorized catalog projection | runner-local authorized projection; production authority supplies only the 13 bound definitions |
 | Administrative surface | `administer_company`, `export_company`, `list_company_skills`, `sync_company_skills`, `list_projects`, `list_goals`, `list_routines`, `manage_routine`, `list_cases`, `upsert_case`, `inspect_operation_result` | existing company-scoped API/services; individually authorization-gated | protocol-only/scenario mock |
 | Secrets | `list_secret_metadata`, `read_secret_value` | secrets service; metadata/value claims separated and output redacted | protocol-only/scenario mock |
 | Escape hatch | `generic_api_request` | no production binding planned until a narrow allowlist is designed | test-only |
@@ -42,4 +43,14 @@ An action moves from `unbound` only when all of the following are true:
 
 ## Cutover order
 
-The first production vertical slice is `get_task_context` + `report_progress` + `finish_task`. Next are documents, interactions, task dependencies/creation, approvals, agent/project reads, workspace/scheduling, then the separately privileged administrative and secret surfaces. `generic_api_request` stays unavailable in production.
+The first production vertical slice is now `get_task_context` + `report_progress` + all five structured `request_human_input` variants, plus bounded document/agent/approval reads. The next slice is document writes and dependency/child-task mutations with durable receipts. Terminal task actions must be reconciled with the native status arbiter before they are advertised. Approval decisions remain board-user-only. Workspace/scheduling follow, then the separately privileged administrative and secret surfaces. `generic_api_request` stays unavailable in production.
+
+## Production transport status
+
+Paperclip now owns a shared WebSocket upgrade route at
+`/api/runner/v1/connect/:runId`. The native executor registers one run-bound
+`DurablePrpControlPlane` authority, runnerd receives that loopback URL, and the
+authority still authenticates the one-time bootstrap ticket and durable lease
+inside PRP. Unknown runs and malformed run IDs fail closed before the protocol
+handshake. The run ID is a path segment because runnerd deliberately rejects
+query-bearing WebSocket URLs to avoid URL ambiguity.

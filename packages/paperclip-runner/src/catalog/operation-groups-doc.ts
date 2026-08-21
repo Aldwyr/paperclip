@@ -376,7 +376,7 @@ export function renderOperationGroupsDocument(input: OperationGroupsInput): stri
     "",
     "### Reconciled semantic-operation ledger",
     "",
-    "`live_codex` means a live provider dispatcher exists against the deterministic runner/mock port; it does **not** mean a production Paperclip service is bound. Every row remains `realServiceBinding: unbound` until the shared mock/real adapter work lands. `generic_api_request` is test-only and cannot satisfy product coverage.",
+    "`live_codex` means a live provider dispatcher exists. Production binding is tracked separately: `bound` rows are advertised by Paperclip's run-scoped authority over the shared PRP route, while `audit_pending` rows remain unavailable to production agents. `generic_api_request` is test-only and cannot satisfy product coverage.",
     "",
     "| Operation | Placement | Claims | Modes / roles | Side effect | Idempotency | Redacts | Mock | Catalogs / current runner | Production / PRP evidence |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
