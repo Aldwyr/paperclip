@@ -69,21 +69,21 @@ function renderItem(
       // put when the tool history expands (PAP-413). The two paths are mutually
       // exclusive at runtime, so only one host ever mounts the node.
       const actions = renderMessageActions?.(item);
+      const turn = item.attachedTurn ? (
+        <TaskChatTurn
+          item={item.attachedTurn}
+          timestampPrefix={item.attachedTurn.standaloneHeader ? undefined : item.timestamp}
+          leading={item.attachedTurn.standaloneHeader ? undefined : actions}
+          renderChild={(child) => renderItem(child, onApprovalDecision)}
+        />
+      ) : undefined;
       return (
         <TaskChatBubble
           item={item}
-          actions={actions}
+          actions={item.attachedTurn?.standaloneHeader ? actions : item.attachedTurn ? undefined : actions}
           queuedAction={renderQueuedAction?.(item)}
-          attachedTurn={
-            item.attachedTurn ? (
-              <TaskChatTurn
-                item={item.attachedTurn}
-                timestampPrefix={item.timestamp}
-                leading={actions}
-                renderChild={(child) => renderItem(child, onApprovalDecision)}
-              />
-            ) : undefined
-          }
+          beforeTurn={item.attachedTurn?.standaloneHeader ? turn : undefined}
+          attachedTurn={item.attachedTurn?.standaloneHeader ? undefined : turn}
         />
       );
     }

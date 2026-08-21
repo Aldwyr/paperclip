@@ -700,6 +700,17 @@ export class DurablePrpControlPlane {
     }
   }
 
+  /** Forces a resumable re-authentication after an immutable run attachment rotates. */
+  disconnectActiveRunner(): void {
+    const connections = [...this.#connections];
+    this.#connections.clear();
+    for (const connection of connections) connection.close();
+  }
+
+  activeRunnerConnectionCount(): number {
+    return [...this.#connections].filter((connection) => connection.secureChannel !== null).length;
+  }
+
   issueBootstrapTicket(ttlMs = 5_000): string {
     const ticket = `bootstrap_${randomUUID()}`;
     const material = credentialMaterial(ticket);
@@ -1239,8 +1250,29 @@ export class DurablePrpControlPlane {
         ? status
         : "failed";
     command.result = structuredClone(result);
+    if (command.status === "completed" && command.type === "run.attach") {
+      this.#applyRunAttachment(command.payload);
+    }
     this.store.save();
     this.#sendNextCommand(connection);
+  }
+
+  #applyRunAttachment(payload: Record<string, unknown>): void {
+    const runId = payload.runId;
+    const turnId = payload.turnId;
+    const itemId = payload.itemId;
+    if (typeof runId !== "string" || typeof turnId !== "string" || typeof itemId !== "string") {
+      throw new Error("completed run.attach omitted its identity binding");
+    }
+    const next = { ...this.identity, runId, turnId, itemId };
+    Object.assign(this.identity, next);
+    this.store.state.identity = structuredClone(next);
+    for (const ticket of Object.values(this.store.state.tickets)) {
+      ticket.identity = structuredClone(next);
+    }
+    for (const lease of Object.values(this.store.state.leases)) {
+      lease.identity = structuredClone(next);
+    }
   }
 
   #event(connection: MockWebSocketConnection, envelope: Record<string, unknown>): void {
@@ -1299,7 +1331,8 @@ export class DurablePrpControlPlane {
     ) {
       const call = { callId: semantic.callId, operationId: semantic.operationId, input: semantic.input };
       void this.#onSemanticToolInput(call).then((result) => {
-        this.queueCommand("semantic_tool.result", { ...call, result }, `command_tool_${call.callId}`, true);
+        const runScope = createHash("sha256").update(this.identity.runId).digest("hex").slice(0, 12);
+        this.queueCommand("semantic_tool.result", { ...call, result }, `command_tool_${runScope}_${call.callId}`, true);
       });
     }
 
@@ -1370,6 +1403,10 @@ export function spawnRunner(options: {
   maxOutboxBytes: number;
   p0ReserveBytes: number;
   maxRuntimeMs?: number;
+  maxLifetimeMs?: number;
+  lifecyclePolicy?:
+    | { mode: "per_turn"; idleTimeoutMs: null }
+    | { mode: "warm"; idleTimeoutMs: number };
   runnerBinaryPath?: string;
   environment?: NodeJS.ProcessEnv;
 }): RunnerProcessHandle {
@@ -1404,9 +1441,18 @@ export function spawnRunner(options: {
     String(options.p0ReserveBytes),
     "--reconnect-delay-ms",
     "20",
-    "--max-runtime-ms",
-    String(options.maxRuntimeMs ?? 10_000),
   ];
+  if (options.maxLifetimeMs !== undefined) {
+    args.push("--max-lifetime-ms", String(options.maxLifetimeMs));
+  } else if (options.maxRuntimeMs !== undefined) {
+    args.push("--max-runtime-ms", String(options.maxRuntimeMs));
+  }
+  if (options.lifecyclePolicy !== undefined) {
+    args.push("--lifecycle-mode", options.lifecyclePolicy.mode);
+    if (options.lifecyclePolicy.mode === "warm") {
+      args.push("--idle-timeout-ms", String(options.lifecyclePolicy.idleTimeoutMs));
+    }
+  }
   const child = spawn(options.runnerBinaryPath ?? runnerBinary, args, {
     cwd: packageRoot,
     env: runnerEnvironment(options.ticket, options.environment),
@@ -1643,6 +1689,10 @@ export interface DurableEvalSessionInput {
   explicitClaims: string[];
   turnTimeoutMs: number;
   toolExposure?: "eager" | "lazy";
+  provider?: "codex" | "opencode";
+  opencodeVersion?: string;
+  opencodeCommand?: string;
+  opencodeProxyPath?: string;
 }
 
 export type DurableEvalInfrastructureFailureClass =
@@ -1773,6 +1823,9 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
     "-c", "shell_environment_policy.inherit=\"none\"",
     "app-server",
   ];
+  const providerKind = input.provider ?? "codex";
+  const opencodeProxyPath = input.opencodeProxyPath
+    ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
   core.queueCommand("run.prepare", {
     authorizedTools: {
       schema: "paperclip.runner.authorized-tools.v1", schemaVersion: 1,
@@ -1780,7 +1833,9 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       operations: exposedOperations,
     },
     provider: {
-      command: process.env.PAPERCLIP_CODEX_COMMAND ?? "codex", args: providerArgs,
+      kind: providerKind,
+      command: providerKind === "opencode" ? process.execPath : process.env.PAPERCLIP_CODEX_COMMAND ?? "codex",
+      args: providerKind === "opencode" ? [opencodeProxyPath] : providerArgs,
       cwd: tmpdir(), model: input.model,
       instructions: "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
     },
@@ -1793,6 +1848,16 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
     ticket: core.issueBootstrapTicket(), maxOutboxBytes: 256 * 1024,
     p0ReserveBytes: 64 * 1024, maxRuntimeMs: input.turnTimeoutMs + 30_000,
     runnerBinaryPath: input.runnerBinaryPath,
+    environment: providerKind === "opencode"
+      ? {
+          ...process.env,
+          PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
+          PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
+          PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+          PAPERCLIP_RUN_ID: identity.runId,
+          PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+        }
+      : process.env,
   });
   try {
     const deadline = Date.now() + input.turnTimeoutMs;
@@ -1838,10 +1903,14 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
     }
     let evidenceIndex = 1;
     let assistantText = "";
+    let semanticResult: Record<string, unknown> | null = null;
     let usage: Record<string, number> = {};
     const projectedCalls = new Map<string, string>();
     for (const record of records) {
       const payload = record.payload as Record<string, unknown> | undefined;
+      if (record.eventType === "run.result.proposed" && payload && semanticResult === null) {
+        semanticResult = structuredClone(payload);
+      }
       const semantic = payload?.semantic_tool as Record<string, unknown> | undefined;
       if (semantic?.phase === "input" || semantic?.phase === "result") {
         const wrapperInput = semantic.input as Record<string, unknown> | undefined;
@@ -1914,10 +1983,11 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       snapshot: {
         schema: "paperclip.capability.live-session.v1", revision: authority.snapshot().revision,
         sessionId: identity.normalizedSessionId, providerThreadId: "withheld", providerSessionId: null,
-        providerModel: { id: input.model, provider: "openai" }, status: "idle", activeTurnId: null,
+        providerModel: { id: input.model, provider: providerKind === "opencode" ? input.model.split("/", 1)[0] : "openai" }, status: "idle", activeTurnId: null,
+        semanticResult,
         createdAt: now, updatedAt: now,
         authority: { active: true, runId: identity.runId, companyId, actorId: input.actorId, taskId: input.taskId, sessionId: identity.normalizedSessionId, scenarioId: input.attemptId, capabilities: input.capabilities, explicitClaims: input.explicitClaims },
-        config: { workingDirectory: tmpdir(), requestedModel: input.model, scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
+        config: { workingDirectory: tmpdir(), requestedModel: input.model, provider: providerKind, driver: providerKind === "opencode" ? "opencode_server" : "codex_app_server", providerVersion: providerKind === "opencode" ? input.opencodeVersion ?? "1.18.17" : null, scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
         mockState: finalState,
         transcript: [
           { id: "transcript-user", role: "user", text: input.prompt, turnId: identity.turnId, at: now },

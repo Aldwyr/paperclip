@@ -19,7 +19,13 @@ const input: NativeExecutionInputV1 = {
     workMode: "standard",
   },
   workspace: { cwd: "/safe/workspace", repoUrl: null, repoRef: null, branchName: null },
-  session: { normalizedSessionId: null, driverKind: "codex_app_server", protocolVersion: 1 },
+  session: {
+    normalizedSessionId: null,
+    driverKind: "codex_app_server",
+    protocolVersion: 1,
+    lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+  },
+  provider: { kind: "codex", model: null },
   completionContract: {
     id: "contract-1",
     sha256: "abc123",
@@ -60,5 +66,51 @@ describe("NativeExecutionInputV1", () => {
       ...input,
       workspace: { ...input.workspace, env: { PAPERCLIP_API_KEY: "canary" } },
     })).toThrow("unknown field env");
+  });
+
+  it("accepts a persisted OpenCode driver/model pair and rejects mismatches", () => {
+    const opencode = parseNativeExecutionInput({
+      ...input,
+      session: { ...input.session, driverKind: "opencode_server" },
+      provider: { kind: "opencode", model: "openrouter/deepseek/deepseek-v4-flash-0731" },
+    });
+    expect(opencode.provider).toEqual({
+      kind: "opencode",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      session: { ...input.session, driverKind: "opencode_server" },
+      provider: { kind: "codex", model: null },
+    })).toThrow("does not match");
+  });
+
+  it("deserializes pre-provider Codex state as Codex", () => {
+    const legacy = structuredClone(input) as Record<string, unknown>;
+    delete legacy.provider;
+    expect(parseNativeExecutionInput(legacy).provider).toEqual({ kind: "codex", model: null });
+  });
+
+  it("defaults legacy lifecycle state to per-turn and validates warm timeouts", () => {
+    const legacy = structuredClone(input) as Record<string, unknown>;
+    delete (legacy.session as Record<string, unknown>).lifecyclePolicy;
+    expect(parseNativeExecutionInput(legacy).session.lifecyclePolicy).toEqual({
+      mode: "per_turn",
+      idleTimeoutMs: null,
+    });
+    expect(parseNativeExecutionInput({
+      ...input,
+      session: {
+        ...input.session,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+      },
+    }).session.lifecyclePolicy).toEqual({ mode: "warm", idleTimeoutMs: 300_000 });
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      session: {
+        ...input.session,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 0 },
+      },
+    })).toThrow("positive integer");
   });
 });

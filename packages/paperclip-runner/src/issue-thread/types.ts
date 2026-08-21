@@ -14,6 +14,9 @@ import type {
   CapabilityJsonValue,
   CapabilityTaskStatus,
 } from "../mock-core/capability-control-plane-types.js";
+import type { PaperclipWorkspaceDiff } from "../live/workspace-diff.js";
+import type { PaperclipWorkspaceFileReference } from "../live/workspace-file-reference.js";
+export type { CapabilityJsonValue } from "../mock-core/capability-control-plane-types.js";
 import type { CapabilitySemanticOperationId } from "../semantic-tools/types.js";
 
 export const CAPABILITY_ISSUE_THREAD_VIEW_SCHEMA = "paperclip.capability.issue-thread-view.v1" as const;
@@ -34,7 +37,7 @@ export const CAPABILITY_DISPOSITION_LABELS: Readonly<Record<CapabilityToolDispos
 };
 
 export interface CapabilityThreadIdentity {
-  /** `Real Codex` in live mode, `Fake agent` in fake mode, `Replay` in replay mode. */
+  /** Provider-aware live harness label, `Fake agent` in fake mode, or `Replay`. */
   agentLabel: string;
   /** `Real runnerd` in live mode, `In-process runner` otherwise. */
   runnerLabel: string;
@@ -207,6 +210,18 @@ export type CapabilityThreadItem =
       summary: string;
       eventCount: number;
       details: Record<string, CapabilityJsonValue>;
+    }
+  | {
+      kind: "workspace_changes";
+      id: string;
+      at: string;
+      changeSet: PaperclipWorkspaceDiff;
+    }
+  | {
+      kind: "workspace_file_reference";
+      id: string;
+      at: string;
+      reference: PaperclipWorkspaceFileReference;
     }
   | ({ kind: "interaction"; id: string; at: string } & CapabilityThreadInteractionCard)
   | {

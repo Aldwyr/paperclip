@@ -23,7 +23,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("@paperclipai/paperclip-runner", () => ({
-  createCodexNativeSessionBackend: state.createBackend,
+  createNativeSessionBackend: state.createBackend,
   executeNativeSession: state.execute,
 }));
 
@@ -31,9 +31,11 @@ import {
   cancelNativeSession,
   executePaperclipNativeSession,
   nativeSessionFailureDisposition,
+  nativeSessionFailureSourceCode,
 } from "./native-session-executor.js";
 
 const execution = {
+  provider: { kind: "codex", model: null },
   binding: {
     companyId: "company",
     runId: "run-native-cancel",
@@ -43,11 +45,11 @@ const execution = {
   completionContract: { id: "contract", sha256: "sha" },
 } as NativeExecutionInputV1;
 
-function leaseDb(): Db {
+function leaseDb(boundExecution: NativeExecutionInputV1 = execution): Db {
   const coordinator = {
-    runId: execution.binding.runId,
-    companyId: execution.binding.companyId,
-    issueId: execution.binding.issueId,
+    runId: boundExecution.binding.runId,
+    companyId: boundExecution.binding.companyId,
+    issueId: boundExecution.binding.issueId,
     phase: "observed",
     attempt: 0,
     leaseOwner: null,
@@ -135,7 +137,73 @@ describe("native session cancellation", () => {
   });
 });
 
+describe("native warm session supervision", () => {
+  it("reuses one session across distinct governed runs and closes it after idle expiry", async () => {
+    const close = vi.fn(async () => undefined);
+    const sharedSession = { close };
+    const base = {
+      ...execution,
+      binding: {
+        ...execution.binding,
+        executionWorkspaceId: "workspace",
+      },
+      workspace: { cwd: "/tmp/warm-native", repoUrl: null, repoRef: null, branchName: null },
+      session: {
+        normalizedSessionId: "session-warm-native",
+        driverKind: "codex_app_server" as const,
+        protocolVersion: 1 as const,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 20 },
+      },
+    } as NativeExecutionInputV1;
+    const second = {
+      ...base,
+      binding: { ...base.binding, runId: "run-native-warm-second" },
+    };
+    const result = {
+      result: { summary: "completed" },
+      terminal: { runTerminalState: "succeeded" },
+      turnId: "turn",
+      normalizedSessionId: "session-warm-native",
+      providerSessionId: "provider-warm-native",
+      driverKind: "test",
+      driverVersion: "1",
+      nativeEventCount: 1,
+      highestContiguousSourceSeq: 1,
+      usage: null,
+    };
+    state.execute.mockReset()
+      .mockImplementationOnce(async (options) => {
+        expect(options.existingSession).toBeUndefined();
+        options.onSession?.(sharedSession);
+        return result;
+      })
+      .mockImplementationOnce(async (options) => {
+        expect(options.existingSession).toBe(sharedSession);
+        return result;
+      });
+
+    await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner" });
+    await executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: "runner" });
+    expect(close).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(close).toHaveBeenCalledWith({
+      reason: "warm native session idle timeout",
+    }), { timeout: 500 });
+  });
+});
+
 describe("native session bounded recovery", () => {
+  it("preserves stable provider and runner failure causes", () => {
+    expect(nativeSessionFailureSourceCode(new Error(
+      "provider_frame_too_large: harness stdout frame exceeded 4194304 bytes",
+    ))).toBe("provider_frame_too_large");
+    expect(nativeSessionFailureSourceCode(new Error(
+      "native_runner_process_exited: runnerd exited unexpectedly with code 1",
+    ))).toBe("native_runner_process_exited");
+    expect(nativeSessionFailureSourceCode(new Error(
+      "provider_transport_failed: invalid JSON-RPC",
+    ))).toBe("provider_transport_failed");
+  });
+
   it("retries the same run twice and stops at the third failed attempt", () => {
     const now = new Date("2026-08-09T00:00:00.000Z");
     expect(nativeSessionFailureDisposition(1, now)).toEqual({
@@ -191,10 +259,10 @@ describe("native process ownership", () => {
       onSpawn,
     });
 
-    expect(state.createBackend).toHaveBeenCalledWith(execution, {
+    expect(state.createBackend).toHaveBeenCalledWith(execution, expect.objectContaining({
       runnerInstanceId: "runner",
       onSpawn,
-    });
+    }));
     expect(onSpawn).toHaveBeenCalledWith(processMetadata);
   });
 });

@@ -1,5 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { expect, it } from "vitest";
 
@@ -83,4 +84,145 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
     await bundle.transport.close();
   }
   expect(bundle.evidence()).toMatchObject({ runnerExited: true, runnerExitCode: 0 });
+}, 30_000);
+
+it("attaches a second governed run to one warm runner and provider process", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: [],
+    lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+  });
+  bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [{
+        name: "get_task_context",
+        description: "Read the active task.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      }],
+    });
+    const runnerPid = bundle.evidence().runnerPid;
+    const providerPid = bundle.evidence().codexPid;
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    const waitForCompletion = async (label: string) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const next = await Promise.race([
+          notifications.next(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${label} notification timeout`)), 1_000)),
+        ]);
+        if (next.value?.method === "turn/completed") return;
+      }
+      throw new Error(`${label} completion timeout`);
+    };
+    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "first run" }] });
+    await waitForCompletion("first run");
+
+    await bundle.transport.attachRun?.({
+      runId: "run-warm-second",
+      turnId: "turn-binding-second",
+      itemId: "item-binding-second",
+    });
+    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "second run" }] });
+    await waitForCompletion("second run");
+
+    expect(bundle.evidence()).toMatchObject({ runnerPid, codexPid: providerPid, runnerExited: false });
+  } finally {
+    await bundle.transport.close();
+  }
+}, 30_000);
+
+it("cold-restores a suspended provider session under a new run binding", async () => {
+  const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-cold-attach-"));
+  const baseIdentity = {
+    runnerInstanceId: "runner-cold-attach",
+    environmentLeaseId: "lease-cold-attach",
+    runId: "run-cold-first",
+    normalizedSessionId: "session-cold-attach",
+    turnId: "turn-cold-first",
+    itemId: "item-cold-first",
+  };
+  const options = {
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: [],
+    stateDirectory,
+    lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
+  };
+  const dynamicTools = [{
+    name: "get_task_context",
+    description: "Read the active task.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  }];
+  const first = createCapabilityRunnerdCodexTransport({ ...options, prpIdentity: baseIdentity });
+  first.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  try {
+    await first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools });
+    await first.transport.request("turn/start", { input: [{ type: "text", text: "first process" }] });
+    for await (const event of first.transport.notifications()) {
+      if (event.method === "turn/completed") break;
+    }
+  } finally {
+    await first.transport.close();
+  }
+
+  const restored = createCapabilityRunnerdCodexTransport({
+    ...options,
+    prpIdentity: {
+      ...baseIdentity,
+      runId: "run-cold-restored",
+      turnId: "turn-cold-restored",
+      itemId: "item-cold-restored",
+    },
+  });
+  restored.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  try {
+    const read = await restored.transport.request("thread/read", {});
+    expect(read.thread).toMatchObject({ id: "fake-thread" });
+    await restored.transport.request("turn/start", { input: [{ type: "text", text: "restored process" }] });
+    for await (const event of restored.transport.notifications()) {
+      if (event.method === "turn/completed") break;
+    }
+    expect(restored.evidence()).toMatchObject({ runnerExited: false, codexPid: expect.any(Number) });
+  } finally {
+    await restored.transport.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it("rejects the notification stream promptly when runnerd exits after accepting a turn", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: ["--linger-after-turn-start"],
+  });
+  bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [{
+        name: "get_task_context",
+        description: "Read the active task.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      }],
+    });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "Wait for another instruction." }],
+    });
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    expect((await notifications.next()).value?.method).toBe("turn/started");
+    const runnerPid = bundle.evidence().runnerPid;
+    expect(runnerPid).not.toBeNull();
+    process.kill(runnerPid!, "SIGKILL");
+    await expect(Promise.race([
+      notifications.next(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("notification stream hung")), 2_000)),
+    ])).rejects.toThrow("native_runner_process_exited");
+  } finally {
+    await bundle.transport.close();
+  }
 }, 30_000);

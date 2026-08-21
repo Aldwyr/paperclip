@@ -5,6 +5,7 @@ import {
   type RunTranscriptSource,
 } from "@/components/transcript/useLiveRunTranscripts";
 import { TaskChatLiveTail } from "@/components/task-chat/TaskChatLiveTail";
+import { TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
 import { commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
 import {
   assembleThreadItems,
@@ -349,6 +350,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // B4), so the transcript stays mounted through the settle gap without ever
     // double-rendering beside its own settled turn.
     const settledRunIds = new Set<string>();
+    const entriesWithFailures = [...orderedEntries];
     // Settled turns for every terminal run whose transcript we have. Messages
     // and thinking are excluded entirely (PAP-361): the final reply already
     // landed as the run's comment bubble, interstitial updates are ephemeral
@@ -362,8 +364,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (!isTerminalRunStatus(source.status)) continue;
       if (liveRun && source.id === liveRun.id) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
-      if (entries.length === 0) continue;
       const meta = linkedRunMetaById.get(source.id);
+      if (entries.length === 0) {
+        if (source.status === "failed" || source.status === "timed_out") {
+          settledRunIds.add(source.id);
+          const code = meta?.errorCode ?? "native_runner_process_exited";
+          const retryDetail = meta?.scheduledRetryAt
+            ? "Retry scheduled automatically."
+            : "You can retry this message now.";
+          const detail = code === "provider_frame_too_large"
+            ? `Provider output exceeded the safe limit. ${retryDetail}`
+            : `The runner stopped before returning an answer (${code}). ${retryDetail}`;
+          const id = `${source.id}:failure`;
+          entriesWithFailures.push({
+            ms: toMs(meta?.finishedAt ?? meta?.startedAt ?? meta?.createdAt),
+            order: 3,
+            id,
+            item: {
+              id,
+              kind: "marker",
+              variant: "interrupted",
+              label: "Run failed",
+              detail,
+            },
+          });
+        }
+        continue;
+      }
       const started = meta?.startedAt ? new Date(meta.startedAt).getTime() : NaN;
       const finished = meta?.finishedAt ? new Date(meta.finishedAt).getTime() : NaN;
       const durationMs =
@@ -376,7 +403,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         running: false,
       });
       const children = settledRunChildren(parsed);
-      if (children.length === 0) continue;
+      if (children.length === 0 && source.adapterType !== "paperclip_runner") continue;
       settledRunIds.add(source.id);
       const failed = source.status !== "succeeded";
       const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
@@ -390,6 +417,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           id: `${source.id}:turn`,
           kind: "turn",
           settled: true,
+          standaloneHeader: source.adapterType === "paperclip_runner",
           animateFold: liveSeenRef.current.has(source.id),
           items: children,
           summary: buildTurnSummary(entries, { durationMs, failed }),
@@ -420,7 +448,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // (stopped runs, or a reply not yet fetched) interleave chronologically at
     // their run's start time instead of piling up under the newest message
     // (PAP-367).
-    const out = assembleThreadItems(orderedEntries, turnsByAnchor, unanchored);
+    entriesWithFailures.sort(
+      (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
+    );
+    const out = assembleThreadItems(entriesWithFailures, turnsByAnchor, unanchored);
 
     // PAP-362: two runs replying back-to-back (same agent, nothing but the
     // agent's own bubbles between) fold into ONE "Worked" row below the last
@@ -468,10 +499,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Hand off once the settled turn or its reply comment is in the thread; a
   // stopped run that yields neither is released by the backstop timeout so the
   // tail never lingers indefinitely.
-  const settledRunRendered =
-    settlingRun != null &&
-    (settledRunIds.has(settlingRun.id) ||
-      comments.some((comment) => comment.runId === settlingRun.id && !comment.deletedAt));
+  const settlingHasComment = settlingRun != null &&
+    comments.some((comment) => comment.runId === settlingRun.id && !comment.deletedAt);
+  const settlingIsPaperclipRunner = settlingRun != null &&
+    runs.find((run) => run.id === settlingRun.id)?.adapterType === "paperclip_runner";
+  const settledRunRendered = settlingRun != null &&
+    (settlingHasComment || (!settlingIsPaperclipRunner && settledRunIds.has(settlingRun.id)));
   useEffect(() => {
     if (!settlingRun) return;
     if (settledRunRendered) {
@@ -492,6 +525,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const tailRunId = liveRun ? liveRun.id : showSettlingTail ? settlingRun!.id : null;
   const tailStreaming = Boolean(liveRun);
   const tailEntries = tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [];
+  const tailAdapterType = tailRunId ? runs.find((run) => run.id === tailRunId)?.adapterType : null;
+  const paperclipRunnerTail = tailAdapterType === "paperclip_runner";
   const tailContentKey = tailEntries.reduce((total, entry) => {
     if ("text" in entry) return total + entry.text.length;
     if ("content" in entry) return total + entry.content.length;
@@ -552,6 +587,35 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // tailEntries is a fresh array each render; tailContentKey tracks its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tailRunId, tailContentKey, tailStreaming, tailAgentName],
+  );
+  const assigneeUsesPaperclipRunner = Boolean(
+    issueAssigneeAgentId && agentMap?.get(issueAssigneeAgentId)?.adapterType === "paperclip_runner",
+  );
+  const [runnerSubmissionPending, setRunnerSubmissionPending] = useState(false);
+  useEffect(() => {
+    if (tailRunId) setRunnerSubmissionPending(false);
+  }, [tailRunId]);
+  useEffect(() => {
+    if (!runnerSubmissionPending || tailRunId) return;
+    const timeout = window.setTimeout(() => setRunnerSubmissionPending(false), 10_000);
+    return () => window.clearTimeout(timeout);
+  }, [runnerSubmissionPending, tailRunId]);
+  const handleThreadAdd = useCallback(
+    async (...args: Parameters<typeof onAdd>) => {
+      if (assigneeUsesPaperclipRunner) setRunnerSubmissionPending(true);
+      try {
+        await onAdd(...args);
+      } catch (error) {
+        setRunnerSubmissionPending(false);
+        throw error;
+      }
+    },
+    [assigneeUsesPaperclipRunner, onAdd],
+  );
+  const optimisticRunnerStartup = assigneeUsesPaperclipRunner && !tailRunId && (
+    runnerSubmissionPending || commentItems.some(
+      (item) => item.kind === "message" && item.author === "human" && item.optimistic === "pending",
+    )
   );
 
   // Feedback votes keyed by the comment they target (targetType
@@ -681,24 +745,36 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             renderBrief={issueBrief ? () => <TaskChatDescriptionBubble brief={issueBrief} /> : undefined}
             renderMessageActions={renderMessageActions}
             renderQueuedAction={renderQueuedAction}
-            tail={tailRunId || bottomBlockerLinks ? (
+            tail={tailRunId || optimisticRunnerStartup || bottomBlockerLinks ? (
               <>
-                {tailRunId ? (
+                {tailRunId || optimisticRunnerStartup ? (
                   <div data-testid="task-chat-live-transcript">
-                    <TaskChatLiveRunPill
-                      status={tailStatus}
-                      startedAtMs={tailStartedAtMs}
-                      finishedAtMs={tailFinishedAtMs}
-                      toolSummary={tailToolSummary}
-                    />
-                    <TaskChatLiveTail
-                      items={tailItems}
-                      emptyMessage={
-                        tailStatus === "queued"
-                          ? "Waiting to start..."
-                          : "Waiting for transcript..."
-                      }
-                    />
+                    {paperclipRunnerTail || optimisticRunnerStartup ? (
+                      <TaskChatRunnerTurn
+                        items={tailItems}
+                        status={optimisticRunnerStartup ? "queued" : tailStatus}
+                        startedAtMs={tailStartedAtMs}
+                        finishedAtMs={tailFinishedAtMs}
+                        toolSummary={tailToolSummary}
+                      />
+                    ) : (
+                      <>
+                        <TaskChatLiveRunPill
+                          status={tailStatus}
+                          startedAtMs={tailStartedAtMs}
+                          finishedAtMs={tailFinishedAtMs}
+                          toolSummary={tailToolSummary}
+                        />
+                        <TaskChatLiveTail
+                          items={tailItems}
+                          emptyMessage={
+                            tailStatus === "queued"
+                              ? "Waiting to start..."
+                              : "Waiting for transcript..."
+                          }
+                        />
+                      </>
+                    )}
                   </div>
                 ) : null}
                 {bottomBlockerLinks}
@@ -733,7 +809,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         >
           {composerAccessory}
           <TaskChatComposer
-            onAdd={onAdd}
+            onAdd={handleThreadAdd}
             workMode={issueWorkMode}
             onWorkModeChange={onWorkModeChange}
             disabled={Boolean(composerDisabledReason)}

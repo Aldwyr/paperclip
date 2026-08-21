@@ -9,6 +9,9 @@ pub fn run_durable_runner(
     }
     let store = DurableStateStore::new(&config.state_dir)?;
     let (mut state, recovered) = store.load_or_create(&config)?;
+    if state.last_activity_at_unix_ms == 0 {
+        state.last_activity_at_unix_ms = current_unix_ms()?;
+    }
     if recovered && state.lifecycle == "revoked" {
         // Revocation is durable and terminal. Do not normalize, rewrite, start
         // a provider, resolve a destination, or consume the fresh bootstrap.
@@ -20,7 +23,13 @@ pub fn run_durable_runner(
         state.lifecycle = "ready".to_owned();
         state.record_diagnostic("resuming an explicitly suspended durable runner");
     }
-    let mut provider = start_configured_provider(&mut state)?;
+    let mut provider = match start_configured_provider(&mut state) {
+        Ok(provider) => provider,
+        Err(error) => {
+            persist_provider_failure(&mut state, &store, &error.to_string())?;
+            return Err(error);
+        }
+    };
     if recovered {
         if let Some(runtime) = provider.as_ref() {
             enqueue_event(
@@ -29,10 +38,10 @@ pub fn run_durable_runner(
                 "provider.started",
                 0,
                 json!({
-                    "provider": "codex",
+                    "provider": match runtime.kind() { crate::codex_provider::ProviderKind::Codex => "codex", crate::codex_provider::ProviderKind::Opencode => "opencode" },
                     "pid": runtime.process_id(),
-                    "threadId": runtime.thread_id(),
-                    "sessionId": runtime.session_id(),
+                    "threadId": runtime.session_identity(),
+                    "sessionId": runtime.provider_session_id(),
                     "resumed": true,
                 }),
                 None,
@@ -70,10 +79,10 @@ pub fn run_durable_runner(
     let started = Instant::now();
 
     loop {
-        if started.elapsed() > config.max_runtime {
+        if started.elapsed() >= config.max_runtime && !state.active_turn {
             state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
             state.lifecycle = "recoverable_failure".to_owned();
-            state.record_diagnostic("transport reconnect deadline exceeded");
+            state.record_diagnostic("transport reconnect deadline exceeded before a safe rotation could flush");
             store.save(&state)?;
             return Err(DurableRunnerError::invalid(
                 "transport reconnect deadline exceeded; durable state is preserved",
@@ -221,10 +230,27 @@ pub fn run_durable_runner(
         let mut revoke_deadline: Option<Instant> = None;
         let disconnected = loop {
             poll_provider(&mut provider, &mut state, &store, &config)?;
+            if started.elapsed() >= config.max_runtime && !state.active_turn {
+                begin_automatic_suspend(
+                    &mut state,
+                    &store,
+                    &config,
+                    &mut provider,
+                    "max_lifetime_rotation",
+                )?;
+            }
+            if should_suspend_for_idle(&state)? {
+                begin_automatic_suspend(&mut state, &store, &config, &mut provider, "idle_timeout")?;
+            }
             if provider.is_some() {
                 send_outbox(&mut client, &state, &mut sent_source_seq)?;
             }
             if (state.stop_after_flush || state.lifecycle == "revoked") && state.outbox.is_empty() {
+                if let Some(mut runtime) = provider.take() {
+                    runtime.shutdown().map_err(|error| {
+                        DurableRunnerError::invalid(format!("failed to stop provider during durable exit: {error}"))
+                    })?;
+                }
                 state.lifecycle = if state.lifecycle == "revoked" {
                     "revoked".to_owned()
                 } else if state.lifecycle == "suspending" {
@@ -292,6 +318,7 @@ pub fn run_durable_runner(
                                     DurableRunnerError::invalid("ACK cursor is required")
                                 })?;
                             state.apply_ack(acked)?;
+                            state.last_activity_at_unix_ms = current_unix_ms()?;
                             store.save(&state)?;
                         }
                         Some("command") => {
@@ -306,6 +333,7 @@ pub fn run_durable_runner(
                                 command,
                             ) {
                                 Ok(processed) => {
+                                    state.last_activity_at_unix_ms = current_unix_ms()?;
                                     let delivery = client
                                         .send_json(&command_result_envelope(&state, &processed))
                                         .and_then(|()| send_outbox(&mut client, &state, &mut sent_source_seq));
@@ -414,11 +442,11 @@ pub fn run_durable_runner(
 
 fn start_configured_provider(
     state: &mut DurableRunnerState,
-) -> Result<Option<crate::codex_provider::CodexProvider>, DurableRunnerError> {
-    let Some(provider_config) = state.codex_provider_config.clone() else {
+) -> Result<Option<Box<dyn crate::codex_provider::Provider>>, DurableRunnerError> {
+    let Some(provider_config) = state.provider_config.clone() else {
         return Ok(None);
     };
-    let resume_thread_id = state.codex_provider_thread_id.clone();
+    let resume_thread_id = state.provider_session_id.clone();
     let tools = state
         .provider_tool_bridge
         .authorized_tools()
@@ -430,8 +458,8 @@ fn start_configured_provider(
         resume_thread_id.as_deref(),
     )
     .map(|provider| {
-        state.codex_provider_thread_id = Some(provider.thread_id().to_owned());
-        Some(provider)
+        state.provider_session_id = Some(provider.thread_id().to_owned());
+        Some(Box::new(provider) as Box<dyn crate::codex_provider::Provider>)
     })
     .map_err(|error| {
         DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
@@ -442,7 +470,7 @@ fn process_command_and_provider(
     state: &mut DurableRunnerState,
     store: &DurableStateStore,
     config: &DurableRunnerConfig,
-    provider: &mut Option<crate::codex_provider::CodexProvider>,
+    provider: &mut Option<Box<dyn crate::codex_provider::Provider>>,
     command: &Value,
 ) -> Result<ProcessedCommand, DurableRunnerError> {
     let command_id = command
@@ -465,10 +493,10 @@ fn process_command_and_provider(
                         "provider.started",
                         0,
                         json!({
-                            "provider": "codex",
+                            "provider": match runtime.kind() { crate::codex_provider::ProviderKind::Codex => "codex", crate::codex_provider::ProviderKind::Opencode => "opencode" },
                             "pid": runtime.process_id(),
-                            "threadId": runtime.thread_id(),
-                            "sessionId": runtime.session_id(),
+                            "threadId": runtime.session_identity(),
+                            "sessionId": runtime.provider_session_id(),
                             "resumed": state.reconnect_count > 0,
                         }),
                         None,
@@ -490,7 +518,7 @@ fn process_command_and_provider(
                     DurableRunnerError::invalid("turn.start payload.text is required")
                 })?;
             let cwd = state
-                .codex_provider_config
+                .provider_config
                 .as_ref()
                 .map(|value| value.cwd.as_str())
                 .unwrap_or(".");
@@ -498,6 +526,7 @@ fn process_command_and_provider(
                 DurableRunnerError::invalid(format!("Codex turn.start failed: {error}"))
             })?;
         }
+        Some("run.attach") => {}
         Some("semantic_tool.result") => {
             let result: crate::provider_bridge::ToolResult =
                 serde_json::from_value(command["payload"].clone()).map_err(|error| {
@@ -536,7 +565,7 @@ fn process_command_and_provider(
                 .ok_or_else(|| {
                     DurableRunnerError::invalid("provider.thread.read requires a provider")
                 })?
-                .read_thread()
+                .read()
                 .map_err(|error| {
                     DurableRunnerError::invalid(format!("Codex thread/read failed: {error}"))
                 })?;
@@ -565,7 +594,7 @@ fn process_command_and_provider(
 }
 
 fn poll_provider(
-    provider: &mut Option<crate::codex_provider::CodexProvider>,
+    provider: &mut Option<Box<dyn crate::codex_provider::Provider>>,
     state: &mut DurableRunnerState,
     store: &DurableStateStore,
     config: &DurableRunnerConfig,
@@ -573,16 +602,25 @@ fn poll_provider(
     let Some(runtime) = provider.as_mut() else {
         return Ok(());
     };
-    while let Some(event) = runtime
-        .poll()
-        .map_err(|error| DurableRunnerError::invalid(format!("Codex provider failed: {error}")))?
-    {
+    loop {
+        let event = match runtime.poll() {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                let detail = error.to_string();
+                persist_provider_failure(state, store, &detail)?;
+                return Err(DurableRunnerError::invalid(format!(
+                    "Codex provider failed: {detail}"
+                )));
+            }
+        };
         match event {
             crate::codex_provider::CodexProviderEvent::ToolCall {
                 call_id,
                 operation_id,
                 input,
             } => {
+                state.last_activity_at_unix_ms = current_unix_ms()?;
                 let call = state
                     .provider_tool_bridge
                     .begin_call(call_id, operation_id, input)
@@ -601,11 +639,12 @@ fn poll_provider(
                             "callId": call.call_id, "input": call.input,
                         }
                     }),
-                    Some(&config.item_id),
+                    Some(&state.item_id.clone()),
                 )?;
                 store.save(state)?;
             }
             crate::codex_provider::CodexProviderEvent::Notification { method, params } => {
+                state.last_activity_at_unix_ms = current_unix_ms()?;
                 let event_type = if method == "turn/completed" {
                     "turn.completed"
                 } else {
@@ -624,28 +663,173 @@ fn poll_provider(
                     event_type,
                     priority,
                     json!({"method": method, "params": params}),
-                    Some(&config.item_id),
+                    Some(&state.item_id.clone()),
+                )?;
+                if method == "turn/completed" {
+                    state.active_turn = false;
+                    if state.lifecycle_mode == "warm" {
+                        state.lifecycle = "warm_idle".to_owned();
+                    } else {
+                        state.lifecycle = "suspending".to_owned();
+                        state.stop_after_flush = true;
+                        enqueue_event(
+                            state,
+                            config,
+                            "runner.suspending",
+                            0,
+                            json!({ "reason": "per_turn_complete", "resumable": true }),
+                            None,
+                        )?;
+                    }
+                }
+                store.save(state)?;
+            }
+            crate::codex_provider::CodexProviderEvent::SemanticResult {
+                result,
+                item_id,
+            } => {
+                state.last_activity_at_unix_ms = current_unix_ms()?;
+                enqueue_event(
+                    state,
+                    config,
+                    "run.result.proposed",
+                    0,
+                    result,
+                    item_id.as_deref(),
                 )?;
                 store.save(state)?;
             }
             crate::codex_provider::CodexProviderEvent::Exited => {
-                state.recoverable_failure = Some("provider_exited".to_owned());
-                state.lifecycle = "recoverable_failure".to_owned();
-                store.save(state)?;
-                return Err(DurableRunnerError::invalid("Codex provider exited"));
+                persist_provider_failure(state, store, "Codex provider exited unexpectedly")?;
+                return Err(DurableRunnerError::invalid(
+                    "native_runner_process_exited: Codex provider exited unexpectedly",
+                ));
             }
         }
     }
     Ok(())
 }
 
+fn should_suspend_for_idle(state: &DurableRunnerState) -> Result<bool, DurableRunnerError> {
+    should_suspend_for_idle_at(state, current_unix_ms()?)
+}
+
+fn should_suspend_for_idle_at(state: &DurableRunnerState, now_unix_ms: u64) -> Result<bool, DurableRunnerError> {
+    if state.lifecycle_mode != "warm"
+        || state.stop_after_flush
+        || !matches!(state.lifecycle.as_str(), "warm_idle" | "waiting_input")
+    {
+        return Ok(false);
+    }
+    let Some(timeout_ms) = state.idle_timeout_ms else {
+        return Ok(false);
+    };
+    Ok(now_unix_ms.saturating_sub(state.last_activity_at_unix_ms) >= timeout_ms)
+}
+
+fn begin_automatic_suspend(
+    state: &mut DurableRunnerState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    provider: &mut Option<Box<dyn crate::codex_provider::Provider>>,
+    reason: &str,
+) -> Result<(), DurableRunnerError> {
+    if state.stop_after_flush {
+        return Ok(());
+    }
+    if let Some(mut runtime) = provider.take() {
+        runtime.shutdown().map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to checkpoint provider for suspension: {error}"))
+        })?;
+    }
+    state.lifecycle = "suspending".to_owned();
+    state.stop_after_flush = true;
+    enqueue_event(
+        state,
+        config,
+        "runner.suspending",
+        0,
+        json!({ "reason": reason, "afterDurableFlush": true, "resumable": true }),
+        None,
+    )?;
+    enqueue_event(
+        state,
+        config,
+        "runner.suspended",
+        0,
+        json!({ "reason": reason, "resumable": true }),
+        None,
+    )?;
+    store.save(state)
+}
+
+fn provider_failure_code(detail: &str) -> &'static str {
+    if detail.contains("stdout frame exceeded") || detail.contains("provider_frame_too_large") {
+        "provider_frame_too_large"
+    } else {
+        "provider_transport_failed"
+    }
+}
+
+fn persist_provider_failure(
+    state: &mut DurableRunnerState,
+    store: &DurableStateStore,
+    detail: &str,
+) -> Result<(), DurableRunnerError> {
+    let code = provider_failure_code(detail);
+    state.recoverable_failure = Some(code.to_owned());
+    state.lifecycle = "recoverable_failure".to_owned();
+    state.record_diagnostic(format!("{code}: {detail}"));
+    store.save(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_provider::{CodexProviderEvent, Provider, ProviderKind};
+    use crate::local_runner::LocalRunnerError;
+    use crate::provider_bridge::ToolResult;
     use std::net::TcpListener;
     use std::sync::{mpsc, Mutex};
 
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct OversizedFrameProvider;
+
+    impl Provider for OversizedFrameProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+        fn process_id(&self) -> u32 {
+            1
+        }
+        fn session_identity(&self) -> &str {
+            "test-thread"
+        }
+        fn provider_session_id(&self) -> Option<&str> {
+            Some("test-session")
+        }
+        fn start_turn(&mut self, _message: &str, _cwd: &str) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn read(&mut self) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+            Err(LocalRunnerError::invalid(
+                "harness stdout frame exceeded 4194304 bytes",
+            ))
+        }
+        fn deliver_tool_result(&mut self, _result: &ToolResult) -> Result<(), LocalRunnerError> {
+            unreachable!()
+        }
+        fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn usage_counts_remain_observable_while_credential_tokens_are_redacted() {
@@ -655,6 +839,81 @@ mod tests {
         }));
         assert_eq!(sanitized.pointer("/tokenUsage/total/inputTokens"), Some(&json!(12)));
         assert_eq!(sanitized.pointer("/accessToken"), Some(&json!("[REDACTED]")));
+    }
+
+    #[test]
+    fn durable_events_strip_binary_payloads_but_preserve_artifact_metadata() {
+        let sanitized = crate::durable::sanitize_value(&json!({
+            "item": {
+                "id": "image-1",
+                "artifactPath": "/tmp/frog.png",
+                "imageUrl": format!("data:image/png;base64,{}", "A".repeat(1_200_000)),
+            }
+        }));
+        assert_eq!(sanitized.pointer("/item/id"), Some(&json!("image-1")));
+        assert_eq!(sanitized.pointer("/item/artifactPath"), Some(&json!("/tmp/frog.png")));
+        assert_eq!(
+            sanitized.pointer("/item/imageUrl").and_then(Value::as_str),
+            Some("[OMITTED data URL: 1200022 bytes]")
+        );
+        assert!(serde_json::to_vec(&sanitized).unwrap().len() < 1_024);
+    }
+
+    #[test]
+    fn provider_failure_codes_are_stable() {
+        assert_eq!(provider_failure_code("harness stdout frame exceeded 4194304 bytes"), "provider_frame_too_large");
+        assert_eq!(provider_failure_code("invalid JSON-RPC"), "provider_transport_failed");
+    }
+
+    #[test]
+    fn warm_idle_clock_expires_only_safe_inactive_states() {
+        let root = temporary_root("warm-idle-clock");
+        let mut runner_config = config(&root);
+        runner_config.lifecycle_mode = "warm".to_owned();
+        runner_config.idle_timeout = Some(Duration::from_millis(300_000));
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        state.lifecycle_mode = "warm".to_owned();
+        state.idle_timeout_ms = Some(300_000);
+        state.last_activity_at_unix_ms = 1_000_000;
+
+        for lifecycle in ["warm_idle", "waiting_input"] {
+            state.lifecycle = lifecycle.to_owned();
+            assert!(!should_suspend_for_idle_at(&state, 1_299_999).unwrap());
+            assert!(should_suspend_for_idle_at(&state, 1_300_000).unwrap());
+        }
+        for lifecycle in ["active", "ready", "suspending", "suspended"] {
+            state.lifecycle = lifecycle.to_owned();
+            assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
+        }
+        state.lifecycle = "warm_idle".to_owned();
+        state.stop_after_flush = true;
+        assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_provider_frame_persists_a_recoverable_failure() {
+        let root = temporary_root("oversized-provider-frame");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        let mut provider: Option<Box<dyn Provider>> = Some(Box::new(OversizedFrameProvider));
+
+        let error = poll_provider(&mut provider, &mut state, &store, &runner_config).unwrap_err();
+        assert!(error.to_string().contains("stdout frame exceeded 4194304 bytes"));
+        let (restored, recovered) = store.load_or_create(&runner_config).unwrap();
+        assert!(recovered);
+        assert_eq!(restored.lifecycle, "recoverable_failure");
+        assert_eq!(
+            restored.recoverable_failure.as_deref(),
+            Some("provider_frame_too_large")
+        );
+        assert!(restored
+            .diagnostics
+            .iter()
+            .any(|entry| entry.contains("provider_frame_too_large")));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn config(root: &Path) -> DurableRunnerConfig {
@@ -676,7 +935,30 @@ mod tests {
             max_frame_bytes: 1024 * 1024,
             reconnect_delay: Duration::from_millis(1),
             max_runtime: Duration::from_millis(10),
+            lifecycle_mode: "per_turn".to_owned(),
+            idle_timeout: None,
         }
+    }
+
+    #[test]
+    fn legacy_codex_provider_fields_deserialize_as_codex() {
+        let root = temporary_root("legacy-provider-state");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (state, _) = store.load_or_create(&runner_config).unwrap();
+        let mut value = serde_json::to_value(state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("providerConfig");
+        object.remove("providerSessionId");
+        object.insert("codexProviderConfig".to_owned(), json!({
+            "command": "codex", "args": ["app-server"], "cwd": "/tmp",
+            "model": null, "instructions": "legacy"
+        }));
+        object.insert("codexProviderThreadId".to_owned(), json!("thread-legacy"));
+        let restored: DurableRunnerState = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.provider_config.unwrap().kind, crate::codex_provider::ProviderKind::Codex);
+        assert_eq!(restored.provider_session_id.as_deref(), Some("thread-legacy"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temporary_root(name: &str) -> PathBuf {

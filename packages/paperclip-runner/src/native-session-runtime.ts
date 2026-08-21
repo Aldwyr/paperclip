@@ -4,6 +4,7 @@ import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeExecutionInputV1, NativeSessionExecutionResult } from "./contracts/native-execution.js";
 import { buildNativeModelEnvelope, parseNativeExecutionInput } from "./contracts/native-execution.js";
 import type { NativeSession, NativeSessionBackend } from "./contracts/native-session-backend.js";
+import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
 import type { PrpEvent, PrpTerminalState } from "./protocol/replay-contract.js";
 
 export interface ExecuteNativeSessionOptions {
@@ -14,6 +15,10 @@ export interface ExecuteNativeSessionOptions {
   controlPlaneInstanceId: string;
   timeoutMs?: number;
   onSession?: (session: NativeSession | null) => void;
+  existingSession?: NativeSession;
+  persistedSession?: PersistedNativeSession | null;
+  keepSessionOpen?: boolean;
+  onCheckpoint?: (snapshot: PersistedNativeSession) => Promise<void> | void;
 }
 
 function isTurnTerminal(event: PrpEvent): boolean {
@@ -62,7 +67,9 @@ async function consumeTurn(session: NativeSession, controlPlane: ControlPlanePor
 export async function executeNativeSession(options: ExecuteNativeSessionOptions): Promise<NativeSessionExecutionResult> {
   const input = parseNativeExecutionInput(options.input);
   const descriptor = await options.backend.descriptor();
-  const persistedSession = await options.controlPlane.loadSessionCheckpoint?.() ?? null;
+  const persistedSession = options.existingSession
+    ? null
+    : options.persistedSession ?? await options.controlPlane.loadSessionCheckpoint?.() ?? null;
   const normalizedSessionId = persistedSession?.identity.sessionId
     ?? input.session.normalizedSessionId
     ?? randomUUID();
@@ -97,7 +104,14 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
   ) throw new Error("native_session_checkpoint_binding_mismatch");
   let recovered = false;
   let session: NativeSession;
-  if (persistedSession) {
+  if (options.existingSession) {
+    if (options.existingSession.attachRun === undefined) {
+      throw new Error("native_session_multi_run_unavailable");
+    }
+    await options.existingSession.attachRun({ identity });
+    session = options.existingSession;
+    recovered = true;
+  } else if (persistedSession) {
     if (!options.backend.recoverSession) {
       throw new Error("native_session_recovery_unavailable: refusing to open a second provider session");
     }
@@ -116,12 +130,13 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
   options.onSession?.(session);
   try {
     const checkpoint = async () => {
-      if (options.controlPlane.checkpointSession) {
-        await options.controlPlane.checkpointSession(await session.snapshot());
-      }
+      const snapshot = await session.snapshot();
+      await options.controlPlane.checkpointSession?.(snapshot);
+      await options.onCheckpoint?.(snapshot);
     };
     const recoveredSnapshot = await session.snapshot();
     await options.controlPlane.checkpointSession?.(recoveredSnapshot);
+    await options.onCheckpoint?.(recoveredSnapshot);
 
     let consumed = { event: null as PrpEvent | null, eventCount: 0, highestContiguousSourceSeq: 0 };
     const completionSnapshot = recoveredSnapshot.semanticResult && recoveredSnapshot.terminal
@@ -225,6 +240,12 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
       semanticResult: completed.result,
       terminal,
     });
+    await options.onCheckpoint?.({
+      ...snapshot,
+      semanticResult: completed.result,
+      terminal,
+    });
+    const usage = await session.usage?.() ?? null;
     return {
       result: completed.result,
       terminal,
@@ -232,14 +253,16 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
       normalizedSessionId,
       providerSessionId: snapshot.providerSessionId ?? null,
       driverKind: descriptor.name,
-      driverVersion: descriptor.version,
+      driverVersion: typeof usage?.driverVersion === "string" ? usage.driverVersion : descriptor.version,
       nativeEventCount: consumed.eventCount,
       highestContiguousSourceSeq: consumed.highestContiguousSourceSeq,
-      usage: null,
+      usage,
     };
   } finally {
-    options.onSession?.(null);
-    await session.close({ reason: "native session execution complete" });
+    if (!options.keepSessionOpen) {
+      options.onSession?.(null);
+      await session.close({ reason: "native session execution complete" });
+    }
   }
 }
 

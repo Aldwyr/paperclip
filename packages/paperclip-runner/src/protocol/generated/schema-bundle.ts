@@ -227,6 +227,7 @@ export const commandSchema = {
     "type": {
       "enum": [
         "run.prepare",
+        "run.attach",
         "session.open",
         "turn.start",
         "turn.steer",
@@ -239,6 +240,7 @@ export const commandSchema = {
         "session.close",
         "run.cancel",
         "runner.drain",
+        "runner.suspend",
         "runner.shutdown"
       ]
     },
@@ -286,6 +288,245 @@ export const commandSchema = {
     }
   },
   "additionalProperties": true
+} as const;
+
+export const workspaceDiffSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/workspace-diff.schema.json",
+  "title": "Paperclip workspace diff",
+  "type": "object",
+  "required": [
+    "schema",
+    "changeSetId",
+    "revision",
+    "source",
+    "complete",
+    "files",
+    "totals",
+    "patchArtifactRef"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.workspace.diff.v1"
+    },
+    "changeSetId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source": {
+      "enum": [
+        "harness_reported",
+        "runner_verified"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "files": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "operation",
+          "previousPath",
+          "additions",
+          "deletions",
+          "binary",
+          "diff"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "operation": {
+            "enum": [
+              "create",
+              "modify",
+              "delete",
+              "rename",
+              "mode_change"
+            ]
+          },
+          "previousPath": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+              }
+            ]
+          },
+          "additions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "deletions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "binary": {
+            "type": "boolean"
+          },
+          "diff": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 262144
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "totals": {
+      "type": "object",
+      "required": [
+        "files",
+        "additions",
+        "deletions"
+      ],
+      "properties": {
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "additions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "deletions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "patchArtifactRef": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048
+    }
+  },
+  "additionalProperties": false
+} as const;
+
+export const workspaceFileReferenceSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/workspace-file-reference.schema.json",
+  "title": "Paperclip workspace file reference",
+  "type": "object",
+  "required": [
+    "schema",
+    "referenceId",
+    "source",
+    "path",
+    "displayName",
+    "mediaType",
+    "presentation",
+    "line",
+    "preview",
+    "previewTruncated",
+    "contentDigest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.workspace.file_reference.v1"
+    },
+    "referenceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "source": {
+      "enum": [
+        "harness_reported",
+        "runner_verified"
+      ]
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "mediaType": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 160
+    },
+    "presentation": {
+      "enum": [
+        "document",
+        "code",
+        "image",
+        "generic"
+      ]
+    },
+    "line": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "preview": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 262144
+    },
+    "previewTruncated": {
+      "type": "boolean"
+    },
+    "contentDigest": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false
 } as const;
 
 export const semanticToolSchema = {
@@ -1171,12 +1412,19 @@ export const eventSchema = {
       "enum": [
         "runner.connected",
         "runner.reconnected",
+        "runner.reconciled",
         "runner.disconnected",
         "runner.draining",
+        "runner.suspending",
+        "runner.suspended",
+        "runner.stopped",
         "runner.diagnostic",
         "runtime.phase.changed",
         "sandbox.metric",
         "workspace.ready",
+        "workspace.change.updated",
+        "workspace.diff.recorded",
+        "workspace.file.referenced",
         "harness.starting",
         "harness.ready",
         "harness.exited",
@@ -1220,6 +1468,8 @@ export const eventSchema = {
         "interaction.response.progressed",
         "interaction.response.resolved",
         "interaction.response.delivered",
+        "run.attached",
+        "run.detached",
         "run.result.proposed",
         "run.result.accepted",
         "run.result.rejected",
@@ -1256,6 +1506,23 @@ export const eventSchema = {
     },
     "payload": {
       "type": "object",
+      "properties": {
+        "channel": {
+          "enum": [
+            "progress",
+            "final",
+            "summary",
+            "detail",
+            "unknown"
+          ]
+        },
+        "providerPhase": {
+          "type": "string"
+        },
+        "providerMethod": {
+          "type": "string"
+        }
+      },
       "additionalProperties": true
     },
     "debug": {
@@ -1264,6 +1531,69 @@ export const eventSchema = {
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "workspace.file.referenced"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/workspace-file-reference.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "workspace.change.updated",
+              "workspace.diff.recorded"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/workspace-diff.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "workspace.diff.recorded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "allOf": [
+              {
+                "$ref": "https://paperclip.dev/schemas/prp/v1/workspace-diff.schema.json"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "complete": {
+                    "const": true
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -1441,6 +1771,8 @@ export const prpSchemaBundle = {
   "identity": identitySchema,
   "capabilities": capabilitiesSchema,
   "command": commandSchema,
+  "workspace-diff": workspaceDiffSchema,
+  "workspace-file-reference": workspaceFileReferenceSchema,
   "semantic-tool": semanticToolSchema,
   "stop-reason": stopReasonSchema,
   "terminal": terminalSchema,

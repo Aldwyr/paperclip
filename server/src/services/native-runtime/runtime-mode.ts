@@ -17,7 +17,7 @@ export type NativeRuntimeResolution =
       kind: "native";
       resolverVersion: typeof NATIVE_RUNTIME_RESOLVER_VERSION;
       reason: "eligible_opt_in";
-      profile: { mode: "native"; backend: "codex_app_server"; protocolVersion: 1 };
+      profile: { mode: "native"; backend: "codex_app_server" | "opencode_server"; protocolVersion: 1 };
       authorityDecision: NativeStatusDecision;
     };
 
@@ -47,8 +47,14 @@ export function resolveNativeRuntimeMode(input: {
   const nativeRunner = record(record(input.runtimeConfig).nativeRunner);
   const runnerAdapterSelected = input.agent.adapterType === "paperclip_runner";
   const runnerProvider = record(input.adapterConfig).provider ?? "codex";
-  if (runnerAdapterSelected && runnerProvider !== "codex") {
-    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex");
+  if (runnerAdapterSelected && runnerProvider !== "codex" && runnerProvider !== "opencode") {
+    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex or opencode");
+  }
+  if (runnerAdapterSelected && runnerProvider === "opencode") {
+    const model = record(input.adapterConfig).model;
+    if (typeof model !== "string" || !model.includes("/") || model.trim().endsWith("/")) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner OpenCode provider requires model in provider/model form");
+    }
   }
   const mode = runnerAdapterSelected ? "native" : nativeRunner.mode;
   if (!runnerAdapterSelected && !input.enabled) {
@@ -101,7 +107,11 @@ export function resolveNativeRuntimeMode(input: {
     kind: "native",
     resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
     reason: "eligible_opt_in",
-    profile: { mode: "native", backend: "codex_app_server", protocolVersion: 1 },
+    profile: {
+      mode: "native",
+      backend: runnerProvider === "opencode" ? "opencode_server" : "codex_app_server",
+      protocolVersion: 1,
+    },
     authorityDecision: rollout,
   };
 }
@@ -116,6 +126,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
     runtimeMode: string | null;
     runtimeModeReason: string | null;
     runtimeModeResolvedAt: Date | null;
+    driverKind?: string | null;
   };
   enabled: boolean;
   runtimeConfig: unknown;
@@ -131,7 +142,11 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
         kind: "native",
         resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
         reason: "eligible_opt_in",
-        profile: { mode: "native", backend: "codex_app_server", protocolVersion: 1 },
+        profile: {
+          mode: "native",
+          backend: input.persisted.driverKind === "opencode_server" ? "opencode_server" : "codex_app_server",
+          protocolVersion: 1,
+        },
         authorityDecision: resolveNativeMigrationStatus({
           facts: input.enabled
             ? { applicationEnabled: true }

@@ -49,6 +49,7 @@ export interface NativeSessionRecoveryResult {
 export interface NativeSession {
   identity(): NativeRunIdentity;
   capabilities(): Promise<NativeSessionCapabilities>;
+  attachRun?(input: { identity: NativeRunIdentity }): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;
   startTurn(input: { message: NativeUserMessage }): Promise<{ turnId: string }>;
   steer?(input: { turnId: string; message: NativeUserMessage }): Promise<void>;
@@ -59,6 +60,7 @@ export interface NativeSession {
     terminal: PrpTerminalState;
     turnId: string | null;
   } | null>;
+  usage?(): Promise<Record<string, unknown> | null>;
   snapshot(): Promise<PersistedNativeSession>;
   close(input: { reason: string }): Promise<void>;
 }

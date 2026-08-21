@@ -519,8 +519,8 @@ export interface ServerAdapterModule {
 // ---------------------------------------------------------------------------
 
 export type TranscriptEntry =
-  | { kind: "assistant"; ts: string; text: string; delta?: boolean }
-  | { kind: "thinking"; ts: string; text: string; delta?: boolean }
+  | { kind: "assistant"; ts: string; text: string; delta?: boolean; channel?: "progress" | "final" | "unknown" }
+  | { kind: "thinking"; ts: string; text: string; delta?: boolean; channel?: "summary" | "detail" | "unknown" }
   | { kind: "user"; ts: string; text: string }
   | { kind: "tool_call"; ts: string; name: string; input: unknown; toolUseId?: string; invocationId?: string; actionRequestId?: string }
   | { kind: "tool_result"; ts: string; toolUseId: string; toolName?: string; content: string; isError: boolean; delta?: boolean }
@@ -548,6 +548,9 @@ export interface CLIAdapterModule {
 
 export interface CreateConfigValues {
   adapterType: string;
+  paperclipRunnerProvider?: "codex" | "opencode";
+  paperclipRunnerLifecycleMode?: "per_turn" | "warm";
+  paperclipRunnerIdleTimeoutMs?: number;
   cwd: string;
   instructionsFilePath?: string;
   promptTemplate: string;

@@ -20,6 +20,11 @@ export interface CodexAppServerTransport {
   setServerRequestHandler(handler: CodexServerRequestHandler): void;
   close(): Promise<void>;
   processInfo?(): CodexTransportProcessInfo;
+  attachRun?(input: {
+    runId: string;
+    turnId: string;
+    itemId: string;
+  }): Promise<void>;
 }
 
 export interface CodexTransportProcessInfo {
@@ -193,7 +198,7 @@ export function redactCodexDiagnostic(message: string): string {
     .replace(/([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi, "$1[REDACTED]")
     .replace(/(["'](?:api[_-]?key|token|secret|password|authorization)["']\s*:\s*["'])[^"']+/gi, "$1[REDACTED]")
     .replace(/(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+/gi, "$1=[REDACTED]")
-    .replace(/(PAPERCLIP_API_KEY|OPENAI_API_KEY)=[^\s]+/g, "$1=[REDACTED]");
+    .replace(/(PAPERCLIP_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY)=[^\s]+/g, "$1=[REDACTED]");
 }
 
 function proxyContainsCredentials(value: string): boolean {

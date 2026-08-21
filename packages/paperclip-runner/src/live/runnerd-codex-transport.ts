@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import type {
 } from "../drivers/codex/app-server-transport.js";
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
+import type { DurableRecoveryIdentity } from "../contracts/durable-recovery.js";
 import {
   DurablePrpControlPlane,
   durableRecoveryInternals,
@@ -25,6 +26,22 @@ const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
+
+function recoveredControlPlaneIdentity(
+  directory: string,
+  desired: DurableRecoveryIdentity,
+): DurableRecoveryIdentity {
+  const stored = record(JSON.parse(readFileSync(resolve(directory, "mock-core-state.json"), "utf8")));
+  const identity = record(stored.identity) as unknown as DurableRecoveryIdentity;
+  if (
+    identity.runnerInstanceId !== desired.runnerInstanceId
+    || identity.environmentLeaseId !== desired.environmentLeaseId
+    || identity.normalizedSessionId !== desired.normalizedSessionId
+  ) {
+    throw new Error("PRP recovery identity does not match the durable session binding");
+  }
+  return structuredClone(identity);
+}
 
 export interface CapabilityRunnerdProcessEvidence {
   runnerPid: number | null;
@@ -50,6 +67,11 @@ export interface CapabilityRunnerdCodexTransportOptions {
   onDiagnostic?: (message: string) => void;
   onEvidence?: (evidence: Readonly<CapabilityRunnerdProcessEvidence>) => void;
   stateDirectory?: string;
+  lifecyclePolicy?:
+    | { mode: "per_turn"; idleTimeoutMs: null }
+    | { mode: "warm"; idleTimeoutMs: number };
+  /** Current run's authority catalog, used when a suspended session is rebound. */
+  resumeDynamicTools?: readonly Readonly<Record<string, unknown>>[];
   prpIdentity?: {
     runnerInstanceId: string;
     environmentLeaseId: string;
@@ -93,16 +115,20 @@ export function unwrapRunnerdProviderNotification(input: unknown): Record<string
 
 class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
   #values: Array<{ value: CodexRpcNotification; bytes: number }> = [];
-  #waiters: Array<(value: IteratorResult<CodexRpcNotification>) => void> = [];
+  #waiters: Array<{
+    resolve: (value: IteratorResult<CodexRpcNotification>) => void;
+    reject: (error: Error) => void;
+  }> = [];
   #bytes = 0;
   #closed = false;
+  #error: Error | null = null;
 
   push(value: CodexRpcNotification): void {
     if (this.#closed) return;
     const bytes = Buffer.byteLength(JSON.stringify(value));
     const waiter = this.#waiters.shift();
     if (waiter !== undefined) {
-      waiter({ value, done: false });
+      waiter.resolve({ value, done: false });
       return;
     }
     if (this.#values.length >= MAX_NOTIFICATION_COUNT || this.#bytes + bytes > MAX_NOTIFICATION_BYTES) {
@@ -112,12 +138,16 @@ class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
     this.#bytes += bytes;
   }
 
-  close(): void {
+  close(error?: Error): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#error = error ?? null;
     this.#values = [];
     this.#bytes = 0;
-    for (const waiter of this.#waiters.splice(0)) waiter({ value: undefined, done: true });
+    for (const waiter of this.#waiters.splice(0)) {
+      if (this.#error !== null) waiter.reject(this.#error);
+      else waiter.resolve({ value: undefined, done: true });
+    }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<CodexRpcNotification> {
@@ -128,8 +158,9 @@ class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
           this.#bytes -= queued.bytes;
           return { value: queued.value, done: false };
         }
+        if (this.#error !== null) throw this.#error;
         if (this.#closed) return { value: undefined, done: true };
-        return new Promise((resolveValue) => this.#waiters.push(resolveValue));
+        return new Promise((resolveValue, reject) => this.#waiters.push({ resolve: resolveValue, reject }));
       },
     };
   }
@@ -143,6 +174,22 @@ function record(value: unknown): Record<string, unknown> {
 
 function commandDigest(value: unknown): string {
   return `sha256:${createHash("sha256").update(durableRecoveryInternals.canonicalJson(value)).digest("hex")}`;
+}
+
+function authorizedToolSet(tools: readonly Readonly<Record<string, unknown>>[]): Record<string, unknown> {
+  const operations = tools.map((tool) => ({
+    operationId: String(tool.name ?? ""),
+    version: 1,
+    description: String(tool.description ?? ""),
+    inputSchema: record(tool.inputSchema),
+    responseSchema: {},
+  }));
+  return {
+    schema: "paperclip.runner.authorized-tools.v1",
+    schemaVersion: 1,
+    catalogDigest: commandDigest(operations),
+    operations,
+  };
 }
 
 function unwrapToolResponse(response: Record<string, unknown>): unknown {
@@ -173,12 +220,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #threadId = "";
   #sessionId: string | null = null;
   #turnId = "";
+  #authorizedTools: Record<string, unknown> | null = null;
   #closed = false;
+  #failure: Error | null = null;
   #controlPlaneRelease: (() => Promise<void> | void) | null = null;
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
     this.#ownsRoot = options.stateDirectory === undefined;
     this.#root = options.stateDirectory ?? mkdtempSync(resolve(tmpdir(), "paperclip-runner-lab-prp-"));
+    if (options.resumeDynamicTools !== undefined) {
+      this.#authorizedTools = authorizedToolSet(options.resumeDynamicTools);
+    }
     mkdirSync(this.#root, { recursive: true, mode: 0o700 });
     this.#evidence = {
       runnerPid: null,
@@ -198,6 +250,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   async request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (this.#closed) throw new Error("PRP Codex transport is closed");
+    this.#throwIfFailed();
     if (method === "initialize") return { user: {} };
     if (method === "thread/start") return this.#start(params);
     if (method === "turn/start") return this.#startTurn(params);
@@ -232,6 +285,34 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       exitCode: this.#evidence.runnerExitCode,
       signal: this.#evidence.runnerSignal,
     };
+  }
+
+  async attachRun(input: { runId: string; turnId: string; itemId: string }): Promise<void> {
+    if (this.#closed || this.#core === null) throw new Error("PRP provider session is not attachable");
+    await this.#command("run.attach", {
+      runId: input.runId,
+      turnId: input.turnId,
+      itemId: input.itemId,
+      ...(this.#authorizedTools === null ? {} : { authorizedTools: this.#authorizedTools }),
+    });
+    const core = this.#core;
+    const attachDeadline = Date.now() + 10_000;
+    let attachmentDrained = false;
+    while (core !== null && Date.now() < attachDeadline) {
+      const durable = record(JSON.parse(readFileSync(resolve(this.#root, "runner", "runner-state.json"), "utf8")));
+      const attached = core.store.state.committedEvents.find((event) =>
+        event.eventType === "run.attached"
+        && record(record(event.envelope.payload).payload).runId === input.runId
+      );
+      if (attached && Number(durable.ackedSourceSeq ?? 0) >= attached.sourceSeq) {
+        attachmentDrained = true;
+        break;
+      }
+      this.#throwIfFailed();
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    if (!attachmentDrained) throw new Error("runnerd did not durably acknowledge the run attachment");
+    this.#turnId = input.turnId;
   }
 
   async close(): Promise<void> {
@@ -272,13 +353,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       itemId: `item_lab_${token}`,
     };
     const dynamicTools = Array.isArray(params.dynamicTools) ? params.dynamicTools.map(record) : [];
-    const operations = dynamicTools.map((tool) => ({
-      operationId: String(tool.name ?? ""),
-      version: 1,
-      description: String(tool.description ?? ""),
-      inputSchema: record(tool.inputSchema),
-      responseSchema: {},
-    }));
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
       identity,
@@ -300,13 +374,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const provider = this.options.provider ?? "codex";
     const opencodeProxyPath = this.options.opencodeProxyPath
       ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
+    this.#authorizedTools = authorizedToolSet(dynamicTools);
     core.queueCommand("run.prepare", {
-      authorizedTools: {
-        schema: "paperclip.runner.authorized-tools.v1",
-        schemaVersion: 1,
-        catalogDigest: commandDigest(operations),
-        operations,
-      },
+      authorizedTools: this.#authorizedTools,
       provider: {
         kind: provider,
         command: provider === "opencode" ? process.execPath : this.options.codexCommand ?? "codex",
@@ -330,9 +400,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       maxOutboxBytes: 256 * 1024,
       p0ReserveBytes: 64 * 1024,
       maxRuntimeMs: 60 * 60 * 1_000,
+      lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath: this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
       environment: provider === "opencode"
         ? {
+            ...process.env,
             ...this.options.environment,
             PAPERCLIP_OPENCODE_COMMAND: this.options.opencodeCommand ?? "opencode",
             PAPERCLIP_OPENCODE_RUNTIME_DIR: this.options.opencodeRuntimeDirectory ?? resolve(this.#root, "opencode"),
@@ -343,24 +415,36 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : this.options.environment,
     });
     this.#handle = handle;
+    this.#watchRunner(handle);
     this.#evidence.runnerPid = handle.child.pid ?? null;
     this.#evidence.runnerProcessGroupId = null;
     this.#publish();
-    this.#pump = setInterval(() => this.#pumpEvents(), 5);
+    this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     await this.#waitCommand("run.prepare");
     await this.#waitCommand("session.open");
     await this.#waitForProviderIdentity();
     this.#diagnostic("runnerd authenticated to the durable PRP control plane");
-    return { thread: { id: this.#threadId, sessionId: this.#sessionId, model: params.model, modelProvider: "openai" } };
+    return {
+      thread: {
+        id: this.#threadId,
+        sessionId: this.#sessionId,
+        model: params.model,
+        modelProvider: provider === "opencode" && typeof params.model === "string"
+          ? params.model.split("/", 1)[0]
+          : "openai",
+      },
+    };
   }
 
   async #resume(): Promise<void> {
-    const identity = this.options.prpIdentity;
-    if (identity === undefined || !existsSync(resolve(this.#root, "runner", "runner-state.json"))) {
+    const desiredIdentity = this.options.prpIdentity;
+    if (desiredIdentity === undefined || !existsSync(resolve(this.#root, "runner", "runner-state.json"))) {
       throw new Error("PRP provider resume state is unavailable");
     }
+    const controlPlaneDirectory = resolve(this.#root, "control-plane");
+    const identity = recoveredControlPlaneIdentity(controlPlaneDirectory, desiredIdentity);
     const core = new DurablePrpControlPlane({
-      stateDirectory: resolve(this.#root, "control-plane"),
+      stateDirectory: controlPlaneDirectory,
       identity,
       onSemanticToolInput: async (call) => unwrapToolResponse(await this.#handler({
         id: call.callId,
@@ -390,14 +474,39 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       maxOutboxBytes: 256 * 1024,
       p0ReserveBytes: 64 * 1024,
       maxRuntimeMs: 60 * 60 * 1_000,
+      lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath: this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
     });
     this.#handle = handle;
+    this.#watchRunner(handle);
     this.#evidence.runnerPid = handle.child.pid ?? null;
     this.#evidence.runnerProcessGroupId = null;
     this.#publish();
-    this.#pump = setInterval(() => this.#pumpEvents(), 5);
+    this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     await this.#waitForProviderIdentity();
+    if (
+      identity.runId !== desiredIdentity.runId
+      || identity.turnId !== desiredIdentity.turnId
+      || identity.itemId !== desiredIdentity.itemId
+    ) {
+      const priorEvidenceSeq = core.store.state.ackedSourceSeq;
+      const drainDeadline = Date.now() + 10_000;
+      while (Date.now() < drainDeadline) {
+        const durable = record(JSON.parse(readFileSync(resolve(this.#root, "runner", "runner-state.json"), "utf8")));
+        if (Number(durable.ackedSourceSeq ?? 0) >= priorEvidenceSeq) break;
+        this.#throwIfFailed();
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      const drained = record(JSON.parse(readFileSync(resolve(this.#root, "runner", "runner-state.json"), "utf8")));
+      if (Number(drained.ackedSourceSeq ?? 0) < priorEvidenceSeq) {
+        throw new Error("runnerd did not drain prior-run evidence before attachment");
+      }
+      await this.attachRun({
+        runId: desiredIdentity.runId,
+        turnId: desiredIdentity.turnId,
+        itemId: desiredIdentity.itemId,
+      });
+    }
     this.#diagnostic("runnerd restored its durable PRP session and provider thread");
   }
 
@@ -412,6 +521,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // do not expose the temporary transport identity to the strict driver.
     const deadline = Date.now() + 30_000;
     while (this.#turnId === pendingTurnId && Date.now() < deadline) {
+      this.#throwIfFailed();
       this.#pumpEvents();
       if (this.#turnId !== pendingTurnId) break;
       if (this.#handle?.child.exitCode !== null) throw new Error("runnerd exited before provider turn startup");
@@ -437,6 +547,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     await this.#waitCommand(type, commandId);
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
+      this.#throwIfFailed();
       const event = core.store.state.committedEvents.find((candidate) => {
         if (candidate.eventType !== "provider.rpc_result") return false;
         return record(record(candidate.envelope.payload).payload).commandId === commandId;
@@ -451,6 +562,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #waitForProviderIdentity(): Promise<void> {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
+      this.#throwIfFailed();
       this.#pumpEvents();
       if (this.#threadId.length > 0 && this.#evidence.codexPid !== null) return;
       if (this.#handle?.child.exitCode !== null) throw new Error("runnerd exited before provider startup");
@@ -462,6 +574,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #waitCommand(type: string, commandId?: string): Promise<void> {
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline) {
+      this.#throwIfFailed();
       const command = this.#core?.store.state.commands.find((candidate) =>
         commandId === undefined ? candidate.type === type : candidate.commandId === commandId
       );
@@ -505,6 +618,55 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#queue.push({ method, params });
       }
     }
+  }
+
+  #pumpEventsSafely(): void {
+    try {
+      this.#pumpEvents();
+    } catch (error) {
+      this.#failTransport(
+        new Error(`provider_transport_failed: ${error instanceof Error ? error.message : String(error)}`),
+      );
+    }
+  }
+
+  #watchRunner(handle: RunnerProcessHandle): void {
+    void handle.completion.then(
+      (result) => {
+        this.#evidence.runnerExited = true;
+        this.#evidence.runnerExitCode = result.code;
+        this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
+        const detail = result.stderr.trim() || result.stdout.trim();
+        if (detail) this.#diagnostic(detail.slice(-4_096));
+        this.#publish();
+        if (this.#closed || this.#handle !== handle) return;
+        const code = /provider_frame_too_large|stdout frame exceeded/i.test(detail)
+          ? "provider_frame_too_large"
+          : "native_runner_process_exited";
+        this.#failTransport(new Error(
+          `${code}: runnerd exited unexpectedly${result.code === null ? "" : ` with code ${result.code}`}${detail ? `: ${detail.slice(-1_000)}` : ""}`,
+        ));
+      },
+      (error) => {
+        if (this.#closed || this.#handle !== handle) return;
+        this.#failTransport(new Error(
+          `native_runner_process_exited: runnerd process failed: ${error instanceof Error ? error.message : String(error)}`,
+        ));
+      },
+    );
+  }
+
+  #failTransport(error: Error): void {
+    if (this.#failure !== null || this.#closed) return;
+    this.#failure = error;
+    if (this.#pump !== null) clearInterval(this.#pump);
+    this.#pump = null;
+    this.#diagnostic(error.message);
+    this.#queue.close(error);
+  }
+
+  #throwIfFailed(): void {
+    if (this.#failure !== null) throw this.#failure;
   }
 
   #diagnostic(message: string): void {

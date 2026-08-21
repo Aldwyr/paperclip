@@ -57,6 +57,7 @@ interface FakeProviderState {
   transports: FakeCapabilityCodexTransport[];
   turns: Map<string, string>;
   holdAfterTool: boolean;
+  onTurnStart?: () => Promise<void>;
 }
 
 class FakeCapabilityCodexTransport implements CodexAppServerTransport {
@@ -114,6 +115,7 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
       this.state.turns.set(turnId, "inProgress");
       const input = Array.isArray(params.input) ? params.input[0] as Record<string, unknown> : {};
       const message = String(input.text ?? "");
+      await this.state.onTurnStart?.();
       void this.#runTurn(turnId, message);
       return { turn: { id: turnId, status: "inProgress" } };
     }
@@ -213,6 +215,8 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
       });
       this.state.lastToolResult = String((result.contentItems as Array<Record<string, unknown>>)[0]?.text);
       assistantText = "I created a durable question and will use its typed result when resumed.";
+    } else if (message.includes("reference file")) {
+      assistantText = "Open [guide.md](guide.md) for the complete notes.";
     } else if (message.includes("long")) {
       return;
     } else {
@@ -288,6 +292,111 @@ function providerState(): FakeProviderState {
 }
 
 describe("Capability live runnerd and Codex session", () => {
+  it("turns an assistant local-file link into a verified dynamic-chat file card record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-live-file-reference-"));
+    await writeFile(join(root, "guide.md"), "# Dynamic guide\n\nVerified by the runner.\n");
+    const state = providerState();
+    const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(state) });
+    const session = await service.create({ workingDirectory: root });
+
+    const result = await session.sendMessage("reference file");
+    expect(result.snapshot.workspaceFileReferences).toHaveLength(1);
+    expect(result.snapshot.workspaceFileReferences?.[0]?.reference).toMatchObject({
+      schema: "paperclip.workspace.file_reference.v1",
+      source: "runner_verified",
+      path: "guide.md",
+      preview: "# Dynamic guide\n\nVerified by the runner.\n",
+    });
+    await service.shutdown(session.id);
+  });
+
+  it("records runner-verified file changes for a dynamic chat turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-live-workspace-"));
+    await writeFile(join(root, "existing.txt"), "before\n");
+    const state = providerState();
+    state.onTurnStart = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await writeFile(join(root, "existing.txt"), "after\n");
+      await writeFile(join(root, "created.ts"), "export const created = true;\n");
+    };
+    const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(state) });
+    const session = await service.create({ workingDirectory: root });
+
+    const result = await session.sendMessage("edit the workspace");
+    expect(result.snapshot.workspaceDiffs).toHaveLength(1);
+    expect(result.snapshot.workspaceDiffs?.[0]).toMatchObject({
+      turnId: "turn-1",
+      diff: {
+        schema: "paperclip.workspace.diff.v1",
+        source: "runner_verified",
+        complete: true,
+        totals: { files: 2 },
+      },
+    });
+    expect(result.snapshot.workspaceDiffs?.[0]?.diff.files.map((file) => file.path))
+      .toEqual(["created.ts", "existing.txt"]);
+    await service.shutdown(session.id);
+  });
+
+  it("suspends after every per-turn response and restores the same provider session", async () => {
+    const state = providerState();
+    const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(state) });
+    const session = await service.create({ lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } });
+
+    await session.sendMessage("first response");
+    expect(session.snapshot()).toMatchObject({ status: "suspended", providerThreadId: state.threadId });
+    expect(state.transports[0]?.processInfo().exited).toBe(true);
+
+    await session.sendMessage("restored response");
+    expect(state.transports).toHaveLength(2);
+    expect(session.snapshot()).toMatchObject({ status: "suspended", providerThreadId: state.threadId });
+    await service.shutdown(session.id);
+  });
+
+  it("keeps a warm runner through active work and suspends it only after idle expiry", async () => {
+    const state = providerState();
+    const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(state) });
+    const session = await service.create({ lifecyclePolicy: { mode: "warm", idleTimeoutMs: 25 } });
+
+    await session.sendMessage("warm response");
+    expect(session.snapshot().status).toBe("warm_idle");
+    expect(state.transports[0]?.processInfo().exited).toBe(false);
+    await vi.waitFor(() => expect(session.snapshot().status).toBe("suspended"), { timeout: 500 });
+    expect(state.transports[0]?.processInfo().exited).toBe(true);
+
+    const active = session.sendMessage("start a long turn");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(session.snapshot().status).toBe("running");
+    await session.interrupt("test cleanup");
+    await expect(active).resolves.toMatchObject({ status: "interrupted" });
+    await service.shutdown(session.id);
+  });
+
+  it("persists the selected provider and passes it to the live runner transport", async () => {
+    const state = providerState();
+    const providers: Array<string | undefined> = [];
+    const baseFactory = fakeTransportFactory(state);
+    const service = new CapabilityLiveSessionService({
+      transportFactory: (options) => {
+        providers.push(options.provider);
+        return baseFactory(options);
+      },
+    });
+    const session = await service.create({
+      provider: "opencode",
+      requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+
+    expect(providers).toEqual(["opencode"]);
+    expect(session.snapshot().config).toMatchObject({
+      provider: "opencode",
+      driver: "opencode_server",
+      providerVersion: "1.18.17",
+      requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    await service.shutdown(session.id);
+  });
+
   it("opens lazy sessions with core and discovery gateways instead of optional schemas", async () => {
     const state = providerState();
     const claim = "discovery:agents:read";
@@ -382,7 +491,7 @@ describe("Capability live runnerd and Codex session", () => {
     await firstService.shutdown(first.id);
   });
 
-  it("stops active work and reset rotates authority while restoring clean mock state", async () => {
+  it("stops active work and reset archives the prior authority while restoring clean mock state", async () => {
     const state = providerState();
     const store = new InMemoryCapabilityLiveSessionStore();
     const service = new CapabilityLiveSessionService({
@@ -392,6 +501,8 @@ describe("Capability live runnerd and Codex session", () => {
     const session = await service.create({
       runId: "run-live-reset",
       sessionId: "session-live-reset",
+      provider: "opencode",
+      requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
     });
     const longTurn = session.sendMessage("Start a long turn.");
     await new Promise((resolve) => setTimeout(resolve, 1));
@@ -404,13 +515,18 @@ describe("Capability live runnerd and Codex session", () => {
     expect(replacement.snapshot().authority.runId).not.toBe("run-live-reset");
     expect(replacement.mockState().comments).toHaveLength(0);
     expect(replacement.snapshot().authority.active).toBe(true);
-    expect(session.snapshot().authority.active).toBe(false);
-    expect((await store.load(session.id))).toBeNull();
+    expect(replacement.snapshot().config).toMatchObject({
+      provider: "opencode",
+      driver: "opencode_server",
+      requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
+    expect(session.snapshot().authority.active).toBe(true);
+    expect((await store.load(session.id))?.status).toBe("suspended");
     expect(state.transports[0]?.processInfo().exited).toBe(true);
     const stopped = await service.stop(replacement.id, "bounded test stop");
-    expect(stopped.authority.active).toBe(false);
+    expect(stopped.authority.active).toBe(true);
     expect(stopped.process?.runnerExited).toBe(true);
-    expect((await store.load(replacement.id))?.status).toBe("closed");
+    expect((await store.load(replacement.id))?.status).toBe("suspended");
   });
 
   it("durably resumes a distinct attempt, preserves partial usage, and deduplicates the semantic effect", async () => {

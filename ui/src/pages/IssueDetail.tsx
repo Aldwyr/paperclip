@@ -1143,7 +1143,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   const { data: liveRuns } = useQuery({
     queryKey: queryKeys.issues.liveRuns(issueId),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueId),
-    refetchInterval: 3000,
+    refetchInterval: 1000,
     placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueId),
   });
   const resolvedLiveRuns = liveRuns ?? [];
@@ -1152,7 +1152,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queryKey: queryKeys.issues.activeRun(issueId),
     queryFn: () => heartbeatsApi.activeRunForIssue(issueId),
     enabled: !!executionRunId || issueStatus === "in_progress",
-    refetchInterval: liveRunCount > 0 ? false : 3000,
+    refetchInterval: liveRunCount > 0 ? false : 1000,
     placeholderData: keepPreviousDataForSameQueryTail<ActiveRunForIssue | null>(issueId),
   });
   const resolvedActiveRun = useMemo(
@@ -1163,7 +1163,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   const { data: linkedRuns } = useQuery({
     queryKey: queryKeys.issues.runs(issueId),
     queryFn: () => activityApi.runsForIssue(issueId),
-    refetchInterval: hasLiveRuns ? 5000 : false,
+    refetchInterval: hasLiveRuns || issueStatus === "in_progress" ? 1000 : false,
     placeholderData: keepPreviousDataForSameQueryTail<RunForIssue[]>(issueId),
   });
   const resolvedActivity = activity ?? [];
@@ -2738,8 +2738,12 @@ export function IssueDetail() {
     mutationFn: ({ body, reopen, interrupt }: { body: string; reopen?: boolean; interrupt?: boolean }) =>
       issuesApi.addComment(issueId!, body, reopen, interrupt),
     onMutate: async ({ body, reopen, interrupt }) => {
-      await queryClient.cancelQueries({ queryKey: queryKeys.issues.comments(issueId!) });
-      await queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
+      // Start cache cancellation immediately but do not put it in front of the
+      // optimistic echo. The new-runner startup placeholder must paint in the
+      // same frame as send, even when an in-flight comments query is slow to
+      // cancel.
+      const cancelComments = queryClient.cancelQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+      const cancelIssue = queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
 
       const previousIssue = queryClient.getQueryData<Issue>(queryKeys.issues.detail(issueId!));
       const queuedComment = !interrupt
@@ -2765,6 +2769,8 @@ export function IssueDetail() {
           applyOptimisticIssueCommentUpdate(previousIssue, { reopen }),
         );
       }
+
+      await Promise.all([cancelComments, cancelIssue]);
 
       return {
         optimisticCommentId: optimisticComment?.clientId ?? null,

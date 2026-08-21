@@ -407,6 +407,24 @@ describe("settledRunChildren (PAP-361)", () => {
   });
 });
 
+describe("paperclip runner semantic channels", () => {
+  it("keeps progress/final messages and reasoning summary/detail in distinct items", () => {
+    const parsed = transcriptToTaskChatItems([
+      { kind: "assistant", ts: TS, text: "Checking.", channel: "progress", delta: true },
+      { kind: "thinking", ts: TS, text: "Summary", channel: "summary", delta: true },
+      { kind: "thinking", ts: TS, text: "Detail", channel: "detail", delta: true },
+      { kind: "assistant", ts: TS, text: "Done.", channel: "final", delta: true },
+    ], { runId: "run-channels", running: true });
+    expect(parsed.map((item) => item.kind)).toEqual(["message", "thinking", "thinking", "message"]);
+    expect(parsed[0]).toMatchObject({ interstitial: true, channel: "progress" });
+    expect(parsed[1]).toMatchObject({ channel: "summary" });
+    expect(parsed[2]).toMatchObject({ channel: "detail" });
+    expect(parsed[3]).toMatchObject({ interstitial: false, channel: "final" });
+    const history = settledRunChildren(parsed);
+    expect(JSON.stringify(history)).not.toContain("Done.");
+  });
+});
+
 describe("buildMergedTurnSummary (PAP-362)", () => {
   const runA: TranscriptEntry[] = [
     { kind: "tool_call", ts: "2026-07-31T12:00:00.000Z", name: "Read", toolUseId: "a-1" } as TranscriptEntry,

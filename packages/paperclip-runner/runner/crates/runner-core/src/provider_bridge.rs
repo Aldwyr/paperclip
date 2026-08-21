@@ -72,6 +72,35 @@ impl Error for ProviderBridgeError {}
 
 impl ProviderToolBridge {
     pub fn prepare(&mut self, tool_set: AuthorizedToolSet) -> Result<(), ProviderBridgeError> {
+        self.prepare_internal(tool_set, false)
+    }
+
+    pub fn attach_run(&mut self, tool_set: AuthorizedToolSet) -> Result<(), ProviderBridgeError> {
+        if !self.pending.is_empty() {
+            return Err(ProviderBridgeError::invalid(
+                "cannot attach a new run while provider tool calls are pending",
+            ));
+        }
+        self.prepare_internal(tool_set, true)?;
+        self.completed.clear();
+        Ok(())
+    }
+
+    pub fn attach_existing_run(&mut self) -> Result<(), ProviderBridgeError> {
+        if !self.pending.is_empty() {
+            return Err(ProviderBridgeError::invalid(
+                "cannot attach a new run while provider tool calls are pending",
+            ));
+        }
+        self.completed.clear();
+        Ok(())
+    }
+
+    fn prepare_internal(
+        &mut self,
+        tool_set: AuthorizedToolSet,
+        allow_catalog_change: bool,
+    ) -> Result<(), ProviderBridgeError> {
         if tool_set.schema != TOOL_SET_SCHEMA || tool_set.schema_version != 1 {
             return Err(ProviderBridgeError::invalid(
                 "unsupported authorized tool-set contract",
@@ -106,11 +135,13 @@ impl ProviderToolBridge {
                 ));
             }
         }
-        if let Some(existing) = &self.catalog_digest {
-            if existing != &tool_set.catalog_digest {
-                return Err(ProviderBridgeError::invalid(
-                    "authorized tool set changed across a durable session",
-                ));
+        if !allow_catalog_change {
+            if let Some(existing) = &self.catalog_digest {
+                if existing != &tool_set.catalog_digest {
+                    return Err(ProviderBridgeError::invalid(
+                        "authorized tool set changed across a durable session",
+                    ));
+                }
             }
         }
         self.catalog_digest = Some(tool_set.catalog_digest);

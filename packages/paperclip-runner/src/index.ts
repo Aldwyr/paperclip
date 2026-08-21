@@ -8,6 +8,8 @@ export * from "./contracts/codex.js";
 export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
 export * from "./backends/codex-native-backend.js";
+export * from "./backends/opencode-native-backend.js";
+export * from "./backends/native-backend-factory.js";
 export * from "./native-session-runtime.js";
 export {
   DurablePrpControlPlane,
@@ -15,12 +17,15 @@ export {
 } from "./control-plane/durable-prp-control-plane.js";
 export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
+export * from "./drivers/opencode/opencode-server-driver.js";
+export * from "./drivers/opencode/mcp-bridge.js";
 export {
   createRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
   type RunnerdCodexTransport,
   type RunnerdCodexTransportOptions,
 } from "./live/runnerd-codex-transport.js";
+export * from "./live/workspace-file-reference.js";
 export * from "./protocol/replay-contract.js";
 export * from "./protocol/replay-loader.js";
 export * from "./protocol/semantic-tool-receipts.js";

@@ -85,7 +85,10 @@ export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: Ta
       type="button"
       onClick={() => setOpen((o) => !o)}
       aria-expanded={open}
-      className="group flex items-center gap-2 px-1 py-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      className={cn(
+        "group flex w-full items-center gap-2 px-1 text-muted-foreground transition-colors hover:text-foreground",
+        item.standaloneHeader ? "border-b border-border/70 py-2 text-sm" : "py-0.5 text-xs",
+      )}
       data-testid="task-chat-turn-summary"
     >
       {timestampPrefix ? (
@@ -94,9 +97,13 @@ export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: Ta
           <span aria-hidden className="text-(length:--text-micro)">·</span>
         </>
       ) : null}
-      <SummaryIcon className="h-3.5 w-3.5 shrink-0" />
-      <span>{item.summary.failed ? "Stopped" : "Worked"}</span>
-      {turnSummaryMetrics(item.summary) ? (
+      {!item.standaloneHeader ? <SummaryIcon className="h-3.5 w-3.5 shrink-0" /> : null}
+      <span>
+        {item.standaloneHeader && item.summary.durationLabel
+          ? `${item.summary.failed ? "Stopped" : "Worked"} for ${item.summary.durationLabel}`
+          : item.summary.failed ? "Stopped" : "Worked"}
+      </span>
+      {!item.standaloneHeader && turnSummaryMetrics(item.summary) ? (
         // Time/tools/tokens is demoted, not deleted (PAP-502): it stays in the
         // DOM (and the accessible tree) but fades in only on hover/focus so the
         // settled line reads as "2:34 PM · ✓ Worked" at rest. Revealed too when
@@ -110,7 +117,7 @@ export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: Ta
           {turnSummaryMetrics(item.summary)}
         </span>
       ) : null}
-      <ChevronRight className={cn("h-3 w-3 shrink-0 transition-transform", open ? "rotate-90" : null)} />
+      <ChevronRight className={cn("h-3 w-3 shrink-0 transition-transform", item.standaloneHeader && "ml-auto", open ? "rotate-90" : null)} />
     </button>
   ) : parentRow ? (
     // The pill renders the expand button itself, wrapped around only the

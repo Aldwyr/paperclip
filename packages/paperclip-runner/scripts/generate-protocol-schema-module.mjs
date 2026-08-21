@@ -16,6 +16,8 @@ const schemaNames = [
   "identity",
   "capabilities",
   "command",
+  "workspace-diff",
+  "workspace-file-reference",
   "semantic-tool",
   "stop-reason",
   "terminal",

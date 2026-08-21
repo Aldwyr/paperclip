@@ -88,7 +88,7 @@ function classify(n: string): Exclude<ToolFamily, "mcp"> {
   if (first === "edit" || first === "write" || n === "multiedit" || n === "notebookedit") {
     return "edit";
   }
-  if (first === "bash" || first === "shell" || first === "run" || n.includes("terminal")) {
+  if (first === "bash" || first === "shell" || first === "run" || first === "command" || n.includes("terminal")) {
     return "terminal";
   }
   // Content grep is its own action (search-code glyph); file-name globbing and

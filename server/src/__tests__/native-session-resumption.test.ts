@@ -280,6 +280,7 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
     },
     workspace: { cwd: repoRoot, repoUrl: null, repoRef: null, branchName: null },
     session: { normalizedSessionId: sessionId, driverKind: "codex_app_server", protocolVersion: 1 },
+    provider: { kind: "codex", model: null },
     completionContract: {
       id: contractId,
       sha256: contractSha,

@@ -23,6 +23,8 @@ export const CAPABILITY_UI_SHOT_SLUGS = [
   "denial-optional-tool",
   "document-revision",
   "deliverable-registered",
+  "workspace-file-changes",
+  "workspace-file-reference",
   "disposition-terminal",
   "debug-panel-open",
   "reconnect-banner",
@@ -954,6 +956,87 @@ const BUILDERS: Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot
     return snapshot;
   },
 
+  "workspace-file-changes": () => {
+    const snapshot = baseline();
+    const turn = lastTurn(snapshot);
+    turn.items.push({
+      kind: "workspace_changes",
+      id: "item-workspace-turn-3",
+      at: at(4, 18),
+      changeSet: {
+        schema: "paperclip.workspace.diff.v1",
+        changeSetId: "turn-3:workspace",
+        revision: 1,
+        source: "runner_verified",
+        complete: true,
+        files: [
+          {
+            path: "packages/runner/src/workspace-events.ts",
+            operation: "create",
+            previousPath: null,
+            additions: 12,
+            deletions: 0,
+            binary: false,
+            diff: "diff --git a/packages/runner/src/workspace-events.ts b/packages/runner/src/workspace-events.ts\n--- /dev/null\n+++ b/packages/runner/src/workspace-events.ts\n@@ -1,0 +1,12 @@\n+export const WORKSPACE_DIFF_SCHEMA = \\\"paperclip.workspace.diff.v1\\\";\n+\n+export function recordWorkspaceDiff() {\n+  return { complete: true };\n+}\n",
+          },
+          {
+            path: "packages/runner/src/index.ts",
+            operation: "modify",
+            previousPath: null,
+            additions: 2,
+            deletions: 1,
+            binary: false,
+            diff: "diff --git a/packages/runner/src/index.ts b/packages/runner/src/index.ts\n--- a/packages/runner/src/index.ts\n+++ b/packages/runner/src/index.ts\n@@ -4,1 +4,2 @@\n-export * from './events';\n+export * from './events';\n+export * from './workspace-events';\n",
+          },
+          {
+            path: "packages/runner/src/legacy-diff.ts",
+            operation: "delete",
+            previousPath: null,
+            additions: 0,
+            deletions: 8,
+            binary: false,
+            diff: "diff --git a/packages/runner/src/legacy-diff.ts b/packages/runner/src/legacy-diff.ts\n--- a/packages/runner/src/legacy-diff.ts\n+++ /dev/null\n@@ -1,8 +1,0 @@\n-export function legacyDiff() {\n-  return null;\n-}\n",
+          },
+          {
+            path: "packages/runner/test/workspace-events.test.ts",
+            operation: "create",
+            previousPath: null,
+            additions: 16,
+            deletions: 0,
+            binary: false,
+            diff: "diff --git a/packages/runner/test/workspace-events.test.ts b/packages/runner/test/workspace-events.test.ts\n--- /dev/null\n+++ b/packages/runner/test/workspace-events.test.ts\n@@ -1,0 +1,16 @@\n+import { test } from 'vitest';\n+\n+test('records workspace changes', () => {\n+  // deterministic fixture\n+});\n",
+          },
+        ],
+        totals: { files: 4, additions: 30, deletions: 9 },
+        patchArtifactRef: null,
+      },
+    });
+    return snapshot;
+  },
+
+  "workspace-file-reference": () => {
+    const snapshot = baseline();
+    lastTurn(snapshot).items.push({
+      kind: "workspace_file_reference",
+      id: "item-file-reference-turn-3",
+      at: at(4, 16),
+      reference: {
+        schema: "paperclip.workspace.file_reference.v1",
+        referenceId: "turn-3:file:runner-plan",
+        source: "runner_verified",
+        path: "docs/paperclip-runner-protocol.md",
+        displayName: "paperclip-runner-protocol.md",
+        mediaType: "text/markdown",
+        presentation: "document",
+        line: null,
+        preview: "# Paperclip Runner Protocol\n\nThe runner projects provider activity into durable, provider-neutral events.\n\n## Workspace references\n\nA local Markdown link becomes a `workspace.file.referenced` event only after the runner verifies that the target stays inside the authorized workspace.\n",
+        previewTruncated: false,
+        contentDigest: "sha256:2e7d2c03a9507ae265ecf5b5356885a53393a2029d241e48b76e557868953c97",
+      },
+    });
+    return snapshot;
+  },
+
   "disposition-terminal": () => {
     const snapshot = baseline();
     const turn = lastTurn(snapshot);
@@ -1046,7 +1129,12 @@ export function capabilityIssueThreadFixture(
   slug: string = "thread-baseline",
   fixtureProfile: string = CAPABILITY_DEFAULT_FIXTURE_PROFILE,
 ): CapabilityIssueThreadSnapshot {
-  const build = BUILDERS[slug as CapabilityUiShotSlug] ?? BUILDERS["thread-baseline"];
+  const effectiveSlug = slug === "thread-baseline" && fixtureProfile === "wc-workspace-changes"
+    ? "workspace-file-changes"
+    : slug === "thread-baseline" && fixtureProfile === "fr-file-reference"
+      ? "workspace-file-reference"
+    : slug;
+  const build = BUILDERS[effectiveSlug as CapabilityUiShotSlug] ?? BUILDERS["thread-baseline"];
   const snapshot = build();
   snapshot.issue.fixtureProfile = fixtureProfile;
   return snapshot;

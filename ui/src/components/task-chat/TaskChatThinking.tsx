@@ -9,7 +9,8 @@ export function TaskChatThinking({ item }: { item: TaskChatThinkingItem }) {
   const [open, setOpen] = useState(item.streaming || !item.collapsed);
   const body = item.lines.join("\n").trim();
   if (!body) return null;
-  const label = item.streaming ? "Reasoning…" : item.summaryLabel ?? "Reasoning";
+  const baseLabel = item.channel === "detail" ? "Reasoning detail" : "Reasoning";
+  const label = item.streaming ? `${baseLabel}…` : item.summaryLabel ?? baseLabel;
 
   return (
     <div className="flex min-w-0 flex-col text-xs" data-testid="task-chat-thinking">

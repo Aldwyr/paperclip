@@ -202,6 +202,42 @@ class RouteError extends Error {
   }
 }
 
+function harnessConfiguration(source, fallbackModel) {
+  const provider = source.provider === undefined ? "codex" : String(source.provider).trim();
+  if (provider !== "codex" && provider !== "opencode") {
+    throw new RouteError(400, "invalid_provider", "Provider must be codex or opencode.");
+  }
+  const rawModel = source.model === undefined ? fallbackModel : source.model;
+  const model = rawModel === undefined || rawModel === null ? "" : String(rawModel).trim();
+  if (model.length > 256) throw new RouteError(400, "invalid_model", "Model is too long.");
+  if (provider === "opencode" && (!model || !model.includes("/"))) {
+    throw new RouteError(400, "invalid_model", "OpenCode requires a provider/model value.");
+  }
+  const suppliedLifecycle = source.lifecyclePolicy && typeof source.lifecyclePolicy === "object"
+    ? source.lifecyclePolicy
+    : source;
+  const lifecycleMode = suppliedLifecycle.mode === undefined
+    ? source.lifecycleMode === undefined ? "warm" : String(source.lifecycleMode).trim()
+    : String(suppliedLifecycle.mode).trim();
+  if (lifecycleMode !== "per_turn" && lifecycleMode !== "warm") {
+    throw new RouteError(400, "invalid_lifecycle_mode", "Execution mode must be per_turn or warm.");
+  }
+  let lifecyclePolicy;
+  if (lifecycleMode === "per_turn") {
+    lifecyclePolicy = { mode: "per_turn", idleTimeoutMs: null };
+  } else {
+    const rawIdleTimeout = suppliedLifecycle.idleTimeoutMs === undefined
+      ? source.idleTimeoutMs
+      : suppliedLifecycle.idleTimeoutMs;
+    const idleTimeoutMs = rawIdleTimeout === undefined ? 300_000 : Number(rawIdleTimeout);
+    if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0) {
+      throw new RouteError(400, "invalid_idle_timeout", "Warm idle timeout must be a positive integer.");
+    }
+    lifecyclePolicy = { mode: "warm", idleTimeoutMs };
+  }
+  return { provider, model: model || null, lifecyclePolicy };
+}
+
 export function createCapabilityIssueThreadMiddleware(options = {}) {
   const load = options.loadRunner ?? loadCapabilityIssueThreadRunner;
   const workingDirectoryRoot = options.scratchRoot ?? scratchRoot();
@@ -269,9 +305,19 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
    * out rather than on the way in.
    */
   function liveView(runner, entry) {
+    const snapshot = entry.session.snapshot();
+    const provider = snapshot.config.provider ?? "codex";
+    const expectedAgentLabel = provider === "opencode" ? "Real OpenCode" : "Real Codex";
     const projected = view(runner, entry);
-    if (projected.mode !== "live" || projected.identity.agentLabel !== "Real Codex") {
-      throw new RouteError(500, "live_mode_required", "The clean-room path refused a non-live view.");
+    if (
+      projected.mode !== "live"
+      || projected.identity.agentLabel !== expectedAgentLabel
+    ) {
+      throw new RouteError(
+        500,
+        "provider_identity_mismatch",
+        "The clean-room path refused a view whose provider identity did not match its immutable session.",
+      );
     }
     return projected;
   }
@@ -326,15 +372,12 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
     return entry;
   }
 
-  /** Retire a session: stop its work, clear its authority, drop its workspace. */
+  /** Archive a session resumably; destructive deletion is intentionally absent. */
   async function retire(service, sessionId, reason) {
     const entry = sessions.get(sessionId);
     if (entry === undefined) return;
-    sessions.delete(sessionId);
     await service.stop(sessionId, reason).catch(() => undefined);
-    if (entry.ownsWorkingDirectory) {
-      await rm(entry.workingDirectory, { recursive: true, force: true }).catch(() => undefined);
-    }
+    entry.connection = { state: "suspended", attempt: entry.connection.attempt };
   }
 
   /**
@@ -351,8 +394,10 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
     }
   }
 
-  async function createCleanRoomSession(runner, service, capabilityHash) {
-    const open = [...sessions.values()].filter((entry) => entry.surface === "cleanroom");
+  async function createCleanRoomSession(runner, service, capabilityHash, configuration) {
+    const open = [...sessions.values()].filter((entry) =>
+      entry.surface === "cleanroom" && entry.session.snapshot().status !== "suspended",
+    );
     // Bounded concurrency: the oldest clean room yields rather than refusing a
     // new board user, because an abandoned chat is the likelier tenant here.
     for (const stale of open.slice(0, Math.max(0, open.length - (MAX_CLEAN_ROOM_SESSIONS - 1)))) {
@@ -367,7 +412,9 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
     try {
       session = await service.create({
         ...input,
-        ...(options.requestedModel === undefined ? {} : { requestedModel: options.requestedModel }),
+        provider: configuration.provider,
+        lifecyclePolicy: configuration.lifecyclePolicy,
+        ...(configuration.model === null ? {} : { requestedModel: configuration.model }),
       });
     } catch (error) {
       await rm(workingDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -383,6 +430,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
       turns: 0,
       createdAt: Date.now(),
       capabilityHash,
+      configuration,
       connection: { state: "connected", attempt: 0 },
     };
     sessions.set(session.id, entry);
@@ -390,12 +438,31 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
   }
 
   function cleanRoomPayload(runner, entry) {
+    const snapshot = entry.session.snapshot();
+    const configuration = {
+      provider: snapshot.config.provider ?? "codex",
+      model: snapshot.config.requestedModel ?? null,
+      lifecyclePolicy: snapshot.config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
+    };
+    if (
+      entry.configuration !== undefined
+      && (entry.configuration.provider !== configuration.provider
+        || entry.configuration.model !== configuration.model
+        || JSON.stringify(entry.configuration.lifecyclePolicy) !== JSON.stringify(configuration.lifecyclePolicy))
+    ) {
+      throw new RouteError(
+        500,
+        "provider_configuration_mismatch",
+        "The clean-room path refused configuration that differed from its immutable session.",
+      );
+    }
     return {
       sessionId: entry.session.id,
       surface: "cleanroom",
       identity: entry.identity,
       limits: { maxTurns: MAX_TURNS_PER_SESSION, maxMessageBytes: MAX_MESSAGE_BYTES },
       turns: entry.turns,
+      configuration,
       view: liveView(runner, entry),
     };
   }
@@ -542,6 +609,13 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         typeof body.sessionId === "string" ? body.sessionId : url.searchParams.get("sessionId");
       const scenario =
         typeof body.scenario === "string" ? body.scenario : url.searchParams.get("scenario") ?? "hb-baseline";
+      const requestedHarness = harnessConfiguration({
+        provider: body.provider ?? url.searchParams.get("provider") ?? undefined,
+        model: body.model ?? url.searchParams.get("model") ?? undefined,
+        lifecyclePolicy: body.lifecyclePolicy,
+        lifecycleMode: body.lifecycleMode ?? url.searchParams.get("lifecycleMode") ?? undefined,
+        idleTimeoutMs: body.idleTimeoutMs ?? url.searchParams.get("idleTimeoutMs") ?? undefined,
+      }, options.requestedModel);
 
       /**
        * Resolves the caller's own session, or `undefined`.
@@ -585,7 +659,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         const capabilityHash = sha256(capability);
         const entry =
           surface === "cleanroom"
-            ? await createCleanRoomSession(runner, service, capabilityHash)
+            ? await createCleanRoomSession(runner, service, capabilityHash, requestedHarness)
             : await createSession(runner, service, scenario, workingDirectory, capabilityHash);
         if (!reuse) {
           response.setHeader("set-cookie", capabilityCookie(request, surface, capability));
@@ -619,7 +693,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         if (owned.state === "owned") {
           await retire(service, owned.entry.session.id, "new clean-room chat");
         }
-        const entry = await mint("cleanroom", { rotate: true });
+        const entry = await mint("cleanroom", { rotate: false });
         send(response, 201, cleanRoomPayload(runner, entry));
         return;
       }
@@ -695,6 +769,7 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
           fork = await service.create({
             seed,
             workingDirectory: forkDirectory,
+            provider: snapshot.config.provider ?? "codex",
             scenario: snapshot.config.scenario,
             capabilities: snapshot.config.capabilities,
             explicitClaims: snapshot.config.explicitClaims,
@@ -766,22 +841,29 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         await entry.session.reconnect();
         entry.connection = { state: "connected", attempt: 0 };
       } else if (route === "reset") {
-        // Reset rotates the capability as well as the session: the cookie the
-        // caller arrived with must stop working, here and on the replacement.
-        const capability = mintCapability();
-        const capabilityHash = sha256(capability);
+        // Reset archives the current session and starts another session for
+        // the same browser principal. Keep the capability stable so the
+        // archived session remains selectable and resumable from history.
+        const capabilityHash = entry.capabilityHash;
         if (entry.surface === "cleanroom") {
           // A clean-room reset is a new tenant, not a rewound one: the seed is
           // blank either way, so restoring it would hand back the same mock
           // identities the board just saw.
           await retire(service, entry.session.id, "clean-room reset");
-          const replacement = await createCleanRoomSession(runner, service, capabilityHash);
-          response.setHeader("set-cookie", capabilityCookie(request, "cleanroom", capability));
+          const replacement = await createCleanRoomSession(
+            runner,
+            service,
+            capabilityHash,
+            entry.configuration ?? {
+              provider: "codex",
+              model: null,
+              lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+            },
+          );
           send(response, 200, cleanRoomPayload(runner, replacement));
           return;
         }
         const next = await service.reset(entry.session.id);
-        sessions.delete(entry.session.id);
         const resetEntry = {
           ...entry,
           session: next,
@@ -790,7 +872,6 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
           connection: { state: "connected", attempt: 0 },
         };
         sessions.set(next.id, resetEntry);
-        response.setHeader("set-cookie", capabilityCookie(request, "issue", capability));
         send(response, 200, payload(runner, resetEntry));
         return;
       } else if (route === "interaction") {

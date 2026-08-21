@@ -10,6 +10,27 @@ interface PaperclipRunnerParserState {
   reasoningDeltaItemIds: Set<string>;
   resultSummaries: Set<string>;
   toolOutputItemIds: Set<string>;
+  itemChannels: Map<string, "progress" | "final" | "summary" | "detail" | "unknown">;
+  structuredFinalItemIds: Set<string>;
+}
+
+function itemChannel(payload: JsonRecord): "progress" | "final" | "summary" | "detail" | "unknown" {
+  const channel = text(payload.channel);
+  return channel === "progress" || channel === "final" || channel === "summary" || channel === "detail"
+    ? channel
+    : "unknown";
+}
+
+function structuredResultSummary(value: string): string | null {
+  if (!value.trimStart().startsWith("{")) return null;
+  try {
+    const parsed = record(JSON.parse(value));
+    return text(parsed.schema) === "paperclip.run_result.v1" && text(parsed.summary)
+      ? text(parsed.summary)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function record(value: unknown): JsonRecord {
@@ -193,14 +214,31 @@ function parseItemEvent(
   const item = record(payload.item);
   const type = normalizedItemType(item, payload);
   const id = itemId(event, item);
+  const channel = itemChannel(payload);
+  if (phase === "started") state.itemChannels.set(id, channel);
+  const resolvedChannel = channel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : channel;
   if (type === "agentmessage") {
     const value = itemText(item, payload);
+    if (phase === "completed") state.itemChannels.delete(id);
     if (!value || state.assistantDeltaItemIds.has(id)) return [];
-    return [{ kind: "assistant", ts, text: value }];
+    if (resolvedChannel === "final") {
+      const summary = structuredResultSummary(value);
+      if (summary) {
+        state.resultSummaries.add(summary);
+        return [{ kind: "assistant", ts, text: summary, channel: "final" }];
+      }
+    }
+    return [{ kind: "assistant", ts, text: value, channel: resolvedChannel === "final" ? "final" : resolvedChannel === "progress" ? "progress" : "unknown" }];
   }
   if (type === "reasoning") {
     const value = itemText(item, payload);
-    if (value && !state.reasoningDeltaItemIds.has(id)) return [{ kind: "thinking", ts, text: value }];
+    if (phase === "completed") state.itemChannels.delete(id);
+    if (value && !state.reasoningDeltaItemIds.has(id)) return [{
+      kind: "thinking",
+      ts,
+      text: value,
+      channel: resolvedChannel === "detail" ? "detail" : resolvedChannel === "summary" ? "summary" : "unknown",
+    }];
     return phase === "started"
       ? [{ kind: "system", ts, text: "Reasoning started" }]
       : [];
@@ -233,14 +271,20 @@ function parseDeltaEvent(
   const kind = text(payload.kind).replaceAll("_", "").toLowerCase();
   const value = text(payload.text);
   const id = text(event.itemId, `${kind || "item"}-delta`);
+  const explicitChannel = itemChannel(payload);
+  const channel = explicitChannel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : explicitChannel;
   if (!value) return [];
   if (kind === "agentmessage") {
     state.assistantDeltaItemIds.add(id);
-    return [{ kind: "assistant", ts, text: value, delta: true }];
+    if (channel === "final" && (state.structuredFinalItemIds.has(id) || value.trimStart().startsWith("{"))) {
+      state.structuredFinalItemIds.add(id);
+      return [];
+    }
+    return [{ kind: "assistant", ts, text: value, delta: true, channel: channel === "final" ? "final" : channel === "progress" ? "progress" : "unknown" }];
   }
   if (kind === "reasoning") {
     state.reasoningDeltaItemIds.add(id);
-    return [{ kind: "thinking", ts, text: value, delta: true }];
+    return [{ kind: "thinking", ts, text: value, delta: true, channel: channel === "detail" ? "detail" : channel === "summary" ? "summary" : "unknown" }];
   }
   if (kind === "commandexecution") {
     state.toolOutputItemIds.add(id);
@@ -309,7 +353,7 @@ function parsePrpEvent(
     const summary = text(result.summary);
     if (!summary || state.resultSummaries.has(summary)) return [];
     state.resultSummaries.add(summary);
-    return [{ kind: "assistant", ts, text: summary }];
+    return [{ kind: "assistant", ts, text: summary, channel: "final" }];
   }
   if (eventType === "harness.diagnostic" || eventType === "session.failed") {
     return [{ kind: "system", ts, text: `Runner: ${text(payload.message, text(payload.code, eventType))}` }];
@@ -323,6 +367,8 @@ function createParserState(): PaperclipRunnerParserState {
     reasoningDeltaItemIds: new Set(),
     resultSummaries: new Set(),
     toolOutputItemIds: new Set(),
+    itemChannels: new Map(),
+    structuredFinalItemIds: new Set(),
   };
 }
 

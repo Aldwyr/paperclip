@@ -9,15 +9,53 @@ use crate::local_runner::LocalRunnerError;
 use crate::process_supervisor::SupervisedProcess;
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
+pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+fn skillless_thread_config() -> Value {
+    json!({
+        "skills.include_instructions": false,
+        "include_apps_instructions": false,
+        "include_collaboration_mode_instructions": false,
+        "features.apps": false,
+        "features.plugins": false,
+        "features.multi_agent": false,
+        "features.memories": false,
+        "features.image_generation": false,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Codex,
+    Opencode,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexProviderConfig {
+    #[serde(default)]
+    pub kind: ProviderKind,
     pub command: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
     pub cwd: String,
     pub model: Option<String>,
     pub instructions: String,
+}
+
+pub trait Provider {
+    fn kind(&self) -> ProviderKind;
+    fn process_id(&self) -> u32;
+    fn session_identity(&self) -> &str;
+    fn provider_session_id(&self) -> Option<&str>;
+    fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError>;
+    fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError>;
+    fn read(&mut self) -> Result<Value, LocalRunnerError>;
+    fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError>;
+    fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError>;
+    fn shutdown(&mut self) -> Result<(), LocalRunnerError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,10 +69,15 @@ pub enum CodexProviderEvent {
         method: String,
         params: Value,
     },
+    SemanticResult {
+        result: Value,
+        item_id: Option<String>,
+    },
     Exited,
 }
 
 pub struct CodexProvider {
+    kind: ProviderKind,
     process: SupervisedProcess,
     next_request_id: u64,
     thread_id: String,
@@ -53,11 +96,12 @@ impl CodexProvider {
         resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
         let mut provider = Self {
+            kind: config.kind,
             process: SupervisedProcess::spawn(
                 Path::new(&config.command),
                 &config.args,
                 Duration::from_secs(2),
-                1024 * 1024,
+                CODEX_APP_SERVER_MAX_FRAME_BYTES,
             )?,
             next_request_id: 1,
             thread_id: String::new(),
@@ -86,6 +130,9 @@ impl CodexProvider {
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": "never",
+                    "permissions": "paperclip-runner-workspace-only",
+                    "runtimeWorkspaceRoots": [config.cwd],
+                    "config": skillless_thread_config(),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -99,6 +146,9 @@ impl CodexProvider {
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": "never",
+                    "permissions": "paperclip-runner-workspace-only",
+                    "runtimeWorkspaceRoots": [config.cwd],
+                    "config": skillless_thread_config(),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -115,7 +165,11 @@ impl CodexProvider {
         provider.session_id = opened
             .pointer("/thread/sessionId")
             .and_then(Value::as_str)
-            .or_else(|| initialized.pointer("/user/sessionId").and_then(Value::as_str))
+            .or_else(|| {
+                initialized
+                    .pointer("/user/sessionId")
+                    .and_then(Value::as_str)
+            })
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
         Ok(provider)
@@ -198,6 +252,19 @@ impl CodexProvider {
             }));
         }
         if let Some(method) = message.get("method").and_then(Value::as_str) {
+            if method == "paperclip/runResult" {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                let result = params.get("result").cloned().ok_or_else(|| {
+                    LocalRunnerError::invalid("OpenCode semantic result omitted result")
+                })?;
+                return Ok(Some(CodexProviderEvent::SemanticResult {
+                    result,
+                    item_id: params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                }));
+            }
             return Ok(Some(CodexProviderEvent::Notification {
                 method: method.to_owned(),
                 params: message.get("params").cloned().unwrap_or(Value::Null),
@@ -254,5 +321,38 @@ impl CodexProvider {
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
         }
+    }
+}
+
+impl Provider for CodexProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+    fn process_id(&self) -> u32 {
+        CodexProvider::process_id(self)
+    }
+    fn session_identity(&self) -> &str {
+        self.thread_id()
+    }
+    fn provider_session_id(&self) -> Option<&str> {
+        self.session_id()
+    }
+    fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
+        CodexProvider::start_turn(self, message, cwd)
+    }
+    fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
+        CodexProvider::interrupt_turn(self, turn_id)
+    }
+    fn read(&mut self) -> Result<Value, LocalRunnerError> {
+        self.read_thread()
+    }
+    fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        CodexProvider::poll(self)
+    }
+    fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
+        CodexProvider::deliver_tool_result(self, result)
+    }
+    fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+        CodexProvider::shutdown(self)
     }
 }

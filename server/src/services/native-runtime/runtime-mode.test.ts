@@ -35,7 +35,24 @@ describe("resolveNativeRuntimeMode", () => {
       runtimeConfig: {},
       adapterConfig: { provider: "claude" },
       agent: { ...eligible.agent, adapterType: "paperclip_runner" },
-    })).toThrow(/provider must be codex/);
+    })).toThrow(/provider must be codex or opencode/);
+  });
+
+  it("selects OpenCode only with a provider/model value", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      runtimeConfig: {},
+      adapterConfig: { provider: "opencode", model: "openrouter/deepseek/deepseek-v4-flash-0731" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toEqual(expect.objectContaining({
+      profile: { mode: "native", backend: "opencode_server", protocolVersion: 1 },
+    }));
+    expect(() => resolveNativeRuntimeMode({
+      ...eligible,
+      runtimeConfig: {},
+      adapterConfig: { provider: "opencode", model: "deepseek" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toThrow(/provider\/model/);
   });
 
   it("preserves legacy as the default and as the kill-switch behavior", () => {
@@ -72,6 +89,22 @@ describe("resolveNativeRuntimeMode", () => {
       persisted: { runtimeMode: null, runtimeModeReason: null, runtimeModeResolvedAt: null },
     })).toEqual(expect.objectContaining({ kind: "legacy", reason: "instance_flag_disabled" }));
     expect(disabled.runtimeConfig.nativeRunner.mode).toBe("native");
+  });
+
+  it("keeps a persisted OpenCode recovery on its immutable driver", () => {
+    expect(resolveHeartbeatNativeRuntimeMode({
+      ...eligible,
+      enabled: false,
+      adapterConfig: { provider: "codex" },
+      persisted: {
+        runtimeMode: "native",
+        runtimeModeReason: "eligible_opt_in",
+        runtimeModeResolvedAt: new Date(),
+        driverKind: "opencode_server",
+      },
+    })).toEqual(expect.objectContaining({
+      profile: { mode: "native", backend: "opencode_server", protocolVersion: 1 },
+    }));
   });
 
   it("rejects an explicit native profile outside the approved boundary", () => {

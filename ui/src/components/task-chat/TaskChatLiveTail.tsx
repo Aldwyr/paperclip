@@ -29,12 +29,18 @@ import { buildActivityPhases } from "./transcript-adapter";
 export function TaskChatLiveTail({
   items,
   emptyMessage,
+  excludeFinal = false,
 }: {
   items: readonly TaskChatItem[];
   /** Shown when nothing renderable has streamed yet (queued / pre-first-token). */
   emptyMessage?: string;
+  /** New-runner turn renders final-answer messages in its dedicated response slot. */
+  excludeFinal?: boolean;
 }) {
-  const rows = buildActivityPhases(items, true)
+  const visibleItems = excludeFinal
+    ? items.filter((item) => item.kind !== "message" || item.interstitial)
+    : items;
+  const rows = buildActivityPhases(visibleItems, true)
     .map((item) => renderTailRow(item))
     .filter((row): row is ReactElement => row != null);
 

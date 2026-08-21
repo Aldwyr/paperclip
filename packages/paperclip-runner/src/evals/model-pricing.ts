@@ -1,4 +1,4 @@
-export const MODEL_PRICING_VERSION = "openai-api-2026-08-20" as const;
+export const MODEL_PRICING_VERSION = "provider-list-prices-2026-08-21" as const;
 
 interface TokenRatesUsdPerMillion {
   input: number;
@@ -14,6 +14,8 @@ const RATES: Readonly<Record<string, TokenRatesUsdPerMillion>> = Object.freeze({
   "gpt-5.6-sol": { input: 5, cachedInput: 0.5, output: 30 },
   "gpt-5.6-terra": { input: 2, cachedInput: 0.2, output: 12 },
   "gpt-5.6-luna": { input: 0.2, cachedInput: 0.02, output: 1.2 },
+  // OpenRouter routed list price published for DeepSeek V4 Flash 0731.
+  "openrouter/deepseek/deepseek-v4-flash-0731": { input: 0.065, cachedInput: 0.02, output: 0.18 },
 });
 
 export interface EstimatedModelCost {

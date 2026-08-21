@@ -26,6 +26,9 @@ export function buildNativeExecutionInput(input: {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
+  provider?: "codex" | "opencode";
+  model?: string | null;
+  lifecyclePolicy?: NativeExecutionInputV1["session"]["lifecyclePolicy"];
   interactionResponses?: NativeInteractionResponseEnvelope[];
   completionContract: {
     id: string;
@@ -61,8 +64,13 @@ export function buildNativeExecutionInput(input: {
     },
     session: {
       normalizedSessionId: input.normalizedSessionId,
-      driverKind: "codex_app_server",
+      driverKind: input.provider === "opencode" ? "opencode_server" : "codex_app_server",
       protocolVersion: 1,
+      lifecyclePolicy: input.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
+    },
+    provider: {
+      kind: input.provider ?? "codex",
+      model: input.model ?? null,
     },
     completionContract: input.completionContract,
     interactionResponses: input.interactionResponses ?? [],

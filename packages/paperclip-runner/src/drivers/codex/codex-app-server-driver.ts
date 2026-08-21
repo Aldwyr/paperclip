@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { parse, relative, resolve } from "node:path";
 
 import type {
@@ -41,6 +42,7 @@ import {
   type PrpStructuredRunResult,
 } from "../../protocol/replay-contract.js";
 import type { NativeUserMessage } from "../../contracts/types.js";
+import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
 import {
   ProcessCodexAppServerTransport,
   createSanitizedCodexEnvironment,
@@ -246,6 +248,7 @@ const SKILLLESS_BASE_CONFIG = {
   "features.plugins": false,
   "features.multi_agent": false,
   "features.memories": false,
+  "features.image_generation": false,
 } as const;
 
 function commandEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
@@ -298,6 +301,8 @@ export function createIsolatedCodexAppServerArgs(
     ...(commandEnv.length > 0
       ? ["-c", `shell_environment_policy.set={${commandEnv}}`]
       : []),
+    "--disable",
+    "image_generation",
     "app-server",
   ];
 }
@@ -644,7 +649,7 @@ export class CodexAppServerDriver implements HarnessDriver {
 
 class CodexHarnessSession implements HarnessSession {
   readonly #transport: CodexAppServerTransport;
-  readonly #runId: string;
+  #runId: string;
   readonly #normalizedSessionId: string;
   readonly #opened: OpenedCodexThread;
   readonly #taskEnvelope: CodexTaskEnvelope;
@@ -669,6 +674,9 @@ class CodexHarnessSession implements HarnessSession {
   #terminal = false;
   #turnStarted = false;
   readonly #terminalTurns = new Map<string, string>();
+  readonly #workspaceChangesByTurn = new Map<string, Record<string, unknown>>();
+  readonly #emittedFileReferences = new Set<string>();
+  readonly #itemChannels = new Map<string, "progress" | "final" | "summary" | "detail" | "unknown">();
   readonly #pendingRuntimeRequests = new Map<string, PendingRuntimeRequest>();
   readonly #lineage = new Map<string, HarnessThreadLineageEntry>();
   #goal: HarnessThreadGoal | null = null;
@@ -699,6 +707,7 @@ class CodexHarnessSession implements HarnessSession {
   }) {
     this.#transport = input.transport;
     this.#runId = input.runId;
+    this.#sourceSequence = 0;
     this.#normalizedSessionId = input.normalizedSessionId;
     this.#opened = input.opened;
     this.#taskEnvelope = input.taskEnvelope;
@@ -770,6 +779,30 @@ class CodexHarnessSession implements HarnessSession {
       providerSessionId: this.#opened.providerSessionId,
       displayId: this.#opened.threadId,
     };
+  }
+
+  async attachRun(input: { runId: string }): Promise<void> {
+    if (this.#activeTurnId !== null || this.#turnStartPending || this.#pendingRuntimeRequests.size > 0) {
+      throw new Error("codex_run_attach_busy");
+    }
+    if (!input.runId) throw new Error("codex_run_attach_invalid");
+    await this.#transport.attachRun?.({
+      runId: input.runId,
+      turnId: `turn_attachment_${randomUUID().replaceAll("-", "")}`,
+      itemId: `item_attachment_${randomUUID().replaceAll("-", "")}`,
+    });
+    this.#runId = input.runId;
+    this.#result = null;
+    this.#resultFingerprint = null;
+    this.#resultCallId = null;
+    this.#resultTurnId = null;
+    this.#terminal = false;
+    this.#terminalTurns.clear();
+    this.#turnStarted = false;
+    this.#protocolFailed = false;
+    this.#protocolFailureCode = null;
+    this.#protocolFailureMessage = null;
+    this.#emit("run.attached", { runId: input.runId, sameSession: true });
   }
 
   contextSnapshot(): CodexModelContextSnapshot {
@@ -1247,8 +1280,12 @@ class CodexHarnessSession implements HarnessSession {
     }
     if (notification.method === "item/started") {
       if (!this.#notificationNamesActiveTurn(turnId, "item start")) return;
+      const channel = this.#channelForStartedItem(item);
+      if (itemId) this.#itemChannels.set(itemId, channel);
       this.#emit("item.started", boundedPayload({
         kind: text(item.type, "unknown"),
+        channel,
+        providerPhase: text(item.phase) || undefined,
         text: itemText(item),
         item,
       }), { turnId, itemId });
@@ -1257,11 +1294,29 @@ class CodexHarnessSession implements HarnessSession {
     if (notification.method === "item/completed") {
       if (!this.#notificationNamesActiveTurn(turnId, "item completion")) return;
       if (!this.#captureResultFromItem(item, turnId)) return;
+      const channel = itemId
+        ? this.#itemChannels.get(itemId) ?? this.#channelForStartedItem(item)
+        : this.#channelForStartedItem(item);
       this.#emit("item.completed", boundedPayload({
         kind: text(item.type, "unknown"),
+        channel,
+        providerPhase: text(item.phase) || undefined,
         text: itemText(item),
         item,
       }), { turnId, itemId });
+      if (text(item.type) === "agentMessage") {
+        for (const reference of paperclipWorkspaceFileReferencesFromText(
+          this.#opened.context.workingDirectory,
+          text(item.text),
+          turnId,
+        )) {
+          if (this.#emittedFileReferences.has(reference.referenceId)) continue;
+          this.#emittedFileReferences.add(reference.referenceId);
+          this.#emit("workspace.file.referenced", { ...reference }, { turnId, itemId: reference.referenceId });
+        }
+      }
+      if (itemId) this.#itemChannels.delete(itemId);
+      if (text(item.type) === "fileChange") this.#recordWorkspaceChanges(turnId, item.changes, true);
       return;
     }
     const deltaKinds: Record<string, string> = {
@@ -1278,11 +1333,22 @@ class CodexHarnessSession implements HarnessSession {
     const deltaKind = deltaKinds[notification.method];
     if (deltaKind !== undefined) {
       if (!this.#notificationNamesActiveTurn(turnId, "item update")) return;
+      const methodChannel = this.#channelForDelta(notification.method);
+      const channel = methodChannel !== "unknown"
+        ? methodChannel
+        : itemId
+          ? this.#itemChannels.get(itemId) ?? "unknown"
+          : "unknown";
       this.#emit("item.delta", boundedPayload({
         kind: deltaKind,
+        channel,
+        providerMethod: notification.method,
         text: text(params.delta, text(params.patch, text(params.output))),
         update: params,
       }), { turnId, itemId: itemId || `${turnId}:${deltaKind}` });
+      if (notification.method === "item/fileChange/patchUpdated") {
+        this.#recordWorkspaceChanges(turnId, params.changes, false);
+      }
       return;
     }
     if (notification.method === "thread/tokenUsage/updated") {
@@ -1294,6 +1360,74 @@ class CodexHarnessSession implements HarnessSession {
       });
       return;
     }
+  }
+
+  #channelForStartedItem(item: Record<string, unknown>): "progress" | "final" | "summary" | "detail" | "unknown" {
+    const type = text(item.type);
+    const phase = text(item.phase).toLowerCase();
+    if (type === "agentMessage") {
+      if (phase === "commentary") return "progress";
+      if (phase === "final_answer") return "final";
+      return "unknown";
+    }
+    if (type === "reasoning") return "summary";
+    return "unknown";
+  }
+
+  #channelForDelta(method: string): "progress" | "final" | "summary" | "detail" | "unknown" {
+    if (method === "item/reasoning/summaryTextDelta") return "summary";
+    if (method === "item/reasoning/textDelta") return "detail";
+    return "unknown";
+  }
+
+  #recordWorkspaceChanges(turnId: string, value: unknown, complete: boolean): void {
+    const changes = Array.isArray(value) ? value : [];
+    const files = changes.slice(0, 2_000).flatMap((candidate): Record<string, unknown>[] => {
+      const change = record(candidate);
+      const path = text(change.path).replaceAll("\\", "/");
+      if (!path || path.startsWith("/") || path.split("/").includes("..")) return [];
+      const kind = change.kind;
+      const kindRecord = record(kind);
+      const kindText = text(kind, text(kindRecord.type, Object.keys(kindRecord)[0] ?? "update"));
+      const update = record(kindRecord.update ?? change.update);
+      const previousPath = text(update.move_path, text(update.movePath)) || null;
+      const operation = previousPath
+        ? "rename"
+        : kindText.toLowerCase().includes("add")
+          ? "create"
+          : kindText.toLowerCase().includes("delete")
+            ? "delete"
+            : "modify";
+      const diff = text(change.diff).slice(0, 262_144) || null;
+      const diffLines = diff?.split("\n") ?? [];
+      return [{
+        path,
+        operation,
+        previousPath,
+        additions: diff === null ? null : diffLines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length,
+        deletions: diff === null ? null : diffLines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length,
+        binary: diff === null,
+        diff,
+      }];
+    });
+    if (files.length === 0) return;
+    const unknown = files.some((file) => file.additions === null || file.deletions === null);
+    const payload = {
+      schema: "paperclip.workspace.diff.v1",
+      changeSetId: `${turnId}:workspace`,
+      revision: Number(record(this.#workspaceChangesByTurn.get(turnId)).revision ?? 0) + 1,
+      source: "harness_reported",
+      complete,
+      files,
+      totals: {
+        files: files.length,
+        additions: unknown ? null : files.reduce((sum, file) => sum + Number(file.additions), 0),
+        deletions: unknown ? null : files.reduce((sum, file) => sum + Number(file.deletions), 0),
+      },
+      patchArtifactRef: null,
+    };
+    this.#workspaceChangesByTurn.set(turnId, payload);
+    this.#emit("workspace.change.updated", payload, { turnId, itemId: `${turnId}:workspace` });
   }
 
   async #handleServerRequest(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
@@ -1516,6 +1650,13 @@ class CodexHarnessSession implements HarnessSession {
       }
     }
     this.#terminalTurns.set(turnId, this.#terminalFingerprint(turn));
+    const workspace = this.#workspaceChangesByTurn.get(turnId);
+    if (workspace !== undefined) {
+      this.#emit("workspace.diff.recorded", { ...workspace, complete: true }, {
+        turnId,
+        itemId: `${turnId}:workspace`,
+      });
+    }
     const eventType =
       status === "failed"
         ? "turn.failed"

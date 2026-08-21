@@ -367,6 +367,11 @@ interface CleanRoomPayload {
   identity: { token: string; companyId: string; actorId: string; taskId: string; identifier: string };
   limits: { maxTurns: number; maxMessageBytes: number };
   view: CapabilityIssueThreadSnapshot;
+  configuration: {
+    provider: "codex" | "opencode";
+    model: string | null;
+    lifecyclePolicy: { mode: "per_turn"; idleTimeoutMs: null } | { mode: "warm"; idleTimeoutMs: number };
+  };
 }
 
 function items(view: CapabilityIssueThreadSnapshot): CapabilityThreadItem[] {
@@ -620,6 +625,20 @@ describe("Capability clean-room chat server", () => {
     expect(opened.view.evidence.traceability).toEqual([]);
   });
 
+  it("creates an OpenCode room with the requested provider/model pinned", async () => {
+    const model = "openrouter/deepseek/deepseek-v4-flash-0731";
+    const opened = await call(
+      `/api/capability/ui/cleanroom/session?provider=opencode&model=${encodeURIComponent(model)}`,
+    );
+
+    expect(opened.configuration).toEqual({
+      provider: "opencode",
+      model,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+    });
+    expect(opened.view.identity.agentLabel).toBe("Real OpenCode");
+  });
+
   it("recreates a removed run scratch root before starting a later chat", async () => {
     const opened = await call("/api/capability/ui/cleanroom/session");
 
@@ -858,7 +877,7 @@ describe("Capability clean-room chat server", () => {
     expect(retried.sessionId).toBe(opened.sessionId);
   });
 
-  it("reset and new chat both rotate identities and retire the prior authority", async () => {
+  it("reset and new chat mint new identities while keeping prior chats resumable", async () => {
     const opened = await call("/api/capability/ui/cleanroom/session");
     await call("/api/capability/ui/message", {
       sessionId: opened.sessionId,
@@ -874,7 +893,7 @@ describe("Capability clean-room chat server", () => {
     expect(await status("/api/capability/ui/message", {
       sessionId: opened.sessionId,
       message: "still there?",
-    })).toBe(404);
+    })).toBe(200);
 
     const fresh = await call("/api/capability/ui/cleanroom/session", { sessionId: reset.sessionId });
     expect(fresh.sessionId).not.toBe(reset.sessionId);
@@ -883,7 +902,7 @@ describe("Capability clean-room chat server", () => {
     expect(await status("/api/capability/ui/message", {
       sessionId: reset.sessionId,
       message: "still there?",
-    })).toBe(404);
+    })).toBe(200);
   });
 
   it("bounds turns per chat with a named reason instead of an opaque failure", async () => {
@@ -1153,7 +1172,7 @@ describe("Capability clean-room chat server", () => {
     expect(await status(`/api/capability/ui/session?sessionId=${aliceIssue.sessionId}`, undefined, alice)).toBe(200);
   });
 
-  it("rotates the capability on reset and new chat and revokes the old one", async () => {
+  it("keeps the capability stable when reset and new chat archive resumable sessions", async () => {
     const alice = new Jar();
     const opened = await call("/api/capability/ui/cleanroom/session", undefined, undefined, alice);
     const first = alice.value("paperclip_capability_chat");
@@ -1165,22 +1184,19 @@ describe("Capability clean-room chat server", () => {
 
     const afterReset = await call("/api/capability/ui/reset", { sessionId: opened.sessionId }, undefined, alice);
     const second = alice.value("paperclip_capability_chat");
-    expect(second).not.toBe(first);
+    expect(second).toBe(first);
     expect(afterReset.sessionId).not.toBe(opened.sessionId);
-    // The old cookie is dead against the replacement session as well as the
-    // retired one, so a stolen cookie does not survive a reset.
-    expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${afterReset.sessionId}`, undefined, stale)).toBe(404);
-    expect(await status("/api/capability/ui/message", { sessionId: afterReset.sessionId, message: "hi" }, stale)).toBe(404);
+    expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${opened.sessionId}`, undefined, stale)).toBe(200);
+    expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${afterReset.sessionId}`, undefined, stale)).toBe(200);
 
     const afterNewChat = await call("/api/capability/ui/cleanroom/session", { sessionId: afterReset.sessionId }, undefined, alice);
     const third = alice.value("paperclip_capability_chat");
-    expect(third).not.toBe(second);
+    expect(third).toBe(second);
     const previous = new Jar();
     previous.capture(new Response(null, {
       headers: { "set-cookie": `paperclip_capability_chat=${second}` },
     }));
-    expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${afterNewChat.sessionId}`, undefined, previous)).toBe(404);
-    expect(await status("/api/capability/ui/reset", { sessionId: afterNewChat.sessionId }, previous)).toBe(404);
+    expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${afterNewChat.sessionId}`, undefined, previous)).toBe(200);
     expect(await status(`/api/capability/ui/cleanroom/session?sessionId=${afterNewChat.sessionId}`, undefined, alice)).toBe(200);
   });
 
@@ -1208,7 +1224,7 @@ describe("Capability clean-room chat server", () => {
     }
   });
 
-  it("rotates the issue-surface capability on reset", async () => {
+  it("keeps the issue-surface capability stable so reset archives remain resumable", async () => {
     const alice = new Jar();
     const opened = await call("/api/capability/ui/session?scenario=hb-baseline", undefined, undefined, alice);
     const first = alice.value("paperclip_capability_issue");
@@ -1218,8 +1234,9 @@ describe("Capability clean-room chat server", () => {
     }));
 
     const reset = await call("/api/capability/ui/reset", { sessionId: opened.sessionId }, undefined, alice);
-    expect(alice.value("paperclip_capability_issue")).not.toBe(first);
-    expect(await status(`/api/capability/ui/session?sessionId=${reset.sessionId}`, undefined, stale)).toBe(404);
+    expect(alice.value("paperclip_capability_issue")).toBe(first);
+    expect(await status(`/api/capability/ui/session?sessionId=${opened.sessionId}`, undefined, stale)).toBe(200);
+    expect(await status(`/api/capability/ui/session?sessionId=${reset.sessionId}`, undefined, stale)).toBe(200);
     expect(await status(`/api/capability/ui/session?sessionId=${reset.sessionId}`, undefined, alice)).toBe(200);
   });
 });

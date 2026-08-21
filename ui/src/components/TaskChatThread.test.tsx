@@ -116,6 +116,34 @@ describe("TaskChatThread draft pass-through", () => {
   });
 });
 
+describe("TaskChatThread native-runner failures", () => {
+  it("replaces an empty failed transcript with actionable retry feedback and keeps the composer enabled", () => {
+    render(
+      <TaskChatThread
+        comments={[]}
+        onAdd={async () => {}}
+        issueStatus="in_progress"
+        linkedRuns={[{
+          runId: "run-failed",
+          status: "failed",
+          agentId: "agent-1",
+          adapterType: "paperclip-runner",
+          createdAt: "2026-08-21T12:00:00.000Z",
+          startedAt: "2026-08-21T12:00:00.000Z",
+          finishedAt: "2026-08-21T12:00:01.000Z",
+          errorCode: "provider_frame_too_large",
+          hasStoredOutput: false,
+        }]}
+      />,
+    );
+
+    expect(container.textContent).toContain("Run failed");
+    expect(container.textContent).toContain("Provider output exceeded the safe limit");
+    expect(container.textContent).not.toContain("Waiting for transcript");
+    expect(container.querySelector("textarea")?.disabled ?? false).toBe(false);
+  });
+});
+
 describe("TaskChatThread composer alignment (PAP-498)", () => {
   it("matches the thread width on mobile and stays narrower on larger screens", () => {
     render(<TaskChatThread comments={[]} onAdd={async () => {}} />);

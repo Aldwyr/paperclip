@@ -3,6 +3,8 @@ import type {
   AdapterRuntimeCommandSpec,
   ServerAdapterModule,
 } from "./types.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { parseAdapterModelsEnv } from "../services/adapter-models-env.js";
 import { stampClaudeAgentIdHeader } from "./claude-agent-id-header.js";
 import {
@@ -132,6 +134,68 @@ import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
+
+const execFileAsync = promisify(execFile);
+
+async function testPaperclipRunnerOpenCodeEnvironment(
+  context: Parameters<typeof openCodeTestEnvironment>[0],
+) {
+  const result = await openCodeTestEnvironment(context);
+  if (context.executionTarget?.kind === "remote") {
+    return {
+      ...result,
+      status: result.status === "pass" ? "warn" as const : result.status,
+      checks: [...result.checks, {
+        code: "opencode_version_unverified_remote",
+        level: "warn" as const,
+        message: "OpenCode version could not be qualified by the local runner probe on a remote target.",
+      }],
+    };
+  }
+  const command = readConfiguredCommand(context.config, "opencode");
+  try {
+    const { stdout, stderr } = await execFileAsync(command, ["--version"], {
+      timeout: 5_000,
+      env: process.env,
+    });
+    const output = `${stdout}\n${stderr}`;
+    const match = output.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
+    if (!match) throw new Error("OpenCode returned an unrecognized version string");
+    const version = `${match[1]}.${match[2]}.${match[3]}`;
+    const comparison = compareSemver(version, "1.18.17");
+    const check = comparison < 0
+      ? { code: "opencode_version_too_old", level: "error" as const, message: `OpenCode ${version} is older than required 1.18.17.` }
+      : comparison > 0
+        ? { code: "opencode_version_unqualified", level: "warn" as const, message: `OpenCode ${version} is newer than qualified version 1.18.17.` }
+        : { code: "opencode_version_qualified", level: "info" as const, message: "OpenCode 1.18.17 is installed and qualified." };
+    return {
+      ...result,
+      status: check.level === "error" ? "fail" as const
+        : check.level === "warn" && result.status === "pass" ? "warn" as const
+          : result.status,
+      checks: [...result.checks, check],
+    };
+  } catch (error) {
+    return {
+      ...result,
+      status: "fail" as const,
+      checks: [...result.checks, {
+        code: "opencode_version_probe_failed",
+        level: "error" as const,
+        message: error instanceof Error ? error.message : "OpenCode version probe failed.",
+      }],
+    };
+  }
+}
+
+function compareSemver(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return (a[index] ?? 0) - (b[index] ?? 0);
+  }
+  return 0;
+}
 
 function readConfiguredCommand(config: Record<string, unknown>, fallback: string): string {
   const value = typeof config.command === "string" ? config.command.trim() : "";
@@ -345,13 +409,19 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
     };
   },
   async testEnvironment(context) {
-    const result = await codexTestEnvironment(context);
+    const provider = context.config.provider === "opencode" ? "opencode" : "codex";
+    const result = provider === "opencode"
+      ? await testPaperclipRunnerOpenCodeEnvironment(context)
+      : await codexTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
   },
   listSkills: listCodexSkills,
   syncSkills: syncCodexSkills,
   sessionCodec: codexSessionCodec,
-  models: codexModels,
+  models: [
+    ...codexModels,
+    { id: "openrouter/deepseek/deepseek-v4-flash-0731", label: "OpenRouter · DeepSeek V4 Flash 0731" },
+  ],
   modelProfiles: codexModelProfiles,
   listModels: listCodexModels,
   refreshModels: refreshCodexModels,
@@ -359,17 +429,47 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
-  getRuntimeCommandSpec: (config) =>
-    buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
-  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex through the Rust Paperclip runner and authenticated PRP control-plane connection.\n`,
+  getRuntimeCommandSpec: (config) => config.provider === "opencode"
+    ? buildNpmRuntimeCommandSpec(config, "opencode", "opencode-ai@1.18.17")
+    : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
+  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex or OpenCode through the native Paperclip runner and authenticated PRP control-plane connection. OpenCode requires a provider/model identifier and runtime OPENROUTER_API_KEY.\n`,
   getConfigSchema: () => ({
     fields: [{
       key: "provider",
       label: "Provider",
       type: "select",
       default: "codex",
-      options: [{ value: "codex", label: "Codex" }],
-      hint: "Paperclip Runner currently supports the Codex app-server provider.",
+      options: [{ value: "codex", label: "Codex" }, { value: "opencode", label: "OpenCode 1.18.17" }],
+      hint: "Select the native provider. OpenCode runs through its authenticated loopback server.",
+    }, {
+      key: "lifecycleMode",
+      label: "Runner lifecycle",
+      type: "select",
+      default: "per_turn",
+      options: [
+        { value: "per_turn", label: "Turn by turn" },
+        { value: "warm", label: "Warm session" },
+      ],
+      hint: "Warm sessions retain runnerd and the provider between separately governed runs.",
+    }, {
+      key: "idleTimeoutMs",
+      label: "Warm idle timeout (ms)",
+      type: "number",
+      default: 300000,
+      hint: "Warm sessions suspend resumably after this much inactivity.",
+    }, {
+      key: "model",
+      label: "OpenCode model",
+      type: "text",
+      default: "openrouter/deepseek/deepseek-v4-flash-0731",
+      placeholder: "openrouter/deepseek/deepseek-v4-flash-0731",
+      hint: "Required when provider is OpenCode; use provider/model form.",
+    }, {
+      key: "command",
+      label: "OpenCode command",
+      type: "text",
+      default: "opencode",
+      hint: "OpenCode executable. Version 1.18.17 is qualified.",
     }],
   }),
   loginCapability: codexLoginCapability,

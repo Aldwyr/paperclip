@@ -168,18 +168,22 @@ export function transcriptToTaskChatItems(
   const thinkingStartTs = new Map<number, string>();
   let lastToolIndex = -1;
   let thinkingIndex = -1;
+  let thinkingChannel: "summary" | "detail" | "unknown" | undefined;
   let messageIndex = -1;
+  let messageChannel: "progress" | "final" | "unknown" | undefined;
 
   const resetInline = () => {
     thinkingIndex = -1;
+    thinkingChannel = undefined;
     messageIndex = -1;
+    messageChannel = undefined;
   };
 
   for (const [i, entry] of entries.entries()) {
     switch (entry.kind) {
       case "thinking": {
         if (!entry.text) break;
-        if (thinkingIndex >= 0) {
+        if (thinkingIndex >= 0 && thinkingChannel === entry.channel) {
           const it = items[thinkingIndex];
           if (it.kind === "thinking") {
             it.lines.push(...entry.text.split("\n"));
@@ -196,16 +200,20 @@ export function transcriptToTaskChatItems(
             // Settled history folds its thinking behind the header (v7);
             // the in-flight run streams it expanded.
             collapsed: !running,
+            channel: entry.channel,
           });
           thinkingIndex = items.length - 1;
+          thinkingChannel = entry.channel;
           thinkingStartTs.set(thinkingIndex, entry.ts);
           messageIndex = -1;
+          messageChannel = undefined;
         }
         break;
       }
       case "assistant": {
         if (!entry.text) break;
-        if (messageIndex >= 0) {
+        const channel = entry.channel;
+        if (messageIndex >= 0 && messageChannel === channel) {
           const it = items[messageIndex];
           if (it.kind === "message") it.text += entry.text;
         } else {
@@ -217,12 +225,15 @@ export function transcriptToTaskChatItems(
             authorName: agentName,
             text: entry.text,
             streaming: running,
-            // Everything the agent says inside a run turn is self-talk until it
-            // lands as the posted comment — live and history tag it alike.
-            interstitial: true,
+            // Explicit final-answer items stream durably. Unclassified text
+            // remains transient for backwards compatibility and fail-closed
+            // handling of a delta whose start metadata was missed.
+            interstitial: channel !== "final",
+            channel,
             atMs: Number.isFinite(atMs) ? atMs : undefined,
           });
           messageIndex = items.length - 1;
+          messageChannel = channel;
           thinkingIndex = -1;
         }
         break;
@@ -440,6 +451,9 @@ export function buildActivityPhases(
   const lastVisible = [...parsed].reverse().find((item) => item.kind !== "thinking");
   for (const item of parsed) {
     if (item.kind === "message") {
+      // Durable final-answer text is rendered beside the Worked header, never
+      // duplicated inside its expandable activity history.
+      if (!item.interstitial) continue;
       // A settled transcript's trailing assistant text is the posted reply.
       // Live/settle-gap tails keep it visible until that canonical reply lands.
       if (!running && item === lastVisible) continue;

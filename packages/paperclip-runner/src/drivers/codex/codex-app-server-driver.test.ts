@@ -357,6 +357,7 @@ describe("Codex app-server Codex driver", () => {
     transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "cmd-1", type: "commandExecution", command: "printf hello" } });
     transport.push("item/commandExecution/outputDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "cmd-1", delta: "hello" });
     transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "file-1", type: "fileChange", changes: [{ path: "hello.txt" }] } });
+    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reference-1", type: "agentMessage", text: "Open [hello.txt](hello.txt)." } });
     const requestResolution = transport.invoke({
       id: "request-1",
       method: "item/tool/requestUserInput",
@@ -379,9 +380,15 @@ describe("Codex app-server Codex driver", () => {
     expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
     expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
     expect(events.filter((event) => event.eventType === "run.terminal")).toHaveLength(0);
+    expect(events.find((event) => event.eventType === "workspace.change.updated")?.payload)
+      .toMatchObject({ schema: "paperclip.workspace.diff.v1", complete: true, totals: { files: 1 } });
+    expect(events.find((event) => event.eventType === "workspace.diff.recorded")?.payload)
+      .toMatchObject({ schema: "paperclip.workspace.diff.v1", complete: true });
+    expect(events.find((event) => event.eventType === "workspace.file.referenced")?.payload)
+      .toMatchObject({ schema: "paperclip.workspace.file_reference.v1", path: "hello.txt" });
     expect(events.map((event) => event.eventType)).toEqual(expect.arrayContaining([
       "session.started", "turn.started", "item.started", "item.delta", "item.completed", "run.result.proposed", "turn.completed",
-      "runtime_request.created", "runtime_request.resolved",
+      "runtime_request.created", "runtime_request.resolved", "workspace.change.updated", "workspace.diff.recorded",
     ]));
 
     const capabilities: PrpCapabilities = {
@@ -405,6 +412,40 @@ describe("Codex app-server Codex driver", () => {
     expect(live).toEqual(replay);
     expect(live.integrity).toBe("complete");
     expect(await session.usage?.()).toMatchObject({ modelContextWindow: 128000 });
+  });
+
+  it("normalizes provider message and reasoning phases onto every streamed item event", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-stream-channels",
+      normalizedSessionId: "normalized-stream-channels",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({ message: { role: "user", text: "Stream progress." } });
+    transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
+    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "progress-1", type: "agentMessage", phase: "commentary", text: "" } });
+    transport.push("item/agentMessage/delta", { threadId: "thread-1", turnId: turn.turnId, itemId: "progress-1", delta: "Running it now." });
+    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "progress-1", type: "agentMessage", phase: "commentary", text: "Running it now." } });
+    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reason-1", type: "reasoning", summary: [] } });
+    transport.push("item/reasoning/summaryTextDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "reason-1", delta: "Summary" });
+    transport.push("item/reasoning/textDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "reason-1", delta: "Detail" });
+    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reason-1", type: "reasoning", summary: [{ text: "Summary" }] } });
+    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "final-1", type: "agentMessage", phase: "final_answer", text: "" } });
+    transport.push("item/agentMessage/delta", { threadId: "thread-1", turnId: turn.turnId, itemId: "final-1", delta: JSON.stringify(result) });
+    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "final-1", type: "agentMessage", phase: "final_answer", text: JSON.stringify(result) } });
+    transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+
+    const events = await collectUntilTerminal(session.events());
+    const pick = (kind: string, channel: string) => events.find((event) =>
+      event.payload.kind === kind && event.payload.channel === channel);
+    expect(pick("agentMessage", "progress")?.payload).toMatchObject({ providerPhase: "commentary" });
+    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "progress")?.payload)
+      .toMatchObject({ providerMethod: "item/agentMessage/delta", text: "Running it now." });
+    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "summary")?.payload)
+      .toMatchObject({ providerMethod: "item/reasoning/summaryTextDelta" });
+    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "detail")?.payload)
+      .toMatchObject({ providerMethod: "item/reasoning/textDelta" });
+    expect(pick("agentMessage", "final")?.payload).toMatchObject({ providerPhase: "final_answer" });
   });
 
   it("captures an exact skillless model/environment snapshot with credentials absent", async () => {
@@ -437,6 +478,7 @@ describe("Codex app-server Codex driver", () => {
         "skills.include_instructions": false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
+        "features.image_generation": false,
       },
       permissions: "paperclip-runner-workspace-only",
       runtimeWorkspaceRoots: ["/workspace"],
@@ -459,6 +501,8 @@ describe("Codex app-server Codex driver", () => {
       "permissions.paperclip-runner-workspace-only.network.enabled=false",
       'shell_environment_policy.inherit="none"',
       expect.stringContaining('shell_environment_policy.set={PATH="/bin",LANG="C.UTF-8"}'),
+      "--disable",
+      "image_generation",
     ]));
     expect(appServerArgs.find((arg) => arg.startsWith("permissions."))).toContain(
       '"/isolated/home"="none"',

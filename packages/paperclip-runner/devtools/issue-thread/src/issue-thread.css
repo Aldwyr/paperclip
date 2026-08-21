@@ -700,6 +700,108 @@ textarea {
   min-width: 0;
 }
 
+.pit-workspace-card {
+  overflow: hidden;
+  border: 1px solid var(--pit-border);
+  border-radius: var(--pit-radius-lg);
+  background: var(--pit-surface);
+  box-shadow: var(--pit-shadow-sm);
+}
+
+.pit-workspace-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--pit-space-3);
+  padding: var(--pit-space-3) var(--pit-space-4);
+  border-bottom: 1px solid var(--pit-border);
+}
+
+.pit-workspace-head strong,
+.pit-workspace-head small,
+.pit-workspace-path small { display: block; }
+.pit-workspace-head small,
+.pit-workspace-path small,
+.pit-workspace-binary { color: var(--pit-muted-foreground); }
+.pit-workspace-icon { font-family: var(--pit-font-symbols); font-size: var(--pit-text-xl); }
+.pit-workspace-total,
+.pit-workspace-stats { display: flex; gap: var(--pit-space-2); font-family: var(--pit-font-mono); }
+[data-stat="add"] { color: var(--pit-success); }
+[data-stat="delete"] { color: var(--pit-danger); }
+
+.pit-workspace-review,
+.pit-workspace-more,
+.pit-workspace-files button,
+.pit-workspace-file-nav button {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.pit-workspace-review {
+  min-height: 2rem;
+  padding: 0 var(--pit-space-3);
+  border: 1px solid var(--pit-border-strong);
+  border-radius: var(--pit-radius-md);
+  background: var(--pit-surface-raised);
+}
+
+.pit-workspace-files button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pit-space-4);
+  min-height: 2.75rem;
+  padding: var(--pit-space-2) var(--pit-space-4);
+  text-align: left;
+}
+.pit-workspace-files button:hover,
+.pit-workspace-file-nav button:hover,
+.pit-workspace-file-nav button[data-selected="true"] { background: var(--pit-surface-raised); }
+.pit-workspace-path { min-width: 0; overflow-wrap: anywhere; font-family: var(--pit-font-mono); }
+.pit-workspace-path small { font-family: var(--pit-font-sans); }
+.pit-workspace-more { width: 100%; padding: var(--pit-space-2) var(--pit-space-4); border-top: 1px solid var(--pit-border); text-align: left; }
+
+.pit-dialog.pit-workspace-dialog {
+  width: min(70rem, calc(100vw - 2rem));
+  max-width: 70rem;
+  max-height: calc(100vh - 2rem);
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+.pit-workspace-dialog > .pit-tool-dialog-head { padding: var(--pit-space-4); }
+.pit-workspace-file-nav { display: flex; max-height: 9rem; overflow: auto; border-bottom: 1px solid var(--pit-border); }
+.pit-workspace-file-nav button { padding: var(--pit-space-2) var(--pit-space-3); white-space: nowrap; font-family: var(--pit-font-mono); }
+.pit-workspace-diff { max-height: min(65vh, 44rem); margin: 0; overflow: auto; padding: var(--pit-space-4); background: var(--pit-surface-sunken); font-family: var(--pit-font-mono); font-size: var(--pit-text-xs); line-height: 1.55; }
+.pit-workspace-diff span { display: block; min-width: max-content; }
+.pit-workspace-diff [data-diff-line="addition"] { color: var(--pit-success); background: var(--pit-success-surface); }
+.pit-workspace-diff [data-diff-line="deletion"] { color: var(--pit-danger); background: var(--pit-danger-surface); }
+.pit-workspace-diff [data-diff-line="hunk"] { color: var(--pit-accent); }
+.pit-workspace-binary { padding: var(--pit-space-4); }
+
+.pit-file-reference-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--pit-space-3);
+  padding: var(--pit-space-3);
+  border: 1px solid var(--pit-border);
+  border-radius: var(--pit-radius-lg);
+  background: var(--pit-surface);
+  box-shadow: var(--pit-shadow-sm);
+}
+.pit-file-reference-icon { display: grid; place-items: center; width: 2.75rem; height: 2.75rem; border-radius: var(--pit-radius-md); background: var(--pit-surface-raised); font-family: var(--pit-font-symbols); font-size: var(--pit-text-xl); }
+.pit-file-reference-copy { min-width: 0; }
+.pit-file-reference-copy strong,
+.pit-file-reference-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pit-file-reference-copy small { color: var(--pit-muted-foreground); }
+.pit-dialog.pit-file-reference-dialog { width: min(58rem, calc(100vw - 2rem)); max-width: 58rem; max-height: calc(100vh - 2rem); padding: 0; gap: 0; overflow: hidden; }
+.pit-file-reference-dialog > .pit-tool-dialog-head { padding: var(--pit-space-4); border-bottom: 1px solid var(--pit-border); }
+.pit-file-reference-preview { overflow: auto; padding: var(--pit-space-4); }
+.pit-file-reference-preview > .pit-code { max-height: 65vh; overflow: auto; white-space: pre; }
+
 /*
  * Chat messages follow the familiar assistant flow: the board's message is a
  * compact bubble, while the assistant answer sits directly on the page. The
@@ -2270,7 +2372,62 @@ textarea {
   text-transform: uppercase;
 }
 
+.pit-harness-picker {
+  display: flex;
+  align-items: end;
+  gap: var(--pit-space-3);
+  padding: var(--pit-space-2) var(--pit-space-4);
+  border-bottom: 1px solid var(--pit-border);
+  background: var(--pit-surface-sunken);
+}
+
+.pit-harness-picker label {
+  display: grid;
+  gap: var(--pit-space-1);
+  color: var(--pit-muted-foreground);
+  font-size: var(--pit-text-xs);
+}
+
+.pit-harness-picker select,
+.pit-harness-picker input {
+  box-sizing: border-box;
+  min-height: var(--pit-touch-target);
+  padding: 0 var(--pit-space-2);
+  border: 1px solid var(--pit-border-strong);
+  border-radius: var(--pit-radius-sm);
+  background: var(--pit-surface-raised);
+}
+
+.pit-harness-model {
+  flex: 1;
+  max-width: 38rem;
+}
+
+.pit-harness-active {
+  align-self: center;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pit-faint-foreground);
+  font-family: var(--pit-font-mono);
+  font-size: var(--pit-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 767px) {
+  .pit-harness-picker {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .pit-harness-model {
+    min-width: 12rem;
+  }
+
+  .pit-harness-active {
+    flex-basis: 100%;
+  }
+
   .pit-header-primary {
     align-items: flex-start;
   }

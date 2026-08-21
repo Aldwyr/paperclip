@@ -63,6 +63,7 @@ const input: NativeExecutionInputV1 = {
   },
   workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
   session: { normalizedSessionId: identity.sessionId, driverKind: "codex_app_server", protocolVersion: 1 },
+  provider: { kind: "codex", model: null },
   completionContract: {
     id: "contract-recovery",
     sha256: "contract-recovery-sha",

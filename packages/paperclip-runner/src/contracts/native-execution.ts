@@ -23,6 +23,10 @@ export interface NativeCredentialBindingRef {
   displayName: string | null;
 }
 
+export type NativeSessionLifecyclePolicy =
+  | { mode: "per_turn"; idleTimeoutMs: null }
+  | { mode: "warm"; idleTimeoutMs: number };
+
 export interface NativeExecutionInputV1 {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
   binding: {
@@ -48,8 +52,13 @@ export interface NativeExecutionInputV1 {
   };
   session: {
     normalizedSessionId: string | null;
-    driverKind: "codex_app_server";
+    driverKind: "codex_app_server" | "opencode_server";
     protocolVersion: 1;
+    lifecyclePolicy: NativeSessionLifecyclePolicy;
+  };
+  provider: {
+    kind: "codex" | "opencode";
+    model: string | null;
   };
   completionContract: {
     id: string;
@@ -131,6 +140,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     "task",
     "workspace",
     "session",
+    "provider",
     "completionContract",
     "interactionResponses",
     "credentialBindings",
@@ -146,15 +156,55 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
   const workspace = record(input.workspace, "input.workspace");
   exactKeys(workspace, ["cwd", "repoUrl", "repoRef", "branchName"], "input.workspace");
   const session = record(input.session, "input.session");
-  exactKeys(session, ["normalizedSessionId", "driverKind", "protocolVersion"], "input.session");
+  exactKeys(session, ["normalizedSessionId", "driverKind", "protocolVersion", "lifecyclePolicy"], "input.session");
   const completionContract = record(input.completionContract, "input.completionContract");
   exactKeys(completionContract, ["id", "sha256", "schemaVersion", "contract"], "input.completionContract");
   const contract = record(completionContract.contract, "input.completionContract.contract");
   exactKeys(contract, ["revision", "objective", "criteria"], "input.completionContract.contract");
 
   if (task.workMode !== "standard") throw new NativeExecutionInputError("input.task.workMode must be standard");
-  if (session.driverKind !== "codex_app_server" || session.protocolVersion !== 1) {
-    throw new NativeExecutionInputError("input.session must select codex_app_server protocol version 1");
+  if (
+    (session.driverKind !== "codex_app_server" && session.driverKind !== "opencode_server")
+    || session.protocolVersion !== 1
+  ) {
+    throw new NativeExecutionInputError("input.session must select a supported protocol version 1 driver");
+  }
+  const lifecyclePolicyValue = session.lifecyclePolicy === undefined
+    ? { mode: "per_turn", idleTimeoutMs: null }
+    : record(session.lifecyclePolicy, "input.session.lifecyclePolicy");
+  exactKeys(lifecyclePolicyValue, ["mode", "idleTimeoutMs"], "input.session.lifecyclePolicy");
+  let lifecyclePolicy: NativeSessionLifecyclePolicy;
+  if (lifecyclePolicyValue.mode === "per_turn") {
+    if (lifecyclePolicyValue.idleTimeoutMs !== null) {
+      throw new NativeExecutionInputError("input.session.lifecyclePolicy.idleTimeoutMs must be null for per_turn");
+    }
+    lifecyclePolicy = { mode: "per_turn", idleTimeoutMs: null };
+  } else if (lifecyclePolicyValue.mode === "warm") {
+    if (!Number.isSafeInteger(lifecyclePolicyValue.idleTimeoutMs) || Number(lifecyclePolicyValue.idleTimeoutMs) <= 0) {
+      throw new NativeExecutionInputError("input.session.lifecyclePolicy.idleTimeoutMs must be a positive integer for warm");
+    }
+    lifecyclePolicy = { mode: "warm", idleTimeoutMs: Number(lifecyclePolicyValue.idleTimeoutMs) };
+  } else {
+    throw new NativeExecutionInputError("input.session.lifecyclePolicy.mode must be per_turn or warm");
+  }
+  const provider = input.provider === undefined
+    ? { kind: "codex", model: null }
+    : record(input.provider, "input.provider");
+  exactKeys(provider, ["kind", "model"], "input.provider");
+  if (provider.kind !== "codex" && provider.kind !== "opencode") {
+    throw new NativeExecutionInputError("input.provider.kind must be codex or opencode");
+  }
+  if (
+    (provider.kind === "codex" && session.driverKind !== "codex_app_server")
+    || (provider.kind === "opencode" && session.driverKind !== "opencode_server")
+  ) {
+    throw new NativeExecutionInputError("input.provider.kind does not match input.session.driverKind");
+  }
+  const providerModel = provider.model === null || provider.model === undefined
+    ? null
+    : text(provider.model, "input.provider.model");
+  if (provider.kind === "opencode" && (providerModel === null || !providerModel.includes("/"))) {
+    throw new NativeExecutionInputError("input.provider.model is required for opencode in provider/model form");
   }
   if (!Array.isArray(contract.criteria) || contract.criteria.length === 0) {
     throw new NativeExecutionInputError("input.completionContract.contract.criteria must not be empty");
@@ -206,7 +256,10 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
       identifier: text(task.identifier, "input.task.identifier"),
       title: text(task.title, "input.task.title"),
       description: nullableText(task.description, "input.task.description"),
-      prompt: text(task.prompt, "input.task.prompt"),
+      // `prompt` was added after native run inputs were already persisted.
+      // Recovery must retain those runs, so derive the same bounded model
+      // prompt from their task fields instead of making them unrecoverable.
+      prompt: text(task.prompt ?? task.description ?? task.title, "input.task.prompt"),
       workMode: "standard",
     },
     workspace: {
@@ -217,8 +270,13 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     },
     session: {
       normalizedSessionId: nullableText(session.normalizedSessionId, "input.session.normalizedSessionId"),
-      driverKind: "codex_app_server",
+      driverKind: session.driverKind,
       protocolVersion: 1,
+      lifecyclePolicy,
+    },
+    provider: {
+      kind: provider.kind,
+      model: providerModel,
     },
     completionContract: {
       id: text(completionContract.id, "input.completionContract.id"),

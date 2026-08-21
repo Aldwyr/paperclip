@@ -80,14 +80,10 @@ export interface TaskChatMessageItem {
    * "for {user}" chip beside the author name (the open cross-task write design (attribution)).
    */
   onBehalfOfUserName?: string;
-  /**
-   * Agent text streamed inside a run turn (interstitial updates between tool
-   * calls). Ephemeral in the redesigned view (PAP-361): while streaming it
-   * takes the live parent row's line (TaskChatStatusItem.selfTalk); once
-   * finished it renders nowhere — the run log / classic transcript remain the
-   * archive. Tagged for live and settled transcripts alike.
-   */
+  /** A transient provider progress update, distinct from the durable final response. */
   interstitial?: boolean;
+  /** Normalized runner message channel. Only paperclip_runner currently emits it. */
+  channel?: "progress" | "final" | "unknown";
   /** Epoch ms of the message's first streamed chunk. */
   atMs?: number;
   /**
@@ -121,6 +117,8 @@ export interface TaskChatThinkingItem {
   collapsed?: boolean;
   /** Human-readable elapsed label for the collapsed header. */
   summaryLabel?: string;
+  /** Provider-emitted reasoning surface; never synthesized by the UI. */
+  channel?: "summary" | "detail" | "unknown";
 }
 
 /** A tool invocation row (ACP tool_call / tool_call_update). */
@@ -267,6 +265,8 @@ export interface TaskChatTurnItem {
   liveStatus?: TaskChatStatusItem;
   /** Animate the fold when settling (false = collapse instantly, e.g. history). */
   animateFold?: boolean;
+  /** New-runner turns keep the Worked header standalone above the final response. */
+  standaloneHeader?: boolean;
   summary: {
     /** e.g. "38s" — omitted when unknown. */
     durationLabel?: string;

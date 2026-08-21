@@ -31,7 +31,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
     const descriptor = await this.#driver.descriptor();
     return {
       kind: "runner",
-      name: descriptor.displayName,
+      name: descriptor.kind,
       version: descriptor.version,
       capabilities: structuredClone(descriptor.capabilities),
     };
@@ -86,7 +86,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
 }
 
 class HarnessNativeSession implements NativeSession {
-  readonly #input: OpenNativeSessionInput;
+  #input: OpenNativeSessionInput;
   readonly #session: HarnessSession;
   #terminal: PrpTerminalState | null = null;
 
@@ -113,6 +113,18 @@ class HarnessNativeSession implements NativeSession {
       goals: this.#session.goal !== undefined,
       threadLineage: this.#session.lineage !== undefined,
     };
+  }
+
+  async attachRun(input: { identity: OpenNativeSessionInput["identity"] }): Promise<void> {
+    if (input.identity.sessionId !== this.#input.identity.sessionId) {
+      throw new Error("native_session_attach_binding_mismatch");
+    }
+    if (this.#session.attachRun === undefined) {
+      throw new Error("native_session_multi_run_unavailable");
+    }
+    await this.#session.attachRun({ runId: input.identity.runId });
+    this.#input = { ...this.#input, identity: structuredClone(input.identity) };
+    this.#terminal = null;
   }
 
   async *events(): AsyncIterable<PrpEvent> {
@@ -190,6 +202,10 @@ class HarnessNativeSession implements NativeSession {
       pendingRuntimeRequests: snapshot.pendingRuntimeRequests ?? [],
       lineage: snapshot.lineage ?? [],
     };
+  }
+
+  async usage(): Promise<Record<string, unknown> | null> {
+    return this.#session.usage?.() ?? null;
   }
 
   close(input: { reason: string }) {

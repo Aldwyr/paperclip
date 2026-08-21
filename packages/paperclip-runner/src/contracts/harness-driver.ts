@@ -328,6 +328,7 @@ export interface HarnessSession {
     displayId?: string | null;
   };
   events(): AsyncIterable<PrpEvent>;
+  attachRun?(input: { runId: string }): Promise<void> | void;
   startTurn(input: { message: NativeUserMessage }): Promise<{ turnId: string }>;
   steer?(input: { turnId: string; message: NativeUserMessage }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;

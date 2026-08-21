@@ -221,6 +221,18 @@ impl SupervisedProcess {
             "TMPDIR",
             "TEMP",
             "TMP",
+            "TZ",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+            "SSL_CERT_DIR",
+            "OPENROUTER_API_KEY",
+            "PAPERCLIP_OPENCODE_COMMAND",
+            "PAPERCLIP_OPENCODE_RUNTIME_DIR",
+            "PAPERCLIP_RUNNER_INSTANCE_ID",
+            "PAPERCLIP_RUN_ID",
+            "PAPERCLIP_NORMALIZED_SESSION_ID",
         ] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

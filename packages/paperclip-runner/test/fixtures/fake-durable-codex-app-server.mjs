@@ -101,6 +101,14 @@ function handleRequest(message) {
   if (method === "turn/start") {
     const turnId = `turn-${++state.nextTurn}`;
     state.turns[turnId] = "inProgress";
+    if (!state.heldOnce) {
+      // Persist which provider turn is intentionally held before exposing its
+      // tool call. If runnerd is killed immediately after delivering the tool
+      // result, a replacement provider must not accidentally hold the next
+      // turn as though the first response had never reached this process.
+      state.heldOnce = true;
+      state.heldTurnId = turnId;
+    }
     save();
     send({ id, result: { turn: { id: turnId, status: "inProgress" } } });
     send({
@@ -147,8 +155,8 @@ function handle(message) {
   const turnId = pendingTools.get(String(message.id));
   if (!turnId) return;
   pendingTools.delete(String(message.id));
-  if (!state.heldOnce) {
-    state.heldOnce = true;
+  if (state.heldTurnId === turnId) {
+    state.heldTurnId = null;
     save();
     return;
   }

@@ -696,16 +696,28 @@ fn validate_control_identity(
     for (field, expected) in [
         ("runnerInstanceId", state.runner_instance_id.as_str()),
         ("environmentLeaseId", state.environment_lease_id.as_str()),
-        ("runId", state.run_id.as_str()),
         ("normalizedSessionId", state.normalized_session_id.as_str()),
-        ("turnId", state.turn_id.as_str()),
-        ("itemId", state.item_id.as_str()),
     ] {
-        if required_string(value, field)? != expected {
+        let actual = required_string(value, field)?;
+        if actual != expected {
             return Err(DurableRunnerError::invalid(format!(
-                "control envelope {field} does not match the authenticated session"
+                "control envelope {field} does not match the authenticated session (expected {expected}, received {actual})"
             )));
         }
+    }
+    let current_attachment_matches = required_string(value, "runId")? == state.run_id
+        && required_string(value, "turnId")? == state.turn_id
+        && required_string(value, "itemId")? == state.item_id;
+    let prior_ack_matches = value.get("kind").and_then(Value::as_str) == Some("ack")
+        && state.previous_attachment_identity.as_ref().is_some_and(|prior| {
+            value.get("runId").and_then(Value::as_str) == Some(prior.run_id.as_str())
+                && value.get("turnId").and_then(Value::as_str) == Some(prior.turn_id.as_str())
+                && value.get("itemId").and_then(Value::as_str) == Some(prior.item_id.as_str())
+        });
+    if !current_attachment_matches && !prior_ack_matches {
+        return Err(DurableRunnerError::invalid(
+            "control envelope run attachment does not match the authenticated session",
+        ));
     }
     if let Some(connection) = connection {
         if required_string(value, "connectionId")? != connection.connection_id

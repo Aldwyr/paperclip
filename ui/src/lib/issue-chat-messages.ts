@@ -49,6 +49,8 @@ export interface IssueChatLinkedRun {
   hasStoredOutput?: boolean;
   logBytes?: number | null;
   errorCode?: string | null;
+  scheduledRetryAt?: string | null;
+  nextAction?: string | null;
   resultJson?: Record<string, unknown> | null;
 }
 

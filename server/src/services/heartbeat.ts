@@ -15941,6 +15941,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               branchName: executionWorkspace.branchName,
             },
             normalizedSessionId: nativeSessionId,
+            provider: nativeRuntimeResolution.profile.backend === "opencode_server" ? "opencode" : "codex",
+            model: typeof parseObject(agent.adapterConfig).model === "string"
+              ? String(parseObject(agent.adapterConfig).model)
+              : null,
+            lifecyclePolicy: parseObject(agent.adapterConfig).lifecycleMode === "warm"
+              ? {
+                  mode: "warm",
+                  idleTimeoutMs: Number.isSafeInteger(parseObject(agent.adapterConfig).idleTimeoutMs)
+                    && Number(parseObject(agent.adapterConfig).idleTimeoutMs) > 0
+                    ? Number(parseObject(agent.adapterConfig).idleTimeoutMs)
+                    : 300_000,
+                }
+              : { mode: "per_turn", idleTimeoutMs: null },
             interactionResponses,
             completionContract: {
               id: completionContract.row.id,
@@ -15970,7 +15983,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             runnerInstanceId: lockedRun.runnerInstanceId ?? nativeRunnerInstanceId,
             nativeSessionId: lockedRun.nativeSessionId ?? nativeSessionId,
-            driverKind: lockedRun.driverKind ?? "codex_app_server",
+            driverKind: lockedRun.driverKind ?? nativeExecution?.session.driverKind ?? "codex_app_server",
             driverVersion: lockedRun.driverVersion ?? "phase6-v1",
             completionContractId: lockedRun.completionContractId ?? completionContract.row.id,
             completionContractSha256: lockedRun.completionContractSha256 ?? completionContract.row.canonicalSha256,

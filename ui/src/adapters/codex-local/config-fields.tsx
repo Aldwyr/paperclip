@@ -32,6 +32,17 @@ export function CodexLocalConfigFields({
   hideInstructionsFile,
 }: AdapterConfigFieldsProps) {
   const runnerManaged = adapterType === "paperclip_runner";
+  const runnerProvider = runnerManaged
+    ? isCreate
+      ? values!.paperclipRunnerProvider ?? "codex"
+      : eff("adapterConfig", "provider", String(config.provider ?? "codex"))
+    : "codex";
+  const openCodeRunner = runnerManaged && runnerProvider === "opencode";
+  const runnerLifecycleMode = runnerManaged
+    ? isCreate
+      ? values!.paperclipRunnerLifecycleMode ?? "per_turn"
+      : eff("adapterConfig", "lifecycleMode", String(config.lifecycleMode ?? "per_turn"))
+    : "per_turn";
   const rawEngine = runnerManaged ? "cli" : isCreate
     ? values!.codexEngine ?? "auto"
     : eff("adapterConfig", "engine", String(config.engine ?? "auto"));
@@ -73,10 +84,86 @@ export function CodexLocalConfigFields({
         </select>
       </Field>}
       {runnerManaged && (
-        <Field label="Provider" hint="Paperclip Runner currently supports Codex through its app-server protocol.">
-          <select className={inputClass} value="codex" disabled>
+        <Field label="Provider" hint="The runner persists this provider with each run so recovery cannot drift after configuration changes.">
+          <select
+            className={inputClass}
+            value={runnerProvider}
+            onChange={(event) => {
+              const provider = event.target.value === "opencode" ? "opencode" : "codex";
+              if (isCreate) {
+                set!({
+                  paperclipRunnerProvider: provider,
+                  ...(provider === "opencode" && !values!.model
+                    ? { model: "openrouter/deepseek/deepseek-v4-flash-0731" }
+                    : {}),
+                });
+              } else {
+                mark("adapterConfig", "provider", provider);
+                if (provider === "opencode" && !String(config.model ?? "")) {
+                  mark("adapterConfig", "model", "openrouter/deepseek/deepseek-v4-flash-0731");
+                }
+              }
+            }}
+          >
             <option value="codex">Codex</option>
+            <option value="opencode">OpenCode 1.18.17</option>
           </select>
+        </Field>
+      )}
+      {runnerManaged && (
+        <Field label="Runner lifecycle" hint="Turn by turn suspends after each run. Warm keeps the same provider process available between governed runs.">
+          <select
+            className={inputClass}
+            value={runnerLifecycleMode}
+            onChange={(event) => {
+              const value = event.target.value === "warm" ? "warm" : "per_turn";
+              isCreate
+                ? set!({ paperclipRunnerLifecycleMode: value })
+                : mark("adapterConfig", "lifecycleMode", value);
+            }}
+          >
+            <option value="per_turn">Turn by turn</option>
+            <option value="warm">Warm session</option>
+          </select>
+        </Field>
+      )}
+      {runnerManaged && runnerLifecycleMode === "warm" && (
+        <Field label="Warm idle timeout (ms)" hint="After this much inactivity, runnerd checkpoints and suspends the provider session.">
+          {isCreate ? (
+            <input
+              type="number"
+              min={1}
+              className={inputClass}
+              value={values!.paperclipRunnerIdleTimeoutMs ?? 300_000}
+              onChange={(event) => set!({ paperclipRunnerIdleTimeoutMs: Math.max(1, Number(event.target.value)) })}
+            />
+          ) : (
+            <DraftNumberInput
+              value={eff("adapterConfig", "idleTimeoutMs", Number(config.idleTimeoutMs ?? 300_000))}
+              onCommit={(value) => mark("adapterConfig", "idleTimeoutMs", Math.max(1, value || 300_000))}
+              immediate
+              className={inputClass}
+            />
+          )}
+        </Field>
+      )}
+      {openCodeRunner && (
+        <Field label="OpenCode command" hint="The OpenCode executable. Version 1.18.17 is qualified for this runner.">
+          <DraftInput
+            value={
+              isCreate
+                ? values!.command ?? ""
+                : eff("adapterConfig", "command", String(config.command ?? ""))
+            }
+            onCommit={(value) =>
+              isCreate
+                ? set!({ command: value })
+                : mark("adapterConfig", "command", value || undefined)
+            }
+            immediate
+            className={inputClass}
+            placeholder="opencode"
+          />
         </Field>
       )}
       {acpSelected && (
@@ -217,49 +304,49 @@ export function CodexLocalConfigFields({
           </div>
         </Field>
       )}
-      <ToggleField
-        label="Bypass sandbox"
-        hint={help.dangerouslyBypassSandbox}
-        checked={
-          isCreate
-            ? values!.dangerouslyBypassSandbox
-            : eff(
-                "adapterConfig",
-                "dangerouslyBypassApprovalsAndSandbox",
-                bypassEnabled,
-              )
-        }
-        onChange={(v) =>
-          isCreate
-            ? set!({ dangerouslyBypassSandbox: v })
-            : mark("adapterConfig", "dangerouslyBypassApprovalsAndSandbox", v)
-        }
-      />
-      <ToggleField
-        label="Enable search"
-        hint={help.search}
-        checked={
-          isCreate
-            ? values!.search
-            : eff("adapterConfig", "search", !!config.search)
-        }
-        onChange={(v) =>
-          isCreate
-            ? set!({ search: v })
-            : mark("adapterConfig", "search", v)
-        }
-      />
-      <ToggleField
-        label="Fast mode"
-        hint={help.fastMode}
-        checked={fastModeEnabled}
-        onChange={(v) =>
-          isCreate
-            ? set!({ fastMode: v })
-            : mark("adapterConfig", "fastMode", v)
-        }
-      />
-      {fastModeEnabled && (
+      {!openCodeRunner && <ToggleField
+          label="Bypass sandbox"
+          hint={help.dangerouslyBypassSandbox}
+          checked={
+            isCreate
+              ? values!.dangerouslyBypassSandbox
+              : eff(
+                  "adapterConfig",
+                  "dangerouslyBypassApprovalsAndSandbox",
+                  bypassEnabled,
+                )
+          }
+          onChange={(v) =>
+            isCreate
+              ? set!({ dangerouslyBypassSandbox: v })
+              : mark("adapterConfig", "dangerouslyBypassApprovalsAndSandbox", v)
+          }
+        />}
+      {!openCodeRunner && <ToggleField
+          label="Enable search"
+          hint={help.search}
+          checked={
+            isCreate
+              ? values!.search
+              : eff("adapterConfig", "search", !!config.search)
+          }
+          onChange={(v) =>
+            isCreate
+              ? set!({ search: v })
+              : mark("adapterConfig", "search", v)
+          }
+        />}
+      {!openCodeRunner && <ToggleField
+          label="Fast mode"
+          hint={help.fastMode}
+          checked={fastModeEnabled}
+          onChange={(v) =>
+            isCreate
+              ? set!({ fastMode: v })
+              : mark("adapterConfig", "fastMode", v)
+          }
+        />}
+      {!openCodeRunner && fastModeEnabled && (
         <div className="rounded-md border border-amber-300/70 bg-amber-50/80 px-3 py-2 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100">
           {fastModeMessage}
         </div>

@@ -35,6 +35,7 @@ const COMPACTED_COMMAND_FILTER_BYTES: usize = 4096;
 const COMPACTED_COMMAND_FILTER_HASHES: usize = 7;
 const REVOKE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const TEMP_FILE_ATTEMPTS: usize = 16;
+const MAX_DURABLE_STRING_BYTES: usize = 32 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -120,6 +121,16 @@ pub struct DurableRunnerConfig {
     pub max_frame_bytes: usize,
     pub reconnect_delay: Duration,
     pub max_runtime: Duration,
+    pub lifecycle_mode: String,
+    pub idle_timeout: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentIdentity {
+    pub run_id: String,
+    pub turn_id: String,
+    pub item_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -155,7 +166,17 @@ pub struct DurableRunnerState {
     pub normalized_session_id: String,
     pub turn_id: String,
     pub item_id: String,
+    #[serde(default)]
+    pub previous_attachment_identity: Option<AttachmentIdentity>,
     pub lifecycle: String,
+    #[serde(default = "default_lifecycle_mode")]
+    pub lifecycle_mode: String,
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub last_activity_at_unix_ms: u64,
+    #[serde(default)]
+    pub active_turn: bool,
     pub next_source_seq: u64,
     pub acked_source_seq: u64,
     pub last_controller_command_seq: u64,
@@ -176,10 +197,10 @@ pub struct DurableRunnerState {
     pub stop_after_flush: bool,
     #[serde(default)]
     pub provider_tool_bridge: ProviderToolBridge,
-    #[serde(default)]
-    pub codex_provider_config: Option<CodexProviderConfig>,
-    #[serde(default)]
-    pub codex_provider_thread_id: Option<String>,
+    #[serde(default, alias = "codexProviderConfig")]
+    pub provider_config: Option<CodexProviderConfig>,
+    #[serde(default, alias = "codexProviderThreadId")]
+    pub provider_session_id: Option<String>,
 }
 
 impl DurableRunnerState {
@@ -192,7 +213,12 @@ impl DurableRunnerState {
             normalized_session_id: config.normalized_session_id.clone(),
             turn_id: config.turn_id.clone(),
             item_id: config.item_id.clone(),
+            previous_attachment_identity: None,
             lifecycle: "connecting".to_owned(),
+            lifecycle_mode: config.lifecycle_mode.clone(),
+            idle_timeout_ms: config.idle_timeout.and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+            last_activity_at_unix_ms: 0,
+            active_turn: false,
             next_source_seq: 1,
             acked_source_seq: 0,
             last_controller_command_seq: 0,
@@ -210,8 +236,8 @@ impl DurableRunnerState {
             harness_generation: 1,
             stop_after_flush: false,
             provider_tool_bridge: ProviderToolBridge::default(),
-            codex_provider_config: None,
-            codex_provider_thread_id: None,
+            provider_config: None,
+            provider_session_id: None,
         }
     }
 
@@ -240,12 +266,16 @@ impl DurableRunnerState {
         Ok(())
     }
 
-    fn record_diagnostic(&mut self, message: impl Into<String>) {
+    pub(crate) fn record_diagnostic(&mut self, message: impl Into<String>) {
         self.diagnostics.push(redact_text(&message.into()));
         if self.diagnostics.len() > MAX_DIAGNOSTICS {
             self.diagnostics.remove(0);
         }
     }
+}
+
+fn default_lifecycle_mode() -> String {
+    "per_turn".to_owned()
 }
 
 #[derive(Clone, Debug)]
@@ -597,20 +627,22 @@ fn validate_state_binding(
             state.environment_lease_id.as_str(),
             config.environment_lease_id.as_str(),
         ),
-        ("runId", state.run_id.as_str(), config.run_id.as_str()),
         (
             "normalizedSessionId",
             state.normalized_session_id.as_str(),
             config.normalized_session_id.as_str(),
         ),
-        ("turnId", state.turn_id.as_str(), config.turn_id.as_str()),
-        ("itemId", state.item_id.as_str(), config.item_id.as_str()),
     ] {
         if stored != expected {
             return Err(DurableRunnerError::invalid(format!(
                 "durable {name} does not match the requested recovery identity"
             )));
         }
+    }
+    if state.lifecycle_mode != config.lifecycle_mode {
+        return Err(DurableRunnerError::invalid(
+            "durable lifecycle policy does not match the requested recovery policy",
+        ));
     }
     decode_compacted_command_filter(&state.compacted_command_filter)?;
     Ok(())
@@ -681,9 +713,28 @@ pub fn sanitize_value(value: &Value) -> Value {
                 .collect(),
         ),
         Value::Array(values) => Value::Array(values.iter().map(sanitize_value).collect()),
-        Value::String(text) => Value::String(redact_text(text)),
+        Value::String(text) => Value::String(sanitize_text_payload(text)),
         other => other.clone(),
     }
+}
+
+fn sanitize_text_payload(input: &str) -> String {
+    let redacted = redact_text(input);
+    if redacted.starts_with("data:") && redacted.len() > 4 * 1024 {
+        return format!("[OMITTED data URL: {} bytes]", redacted.len());
+    }
+    if redacted.len() <= MAX_DURABLE_STRING_BYTES {
+        return redacted;
+    }
+    let mut boundary = MAX_DURABLE_STRING_BYTES;
+    while !redacted.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!(
+        "{}\n[TRUNCATED: {} bytes omitted]",
+        &redacted[..boundary],
+        redacted.len() - boundary
+    )
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -1145,14 +1196,14 @@ fn execute_command_effect(
                             "run.prepare provider is invalid: {error}"
                         ))
                     })?;
-                if let Some(existing) = &state.codex_provider_config {
+                if let Some(existing) = &state.provider_config {
                     if existing != &provider {
                         return Err(DurableRunnerError::invalid(
                             "provider configuration changed across a durable session",
                         ));
                     }
                 }
-                state.codex_provider_config = Some(provider);
+                state.provider_config = Some(provider);
             }
             state.lifecycle = "ready".to_owned();
             enqueue_event(
@@ -1164,6 +1215,58 @@ fn execute_command_effect(
                 None,
             )?;
             Ok(("completed".to_owned(), 1, "run prepared".to_owned()))
+        }
+        "run.attach" => {
+            if state.active_turn || state.lifecycle == "active" || state.lifecycle == "waiting_input" {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    "a run cannot attach while another run or turn is active".to_owned(),
+                ));
+            }
+            let required = |name: &str| {
+                payload.get(name).and_then(Value::as_str).filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| DurableRunnerError::invalid(format!("run.attach payload.{name} is required")))
+            };
+            let run_id = required("runId")?;
+            let turn_id = required("turnId")?;
+            let item_id = required("itemId")?;
+            if let Some(value) = payload.get("authorizedTools") {
+                let tool_set: AuthorizedToolSet = serde_json::from_value(value.clone()).map_err(|error| {
+                    DurableRunnerError::invalid(format!("run.attach authorizedTools is invalid: {error}"))
+                })?;
+                state.provider_tool_bridge.attach_run(tool_set).map_err(|error| {
+                    DurableRunnerError::invalid(format!("run.attach tool contract rejected: {error}"))
+                })?;
+            } else {
+                state.provider_tool_bridge.attach_existing_run().map_err(|error| {
+                    DurableRunnerError::invalid(format!("run.attach tool contract rejected: {error}"))
+                })?;
+            }
+            state.previous_attachment_identity = Some(AttachmentIdentity {
+                run_id: state.run_id.clone(),
+                turn_id: state.turn_id.clone(),
+                item_id: state.item_id.clone(),
+            });
+            state.run_id = run_id;
+            state.turn_id = turn_id;
+            state.item_id = item_id;
+            state.lifecycle = "ready".to_owned();
+            enqueue_event(
+                state,
+                config,
+                "run.attached",
+                0,
+                json!({
+                    "runId": state.run_id,
+                    "turnId": state.turn_id,
+                    "itemId": state.item_id,
+                    "sameSession": true,
+                }),
+                None,
+            )?;
+            Ok(("completed".to_owned(), 1, "run attached to durable session".to_owned()))
         }
         "semantic_tool.result" => {
             let result: ToolResult = serde_json::from_value(payload.clone()).map_err(|error| {
@@ -1283,6 +1386,8 @@ fn execute_command_effect(
             "new turns are disabled while draining or backpressured".to_owned(),
         )),
         "turn.start" => {
+            state.active_turn = true;
+            state.lifecycle = "active".to_owned();
             let item_id = state.item_id.clone();
             enqueue_event(
                 state,
@@ -1292,7 +1397,7 @@ fn execute_command_effect(
                 json!({ "turnId": state.turn_id, "sameSession": true }),
                 None,
             )?;
-            if state.codex_provider_config.is_some() {
+            if state.provider_config.is_some() {
                 return Ok((
                     "completed".to_owned(),
                     1,
@@ -1349,7 +1454,23 @@ fn execute_command_effect(
                 }),
                 None,
             )?;
-            state.lifecycle = "terminal".to_owned();
+            state.active_turn = false;
+            state.lifecycle = if state.lifecycle_mode == "warm" {
+                "warm_idle".to_owned()
+            } else {
+                "suspending".to_owned()
+            };
+            if state.lifecycle_mode == "per_turn" {
+                state.stop_after_flush = true;
+                enqueue_event(
+                    state,
+                    config,
+                    "runner.suspending",
+                    0,
+                    json!({ "reason": "per_turn_complete", "resumable": true }),
+                    None,
+                )?;
+            }
             Ok(("completed".to_owned(), 1, "turn completed".to_owned()))
         }
         "turn.interrupt" => Ok((

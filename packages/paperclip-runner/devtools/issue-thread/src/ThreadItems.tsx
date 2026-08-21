@@ -150,6 +150,147 @@ function ProgressItem({
   );
 }
 
+function FileDiff({ diff }: { diff: string | null }) {
+  if (diff === null) return <p className="pit-workspace-binary">Binary or oversized file; textual diff unavailable.</p>;
+  return (
+    <pre className="pit-workspace-diff" aria-label="Unified file diff">
+      {diff.split("\n").map((line, index) => (
+        <span
+          key={`${index}:${line}`}
+          data-diff-line={line.startsWith("+") && !line.startsWith("+++")
+            ? "addition"
+            : line.startsWith("-") && !line.startsWith("---")
+              ? "deletion"
+              : line.startsWith("@@")
+                ? "hunk"
+                : "context"}
+        >{line || " "}{"\n"}</span>
+      ))}
+    </pre>
+  );
+}
+
+function WorkspaceChanges({
+  item,
+}: {
+  item: Extract<CapabilityThreadItem, { kind: "workspace_changes" }>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const files = item.changeSet.files;
+  const visible = expanded ? files : files.slice(0, 3);
+  const selected = files.find((file) => file.path === selectedPath) ?? null;
+  const stats = (file: (typeof files)[number]) => (
+    <span className="pit-workspace-stats">
+      {file.additions === null ? null : <span data-stat="add">+{file.additions}</span>}
+      {file.deletions === null ? null : <span data-stat="delete">-{file.deletions}</span>}
+    </span>
+  );
+
+  return (
+    <>
+      <article id={item.id} className="pit-workspace-card" data-thread-item="workspace_changes">
+        <header className="pit-workspace-head">
+          <span className="pit-workspace-icon" aria-hidden="true">▣</span>
+          <span>
+            <strong>{item.changeSet.complete ? "Edited" : "Editing"} {files.length} file{files.length === 1 ? "" : "s"}</strong>
+            <small>{item.changeSet.source === "runner_verified" ? "Verified from workspace" : "Reported by harness"}</small>
+          </span>
+          <span className="pit-workspace-total">
+            {item.changeSet.totals.additions === null ? null : <span data-stat="add">+{item.changeSet.totals.additions}</span>}
+            {item.changeSet.totals.deletions === null ? null : <span data-stat="delete">-{item.changeSet.totals.deletions}</span>}
+          </span>
+          <button type="button" className="pit-workspace-review" onClick={() => setSelectedPath(files[0]?.path ?? null)}>Review</button>
+        </header>
+        <div className="pit-workspace-files">
+          {visible.map((file) => (
+            <button type="button" key={`${file.operation}:${file.path}`} onClick={() => setSelectedPath(file.path)}>
+              <span className="pit-workspace-path">
+                {file.previousPath === null ? file.path : `${file.previousPath} → ${file.path}`}
+                <small>{file.operation.replace("_", " ")}</small>
+              </span>
+              {stats(file)}
+            </button>
+          ))}
+        </div>
+        {files.length > 3 ? (
+          <button type="button" className="pit-workspace-more" onClick={() => setExpanded((value) => !value)}>
+            {expanded ? "Show fewer files" : `Show ${files.length - 3} more files`} <span aria-hidden="true">⌄</span>
+          </button>
+        ) : null}
+      </article>
+      {selected !== null ? (
+        <div className="pit-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedPath(null); }}>
+          <div className="pit-dialog pit-workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-diff-title">
+            <header className="pit-tool-dialog-head">
+              <div>
+                <span className="pit-card-meta">{selected.operation.replace("_", " ")} · workspace diff</span>
+                <h2 id="workspace-diff-title">{selected.path}</h2>
+              </div>
+              {stats(selected)}
+              <button type="button" className="pit-icon-button" aria-label="Close diff" onClick={() => setSelectedPath(null)}>×</button>
+            </header>
+            {files.length > 1 ? (
+              <nav className="pit-workspace-file-nav" aria-label="Changed files">
+                {files.map((file) => <button type="button" key={file.path} data-selected={file.path === selected.path} onClick={() => setSelectedPath(file.path)}>{file.path}</button>)}
+              </nav>
+            ) : null}
+            <FileDiff diff={selected.diff} />
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function WorkspaceFileReference({
+  item,
+}: {
+  item: Extract<CapabilityThreadItem, { kind: "workspace_file_reference" }>;
+}) {
+  const [open, setOpen] = useState(false);
+  const extension = item.reference.path.includes(".")
+    ? item.reference.path.split(".").at(-1)?.toUpperCase()
+    : "FILE";
+  const presentation = item.reference.presentation === "document"
+    ? "Document"
+    : item.reference.presentation === "code"
+      ? "Code"
+      : item.reference.presentation === "image"
+        ? "Image"
+        : "File";
+  return (
+    <>
+      <article id={item.id} className="pit-file-reference-card" data-thread-item="workspace_file_reference">
+        <span className="pit-file-reference-icon" aria-hidden="true">▤</span>
+        <span className="pit-file-reference-copy">
+          <strong>{item.reference.displayName}</strong>
+          <small>{presentation} · {extension}{item.reference.line === null ? "" : ` · line ${item.reference.line}`}</small>
+        </span>
+        <button type="button" className="pit-workspace-review" onClick={() => setOpen(true)}>Open</button>
+      </article>
+      {open ? (
+        <div className="pit-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}>
+          <div className="pit-dialog pit-file-reference-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-file-title">
+            <header className="pit-tool-dialog-head">
+              <div><span className="pit-card-meta">{item.reference.path}</span><h2 id="workspace-file-title">{item.reference.displayName}</h2></div>
+              <button type="button" className="pit-icon-button" aria-label="Close file" onClick={() => setOpen(false)}>×</button>
+            </header>
+            <div className="pit-file-reference-preview">
+              {item.reference.preview === null
+                ? <p className="pit-workspace-binary">Preview unavailable. The reference remains recorded with its normalized workspace path.</p>
+                : item.reference.presentation === "document"
+                  ? <MarkdownBody>{item.reference.preview}</MarkdownBody>
+                  : <pre className="pit-code">{item.reference.preview}</pre>}
+              {item.reference.previewTruncated ? <p className="pit-withheld-note">Preview truncated by the runner.</p> : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function ThreadItemView({
   item,
   callbacks,
@@ -229,6 +370,12 @@ function ThreadItemView({
 
     case "progress_activity":
       return <ProgressItem item={item} />;
+
+    case "workspace_changes":
+      return <WorkspaceChanges item={item} />;
+
+    case "workspace_file_reference":
+      return <WorkspaceFileReference item={item} />;
 
     case "denial":
       return (

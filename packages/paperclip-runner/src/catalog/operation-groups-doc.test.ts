@@ -68,8 +68,8 @@ describe("canonical operation-groups specification", () => {
     expect(input.source.behaviorGroups).toHaveLength(16);
     expect(input.scenarios).toHaveLength(106);
     expect(new Set(input.scenarios.map((scenario) => scenario.id)).size).toBe(106);
-    expect(input.eventTypes).toHaveLength(65);
-    expect(input.commandTypes).toHaveLength(14);
+    expect(input.eventTypes).toHaveLength(74);
+    expect(input.commandTypes).toHaveLength(16);
   });
 
   it("keeps the checked-in Markdown byte-identical to the generated contract", () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCodexLocalConfig } from "./build-config.js";
+import { buildCodexLocalConfig, buildPaperclipRunnerConfig } from "./build-config.js";
 import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 
 function makeValues(overrides: Partial<CreateConfigValues> = {}): CreateConfigValues {
@@ -67,5 +67,33 @@ describe("buildCodexLocalConfig", () => {
     const config = buildCodexLocalConfig(makeValues({ model: "" }));
 
     expect(config).not.toHaveProperty("model");
+  });
+});
+
+describe("buildPaperclipRunnerConfig", () => {
+  it("preserves the Codex provider default", () => {
+    expect(buildPaperclipRunnerConfig(makeValues())).toMatchObject({
+      provider: "codex",
+      model: "gpt-5.4",
+      lifecycleMode: "per_turn",
+    });
+  });
+
+  it("persists a warm lifecycle and its idle timeout", () => {
+    expect(buildPaperclipRunnerConfig(makeValues({
+      paperclipRunnerLifecycleMode: "warm",
+      paperclipRunnerIdleTimeoutMs: 45_000,
+    }))).toMatchObject({ lifecycleMode: "warm", idleTimeoutMs: 45_000 });
+  });
+
+  it("persists OpenCode and supplies the qualified model when blank", () => {
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      paperclipRunnerProvider: "opencode",
+      model: "",
+    }))).toMatchObject({
+      provider: "opencode",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+    });
   });
 });

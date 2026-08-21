@@ -70,5 +70,17 @@ export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string
   delete config.nonInteractivePermissions;
   delete config.stateDir;
   delete config.warmHandleIdleMs;
-  return { ...config, provider: "codex" };
+  const provider = v.paperclipRunnerProvider
+    ?? (v.adapterSchemaValues?.provider === "opencode" ? "opencode" : "codex");
+  return {
+    ...config,
+    provider,
+    lifecycleMode: v.paperclipRunnerLifecycleMode ?? "per_turn",
+    ...(v.paperclipRunnerLifecycleMode === "warm"
+      ? { idleTimeoutMs: v.paperclipRunnerIdleTimeoutMs ?? 300_000 }
+      : {}),
+    ...(provider === "opencode" && !v.model
+      ? { model: "openrouter/deepseek/deepseek-v4-flash-0731" }
+      : {}),
+  };
 }

@@ -36,6 +36,15 @@ import {
   type CapabilityRunnerdCodexTransportOptions,
   type CapabilityRunnerdProcessEvidence,
 } from "./runnerd-codex-transport.js";
+import {
+  capturePaperclipWorkspace,
+  diffPaperclipWorkspace,
+  type PaperclipWorkspaceDiff,
+} from "./workspace-diff.js";
+import {
+  discoverPaperclipWorkspaceFileReferences,
+  type PaperclipWorkspaceFileReference,
+} from "./workspace-file-reference.js";
 
 const LIVE_SESSION_SCHEMA = "paperclip.capability.live-session.v1" as const;
 const LIVE_BASE_INSTRUCTIONS = [
@@ -51,7 +60,12 @@ const INVOKE_DISCOVERED_TOOL = "invoke_discovered_capability";
 
 export type CapabilityLiveSessionStatus =
   | "starting"
+  | "restoring"
   | "idle"
+  | "warm_idle"
+  | "waiting_input"
+  | "suspending"
+  | "suspended"
   | "running"
   | "stopping"
   | "closed"
@@ -94,11 +108,18 @@ export interface CapabilityLiveSessionConfigSnapshot {
   workingDirectory: string;
   /** Exact model requested by the caller; omitted only for legacy interactive sessions. */
   requestedModel?: string;
+  /** Safe harness identity used by server-side projections and eval metadata. */
+  provider?: "codex" | "opencode";
+  driver?: "codex_app_server" | "opencode_server";
+  providerVersion?: string | null;
   scenario: CapabilitySemanticScenarioPolicy;
   capabilities: string[];
   explicitClaims: string[];
   seedState: string;
   turnTimeoutMs: number;
+  lifecyclePolicy?:
+    | { mode: "per_turn"; idleTimeoutMs: null }
+    | { mode: "warm"; idleTimeoutMs: number };
   toolExposure?: CapabilityToolExposureMode;
 }
 
@@ -143,6 +164,18 @@ export interface CapabilityLiveStateRevision {
   state: string;
 }
 
+export interface CapabilityLiveWorkspaceDiffEntry {
+  turnId: string;
+  at: string;
+  diff: PaperclipWorkspaceDiff;
+}
+
+export interface CapabilityLiveWorkspaceFileReferenceEntry {
+  turnId: string;
+  at: string;
+  reference: PaperclipWorkspaceFileReference;
+}
+
 export interface RecordCapabilityLiveUsageInput {
   receiptId: string;
   providerResponseId?: string | null;
@@ -164,6 +197,8 @@ export interface CapabilityLiveSessionSnapshot {
   providerSessionId: string | null;
   /** Safe provider identity retained for reproducible eval bundle declarations. */
   providerModel?: { id: string; provider: string };
+  /** Validated structured provider result, retained separately from assistant prose. */
+  semanticResult?: Record<string, CapabilityJsonValue> | null;
   status: CapabilityLiveSessionStatus;
   activeTurnId: string | null;
   createdAt: string;
@@ -188,12 +223,17 @@ export interface CapabilityLiveSessionSnapshot {
   usageLedger?: CapabilityLiveUsageReceipt[];
   /** Bounded mock-control-plane snapshots for DevTools time travel and diffs. */
   stateHistory?: CapabilityLiveStateRevision[];
+  /** Complete, bounded per-turn workspace changes verified by the runner. */
+  workspaceDiffs?: CapabilityLiveWorkspaceDiffEntry[];
+  /** Assistant-authored local links verified and normalized by the runner. */
+  workspaceFileReferences?: CapabilityLiveWorkspaceFileReferenceEntry[];
   loadedOperationIds?: string[];
 }
 
 export interface CreateCapabilityLiveSessionInput {
   seed?: CapabilityFixtureSeed | CapabilityFixtureState;
   workingDirectory?: string;
+  provider?: "codex" | "opencode";
   requestedModel?: string;
   scenario?: CapabilitySemanticScenarioPolicy;
   capabilities?: string[];
@@ -205,6 +245,7 @@ export interface CreateCapabilityLiveSessionInput {
   sessionId?: string;
   attemptId?: string;
   turnTimeoutMs?: number;
+  lifecyclePolicy?: CapabilityLiveSessionConfigSnapshot["lifecyclePolicy"];
   toolExposure?: CapabilityToolExposureMode;
 }
 
@@ -400,6 +441,55 @@ export function assertCapabilityLiveSessionSnapshot(
   }
   if (authority.sessionId !== snapshot.sessionId) {
     throw new Error("capability_live_checkpoint_binding_mismatch");
+  }
+  const config = record(snapshot.config);
+  const persistedProvider = config.provider;
+  if (
+    persistedProvider !== undefined &&
+    persistedProvider !== "codex" &&
+    persistedProvider !== "opencode"
+  ) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid config.provider");
+  }
+  const provider = persistedProvider ?? "codex";
+  const expectedDriver = provider === "opencode" ? "opencode_server" : "codex_app_server";
+  if (config.driver !== undefined && config.driver !== expectedDriver) {
+    throw new Error("capability_live_checkpoint_corrupt: provider/driver mismatch");
+  }
+  if (persistedProvider !== undefined && config.driver === undefined) {
+    throw new Error("capability_live_checkpoint_corrupt: missing config.driver");
+  }
+  if (config.requestedModel !== undefined) {
+    const requestedModel = text(config.requestedModel);
+    if (requestedModel.trim().length === 0) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid config.requestedModel");
+    }
+    if (provider === "opencode" && !requestedModel.includes("/")) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid OpenCode model");
+    }
+  } else if (provider === "opencode") {
+    throw new Error("capability_live_checkpoint_corrupt: missing OpenCode model");
+  }
+  if (
+    config.providerVersion !== undefined &&
+    config.providerVersion !== null &&
+    (typeof config.providerVersion !== "string" || config.providerVersion.trim().length === 0)
+  ) {
+    throw new Error("capability_live_checkpoint_corrupt: invalid config.providerVersion");
+  }
+  if (config.lifecyclePolicy !== undefined) {
+    const lifecyclePolicy = record(config.lifecyclePolicy);
+    if (lifecyclePolicy.mode === "per_turn") {
+      if (lifecyclePolicy.idleTimeoutMs !== null) {
+        throw new Error("capability_live_checkpoint_corrupt: per-turn idle timeout must be null");
+      }
+    } else if (
+      lifecyclePolicy.mode !== "warm"
+      || !Number.isSafeInteger(lifecyclePolicy.idleTimeoutMs)
+      || Number(lifecyclePolicy.idleTimeoutMs) <= 0
+    ) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid lifecycle policy");
+    }
   }
   if (typeof snapshot.mockState !== "string") {
     throw new Error("capability_live_checkpoint_corrupt: invalid mockState");
@@ -613,6 +703,9 @@ export class CapabilityLiveSessionService {
       authority,
       config: {
         workingDirectory: input.workingDirectory ?? process.cwd(),
+        provider: input.provider ?? "codex",
+        driver: input.provider === "opencode" ? "opencode_server" : "codex_app_server",
+        providerVersion: input.provider === "opencode" ? "1.18.17" : null,
         ...(input.requestedModel === undefined
           ? {}
           : { requestedModel: requireNonEmpty(input.requestedModel, "requested_model") }),
@@ -621,6 +714,7 @@ export class CapabilityLiveSessionService {
         explicitClaims: authority.explicitClaims,
         seedState,
         turnTimeoutMs: input.turnTimeoutMs ?? 120_000,
+        lifecyclePolicy: input.lifecyclePolicy ?? { mode: "warm", idleTimeoutMs: 300_000 },
         toolExposure: input.toolExposure ?? "eager",
       },
       store: this.#store,
@@ -745,33 +839,35 @@ export class CapabilityLiveSessionService {
   async reset(sessionId: string): Promise<CapabilityLiveSession> {
     const session = await this.restore(sessionId);
     const config = session.snapshot().config;
-    await session.shutdown("reset");
-    this.#sessions.delete(sessionId);
-    await this.#store.delete(sessionId);
+    // Reset starts a distinct governed chat, but the prior chat is an archive,
+    // not disposable state.  Suspending preserves its provider checkpoint and
+    // authority binding so selecting it from history can restore it safely.
+    await session.suspend("reset archived prior session");
     const seedPort = CapabilityMockControlPlaneAdapter.restore(config.seedState);
     return this.create({
       seed: seedPort.snapshot(),
       workingDirectory: config.workingDirectory,
+      provider: config.provider ?? "codex",
+      ...(config.requestedModel === undefined ? {} : { requestedModel: config.requestedModel }),
       scenario: config.scenario,
       capabilities: config.capabilities,
       explicitClaims: config.explicitClaims,
       turnTimeoutMs: config.turnTimeoutMs,
+      lifecyclePolicy: config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
       toolExposure: config.toolExposure ?? "eager",
     });
   }
 
   async stop(sessionId: string, reason = "operator stopped session"): Promise<CapabilityLiveSessionSnapshot> {
     const session = await this.restore(sessionId);
-    await session.shutdown(reason);
-    this.#sessions.delete(sessionId);
+    await session.suspend(reason);
     return session.snapshot();
   }
 
   async shutdown(sessionId: string, reason = "service shutdown"): Promise<void> {
     const session = this.#sessions.get(sessionId);
     if (session === undefined) return;
-    await session.shutdown(reason);
-    this.#sessions.delete(sessionId);
+    await session.suspend(reason);
   }
 }
 
@@ -807,6 +903,8 @@ export class CapabilityLiveSession {
   readonly #terminalTurns: CapabilityLiveTurnTerminalFact[];
   readonly #usageLedger: CapabilityLiveUsageReceipt[];
   readonly #stateHistory: CapabilityLiveStateRevision[];
+  readonly #workspaceDiffs: CapabilityLiveWorkspaceDiffEntry[];
+  readonly #workspaceFileReferences: CapabilityLiveWorkspaceFileReferenceEntry[];
   #currentAttemptId: string;
   #transport: CodexAppServerTransport | null = null;
   #processEvidence: CapabilityRunnerdProcessEvidence | null = null;
@@ -826,6 +924,7 @@ export class CapabilityLiveSession {
   #turnEventCount = 0;
   readonly #rawUsageByTurn = new Map<string, { providerRequests: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number }>();
   #latestCumulativeUsage: Record<string, unknown> = {};
+  #idleTimer: ReturnType<typeof setTimeout> | null = null;
   readonly #loadedOperationIds = new Set<string>();
 
   private constructor(options: OpenSessionOptions & { snapshot?: CapabilityLiveSessionSnapshot }) {
@@ -864,6 +963,8 @@ export class CapabilityLiveSession {
       operationId: "session.open",
       state: this.#port.serialize(),
     }]);
+    this.#workspaceDiffs = structuredClone(options.snapshot?.workspaceDiffs ?? []);
+    this.#workspaceFileReferences = structuredClone(options.snapshot?.workspaceFileReferences ?? []);
     for (const operationId of options.snapshot?.loadedOperationIds ?? []) this.#loadedOperationIds.add(operationId);
     this.#providerThreadId = options.snapshot?.providerThreadId ?? "";
     this.#providerSessionId = options.snapshot?.providerSessionId ?? null;
@@ -1033,6 +1134,8 @@ export class CapabilityLiveSession {
       terminalTurns: structuredClone(this.#terminalTurns),
       usageLedger: structuredClone(this.#usageLedger),
       stateHistory: structuredClone(this.#stateHistory),
+      workspaceDiffs: structuredClone(this.#workspaceDiffs),
+      workspaceFileReferences: structuredClone(this.#workspaceFileReferences),
       loadedOperationIds: [...this.#loadedOperationIds].sort(),
     };
   }
@@ -1093,6 +1196,9 @@ export class CapabilityLiveSession {
   async sendMessage(message: string): Promise<CapabilityLiveTurnResult> {
     const value = message.trim();
     if (value.length === 0) throw new Error("Capability live messages cannot be empty");
+    if (this.#status === "suspended" || this.#transport === null) {
+      await this.#connect(true);
+    }
     if (this.#transport === null || this.#status === "closed" || this.#status === "failed") {
       throw new Error("Capability live session is not connected");
     }
@@ -1100,13 +1206,23 @@ export class CapabilityLiveSession {
       throw new Error("Capability live session already has an active turn");
     }
     this.#status = "running";
+    this.#clearIdleTimer();
     this.#turnEventCount = 0;
+    // Start the baseline before admitting provider work, but do not make turn
+    // interruption wait for a potentially large workspace walk. The provider
+    // turn id is bound first; the terminal path waits for this baseline before
+    // comparing the post-turn workspace.
+    const workspaceBeforePromise = capturePaperclipWorkspace(this.#config.workingDirectory);
     // Held by id, not by position: a provider can start streaming before
     // `turn/start` resolves, in which case the assistant draft is already the
     // last transcript entry and the user message would never learn its turn.
     const userEntryId = this.#appendTranscript("user", value, null);
     let response: Record<string, unknown>;
     const terminal = this.#armTurnWaiter();
+    // Workspace capture can outlive a deliberately tiny test timeout. Attach
+    // a rejection observer immediately; the authoritative await below still
+    // propagates the same error to the caller.
+    void terminal.catch(() => undefined);
     try {
       response = await this.#transport.request("turn/start", {
         threadId: this.#providerThreadId,
@@ -1136,11 +1252,75 @@ export class CapabilityLiveSession {
     const draft =
       draftId === null ? undefined : this.#transcript.find((entry) => entry.id === draftId);
     if (draft !== undefined && draft.turnId === null) draft.turnId = turnId;
+    const workspaceBefore = await workspaceBeforePromise;
     await this.#persist();
     const result = await terminal;
+    const workspaceFileReferences = await discoverPaperclipWorkspaceFileReferences(
+      this.#config.workingDirectory,
+      result.assistantText,
+      result.turnId,
+    );
+    for (const reference of workspaceFileReferences) {
+      this.#workspaceFileReferences.push({
+        turnId: result.turnId,
+        at: this.#now().toISOString(),
+        reference: {
+          ...reference,
+          preview: reference.preview === null ? null : redactCodexDiagnostic(reference.preview),
+        },
+      });
+    }
+    const workspaceAfter = await capturePaperclipWorkspace(this.#config.workingDirectory);
+    const workspaceDiff = diffPaperclipWorkspace(
+      workspaceBefore,
+      workspaceAfter,
+      `${this.id}:${result.turnId}:workspace`,
+    );
+    if (workspaceDiff !== null) {
+      this.#workspaceDiffs.push({
+        turnId: result.turnId,
+        at: this.#now().toISOString(),
+        diff: {
+          ...workspaceDiff,
+          files: workspaceDiff.files.map((file) => ({
+            ...file,
+            diff: file.diff === null ? null : redactCodexDiagnostic(file.diff),
+          })),
+        },
+      });
+    }
     await this.#captureTurnUsage(result.turnId);
     await this.#persist();
+    await this.#afterTurnSettled();
     return { ...result, snapshot: this.snapshot() };
+  }
+
+  async #afterTurnSettled(): Promise<void> {
+    const policy = this.#config.lifecyclePolicy ?? { mode: "per_turn" as const, idleTimeoutMs: null };
+    if (policy.mode === "per_turn") {
+      await this.suspend("per-turn lifecycle completed");
+      return;
+    }
+    this.#status = this.pendingInteractions().length > 0 ? "waiting_input" : "warm_idle";
+    this.#armIdleTimer(policy.idleTimeoutMs);
+    await this.#persist();
+  }
+
+  #clearIdleTimer(): void {
+    if (this.#idleTimer !== null) clearTimeout(this.#idleTimer);
+    this.#idleTimer = null;
+  }
+
+  #armIdleTimer(timeoutMs: number): void {
+    this.#clearIdleTimer();
+    this.#idleTimer = setTimeout(() => {
+      this.#idleTimer = null;
+      void this.suspend("warm session idle timeout").catch((error) => {
+        this.#appendEvidence("diagnostic", this.#activeTurnId, {
+          message: redactCodexDiagnostic(String(error)),
+        });
+      });
+    }, timeoutMs);
   }
 
   async #captureTurnUsage(turnId: string): Promise<void> {
@@ -1294,6 +1474,7 @@ export class CapabilityLiveSession {
     const result = await terminal;
     if (result.turnId !== turnId) throw new Error("capability_live_provider_session_drift: terminal turn mismatch");
     await this.#persist();
+    await this.#afterTurnSettled();
     return { ...result, snapshot: this.snapshot() };
   }
 
@@ -1354,7 +1535,25 @@ export class CapabilityLiveSession {
     await this.#connect(true);
   }
 
+  async suspend(reason = "session suspended"): Promise<void> {
+    if (this.#status === "closed" || this.#status === "failed" || this.#status === "suspended") return;
+    this.#clearIdleTimer();
+    this.#status = "suspending";
+    await this.#persist();
+    await this.#disconnect(reason);
+    this.#status = "suspended";
+    this.#appendEvidence("cleanup", null, {
+      reason,
+      authorityCleared: false,
+      mockStopped: false,
+      processExited: this.#processEvidence?.runnerExited ?? true,
+      resumable: true,
+    });
+    await this.#persist();
+  }
+
   async shutdown(reason: string): Promise<void> {
+    this.#clearIdleTimer();
     if (this.#activeTurnId !== null) {
       try {
         await this.interrupt(reason);
@@ -1378,10 +1577,12 @@ export class CapabilityLiveSession {
   }
 
   async #connect(resume: boolean): Promise<void> {
-    this.#status = "starting";
+    this.#status = resume ? "restoring" : "starting";
     const identityDigest = createHash("sha256").update(this.id).digest("hex").slice(0, 20);
     const transportBundle = this.#transportFactory({
       ...this.#transportOptions,
+      provider: this.#config.provider ?? this.#transportOptions.provider ?? "codex",
+      lifecyclePolicy: this.#config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
       stateDirectory: resolve(this.#config.workingDirectory, ".paperclip-runner-prp", identityDigest),
       prpIdentity: {
         runnerInstanceId: `runner_lab_${identityDigest}`,
@@ -1504,7 +1705,7 @@ export class CapabilityLiveSession {
       sessionId: this.id,
       providerThreadId: this.#providerThreadId,
       providerSessionId: this.#providerSessionId,
-      mode: "live_codex",
+      mode: `live_${this.#config.provider ?? "codex"}`,
       runner: "paperclip-runnerd",
       requestedModel: this.#config.requestedModel ?? null,
       controlPlane: "mock",

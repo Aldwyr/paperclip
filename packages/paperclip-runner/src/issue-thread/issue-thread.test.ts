@@ -22,6 +22,8 @@ const REQUIRED_ITEM_KINDS: Array<CapabilityThreadItem["kind"]> = [
   "agent_message",
   "durable_comment",
   "tool_activity",
+  "workspace_changes",
+  "workspace_file_reference",
   "interaction",
   "document",
   "deliverable",
@@ -59,9 +61,9 @@ function credentialLike(value: unknown): string[] {
 }
 
 describe("Capability issue-thread fixtures", () => {
-  it("exposes exactly the twelve screenshot slugs from the UX contract §10.2", () => {
-    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(12);
-    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(12);
+  it("exposes every screenshot slug exactly once", () => {
+    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(14);
+    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(14);
   });
 
   it("builds a schema-valid snapshot for every slug", () => {
@@ -163,6 +165,34 @@ describe("Capability issue-thread fixtures", () => {
     for (const slug of CAPABILITY_UI_SHOT_SLUGS) {
       expect(credentialLike(capabilityIssueThreadFixture(slug)), slug).toEqual([]);
     }
+  });
+
+  it("includes a reviewable workspace-change scenario", () => {
+    const snapshot = capabilityIssueThreadFixture("workspace-file-changes");
+    const item = allItems(snapshot).find((candidate) => candidate.kind === "workspace_changes");
+    expect(item?.kind).toBe("workspace_changes");
+    if (item?.kind !== "workspace_changes") return;
+    expect(item.changeSet.files).toHaveLength(4);
+    expect(item.changeSet.source).toBe("runner_verified");
+    expect(item.changeSet.files[0]?.diff).toContain("diff --git");
+    expect(allItems(capabilityIssueThreadFixture("thread-baseline", "wc-workspace-changes")))
+      .toEqual(allItems(snapshot));
+  });
+
+  it("includes a verified individual-file reference scenario", () => {
+    const snapshot = capabilityIssueThreadFixture("workspace-file-reference");
+    const item = allItems(snapshot).find((candidate) => candidate.kind === "workspace_file_reference");
+    expect(item?.kind).toBe("workspace_file_reference");
+    if (item?.kind !== "workspace_file_reference") return;
+    expect(item.reference).toMatchObject({
+      schema: "paperclip.workspace.file_reference.v1",
+      source: "runner_verified",
+      path: "docs/paperclip-runner-protocol.md",
+      presentation: "document",
+    });
+    expect(item.reference.preview).toContain("# Paperclip Runner Protocol");
+    expect(allItems(capabilityIssueThreadFixture("thread-baseline", "fr-file-reference")))
+      .toEqual(allItems(snapshot));
   });
 });
 
@@ -345,7 +375,22 @@ describe("Capability live projection", () => {
   }
 
   it("projects mock records into the same view contract the fixtures use", async () => {
-    const view = projectCapabilityIssueThread({ snapshot: await liveSnapshot() });
+    const snapshot = await liveSnapshot();
+    snapshot.workspaceDiffs = [{
+      turnId: "turn-1",
+      at: "2026-08-09T09:00:35.000Z",
+      diff: {
+        schema: "paperclip.workspace.diff.v1",
+        changeSetId: "turn-1:workspace",
+        revision: 1,
+        source: "runner_verified",
+        complete: true,
+        files: [{ path: "src/index.ts", operation: "modify", previousPath: null, additions: 1, deletions: 1, binary: false, diff: "-old\n+new\n" }],
+        totals: { files: 1, additions: 1, deletions: 1 },
+        patchArtifactRef: null,
+      },
+    }];
+    const view = projectCapabilityIssueThread({ snapshot });
 
     expect(view.schema).toBe(CAPABILITY_ISSUE_THREAD_VIEW_SCHEMA);
     expect(view.mode).toBe("live");
@@ -357,6 +402,10 @@ describe("Capability live projection", () => {
     expect(items.filter((item) => item.kind === "user_message")).toHaveLength(1);
     expect(items.some((item) => item.kind === "agent_message")).toBe(true);
     expect(items.some((item) => item.kind === "tool_activity")).toBe(true);
+    expect(items.find((item) => item.kind === "workspace_changes")).toMatchObject({
+      kind: "workspace_changes",
+      changeSet: { source: "runner_verified", totals: { files: 1 } },
+    });
 
     const progress = items.find((item) => item.kind === "progress_activity");
     expect(progress).toMatchObject({
@@ -378,6 +427,21 @@ describe("Capability live projection", () => {
       expect(durable.body).toBe("Read the mock task.");
       expect(durable.operationId).toBe("report_progress");
     }
+  });
+
+  it("uses the persisted harness provider for live agent identity", async () => {
+    const snapshot = await liveSnapshot();
+    snapshot.config.provider = "opencode";
+    snapshot.config.driver = "opencode_server";
+    snapshot.status = "running";
+    snapshot.activeTurnId = "turn-1";
+    const view = projectCapabilityIssueThread({ snapshot });
+
+    expect(view.identity.agentLabel).toBe("Real OpenCode");
+    expect(allItems(view).find((item) => item.kind === "agent_message"))
+      .toMatchObject({ author: "Real OpenCode" });
+    expect(view.composer.helper).toBe("OpenCode is working — send to steer, or stop the turn.");
+    expect(JSON.stringify(view)).not.toContain("Codex");
   });
 
   it("hides the synthetic interaction-result message from the thread", async () => {

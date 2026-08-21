@@ -21,6 +21,7 @@ describe("toolTaxonomy", () => {
       verbLabel: "Running a command",
     });
     expect(toolTaxonomy("Shell").family).toBe("terminal");
+    expect(toolTaxonomy("command").family).toBe("terminal");
 
     expect(toolTaxonomy("Grep")).toEqual({
       family: "grep",

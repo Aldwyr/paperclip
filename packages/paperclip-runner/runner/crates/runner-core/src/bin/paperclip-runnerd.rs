@@ -65,6 +65,13 @@ fn duration_value(args: &[String], name: &str, default: u64) -> Result<Duration,
     ))
 }
 
+fn optional_duration_value(
+    args: &[String],
+    name: &str,
+) -> Result<Option<Duration>, LocalRunnerError> {
+    Ok(optional_u64(args, name)?.map(Duration::from_millis))
+}
+
 fn repeated_values(args: &[String], name: &str) -> Result<Vec<String>, LocalRunnerError> {
     let mut values = Vec::new();
     let mut index = 0;
@@ -189,6 +196,35 @@ fn run_durable_mode(
     args: &[String],
     bootstrap_ticket: Option<BootstrapTicket>,
 ) -> Result<(), LocalRunnerError> {
+    let lifecycle_mode = args
+        .iter()
+        .position(|argument| argument == "--lifecycle-mode")
+        .map(|index| {
+            args.get(index + 1)
+                .cloned()
+                .ok_or_else(|| LocalRunnerError::invalid("missing value for --lifecycle-mode"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| "per_turn".to_owned());
+    if lifecycle_mode != "per_turn" && lifecycle_mode != "warm" {
+        return Err(LocalRunnerError::invalid(
+            "--lifecycle-mode must be per_turn or warm",
+        ));
+    }
+    let idle_timeout = optional_duration_value(args, "--idle-timeout-ms")?;
+    if lifecycle_mode == "warm" && idle_timeout.is_none() {
+        return Err(LocalRunnerError::invalid(
+            "warm lifecycle requires --idle-timeout-ms",
+        ));
+    }
+    if lifecycle_mode == "per_turn" && idle_timeout.is_some() {
+        return Err(LocalRunnerError::invalid(
+            "per_turn lifecycle does not accept --idle-timeout-ms",
+        ));
+    }
+    let max_runtime = optional_duration_value(args, "--max-lifetime-ms")?
+        .or(optional_duration_value(args, "--max-runtime-ms")?)
+        .unwrap_or(Duration::MAX);
     let config = DurableRunnerConfig {
         connect_url: value(args, "--connect-url")?,
         state_dir: PathBuf::from(value(args, "--state-dir")?),
@@ -214,7 +250,9 @@ fn run_durable_mode(
         p0_reserve_bytes: usize_value(args, "--p0-reserve-bytes", 32 * 1024)?,
         max_frame_bytes: usize_value(args, "--max-frame-bytes", 1024 * 1024)?,
         reconnect_delay: duration_value(args, "--reconnect-delay-ms", 25)?,
-        max_runtime: duration_value(args, "--max-runtime-ms", 15_000)?,
+        max_runtime,
+        lifecycle_mode,
+        idle_timeout,
     };
     let bootstrap_ticket = bootstrap_ticket
         .ok_or_else(|| LocalRunnerError::invalid("runner bootstrap ticket is not available"))?;

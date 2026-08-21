@@ -11,6 +11,7 @@
     "type": {
       "enum": [
         "run.prepare",
+        "run.attach",
         "session.open",
         "turn.start",
         "turn.steer",
@@ -23,6 +24,7 @@
         "session.close",
         "run.cancel",
         "runner.drain",
+        "runner.suspend",
         "runner.shutdown"
       ]
     },

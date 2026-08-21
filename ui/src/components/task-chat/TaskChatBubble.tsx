@@ -29,6 +29,8 @@ interface TaskChatBubbleProps {
    * Supplied by TaskChatThreadView when `item.attachedTurn` is set.
    */
   attachedTurn?: ReactNode;
+  /** New-runner Worked header, rendered above the durable final response. */
+  beforeTurn?: ReactNode;
   /**
    * copy · 👍 · 👎 controls for an agent bubble's footer line (PAP-413).
    * Rendered here only for a runless reply (leading the bare timestamp); when
@@ -63,7 +65,7 @@ function galleryItemForImage(src: string, name?: string): GalleryMediaItem {
   };
 }
 
-export function TaskChatBubble({ item, queuedAction, attachedTurn, actions }: TaskChatBubbleProps) {
+export function TaskChatBubble({ item, queuedAction, attachedTurn, beforeTurn, actions }: TaskChatBubbleProps) {
   // Clicking an embedded image opens the full-screen lightbox (with download);
   // arrow keys walk across the other images in the same bubble.
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
@@ -96,6 +98,7 @@ export function TaskChatBubble({ item, queuedAction, attachedTurn, actions }: Ta
     : Math.max(0, galleryItems.findIndex((galleryItem) => galleryItem.contentPath === lightboxSrc));
   return (
     <div className={cn("tc-enter-bubble flex w-full flex-col gap-1", isHuman ? "items-end" : "items-start")}>
+      {beforeTurn ? <div className="w-full pb-1">{beforeTurn}</div> : null}
       {!isHuman && item.authorName ? (
         <span className="flex items-center gap-2 px-1">
           <Avatar size="sm" className="shrink-0" data-testid="task-chat-agent-avatar">

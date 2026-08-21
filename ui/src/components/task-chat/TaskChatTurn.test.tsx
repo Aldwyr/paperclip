@@ -124,6 +124,13 @@ describe("TaskChatTurn", () => {
     expect(fold()?.getAttribute("data-folded")).toBe("true");
   });
 
+  it("renders the new-runner settled header as Worked for N above the response", () => {
+    renderTurn({ ...SETTLED, standaloneHeader: true });
+    expect(summaryBtn()?.textContent).toContain("Worked for 38s");
+    expect(summaryBtn()?.textContent).not.toContain("3 tools");
+    expect(fold()?.getAttribute("data-folded")).toBe("true");
+  });
+
   it("toggles open on summary click", () => {
     renderTurn(SETTLED);
     flushSync(() => summaryBtn()!.click());

@@ -21,6 +21,7 @@ import {
   recallSession,
   rememberSession,
   type CapabilityCleanRoomIdentity,
+  type CapabilityHarnessConfiguration,
 } from "./live-client";
 import { parseCapabilityRoute, capabilityRouteHref, type CapabilityRoute } from "./route";
 import { SurfaceNav, type CapabilityChatHistoryItem } from "./SurfaceNav";
@@ -47,8 +48,13 @@ const REPLAY_STEP_MS = 800;
 const PENDING_ANNOUNCEMENT = "A request is waiting for your answer.";
 const ANSWERED_ANNOUNCEMENT = "Your answer was recorded.";
 const SETTLED_ANNOUNCEMENT = "The pending request is resolved.";
-const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts"];
+const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts", "wc-workspace-changes", "fr-file-reference"];
 const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
+const CHAT_HARNESS_KEY = "paperclip-runner.capability.chat.harness.v1";
+const MODEL_PRESETS = {
+  codex: ["gpt-5.4-mini", "gpt-5.4"],
+  opencode: ["openrouter/deepseek/deepseek-v4-flash-0731"],
+} as const;
 
 interface EmbeddedEvalCheck {
   id: string;
@@ -105,6 +111,40 @@ interface StoredChatSession {
   snapshot: CapabilityIssueThreadSnapshot;
   identity: CapabilityCleanRoomIdentity | null;
   updatedAt: string;
+  configuration?: CapabilityHarnessConfiguration;
+}
+
+function defaultHarness(provider: CapabilityHarnessConfiguration["provider"] = "codex"): CapabilityHarnessConfiguration {
+  return {
+    provider,
+    model: MODEL_PRESETS[provider][0],
+    lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+  };
+}
+
+function readHarnessConfiguration(): CapabilityHarnessConfiguration {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(CHAT_HARNESS_KEY) ?? "null") as Partial<CapabilityHarnessConfiguration> | null;
+    if (value && (value.provider === "codex" || value.provider === "opencode") && typeof value.model === "string") {
+      const lifecyclePolicy = value.lifecyclePolicy?.mode === "per_turn"
+        ? { mode: "per_turn" as const, idleTimeoutMs: null }
+        : value.lifecyclePolicy?.mode === "warm" && Number.isSafeInteger(value.lifecyclePolicy.idleTimeoutMs) && Number(value.lifecyclePolicy.idleTimeoutMs) > 0
+          ? { mode: "warm" as const, idleTimeoutMs: Number(value.lifecyclePolicy.idleTimeoutMs) }
+          : { mode: "warm" as const, idleTimeoutMs: 300_000 };
+      return { provider: value.provider, model: value.model, lifecyclePolicy };
+    }
+  } catch {
+    // Invalid preferences fall back to the qualified defaults.
+  }
+  return defaultHarness();
+}
+
+function persistHarnessConfiguration(configuration: CapabilityHarnessConfiguration): void {
+  try {
+    window.localStorage.setItem(CHAT_HARNESS_KEY, JSON.stringify(configuration));
+  } catch {
+    // Provider/model preference is convenient but not authority-bearing.
+  }
 }
 
 function readChatHistory(): StoredChatSession[] {
@@ -180,8 +220,9 @@ function settledAnnouncement(snapshot: CapabilityIssueThreadSnapshot, interactio
 }
 
 function currentTurnActivity(snapshot: CapabilityIssueThreadSnapshot): string {
+  const harness = snapshot.identity.agentLabel.replace(/^Real /, "");
   const turn = snapshot.turns.at(-1);
-  if (turn === undefined) return "Dispatching turn to Codex";
+  if (turn === undefined) return `Dispatching turn to ${harness}`;
   const activity = [...turn.items].reverse().find((item) =>
     item.kind === "tool_activity" || item.kind === "progress_activity" ||
     (item.kind === "agent_message" && item.streaming),
@@ -192,8 +233,8 @@ function currentTurnActivity(snapshot: CapabilityIssueThreadSnapshot): string {
       : `Paperclip tool completed · ${activity.operationId}`;
   }
   if (activity?.kind === "progress_activity") return activity.summary;
-  if (activity?.kind === "agent_message") return "Receiving Codex response";
-  return "Waiting for Codex activity";
+  if (activity?.kind === "agent_message") return `Receiving ${harness} response`;
+  return `Waiting for ${harness} activity`;
 }
 
 function useRoute(): CapabilityRoute {
@@ -242,6 +283,9 @@ export function App() {
   const [snapshot, setSnapshot] = useState<CapabilityIssueThreadSnapshot | null>(null);
   const [devtools, setDevtools] = useState<CapabilityDevtoolsSnapshot | null>(null);
   const [identity, setIdentity] = useState<CapabilityCleanRoomIdentity | null>(null);
+  const initialHarnessRef = useRef<CapabilityHarnessConfiguration>(readHarnessConfiguration());
+  const [harness, setHarness] = useState<CapabilityHarnessConfiguration>(initialHarnessRef.current);
+  const [activeHarness, setActiveHarness] = useState<CapabilityHarnessConfiguration | null>(null);
   const [chatHistory, setChatHistory] = useState<StoredChatSession[]>(readChatHistory);
   const [historicSessionId, setHistoricSessionId] = useState<string | null>(null);
   const liveRoomRef = useRef<StoredChatSession | null>(null);
@@ -315,10 +359,14 @@ export function App() {
       // cannot start, the surface says so rather than rendering a canned thread.
       void (async () => {
         try {
-          const response = await capabilityLiveClient.loadCleanRoom(recallSession("cleanroom"));
+          const response = await capabilityLiveClient.loadCleanRoom(
+            recallSession("cleanroom"),
+            initialHarnessRef.current,
+          );
           if (cancelled) return;
           rememberSession(response.sessionId, "cleanroom");
           setIdentity(response.identity ?? null);
+          setActiveHarness(response.configuration ?? initialHarnessRef.current);
           setHistoricSessionId(null);
           setSnapshot(response.view);
           setSnapshotSurface("chat");
@@ -434,6 +482,7 @@ export function App() {
       snapshot,
       identity,
       updatedAt: snapshot.renderedAt,
+      ...(activeHarness === null ? {} : { configuration: activeHarness }),
     };
     liveRoomRef.current = record;
     setChatHistory((current) => {
@@ -441,7 +490,7 @@ export function App() {
       persistChatHistory(next);
       return next;
     });
-  }, [chat, historicSessionId, identity, snapshot?.renderedAt, snapshot?.sessionId]);
+  }, [activeHarness, chat, historicSessionId, identity, snapshot?.renderedAt, snapshot?.sessionId]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -659,6 +708,7 @@ export function App() {
   const adoptCleanRoom = useCallback((next: Awaited<ReturnType<typeof capabilityLiveClient.newCleanRoom>>) => {
     rememberSession(next.sessionId, "cleanroom");
     setIdentity(next.identity ?? null);
+    setActiveHarness(next.configuration ?? harness);
     setHistoricSessionId(null);
     setSnapshot(next.view);
     setDevtools(null);
@@ -666,25 +716,37 @@ export function App() {
     setAnnouncement(
       `New clean-room chat started on ${next.view.issue.identifier}. The previous session was closed.`,
     );
-  }, []);
+  }, [harness]);
 
   const newChat = useCallback(() => {
+    const model = harness.model?.trim() ?? "";
+    if (!model) {
+      setActionError("Choose or enter a model before starting a new chat.");
+      return;
+    }
+    if (harness.provider === "opencode" && !model.includes("/")) {
+      setActionError("OpenCode models must use provider/model form.");
+      return;
+    }
+    const configuration = { ...harness, model };
+    persistHarnessConfiguration(configuration);
     setConfirmReset(false);
     // The room this turn belongs to is about to be retired, so the stream is
     // dropped before the request that retires it.
     abandonTurn();
     setAnnouncement("Starting a new clean-room chat…");
     void capabilityLiveClient
-      .newCleanRoom(liveRoomRef.current?.sessionId ?? snapshot?.sessionId ?? null)
+      .newCleanRoom(liveRoomRef.current?.sessionId ?? snapshot?.sessionId ?? null, configuration)
       .then(adoptCleanRoom)
       .catch((cause) => setActionError(describe(cause)));
-  }, [abandonTurn, adoptCleanRoom, snapshot]);
+  }, [abandonTurn, adoptCleanRoom, harness, snapshot]);
 
   const selectChatHistory = useCallback((sessionId: string) => {
     const live = liveRoomRef.current;
     if (live?.sessionId === sessionId) {
       setSnapshot(live.snapshot);
       setIdentity(live.identity);
+      setActiveHarness(live.configuration ?? null);
       setDevtools(null);
       setHistoricSessionId(null);
       setActionError(null);
@@ -693,19 +755,19 @@ export function App() {
     const archived = chatHistory.find((item) => item.sessionId === sessionId);
     if (archived === undefined) return;
     abandonTurn();
-    setSnapshot({
-      ...archived.snapshot,
-      composer: {
-        state: "disabled",
-        helper: null,
-        reason: "Historical session is read-only",
-        pendingInteractionId: null,
-      },
-    });
-    setIdentity(archived.identity);
-    setDevtools(null);
-    setHistoricSessionId(sessionId);
-    setActionError(null);
+    const configuration = archived.configuration ?? defaultHarness();
+    void capabilityLiveClient.loadCleanRoom(sessionId, configuration)
+      .then((restored) => {
+        rememberSession(restored.sessionId, "cleanroom");
+        setSnapshot(restored.view);
+        setIdentity(restored.identity ?? archived.identity);
+        setActiveHarness(restored.configuration ?? configuration);
+        setDevtools(null);
+        setHistoricSessionId(null);
+        setActionError(null);
+        setAnnouncement("Archived chat restored. The runner will resume when you send a message.");
+      })
+      .catch((cause) => setActionError(describe(cause)));
   }, [abandonTurn, chatHistory]);
 
   const reset = useCallback(() => {
@@ -829,12 +891,12 @@ export function App() {
         <main className="pit-app-error">
           <p className="pit-composer-reason" role="alert" data-testid="surface-error">
             {chat
-              ? `The clean-room chat could not start a real Codex session: ${error}`
+              ? `The clean-room chat could not start the selected provider: ${error}`
               : error}
           </p>
           {chat ? (
             <p className="pit-muted">
-              The clean room only runs against real Codex through real runnerd, so it does not fall
+              The clean room only runs against the selected real provider through real runnerd, so it does not fall
               back to a fixture or a recording.
             </p>
           ) : null}
@@ -859,7 +921,7 @@ export function App() {
         <main className="pit-app-error">
           <p className="pit-muted" role="status" data-testid="surface-loading">
             {chat
-              ? "Starting real runnerd and a real Codex session for a fresh mock tenant…"
+              ? "Starting real runnerd and the selected provider for a fresh mock tenant…"
               : "Loading…"}
           </p>
         </main>
@@ -916,6 +978,95 @@ export function App() {
         onStop={stop}
         onSelectSegment={setSegment}
       />
+
+      {chat && embeddedEval === null ? (
+        <section className="pit-harness-picker" aria-label="Chat provider and model">
+          <label>
+            <span>Provider</span>
+            <select
+              data-testid="chat-provider"
+              value={harness.provider}
+              disabled={streamingTurn}
+              onChange={(event) => {
+                const provider = event.target.value as CapabilityHarnessConfiguration["provider"];
+                setHarness((current) => ({
+                  ...defaultHarness(provider),
+                  lifecyclePolicy: current.lifecyclePolicy,
+                }));
+              }}
+            >
+              <option value="codex">Codex</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+          </label>
+          <label>
+            <span>Execution</span>
+            <select
+              data-testid="chat-lifecycle-mode"
+              value={harness.lifecyclePolicy.mode}
+              disabled={streamingTurn}
+              onChange={(event) => setHarness((current) => ({
+                ...current,
+                lifecyclePolicy: event.target.value === "per_turn"
+                  ? { mode: "per_turn", idleTimeoutMs: null }
+                  : { mode: "warm", idleTimeoutMs: 300_000 },
+              }))}
+            >
+              <option value="warm">Warm session</option>
+              <option value="per_turn">Turn by turn</option>
+            </select>
+          </label>
+          {harness.lifecyclePolicy.mode === "warm" ? (
+            <label>
+              <span>Idle timeout (seconds)</span>
+              <input
+                data-testid="chat-idle-timeout"
+                type="number"
+                min={1}
+                step={1}
+                value={Math.round(harness.lifecyclePolicy.idleTimeoutMs / 1_000)}
+                disabled={streamingTurn}
+                onChange={(event) => {
+                  const seconds = Math.max(1, Number.parseInt(event.target.value || "1", 10));
+                  setHarness((current) => ({
+                    ...current,
+                    lifecyclePolicy: { mode: "warm", idleTimeoutMs: seconds * 1_000 },
+                  }));
+                }}
+              />
+            </label>
+          ) : null}
+          <label className="pit-harness-model">
+            <span>Model</span>
+            <input
+              data-testid="chat-model"
+              list={`chat-models-${harness.provider}`}
+              value={harness.model ?? ""}
+              disabled={streamingTurn}
+              placeholder={harness.provider === "opencode" ? "provider/model" : "model name"}
+              onChange={(event) => setHarness((current) => ({ ...current, model: event.target.value }))}
+            />
+            <datalist id={`chat-models-${harness.provider}`}>
+              {MODEL_PRESETS[harness.provider].map((model) => <option key={model} value={model} />)}
+            </datalist>
+          </label>
+          <button
+            type="button"
+            className="pit-button"
+            data-variant="primary"
+            data-testid="chat-apply-harness"
+            disabled={streamingTurn || historicSessionId !== null}
+            onClick={newChat}
+          >
+            Start new chat
+          </button>
+          <span className="pit-harness-active" data-testid="chat-active-harness">
+            Active: {activeHarness?.provider ?? "starting"}
+            {activeHarness?.model ? ` · ${activeHarness.model}` : ""}
+            {activeHarness ? ` · ${activeHarness.lifecyclePolicy.mode === "warm" ? `warm ${Math.round(activeHarness.lifecyclePolicy.idleTimeoutMs / 1_000)}s` : "turn by turn"}` : ""}
+          </span>
+        </section>
+      ) : null}
 
       {embeddedEval !== null ? (
         <nav className="pit-eval-nav" aria-label="Eval result navigation">
@@ -1039,7 +1190,7 @@ export function App() {
                       recorded yet.
                     </p>
                     <p className="pit-muted">
-                      Your first message starts a real Codex turn through real runnerd. Codex may
+                      Your first message starts a real {snapshot.identity.agentLabel.replace(/^Real /, "")} turn through real runnerd. The agent may
                       call the semantic tools this session exposes, and every record it creates lands
                       in the mock control plane only — never a real Paperclip API. Detailed tool,
                       policy, event, and state evidence stays in the Evidence drawer until you open

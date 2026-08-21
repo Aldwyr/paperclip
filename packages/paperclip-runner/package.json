@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "paperclip-runner-eval-session": "./dist/cli/eval-session.js"
+    "paperclip-runner-eval-session": "./dist/cli/eval-session.js",
+    "paperclip-runner-opencode-proxy": "./dist/cli/opencode-app-server-proxy.js"
   },
   "exports": {
     ".": {

@@ -514,6 +514,7 @@ function composerModel(
   mode: CapabilityThreadMode,
   pendingInteractionId: string | null,
   terminal: boolean,
+  providerName: string,
 ): CapabilityComposerModel {
   if (mode === "replay") {
     return { state: "disabled", helper: null, reason: "Replay is read-only", pendingInteractionId: null };
@@ -532,6 +533,16 @@ function composerModel(
       helper: null,
       reason: "Session is closed",
       pendingInteractionId: null,
+    };
+  }
+  if (snapshot.status === "suspended" || snapshot.status === "suspending") {
+    return {
+      state: snapshot.status === "suspending" ? "reconnecting" : "ready",
+      helper: snapshot.status === "suspended"
+        ? "Runner suspended — your next message will restore this provider session."
+        : "Suspending runner after durable flush…",
+      reason: null,
+      pendingInteractionId,
     };
   }
   if (terminal) {
@@ -556,7 +567,7 @@ function composerModel(
   if (snapshot.activeTurnId !== null || snapshot.status === "running") {
     return {
       state: "streaming",
-      helper: "Codex is working — send to steer, or stop the turn.",
+      helper: `${providerName} is working — send to steer, or stop the turn.`,
       reason: null,
       pendingInteractionId: null,
     };
@@ -707,6 +718,11 @@ export function projectCapabilityIssueThread(
 ): CapabilityIssueThreadSnapshot {
   const { snapshot } = input;
   const mode = input.mode ?? "live";
+  const agentLabel = mode === "live"
+    ? snapshot.config.provider === "opencode" || snapshot.config.driver === "opencode_server"
+      ? "Real OpenCode"
+      : "Real Codex"
+    : mode === "replay" ? "Replay" : "Fake agent";
   const connection = input.connection ?? { state: "connected", attempt: 0 };
   const state = parseMockState(snapshot.mockState);
   const calls = collectCalls(snapshot.evidence);
@@ -752,7 +768,7 @@ export function projectCapabilityIssueThread(
         kind: "agent_message",
         id: entry.id,
         at: entry.at,
-        author: mode === "live" ? "Real Codex" : "Fake agent",
+        author: agentLabel,
         body: entry.text,
         streaming: snapshot.activeTurnId !== null && entry.turnId === snapshot.activeTurnId,
       });
@@ -803,6 +819,7 @@ export function projectCapabilityIssueThread(
   }
   for (const group of progressGroups.values()) {
     const copy = PROGRESS_EVENTS[group.event];
+    const providerName = agentLabel.replace(/^Real /, "");
     const running = snapshot.activeTurnId === group.turnId && !group.event.endsWith("_completed");
     turnFor(group.turnId, group.at).items.push({
       kind: "progress_activity",
@@ -810,10 +827,28 @@ export function projectCapabilityIssueThread(
       at: group.at,
       activity: copy.activity,
       status: running ? "running" : "complete",
-      label: copy.label,
-      summary: running ? copy.running : copy.complete,
+      label: copy.label.replaceAll("Codex", providerName),
+      summary: (running ? copy.running : copy.complete).replaceAll("Codex", providerName),
       eventCount: group.count,
       details: group.details,
+    });
+  }
+
+  for (const entry of snapshot.workspaceDiffs ?? []) {
+    turnFor(entry.turnId, entry.at).items.push({
+      kind: "workspace_changes",
+      id: `item-workspace-${entry.diff.changeSetId}`,
+      at: entry.at,
+      changeSet: structuredClone(entry.diff),
+    });
+  }
+
+  for (const entry of snapshot.workspaceFileReferences ?? []) {
+    turnFor(entry.turnId, entry.at).items.push({
+      kind: "workspace_file_reference",
+      id: `item-file-reference-${entry.reference.referenceId}`,
+      at: entry.at,
+      reference: structuredClone(entry.reference),
     });
   }
 
@@ -841,9 +876,9 @@ export function projectCapabilityIssueThread(
     sessionId: snapshot.sessionId,
     mode,
     identity: {
-      agentLabel: mode === "live" ? "Real Codex" : mode === "replay" ? "Replay" : "Fake agent",
+      agentLabel,
       runnerLabel: mode === "live" ? "Real runnerd" : "In-process runner",
-      runnerAttached: snapshot.status === "idle" || snapshot.status === "running",
+      runnerAttached: ["idle", "warm_idle", "waiting_input", "running"].includes(snapshot.status),
       controlPlaneLabel: "Mock Paperclip",
       controlPlaneTooltip: "All issue records are mock. No real Paperclip API is reachable.",
       replaySource: input.replaySource ?? null,
@@ -866,6 +901,7 @@ export function projectCapabilityIssueThread(
       mode,
       pendingInteraction?.id ?? null,
       terminal,
+      agentLabel.replace(/^Real /, ""),
     ),
     evidence: evidenceModel(snapshot, state, calls, input),
     connection,

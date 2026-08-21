@@ -41,6 +41,14 @@ export interface CapabilityCleanRoomIdentity {
   identifier: string;
 }
 
+export interface CapabilityHarnessConfiguration {
+  provider: "codex" | "opencode";
+  model: string | null;
+  lifecyclePolicy:
+    | { mode: "per_turn"; idleTimeoutMs: null }
+    | { mode: "warm"; idleTimeoutMs: number };
+}
+
 export interface CapabilityLiveResponse {
   sessionId: string;
   view: CapabilityIssueThreadSnapshot;
@@ -49,6 +57,7 @@ export interface CapabilityLiveResponse {
   identity?: CapabilityCleanRoomIdentity;
   limits?: { maxTurns: number; maxMessageBytes: number };
   turns?: number;
+  configuration?: CapabilityHarnessConfiguration;
 }
 
 export interface CapabilityToolTestResponse extends CapabilityLiveResponse {
@@ -160,15 +169,21 @@ export const capabilityLiveClient = {
     return post("/session", { scenario });
   },
   /** Reconnect to a clean room, or open one when there is nothing to resume. */
-  async loadCleanRoom(sessionId: string | null): Promise<CapabilityLiveResponse> {
-    const query = sessionId === null ? "" : `?sessionId=${encodeURIComponent(sessionId)}`;
-    const response = await fetch(`${BASE}/cleanroom/session${query}`, { credentials: CREDENTIALS });
+  async loadCleanRoom(sessionId: string | null, configuration: CapabilityHarnessConfiguration): Promise<CapabilityLiveResponse> {
+    const query = new URLSearchParams({ provider: configuration.provider });
+    if (sessionId !== null) query.set("sessionId", sessionId);
+    if (configuration.model !== null) query.set("model", configuration.model);
+    query.set("lifecycleMode", configuration.lifecyclePolicy.mode);
+    if (configuration.lifecyclePolicy.mode === "warm") {
+      query.set("idleTimeoutMs", String(configuration.lifecyclePolicy.idleTimeoutMs));
+    }
+    const response = await fetch(`${BASE}/cleanroom/session?${query.toString()}`, { credentials: CREDENTIALS });
     if (!response.ok) throw await readError(response, "/cleanroom/session");
     return (await response.json()) as CapabilityLiveResponse;
   },
   /** `New chat`: retire the current room and mint a new mock tenant. */
-  newCleanRoom(sessionId: string | null): Promise<CapabilityLiveResponse> {
-    return post("/cleanroom/session", sessionId === null ? {} : { sessionId });
+  newCleanRoom(sessionId: string | null, configuration: CapabilityHarnessConfiguration): Promise<CapabilityLiveResponse> {
+    return post("/cleanroom/session", { ...(sessionId === null ? {} : { sessionId }), ...configuration });
   },
   /**
    * Runs one turn. `onFrame` fires for every interim projection the server

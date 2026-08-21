@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
@@ -8,9 +8,10 @@ import type {
   NativeExecutionInputV1,
   NativeSession,
   NativeSessionBackend,
+  PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import {
-  createCodexNativeSessionBackend,
+  createNativeSessionBackend,
   createRunnerdCodexTransport,
   executeNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
@@ -23,6 +24,7 @@ import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
+import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -36,6 +38,134 @@ type ActiveNativeSession = {
 
 const activeNativeSessions = new Map<string, ActiveNativeSession>();
 
+type WarmNativeSession = {
+  session: NativeSession;
+  configDigest: string;
+  busy: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  lastActivityAt: string;
+};
+
+const warmNativeSessions = new Map<string, WarmNativeSession>();
+
+class SessionToolAuthorityRouter {
+  #authority: PaperclipRunnerToolAuthority;
+
+  constructor(authority: PaperclipRunnerToolAuthority) {
+    this.#authority = authority;
+  }
+
+  bind(authority: PaperclipRunnerToolAuthority): void {
+    this.#authority = authority;
+  }
+
+  definitions() {
+    return this.#authority.definitions();
+  }
+
+  execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]) {
+    return this.#authority.execute(call);
+  }
+}
+
+const sessionToolRouters = new Map<string, SessionToolAuthorityRouter>();
+
+function nativeSessionKey(execution: NativeExecutionInputV1): string {
+  return execution.session.normalizedSessionId ?? `session-${execution.binding.runId}`;
+}
+
+function nativeSessionConfigDigest(execution: NativeExecutionInputV1): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify({
+    companyId: execution.binding.companyId,
+    issueId: execution.binding.issueId,
+    agentId: execution.binding.agentId,
+    workspaceId: execution.binding.executionWorkspaceId,
+    cwd: execution.workspace.cwd,
+    provider: execution.provider,
+    driverKind: execution.session.driverKind,
+    lifecyclePolicy: execution.session.lifecyclePolicy,
+  })).digest("hex")}`;
+}
+
+function nativeSessionCheckpointPath(sessionId: string): string {
+  const directory = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "sessions");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  return resolve(directory, `${createHash("sha256").update(sessionId).digest("hex")}.json`);
+}
+
+function persistWarmNativeCheckpoint(
+  sessionId: string,
+  configDigest: string,
+  snapshot: PersistedNativeSession,
+): void {
+  const path = nativeSessionCheckpointPath(sessionId);
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify({
+    schema: "paperclip.native-session-supervisor.v1",
+    configDigest,
+    updatedAt: new Date().toISOString(),
+    snapshot,
+  }), { encoding: "utf8", mode: 0o600 });
+  renameSync(temporary, path);
+  chmodSync(path, 0o600);
+}
+
+function loadWarmNativeCheckpoint(
+  execution: NativeExecutionInputV1,
+  configDigest: string,
+): PersistedNativeSession | null {
+  const path = nativeSessionCheckpointPath(nativeSessionKey(execution));
+  if (!existsSync(path)) return null;
+  const envelope = JSON.parse(readFileSync(path, "utf8")) as {
+    schema?: string;
+    configDigest?: string;
+    snapshot?: PersistedNativeSession;
+  };
+  if (envelope.schema !== "paperclip.native-session-supervisor.v1" || envelope.configDigest !== configDigest || !envelope.snapshot) {
+    throw new Error("native_session_supervisor_checkpoint_mismatch");
+  }
+  return {
+    ...envelope.snapshot,
+    identity: {
+      runId: execution.binding.runId,
+      sessionId: nativeSessionKey(execution),
+      companyId: execution.binding.companyId,
+      issueId: execution.binding.issueId,
+      agentId: execution.binding.agentId,
+    },
+    semanticResult: null,
+    terminal: null,
+    activeTurnId: null,
+    terminalTurns: [],
+    pendingRuntimeRequests: [],
+  };
+}
+
+async function releaseWarmNativeSession(
+  sessionId: string,
+  idleTimeoutMs: number,
+  failed: boolean,
+): Promise<void> {
+  const entry = warmNativeSessions.get(sessionId);
+  if (!entry) return;
+  entry.busy = false;
+  entry.lastActivityAt = new Date().toISOString();
+  if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+  if (failed) {
+    warmNativeSessions.delete(sessionId);
+    await entry.session.close({ reason: "warm native session failed" }).catch(() => undefined);
+    return;
+  }
+  entry.idleTimer = setTimeout(() => {
+    const current = warmNativeSessions.get(sessionId);
+    if (!current || current.busy) return;
+    warmNativeSessions.delete(sessionId);
+    void current.session.close({ reason: "warm native session idle timeout" });
+  }, idleTimeoutMs);
+  entry.idleTimer.unref();
+}
+
 export function nativeSessionFailureDisposition(attempt: number, now = new Date()) {
   const exhausted = attempt >= 3;
   return {
@@ -43,6 +173,24 @@ export function nativeSessionFailureDisposition(attempt: number, now = new Date(
     failureCode: exhausted ? "native_session_retry_exhausted" as const : "native_session_interrupted" as const,
     nextAttemptAt: exhausted ? null : new Date(now.getTime() + 30_000),
   };
+}
+
+export function nativeSessionFailureSourceCode(error: unknown):
+  | "provider_frame_too_large"
+  | "provider_transport_failed"
+  | "native_runner_process_exited"
+  | "native_session_interrupted" {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/provider_frame_too_large|stdout frame exceeded/i.test(message)) {
+    return "provider_frame_too_large";
+  }
+  if (/provider_transport_failed|invalid JSON-RPC|provider failed/i.test(message)) {
+    return "provider_transport_failed";
+  }
+  if (/native_runner_process_exited|runnerd exited|runner process failed/i.test(message)) {
+    return "native_runner_process_exited";
+  }
+  return "native_session_interrupted";
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -301,6 +449,25 @@ export async function executePaperclipNativeSession(input: {
       : undefined,
   });
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
+  const lifecyclePolicy = input.execution.session?.lifecyclePolicy
+    ?? { mode: "per_turn" as const, idleTimeoutMs: null };
+  const warmSessionId = lifecyclePolicy.mode === "warm" ? nativeSessionKey(input.execution) : null;
+  const warmConfigDigest = lifecyclePolicy.mode === "warm" ? nativeSessionConfigDigest(input.execution) : null;
+  let existingWarmSession: NativeSession | undefined;
+  let persistedWarmSession: PersistedNativeSession | null | undefined;
+  if (warmSessionId !== null && warmConfigDigest !== null) {
+    const entry = warmNativeSessions.get(warmSessionId);
+    if (entry) {
+      if (entry.configDigest !== warmConfigDigest) throw new Error("native_session_supervisor_config_mismatch");
+      if (entry.busy) throw new Error("native_session_supervisor_busy");
+      entry.busy = true;
+      if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+      existingWarmSession = entry.session;
+    } else {
+      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest);
+    }
+  }
   try {
     const runnerdBackend = input.useRunnerd && input.backend === undefined
       ? createRunnerdBackend(input)
@@ -309,14 +476,33 @@ export async function executePaperclipNativeSession(input: {
       input: input.execution,
       backend: input.backend
         ?? runnerdBackend
-        ?? createCodexNativeSessionBackend(input.execution, {
+        ?? createNativeSessionBackend(input.execution, {
           runnerInstanceId: input.runnerInstanceId,
           onSpawn: input.onSpawn,
+          environment: process.env,
+          opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
         }),
       controlPlane,
       runnerInstanceId: input.runnerInstanceId,
       controlPlaneInstanceId,
+      existingSession: existingWarmSession,
+      persistedSession: persistedWarmSession,
+      keepSessionOpen: warmSessionId !== null,
+      onCheckpoint: warmSessionId !== null && warmConfigDigest !== null
+        ? async (snapshot) => persistWarmNativeCheckpoint(warmSessionId, warmConfigDigest, snapshot)
+        : undefined,
       onSession: (session) => {
+        if (session && warmSessionId !== null && warmConfigDigest !== null) {
+          const existing = warmNativeSessions.get(warmSessionId);
+          if (existing) existing.session = session;
+          else warmNativeSessions.set(warmSessionId, {
+            session,
+            configDigest: warmConfigDigest,
+            busy: true,
+            idleTimer: null,
+            lastActivityAt: new Date().toISOString(),
+          });
+        }
         if (session) activeNativeSessions.set(input.execution.binding.runId, {
           session,
           cancelRequested: false,
@@ -324,11 +510,17 @@ export async function executePaperclipNativeSession(input: {
         else activeNativeSessions.delete(input.execution.binding.runId);
       },
     });
+    activeNativeSessions.delete(input.execution.binding.runId);
   } catch (error) {
+    activeNativeSessions.delete(input.execution.binding.runId);
+    if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+      await releaseWarmNativeSession(warmSessionId, lifecyclePolicy.idleTimeoutMs, true);
+    }
     const now = new Date();
     const { phase, failureCode, nextAttemptAt } = nativeSessionFailureDisposition(attempt, now);
     const exhausted = phase === "terminal_failure";
     const message = error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000);
+    const sourceFailureCode = nativeSessionFailureSourceCode(error);
     await input.db.transaction(async (tx) => {
       const updated = await tx.update(nativeRunFinalizations).set({
         phase,
@@ -337,7 +529,7 @@ export async function executePaperclipNativeSession(input: {
         failureCode,
         failureDetail: {
           message,
-          originalFailureCode: "native_session_interrupted",
+          originalFailureCode: sourceFailureCode,
           recoveryOwner: { kind: "agent", agentId: input.execution.binding.agentId },
           nextAction: exhausted
             ? "Inspect the persisted native session after its bounded resume budget was exhausted."
@@ -354,7 +546,7 @@ export async function executePaperclipNativeSession(input: {
         nativePhase: phase,
         nativePhaseUpdatedAt: now,
         error: message,
-        errorCode: failureCode,
+        errorCode: sourceFailureCode,
         updatedAt: now,
       }).where(eq(heartbeatRuns.id, input.execution.binding.runId));
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
@@ -363,11 +555,16 @@ export async function executePaperclipNativeSession(input: {
         kind: "active_run_watchdog",
         ownerType: "agent",
         ownerAgentId: input.execution.binding.agentId,
-        cause: failureCode,
+        cause: sourceFailureCode,
         fingerprint: createHash("sha256")
-          .update(`${input.execution.binding.runId}:${failureCode}`)
+          .update(`${input.execution.binding.runId}:${sourceFailureCode}`)
           .digest("hex"),
-        evidence: { runId: input.execution.binding.runId, coordinatorAttempt: attempt },
+        evidence: {
+          runId: input.execution.binding.runId,
+          coordinatorAttempt: attempt,
+          sourceFailureCode,
+          recoveryDisposition: failureCode,
+        },
         nextAction: exhausted
           ? "Inspect or explicitly restart the exhausted persisted native session."
           : "Resume the persisted native session on the same heartbeat run.",
@@ -405,6 +602,11 @@ export async function executePaperclipNativeSession(input: {
     highestContiguousSourceSeq: native.highestContiguousSourceSeq,
     workspaceFinalizeStatus: "pending",
   };
+  // A following run cannot attach until the prior run's durable finalization
+  // is committed. Provider completion alone is not an authority boundary.
+  if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
+    await releaseWarmNativeSession(warmSessionId, lifecyclePolicy.idleTimeoutMs, false);
+  }
   return {
     exitCode: native.terminal.runTerminalState === "succeeded" ? 0 : 1,
     signal: null,
@@ -419,9 +621,38 @@ export async function executePaperclipNativeSession(input: {
     summary: native.result.summary,
     sessionId: native.normalizedSessionId,
     sessionDisplayId: native.providerSessionId ?? native.normalizedSessionId,
-    provider: "openai",
+    provider: input.execution.provider.kind === "opencode"
+      ? input.execution.provider.model?.split("/", 1)[0] ?? "opencode"
+      : "openai",
+    model: input.execution.provider.model,
+    usage: normalizeNativeUsage(native.usage),
+    costUsd: numericUsageField(native.usage, ["costUsd", "cost"]),
     usageBasis: "per_run",
     nativeFinalization: finalization,
+  };
+}
+
+function numericUsageField(
+  usage: Record<string, unknown> | null,
+  keys: string[],
+): number | undefined {
+  if (!usage) return undefined;
+  for (const key of keys) {
+    const value = usage[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  }
+  return undefined;
+}
+
+function normalizeNativeUsage(usage: Record<string, unknown> | null) {
+  if (!usage) return undefined;
+  const cache = record(usage.cache);
+  const cachedInputTokens = numericUsageField(usage, ["cachedInputTokens", "cacheReadInputTokens"])
+    ?? numericUsageField(cache, ["read"]);
+  return {
+    inputTokens: numericUsageField(usage, ["inputTokens", "input", "promptTokens"]) ?? 0,
+    outputTokens: numericUsageField(usage, ["outputTokens", "output", "completionTokens"]) ?? 0,
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
   };
 }
 
@@ -437,19 +668,28 @@ function createRunnerdBackend(input: {
     runId: input.execution.binding.runId,
     agentId: input.execution.binding.agentId,
   });
+  const sessionId = nativeSessionKey(input.execution);
+  const existingRouter = sessionToolRouters.get(sessionId);
+  const authorityRouter = existingRouter ?? new SessionToolAuthorityRouter(authority);
+  authorityRouter.bind(authority);
+  sessionToolRouters.set(sessionId, authorityRouter);
   const root = resolve(
     process.env.PAPERCLIP_RUNNER_STATE_DIR ?? resolve(tmpdir(), "paperclip-runner"),
-    input.execution.binding.runId,
+    createHash("sha256").update(sessionId).digest("hex"),
   );
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  return createCodexNativeSessionBackend(input.execution, {
+  return createNativeSessionBackend(input.execution, {
     runnerInstanceId: input.runnerInstanceId,
     onSpawn: input.onSpawn,
-    dynamicTools: authority.definitions(),
-    dynamicToolHandler: (call) => authority.execute(call),
-    transportFactory: () => createRunnerdCodexTransport({
+    dynamicTools: authorityRouter.definitions(),
+    dynamicToolHandler: (call) => authorityRouter.execute(call),
+    environment: process.env,
+    opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
+    codexTransportFactory: () => createRunnerdCodexTransport({
       stateDirectory: root,
       environment: process.env,
+      lifecyclePolicy: input.execution.session.lifecyclePolicy,
+      resumeDynamicTools: authorityRouter.definitions(),
       prpIdentity: {
         runnerInstanceId: input.runnerInstanceId,
         environmentLeaseId: input.execution.binding.executionWorkspaceId,

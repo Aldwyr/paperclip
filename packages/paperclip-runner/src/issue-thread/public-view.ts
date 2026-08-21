@@ -298,6 +298,51 @@ function publicItem(item: CapabilityThreadItem, aliases: Aliases): CapabilityThr
         eventCount: item.eventCount,
         details: item.details,
       };
+    case "workspace_changes":
+      return {
+        kind: "workspace_changes",
+        id,
+        at: item.at,
+        changeSet: {
+          schema: item.changeSet.schema,
+          changeSetId: aliases.text(item.changeSet.changeSetId),
+          revision: item.changeSet.revision,
+          source: item.changeSet.source,
+          complete: item.changeSet.complete,
+          files: item.changeSet.files.map((file) => ({
+            path: clamp(file.path, 1024),
+            operation: file.operation,
+            previousPath: file.previousPath === null ? null : clamp(file.previousPath, 1024),
+            additions: file.additions,
+            deletions: file.deletions,
+            binary: file.binary,
+            diff: file.diff === null ? null : clamp(file.diff, 262_144),
+          })),
+          totals: { ...item.changeSet.totals },
+          patchArtifactRef: item.changeSet.patchArtifactRef === null
+            ? null
+            : clamp(item.changeSet.patchArtifactRef, 2048),
+        },
+      };
+    case "workspace_file_reference":
+      return {
+        kind: "workspace_file_reference",
+        id,
+        at: item.at,
+        reference: {
+          schema: item.reference.schema,
+          referenceId: aliases.text(item.reference.referenceId),
+          source: item.reference.source,
+          path: clamp(item.reference.path, 1024),
+          displayName: clamp(item.reference.displayName, 255),
+          mediaType: item.reference.mediaType === null ? null : clamp(item.reference.mediaType, 160),
+          presentation: item.reference.presentation,
+          line: item.reference.line,
+          preview: item.reference.preview === null ? null : clamp(item.reference.preview, 262_144),
+          previewTruncated: item.reference.previewTruncated,
+          contentDigest: item.reference.contentDigest,
+        },
+      };
     case "interaction":
       return {
         kind: "interaction",

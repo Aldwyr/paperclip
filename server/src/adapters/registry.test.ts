@@ -8,6 +8,19 @@ import { requireServerAdapter } from "./registry.js";
 // obey the same fail-closed contract as an external adapter.
 
 describe("built-in adapter login capabilities", () => {
+  it("publishes the qualified OpenCode runner configuration", async () => {
+    const adapter = requireServerAdapter("paperclip_runner");
+    expect(adapter.models).toContainEqual({
+      id: "openrouter/deepseek/deepseek-v4-flash-0731",
+      label: "OpenRouter · DeepSeek V4 Flash 0731",
+    });
+    expect(adapter.getRuntimeCommandSpec?.({ provider: "opencode" }))
+      .toMatchObject({ command: "opencode", installCommand: expect.stringContaining("opencode-ai@1.18.17") });
+    const schema = await adapter.getConfigSchema?.();
+    expect(schema?.fields.map((field) => field.key))
+      .toEqual(expect.arrayContaining(["provider", "model", "command"]));
+  });
+
   it("registers the Codex device-login capability", () => {
     const capability = requireServerAdapter("codex_local").loginCapability;
     expect(capability).toBeDefined();

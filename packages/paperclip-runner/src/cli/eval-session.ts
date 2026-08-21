@@ -21,6 +21,9 @@ interface EvalSessionRequest {
   attemptId: string;
   prompt: string;
   model: string;
+  provider?: "codex" | "opencode";
+  driver?: "codex_app_server" | "opencode_server";
+  opencodeVersion?: string;
   runnerd: { path: string; sha256: string };
   limits: { turnTimeoutMs: number; maxAgentTurns: number; maxEstimatedCostNanodollars: number };
   session: CreateCapabilityLiveSessionInput;
@@ -61,6 +64,8 @@ try {
     attemptId: request.attemptId,
     prompt: request.prompt,
     model: request.model,
+    provider: request.provider ?? "codex",
+    opencodeVersion: request.opencodeVersion,
     runnerBinaryPath: runnerdPath,
     seed: request.session.seed ?? {},
     actorId: request.session.actorId ?? "",
@@ -92,6 +97,9 @@ try {
     build: PAPERCLIP_RUNNER_BUILD_METADATA,
     runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
     requestedModel: request.model,
+    provider: request.provider ?? "codex",
+    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : "codex_app_server"),
+    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : null,
     turn,
     snapshot,
     devtools: projectCapabilityDevtools(snapshot),
@@ -121,6 +129,9 @@ try {
     build: PAPERCLIP_RUNNER_BUILD_METADATA,
     runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
     requestedModel: request.model,
+    provider: request.provider ?? "codex",
+    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : "codex_app_server"),
+    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : null,
     timing: { startedAt: evalStartedAt, finishedAt: new Date().toISOString(), durationMs: Date.now() - evalStartedAtMs },
   }, null, 2)}\n`);
   process.exitCode = 2;

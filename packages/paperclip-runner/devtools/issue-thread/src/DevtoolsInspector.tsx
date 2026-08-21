@@ -142,7 +142,7 @@ export function DevtoolsInspector({ snapshot, onFork, tab, onTabChange, evalRepo
         <div className="pit-devtools-pane pit-eval-inspector">
           <div className="pit-eval-summary-head"><a href="../../index.html">← Eval suite</a><strong>{evalReport.passed ? "PASS" : evalReport.disposition.replaceAll("_", " ").toUpperCase()}</strong><code>{evalReport.attemptId}</code></div>
           <dl className="pit-eval-run-facts">
-            <div><dt>Model</dt><dd>{evalReport.run.provider}/{evalReport.run.model}</dd></div>
+            <div><dt>Model</dt><dd>{evalReport.run.model.startsWith(`${evalReport.run.provider}/`) ? evalReport.run.model : `${evalReport.run.provider}/${evalReport.run.model}`}</dd></div>
             <div><dt>Configuration</dt><dd>{evalReport.run.configuration}</dd></div>
             <div><dt>Session</dt><dd>{evalReport.run.sessionId}</dd></div>
             <div><dt>Duration</dt><dd>{evalReport.run.durationMs} ms</dd></div>
