@@ -6,6 +6,7 @@ import {
   agents,
   approvals,
   companies,
+  companyMemberships,
   connectionGrantMembers,
   connectionGrantDelegations,
   connectionGrants,
@@ -2721,6 +2722,19 @@ export function createToolGatewayService(
     const autonomous = run?.invocationSource === "automation" || run?.invocationSource === "timer";
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
+      const [membership] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+        eq(companyMemberships.companyId, connection.companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, actingUserId),
+        eq(companyMemberships.status, "active"),
+      )).limit(1);
+      if (!membership) {
+        throw new ToolGatewayHttpError(403, "The personal grant owner is not an active company member", "grant_owner_membership_inactive", {
+          connectionId: connection.id,
+          actingUserId,
+          remediation: { action: "restore_membership_or_reconnect" },
+        });
+      }
       const [grant] = await db.select().from(connectionGrants).where(and(
         eq(connectionGrants.companyId, connection.companyId),
         eq(connectionGrants.connectionId, connection.id),

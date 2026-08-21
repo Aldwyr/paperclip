@@ -240,6 +240,13 @@ async function createAgent(db: ReturnType<typeof createDb>, companyId: string, s
 }
 
 async function createIssueAndRun(db: ReturnType<typeof createDb>, companyId: string, agentId: string) {
+  await db.insert(companyMemberships).values({
+    companyId,
+    principalType: "user",
+    principalId: "user-for-run",
+    status: "active",
+    membershipRole: "member",
+  }).onConflictDoNothing();
   const [issue] = await db.insert(issues).values({
     companyId,
     title: `Broker issue ${randomUUID()}`,
@@ -936,6 +943,19 @@ describeEmbeddedPostgres("tool access service", () => {
         addresseeUserId: "user-for-run",
         idempotencyKey: `connection-delegation:${connection.id}:user-for-run:${agent.id}`,
       })]);
+
+    await db.update(companyMemberships).set({ status: "suspended" }).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalId, "user-for-run"),
+    ));
+    const inactiveOwner = await request(app)
+      .post(`/api/agents/me/connections/${connection.id}/token`)
+      .send({});
+    expect(inactiveOwner.status).toBe(403);
+    expect(inactiveOwner.body).toMatchObject({
+      code: "grant_owner_membership_inactive",
+    });
+    expect(inactiveOwner.body.error).toContain("not an active company member");
   });
 
   it("enforces organization grant audiences at token mint time", async () => {
@@ -3640,6 +3660,32 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(unchangedConnection.credentialSecretRefs.map((ref) => ref.secretId).sort()).toEqual(workspaceSecretIds);
     const [resolved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));
     expect(resolved).toMatchObject({ status: "accepted", result: { version: 1, outcome: "accepted" } });
+
+    const versionCountBeforeSuspension = (await db.select().from(companySecretVersions).where(
+      inArray(companySecretVersions.secretId, grant.credentialSecretRefs.map((ref) => ref.secretId)),
+    )).length;
+    const retry = await service.startAuthorizationForAgent({
+      companyId: company.id,
+      connectionId: connected.connectionId,
+      agentId: agent.id,
+      runId: run.id,
+      subjectUserId: "user-for-run",
+      scopes: ["users:read"],
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+    });
+    await db.update(companyMemberships).set({ status: "suspended" }).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalId, "user-for-run"),
+    ));
+    await expect(service.completeOAuthCallback({
+      state: new URL(retry.authorizationUrl).searchParams.get("state")!,
+      code: "user-authorization-code",
+      redirectUri: "https://paperclip.example/api/tools/oauth/callback",
+      actor: { actorType: "user", actorId: "user-for-run" },
+    })).rejects.toMatchObject({ status: 403 });
+    expect((await db.select().from(companySecretVersions).where(
+      inArray(companySecretVersions.secretId, grant.credentialSecretRefs.map((ref) => ref.secretId)),
+    )).length).toBe(versionCountBeforeSuspension);
   });
 
   it("starts and completes OAuth app sign-in with PKCE state and secret-backed tokens", async () => {

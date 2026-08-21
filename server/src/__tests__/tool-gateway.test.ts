@@ -116,6 +116,16 @@ async function createIssueAndRun(db: Db, companyId: string, agentId: string) {
   return { project, issue, run };
 }
 
+async function createActiveMember(db: Db, companyId: string, userId: string) {
+  await db.insert(companyMemberships).values({
+    companyId,
+    principalType: "user",
+    principalId: userId,
+    status: "active",
+    membershipRole: "member",
+  });
+}
+
 async function allowToolsForAgent(db: Db, companyId: string, agentId: string, toolNames: string[]) {
   const profile = await db
     .insert(toolProfiles)
@@ -1407,6 +1417,7 @@ rl.on("line", (line) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run } = await createIssueAndRun(db, company.id, agent.id);
+    await createActiveMember(db, company.id, "alice");
     await db.update(heartbeatRuns).set({ responsibleUserId: "alice" }).where(eq(heartbeatRuns.id, run.id));
     const values = {
       organization: `organization-${randomUUID()}`,
@@ -1826,6 +1837,7 @@ rl.on("line", (line) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await createActiveMember(db, company.id, "carol");
     await db.update(heartbeatRuns).set({ responsibleUserId: "carol" }).where(eq(heartbeatRuns.id, run.id));
     const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
       body: {
@@ -1902,6 +1914,7 @@ rl.on("line", (line) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await createActiveMember(db, company.id, "alice");
     await db.update(heartbeatRuns).set({
       responsibleUserId: "alice",
       invocationSource: "automation",
@@ -1952,6 +1965,14 @@ rl.on("line", (line) => {
       });
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
         .resolves.toMatchObject({ status: "completed", result: { content: "delegated" } });
+      expect(fake.requests).toHaveLength(1);
+
+      await db.update(companyMemberships).set({ status: "suspended" }).where(and(
+        eq(companyMemberships.companyId, company.id),
+        eq(companyMemberships.principalId, "alice"),
+      ));
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 403, reasonCode: "grant_owner_membership_inactive" });
       expect(fake.requests).toHaveLength(1);
     } finally {
       await fake.close();
