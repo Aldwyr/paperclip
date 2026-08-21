@@ -872,6 +872,58 @@ export function toolAccessRoutes(
     res.json(connection);
   });
 
+  router.get("/tool-connections/:connectionId/services", async (req, res) => {
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    await assertToolConnectionConfigureAccess(req, connection);
+    res.json(await svc.listComposioServices(connection.id, getActorInfo(req)));
+  });
+
+  router.post("/tool-connections/:connectionId/services/:toolkitSlug/connect", async (req, res) => {
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    await assertToolConnectionConfigureAccess(req, connection);
+    const body = req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
+    const result = await svc.startComposioServiceConnect(connection.id, req.params.toolkitSlug as string, {
+      ...(typeof body.authConfigId === "string" ? { authConfigId: body.authConfigId } : {}),
+      ...(typeof body.callbackUrl === "string" ? { callbackUrl: body.callbackUrl } : {}),
+    });
+    await logActivity(db, {
+      companyId: connection.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "composio.service_connect_started",
+      entityType: "tool_connection",
+      entityId: connection.id,
+      details: { toolkitSlug: req.params.toolkitSlug, authConfigId: result.authConfigId },
+    });
+    res.status(201).json(result);
+  });
+
+  router.get("/tool-connections/:connectionId/services/:toolkitSlug/status", async (req, res) => {
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    await assertToolConnectionConfigureAccess(req, connection);
+    res.json(await svc.pollComposioService(connection.id, req.params.toolkitSlug as string, getActorInfo(req)));
+  });
+
+  router.delete("/tool-connections/:connectionId/services/:toolkitSlug", async (req, res) => {
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    await assertToolConnectionConfigureAccess(req, connection);
+    const result = await svc.disconnectComposioService(connection.id, req.params.toolkitSlug as string, getActorInfo(req));
+    await logActivity(db, {
+      companyId: connection.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "composio.service_disconnected",
+      entityType: "tool_connection",
+      entityId: connection.id,
+      details: { toolkitSlug: req.params.toolkitSlug, removedChildCount: result.removedChildIds.length },
+    });
+    res.json(result);
+  });
+
   router.get("/tool-connections/:connectionId/grants", async (req, res) => {
     assertBoard(req);
     const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");

@@ -152,6 +152,13 @@ import { recordToolRuntimeAuditWriteFailure, TOOL_RUNTIME_AUDIT_WRITE_FAILURE_ME
 import { createToolRuntimeSupervisor, ToolRuntimeSupervisorError } from "./tool-runtime-supervisor.js";
 import { listConnectionLifecycleEvents } from "./tool-connection-activity.js";
 import { ComposioApiError, createComposioClient, type ComposioClient } from "./composio.js";
+import { composioChildConfig, createComposioSessionManager } from "./composio-session-manager.js";
+import {
+  createPaperclipIdGmailConnector,
+  GMAIL_CONNECTOR_SCOPES,
+  paperclipIdGmailConnectorConfigFromEnv,
+  type PaperclipIdGmailConnector,
+} from "./paperclip-id-gmail-connector.js";
 
 type ActorInfo = {
   actorType?: "agent" | "user" | "system" | "plugin";
@@ -486,6 +493,8 @@ type ToolAccessServiceOptions = {
   remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
   /** Test seam for Composio without live vendor traffic. */
   composioClientFactory?: (apiKey: string) => ComposioClient;
+  /** Test seam for the centrally registered Gmail OAuth broker. */
+  paperclipIdGmailConnector?: PaperclipIdGmailConnector | null;
 };
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -1812,8 +1821,19 @@ function readStdioTemplateId(config: Record<string, unknown>): string {
 
 export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}) {
   const secrets = secretService(db);
+  const composioSessions = createComposioSessionManager(db, {
+    composioClientFactory: options.composioClientFactory,
+    now: options.now,
+  });
   const policySvc = toolAccessPolicyService(db);
   const now = options.now ?? (() => new Date());
+  const gmailConnectorConfig = options.paperclipIdGmailConnector === undefined
+    ? paperclipIdGmailConnectorConfigFromEnv()
+    : null;
+  const gmailConnector = options.paperclipIdGmailConnector
+    ?? (gmailConnectorConfig
+      ? createPaperclipIdGmailConnector({ config: gmailConnectorConfig, now: () => now().getTime() })
+      : null);
   const runtimeSupervisor = createToolRuntimeSupervisor(db, options);
   // These maps remove duplicate work inside one service instance. OAuth also
   // uses the database refresh lease below as its cross-process boundary.
@@ -4063,11 +4083,15 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   }
 
   async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
-    const headers = { ...projectedConnectionHeaders(connection), ...await resolveCredentialHeaders(connection) };
+    const composioChild = composioChildConfig(connection);
+    const composioSession = composioChild ? await composioSessions.ensureSession(connection.id) : null;
+    const headers = composioSession?.headers
+      ?? { ...projectedConnectionHeaders(connection), ...await resolveCredentialHeaders(connection) };
+    const endpoint = composioSession?.url ?? remoteEndpoint(connection.config);
     // Pinned to the address the guard approved: `config.url` is operator-supplied,
     // so a second DNS resolution here would reopen the rebinding window that
     // PAP-17098 closed for the OAuth endpoints.
-    const response = await requestRemoteHttpEndpoint(new URL(remoteEndpoint(connection.config)), {
+    let response = await requestRemoteHttpEndpoint(new URL(endpoint), {
       method: "POST",
       // MCP Streamable HTTP requires advertising that we accept both a JSON body
       // and an SSE stream; spec-compliant servers 406 without it (see mcp-http.ts).
@@ -4079,6 +4103,19 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         params: {},
       }),
     });
+    if (response.status === 401 && composioChild) {
+      const refreshed = await composioSessions.ensureSession(connection.id, { force: true });
+      response = await requestRemoteHttpEndpoint(new URL(refreshed.url), {
+        method: "POST",
+        headers: mcpHttpRequestHeaders(refreshed.headers),
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "paperclip-catalog-refresh-retry",
+          method: "tools/list",
+          params: {},
+        }),
+      });
+    }
     if (!response.ok) {
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (response.status === 401 && /bearer|oauth|authorization/i.test(authenticate)) {
@@ -4148,14 +4185,204 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return asRecord(connection.config).sourceTemplateKey === COMPOSIO_GALLERY_KEY;
   }
 
-  async function validateComposioConnection(connection: typeof toolConnections.$inferSelect) {
-    const headers = await resolveCredentialHeaders(connection);
-    const apiKey = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-api-key")?.[1];
-    if (!apiKey) {
-      throw unprocessable("The Composio API key secret is missing.", { code: "secret_missing" });
+  async function composioClientForParent(parent: typeof toolConnections.$inferSelect) {
+    if (!isComposioConnection(parent) || parent.transport !== "rest_api") {
+      throw unprocessable("This connection is not a parent Composio connection.", { code: "not_composio_parent" });
     }
-    const client = options.composioClientFactory?.(apiKey) ?? createComposioClient({ apiKey });
+    const headers = await resolveCredentialHeaders(parent);
+    const apiKey = Object.entries(headers).find(([name]) => name.toLowerCase() === "x-api-key")?.[1];
+    if (!apiKey) throw unprocessable("The Composio API key secret is missing.", { code: "secret_missing" });
+    return options.composioClientFactory?.(apiKey) ?? createComposioClient({ apiKey });
+  }
+
+  async function existingComposioChildren(parent: typeof toolConnections.$inferSelect) {
+    const rows = await db.select().from(toolConnections).where(and(
+      eq(toolConnections.companyId, parent.companyId),
+      eq(toolConnections.applicationId, parent.applicationId),
+    ));
+    return rows.filter((row) => composioChildConfig(row)?.parentConnectionId === parent.id);
+  }
+
+  async function syncComposioChild(
+    parent: typeof toolConnections.$inferSelect,
+    account: { id: string; status: string; toolkit: { slug: string } },
+    toolkitName: string,
+    actor?: ActorInfo,
+  ) {
+    if (account.status.toUpperCase() !== "ACTIVE") return null;
+    const children = await existingComposioChildren(parent);
+    const existing = children.find((candidate) => {
+      const config = composioChildConfig(candidate);
+      return config?.toolkitSlug === account.toolkit.slug && candidate.status !== "archived";
+    });
+    if (existing) {
+      const config = composioChildConfig(existing)!;
+      if (config.connectedAccountId !== account.id) {
+        const nextConfig = { ...existing.config, connectedAccountId: account.id };
+        const [updated] = await db.update(toolConnections).set({
+          config: nextConfig,
+          transportConfig: { ...existing.transportConfig, connectedAccountId: account.id, composioSessions: {} },
+          updatedAt: now(),
+        }).where(eq(toolConnections.id, existing.id)).returning();
+        return updated;
+      }
+      return existing;
+    }
+    const connectionId = randomUUID();
+    const binding = actorBinding(actor);
+    const config = {
+      provider: "composio",
+      parentConnectionId: parent.id,
+      toolkitSlug: account.toolkit.slug,
+      connectedAccountId: account.id,
+    };
+    const [created] = await db.insert(toolConnections).values({
+      id: connectionId,
+      companyId: parent.companyId,
+      applicationId: parent.applicationId,
+      name: `${toolkitName} (via Composio)`,
+      uid: connectionUid(`composio:${parent.id}`, account.toolkit.slug, connectionId),
+      connectionKind: "managed",
+      ownership: parent.ownership,
+      transport: "mcp_remote",
+      authKind: "none",
+      credentialPolicy: "shared",
+      status: "active",
+      enabled: true,
+      config,
+      transportConfig: { ...config, composioSessions: {} },
+      credentialRefs: [],
+      credentialSecretRefs: [],
+      createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
+      createdByUserId: binding.actorType === "user" ? binding.actorId : null,
+    }).returning();
+    if (!created) throw new Error("Failed to create Composio toolkit connection");
+    await ensureDefaultOrganizationGrant(created);
+    await syncCredentialBindings(created);
+    await ensureRuntimeSlot(created);
+    await audit({
+      companyId: created.companyId,
+      connectionId: created.id,
+      action: "composio.child_created",
+      outcome: "success",
+      actor,
+      details: { parentConnectionId: parent.id, toolkitSlug: account.toolkit.slug },
+    });
+    return created;
+  }
+
+  async function syncComposioToolkit(
+    parent: typeof toolConnections.$inferSelect,
+    toolkitSlug: string,
+    actor?: ActorInfo,
+  ) {
+    const client = await composioClientForParent(parent);
+    const userId = `paperclip:${parent.companyId}`;
+    const [toolkits, accounts] = await Promise.all([
+      client.listToolkits({ limit: 1000 }),
+      client.listConnectedAccounts({ toolkitSlugs: [toolkitSlug], userIds: [userId], limit: 100 }),
+    ]);
+    const toolkit = toolkits.items.find((item) => item.slug === toolkitSlug);
+    if (!toolkit) throw notFound("Composio toolkit not found");
+    const account = accounts.items.find((item) => item.toolkit.slug === toolkitSlug && item.status.toUpperCase() === "ACTIVE")
+      ?? accounts.items.find((item) => item.toolkit.slug === toolkitSlug)
+      ?? null;
+    const child = account ? await syncComposioChild(parent, account, toolkit.name, actor) : null;
+    if (child) await refreshCatalog(child.id, actor, { enableAllByDefault: true });
+    return { toolkit, account, child: child ? toConnection(await getConnectionRow(child.id)) : null };
+  }
+
+  async function validateComposioConnection(connection: typeof toolConnections.$inferSelect) {
+    const client = await composioClientForParent(connection);
     await client.validateApiKey();
+  }
+
+  async function listComposioServices(parentConnectionId: string, actor?: ActorInfo) {
+    const parent = await getConnectionRow(parentConnectionId);
+    const client = await composioClientForParent(parent);
+    const userId = `paperclip:${parent.companyId}`;
+    const [toolkits, accounts] = await Promise.all([
+      client.listToolkits({ limit: 1000 }),
+      client.listConnectedAccounts({ userIds: [userId], limit: 1000 }),
+    ]);
+    const children = await existingComposioChildren(parent);
+    const childByToolkit = new Map(children.filter((child) => child.status !== "archived").map((child) => [
+      composioChildConfig(child)?.toolkitSlug,
+      child,
+    ]));
+    const services = [];
+    for (const toolkit of toolkits.items) {
+      const toolkitAccounts = accounts.items.filter((account) => account.toolkit.slug === toolkit.slug);
+      const account = toolkitAccounts.find((candidate) => candidate.status.toUpperCase() === "ACTIVE")
+        ?? toolkitAccounts[0]
+        ?? null;
+      let child = childByToolkit.get(toolkit.slug) ?? null;
+      if (account?.status.toUpperCase() === "ACTIVE" && !child) {
+        child = await syncComposioChild(parent, account, toolkit.name, actor);
+        if (child) await refreshCatalog(child.id, actor, { enableAllByDefault: true });
+      }
+      services.push({
+        toolkit,
+        status: account?.status.toUpperCase() === "ACTIVE"
+          ? "connected"
+          : account ? "pending" : "not_connected",
+        connectedAccountId: account?.id ?? null,
+        connectedAccountStatus: account?.status ?? null,
+        childConnectionId: child?.id ?? null,
+      });
+    }
+    return { parentConnectionId: parent.id, userId, services };
+  }
+
+  async function startComposioServiceConnect(
+    parentConnectionId: string,
+    toolkitSlug: string,
+    input: { authConfigId?: string; callbackUrl?: string },
+  ) {
+    const parent = await getConnectionRow(parentConnectionId);
+    const client = await composioClientForParent(parent);
+    let authConfigId = input.authConfigId?.trim();
+    if (!authConfigId) {
+      const configs = await client.listAuthConfigs({ toolkitSlugs: [toolkitSlug], showDisabled: false, limit: 100 });
+      authConfigId = configs.items.find((config) => config.toolkit.slug === toolkitSlug && config.status !== "DISABLED")?.id;
+    }
+    if (!authConfigId) throw unprocessable("This Composio toolkit has no enabled auth configuration.", { code: "composio_auth_config_missing" });
+    const link = await client.createConnectLink({
+      authConfigId,
+      userId: `paperclip:${parent.companyId}`,
+      alias: `paperclip-${parent.companyId}-${toolkitSlug}`,
+      ...(input.callbackUrl ? { callbackUrl: input.callbackUrl } : {}),
+    });
+    return { toolkitSlug, authConfigId, ...link };
+  }
+
+  async function disconnectComposioService(parentConnectionId: string, toolkitSlug: string, actor?: ActorInfo) {
+    const parent = await getConnectionRow(parentConnectionId);
+    const client = await composioClientForParent(parent);
+    const accounts = await client.listConnectedAccounts({
+      toolkitSlugs: [toolkitSlug],
+      userIds: [`paperclip:${parent.companyId}`],
+      limit: 100,
+    });
+    for (const account of accounts.items.filter((candidate) => candidate.toolkit.slug === toolkitSlug)) {
+      await client.deleteConnectedAccount(account.id);
+    }
+    const children = await existingComposioChildren(parent);
+    const removedChildIds: string[] = [];
+    for (const child of children) {
+      if (composioChildConfig(child)?.toolkitSlug !== toolkitSlug || child.status === "archived") continue;
+      await removeConnection(child.id, child.companyId, actor);
+      removedChildIds.push(child.id);
+    }
+    await audit({
+      companyId: parent.companyId,
+      connectionId: parent.id,
+      action: "composio.service_disconnected",
+      outcome: "success",
+      actor,
+      details: { toolkitSlug, connectedAccountCount: accounts.items.length, removedChildCount: removedChildIds.length },
+    });
+    return { toolkitSlug, disconnectedAccountIds: accounts.items.map((account) => account.id), removedChildIds };
   }
 
   async function discoverTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
@@ -6558,6 +6785,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       throw badRequest("Choose a connection method for this app");
     }
     const method = galleryEntry ? connectionMethodFor(galleryEntry, input.connectionMethodKey) : null;
+    const requestedGrantKind = input.grantKind ?? "organization";
+    if (method?.grantKinds && !method.grantKinds.includes(requestedGrantKind)) {
+      throw badRequest(`${galleryEntry?.name ?? "This app"} supports only ${method.grantKinds.join(" or ")} credentials`);
+    }
     const transport = method?.transport ?? "mcp_remote";
     const normalizedMethodConfig = galleryEntry?.slug === GOOGLE_SHEETS_GALLERY_KEY || !method
       ? null
@@ -6575,6 +6806,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           ...(galleryEntry.slug === "posthog" ? { safeDefault: true } : {}),
         }
       : { ...baseConfig, quarantineNewEntries: false, unverifiedServer: true };
+    if (method?.oauthStrategy === "paperclip_id_connector") {
+      config.oauth = {
+        strategy: method.oauthStrategy,
+        provider: "gmail",
+        resource: method.defaults?.serverUrl,
+        scopes: [...GMAIL_CONNECTOR_SCOPES],
+      };
+    }
     // A pasted URL may arrive with a client the operator preregistered in the
     // provider's own console, because that authorization server supports neither
     // CIMD nor dynamic registration. Record the client id now; the secret becomes
@@ -8276,6 +8515,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
       return connections;
     },
+
+    listComposioServices,
+
+    startComposioServiceConnect,
+
+    pollComposioService: async (parentConnectionId: string, toolkitSlug: string, actor?: ActorInfo) => {
+      const parent = await getConnectionRow(parentConnectionId);
+      return syncComposioToolkit(parent, toolkitSlug, actor);
+    },
+
+    disconnectComposioService,
 
     createConnection: async (companyId: string, input: CreateToolConnection, actor?: ActorInfo): Promise<ToolConnection> => {
       let applicationId = input.applicationId;

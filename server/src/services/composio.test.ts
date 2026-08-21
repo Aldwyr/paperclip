@@ -78,6 +78,7 @@ describe("Composio REST client", () => {
       userIds: ["user-1", "user-2"],
       authConfigIds: ["ac_1", "ac_2"],
     });
+    await client.deleteConnectedAccount("ca/with spaces");
     await client.createSession("user-1", {
       mcp: true,
       toolkits: ["github"],
@@ -109,10 +110,16 @@ describe("Composio REST client", () => {
         body: undefined,
       },
       {
+        url: "https://composio.test/api/v3.1/connected_accounts/ca%2Fwith%20spaces",
+        method: "DELETE",
+        body: undefined,
+      },
+      {
         url: "https://composio.test/api/v3.1/tool_router/session",
         method: "POST",
         body: {
           user_id: "user-1",
+          mcp: true,
           toolkits: { enabled: ["github"] },
           tools: { github: { enable: ["GITHUB_LIST_REPOS"] } },
           auth_configs: { github: "ac_1" },

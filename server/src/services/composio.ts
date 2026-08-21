@@ -89,6 +89,7 @@ export interface ComposioClient {
   listAuthConfigs(options?: ComposioListOptions & { toolkitSlugs?: string[]; showDisabled?: boolean }): Promise<ComposioPage<ComposioAuthConfig>>;
   createConnectLink(input: { authConfigId: string; userId: string; alias?: string; callbackUrl?: string }): Promise<ComposioConnectLink>;
   listConnectedAccounts(options?: ComposioListOptions & { toolkitSlugs?: string[]; statuses?: string[]; userIds?: string[]; authConfigIds?: string[] }): Promise<ComposioPage<ComposioConnectedAccount>>;
+  deleteConnectedAccount(connectedAccountId: string): Promise<void>;
   createSession(userId: string, options: ComposioSessionOptions): Promise<ComposioSession>;
   resumeSession(sessionId: string, options: { mcp: true }): Promise<ComposioSession>;
 }
@@ -179,11 +180,25 @@ export function createComposioClient(options: ComposioClientOptions): ComposioCl
         appendQueryList(url, "auth_config_ids", options.authConfigIds);
       });
     },
+    async deleteConnectedAccount(connectedAccountId) {
+      const url = new URL(`${baseUrl}/connected_accounts/${encodeURIComponent(connectedAccountId)}`);
+      let response: Response;
+      try {
+        response = await fetchImpl(url, {
+          method: "DELETE",
+          headers: { accept: "application/json", "x-api-key": apiKey },
+        });
+      } catch {
+        throw new ComposioApiError("Could not reach Composio.", 0);
+      }
+      if (!response.ok) throw new ComposioApiError(errorMessage(response.status), response.status);
+    },
     createSession(userId, options) {
       return request<ComposioSession>("tool_router/session", {
         method: "POST",
         body: JSON.stringify({
           user_id: userId,
+          mcp: options.mcp,
           ...(options.toolkits ? { toolkits: { enabled: options.toolkits } } : {}),
           ...(options.tools ? { tools: options.tools } : {}),
           ...(options.authConfigs ? { auth_configs: options.authConfigs } : {}),

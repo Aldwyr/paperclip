@@ -71,6 +71,8 @@ import {
   type ToolRuntimeSlotView,
 } from "./tool-runtime-supervisor.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { composioChildConfig, createComposioSessionManager } from "./composio-session-manager.js";
+import type { ComposioClient } from "./composio.js";
 import {
   canonicalToolArguments,
   readSignedToolArgumentsPayload,
@@ -779,6 +781,8 @@ export function createToolGatewayService(
     toolActionSigningSecret?: string;
     /** Test seam for deterministic remote MCP protocol fixtures. */
     remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
+    /** Test seam for Composio session creation without vendor traffic. */
+    composioClientFactory?: (apiKey: string) => ComposioClient;
     mcpGatewayProtocolLimits?: Partial<{
       authFailures: Partial<McpGatewayRateLimitConfig>;
       gatewayRequests: Partial<McpGatewayRateLimitConfig>;
@@ -798,6 +802,10 @@ export function createToolGatewayService(
   const interactions = issueThreadInteractionService(db);
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
+  const composioSessions = createComposioSessionManager(db, {
+    composioClientFactory: options.composioClientFactory,
+    now: options.now ? () => new Date(options.now!()) : undefined,
+  });
   const protocolLimits = mcpGatewayProtocolLimits(options.mcpGatewayProtocolLimits);
   let nextProtocolRateLimitPruneAt = 0;
 
@@ -3391,27 +3399,37 @@ export function createToolGatewayService(
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedRemoteTool(session, tool);
     const grant = await resolveConnectionGrant(session, connection);
-    const endpoint = remoteEndpoint(connection.config ?? {});
+    const composioScopeRevision = `${grant.id}:${grant.status}:${grant.updatedAt.toISOString()}`;
+    const composioChild = composioChildConfig(connection);
+    let composioSession = composioChild
+      ? await composioSessions.ensureSession(connection.id, {
+          tools: [entry.toolName],
+          scopeRevision: composioScopeRevision,
+        })
+      : null;
+    let endpoint = composioSession?.url ?? remoteEndpoint(connection.config ?? {});
     // Method-defined headers are trusted catalog configuration. Treat them as
     // managed headers so callers cannot override the scope that was reviewed
     // during tools/list. Credentials remain authoritative on collisions.
-    const credentialHeaders = {
+    let credentialHeaders = composioSession?.headers ?? {
       ...projectedConnectionHeaders(connection),
       ...await resolveCredentialHeaders(session, connection, grant),
     };
-    const { headers, summary: headerSummary } = buildRemoteHeaders({
+    let builtHeaders = buildRemoteHeaders({
       session,
       connection,
       credentialHeaders,
       callerHeaders,
     });
+    let headers = builtHeaders.headers;
+    let headerSummary = builtHeaders.summary;
     const requestId = `paperclip-tool-${randomUUID()}`;
     const execution: RemoteHttpExecutionAudit = {
       transport: "mcp_remote",
       request: {
         protocol: "MCP JSON-RPC 2.0",
         httpMethod: "POST",
-        endpoint: auditSafeEndpoint(endpoint),
+        endpoint: composioChild ? `${new URL(endpoint).origin}/[composio-session]` : auditSafeEndpoint(endpoint),
         mcpMethod: "tools/call",
         requestId,
         upstreamToolName: entry.toolName,
@@ -3443,7 +3461,7 @@ export function createToolGatewayService(
           },
         }),
       };
-      const response = options.remoteHttpRequest
+      let response = options.remoteHttpRequest
         ? await options.remoteHttpRequest(endpoint, requestInit)
         : await guardedRemoteHttpFetch(endpoint, requestInit, {
             ...remoteHttpFetchOptions(),
@@ -3452,6 +3470,25 @@ export function createToolGatewayService(
             // letting the tighter default cut a legitimately slow tool short.
             responseTimeoutMs: ms,
           });
+      if (response.status === 401 && composioChild) {
+        composioSession = await composioSessions.ensureSession(connection.id, {
+          tools: [entry.toolName],
+          scopeRevision: composioScopeRevision,
+          force: true,
+        });
+        endpoint = composioSession.url;
+        credentialHeaders = composioSession.headers;
+        builtHeaders = buildRemoteHeaders({ session, connection, credentialHeaders, callerHeaders });
+        headers = builtHeaders.headers;
+        headerSummary = builtHeaders.summary;
+        const retryInit = { ...requestInit, headers: mcpHttpRequestHeaders(headers) };
+        response = options.remoteHttpRequest
+          ? await options.remoteHttpRequest(endpoint, retryInit)
+          : await guardedRemoteHttpFetch(endpoint, retryInit, {
+              ...remoteHttpFetchOptions(),
+              responseTimeoutMs: ms,
+            });
+      }
       const body = await readBoundedRemoteResponse(response);
       execution.response = {
         httpStatus: response.status,
