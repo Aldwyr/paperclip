@@ -53,7 +53,12 @@ describe("PaperclipRunnerToolAuthority", () => {
 
   it("advertises only real bindings and reads the bound task", async () => {
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
-    expect(authority.definitions().map((tool) => tool.name)).toEqual(["get_task_context", "report_progress"]);
+    expect(authority.definitions()).toHaveLength(12);
+    expect(authority.definitions().map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "get_task_context", "get_task_history", "search_tasks", "report_progress",
+      "list_documents", "read_document", "list_document_revisions",
+      "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
+    ]));
     await expect(authority.execute({ tool: "get_task_context", callId: "context", arguments: {} }))
       .resolves.toMatchObject({ activeTask: { id: issueId, identifier: "RNT-1" }, actor: { id: agentId } });
     await expect(authority.execute({ tool: "finish_task", callId: "hidden", arguments: {} }))
