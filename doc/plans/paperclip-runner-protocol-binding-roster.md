@@ -8,7 +8,7 @@ This roster is the implementation ledger for binding the canonical Paperclip Run
 - Actions in the Codex semantic catalog: **28**
 - Actions advertised by the production Paperclip authority: **13**
 - Actions with a real Paperclip service binding: **13**
-- Actions audited through the shared Paperclip-server PRP route: **13 service bindings; route smoke audit pending**
+- Actions audited through the shared Paperclip-server PRP route: **1 full real-service vertical slice; 12 additional bound operations unit-audited**
 - Existing semantic conformance bridge: five route-backed test operations (`report_progress`, `write_document`, confirmation-only `request_human_input`, `set_dependencies`, and `finish_task`). It is test-only and is not a production binding.
 
 The generated action metadata currently says `realServiceBinding: unbound` and `prpBindingStatus: audit_pending` for every action. `realBindingStatus: live_codex` means only that a Codex scenario exercised the mock semantic implementation; it must not be interpreted as a production Paperclip binding.
@@ -54,3 +54,10 @@ authority still authenticates the one-time bootstrap ticket and durable lease
 inside PRP. Unknown runs and malformed run IDs fail closed before the protocol
 handshake. The run ID is a path segment because runnerd deliberately rejects
 query-bearing WebSocket URLs to avoid URL ambiguity.
+
+`paperclip-runner-real-server.integration.test.ts` is the first complete proof:
+an embedded real Paperclip database and active native heartbeat run are routed
+through the shared server endpoint to Rust runnerd and the fake Codex
+app-server; Codex calls `get_task_context`, and the result is read from the real
+run-bound Paperclip authority. The remaining advertised operations still need
+their own route-level cases before the roster can call all 13 fully audited.
