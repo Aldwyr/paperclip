@@ -64,21 +64,25 @@ function promptTextarea(): HTMLTextAreaElement | undefined {
  */
 describe("Paste a config — MCP config help", () => {
   let container: HTMLDivElement;
+  let root: ReturnType<typeof createRoot> | null;
 
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
+    root = null;
     copyTextToClipboardMock.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
+    flushSync(() => root?.unmount());
+    root = null;
     document.body.removeChild(container);
     document.body.innerHTML = "";
     vi.clearAllMocks();
   });
 
   async function render() {
-    const root = createRoot(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(
