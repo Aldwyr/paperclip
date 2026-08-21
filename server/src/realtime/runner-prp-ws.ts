@@ -13,6 +13,10 @@ type Registration = {
 const registrations = new Map<string, Registration>();
 let loopbackOrigin: string | null = null;
 
+type IncomingMessageWithUpgradeOwnership = IncomingMessage & {
+  paperclipWebSocketHandled?: boolean;
+};
+
 function rejectUpgrade(socket: Duplex, status: 400 | 404 | 409, message: string): void {
   if (socket.destroyed) return;
   try {
@@ -27,6 +31,7 @@ export function setupRunnerPrpWebSocketServer(server: Server, options: { port: n
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(request.url ?? "/", "http://paperclip.invalid");
     if (!url.pathname.startsWith(CONNECT_PATH_PREFIX)) return;
+    (request as IncomingMessageWithUpgradeOwnership).paperclipWebSocketHandled = true;
     socket.on("error", (err) => {
       logger.warn({ err }, "runner PRP websocket upgrade socket error");
     });

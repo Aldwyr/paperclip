@@ -836,6 +836,9 @@ export async function startServer(): Promise<StartedServer> {
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
+  // Claim the private runner route before the generic live-events handler, which intentionally
+  // closes unrecognized upgrade paths. The runner handler marks matching requests as handled.
+  setupRunnerPrpWebSocketServer(server, { port: listenPort });
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
@@ -854,8 +857,6 @@ export async function startServer(): Promise<StartedServer> {
       return { userId: actor.userId, companyIds: actor.companyIds };
     },
   });
-  setupRunnerPrpWebSocketServer(server, { port: listenPort });
-
   try {
     const result = await workspaceOperationService(db as any)
       .reconcileStaleRuntimeControlOperations();

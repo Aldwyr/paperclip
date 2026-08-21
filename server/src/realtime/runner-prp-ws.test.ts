@@ -29,7 +29,9 @@ describe("runner PRP websocket route", () => {
     expect(registration.connectUrl).toBe(`ws://127.0.0.1:3210/api/runner/v1/connect/${runId}`);
 
     const socket = new PassThrough();
-    server.emit("upgrade", { url: `/api/runner/v1/connect/${runId}`, headers: {} }, socket, Buffer.alloc(0));
+    const request = { url: `/api/runner/v1/connect/${runId}`, headers: {} };
+    server.emit("upgrade", request, socket, Buffer.alloc(0));
+    expect(request).toMatchObject({ paperclipWebSocketHandled: true });
     expect(handleUpgrade).toHaveBeenCalledWith(
       expect.objectContaining({ url: `/api/runner/v1/connect/${runId}` }),
       socket,
