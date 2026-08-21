@@ -15845,9 +15845,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let nativeExecution: ReturnType<typeof buildNativeExecutionInput> | null = null;
       let nativeRunnerInstanceId: string | null = null;
       if (nativeRuntimeResolution.kind === "native") {
-        if (!issueRef || !persistedExecutionWorkspace) {
-          throw new Error("native_runtime_ineligible: issue and realized workspace are required");
+        if (!issueRef) {
+          throw new Error("native_runtime_ineligible: issue is required");
         }
+        const nativeExecutionWorkspaceId = persistedExecutionWorkspace?.id ?? run.id;
         const persistedContract = run.completionContractId
           ? await db.select().from(completionContracts)
               .where(and(
@@ -15876,7 +15877,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             || nativeExecution.binding.runId !== run.id
             || nativeExecution.binding.issueId !== issueRef.id
             || nativeExecution.binding.agentId !== agent.id
-            || nativeExecution.binding.executionWorkspaceId !== persistedExecutionWorkspace.id
+            || nativeExecution.binding.executionWorkspaceId !== nativeExecutionWorkspaceId
             || nativeExecution.completionContract.id !== completionContract.row.id
             || nativeExecution.completionContract.sha256 !== completionContract.row.canonicalSha256
           ) throw new Error("native_execution_input_persisted_binding_mismatch");
@@ -15896,7 +15897,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issue: issueRef,
             agentId: agent.id,
             workspace: {
-              id: persistedExecutionWorkspace.id,
+              // Projectless paperclip_runner tasks still have a resolved local cwd. Bind that
+              // transient workspace to the run id so the native input remains durable and replayable
+              // without fabricating a project-scoped execution_workspaces row.
+              id: nativeExecutionWorkspaceId,
               cwd: executionWorkspace.cwd,
               repoUrl: executionWorkspace.repoUrl,
               repoRef: executionWorkspace.repoRef,

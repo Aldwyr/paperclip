@@ -83,7 +83,10 @@ export function resolveNativeRuntimeMode(input: {
   if (!input.issue || input.issue.workMode !== "standard") {
     throw new NativeRuntimeEligibilityError("run must be bound to a standard issue");
   }
-  if (!input.workspaceId || input.target?.kind && input.target.kind !== "local") {
+  if (
+    (!input.workspaceId && !runnerAdapterSelected)
+    || input.target?.kind && input.target.kind !== "local"
+  ) {
     throw new NativeRuntimeEligibilityError("a realized local workspace is required");
   }
   const rollout = resolveNativeMigrationStatus({

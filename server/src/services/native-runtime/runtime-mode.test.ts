@@ -82,4 +82,14 @@ describe("resolveNativeRuntimeMode", () => {
     expect(() => resolveNativeRuntimeMode({ ...eligible, target: { kind: "remote" } }))
       .toThrow(NativeRuntimeEligibilityError);
   });
+
+  it("allows paperclip_runner to use a transient local workspace for projectless issues", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      workspaceId: null,
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+      runtimeConfig: {},
+      adapterConfig: { provider: "codex" },
+    })).toEqual(expect.objectContaining({ kind: "native" }));
+  });
 });
