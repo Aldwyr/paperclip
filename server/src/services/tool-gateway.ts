@@ -2605,6 +2605,11 @@ export function createToolGatewayService(
     if (existing) {
       await db.update(issueThreadInteractions).set({
         status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
         payload,
         result: null,
         resolvedAt: null,

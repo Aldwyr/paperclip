@@ -1832,14 +1832,34 @@ rl.on("line", (line) => {
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.providerType === "mcp_remote_http")!;
 
+      await db.insert(issueThreadInteractions).values({
+        companyId: company.id,
+        issueId: issue.id,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "none",
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        idempotencyKey: `connection-authorization:${connection.id}:carol`,
+        title: "Connect your account",
+        summary: `Connect ${connection.name} to continue`,
+        payload: {
+          version: 1,
+          prompt: `Connect your account to ${connection.name}`,
+          acceptLabel: "Open authorization",
+          rejectLabel: "Not now",
+        },
+      });
+
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
         .rejects.toMatchObject({ status: 409, reasonCode: "user_authorization_required" });
       const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issue.id));
       expect(interaction).toMatchObject({
         kind: "request_confirmation",
         status: "pending",
+        continuationPolicy: "wake_assignee",
         requestedResolverPolicy: "human_only",
-        title: `Connect your ${connection.name}`,
+        effectiveResolverPolicy: "human_only",
       });
       expect(interaction!.payload).toMatchObject({
         prompt: `Connect your ${connection.name} account to continue`,
