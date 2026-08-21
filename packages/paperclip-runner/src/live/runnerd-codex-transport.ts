@@ -74,6 +74,13 @@ export interface CapabilityRunnerdCodexTransport {
 
 export type RunnerdCodexTransport = CapabilityRunnerdCodexTransport;
 
+export function unwrapRunnerdProviderNotification(input: unknown): Record<string, unknown> {
+  const payload = record(input);
+  if (typeof payload.method === "string") return payload;
+  const latest = record(payload.latest);
+  return typeof latest.method === "string" ? latest : payload;
+}
+
 class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
   #values: Array<{ value: CodexRpcNotification; bytes: number }> = [];
   #waiters: Array<(value: IteratorResult<CodexRpcNotification>) => void> = [];
@@ -389,6 +396,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const message = input.map((item) => typeof item.text === "string" ? item.text : "").join("\n");
     this.#turnId = `turn_lab_${randomUUID().replaceAll("-", "")}`;
     await this.#command("turn.start", { text: message });
+    this.#pumpEvents();
     return { turn: { id: this.#turnId, status: "inProgress" } };
   }
 
@@ -464,7 +472,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         continue;
       }
       if (event.eventType !== "provider.event" && event.eventType !== "turn.completed") continue;
-      const payload = record(record(event.envelope.payload).payload);
+      const payload = unwrapRunnerdProviderNotification(record(event.envelope.payload).payload);
       const method = payload.method;
       if (typeof method !== "string") continue;
       const params = record(payload.params);

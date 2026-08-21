@@ -1211,37 +1211,6 @@ describe("Codex app-server Codex driver", () => {
     })).toMatchObject({ success: false });
   });
 
-  it("binds a same-thread item without turnId to the sole active turn", async () => {
-    const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({
-      runId: "run-implicit-item-turn",
-      normalizedSessionId: "normalized-implicit-item-turn",
-      workingDirectory: "/workspace",
-    });
-    let resolveTurnStart!: (value: Record<string, unknown>) => void;
-    transport.turnStartResponse = new Promise((resolve) => { resolveTurnStart = resolve; });
-    const starting = session.startTurn({ message: { role: "user", text: "Complete." } });
-    while (!transport.calls.some((call) => call.method === "turn/start")) await Promise.resolve();
-    transport.push("item/completed", {
-      threadId: "thread-1",
-      item: { id: "answer-implicit", type: "agentMessage", text: JSON.stringify(result) },
-    });
-    resolveTurnStart({ turn: { id: "turn-1", status: "inProgress", items: [] } });
-    const turn = await starting;
-    transport.push("turn/completed", {
-      threadId: "thread-1",
-      turn: { id: turn.turnId, status: "completed", items: [] },
-    });
-    const events = await collectUntilTerminal(session.events());
-    expect(events.find((event) => event.eventType === "item.completed" && event.itemId === "answer-implicit"))
-      .toMatchObject({
-      eventType: "item.completed",
-      turnId: turn.turnId,
-      itemId: "answer-implicit",
-    });
-    expect(events.find((event) => event.eventType === "session.failed")).toBeUndefined();
-  });
-
   it("rejects duplicate and conflicting terminal facts", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({

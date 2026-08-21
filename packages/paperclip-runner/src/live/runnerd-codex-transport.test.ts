@@ -3,12 +3,29 @@ import { resolve } from "node:path";
 
 import { expect, it } from "vitest";
 
-import { createCapabilityRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
+import {
+  createCapabilityRunnerdCodexTransport,
+  defaultCapabilityRunnerdBinary,
+  unwrapRunnerdProviderNotification,
+} from "./runnerd-codex-transport.js";
 
 const fakeCodex = resolve(
   import.meta.dirname,
   "../../runner/target/debug/fake-codex-app-server",
 );
+
+it("unwraps a coalesced provider notification without losing its turn identity", () => {
+  expect(unwrapRunnerdProviderNotification({
+    coalescedCount: 2,
+    latest: {
+      method: "turn/started",
+      params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
+    },
+  })).toEqual({
+    method: "turn/started",
+    params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
+  });
+});
 
 it("runs the lab provider boundary through authenticated durable PRP", async () => {
   const bundle = createCapabilityRunnerdCodexTransport({
