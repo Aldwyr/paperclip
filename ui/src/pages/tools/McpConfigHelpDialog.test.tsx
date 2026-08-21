@@ -82,10 +82,11 @@ describe("Paste a config — MCP config help", () => {
   });
 
   async function render() {
-    root = createRoot(container);
+    const nextRoot = createRoot(container);
+    root = nextRoot;
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
-      root.render(
+      nextRoot.render(
         <QueryClientProvider client={queryClient}>
           <MemoryRouter>
             <PasteConfigTab companyId="company-1" />
@@ -93,7 +94,7 @@ describe("Paste a config — MCP config help", () => {
         </QueryClientProvider>,
       );
     });
-    return root;
+    return nextRoot;
   }
 
   async function openHelp() {
