@@ -831,7 +831,13 @@ describe("AppDetail", () => {
     ]);
   });
 
-  it("removes an existing agent grant directly from Permissions", async () => {
+  /**
+   * PAP-17859: agent availability is stated once. The tab used to stack a
+   * legacy "Who can use it" editor — its own Change button, per-agent remove
+   * buttons and Save — on top of "Available to agents", so the same fact had
+   * two visible editors and the reader had to guess which one won.
+   */
+  it("shows one agent-availability model on Permissions, not the legacy access editor", async () => {
     mockParams.tab = "permissions";
     listProfilesMock.mockResolvedValue({
       profiles: [{
@@ -846,18 +852,54 @@ describe("AppDetail", () => {
 
     await renderAppDetail();
 
-    const remove = container.querySelector<HTMLButtonElement>('button[aria-label="Remove Coder access"]');
-    expect(remove).toBeTruthy();
-    await act(async () => {
-      remove!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await flushReact();
+    expect(container.textContent).toContain("Available to agents");
+    expect(container.textContent).not.toContain("Who can use it");
+    expect(container.textContent).not.toContain("Only specific agents");
+    expect(container.querySelector('button[aria-label="Remove Coder access"]')).toBeNull();
+    // Exactly one radiogroup on the tab: the install model.
+    expect(container.querySelectorAll('[role="radiogroup"]').length).toBe(1);
+    expect(
+      Array.from(container.querySelectorAll("button")).filter(
+        (button) => button.textContent?.trim() === "Change",
+      ),
+    ).toHaveLength(0);
+  });
 
-    expect(finishAppMock).toHaveBeenCalledWith("company-1", "conn-1", {
-      enabledCatalogEntryIds: ["catalog-read", "catalog-write"],
-      askFirstCatalogEntryIds: ["catalog-write"],
-      access: { agentIds: [] },
+  /**
+   * Viewer rule D4: a policy-forbidden action is omitted, not disabled. The
+   * viewer still sees the whole state — which agents have it, what each action
+   * is allowed to do — with nothing to press.
+   */
+  it("gives a viewer a read-only Permissions tab with no mutation affordances", async () => {
+    mockParams.tab = "permissions";
+    listConnectionGrantsMock.mockResolvedValue({
+      connection: { id: "conn-1", uid: "conn-uid-1" },
+      grants: [],
+      currentUserId: "user-1",
+      members: [],
+      capabilities: fullCapabilities({
+        canConfigure: false,
+        canManageAgentInstalls: false,
+        canSetCompanyInstall: false,
+        canConnectAsCurrentUser: false,
+        editableAgentIds: [],
+      }),
     });
+
+    await renderAppDetail();
+
+    // State is still legible.
+    expect(container.textContent).toContain("Available to agents");
+    expect(container.textContent).toContain("Action permissions");
+    expect(container.textContent).toContain("Read repo");
+
+    // Nothing to mutate: no radios, no permission selects, no refresh, no save.
+    expect(container.querySelector('[role="radiogroup"]')).toBeNull();
+    expect(container.querySelectorAll("select").length).toBe(0);
+    const labels = Array.from(container.querySelectorAll("button")).map((b) => b.textContent?.trim());
+    for (const forbidden of ["Change", "Save", "Refresh actions", "Choose agents"]) {
+      expect(labels).not.toContain(forbidden);
+    }
   });
 
   it("renders activity attribution with issue context and human resolver names", async () => {
@@ -1030,7 +1072,7 @@ describe("AppDetail", () => {
     expect(container.textContent).toContain("Needs attention");
     expect(container.textContent).toContain("This app needs reconnecting");
     expect(container.textContent).toContain("Token expired.");
-    expect(container.textContent).toContain("Who can use it");
+    expect(container.textContent).toContain("Available to agents");
   });
 
   it("shows terminal OAuth failures as reconnect-required sign-in", async () => {

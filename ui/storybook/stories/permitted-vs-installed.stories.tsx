@@ -7,11 +7,17 @@ import type {
   ToolConnection,
   ToolConnectionCapabilities,
 } from "@paperclipai/shared";
+import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
+import {
+  issueThreadInteractionFixtureMeta,
+  pendingConnectionAuthorizationInteraction,
+  resolvedConnectionAuthorizationInteraction,
+} from "@/fixtures/issueThreadInteractionFixtures";
+import type { RequestConfirmationInteraction } from "@/lib/issue-thread-interactions";
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentToolsTab } from "@/pages/AgentToolsTab";
 import { PermissionsPanel } from "@/pages/apps/app-detail/PermissionsPanel";
 import { AccessStep } from "@/pages/apps/AppsConnect";
-import type { AccessDraft } from "@/pages/apps/app-detail/types";
 import type { InstallState } from "@/lib/tool-installs";
 
 const AGENT_IDS = ["a-sage", "a-atlas", "a-orion"];
@@ -124,11 +130,9 @@ type Story = StoryObj;
 // --- Surface 1: App detail Permissions tab (PermissionsPanel) --------------
 
 function PanelHarness({
-  access,
   install,
   capabilities = FULL_CAPABILITIES,
 }: {
-  access: AccessDraft;
   install: InstallState;
   capabilities?: ToolConnectionCapabilities;
 }) {
@@ -136,7 +140,6 @@ function PanelHarness({
   return (
     <div className="mx-auto max-w-3xl bg-background p-6">
       <PermissionsPanel
-        access={access}
         capabilities={capabilities}
         agents={AGENTS}
         install={state}
@@ -148,7 +151,6 @@ function PanelHarness({
         pending={false}
         installPending={false}
         refreshPending={false}
-        onSaveAccess={() => {}}
         onSaveInstall={setState}
         onSetActionPermission={() => {}}
         onReviewQuarantined={() => {}}
@@ -162,7 +164,6 @@ export const AppDetailAgentsIPick: Story = {
   name: "1 · App detail — Agents I pick",
   render: () => (
     <PanelHarness
-      access={{ mode: "specific", agentIds: new Set(["a-sage", "a-atlas"]) }}
       install={{ onAll: false, agentIds: new Set(["a-sage", "a-orion"]) }}
     />
   ),
@@ -172,7 +173,6 @@ export const AppDetailAnyAgent: Story = {
   name: "1 · App detail — Any agent",
   render: () => (
     <PanelHarness
-      access={{ mode: "all", agentIds: new Set() }}
       install={{ onAll: true, agentIds: new Set() }}
     />
   ),
@@ -182,7 +182,6 @@ export const AppDetailNoAgentsYet: Story = {
   name: "1 · App detail — no agents yet",
   render: () => (
     <PanelHarness
-      access={{ mode: "all", agentIds: new Set() }}
       install={{ onAll: false, agentIds: new Set() }}
     />
   ),
@@ -196,7 +195,6 @@ export const AppDetailViewerReadOnly: Story = {
   name: "1 · App detail — viewer read-only",
   render: () => (
     <PanelHarness
-      access={{ mode: "specific", agentIds: new Set(["a-sage"]) }}
       install={{ onAll: false, agentIds: new Set(["a-sage"]) }}
       capabilities={VIEWER_CAPABILITIES}
     />
@@ -211,7 +209,6 @@ export const AppDetailMemberWithoutCompanyInstall: Story = {
   name: "1 · App detail — member without company-wide install",
   render: () => (
     <PanelHarness
-      access={{ mode: "specific", agentIds: new Set(["a-sage"]) }}
       install={{ onAll: false, agentIds: new Set(["a-sage"]) }}
       capabilities={{ ...FULL_CAPABILITIES, canSetCompanyInstall: false }}
     />
@@ -342,6 +339,68 @@ export const ConnectAccessNoIdentityRequired: Story = {
       initialGrantKind="organization"
       initialChoice="specific"
       initialAgentIds={new Set(["a-sage"])}
+    />
+  ),
+};
+
+// --- Surface 4: the "Connect your Gmail to continue" card -------------------
+//
+// One `request_confirmation`, three readings (PAP-17859). The card no longer
+// falls through to the generic Approve / Revise… / Reject layout: consent is
+// the addressed person's alone, so the affordances change with the reader, and
+// a policy-forbidden action is omitted rather than shown greyed out.
+
+const AUTHORIZATION_USER_LABELS = new Map<string, string>([
+  [issueThreadInteractionFixtureMeta.currentUserId, "Carol"],
+]);
+
+function AuthorizationCardHarness({
+  interaction,
+  currentUserId,
+}: {
+  interaction: RequestConfirmationInteraction;
+  currentUserId: string;
+}) {
+  return (
+    <div className="mx-auto max-w-3xl bg-background p-6">
+      <IssueThreadInteractionCard
+        interaction={interaction}
+        agentMap={new Map()}
+        currentUserId={currentUserId}
+        userLabelMap={AUTHORIZATION_USER_LABELS}
+        onAcceptInteraction={async () => {}}
+        onRejectInteraction={async () => {}}
+      />
+    </div>
+  );
+}
+
+export const AuthorizationAddressed: Story = {
+  name: "4 · Connect Gmail — addressed user",
+  render: () => (
+    <AuthorizationCardHarness
+      interaction={pendingConnectionAuthorizationInteraction}
+      currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
+    />
+  ),
+};
+
+export const AuthorizationOtherReader: Story = {
+  name: "4 · Connect Gmail — another reader waiting",
+  render: () => (
+    <AuthorizationCardHarness
+      interaction={pendingConnectionAuthorizationInteraction}
+      currentUserId="user-someone-else"
+    />
+  ),
+};
+
+export const AuthorizationResolved: Story = {
+  name: "4 · Connect Gmail — resolved",
+  render: () => (
+    <AuthorizationCardHarness
+      interaction={resolvedConnectionAuthorizationInteraction}
+      currentUserId={issueThreadInteractionFixtureMeta.currentUserId}
     />
   ),
 };

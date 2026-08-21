@@ -190,11 +190,11 @@ export function AppDetail() {
     () => askFirstCatalogIds(policiesQuery.data?.policies ?? [], connectionId),
     [policiesQuery.data, connectionId],
   );
-  const access = useMemo(() => accessFrom(profile), [profile]);
   const install = useMemo(
     () => installStateFrom(installsQuery.data?.installs ?? connection?.installs),
     [connection?.installs, installsQuery.data?.installs],
   );
+  const access = useMemo(() => accessFrom(profile, install), [profile, install]);
   const agents = agentsQuery.data ?? [];
   const userLabelById = useMemo(() => {
     const labels = buildCompanyUserLabelMap(userDirectoryQuery.data?.users);
@@ -687,7 +687,6 @@ export function AppDetail() {
           : permissionsLoading
           ? <ToolsLoading />
           : <PermissionsPanel
-              access={access}
               capabilities={grantsQuery.data?.capabilities}
               agents={agents}
               install={install}
@@ -699,7 +698,6 @@ export function AppDetail() {
               pending={pending}
               installPending={persistInstall.isPending}
               refreshPending={refreshTools.isPending}
-              onSaveAccess={(next) => apply({ access: next })}
               onSaveInstall={(next) => persistInstall.mutate(next)}
               onRefreshActions={() => refreshTools.mutate()}
               onSetActionPermission={(id, next) => apply(actionPermissionMutation(id, next, enabledIds, askFirstIds))}
@@ -926,14 +924,35 @@ function askFirstCatalogIds(policies: ToolPolicy[], connectionId: string): Set<s
   return ids;
 }
 
-function accessFrom(profile: ToolProfileWithDetails | undefined): AccessDraft {
+/**
+ * Who may use this connection, read back from the app profile's bindings.
+ *
+ * `finishApp` replaces a profile's whole binding set, so every save from this
+ * page — including an action-permission toggle — has to restate this. Since
+ * PAP-17859 there is no user-facing editor for it: the Permissions tab shows
+ * agent availability once, as installs. This function therefore only ever
+ * *preserves* what the server already has, and falls back to the install state
+ * when the profile has no bindings yet.
+ *
+ * That fallback is the important part. It used to return "all agents" for an
+ * unbound profile, which turned any unrelated save into a silent company-wide
+ * grant from a control the reader could not see. Installs authorize their
+ * targets, so mirroring the install state is both the truthful reading and the
+ * one that agrees with what the tab displays.
+ */
+function accessFrom(
+  profile: ToolProfileWithDetails | undefined,
+  install: InstallState,
+): AccessDraft {
   const bindings = profile?.bindings ?? [];
   if (bindings.some((b) => b.targetType === "company")) {
     return { mode: "all", agentIds: new Set() };
   }
   const agentIds = new Set(bindings.filter((b) => b.targetType === "agent").map((b) => b.targetId));
-  if (agentIds.size === 0) return { mode: "all", agentIds: new Set() };
-  return { mode: "specific", agentIds };
+  if (agentIds.size > 0) return { mode: "specific", agentIds };
+  return install.onAll
+    ? { mode: "all", agentIds: new Set() }
+    : { mode: "specific", agentIds: new Set(install.agentIds) };
 }
 
 function galleryEntryFor(
