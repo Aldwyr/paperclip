@@ -82,13 +82,15 @@ export function TaskChatLiveRunPill({
       <>
         <span className="text-sm font-medium text-foreground/80">{verb}</span>
         {suffix ? <span className="text-sm text-muted-foreground">{suffix}</span> : null}
-        <ChevronRight
-          className={cn("ml-auto h-3.5 w-3.5 text-muted-foreground transition-transform", expanded && "rotate-90")}
-          aria-hidden
-        />
+        {!active ? (
+          <ChevronRight
+            className={cn("ml-auto h-3.5 w-3.5 text-muted-foreground transition-transform", expanded && "rotate-90")}
+            aria-hidden
+          />
+        ) : null}
       </>
     );
-    return onToggle ? (
+    return onToggle && !active ? (
       <button
         type="button"
         onClick={onToggle}
