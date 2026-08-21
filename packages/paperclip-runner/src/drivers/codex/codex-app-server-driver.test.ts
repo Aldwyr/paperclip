@@ -1218,11 +1218,16 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-implicit-item-turn",
       workingDirectory: "/workspace",
     });
-    const turn = await session.startTurn({ message: { role: "user", text: "Complete." } });
+    let resolveTurnStart!: (value: Record<string, unknown>) => void;
+    transport.turnStartResponse = new Promise((resolve) => { resolveTurnStart = resolve; });
+    const starting = session.startTurn({ message: { role: "user", text: "Complete." } });
+    while (!transport.calls.some((call) => call.method === "turn/start")) await Promise.resolve();
     transport.push("item/completed", {
       threadId: "thread-1",
       item: { id: "answer-implicit", type: "agentMessage", text: JSON.stringify(result) },
     });
+    resolveTurnStart({ turn: { id: "turn-1", status: "inProgress", items: [] } });
+    const turn = await starting;
     transport.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: turn.turnId, status: "completed", items: [] },

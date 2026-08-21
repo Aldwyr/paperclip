@@ -663,6 +663,7 @@ class CodexHarnessSession implements HarnessSession {
   #resultCallId: string | null = null;
   #resultTurnId: string | null = null;
   #turnStartPending = false;
+  readonly #pendingTurnNotifications: CodexRpcNotification[] = [];
   #protocolFailed = false;
   #protocolFailureCode: string | null = null;
   #protocolFailureMessage: string | null = null;
@@ -822,6 +823,8 @@ class CodexHarnessSession implements HarnessSession {
     }
     this.#activeTurnId ??= turnId;
     this.#emit("turn.accepted", { turnId }, { turnId });
+    const pendingTurnNotifications = this.#pendingTurnNotifications.splice(0);
+    for (const notification of pendingTurnNotifications) this.#mapNotification(notification);
     if (this.#interruptQueued) {
       this.#interruptQueued = false;
       await this.#sendInterrupt(turnId, "queued_before_start");
@@ -1125,6 +1128,15 @@ class CodexHarnessSession implements HarnessSession {
     const item = itemFromParams(params);
     const threadId = text(params.threadId);
     const explicitTurnId = text(params.turnId, text(turn.id));
+    if (
+      explicitTurnId.length === 0
+      && this.#turnStartPending
+      && this.#activeTurnId === null
+      && (notification.method.startsWith("item/") || notification.method === "thread/tokenUsage/updated")
+    ) {
+      this.#pendingTurnNotifications.push(structuredClone(notification));
+      return;
+    }
     // Current Codex app-server builds omit turnId from some item notifications. This driver
     // permits only one active turn, so a same-thread item can be bound to that turn without
     // ambiguity. Pre-turn, cross-thread, stale, and post-terminal notifications still fail closed.
