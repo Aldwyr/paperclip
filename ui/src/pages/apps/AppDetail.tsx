@@ -38,6 +38,8 @@ import {
 } from "./app-definition-display";
 import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs";
 import { SetupPanel, connectionProviderName } from "./app-detail/SetupPanel";
+import { ServicesPanel } from "./app-detail/ServicesPanel";
+import { ComposioProvenanceChip } from "./ComposioProvenanceChip";
 import { IdentitiesSection } from "./app-detail/IdentitiesSection";
 import { actsAsSummary } from "./connection-identity";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
@@ -659,6 +661,9 @@ export function AppDetail() {
           />
         </div>
       )}
+      {activeTab === "services" && (
+        <ServicesPanel connectionId={connectionId} appName={appName} />
+      )}
       {activeTab === "review" && (
         reviewFailed
           ? <ToolsLoadError onRetry={() => {
@@ -819,6 +824,7 @@ function AppDetailHeader({
             </div>
           )}
           {unverifiedHost ? <UnverifiedServerBadge host={unverifiedHost} className="mt-1" /> : null}
+          <ComposioProvenanceChip connection={connection} className="mt-1" />
           <div className="mt-1 flex items-center gap-2">
             <StatusBadge status={status} />
             {actionCount !== null && (

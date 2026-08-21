@@ -33,6 +33,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 import { AppLogo } from "./AppLogo";
+import { ComposioProvenanceChip } from "./ComposioProvenanceChip";
 import {
   appApplicationSourceSlug,
   appDefinitionLogoUrl,
@@ -395,8 +396,9 @@ export function Connections() {
                             size={32}
                           />
                           <div className="min-w-0">
-                            <div className="font-medium text-foreground">
-                              {row.displayName}
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-medium text-foreground">{row.displayName}</span>
+                              <ComposioProvenanceChip connection={row.connection} />
                             </div>
                             {hint && (
                               <div className="truncate text-xs text-muted-foreground">{hint}</div>

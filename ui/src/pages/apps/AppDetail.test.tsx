@@ -380,6 +380,9 @@ describe("AppDetail", () => {
     expect(APP_TABS.map((tab) => tab.key)).toEqual([
       "setup",
       "test",
+      // Services (PAP-17865) sits below Test rather than above it, so the
+      // Setup→Test adjacency this test exists to protect still holds.
+      "services",
       "review",
       "permissions",
       "activity",
