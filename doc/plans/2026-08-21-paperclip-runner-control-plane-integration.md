@@ -293,3 +293,33 @@ Daytona sandbox
 - Cohesive commits are pushed on the two existing branches, both worktrees are
   clean and equal their remotes, and the final report includes commits, tests,
   eval IDs/report paths, demonstrated workflow, and remaining limitations.
+
+## Implementation ledger (2026-08-21)
+
+- Complete: selectable `paperclip_runner` adapter with legacy adapters retained.
+- Complete: Rust runnerd is the sole Paperclip sandbox proxy; Codex is the first
+  provider and provider-specific TypeScript is outside the sandbox process tree.
+- Complete: shared real-server PRP endpoint
+  `/api/runner/v1/connect/:runId`, run-bound authority registration, bootstrap
+  ticket/lease authentication, malformed/unknown run rejection, and buffered
+  WebSocket upgrade handling.
+- Complete: deterministic real-server vertical slice using embedded Paperclip
+  Postgres, an active native heartbeat run, the shared server route, Rust
+  runnerd, fake Codex, and the real `get_task_context` service authority.
+- Complete for the current production catalog: 14 advertised operations are
+  real-service bound. All 41 canonical actions have an explicit
+  bound/withheld/prohibited disposition in the binding roster; unbound actions
+  are absent rather than stubbed.
+- Complete: existing task-thread projection, structured interactions, exact-once
+  continuation fixes, model/usage/cost metadata, and Runner Lab DevTools reuse.
+- Complete: coverage matrix and HTML Inventory tab include the shared PRP and
+  real-server deterministic owners; the live report remains model-result-only.
+- Verified: focused server/runner tests and typechecks. The Runner Lab server
+  contract suite passed 68/69 in one parallel run; the sole 2-second resume
+  timeout passed immediately in isolation and is retained as a timing-flake
+  finding rather than hidden.
+- Environment limitation: this Codex session exposed no in-app browser backend,
+  so the manual `:4184` click-through remains to be performed even though the
+  package server and projection tests pass.
+- Intentionally deferred by this plan: remote Daytona/WSS implementation. The
+  checked-in Daytona networking thesis remains the follow-up contract.
