@@ -60,3 +60,15 @@ export function buildCodexLocalConfig(v: CreateConfigValues): Record<string, unk
   if (v.extraArgs) ac.extraArgs = parseCommaArgs(v.extraArgs);
   return ac;
 }
+
+/** Build the Codex-backed Rust runner profile without exposing legacy engines. */
+export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string, unknown> {
+  const config = buildCodexLocalConfig(v);
+  delete config.engine;
+  delete config.agentCommand;
+  delete config.mode;
+  delete config.nonInteractivePermissions;
+  delete config.stateDir;
+  delete config.warmHandleIdleMs;
+  return { ...config, provider: "codex" };
+}

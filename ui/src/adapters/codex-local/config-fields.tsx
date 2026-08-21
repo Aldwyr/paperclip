@@ -31,7 +31,8 @@ export function CodexLocalConfigFields({
   models,
   hideInstructionsFile,
 }: AdapterConfigFieldsProps) {
-  const rawEngine = isCreate
+  const runnerManaged = adapterType === "paperclip_runner";
+  const rawEngine = runnerManaged ? "cli" : isCreate
     ? values!.codexEngine ?? "auto"
     : eff("adapterConfig", "engine", String(config.engine ?? "auto"));
   const engine = rawEngine === "acp" || rawEngine === "cli" ? rawEngine : "auto";
@@ -55,7 +56,7 @@ export function CodexLocalConfigFields({
 
   return (
     <>
-      <Field label="Execution engine" hint="Auto uses ACP when prerequisites pass and falls back to Codex CLI with diagnostics.">
+      {!runnerManaged && <Field label="Execution engine" hint="Auto uses ACP when prerequisites pass and falls back to Codex CLI with diagnostics.">
         <select
           className={inputClass}
           value={engine}
@@ -70,7 +71,14 @@ export function CodexLocalConfigFields({
           <option value="cli">Codex CLI</option>
           <option value="acp">ACP</option>
         </select>
-      </Field>
+      </Field>}
+      {runnerManaged && (
+        <Field label="Provider" hint="Paperclip Runner currently supports Codex through its app-server protocol.">
+          <select className={inputClass} value="codex" disabled>
+            <option value="codex">Codex</option>
+          </select>
+        </Field>
+      )}
       {acpSelected && (
         <>
           <Field

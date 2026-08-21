@@ -38,14 +38,20 @@ function record(value: unknown): Record<string, unknown> {
 export function resolveNativeRuntimeMode(input: {
   enabled: boolean;
   runtimeConfig: unknown;
+  adapterConfig?: unknown;
   agent: { id?: string; status: string; adapterType: string | null };
   issue: { id: string; workMode: string; executionWorkspaceId?: string | null } | null;
   target: { kind?: string } | null | undefined;
   workspaceId: string | null;
 }): NativeRuntimeResolution {
   const nativeRunner = record(record(input.runtimeConfig).nativeRunner);
-  const mode = nativeRunner.mode;
-  if (!input.enabled) {
+  const runnerAdapterSelected = input.agent.adapterType === "paperclip_runner";
+  const runnerProvider = record(input.adapterConfig).provider ?? "codex";
+  if (runnerAdapterSelected && runnerProvider !== "codex") {
+    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex");
+  }
+  const mode = runnerAdapterSelected ? "native" : nativeRunner.mode;
+  if (!runnerAdapterSelected && !input.enabled) {
     const compatibility = resolveNativeCompatibilityStatus({
       facts: { shadowApplicationDisabled: true },
       priorIssueStatus: "in_progress",
@@ -65,11 +71,14 @@ export function resolveNativeRuntimeMode(input: {
     return { kind: "legacy", resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION, reason: "agent_not_opted_in" };
   }
   if (mode !== "native") throw new NativeRuntimeEligibilityError("unsupported profile mode");
-  if (nativeRunner.backend !== "codex_app_server" || nativeRunner.protocolVersion !== 1) {
+  if (!runnerAdapterSelected && (nativeRunner.backend !== "codex_app_server" || nativeRunner.protocolVersion !== 1)) {
     throw new NativeRuntimeEligibilityError("unsupported backend or protocol version");
   }
-  if (input.agent.adapterType !== "codex_local" || input.agent.status !== "active" && input.agent.status !== "running") {
-    throw new NativeRuntimeEligibilityError("agent must be an active codex_local agent");
+  if (
+    !["codex_local", "paperclip_runner"].includes(input.agent.adapterType ?? "")
+    || input.agent.status !== "active" && input.agent.status !== "running"
+  ) {
+    throw new NativeRuntimeEligibilityError("agent must be an active Codex-backed native agent");
   }
   if (!input.issue || input.issue.workMode !== "standard") {
     throw new NativeRuntimeEligibilityError("run must be bound to a standard issue");
@@ -107,6 +116,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
   };
   enabled: boolean;
   runtimeConfig: unknown;
+  adapterConfig?: unknown;
   agent: { id?: string; status: string; adapterType: string | null };
   issue: { id: string; workMode: string; executionWorkspaceId?: string | null } | null;
   target: { kind?: string } | null | undefined;

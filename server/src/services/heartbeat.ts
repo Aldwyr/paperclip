@@ -15836,6 +15836,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persisted: run,
         enabled: resolvedInstanceSettings.experimental.enableNativeRunner === true,
         runtimeConfig: agent.runtimeConfig,
+        adapterConfig: agent.adapterConfig,
         agent: { id: agent.id, status: runningAgent.status, adapterType: agent.adapterType },
         issue: issueRef,
         target: executionTarget,

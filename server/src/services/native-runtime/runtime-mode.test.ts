@@ -15,6 +15,29 @@ const eligible = {
 } as const;
 
 describe("resolveNativeRuntimeMode", () => {
+  it("selects the Rust runner adapter without the experimental codex runtime toggle", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      enabled: false,
+      runtimeConfig: {},
+      adapterConfig: { provider: "codex" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toEqual(expect.objectContaining({
+      kind: "native",
+      reason: "eligible_opt_in",
+      profile: { mode: "native", backend: "codex_app_server", protocolVersion: 1 },
+    }));
+  });
+
+  it("rejects unknown Paperclip Runner providers", () => {
+    expect(() => resolveNativeRuntimeMode({
+      ...eligible,
+      runtimeConfig: {},
+      adapterConfig: { provider: "claude" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toThrow(/provider must be codex/);
+  });
+
   it("preserves legacy as the default and as the kill-switch behavior", () => {
     expect(resolveNativeRuntimeMode({ ...eligible, runtimeConfig: {} }).kind).toBe("legacy");
     expect(resolveNativeRuntimeMode({ ...eligible, enabled: false })).toEqual(expect.objectContaining({
