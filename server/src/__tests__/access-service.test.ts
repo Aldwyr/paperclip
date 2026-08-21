@@ -242,6 +242,67 @@ describeEmbeddedPostgres("access service", () => {
     ).rejects.toThrow("Instance admins cannot be removed from company access");
   });
 
+  it("sweeps personal grants when instance-level company access is removed", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const member = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `member-${randomUUID()}`,
+      status: "active",
+      membershipRole: "member",
+    }).returning().then((rows) => rows[0]!);
+    const agent = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Instance access delegated agent",
+      role: "worker",
+      adapterType: "process",
+      adapterConfig: {},
+    }).returning().then((rows) => rows[0]!);
+    const application = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `instance-access-${randomUUID()}`,
+      name: "Instance access app",
+      type: "mcp",
+      status: "active",
+    }).returning().then((rows) => rows[0]!);
+    const connection = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: "Instance access connection",
+      uid: `instance-access-${randomUUID()}`,
+      connectionKind: "managed",
+      ownership: "customer",
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+      status: "active",
+      enabled: true,
+    }).returning().then((rows) => rows[0]!);
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: member.principalId,
+      status: "active",
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(connectionGrantDelegations).values({
+      companyId: company.id,
+      grantId: grant.id,
+      agentId: agent.id,
+      createdByUserId: member.principalId,
+    });
+
+    await accessService(db).setUserCompanyAccess(member.principalId, [], {
+      actorUserId: owner.principalId,
+    });
+
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.id, member.id)))
+      .toEqual([expect.objectContaining({ status: "archived" })]);
+    expect(await db.select().from(connectionGrantDelegations)).toHaveLength(0);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
+      .toEqual([expect.objectContaining({ status: "revoked" })]);
+  });
+
   it("revokes personal connection access and destroys user-scoped secrets when membership is archived", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const member = await db.insert(companyMemberships).values({
