@@ -96,7 +96,11 @@ export function TaskChatRunnerTurn({
         expanded={open}
         onToggle={() => setOpen((value) => !value)}
       />
-      {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
+      {agentName ? (
+        <div className="pt-2" data-testid="task-chat-runner-identity-row">
+          <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} />
+        </div>
+      ) : null}
       <div className="tc-turn-fold" data-folded={open ? "false" : "true"} aria-hidden={!open}>
         <div>
           <div className="flex flex-col gap-2 py-2">

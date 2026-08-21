@@ -51,6 +51,7 @@ describe("TaskChatRunnerTurn", () => {
     const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
     const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
     expect(identity?.compareDocumentPosition(activity!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(container.querySelector('[data-testid="task-chat-runner-identity-row"]')?.classList.contains("pt-2")).toBe(true);
   });
 
   it("streams the final response in its durable slot and hides current activity", () => {
