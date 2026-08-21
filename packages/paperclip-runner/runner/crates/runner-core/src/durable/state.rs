@@ -996,9 +996,34 @@ fn enqueue_event(
                     .pointer("/payload/payload/coalescedCount")
                     .and_then(Value::as_u64)
                     .unwrap_or(1);
+                // Keep every provider notification in the compacted envelope.
+                // The old `latest` shape made durability cheap by silently
+                // discarding token, reasoning, tool-output, and diff deltas
+                // whenever runnerd produced them faster than the PRP authority
+                // acknowledged the previous event. One durable envelope may
+                // still batch adjacent P2 records, but the consumer can now
+                // replay the complete ordered batch.
+                let previous_payload = last
+                    .envelope
+                    .pointer("/payload/payload")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let mut events = previous_payload
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        previous_payload
+                            .get("latest")
+                            .cloned()
+                            .or_else(|| (!previous_payload.is_null()).then_some(previous_payload))
+                            .into_iter()
+                            .collect()
+                    });
+                events.push(sanitize_value(&payload));
                 let compacted = json!({
                     "coalescedCount": previous_count + 1,
-                    "latest": sanitize_value(&payload),
+                    "events": events,
                 });
                 let mut replacement = last.clone();
                 replacement.envelope["payload"]["payload"] = compacted;

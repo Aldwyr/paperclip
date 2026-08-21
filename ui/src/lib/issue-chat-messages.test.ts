@@ -175,6 +175,19 @@ describe("buildAssistantPartsFromTranscript", () => {
     expect(result.notices).toEqual([]);
   });
 
+  it("accumulates streamed tool output before the completed result", () => {
+    const result = buildAssistantPartsFromTranscript([
+      { kind: "tool_call", ts: "2026-04-06T12:00:00.000Z", name: "shell", toolUseId: "tool-1", input: {} },
+      { kind: "tool_result", ts: "2026-04-06T12:00:01.000Z", toolUseId: "tool-1", content: "first\n", delta: true },
+      { kind: "tool_result", ts: "2026-04-06T12:00:02.000Z", toolUseId: "tool-1", content: "second\n", delta: true },
+      { kind: "tool_result", ts: "2026-04-06T12:00:03.000Z", toolUseId: "tool-1", content: "", isError: false },
+    ]);
+
+    expect(result.parts).toMatchObject([
+      { type: "tool-call", toolCallId: "tool-1", result: "first\nsecond\n", isError: false },
+    ]);
+  });
+
   it("preserves transcript ordering when text and tool activity are interleaved", () => {
     const result = buildAssistantPartsFromTranscript([
       { kind: "assistant", ts: "2026-04-06T12:00:00.000Z", text: "First." },

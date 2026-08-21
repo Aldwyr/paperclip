@@ -30,16 +30,14 @@ export function isTerminalRunStatus(status: string | undefined | null): boolean 
 
 /**
  * The live parent row's nesting rule (PAP-354, narrowed by PAP-361): only tool
- * calls and usage readouts nest inside the expandable live turn. Messages
+ * calls, provider-supplied reasoning summaries, and usage readouts nest inside the expandable live turn. Messages
  * never nest — an interstitial update streams on the parent row's own line
  * (TaskChatStatusItem.selfTalk) and vanishes when it completes, and the run's
- * final reply lands as its posted comment bubble. Thinking never nests either:
- * its live signal is the pill's "Thinking…" state, and the text stays in the
- * run log / classic transcript. Markers, statuses and interaction cards stay
- * in the thread outside.
+ * final reply lands as its posted comment bubble. Markers, statuses and
+ * interaction cards stay in the thread outside.
  */
 export function isNestableLiveChild(item: TaskChatItem): item is TaskChatTurnChildItem {
-  return item.kind === "tool" || item.kind === "usage" || item.kind === "activity_phase";
+  return item.kind === "tool" || item.kind === "thinking" || item.kind === "usage" || item.kind === "activity_phase";
 }
 
 /**
@@ -269,14 +267,16 @@ export function transcriptToTaskChatItems(
         if (idx != null) {
           const existing = items[idx];
           if (existing.kind === "tool") {
-            existing.status = entry.isError ? "failed" : "completed";
+            existing.status = entry.delta ? "in_progress" : entry.isError ? "failed" : "completed";
             if (isGenericToolName(existing.rawName) && !isGenericToolName(entry.toolName)) {
               existing.name = toolDisplayName(entry.toolName);
               existing.rawName = entry.toolName;
             }
-            if (!existing.detail) {
-              const detail = formatToolResultDetail(entry.content);
-              if (detail) existing.detail = detail;
+            const detail = formatToolResultDetail(entry.content);
+            if (detail) {
+              existing.detail = entry.delta && existing.detail
+                ? `${existing.detail}${detail}`
+                : detail;
             }
           }
         }
@@ -284,6 +284,15 @@ export function transcriptToTaskChatItems(
         break;
       }
       case "diff": {
+        if (entry.changeType === "file_header") {
+          if (lastToolIndex >= 0 && items[lastToolIndex].kind === "tool") {
+            const tool = items[lastToolIndex] as TaskChatToolItem;
+            tool.diff = tool.diff ?? { path: entry.text, added: 0, removed: 0, lines: [] };
+            tool.diff.path = entry.text;
+          }
+          resetInline();
+          break;
+        }
         const line = { kind: diffKind(entry.changeType), text: entry.text ?? "" };
         if (lastToolIndex >= 0 && items[lastToolIndex].kind === "tool") {
           const tool = items[lastToolIndex] as TaskChatToolItem;
@@ -310,8 +319,54 @@ export function transcriptToTaskChatItems(
         resetInline();
         break;
       }
-      // init / result / stderr / stdout / system / user carry no thread-visible
-      // content in the live turn (status is rendered separately).
+      case "system": {
+        if (entry.text.startsWith("Paperclip session ")) {
+          const [label, ...detail] = entry.text.split(" · ");
+          items.push({
+            id: `${runId}:session:${i}`,
+            kind: "marker",
+            variant: "session_start",
+            label: label.replace("Paperclip ", "").replace(/^./, (character) => character.toUpperCase()),
+            detail: detail.join(" · ") || undefined,
+          });
+        } else if (entry.text === "Turn started" || entry.text === "Turn completed") {
+          items.push({
+            id: `${runId}:turn-boundary:${i}`,
+            kind: "marker",
+            variant: "turn_boundary",
+            label: entry.text,
+          });
+        } else if (entry.text.startsWith("Runner:")) {
+          items.push({
+            id: `${runId}:runner:${i}`,
+            kind: "marker",
+            variant: "turn_boundary",
+            label: "Runner update",
+            detail: entry.text.slice("Runner:".length).trim(),
+          });
+        }
+        resetInline();
+        break;
+      }
+      case "result": {
+        if (entry.subtype === "paperclip.usage") {
+          items.push({
+            id: `${runId}:usage:${i}`,
+            kind: "usage",
+            usage: {
+              used: entry.inputTokens + entry.outputTokens,
+              size: 0,
+              inputTokens: entry.inputTokens,
+              outputTokens: entry.outputTokens,
+              costUsd: entry.costUsd,
+            },
+          });
+        }
+        resetInline();
+        break;
+      }
+      // init / stderr / stdout / user and unrecognized result/system records
+      // carry no thread-visible content in the live turn.
       default:
         break;
     }
@@ -338,7 +393,7 @@ export function settledRunChildren(parsed: readonly TaskChatItem[]): TaskChatTur
   return buildActivityPhases(parsed, false);
 }
 
-function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" })[]): string {
+function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { kind: "thinking" } | { kind: "marker" })[]): string {
   const counts = new Map<string, number>();
   let generic = 0;
   for (const item of items) {
@@ -363,7 +418,9 @@ function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" })[]):
   const known = new Set(["read", "edit", "terminal", "grep", "search"]);
   const other = [...counts].reduce((n, [family, count]) => n + (known.has(family) ? 0 : count), 0) + generic;
   if (other) phrases.push(`Called ${other} ${other === 1 ? "tool" : "tools"}`);
-  return phrases.join(", ") || "No tool activity";
+  if (phrases.length > 0) return phrases.join(", ");
+  if (items.some((item) => item.kind === "thinking")) return "Reasoning";
+  return items.some((item) => item.kind === "marker") ? "Turn activity" : "No tool activity";
 }
 
 /** Segment parsed transcript rows at assistant boundaries with stable run-derived ids. */
@@ -395,7 +452,7 @@ export function buildActivityPhases(
         active: false,
       };
       phases.push(current);
-    } else if (item.kind === "tool" || item.kind === "usage") {
+    } else if (item.kind === "tool" || item.kind === "usage" || item.kind === "thinking" || item.kind === "marker") {
       ensureOpening(item.id).items.push(item);
     }
   }
@@ -726,6 +783,7 @@ export function deriveRunStatusLabel(entries: readonly TranscriptEntry[]): {
       return { label: "Responding", selfTalk: selfTalk || undefined };
     }
     if (entry.kind === "thinking") return { label: "Thinking" };
+    if (entry.kind === "system" && entry.text === "Reasoning started") return { label: "Thinking" };
   }
   return { label: "Running" };
 }

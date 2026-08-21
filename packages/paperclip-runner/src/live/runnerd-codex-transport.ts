@@ -74,11 +74,21 @@ export interface CapabilityRunnerdCodexTransport {
 
 export type RunnerdCodexTransport = CapabilityRunnerdCodexTransport;
 
-export function unwrapRunnerdProviderNotification(input: unknown): Record<string, unknown> {
+export function unwrapRunnerdProviderNotifications(input: unknown): Record<string, unknown>[] {
   const payload = record(input);
-  if (typeof payload.method === "string") return payload;
+  if (typeof payload.method === "string") return [payload];
+  if (Array.isArray(payload.events)) {
+    return payload.events
+      .map(record)
+      .filter((event) => typeof event.method === "string");
+  }
   const latest = record(payload.latest);
-  return typeof latest.method === "string" ? latest : payload;
+  return typeof latest.method === "string" ? [latest] : [];
+}
+
+export function unwrapRunnerdProviderNotification(input: unknown): Record<string, unknown> {
+  const notifications = unwrapRunnerdProviderNotifications(input);
+  return notifications.at(-1) ?? record(input);
 }
 
 class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
@@ -483,15 +493,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         continue;
       }
       if (event.eventType !== "provider.event" && event.eventType !== "turn.completed") continue;
-      const payload = unwrapRunnerdProviderNotification(record(event.envelope.payload).payload);
-      const method = payload.method;
-      if (typeof method !== "string") continue;
-      const params = record(payload.params);
-      const providerTurnId = params.turnId ?? record(params.turn).id;
-      if (typeof providerTurnId === "string" && providerTurnId.length > 0) {
-        this.#turnId = providerTurnId;
+      const notifications = unwrapRunnerdProviderNotifications(record(event.envelope.payload).payload);
+      for (const payload of notifications) {
+        const method = payload.method;
+        if (typeof method !== "string") continue;
+        const params = record(payload.params);
+        const providerTurnId = params.turnId ?? record(params.turn).id;
+        if (typeof providerTurnId === "string" && providerTurnId.length > 0) {
+          this.#turnId = providerTurnId;
+        }
+        this.#queue.push({ method, params });
       }
-      this.#queue.push({ method, params });
     }
   }
 

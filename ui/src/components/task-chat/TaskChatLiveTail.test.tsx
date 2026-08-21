@@ -53,8 +53,7 @@ describe("TaskChatLiveTail", () => {
       "Looking into the failing test.",
     );
     const phaseSummary = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-phase-summary"]');
-    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("false");
-    flushSync(() => phaseSummary!.click());
+    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("true");
     // Tool row renders with its name + mono target.
     expect(container.textContent).toContain("Read");
     expect(container.textContent).toContain("src/app.ts");
@@ -69,8 +68,7 @@ describe("TaskChatLiveTail", () => {
     render(items);
 
     const phaseSummary = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-phase-summary"]');
-    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("false");
-    flushSync(() => phaseSummary!.click());
+    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("true");
     expect(container.textContent).toContain("const x = 1;");
     expect(container.textContent).toContain("+1 −1");
   });
@@ -105,8 +103,7 @@ describe("TaskChatLiveTail", () => {
       "Here is the real reply.",
     );
     const phaseSummary = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-phase-summary"]');
-    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("false");
-    flushSync(() => phaseSummary!.click());
+    expect(phaseSummary?.getAttribute("aria-expanded")).toBe("true");
     const text = container.textContent ?? "";
     expect(text).toContain("Here is the real reply.");
     expect(text).toContain("pnpm test");
@@ -125,15 +122,16 @@ describe("TaskChatLiveTail", () => {
     }
   });
 
-  it("does not render a thinking row (its signal is the status pill)", () => {
+  it("renders provider-supplied reasoning in the live activity stream", () => {
     const items = parse([
-      { kind: "thinking", ts: TS, text: "SECRET internal reasoning" },
+      { kind: "thinking", ts: TS, text: "Provider reasoning summary" },
       { kind: "assistant", ts: TS, text: "Visible answer." },
     ]);
     render(items);
 
     expect(container.textContent).toContain("Visible answer.");
-    expect(container.textContent).not.toContain("SECRET internal reasoning");
+    expect(container.textContent).toContain("Provider reasoning summary");
+    expect(container.querySelector('[data-testid="task-chat-thinking"]')).not.toBeNull();
   });
 
   it("shows the empty message when nothing renderable has streamed yet", () => {

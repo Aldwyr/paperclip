@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MarkdownBody } from "@/components/MarkdownBody";
@@ -11,7 +11,14 @@ export function TaskChatActivityPhase({
   item: TaskChatActivityPhaseItem;
   renderChild: (child: TaskChatActivityPhaseItem["items"][number]) => ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
+  const shouldAutoOpen =
+    item.active || item.items.some((child) =>
+      (child.kind === "thinking" && child.streaming) ||
+      (child.kind === "tool" && child.status === "in_progress"));
+  const [open, setOpen] = useState(shouldAutoOpen);
+  useEffect(() => {
+    if (shouldAutoOpen) setOpen(true);
+  }, [shouldAutoOpen]);
   const expandable = item.items.length > 0;
   return (
     <div className="flex min-w-0 flex-col gap-1" data-testid="task-chat-activity-phase">

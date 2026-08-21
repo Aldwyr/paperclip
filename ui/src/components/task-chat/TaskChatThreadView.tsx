@@ -12,6 +12,7 @@ import { TaskChatStatusPill } from "./TaskChatStatusPill";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
+import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskMessageScroller } from "./TaskMessageScroller";
 
 interface TaskChatThreadViewProps {
@@ -89,11 +90,7 @@ function renderItem(
     case "marker":
       return <TaskChatMarker item={item} />;
     case "thinking":
-      // Thinking never renders as a row (PAP-361): its live signal is the
-      // pill's "Thinking…" state, and the text stays in the run log / classic
-      // transcript. The kind survives in the model because the transcript
-      // parser still emits it (both nesting rules filter it out).
-      return null;
+      return <TaskChatThinking item={item} />;
     case "tool":
       return <TaskChatToolCard item={item} />;
     case "status":

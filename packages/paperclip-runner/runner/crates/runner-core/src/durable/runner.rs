@@ -1120,6 +1120,50 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_p2_preserves_every_ordered_provider_notification() {
+        let root = temporary_root("ordered-p2-coalesce");
+        let config = config(&root);
+        let mut state = DurableRunnerState::new(&config);
+        let item_id = state.item_id.clone();
+        for payload in [
+            json!({ "method": "item/started", "params": { "item": { "id": "reasoning-1" } } }),
+            json!({ "method": "item/reasoning/summaryTextDelta", "params": { "delta": "Inspecting" } }),
+            json!({ "method": "item/completed", "params": { "item": { "id": "reasoning-1" } } }),
+        ] {
+            enqueue_event(
+                &mut state,
+                &config,
+                "provider.event",
+                2,
+                payload,
+                Some(&item_id),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(state.outbox.len(), 1);
+        let payload = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload")
+            .unwrap();
+        assert_eq!(payload["coalescedCount"], json!(3));
+        assert_eq!(
+            payload["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "item/started",
+                "item/reasoning/summaryTextDelta",
+                "item/completed",
+            ],
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn oversized_coalesced_p2_retains_prior_event_and_never_exceeds_bounds() {
         let root = temporary_root("oversized-p2-coalesce");
         let mut config = config(&root);

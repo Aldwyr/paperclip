@@ -204,7 +204,7 @@ export interface TaskChatActivityPhaseItem {
   /** Historical assistant update that introduced this phase. */
   interstitial?: TaskChatMessageItem;
   /** Chronological tool/usage rows owned exclusively by this phase. */
-  items: Array<TaskChatToolItem | TaskChatUsageItem>;
+  items: Array<TaskChatToolItem | TaskChatUsageItem | TaskChatThinkingItem | TaskChatMarkerItem>;
   /** Deterministic, taxonomy-based summary (for example "Read 3 files, ran 1 command"). */
   summary: string;
   /** The tail phase of an in-flight run stays foregrounded. */

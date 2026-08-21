@@ -7,6 +7,7 @@ import {
   createCapabilityRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
   unwrapRunnerdProviderNotification,
+  unwrapRunnerdProviderNotifications,
 } from "./runnerd-codex-transport.js";
 
 const fakeCodex = resolve(
@@ -25,6 +26,21 @@ it("unwraps a coalesced provider notification without losing its turn identity",
     method: "turn/started",
     params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
   });
+});
+
+it("replays every provider notification from a durable coalesced batch", () => {
+  expect(unwrapRunnerdProviderNotifications({
+    coalescedCount: 3,
+    events: [
+      { method: "item/started", params: { item: { id: "reasoning-1" } } },
+      { method: "item/reasoning/summaryTextDelta", params: { delta: "Checking the task" } },
+      { method: "item/completed", params: { item: { id: "reasoning-1" } } },
+    ],
+  })).toEqual([
+    expect.objectContaining({ method: "item/started" }),
+    expect.objectContaining({ method: "item/reasoning/summaryTextDelta" }),
+    expect.objectContaining({ method: "item/completed" }),
+  ]);
 });
 
 it("runs the lab provider boundary through authenticated durable PRP", async () => {

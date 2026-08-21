@@ -232,19 +232,19 @@ describe("isNestableLiveChild", () => {
     { id: "i", kind: "interaction", interaction: {} as never },
   ];
 
-  it("nests only tool and usage rows inside the live parent row (PAP-361)", () => {
+  it("nests tools, provider reasoning, and usage inside the live parent row", () => {
     expect(items.filter(isNestableLiveChild).map((it) => it.kind)).toEqual([
       "tool",
+      "thinking",
       "usage",
     ]);
   });
 
-  it("keeps messages, thinking, markers, statuses and interactions out", () => {
+  it("keeps messages, markers, statuses and interactions out", () => {
     // Interstitial updates — finished or streaming — never nest: they are
-    // ephemeral, living on the live line only while streaming. Thinking never
-    // nests either (its live signal is the pill's "Thinking…" state), and the
-    // final reply keeps its bubble.
-    for (const kind of ["message", "thinking", "marker", "status", "interaction"]) {
+    // ephemeral, living on the live line only while streaming, and the final
+    // reply keeps its bubble.
+    for (const kind of ["message", "marker", "status", "interaction"]) {
       const item = items.find((it) => it.kind === kind)!;
       expect(isNestableLiveChild(item)).toBe(false);
     }
@@ -380,7 +380,7 @@ describe("settledRunChildren (PAP-361)", () => {
     expect(children.map((c) => c.kind)).toEqual(["activity_phase"]);
     const phase = children[0];
     expect(phase.kind === "activity_phase" && phase.interstitial?.text).toBe("Checking the adapter first.");
-    expect(phase.kind === "activity_phase" && phase.items.map((item) => item.kind)).toEqual(["tool", "tool"]);
+    expect(phase.kind === "activity_phase" && phase.items.map((item) => item.kind)).toEqual(["tool", "thinking", "tool"]);
   });
 
   it("matches the folded summary's tool count exactly (row-count parity)", () => {

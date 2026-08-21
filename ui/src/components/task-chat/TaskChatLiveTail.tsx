@@ -4,6 +4,8 @@ import type { TaskChatItem } from "./task-chat-model";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
+import { TaskChatThinking } from "./TaskChatThinking";
+import { TaskChatMarker } from "./TaskChatMarker";
 import { buildActivityPhases } from "./transcript-adapter";
 
 /**
@@ -77,18 +79,24 @@ function renderTailRow(item: TaskChatItem): ReactElement | null {
           <TaskChatUsageReadout item={item} />
         </div>
       );
+    case "thinking":
+      return <TaskChatThinking key={item.id} item={item} />;
     case "activity_phase":
       return (
         <TaskChatActivityPhase
           key={item.id}
           item={item}
-          renderChild={(child) => child.kind === "tool" ? <TaskChatToolCard item={child} /> : <TaskChatUsageReadout item={child} />}
+          renderChild={(child) => child.kind === "tool"
+            ? <TaskChatToolCard item={child} />
+            : child.kind === "thinking"
+              ? <TaskChatThinking item={child} />
+              : child.kind === "marker"
+                ? <TaskChatMarker item={child} />
+              : <TaskChatUsageReadout item={child} />}
         />
       );
-    // Thinking never renders as a row (PAP-361): its live signal is the status
-    // pill, and the text stays in the run log / classic transcript. Every other
-    // kind (markers, interactions, briefs, statuses, turns, and the dropped
-    // debug kinds) cannot appear in a parsed live transcript.
+    // Markers, interactions, briefs, statuses, turns, and dropped debug kinds
+    // cannot appear as direct live-tail rows.
     default:
       return null;
   }
