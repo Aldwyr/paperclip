@@ -1697,6 +1697,12 @@ export function classifyRisk(tool: McpToolDescriptor, sourceTemplateKey?: string
   return "read";
 }
 
+export function isGmailToolPermanentlyBlocked(tool: McpToolDescriptor): boolean {
+  const riskLevel = classifyRisk(tool, "gmail");
+  return verbMatches(tool.name, "send|trash|spam|delete|remove|destroy|execute|run")
+    || (normalizedProviderToolName(tool.name).includes("label") && riskLevel !== "read");
+}
+
 function descriptorHash(tool: McpToolDescriptor, riskLevel: ToolRiskLevel): string {
   return stableHash({
     name: tool.name,
@@ -4099,10 +4105,14 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return headers;
   }
 
-  async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
+  async function remoteTools(
+    connection: typeof toolConnections.$inferSelect,
+    credentialHeaders?: Record<string, string>,
+  ): Promise<McpToolDescriptor[]> {
     const composioChild = composioChildConfig(connection);
     const composioSession = composioChild ? await composioSessions.ensureSession(connection.id) : null;
     const headers = composioSession?.headers
+      ?? credentialHeaders
       ?? { ...projectedConnectionHeaders(connection), ...await resolveCredentialHeaders(connection) };
     const endpoint = composioSession?.url ?? remoteEndpoint(connection.config);
     // Pinned to the address the guard approved: `config.url` is operator-supplied,
@@ -4476,8 +4486,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return { toolkitSlug, disconnectedAccountIds: accounts.items.map((account) => account.id), removedChildIds };
   }
 
-  async function discoverTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
-    if (connection.transport === "mcp_remote") return remoteTools(connection);
+  async function discoverTools(
+    connection: typeof toolConnections.$inferSelect,
+    credentialHeaders?: Record<string, string>,
+  ): Promise<McpToolDescriptor[]> {
+    if (connection.transport === "mcp_remote") return remoteTools(connection, credentialHeaders);
     if (isComposioConnection(connection)) {
       await validateComposioConnection(connection);
       return [];
@@ -4570,13 +4583,13 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   async function refreshCatalog(
     connectionId: string,
     actor?: ActorInfo,
-    refreshOptions: { enableAllByDefault?: boolean } = {},
+    refreshOptions: { enableAllByDefault?: boolean; credentialHeaders?: Record<string, string> } = {},
   ): Promise<ToolCatalogRefreshResult> {
     const connection = await getConnectionRow(connectionId);
     const refreshedAt = now();
     let descriptors: McpToolDescriptor[];
     try {
-      descriptors = await discoverTools(connection);
+      descriptors = await discoverTools(connection, refreshOptions.credentialHeaders);
     } catch (error) {
       const failure = sanitizeHttpFailure(error);
       const updated = await updateConnectionHealth(connection, failure.status, failure.message);
@@ -4618,14 +4631,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         && (!existing || changed)
         && existing?.status !== "disabled"
         && (!safeDefault || riskLevel !== "read");
-      const status = shouldQuarantine
-        ? "quarantined"
-        : existing?.status === "disabled"
-          ? "disabled"
-          : quarantineOnRefresh && existing?.status === "quarantined"
-            ? "quarantined"
-            : "active";
-      if (shouldQuarantine) quarantinedCount += 1;
+      const gmailPermanentlyBlocked = sourceTemplateKey === "gmail" && isGmailToolPermanentlyBlocked(descriptor);
+      const status = gmailPermanentlyBlocked
+        ? "disabled"
+        : shouldQuarantine
+          ? "quarantined"
+          : existing?.status === "disabled"
+            ? "disabled"
+            : quarantineOnRefresh && existing?.status === "quarantined"
+              ? "quarantined"
+              : "active";
+      if (shouldQuarantine && !gmailPermanentlyBlocked) quarantinedCount += 1;
 
       if (existing) {
         const [updated] = await db
@@ -6905,6 +6921,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         resource: method.defaults?.serverUrl,
         scopes: [...GMAIL_CONNECTOR_SCOPES],
       };
+      config.quarantineNewEntries = true;
     }
     // A pasted URL may arrive with a client the operator preregistered in the
     // provider's own console, because that authorization server supports neither
@@ -7702,6 +7719,66 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
     const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
     assertOAuthRedirectConstraints(galleryEntry, input.redirectUri);
+    const galleryMethod = galleryEntry ? connectionMethodForConnection(galleryEntry, connection) : null;
+    if (galleryMethod?.oauthStrategy === "paperclip_id_connector") {
+      if (!gmailConnector) {
+        throw unprocessable("Gmail connections are not available on this Paperclip instance yet", {
+          code: "paperclip_id_connector_unavailable",
+        });
+      }
+      const binding = actorBinding(input.actor);
+      if (!binding.actorType || !binding.actorId) {
+        throw forbidden("Gmail sign-in requires an authenticated actor");
+      }
+      const subjectUserId = input.subjectUserId ?? (binding.actorType === "user" ? binding.actorId : null);
+      if (!subjectUserId) {
+        throw forbidden("Agent-started Gmail sign-in requires an authorized user subject");
+      }
+      if (binding.actorType === "user" && subjectUserId !== binding.actorId) {
+        throw forbidden("Board users may only authorize their own Gmail identity");
+      }
+      await db.delete(toolOauthStates).where(lt(toolOauthStates.expiresAt, now()));
+      const state = randomOauthToken();
+      const returnUri = new URL(input.redirectUri);
+      returnUri.pathname = "/api/tools/oauth/paperclip-id/callback";
+      returnUri.search = "";
+      returnUri.hash = "";
+      const session = await gmailConnector.startAuthorization({
+        subject: subjectUserId,
+        companyId,
+        returnUri: returnUri.toString(),
+        returnState: state,
+      });
+      const remoteExpiry = new Date(session.expiresAt);
+      const expiresAt = Number.isFinite(remoteExpiry.getTime())
+        ? new Date(Math.min(remoteExpiry.getTime(), now().getTime() + 10 * 60 * 1000))
+        : new Date(now().getTime() + 10 * 60 * 1000);
+      await db.insert(toolOauthStates).values({
+        state,
+        companyId,
+        connectionId: connection.id,
+        // Paperclip ID owns PKCE for this flow. The local state row remains the
+        // single-use browser correlator and never stores broker token material.
+        codeVerifier: "paperclip-id-connector",
+        createdByActorType: binding.actorType,
+        createdByActorId: binding.actorId,
+        createdBySessionId: binding.sessionId,
+        subjectUserId,
+        requestedScopes: [...GMAIL_CONNECTOR_SCOPES],
+        returnTo: input.returnTo,
+        issueId: input.issueId,
+        expiresAt,
+      });
+      return {
+        connectionId: connection.id,
+        provider: "gmail",
+        authorizationUrl: session.authorizationUrl,
+        expiresAt: expiresAt.toISOString(),
+        issuer: "https://accounts.google.com",
+        resource: galleryMethod.defaults?.serverUrl ?? null,
+        registrationSource: null,
+      };
+    }
     const endpoints = await oauthEndpointsForConnection(connection, null, input.redirectUri);
     if (endpoints.grantType === "client_credentials") {
       throw unprocessable("This app uses shared machine credentials and does not need browser sign in");
@@ -7978,6 +8055,160 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         eq(issueThreadInteractions.companyId, stateRow.companyId),
         eq(issueThreadInteractions.status, "pending"),
       ));
+  }
+
+  async function completePaperclipIdGmailCallback(input: {
+    state: string;
+    claimId?: string | null;
+    error?: string | null;
+    actor?: ActorInfo;
+  }): Promise<ConnectToolAppResult> {
+    const stateRow = await consumeOAuthState(input.state, input.actor);
+    if (input.error) {
+      await rejectPendingOAuthInteraction(stateRow, input.actor);
+      throw new HttpError(400, "Google authorization did not complete. Start a new Gmail connection to try again.", {
+        code: input.error === "access_denied" ? "oauth_authorization_denied" : "paperclip_id_connector_failed",
+      });
+    }
+    if (!input.claimId) throw badRequest("Gmail callback is missing a claim identifier");
+    if (!gmailConnector) {
+      throw unprocessable("Gmail connections are not available on this Paperclip instance yet", {
+        code: "paperclip_id_connector_unavailable",
+      });
+    }
+    let connection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);
+    const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
+    const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
+    const method = galleryEntry ? connectionMethodForConnection(galleryEntry, connection) : null;
+    if (method?.oauthStrategy !== "paperclip_id_connector" || !stateRow.subjectUserId) {
+      throw badRequest("OAuth state does not belong to a Gmail connector flow");
+    }
+    const credentials = await gmailConnector.claim({
+      subject: stateRow.subjectUserId,
+      companyId: stateRow.companyId,
+      claimId: input.claimId,
+    });
+    if (!credentials.refreshToken) {
+      throw unprocessable("Google did not return offline access. Reconnect Gmail and grant both requested scopes.", {
+        code: "oauth_refresh_missing",
+      });
+    }
+
+    const [membership] = await db.select({ id: companyMemberships.id }).from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, connection.companyId),
+      eq(companyMemberships.principalType, "user"),
+      eq(companyMemberships.principalId, stateRow.subjectUserId),
+      eq(companyMemberships.status, "active"),
+    )).limit(1);
+    if (!membership) {
+      throw forbidden("Your company membership is no longer active. Restore access before you connect Gmail again.");
+    }
+    const [existingUserGrant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.companyId, connection.companyId),
+      eq(connectionGrants.connectionId, connection.id),
+      eq(connectionGrants.kind, "user"),
+      eq(connectionGrants.subjectUserId, stateRow.subjectUserId),
+    )).limit(1);
+    const existingRefs = existingUserGrant?.credentialSecretRefs ?? [];
+    const accessRef = await createOrRotateOAuthSecret({
+      companyId: connection.companyId,
+      connection,
+      configPath: "oauth.access_token",
+      label: "Gmail access token",
+      value: credentials.accessToken,
+      actor: input.actor,
+      existingRefs,
+      ownerUserId: stateRow.subjectUserId,
+    });
+    const refreshRef = await createOrRotateOAuthSecret({
+      companyId: connection.companyId,
+      connection,
+      configPath: "oauth.refresh_token",
+      label: "Gmail refresh token",
+      value: credentials.refreshToken,
+      actor: input.actor,
+      existingRefs,
+      ownerUserId: stateRow.subjectUserId,
+    });
+    const credentialSecretRefs = [
+      ...existingRefs.filter((ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token"),
+      accessRef,
+      refreshRef,
+    ];
+    const grantValues = {
+      providerTenant: {
+        name: "Gmail",
+        externalId: credentials.subject,
+        oauth: {
+          strategy: "paperclip_id_connector",
+          accessTokenExpiresAt: credentials.accessTokenExpiresAt,
+          scopes: credentials.scopes,
+          tokenType: credentials.tokenType,
+        },
+      },
+      credentialSecretRefs,
+      status: "active" as const,
+      revokedAt: null,
+      revokedByAgentId: null,
+      revokedByUserId: null,
+      updatedAt: now(),
+    };
+    if (existingUserGrant) {
+      await db.update(connectionGrants).set(grantValues).where(eq(connectionGrants.id, existingUserGrant.id));
+    } else {
+      await db.insert(connectionGrants).values({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        kind: "user",
+        subjectUserId: stateRow.subjectUserId,
+        ...grantValues,
+        isDefault: false,
+        createdByUserId: stateRow.subjectUserId,
+      });
+    }
+    const nextConfig = {
+      ...connection.config,
+      oauth: {
+        ...oauthConfig(connection),
+        strategy: "paperclip_id_connector",
+        provider: "gmail",
+        resource: method.defaults?.serverUrl,
+        scopes: [...GMAIL_CONNECTOR_SCOPES],
+      },
+    };
+    [connection] = await db.update(toolConnections).set({
+      status: "active",
+      enabled: true,
+      authKind: "oauth",
+      config: nextConfig,
+      transportConfig: nextConfig,
+      updatedAt: now(),
+    }).where(eq(toolConnections.id, connection.id)).returning();
+    await db.update(toolApplications).set({ status: "active", updatedAt: now() }).where(eq(toolApplications.id, connection.applicationId));
+    await syncCredentialBindings(connection, credentialSecretRefs);
+    if (stateRow.interactionId) {
+      await db.update(issueThreadInteractions).set({
+        status: "accepted",
+        result: { version: 1, outcome: "accepted" },
+        resolvedByUserId: stateRow.subjectUserId,
+        resolvedAt: now(),
+        updatedAt: now(),
+      }).where(eq(issueThreadInteractions.id, stateRow.interactionId));
+    }
+    const refresh = await refreshCatalog(connection.id, input.actor, {
+      enableAllByDefault: false,
+      credentialHeaders: { Authorization: `Bearer ${credentials.accessToken}` },
+    });
+    const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
+    return {
+      connectionId: connection.id,
+      application: toApplication(application),
+      connection: refresh.connection,
+      catalog: refresh.catalog,
+      actions: groupedActions(refresh.catalog),
+      suggestedDefaults: recommendedDefaultsForApp(galleryEntry!, method.key),
+      auth: null,
+    };
   }
 
   async function completeOAuthCallback(input: {
@@ -8336,6 +8567,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     },
 
     peekOAuthState,
+
+    completePaperclipIdGmailCallback,
 
     completeOAuthCallback,
 
@@ -8945,6 +9178,43 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     revokeConnectionGrant: async (idOrUid: string, grantId: string, actor?: ActorInfo) => {
       const connection = await getConnectionRow(idOrUid);
       const binding = actorBinding(actor);
+      const [currentGrant] = await db.select().from(connectionGrants).where(and(
+        eq(connectionGrants.id, grantId),
+        eq(connectionGrants.companyId, connection.companyId),
+        eq(connectionGrants.connectionId, connection.id),
+      )).limit(1);
+      if (!currentGrant) throw notFound("Connection grant not found");
+      let providerRevocation = "not_applicable";
+      if (oauthConfig(connection).strategy === "paperclip_id_connector" && currentGrant.subjectUserId && gmailConnector) {
+        const tokenRef = currentGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token")
+          ?? currentGrant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
+        if (tokenRef) {
+          try {
+            const token = await secrets.resolveSecretValue(
+              connection.companyId,
+              tokenRef.secretId,
+              tokenRef.versionSelector ?? "latest",
+              {
+                consumerType: "tool_connection",
+                consumerId: connection.id,
+                configPath: tokenRef.configPath,
+                actorType: binding.actorType ?? "system",
+                actorId: binding.actorId,
+              },
+            );
+            await gmailConnector.revoke({
+              subject: currentGrant.subjectUserId,
+              companyId: connection.companyId,
+              token,
+            });
+            providerRevocation = "success";
+          } catch {
+            // Local revocation is authoritative for Paperclip and must not be
+            // rolled back because Google or the broker is temporarily offline.
+            providerRevocation = "failed";
+          }
+        }
+      }
       const grant = await db.transaction(async (tx) => {
         const removedDelegations = await tx.delete(connectionGrantDelegations).where(and(
           eq(connectionGrantDelegations.companyId, connection.companyId),
@@ -8986,7 +9256,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         action: "connection_grant.revoked",
         outcome: "success",
         reasonCode: "grant_revoked",
-        details: { grantId: grant.id, kind: grant.kind },
+        details: { grantId: grant.id, kind: grant.kind, providerRevocation },
       });
       return grant;
     },

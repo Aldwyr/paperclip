@@ -9,6 +9,7 @@ describe("tool app gallery URL matching", () => {
     expect(getAppDefinitionForUrl("https://mcp.zapier.com/api/mcp")?.slug).toBe("zapier");
     expect(getAppDefinitionForUrl("https://api.githubcopilot.com/mcp/")?.slug).toBe("github");
     expect(getAppDefinitionForUrl("https://docs.google.com/spreadsheets/d/sheet_123/edit")?.slug).toBe("google-sheets");
+    expect(getAppDefinitionForUrl("https://gmailmcp.googleapis.com/mcp/v1")?.slug).toBe("gmail");
   });
 
   it("returns null for invalid or unknown links", () => {

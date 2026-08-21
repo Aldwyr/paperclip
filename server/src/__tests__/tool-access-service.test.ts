@@ -3256,7 +3256,12 @@ describeEmbeddedPostgres("tool access service", () => {
       "google-sheets",
       "context7",
       "composio",
+      "gmail",
     ]);
+    expect(res.body.apps.find((app: { slug: string }) => app.slug === "gmail").availability).toEqual({
+      available: false,
+      reason: "Gmail is not available on this Paperclip instance yet.",
+    });
     expect(res.body.apps.map((app: { slug: string }) => app.slug)).not.toContain("google-drive");
     expect(res.body.apps).toEqual(
       expect.arrayContaining([

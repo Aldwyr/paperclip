@@ -154,7 +154,7 @@ The Gmail authorization request must use:
 - `response_type=code`;
 - the two exact Gmail scopes above;
 - `access_type=offline`;
-- `prompt=consent select_account` for first connect and explicit reconnect;
+- `prompt=consent` for every connect and explicit reconnect;
 - a random, short-lived, single-use state value; and
 - PKCE S256.
 
@@ -209,6 +209,36 @@ Paperclip ID may retain instance-encrypted initial-token ciphertext for at most
 five minutes. It deletes the ciphertext on claim or expiry and excludes it from
 long-term backups. Refresh and revoke handle plaintext only in memory for one
 bounded request.
+
+### Configure each originating Paperclip instance
+
+Generate the two long-lived instance keys once. PEM-encoded PKCS#8 keys work
+directly with Paperclip:
+
+```sh
+openssl genpkey -algorithm ED25519 -out paperclip-id-signing.pem
+openssl genpkey -algorithm X25519 -out paperclip-id-sealing.pem
+openssl pkey -in paperclip-id-signing.pem -pubout -out paperclip-id-signing.pub.pem
+openssl pkey -in paperclip-id-sealing.pem -pubout -out paperclip-id-sealing.pub.pem
+```
+
+Keep both private files in the instance secret manager. Enroll only the public
+files with Paperclip ID, together with the instance id, the matching environment,
+and every exact browser return origin. Then configure the originating Paperclip
+deployment:
+
+| Variable | Development | Staging | Production |
+| --- | --- | --- | --- |
+| `PAPERCLIP_ID_CONNECTOR_BASE_URL` | Local Paperclip ID URL | `https://id-staging.paperclip.app` | `https://id.paperclip.app` |
+| `PAPERCLIP_ID_CONNECTOR_ENVIRONMENT` | `development` | `staging` | `production` |
+| `PAPERCLIP_ID_CONNECTOR_INSTANCE_ID` | Enrolled development instance id | Enrolled staging instance id | Enrolled production instance id |
+| `PAPERCLIP_ID_CONNECTOR_SIGN_PRIVATE_KEY` | Development Ed25519 private key | Staging Ed25519 private key | Production Ed25519 private key |
+| `PAPERCLIP_ID_CONNECTOR_SEAL_PRIVATE_KEY` | Development X25519 private key | Staging X25519 private key | Production X25519 private key |
+
+Use separate keypairs and instance enrollments across environments. The
+connector is unavailable unless all four identity/key variables are present.
+HTTP is accepted only for a loopback Paperclip ID URL; staging and production
+must use HTTPS.
 
 ## Paperclip access defaults
 
