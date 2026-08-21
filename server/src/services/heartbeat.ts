@@ -16171,6 +16171,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             leaseOwner: runOptions.nativeLeaseOwner,
             backend: options.nativeSessionBackendFactory?.(nativeExecution),
             useRunnerd: agent.adapterType === "paperclip_runner",
+            onLog,
             onSpawn: async (meta) => {
               await persistRunProcessMetadata(run.id, meta);
             },

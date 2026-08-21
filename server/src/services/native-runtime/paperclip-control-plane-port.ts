@@ -66,10 +66,14 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
   readonly #db: Db;
   readonly #binding: PaperclipControlPlaneBinding;
   #sessionId: string | null = null;
+  readonly #onCommittedEvent?: (event: PrpEvent) => Promise<void>;
 
-  constructor(db: Db, binding: PaperclipControlPlaneBinding) {
+  constructor(db: Db, binding: PaperclipControlPlaneBinding, options: {
+    onCommittedEvent?: (event: PrpEvent) => Promise<void>;
+  } = {}) {
     this.#db = db;
     this.#binding = structuredClone(binding);
+    this.#onCommittedEvent = options.onCommittedEvent;
   }
 
   async openRun(input: OpenControlPlaneRunInput): Promise<void> {
@@ -190,6 +194,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
         canonicalPayload: event as unknown as Record<string, unknown>,
       },
     });
+    if (persisted.disposition === "committed") await this.#onCommittedEvent?.(event);
     return {
       cursor: persisted.row.seq,
       highestContiguousSourceSeq: persisted.highestContiguousSourceSeq,

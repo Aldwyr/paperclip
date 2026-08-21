@@ -247,6 +247,7 @@ export async function executePaperclipNativeSession(input: {
   /** Test seam at the provider boundary; production always uses the package Codex backend. */
   backend?: NativeSessionBackend;
   useRunnerd?: boolean;
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<AdapterExecutionResult> {
   const leaseOwner = input.leaseOwner ?? `${input.runnerInstanceId}:${randomUUID()}`;
   const leaseNow = new Date();
@@ -293,6 +294,10 @@ export async function executePaperclipNativeSession(input: {
     completionContractSha256: input.execution.completionContract.sha256,
     sourceInstanceId: input.runnerInstanceId,
     controlPlaneSourceInstanceId: controlPlaneInstanceId,
+  }, {
+    onCommittedEvent: input.onLog
+      ? async (event) => input.onLog!("stdout", `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`)
+      : undefined,
   });
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
   try {

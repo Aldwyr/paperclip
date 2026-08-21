@@ -1316,18 +1316,32 @@ class CodexHarnessSession implements HarnessSession {
       if (!isSemanticTool(tool)) {
         const admitted = this.#dynamicTools.some((candidate) => candidate.name === tool);
         if (admitted && this.#dynamicToolHandler !== undefined) {
+          this.#emit("item.started", {
+            kind: "dynamicToolCall",
+            item: { type: "tool_use", id: callId, name: tool, input: request.params.arguments },
+          }, { turnId, itemId: callId });
           try {
-            return dynamicToolResponse(await this.#dynamicToolHandler({
+            const result = await this.#dynamicToolHandler({
               tool,
               callId,
               threadId,
               turnId,
               arguments: request.params.arguments,
-            }));
+            });
+            this.#emit("item.completed", {
+              kind: "dynamicToolCall",
+              item: { type: "tool_result", id: callId, tool_use_id: callId, result },
+            }, { turnId, itemId: callId });
+            return dynamicToolResponse(result);
           } catch (error) {
+            const message = boundedText(error instanceof Error ? error.message : error);
+            this.#emit("item.completed", {
+              kind: "dynamicToolCall",
+              item: { type: "tool_result", id: callId, tool_use_id: callId, error: message, is_error: true },
+            }, { turnId, itemId: callId });
             return {
               success: false,
-              contentItems: [{ type: "inputText", text: boundedText(error instanceof Error ? error.message : error) }],
+              contentItems: [{ type: "inputText", text: message }],
             };
           }
         }
