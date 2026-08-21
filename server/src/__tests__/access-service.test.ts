@@ -289,6 +289,9 @@ describeEmbeddedPostgres("access service", () => {
       key: `oauth-${randomUUID()}`,
       name: `OAuth ${randomUUID()}`,
     }).returning().then((rows) => rows[0]!);
+    await db.update(toolConnections).set({
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+    }).where(eq(toolConnections.id, connection.id));
     const grant = await db.insert(connectionGrants).values({
       companyId: company.id,
       connectionId: connection.id,
@@ -307,6 +310,7 @@ describeEmbeddedPostgres("access service", () => {
       connectionId: connection.id,
       kind: "organization",
       isDefault: true,
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
     }).returning().then((rows) => rows[0]!);
     await db.insert(connectionGrantMembers).values({
       companyId: company.id,
@@ -323,9 +327,82 @@ describeEmbeddedPostgres("access service", () => {
     expect(await db.select().from(connectionGrantMembers)).toHaveLength(0);
     expect(await db.select().from(companySecrets).where(eq(companySecrets.id, secret.id))).toHaveLength(0);
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
-      .toEqual([expect.objectContaining({ status: "revoked" })]);
+      .toEqual([expect.objectContaining({ status: "revoked", credentialSecretRefs: [] })]);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, organizationGrant.id)))
+      .toEqual([expect.objectContaining({ credentialSecretRefs: [] })]);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id)))
+      .toEqual([expect.objectContaining({ credentialSecretRefs: [] })]);
     expect(await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.reasonCode, "membership_removed")))
       .toHaveLength(1);
+  });
+
+  it("revokes delegated personal connection access when membership is suspended", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: `member-${randomUUID()}`,
+      status: "active",
+      membershipRole: "member",
+    }).returning().then((rows) => rows[0]!);
+    const agent = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Delegated agent",
+      role: "worker",
+      adapterType: "process",
+      adapterConfig: {},
+    }).returning().then((rows) => rows[0]!);
+    const application = await db.insert(toolApplications).values({
+      companyId: company.id,
+      applicationKey: `app-${randomUUID()}`,
+      name: "Personal mail",
+      type: "mcp",
+      status: "active",
+    }).returning().then((rows) => rows[0]!);
+    const connection = await db.insert(toolConnections).values({
+      companyId: company.id,
+      applicationId: application.id,
+      name: "Mail",
+      uid: `mail-${randomUUID()}`,
+      connectionKind: "managed",
+      ownership: "customer",
+      transport: "mcp_remote",
+      authKind: "oauth",
+      credentialPolicy: "per_user",
+    }).returning().then((rows) => rows[0]!);
+    const definition = await db.insert(userSecretDefinitions).values({
+      companyId: company.id,
+      key: `oauth-${randomUUID()}`,
+      name: "Personal OAuth token",
+    }).returning().then((rows) => rows[0]!);
+    const secret = await db.insert(companySecrets).values({
+      companyId: company.id,
+      scope: "user",
+      ownerUserId: member.principalId,
+      userSecretDefinitionId: definition.id,
+      key: `oauth-${randomUUID()}`,
+      name: `OAuth ${randomUUID()}`,
+    }).returning().then((rows) => rows[0]!);
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: member.principalId,
+      credentialSecretRefs: [{ secretId: secret.id, configPath: "oauth.access_token" }],
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(connectionGrantDelegations).values({
+      companyId: company.id,
+      grantId: grant.id,
+      agentId: agent.id,
+      createdByUserId: member.principalId,
+    });
+
+    await accessService(db).updateMember(company.id, member.id, { status: "suspended" });
+
+    expect(await db.select().from(connectionGrantDelegations)).toHaveLength(0);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.id, secret.id))).toHaveLength(0);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))
+      .toEqual([expect.objectContaining({ status: "revoked", credentialSecretRefs: [] })]);
   });
 
   it("allows owner and admin role-default grants to manage environments", async () => {

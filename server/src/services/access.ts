@@ -10,6 +10,7 @@ import {
   issues,
   principalPermissionGrants,
   toolAccessAuditEvents,
+  toolConnections,
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
@@ -49,9 +50,18 @@ export function accessService(db: Db) {
       eq(connectionGrants.subjectUserId, userId),
     ));
     const grantIds = ownedGrants.map((grant) => grant.id);
-    const secretIds = [...new Set(ownedGrants.flatMap((grant) =>
+    const referencedSecretIds = [...new Set(ownedGrants.flatMap((grant) =>
       grant.credentialSecretRefs.map((ref) => ref.secretId),
     ))];
+    const ownedSecrets = referencedSecretIds.length === 0 ? [] : await tx.select({
+      id: companySecrets.id,
+    }).from(companySecrets).where(and(
+      eq(companySecrets.companyId, companyId),
+      eq(companySecrets.scope, "user"),
+      eq(companySecrets.ownerUserId, userId),
+      inArray(companySecrets.id, referencedSecretIds),
+    ));
+    const secretIds = ownedSecrets.map((secret) => secret.id);
     const removedDelegations = grantIds.length === 0 ? [] : await tx
       .delete(connectionGrantDelegations)
       .where(and(
@@ -71,14 +81,41 @@ export function accessService(db: Db) {
         eq(connectionGrants.companyId, companyId),
         inArray(connectionGrants.id, grantIds),
       ));
-      if (secretIds.length > 0) {
-        await tx.delete(companySecrets).where(and(
-          eq(companySecrets.companyId, companyId),
-          eq(companySecrets.scope, "user"),
-          eq(companySecrets.ownerUserId, userId),
-          inArray(companySecrets.id, secretIds),
-        ));
+    }
+    if (secretIds.length > 0) {
+      const removedSecretIds = new Set(secretIds);
+      const [grantRefs, connectionRefs] = await Promise.all([
+        tx.select({
+          id: connectionGrants.id,
+          credentialSecretRefs: connectionGrants.credentialSecretRefs,
+        }).from(connectionGrants).where(eq(connectionGrants.companyId, companyId)),
+        tx.select({
+          id: toolConnections.id,
+          credentialSecretRefs: toolConnections.credentialSecretRefs,
+        }).from(toolConnections).where(eq(toolConnections.companyId, companyId)),
+      ]);
+      for (const grant of grantRefs) {
+        const credentialSecretRefs = grant.credentialSecretRefs.filter(
+          (ref) => !removedSecretIds.has(ref.secretId),
+        );
+        if (credentialSecretRefs.length !== grant.credentialSecretRefs.length) {
+          await tx.update(connectionGrants).set({ credentialSecretRefs, updatedAt: now })
+            .where(eq(connectionGrants.id, grant.id));
+        }
       }
+      for (const connection of connectionRefs) {
+        const credentialSecretRefs = connection.credentialSecretRefs.filter(
+          (ref) => !removedSecretIds.has(ref.secretId),
+        );
+        if (credentialSecretRefs.length !== connection.credentialSecretRefs.length) {
+          await tx.update(toolConnections).set({ credentialSecretRefs, updatedAt: now })
+            .where(eq(toolConnections.id, connection.id));
+        }
+      }
+      await tx.delete(companySecrets).where(and(
+        eq(companySecrets.companyId, companyId),
+        inArray(companySecrets.id, secretIds),
+      ));
     }
     await tx.delete(connectionGrantMembers).where(and(
       eq(connectionGrantMembers.companyId, companyId),
@@ -851,12 +888,21 @@ export function accessService(db: Db) {
         }
       }
 
+      const now = new Date();
+      if (
+        existing.principalType === "user" &&
+        existing.status !== "suspended" &&
+        nextStatus === "suspended"
+      ) {
+        await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
+      }
+
       return tx
         .update(companyMemberships)
         .set({
           membershipRole: nextMembershipRole,
           status: nextStatus,
-          updatedAt: new Date(),
+          updatedAt: now,
         })
         .where(eq(companyMemberships.id, existing.id))
         .returning()
