@@ -342,6 +342,20 @@ function isSecretProposalConfirmation(interaction: IssueThreadInteraction): bool
   return secretProposalPayload(interaction) != null;
 }
 
+/**
+ * A `request_confirmation` carrying `payload.connectionAuthorization` is asking
+ * one person to connect their own account so an agent can act as them
+ * (PAP-17835). It keeps the interaction kind and the server-addressed audience;
+ * only the presentation differs, and it reads that presentation from the payload
+ * rather than parsing the title string.
+ */
+function connectionAuthorizationPayload(
+  interaction: IssueThreadInteraction,
+): NonNullable<RequestConfirmationInteraction["payload"]["connectionAuthorization"]> | null {
+  if (interaction.kind !== "request_confirmation") return null;
+  return interaction.payload.connectionAuthorization ?? null;
+}
+
 type ToolActionCardState =
   | "pending"
   | "running"
@@ -3552,6 +3566,7 @@ export function IssueThreadInteractionCard({
     interaction.kind === "request_confirmation" && isToolActionConfirmation(interaction);
   const isSecretProposal =
     interaction.kind === "request_confirmation" && isSecretProposalConfirmation(interaction);
+  const connectionAuthorization = connectionAuthorizationPayload(interaction);
   const toolActionState =
     isToolAction && interaction.kind === "request_confirmation"
       ? toolActionCardState(interaction)
@@ -3664,9 +3679,13 @@ export function IssueThreadInteractionCard({
                   </span>
                 ) : (
                   <>
-                    {isPlan ? "Plan" : interactionKindLabel(interaction.kind)}
+                    {connectionAuthorization
+                      ? (interaction.status === "pending" ? "Action required" : "Connection")
+                      : isPlan ? "Plan" : interactionKindLabel(interaction.kind)}
                     <span className="text-current/60">/</span>
-                    {statusText}
+                    {connectionAuthorization && interaction.status === "accepted"
+                      ? `${connectionAuthorization.providerName} connected`
+                      : statusText}
                   </>
                 )}
               </span>
@@ -3704,6 +3723,8 @@ export function IssueThreadInteractionCard({
                     ? "Checkbox confirmation requested"
                     : isSecretProposal
                       ? "Secret binding requested"
+                    : connectionAuthorization
+                      ? `Connect your ${connectionAuthorization.providerName} to continue`
                     : isToolAction
                       ? "Tool approval requested"
                       : interaction.kind === "request_item_verdicts"

@@ -23,7 +23,10 @@ import {
   pendingRequestConfirmationInteraction,
   pendingToolActionDestructiveInteraction,
   pendingToolActionWriteInteraction,
+  issueThreadInteractionFixtureMeta,
   pendingSecretProposalInteraction,
+  pendingConnectionAuthorizationInteraction,
+  resolvedConnectionAuthorizationInteraction,
   executedSecretProposalInteraction,
   failedSecretProposalInteraction,
   rejectedSecretProposalInteraction,
@@ -1220,6 +1223,63 @@ describe("IssueThreadInteractionCard secret-proposal card", () => {
  * The effective audience is shown *before* anyone responds, so a reader never
  * has to guess whether an open card is waiting on them (PAP-17280).
  */
+describe("IssueThreadInteractionCard connection-authorization card", () => {
+  it("reads its presentation from the payload and names only the addressed person", () => {
+    const host = renderCard({
+      interaction: pendingConnectionAuthorizationInteraction,
+      currentUserId: issueThreadInteractionFixtureMeta.currentUserId,
+    });
+
+    // The recovery action is the one thing this card is for.
+    expect(host.textContent).toContain("Connect your Gmail to continue");
+    expect(host.textContent).toContain(
+      "Outreach Agent needs your Gmail identity for work running as you.",
+    );
+
+    // "Action required" rather than the generic kind label: the mechanism is
+    // not the point, the blocked work is.
+    const statusBadge = host.querySelector('[data-testid="interaction-status-badge"]');
+    expect(statusBadge?.textContent).toContain("Action required");
+    expect(statusBadge?.textContent).not.toContain("Confirmation");
+
+    // Consent is the addressed person's alone. The card must never imply a
+    // teammate can give it for them.
+    expect(host.textContent?.toLowerCase()).not.toContain("on behalf of");
+    expect(host.textContent?.toLowerCase()).not.toContain("anyone can");
+  });
+
+  it("shows another reader that it is waiting on the addressed person, with no action", () => {
+    const host = renderCard({
+      interaction: pendingConnectionAuthorizationInteraction,
+      currentUserId: "user-someone-else",
+      userLabelMap: new Map([
+        [issueThreadInteractionFixtureMeta.currentUserId, "Carol"],
+      ]),
+    });
+
+    expect(host.textContent).toContain("Carol");
+    // The design's rule: the Connect button is present but never actionable for
+    // a reader who cannot consent. Refusing to give it *some* affordance would
+    // hide who the card is waiting on; making it work would be the dark pattern.
+    const connect = Array.from(host.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Connect Gmail",
+    );
+    expect(connect).toBeTruthy();
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("resolves to a connected state naming the provider", () => {
+    const host = renderCard({
+      interaction: resolvedConnectionAuthorizationInteraction,
+      currentUserId: issueThreadInteractionFixtureMeta.currentUserId,
+    });
+
+    const statusBadge = host.querySelector('[data-testid="interaction-status-badge"]');
+    expect(statusBadge?.textContent).toContain("Gmail connected");
+    expect(statusBadge?.textContent).not.toContain("Action required");
+  });
+});
+
 describe("IssueThreadInteractionCard resolver audience", () => {
   it("shows an open audience on a pending card created without a restriction", () => {
     const host = renderCard({ interaction: pendingRequestConfirmationInteraction });

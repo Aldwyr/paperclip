@@ -1077,6 +1077,7 @@ export type {
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,
+  RequestConfirmationConnectionAuthorizationPayload,
   RequestConfirmationSecretProposalPayload,
   RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,

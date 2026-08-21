@@ -7380,17 +7380,39 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
 
     if (input.subjectUserId && input.issueId && binding.actorType === "agent") {
       const idempotencyKey = `connection-authorization:${connection.id}:${input.subjectUserId}`;
+      // Provider label for the card's copy. The gallery definition's name when we
+      // have one, else the connection's own name — never a secret name or ref.
+      const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string"
+        ? connection.config.sourceTemplateKey
+        : null;
+      const providerName = (sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey)?.name : null)
+        ?? connection.name;
+      const [requestingAgent] = binding.actorId
+        ? await db.select({ name: agents.name }).from(agents).where(and(
+            eq(agents.id, binding.actorId),
+            eq(agents.companyId, companyId),
+          )).limit(1)
+        : [undefined];
       const payload = {
         version: 1 as const,
-        prompt: `Connect your account to ${connection.name}`,
-        acceptLabel: "Open authorization",
+        prompt: `Connect your ${providerName} to continue`,
+        acceptLabel: `Connect ${providerName}`,
         rejectLabel: "Not now",
         detailsMarkdown: "Authorization is required before this agent can act on your behalf.",
+        // Presentation metadata so the card can compose its own copy instead of
+        // parsing the title string (PAP-17835 seam #6). The interaction kind and
+        // the server-addressed audience are unchanged.
+        connectionAuthorization: {
+          version: 1 as const,
+          providerName,
+          connectionName: connection.name === providerName ? null : connection.name,
+          requestingAgentName: requestingAgent?.name ?? null,
+        },
         target: {
           type: "custom" as const,
           key: `connection:${connection.uid}:user:${input.subjectUserId}`,
           revisionId: state,
-          label: `Connect ${connection.name}`,
+          label: `Connect ${providerName}`,
           href: authorizationUrl.toString(),
         },
       };
@@ -7425,8 +7447,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             addresseeUserId: input.subjectUserId,
             idempotencyKey,
             sourceRunId: binding.actorType === "agent" ? input.actor.sessionId ?? null : null,
-            title: "Connect your account",
-            summary: `Connect ${connection.name} to continue`,
+            title: `Connect your ${providerName} to continue`,
+            summary: `${requestingAgent?.name ?? "An agent"} needs your ${providerName} identity for work running as you.`,
             createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
             payload,
           }).returning();
