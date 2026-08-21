@@ -2968,7 +2968,11 @@ function RequestCheckboxConfirmationCard({
   return (
     <div className="space-y-4">
       <div className="space-y-3 rounded-sm border border-border/70 bg-background/75 p-4">
-        <div className="text-sm leading-6 text-foreground">{interaction.payload.prompt}</div>
+        {/* Show each piece of state once: a connection-authorization prompt is
+            the same sentence as the card title, so repeating it here is noise. */}
+        {interaction.payload.prompt === interaction.title ? null : (
+          <div className="text-sm leading-6 text-foreground">{interaction.payload.prompt}</div>
+        )}
         {interaction.payload.detailsMarkdown ? (
           <div className="border-t border-border/60 pt-3 text-sm">
             <MarkdownBody externalReferences={externalReferences}>{interaction.payload.detailsMarkdown}</MarkdownBody>
@@ -3034,7 +3038,7 @@ function RequestCheckboxConfirmationCard({
         <ConfirmationActionRow
           resetKey={`${interaction.id}:${interaction.status}`}
           approveLabel={interaction.payload.acceptLabel ?? CONFIRMATION_APPROVE_LABEL}
-          rejectLabel={CONFIRMATION_REJECT_LABEL}
+          rejectLabel={interaction.payload.rejectLabel ?? CONFIRMATION_REJECT_LABEL}
           primaryActionOnRight={primaryActionOnRight}
           allowRevise={allowRevise}
           rejectRequiresReason={rejectRequiresReason}
