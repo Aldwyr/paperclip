@@ -2224,7 +2224,9 @@ export function AccessStep({
   // scope stays legible instead of quietly disappearing.
   const canSetCompanyInstall = capabilities?.canSetCompanyInstall ?? true;
   const needsIdentityChoice = authKind !== "none";
-  const canContinue = installChoice === "all" || installAgentIds.size > 0;
+  const canContinue = installChoice === "all"
+    ? canSetCompanyInstall
+    : installAgentIds.size > 0;
 
   return (
     <div className="mx-auto max-w-xl">
@@ -2284,6 +2286,7 @@ export function AccessStep({
                   description: canSetCompanyInstall
                     ? "Make this connection available to every agent."
                     : "Only someone who can configure this connection can choose this.",
+                  disabled: !canSetCompanyInstall,
                 },
               ]}
             />

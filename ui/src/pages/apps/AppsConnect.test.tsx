@@ -7,7 +7,7 @@ import { CONNECTABLE_APP_DEFINITIONS } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
-import { AppsConnect } from "./AppsConnect";
+import { AccessStep, AppsConnect } from "./AppsConnect";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
@@ -328,6 +328,154 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       .toBe("true");
     expect(radios.find((r) => r.textContent?.includes("Any agent"))?.getAttribute("aria-checked"))
       .toBe("true");
+  });
+
+  /**
+   * The identity question is answered per connection method, not per auth kind.
+   *
+   * A homogeneous fixture cannot tell those two apart: if every app on screen
+   * is API-key-only, a blanket rule and a per-method predicate produce exactly
+   * the same DOM. So both live in one gallery here — Zapier, whose only method
+   * is an API key, and PostHog, whose methods are identity-bearing sign-in plus
+   * a key its own label calls *personal*. The two mounts must disagree about
+   * the default, which no blanket rule can do.
+   *
+   * "Just me" also has to stay live for the API-key-only app, not disabled with
+   * a reason: the personal key path completes and lands on the caller's own
+   * grant, so disabling it would describe the product wrongly.
+   */
+  it("decides the identity default per method, and keeps a personal key submittable", async () => {
+    listGalleryMock.mockResolvedValue({ apps: [ZAPIER, POSTHOG] });
+
+    const identityChoices = () => {
+      const radios = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+      );
+      return {
+        justMe: radios.find((r) => r.textContent?.includes("Just me")),
+        wholeOrg: radios.find((r) => r.textContent?.includes("The whole organization")),
+      };
+    };
+
+    // --- API-key-only method: shared by default, personal still offered ------
+    let root = await render();
+    await act(async () => {
+      buttonContaining("Zapier")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const zapier = identityChoices();
+    expect(zapier.wholeOrg?.getAttribute("aria-checked")).toBe("true");
+    expect(zapier.justMe?.getAttribute("aria-checked")).toBe("false");
+    // Present, and genuinely selectable — not the disabled-with-reason state.
+    expect(zapier.justMe).toBeTruthy();
+    expect(zapier.justMe?.disabled).toBe(false);
+    expect(document.body.textContent).not.toContain(
+      "This connection method supports a shared organization credential only.",
+    );
+
+    await act(async () => {
+      zapier.justMe?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await act(async () => {
+      Array.from(document.body.querySelectorAll('[role="radio"]'))
+        .find((r) => r.textContent?.includes("Any agent"))
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    await act(async () => {
+      buttonByText("Save and continue")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const keyField = container.querySelector<HTMLInputElement>("input[type=password]");
+    await act(async () => setInputValue(keyField!, "zapier-personal-token"));
+    await flushReact();
+    await act(async () => {
+      buttonByText("Connect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // The load-bearing assertion: an API-key-only method reaches the server as
+    // a personal grant. A disabled "Just me" would make this unreachable.
+    expect(connectAppMock).toHaveBeenCalledTimes(1);
+    expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({
+      galleryKey: "zapier",
+      grantKind: "user",
+    });
+
+    // --- Same gallery, identity-bearing method: personal by default ----------
+    await act(async () => root.unmount());
+    document.body.innerHTML = "";
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    mockParams.appKey = "posthog";
+    root = await render();
+
+    const posthog = identityChoices();
+    expect(posthog.justMe?.getAttribute("aria-checked")).toBe("true");
+    expect(posthog.wholeOrg?.getAttribute("aria-checked")).toBe("false");
+    expect(posthog.justMe?.disabled).toBe(false);
+    expect(posthog.wholeOrg?.disabled).toBe(false);
+  });
+
+  /**
+   * Design §"Question 2": a member who may create a personal grant but cannot
+   * configure a company-wide install sees **Any agent** disabled with the
+   * reason — not hidden. Disabling it is only half the job; Continue has to
+   * refuse it too, or the forbidden choice is still submittable by keyboard.
+   *
+   * Driven through `AccessStep` directly because the create flow has no
+   * connection to read per-connection capabilities from yet (see the
+   * `capabilities` prop, currently supplied by no caller).
+   */
+  it("disables Any agent and blocks Continue when the member cannot install company-wide", async () => {
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <AccessStep
+            appName="Zapier"
+            providerName="Zapier"
+            companyId="company-1"
+            authKind="api_key"
+            grantKind="organization"
+            setGrantKind={() => {}}
+            installChoice="all"
+            setInstallChoice={() => {}}
+            installAgentIds={new Set()}
+            setInstallAgentIds={() => {}}
+            capabilities={{ canSetCompanyInstall: false, editableAgentIds: ["agent-1"] }}
+            submitLabel="Save and continue"
+            onBack={() => {}}
+            onContinue={() => {}}
+          />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    const anyAgent = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+    ).find((r) => r.textContent?.includes("Any agent"));
+
+    // Visible, with the reason, and not selectable.
+    expect(anyAgent).toBeTruthy();
+    expect(anyAgent?.disabled).toBe(true);
+    expect(anyAgent?.textContent).toContain(
+      "Only someone who can configure this connection can choose this.",
+    );
+    // "Agents I pick" is the live alternative, so the step is not a dead end.
+    const pick = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+    ).find((r) => r.textContent?.includes("Agents I pick"));
+    expect(pick?.disabled).toBe(false);
+    // Continue refuses the forbidden choice even though it is the current one.
+    expect(buttonByText("Save and continue")?.disabled).toBe(true);
+
+    await act(async () => root.unmount());
   });
 
   it("opens the selected app directly on its setup route", async () => {
