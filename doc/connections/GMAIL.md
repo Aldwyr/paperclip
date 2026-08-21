@@ -193,11 +193,13 @@ sequenceDiagram
 
 Before an instance can create a session:
 
-1. The instance generates an Ed25519 signing key and stores the private key
-   locally.
+1. The instance generates an Ed25519 signing key and a separate X25519 seal
+   key. Both private keys stay local; Ed25519 authenticates requests and
+   X25519 lets Paperclip ID encrypt token responses that only the instance can
+   open.
 2. An operator signs in to Paperclip ID and enrolls the instance.
-3. Paperclip ID binds the account, opaque instance id, public key, deployment
-   environment, and exact allowed browser return origins.
+3. Paperclip ID binds the account, opaque instance id, both public keys,
+   deployment environment, and exact allowed browser return origins.
 4. Tailscale HTTPS origins are allowed only when explicitly enrolled. Loopback
    HTTP is development-only. Other plaintext origins are rejected.
 5. Create, claim, refresh, and revoke requests are signed, audience-bound,
