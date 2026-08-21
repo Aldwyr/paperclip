@@ -133,6 +133,26 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(compact).toContain("Please also update the changelog.");
   });
 
+  it("makes the latest wake comment the immediate follow-up request", () => {
+    const commentWake = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-follow-up",
+        identifier: "PAP-418",
+        title: "Original task",
+        workMode: "standard",
+        description: "Reply with the original answer.",
+      },
+      wakeComment: {
+        id: "comment-follow-up",
+        body: "Reply with the new answer instead.",
+      },
+    });
+
+    expect(commentWake).toContain("The latest wake comment is the immediate request for this run.");
+    expect(commentWake).toContain("Do not repeat an earlier requested output from the issue description");
+    expect(commentWake).toContain("Reply with the new answer instead.");
+  });
+
   it("prefers ordinary comment planning guidance over stale accepted confirmation state", () => {
     const commentWake = buildPaperclipTaskMarkdown({
       issue: {

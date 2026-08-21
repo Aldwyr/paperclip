@@ -124,6 +124,7 @@ import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
+  findHeartbeatRunCompletionComment,
   HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS,
   HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS,
   HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES,
@@ -6307,7 +6308,14 @@ export function buildPaperclipTaskMarkdown(input: {
     }
   }
   if (wakeComment?.body.trim()) {
-    lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+    lines.push(
+      "",
+      "Follow-up directive:",
+      "The latest wake comment is the immediate request for this run. Address it directly. Do not repeat an earlier requested output from the issue description unless the latest comment asks you to.",
+      "",
+      "Latest wake comment:",
+      fenceTaskText(wakeComment.body.trim()),
+    );
   }
   lines.push("", "Use this task context as the current assignment.");
   return lines.join("\n");
@@ -9880,8 +9888,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function findRunIssueComment(runId: string, companyId: string, issueId: string) {
-    return db
+  async function findRunIssueComment(
+    runId: string,
+    companyId: string,
+    issueId: string,
+    resultJson?: Record<string, unknown> | null,
+  ) {
+    const comments = await db
       .select({
         id: issueComments.id,
       })
@@ -9893,9 +9906,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issueComments.createdByRunId, runId),
         ),
       )
-      .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
+    return findHeartbeatRunCompletionComment(comments, resultJson);
   }
 
   async function refreshContinuationSummaryForRun(
@@ -10109,7 +10121,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
-    const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
+    const postedComment = await findRunIssueComment(
+      run.id,
+      run.companyId,
+      issueId,
+      parseObject(run.resultJson),
+    );
     if (postedComment) {
       await patchRunIssueCommentStatus(run.id, {
         issueCommentStatus: "satisfied",
@@ -15866,6 +15883,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               companyId: agent.companyId,
               issue: issueRef,
               actorId: agent.id,
+              immediateRequest: safeWakeCommentContext?.body ?? null,
             });
         nativeRunnerInstanceId = run.runnerInstanceId ?? randomUUID();
         const nativeSessionId = run.nativeSessionId ?? randomUUID();
@@ -16589,11 +16607,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
         if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
           try {
-            const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
+            const existingRunComment = await findRunIssueComment(
+              livenessRun.id,
+              livenessRun.companyId,
+              issueId,
+              persistedResultJson,
+            );
             if (!existingRunComment) {
               const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
               if (issueComment) {
-                await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
+                const comment = await issuesSvc.addComment(
+                  issueId,
+                  issueComment,
+                  { agentId: agent.id, runId: livenessRun.id },
+                );
+                await logActivity(db, {
+                  companyId: livenessRun.companyId,
+                  actorType: "agent",
+                  actorId: agent.id,
+                  agentId: agent.id,
+                  runId: livenessRun.id,
+                  issueId,
+                  action: "issue.comment_added",
+                  entityType: "issue",
+                  entityId: issueId,
+                  details: {
+                    commentId: comment.id,
+                    bodySnippet: comment.body.slice(0, 120),
+                    identifier: issueRef?.identifier ?? null,
+                    issueTitle: issueRef?.title ?? null,
+                    authorizationReason: "internal_agent_write",
+                    source: "heartbeat_run_summary",
+                  },
+                });
               }
             }
           } catch (err) {

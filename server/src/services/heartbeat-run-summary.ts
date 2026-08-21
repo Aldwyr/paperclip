@@ -126,3 +126,28 @@ export function buildHeartbeatRunIssueComment(
 
   return text;
 }
+
+export function findHeartbeatRunCompletionComment<T extends { id: string }>(
+  comments: T[],
+  resultJson: Record<string, unknown> | null | undefined,
+): T | null {
+  const receipts = resultJson?.semanticToolReceipts;
+  if (!receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
+    return comments[0] ?? null;
+  }
+
+  const progressCommentIds = new Set<string>();
+  for (const receipt of Object.values(receipts)) {
+    if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) continue;
+    const receiptRecord = receipt as Record<string, unknown>;
+    if (receiptRecord.operationId !== "report_progress") continue;
+    const result = receiptRecord.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) continue;
+    const commentId = (result as Record<string, unknown>).commentId;
+    if (typeof commentId === "string" && commentId.length > 0) {
+      progressCommentIds.add(commentId);
+    }
+  }
+
+  return comments.find((comment) => !progressCommentIds.has(comment.id)) ?? null;
+}

@@ -7,20 +7,29 @@ import { nativeSha256 } from "./canonical.js";
 export const NATIVE_COMPLETION_CONTRACT_SCHEMA = "paperclip.completion-contract.v1";
 export const NATIVE_COMPLETION_POLICY_VERSION = "phase6-v2";
 
+export function buildNativeCompletionContract(
+  issue: { title: string; description: string | null },
+  immediateRequest?: string | null,
+): StrictCompletionContractInput {
+  const followUp = immediateRequest?.trim();
+  return {
+    revision: "1",
+    objective: followUp ? `Respond to the latest comment on ${issue.title}` : issue.title,
+    criteria: [{
+      id: "objective",
+      requirement: followUp || issue.description?.trim() || `Complete: ${issue.title}`,
+    }],
+  };
+}
+
 export async function ensureNativeCompletionContract(input: {
   db: Db;
   companyId: string;
   issue: { id: string; title: string; description: string | null };
   actorId: string;
+  immediateRequest?: string | null;
 }) {
-  const contract: StrictCompletionContractInput = {
-    revision: "1",
-    objective: input.issue.title,
-    criteria: [{
-      id: "objective",
-      requirement: input.issue.description?.trim() || `Complete: ${input.issue.title}`,
-    }],
-  };
+  const contract = buildNativeCompletionContract(input.issue, input.immediateRequest);
   const canonicalSha256 = nativeSha256({
     schemaVersion: NATIVE_COMPLETION_CONTRACT_SCHEMA,
     policyVersion: NATIVE_COMPLETION_POLICY_VERSION,

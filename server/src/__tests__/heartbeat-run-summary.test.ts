@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   summarizeHeartbeatRunResultJson,
   buildHeartbeatRunIssueComment,
+  findHeartbeatRunCompletionComment,
   mergeHeartbeatRunResultJson,
 } from "../services/heartbeat-run-summary.js";
 
@@ -115,6 +116,29 @@ describe("buildHeartbeatRunIssueComment", () => {
     const summary = "S" + "x".repeat(1199);
     expect(summary.length).toBe(1200);
     expect(buildHeartbeatRunIssueComment({ summary })).toBe(summary);
+  });
+});
+
+describe("findHeartbeatRunCompletionComment", () => {
+  it("does not let semantic progress satisfy the final comment", () => {
+    const progress = { id: "progress-comment" };
+    const final = { id: "final-comment" };
+    const resultJson = {
+      semanticToolReceipts: {
+        progress: {
+          operationId: "report_progress",
+          result: { commentId: progress.id },
+        },
+      },
+    };
+
+    expect(findHeartbeatRunCompletionComment([progress], resultJson)).toBeNull();
+    expect(findHeartbeatRunCompletionComment([final, progress], resultJson)).toEqual(final);
+  });
+
+  it("preserves the fallback-only behavior for ordinary agent comments", () => {
+    const comment = { id: "manual-comment" };
+    expect(findHeartbeatRunCompletionComment([comment], { summary: "done" })).toEqual(comment);
   });
 });
 

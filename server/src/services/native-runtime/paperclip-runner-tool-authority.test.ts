@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
@@ -78,6 +78,23 @@ describe("PaperclipRunnerToolAuthority", () => {
     expect(replay).toEqual(first);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
       .toHaveLength(1);
+    const progressActivity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(progressActivity).toHaveLength(1);
+    expect(progressActivity[0]).toMatchObject({
+      action: "issue.comment_added",
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId,
+      entityType: "issue",
+      entityId: issueId,
+      details: expect.objectContaining({
+        bodySnippet: "Runner progress",
+        identifier: "RNT-1",
+        issueTitle: "Exercise real runner tools",
+        source: "paperclip_runner_protocol",
+      }),
+    });
     await expect(authority.execute({
       ...call,
       arguments: { body: "Changed", idempotencyKey: "progress-1" },

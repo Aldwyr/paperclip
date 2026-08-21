@@ -113,7 +113,7 @@ export class PaperclipRunnerToolAuthority {
           .where(eq(issueApprovals.approvalId, approval.id));
         return { approval, tasks: tasks.map((row) => row.issue) };
       }
-      case "report_progress": return this.#reportProgress(call.callId, call.arguments);
+      case "report_progress": return this.#reportProgress(call.callId, input, context.issue);
       case "request_human_input": return this.#requestHumanInput(input, context.issue);
       default: throw new Error("paperclip_runner_tool_not_bound");
     }
@@ -146,12 +146,15 @@ export class PaperclipRunnerToolAuthority {
     return row;
   }
 
-  async #reportProgress(callId: string, value: unknown): Promise<unknown> {
-    const input = record(value);
+  async #reportProgress(
+    callId: string,
+    input: Record<string, unknown>,
+    issue: typeof issues.$inferSelect,
+  ): Promise<unknown> {
     const body = typeof input.body === "string" ? input.body.trim() : "";
     const idempotencyKey = typeof input.idempotencyKey === "string" ? input.idempotencyKey.trim() : "";
     if (!body || !idempotencyKey) throw new Error("paperclip_runner_tool_input_invalid");
-    return this.db.transaction(async (tx) => {
+    const mutation = await this.db.transaction(async (tx) => {
       const [run] = await tx.select().from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId)))
         .for("update").limit(1);
@@ -165,7 +168,7 @@ export class PaperclipRunnerToolAuthority {
         if (prior.operationId !== "report_progress" || canonicalJson(prior.input) !== canonicalJson(input)) {
           throw new Error("paperclip_runner_tool_idempotency_conflict");
         }
-        return prior.result;
+        return { result: prior.result, publication: null };
       }
       const comment = await issueService(this.db).addComment(
         this.binding.issueId,
@@ -180,8 +183,29 @@ export class PaperclipRunnerToolAuthority {
         resultJson: { ...resultJson, semanticToolReceipts: receipts },
         updatedAt: new Date(),
       }).where(eq(heartbeatRuns.id, this.binding.runId));
-      return result;
+      const activity = await persistActivity(tx as unknown as Db, {
+        companyId: this.binding.companyId,
+        actorType: "agent",
+        actorId: this.binding.agentId,
+        agentId: this.binding.agentId,
+        runId: this.binding.runId,
+        issueId: this.binding.issueId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: this.binding.issueId,
+        details: {
+          commentId: comment.id,
+          bodySnippet: comment.body.slice(0, 120),
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          authorizationReason: "paperclip_runner_protocol",
+          source: "paperclip_runner_protocol",
+        },
+      });
+      return { result, publication: activity.publication };
     });
+    if (mutation.publication) publishActivity(mutation.publication);
+    return mutation.result;
   }
 
   async #writeDocument(input: Record<string, unknown>): Promise<unknown> {
