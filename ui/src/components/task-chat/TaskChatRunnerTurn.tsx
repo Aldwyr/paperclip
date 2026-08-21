@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import type { TaskChatItem, TaskChatMessageItem, TaskChatThinkingItem, TaskChatToolItem } from "./task-chat-model";
 import { TaskChatLiveRunPill } from "./TaskChatLiveRunPill";
 import { TaskChatLiveTail } from "./TaskChatLiveTail";
+import { paperclipRunnerHistoryItems } from "./transcript-adapter";
 import { toolTaxonomy } from "./tool-taxonomy";
 
 function lastOf<T extends TaskChatItem>(items: readonly TaskChatItem[], predicate: (item: TaskChatItem) => item is T): T | undefined {
@@ -54,6 +55,7 @@ export function TaskChatRunnerTurn({
   toolSummary: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const historyItems = paperclipRunnerHistoryItems(items);
   const progress = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && Boolean(item.interstitial));
   const final = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
 
@@ -79,7 +81,7 @@ export function TaskChatRunnerTurn({
       <div className="tc-turn-fold" data-folded={open ? "false" : "true"} aria-hidden={!open}>
         <div>
           <div className="flex flex-col gap-2 py-2">
-            <TaskChatLiveTail items={items as TaskChatItem[]} excludeFinal />
+            <TaskChatLiveTail items={historyItems} excludeFinal />
           </div>
         </div>
       </div>

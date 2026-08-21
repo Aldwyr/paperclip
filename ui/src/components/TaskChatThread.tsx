@@ -13,6 +13,7 @@ import {
   buildTurnSummary,
   coalesceSettledTurns,
   isTerminalRunStatus,
+  paperclipRunnerHistoryItems,
   prependIssueBrief,
   settledRunChildren,
   transcriptToTaskChatItems,
@@ -402,7 +403,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         agentName: meta?.agentName,
         running: false,
       });
-      const children = settledRunChildren(parsed);
+      const children = settledRunChildren(
+        source.adapterType === "paperclip_runner"
+          ? paperclipRunnerHistoryItems(parsed)
+          : parsed,
+      );
       if (children.length === 0 && source.adapterType !== "paperclip_runner") continue;
       settledRunIds.add(source.id);
       const failed = source.status !== "succeeded";

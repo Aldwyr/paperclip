@@ -10,6 +10,7 @@ import {
   flattenSelfTalk,
   isNestableLiveChild,
   ISSUE_BRIEF_ITEM_ID,
+  paperclipRunnerHistoryItems,
   prependIssueBrief,
   settledRunChildren,
   toolDisplayName,
@@ -422,6 +423,25 @@ describe("paperclip runner semantic channels", () => {
     expect(parsed[3]).toMatchObject({ interstitial: false, channel: "final" });
     const history = settledRunChildren(parsed);
     expect(JSON.stringify(history)).not.toContain("Done.");
+  });
+
+  it("filters lifecycle and usage noise from only the runner history surface", () => {
+    const items: TaskChatItem[] = [
+      { id: "session", kind: "marker", variant: "session_start", label: "Session started", detail: "session-id" },
+      { id: "start", kind: "marker", variant: "turn_boundary", label: "Turn started" },
+      { id: "usage", kind: "usage", usage: { used: 1_024, size: 128_000, inputTokens: 1_000, outputTokens: 24 } },
+      { id: "tool", kind: "tool", name: "Paperclip_finish", status: "completed", target: "done" },
+      { id: "interrupt", kind: "marker", variant: "interrupted", label: "Interrupted" },
+      { id: "runner", kind: "marker", variant: "turn_boundary", label: "Runner update" },
+      { id: "complete", kind: "marker", variant: "turn_boundary", label: "Turn completed" },
+    ];
+
+    expect(paperclipRunnerHistoryItems(items).map((item) => item.id)).toEqual([
+      "tool",
+      "interrupt",
+      "runner",
+    ]);
+    expect(items).toHaveLength(7);
   });
 });
 

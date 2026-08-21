@@ -404,6 +404,22 @@ export function settledRunChildren(parsed: readonly TaskChatItem[]): TaskChatTur
   return buildActivityPhases(parsed, false);
 }
 
+/**
+ * Keep the paperclip runner's expanded activity history focused on work the
+ * user can act on. The normalized transcript remains lossless; this is only a
+ * presentation filter for the new-runner turn surface. Legacy adapters keep
+ * their existing lifecycle and usage rows.
+ */
+export function paperclipRunnerHistoryItems(parsed: readonly TaskChatItem[]): TaskChatItem[] {
+  return parsed.filter((item) => {
+    if (item.kind === "usage") return false;
+    if (item.kind !== "marker") return true;
+    if (item.variant === "session_start") return false;
+    return item.variant !== "turn_boundary"
+      || (item.label !== "Turn started" && item.label !== "Turn completed");
+  });
+}
+
 function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { kind: "thinking" } | { kind: "marker" })[]): string {
   const counts = new Map<string, number>();
   let generic = 0;

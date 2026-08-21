@@ -37,14 +37,14 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
         onClick={expandable ? () => setShowDetail((v) => !v) : undefined}
         aria-expanded={expandable ? showDetail : undefined}
         className={cn(
-          "group/tool -mx-1.5 flex min-w-0 items-center gap-2 rounded-sm px-1.5 py-0.5 text-left text-muted-foreground",
+          "group/tool -mx-1.5 flex min-h-6 min-w-0 items-center gap-2 rounded-sm px-1.5 py-1 text-left leading-none text-muted-foreground",
           expandable ? "cursor-pointer transition-colors hover:bg-muted/60 hover:text-foreground" : "cursor-default",
         )}
       >
         <RowIcon className="h-3.5 w-3.5 shrink-0" aria-hidden />
-        <span className="shrink-0 font-medium">{item.name}</span>
+        <span className="shrink-0 font-medium leading-none">{item.name}</span>
         {item.target ? (
-          <span className="min-w-0 truncate font-mono text-(length:--text-micro)">{item.target}</span>
+          <span className="min-w-0 truncate font-mono text-(length:--text-micro) leading-none">{item.target}</span>
         ) : null}
         <span className="ml-auto flex shrink-0 items-center gap-2">
           {item.decision ? (

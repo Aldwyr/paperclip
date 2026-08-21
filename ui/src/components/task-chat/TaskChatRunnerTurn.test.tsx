@@ -53,4 +53,22 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain("Completed successfully.");
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
   });
+
+  it("omits runner lifecycle and token noise while preserving useful history", () => {
+    render([
+      { id: "session", kind: "marker", variant: "session_start", label: "Session started", detail: "session-id" },
+      { id: "start", kind: "marker", variant: "turn_boundary", label: "Turn started" },
+      { id: "usage", kind: "usage", usage: { used: 10_520, size: 0, inputTokens: 10_254, outputTokens: 266 } },
+      { id: "tool", kind: "tool", name: "Paperclip_finish", rawName: "paperclip_finish", target: "reportedWorkDisposition: done", status: "completed" },
+      { id: "interrupt", kind: "marker", variant: "interrupted", label: "Interrupted" },
+      { id: "complete", kind: "marker", variant: "turn_boundary", label: "Turn completed" },
+    ]);
+
+    expect(container.textContent).toContain("Paperclip_finish");
+    expect(container.textContent).toContain("Interrupted");
+    expect(container.textContent).not.toContain("Session started");
+    expect(container.textContent).not.toContain("Turn started");
+    expect(container.textContent).not.toContain("Turn completed");
+    expect(container.textContent).not.toContain("10,520");
+  });
 });
