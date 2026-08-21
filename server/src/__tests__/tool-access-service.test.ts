@@ -4205,7 +4205,6 @@ describeEmbeddedPostgres("tool access service", () => {
         },
       },
     }).where(eq(toolConnections.id, connect.connectionId));
-
     let refreshCallCount = 0;
     fetchMock.mockImplementation(async (url, init) => {
       const href = String(url);
@@ -6065,7 +6064,7 @@ describeEmbeddedPostgres("tool access service", () => {
   it("reconnects a gallery app by rotating the existing credential in place (PAP-10859)", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
-    mockToolsList([
+    const fetchMock = mockToolsList([
       { name: "list_zaps", description: "List", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } },
       { name: "update_zap", description: "Update", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: false } },
     ]);
@@ -6098,6 +6097,17 @@ describeEmbeddedPostgres("tool access service", () => {
       config: { ...before.config, quarantineNewEntries: true },
       transportConfig: { ...before.transportConfig, quarantineNewEntries: true },
     }).where(eq(toolConnections.id, connect.connectionId));
+    fetchMock.mockResolvedValue(mcpHttpResponse({
+      jsonrpc: "2.0",
+      id: "paperclip-catalog-refresh",
+      result: {
+        tools: [
+          { name: "list_zaps", description: "List", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: true } },
+          { name: "update_zap", description: "Update", inputSchema: { type: "object", properties: {} }, annotations: { readOnlyHint: false } },
+          { name: "delete_zap", description: "Delete", inputSchema: { type: "object", properties: {} }, annotations: { destructiveHint: true } },
+        ],
+      },
+    }));
 
     await expect(
       service.reconnectGalleryApp(connect.connectionId, company.id, { credentialValues: {} }, { actorType: "user", actorId: "board" }),
@@ -6125,6 +6135,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(catalogAfterReconnect).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: listEntry.id, status: "active", quarantineReason: null }),
       expect.objectContaining({ id: updateEntry.id, status: "active", quarantineReason: null }),
+      expect.objectContaining({ toolName: "delete_zap", status: "active", riskLevel: "destructive" }),
     ]));
     const profileEntriesAfterReconnect = await db.select().from(toolProfileEntries).where(
       eq(toolProfileEntries.profileId, finished.profile.id),
@@ -6133,15 +6144,21 @@ describeEmbeddedPostgres("tool access service", () => {
       expect.objectContaining({ catalogEntryId: listEntry.id, effect: "include" }),
       expect.objectContaining({ catalogEntryId: updateEntry.id, effect: "include" }),
     ]));
-    await expect(db.select().from(toolPolicies).where(and(
+    const policiesAfterReconnect = await db.select().from(toolPolicies).where(and(
       eq(toolPolicies.companyId, company.id),
       eq(toolPolicies.enabled, true),
-    ))).resolves.toEqual([
+    ));
+    expect(policiesAfterReconnect).toHaveLength(2);
+    expect(policiesAfterReconnect).toEqual(expect.arrayContaining([
       expect.objectContaining({
         policyType: "require_approval",
         selectors: { catalogEntryId: updateEntry.id },
       }),
-    ]);
+      expect.objectContaining({
+        policyType: "require_approval",
+        selectors: { catalogEntryId: catalogAfterReconnect.find((entry) => entry.toolName === "delete_zap")!.id },
+      }),
+    ]));
   });
 
   it("stops and restarts local stdio runtime slots through the board service", async () => {

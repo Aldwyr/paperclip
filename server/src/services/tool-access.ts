@@ -6733,6 +6733,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connection: typeof toolConnections.$inferSelect;
     askFirstEntries: Array<typeof toolCatalogEntries.$inferSelect>;
     actor?: ActorInfo;
+    disableStale?: boolean;
   }, dbClient: ToolAccessMutationDb = db): Promise<ToolPolicy[]> {
     const existingPolicies = await dbClient
       .select()
@@ -6788,15 +6789,17 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         results.push(toPolicy(created));
       }
     }
-    const stalePolicies = managedPolicies.filter((policy) => {
-      const config = asRecord(policy.config);
-      return typeof config.catalogEntryId === "string" && !askFirstIds.has(config.catalogEntryId);
-    });
-    for (const policy of stalePolicies) {
-      await dbClient
-        .update(toolPolicies)
-        .set({ enabled: false, updatedAt: new Date() })
-        .where(eq(toolPolicies.id, policy.id));
+    if (input.disableStale !== false) {
+      const stalePolicies = managedPolicies.filter((policy) => {
+        const config = asRecord(policy.config);
+        return typeof config.catalogEntryId === "string" && !askFirstIds.has(config.catalogEntryId);
+      });
+      for (const policy of stalePolicies) {
+        await dbClient
+          .update(toolPolicies)
+          .set({ enabled: false, updatedAt: new Date() })
+          .where(eq(toolPolicies.id, policy.id));
+      }
     }
     return results;
   }
@@ -7094,7 +7097,28 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .returning();
     await syncCredentialBindings(updated);
     const health = await checkConnectionHealth(updated.id, actor);
+    const catalogBefore = await db
+      .select({ id: toolCatalogEntries.id, riskLevel: toolCatalogEntries.riskLevel })
+      .from(toolCatalogEntries)
+      .where(eq(toolCatalogEntries.connectionId, updated.id));
     const refresh = await refreshCatalog(updated.id, actor, { enableAllByDefault: true });
+    const previousRiskByCatalogId = new Map(catalogBefore.map((entry) => [entry.id, entry.riskLevel]));
+    const newAskFirstIds = refresh.catalog
+      .filter((entry) => {
+        if (entry.riskLevel !== "write" && entry.riskLevel !== "destructive") return false;
+        const previousRisk = previousRiskByCatalogId.get(entry.id);
+        return previousRisk === undefined || previousRisk === "read";
+      })
+      .map((entry) => entry.id);
+    if (newAskFirstIds.length > 0) {
+      await upsertAskFirstPolicies({
+        companyId,
+        connection: updated,
+        askFirstEntries: await assertCatalogEntriesForConnection(companyId, updated.id, newAskFirstIds),
+        actor,
+        disableStale: false,
+      });
+    }
     return { ...health, connection: refresh.connection };
   }
 
