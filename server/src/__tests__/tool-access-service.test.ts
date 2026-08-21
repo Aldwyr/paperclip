@@ -38,7 +38,7 @@ import {
   toolRuntimeSlots,
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -879,6 +879,8 @@ describeEmbeddedPostgres("tool access service", () => {
   it("allows only the personal grant owner to create named-agent delegations and audits revocation", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
+    await grantBoardUser(db, company.id, "alice", [], "member");
+    await grantBoardUser(db, company.id, "mallory", [], "member");
     const { connection } = await createBrokerConnection(db, company.id);
     const grant = await db.insert(connectionGrants).values({
       companyId: company.id,
@@ -908,6 +910,88 @@ describeEmbeddedPostgres("tool access service", () => {
         expect.objectContaining({ action: "connection_grant.delegated", actorId: "alice" }),
         expect.objectContaining({ action: "connection_grant.delegation_revoked", actorId: "manager" }),
       ]));
+  });
+
+  it("serializes delegation creation behind membership removal so reauthorization cannot revive stale consent", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    await grantBoardUser(db, company.id, "alice", [], "member");
+    const { connection } = await createBrokerConnection(db, company.id);
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: "alice",
+      status: "active",
+      isDefault: false,
+    }).returning().then((rows) => rows[0]!);
+    const serviceDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    const service = createTestToolAccessService(serviceDb);
+    const removalDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    let releaseRemoval!: () => void;
+    const removalMayCommit = new Promise<void>((resolve) => {
+      releaseRemoval = resolve;
+    });
+    let membershipLocked!: () => void;
+    const membershipIsLocked = new Promise<void>((resolve) => {
+      membershipLocked = resolve;
+    });
+
+    const removal = removalDb.transaction(async (tx) => {
+      await tx.execute(sql`
+        SELECT "id"
+        FROM "company_memberships"
+        WHERE "company_id" = ${company.id}
+          AND "principal_type" = 'user'
+          AND "principal_id" = 'alice'
+        FOR UPDATE
+      `);
+      await tx.execute(sql`
+        UPDATE "connection_grants"
+        SET "status" = 'revoked', "revoked_at" = now(), "updated_at" = now()
+        WHERE "id" = ${grant.id}
+      `);
+      await tx.execute(sql`
+        DELETE FROM "connection_grant_delegations"
+        WHERE "company_id" = ${company.id} AND "grant_id" = ${grant.id}
+      `);
+      membershipLocked();
+      await removalMayCommit;
+      await tx.execute(sql`
+        UPDATE "company_memberships"
+        SET "status" = 'suspended', "updated_at" = now()
+        WHERE "company_id" = ${company.id}
+          AND "principal_type" = 'user'
+          AND "principal_id" = 'alice'
+      `);
+    });
+
+    await membershipIsLocked;
+    let creationSettled = false;
+    const creation = service.createConnectionGrantDelegation(connection.id, grant.id, agent.id, "alice")
+      .then(
+        (value) => ({ value, error: null }),
+        (error: unknown) => ({ value: null, error }),
+      )
+      .finally(() => {
+        creationSettled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(creationSettled).toBe(false);
+    releaseRemoval();
+    await removal;
+    const creationResult = await creation;
+    expect(creationResult.error).toEqual(expect.objectContaining({
+      message: "Only an active company member can delegate their personal grant",
+    }));
+
+    await db.update(companyMemberships).set({ status: "active" }).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalId, "alice"),
+    ));
+    await db.update(connectionGrants).set({ status: "active", revokedAt: null }).where(eq(connectionGrants.id, grant.id));
+    expect(await db.select().from(connectionGrantDelegations).where(eq(connectionGrantDelegations.grantId, grant.id)))
+      .toHaveLength(0);
   });
 
   it("fails autonomous token minting closed until the named agent has a standing delegation", async () => {

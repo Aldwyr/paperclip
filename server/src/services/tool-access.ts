@@ -8424,42 +8424,62 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       ownerUserId: string,
     ) => {
       const connection = await getConnectionRow(idOrUid);
-      const [grant] = await db.select().from(connectionGrants).where(and(
-        eq(connectionGrants.id, grantId),
-        eq(connectionGrants.companyId, connection.companyId),
-        eq(connectionGrants.connectionId, connection.id),
-        eq(connectionGrants.kind, "user"),
-        eq(connectionGrants.subjectUserId, ownerUserId),
-        eq(connectionGrants.status, "active"),
-      )).limit(1);
-      if (!grant) throw forbidden("Only the active personal grant owner can create a delegation");
-      const [targetAgent] = await db.select({ id: agents.id }).from(agents).where(and(
-        eq(agents.id, agentId),
-        eq(agents.companyId, connection.companyId),
-      )).limit(1);
-      if (!targetAgent) throw notFound("Agent not found");
-      const [existing] = await db.select().from(connectionGrantDelegations).where(and(
-        eq(connectionGrantDelegations.grantId, grant.id),
-        eq(connectionGrantDelegations.agentId, agentId),
-      )).limit(1);
-      if (existing) return existing;
-      const [delegation] = await db.insert(connectionGrantDelegations).values({
-        companyId: connection.companyId,
-        grantId: grant.id,
-        agentId,
-        createdByUserId: ownerUserId,
-      }).returning();
-      await db.insert(toolAccessAuditEvents).values({
-        companyId: connection.companyId,
-        connectionId: connection.id,
-        actorType: "user",
-        actorId: ownerUserId,
-        action: "connection_grant.delegated",
-        outcome: "success",
-        reasonCode: "delegation_created",
-        details: { grantId: grant.id, delegationId: delegation!.id, agentId },
+      return db.transaction(async (tx) => {
+        // Membership removal/suspension takes this same row lock before sweeping
+        // personal grants. Whichever operation wins is therefore authoritative:
+        // removal deletes a delegation committed first, while creation that runs
+        // second observes the inactive membership and fails closed.
+        const [membership] = await tx.select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, connection.companyId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, ownerUserId),
+            eq(companyMemberships.status, "active"),
+          ))
+          .for("update")
+          .limit(1);
+        if (!membership) {
+          throw forbidden("Only an active company member can delegate their personal grant");
+        }
+
+        const [grant] = await tx.select().from(connectionGrants).where(and(
+          eq(connectionGrants.id, grantId),
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+          eq(connectionGrants.kind, "user"),
+          eq(connectionGrants.subjectUserId, ownerUserId),
+          eq(connectionGrants.status, "active"),
+        )).limit(1);
+        if (!grant) throw forbidden("Only the active personal grant owner can create a delegation");
+        const [targetAgent] = await tx.select({ id: agents.id }).from(agents).where(and(
+          eq(agents.id, agentId),
+          eq(agents.companyId, connection.companyId),
+        )).limit(1);
+        if (!targetAgent) throw notFound("Agent not found");
+        const [existing] = await tx.select().from(connectionGrantDelegations).where(and(
+          eq(connectionGrantDelegations.grantId, grant.id),
+          eq(connectionGrantDelegations.agentId, agentId),
+        )).limit(1);
+        if (existing) return existing;
+        const [delegation] = await tx.insert(connectionGrantDelegations).values({
+          companyId: connection.companyId,
+          grantId: grant.id,
+          agentId,
+          createdByUserId: ownerUserId,
+        }).returning();
+        await tx.insert(toolAccessAuditEvents).values({
+          companyId: connection.companyId,
+          connectionId: connection.id,
+          actorType: "user",
+          actorId: ownerUserId,
+          action: "connection_grant.delegated",
+          outcome: "success",
+          reasonCode: "delegation_created",
+          details: { grantId: grant.id, delegationId: delegation!.id, agentId },
+        });
+        return delegation!;
       });
-      return delegation!;
     },
 
     revokeConnectionGrantDelegation: async (idOrUid: string, grantId: string, delegationId: string, actor?: ActorInfo) => {
