@@ -1,27 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { Loader2, PackageCheck, RefreshCw, X } from "lucide-react";
-import type { Agent, ToolCatalogEntry } from "@paperclipai/shared";
+import { Loader2, RefreshCw, X } from "lucide-react";
+import type { Agent, ToolCatalogEntry, ToolConnectionCapabilities } from "@paperclipai/shared";
 import { useSearchParams } from "@/lib/router";
 import { AgentIcon } from "@/components/AgentIconPicker";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { AgentMultiSelect } from "@/components/AgentMultiSelect";
-import { InlineBanner } from "@/components/InlineBanner";
+import { RadioCardGroup } from "@/components/ui/radio-card";
 import { cn } from "@/lib/utils";
-import { brandChipBadge } from "@/lib/status-colors";
-import {
-  autoExtendNotice,
-  INSTALL_ALL_WARNING,
-  installInfoNotice,
-  type InstallState,
-} from "@/lib/tool-installs";
+import { type InstallState } from "@/lib/tool-installs";
 import { QuarantinedActionsReview } from "./SetupPanel";
 import type { AccessDraft, AppDetailSectionProps } from "./types";
 
 type ActionPermission = "off" | "allowed" | "ask";
 
 export function PermissionsPanel({
-  appName,
   access,
   agents,
   install,
@@ -38,11 +30,11 @@ export function PermissionsPanel({
   onReviewQuarantined,
   onRefreshActions,
   refreshPending,
+  capabilities,
 }: Pick<
   AppDetailSectionProps,
   "access" | "agents" | "readOnly" | "canChange" | "quarantined" | "enabledIds" | "askFirstIds" | "pending"
 > & {
-  appName: string;
   install: InstallState;
   installPending: boolean;
   onSaveAccess: (next: AccessDraft) => void;
@@ -51,6 +43,8 @@ export function PermissionsPanel({
   onReviewQuarantined: (enabledIds: string[]) => void;
   onRefreshActions: () => void;
   refreshPending: boolean;
+  /** Server verdict on what this caller may change here (PAP-17835). */
+  capabilities: ToolConnectionCapabilities | undefined;
 }) {
   // Deep-link from the Test tab's "off" panel: ?focus={catalogEntryId} scrolls
   // to and highlights that action row.
@@ -59,11 +53,10 @@ export function PermissionsPanel({
   return (
     <div className="space-y-6">
       <AccessSection access={access} agents={agents} disabled={pending} onSave={onSaveAccess} />
-      <InstalledSection
-        appName={appName}
+      <AvailableToAgentsSection
         agents={agents}
-        access={access}
         install={install}
+        capabilities={capabilities}
         disabled={installPending}
         onSave={onSaveInstall}
       />
@@ -207,124 +200,121 @@ function AccessSection({
   );
 }
 
-function InstalledSection({
-  appName,
+/**
+ * "Available to agents" (PAP-17835 Surface E).
+ *
+ * The old section exposed the runtime's own vocabulary — "permitted only",
+ * "installed", an auto-extend warning — which asked the reader to hold two
+ * overlapping concepts to answer one question. It is now the same two-choice
+ * model the create flow uses: pick agents, or any agent. The runtime
+ * distinction still exists in code; it just stopped being the user's problem.
+ *
+ * Every control is gated on a server capability. A viewer, or a member who may
+ * not configure this connection, sees the summary and the agent list with no
+ * controls at all rather than disabled ones.
+ */
+function AvailableToAgentsSection({
   agents,
-  access,
   install,
+  capabilities,
   disabled,
   onSave,
 }: {
-  appName: string;
   agents: Agent[];
-  access: AccessDraft;
   install: InstallState;
+  capabilities: ToolConnectionCapabilities | undefined;
   disabled: boolean;
   onSave: (next: InstallState) => void;
 }) {
   const liveAgents = agents.filter((a) => a.status !== "terminated");
-  const hasAccess = (agentId: string) => access.mode === "all" || access.agentIds.has(agentId);
-  // Agents that are installed but not (yet) in the access set — installing on
-  // them auto-extends access server-side. Surfaced amber so it's never silent.
-  const extendingAgents =
-    access.mode === "all"
-      ? []
-      : [...install.agentIds].filter((id) => !access.agentIds.has(id));
-  const installedCount = install.onAll ? liveAgents.length : install.agentIds.size;
+  const canManage = capabilities?.canManageAgentInstalls ?? false;
+  const canSetCompanyWide = capabilities?.canSetCompanyInstall ?? false;
+  // "Agents I pick" is scoped to the agents this person may actually edit. The
+  // server decides that set; the client never infers it from a role string.
+  const editableAgentIds = capabilities?.editableAgentIds;
+  const selectableAgents = editableAgentIds
+    ? liveAgents.filter((agent) => editableAgentIds.includes(agent.id))
+    : liveAgents;
+  const mode: "all" | "specific" = install.onAll ? "all" : "specific";
+  const selectedAgents = liveAgents.filter((agent) => install.agentIds.has(agent.id));
+  const summary = install.onAll
+    ? "Any agent"
+    : install.agentIds.size === 0
+      ? "No agents yet"
+      : `${install.agentIds.size} ${install.agentIds.size === 1 ? "agent" : "agents"}`;
 
   return (
     <section>
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-sm font-bold text-foreground">Installed on agents</h2>
-          <p className="mt-0.5 text-sm text-muted-foreground">
-            Whose harness carries {appName}'s tools on every run.
-          </p>
+          <h2 className="text-sm font-bold text-foreground">Available to agents</h2>
+          <p className="mt-0.5 text-sm text-muted-foreground">{summary}</p>
         </div>
-        <div className="flex items-center gap-2">
-          {disabled && <span className="text-xs text-muted-foreground">Saving…</span>}
+        {disabled && <span className="text-xs text-muted-foreground">Saving…</span>}
+      </div>
+
+      {canManage ? (
+        <div className="space-y-3 pt-4">
+          <RadioCardGroup
+            ariaLabel="Which agents can use this connection"
+            value={mode}
+            disabled={disabled}
+            className="sm:grid-cols-2"
+            onValueChange={(next) => {
+              if (next === "all") onSave({ onAll: true, agentIds: new Set() });
+              else onSave({ onAll: false, agentIds: new Set(install.agentIds) });
+            }}
+            options={[
+              {
+                value: "specific",
+                title: "Agents I pick",
+                description: "Choose one or more agents you can edit.",
+              },
+              {
+                value: "all",
+                title: "Any agent",
+                description: canSetCompanyWide
+                  ? "Make this connection available to every agent."
+                  : "Only someone who can configure this connection can choose this.",
+              },
+            ].filter((option) => option.value !== "all" || canSetCompanyWide || install.onAll)}
+          />
+
+          {mode === "specific" ? (
+            <AgentMultiSelect
+              agents={selectableAgents}
+              selectedAgentIds={install.agentIds}
+              disabled={disabled}
+              triggerLabel={
+                install.agentIds.size === 0
+                  ? "Choose agents"
+                  : `${install.agentIds.size} ${install.agentIds.size === 1 ? "agent" : "agents"} selected`
+              }
+              emptyMessage="You cannot edit any agents yet."
+              onChange={(agentIds) => onSave({ onAll: false, agentIds })}
+            />
+          ) : null}
+        </div>
+      ) : (
+        // Read-only: the state is still fully legible, just not editable.
+        <div className="pt-3">
           {install.onAll ? (
-            <InstalledBadge label="Installed on all agents" />
-          ) : install.agentIds.size > 0 ? (
-            <InstalledBadge label={`${installedCount} installed`} />
+            <p className="text-sm text-muted-foreground">Every agent can use this connection.</p>
+          ) : selectedAgents.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No agents have this connection yet.</p>
           ) : (
-            <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
-              Permitted only — not installed on any agent
-            </span>
+            <div className="space-y-0.5">
+              {selectedAgents.map((agent) => (
+                <div key={agent.id} className="flex items-center gap-2 px-1.5 py-1 text-sm">
+                  <AgentIcon icon={agent.icon ?? null} className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 truncate text-foreground">{agent.name}</span>
+                </div>
+              ))}
+            </div>
           )}
         </div>
-      </div>
-
-      <div className="space-y-3 pt-4">
-        <InlineBanner tone="info" compact>
-          {installInfoNotice(appName)}
-        </InlineBanner>
-
-        {!install.onAll && (
-          <AgentMultiSelect
-            agents={liveAgents}
-            selectedAgentIds={install.agentIds}
-            disabled={disabled}
-            triggerLabel={
-              install.agentIds.size === 0
-                ? "Choose agents to install on"
-                : `${install.agentIds.size} ${install.agentIds.size === 1 ? "agent" : "agents"} installed`
-            }
-            getDescription={(agent) => (hasAccess(agent.id) ? "has access" : "no access yet")}
-            renderNameSuffix={(agent) =>
-              !hasAccess(agent.id) && install.agentIds.has(agent.id) ? (
-                <span className={cn("rounded border px-1 py-0 text-xs font-medium", brandChipBadge.amber)}>
-                  will grant access
-                </span>
-              ) : null
-            }
-            onChange={(agentIds) => onSave({ onAll: false, agentIds })}
-          />
-        )}
-
-        <label className="flex items-start gap-3 py-2.5">
-          <Checkbox
-            checked={install.onAll}
-            disabled={disabled}
-            aria-label="Install on all agents"
-            onCheckedChange={(checked) =>
-              onSave(checked ? { onAll: true, agentIds: new Set() } : { onAll: false, agentIds: new Set() })
-            }
-          />
-          <span className="text-xs text-foreground">
-            <span className="font-semibold">Install on all agents</span>
-            <span className="mt-0.5 block text-muted-foreground">
-              {INSTALL_ALL_WARNING}
-            </span>
-          </span>
-        </label>
-
-        {extendingAgents.length > 0 ? (
-          <InlineBanner tone="warning" compact>
-            <span>
-              {autoExtendNotice(
-                extendingAgents.length === 1
-                  ? liveAgents.find((a) => a.id === extendingAgents[0])?.name ?? "1 agent"
-                  : `${extendingAgents.length} agents`,
-              )}{" "}
-              <span className="font-medium">
-                Review the {extendingAgents.length} access change
-                {extendingAgents.length === 1 ? "" : "s"}
-              </span>
-            </span>
-          </InlineBanner>
-        ) : null}
-      </div>
+      )}
     </section>
-  );
-}
-
-function InstalledBadge({ label }: { label: string }) {
-  return (
-    <span className={cn("inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium", brandChipBadge.green)}>
-      <PackageCheck className="h-3 w-3" />
-      {label}
-    </span>
   );
 }
 

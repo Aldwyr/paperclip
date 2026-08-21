@@ -37,7 +37,9 @@ import {
   type AppGalleryDisplayEntry,
 } from "./app-definition-display";
 import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs";
-import { SetupPanel } from "./app-detail/SetupPanel";
+import { SetupPanel, connectionProviderName } from "./app-detail/SetupPanel";
+import { IdentitiesSection } from "./app-detail/IdentitiesSection";
+import { actsAsSummary } from "./connection-identity";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
 import { TestPanel } from "./app-detail/TestPanel";
 import { ReviewPanel } from "./app-detail/ReviewPanel";
@@ -121,6 +123,14 @@ export function AppDetail() {
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
     enabled: activeTab === "activity",
+  });
+  // Identity grants drive the Setup tab's Identities section and the header's
+  // "acts as" sentence, and Permissions reads `capabilities` from the same
+  // response so install controls follow one server verdict (PAP-17835).
+  const grantsQuery = useQuery({
+    queryKey: queryKeys.tools.connectionGrants(connectionId),
+    queryFn: () => toolsApi.listConnectionGrants(connectionId),
+    enabled: !!connectionId && (activeTab === "setup" || activeTab === "permissions"),
   });
 
   const connection = connectionQuery.data;
@@ -299,6 +309,84 @@ export function AppDetail() {
       }),
   });
 
+  const invalidateGrants = () => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.tools.connectionGrants(connectionId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.tools.connection(connectionId) });
+  };
+
+  /**
+   * "Connect as me" and "Reconnect" for the signed-in user's own identity. The
+   * subject is always the caller — the server refuses any other subject — so
+   * there is no path here to start consent on a coworker's behalf.
+   */
+  const startPersonalAuth = useMutation({
+    mutationFn: () => {
+      const subjectUserId = grantsQuery.data?.currentUserId;
+      if (!subjectUserId) throw new Error("Sign in again to connect your own account.");
+      return toolsApi.startPersonalAuthorization(selectedCompanyId!, connectionId, {
+        subjectUserId,
+        returnTo: appTabHref(connectionId, "setup"),
+      });
+    },
+    onSuccess: ({ url }) => {
+      const target = resolveAuthorizationTarget(url);
+      if (!target.ok) {
+        pushToast({ title: "Couldn't start sign-in", body: target.message, tone: "error" });
+        return;
+      }
+      navigateTopLevel(target.url);
+    },
+    onError: (error) =>
+      pushToast({
+        title: "Couldn't start sign-in",
+        body: error instanceof Error ? error.message : "Please try again.",
+        tone: "error",
+      }),
+  });
+
+  const revokeGrant = useMutation({
+    mutationFn: (grantId: string) => toolsApi.revokeConnectionGrant(connectionId, grantId),
+    onSuccess: (grant) => {
+      invalidateGrants();
+      pushToast({
+        title: grant.kind === "user" ? "Identity revoked" : "Organization identity revoked",
+        body: grant.kind === "user"
+          ? "Agents will stop acting as this person."
+          : "Installed agents no longer have the shared identity.",
+        tone: "success",
+      });
+    },
+    onError: (error) =>
+      pushToast({
+        title: "Couldn't revoke that identity",
+        body: error instanceof Error ? error.message : "Please try again.",
+        tone: "error",
+      }),
+  });
+
+  // A denied or conflicting audience save keeps the dialog open with the
+  // selection intact, so the error is surfaced inline rather than as a toast.
+  const [audienceError, setAudienceError] = useState<string | null>(null);
+  const [audienceOpenGrantId, setAudienceOpenGrantId] = useState<string | null>(null);
+  const replaceAudience = useMutation({
+    mutationFn: ({ grantId, memberUserIds }: { grantId: string; memberUserIds: string[] }) =>
+      toolsApi.replaceConnectionGrantMembers(connectionId, grantId, memberUserIds),
+    onMutate: () => setAudienceError(null),
+    onSuccess: (grant) => {
+      invalidateGrants();
+      setAudienceOpenGrantId(null);
+      pushToast({
+        title: "Audience saved",
+        body: (grant.members?.length ?? 0) === 0
+          ? "Every organization member can use this identity."
+          : `${grant.members?.length} ${grant.members?.length === 1 ? "member" : "members"} can use this identity.`,
+        tone: "success",
+      });
+    },
+    onError: (error) =>
+      setAudienceError(error instanceof Error ? error.message : "We couldn't save that audience."),
+  });
+
   const removeApp = useMutation({
     mutationFn: () => toolsApi.archiveConnection(connectionId),
     onSuccess: () => {
@@ -414,6 +502,7 @@ export function AppDetail() {
   }
 
   const status = statusFor(connection);
+  const providerName = connectionProviderName(logoEntry, baseAppName);
   const needsReconnect = status.tone === "attention" && connection.healthStatus !== "unknown";
   const quarantined = catalog.filter((e) => e.status === "quarantined");
   const active = catalog.filter((e) => e.status !== "quarantined" && e.status !== "removed");
@@ -470,8 +559,37 @@ export function AppDetail() {
             onToggleApp={() => toggleEnabled.mutate()}
             configUpdateDisabled={updateConfig.isPending}
             onUpdateConfig={(config) => updateConfig.mutate(config)}
-            oauthStartDisabled={startOAuth.isPending}
-            onStartOAuth={() => startOAuth.mutate()}
+            identities={
+              <IdentitiesSection
+                appName={appName}
+                providerName={providerName}
+                credentialPolicy={connection.credentialPolicy}
+                grantsQuery={grantsQuery.data}
+                loading={grantsQuery.isLoading}
+                error={grantsQuery.isError}
+                connectPending={startPersonalAuth.isPending || startOAuth.isPending}
+                revokePending={revokeGrant.isPending}
+                audiencePending={replaceAudience.isPending}
+                audienceError={audienceError}
+                audienceGrantId={audienceOpenGrantId}
+                onOpenAudience={(grantId) => {
+                  setAudienceError(null);
+                  setAudienceOpenGrantId(grantId);
+                }}
+                onCloseAudience={() => {
+                  setAudienceOpenGrantId(null);
+                  setAudienceError(null);
+                }}
+                onConnectAsMe={() => startPersonalAuth.mutate()}
+                // The organization identity is a shared credential, so it goes
+                // through the connection-level OAuth start, not a personal one.
+                onConnectOrganization={() => startOAuth.mutate()}
+                onReconnectOrganization={() => startOAuth.mutate()}
+                onRevokeGrant={(grant) => revokeGrant.mutate(grant.id)}
+                onReplaceAudience={(grant, memberUserIds) =>
+                  replaceAudience.mutate({ grantId: grant.id, memberUserIds })}
+              />
+            }
           />
           <AdvancedPanel
             connection={connection}
@@ -515,8 +633,8 @@ export function AppDetail() {
           : permissionsLoading
           ? <ToolsLoading />
           : <PermissionsPanel
-              appName={appName}
               access={access}
+              capabilities={grantsQuery.data?.capabilities}
               agents={agents}
               install={install}
               readOnly={readOnly}
@@ -588,6 +706,7 @@ function AppDetailHeader({
   onRenameSubmit: (value: string) => void;
 }) {
   const unverifiedHost = unverifiedRemoteHost(connection);
+  const actsAs = actsAsSummary(connection.credentialPolicy);
 
   return (
     <header className="flex flex-wrap items-start justify-between gap-4">
@@ -633,6 +752,14 @@ function AppDetailHeader({
           {connectionDisplaySecondaryHint(connection) && (
             <p className="text-xs text-muted-foreground">{connectionDisplaySecondaryHint(connection)}</p>
           )}
+          {/* One sentence, not a cluster of badges: whether an agent acts as you
+              or as the organization is the first thing every tab has to answer
+              (PAP-17835). It lives in the header so it carries across tabs. */}
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">{actsAs.title}</span>
+            {" · "}
+            {actsAs.detail}
+          </p>
           {owner && (
             <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
               <span>Connected by</span>

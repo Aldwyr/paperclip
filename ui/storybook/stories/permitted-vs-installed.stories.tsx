@@ -5,6 +5,7 @@ import type {
   Agent,
   ToolCatalogEntry,
   ToolConnection,
+  ToolConnectionCapabilities,
 } from "@paperclipai/shared";
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentToolsTab } from "@/pages/AgentToolsTab";
@@ -12,6 +13,29 @@ import { PermissionsPanel } from "@/pages/apps/app-detail/PermissionsPanel";
 import { InstallStep } from "@/pages/apps/AppsConnect";
 import type { AccessDraft } from "@/pages/apps/app-detail/types";
 import type { InstallState } from "@/lib/tool-installs";
+
+const AGENT_IDS = ["a-sage", "a-atlas", "a-orion"];
+
+/** A member who may configure this connection and edit every agent. */
+const FULL_CAPABILITIES: ToolConnectionCapabilities = {
+  canConfigure: true,
+  canCreateOrganizationGrant: true,
+  canSetCompanyInstall: true,
+  canConnectAsCurrentUser: true,
+  canManageAgentInstalls: true,
+  canViewOtherPersonalIdentities: false,
+  editableAgentIds: AGENT_IDS,
+};
+
+const VIEWER_CAPABILITIES: ToolConnectionCapabilities = {
+  canConfigure: false,
+  canCreateOrganizationGrant: false,
+  canSetCompanyInstall: false,
+  canConnectAsCurrentUser: false,
+  canManageAgentInstalls: false,
+  canViewOtherPersonalIdentities: false,
+  editableAgentIds: [],
+};
 
 // ---------------------------------------------------------------------------
 // Phase 3b — Permitted vs Installed UX review harness (PAP-13634).
@@ -99,13 +123,21 @@ type Story = StoryObj;
 
 // --- Surface 1: App detail Permissions tab (PermissionsPanel) --------------
 
-function PanelHarness({ access, install }: { access: AccessDraft; install: InstallState }) {
+function PanelHarness({
+  access,
+  install,
+  capabilities = FULL_CAPABILITIES,
+}: {
+  access: AccessDraft;
+  install: InstallState;
+  capabilities?: ToolConnectionCapabilities;
+}) {
   const [state, setState] = useState(install);
   return (
     <div className="mx-auto max-w-3xl bg-background p-6">
       <PermissionsPanel
-        appName="Gmail"
         access={access}
+        capabilities={capabilities}
         agents={AGENTS}
         install={state}
         readOnly={GMAIL_TOOLS.filter((t) => t.isReadOnly)}
@@ -126,8 +158,8 @@ function PanelHarness({ access, install }: { access: AccessDraft; install: Insta
   );
 }
 
-export const AppDetailInstalledMixed: Story = {
-  name: "1 · App detail — mixed install + auto-extend warning",
+export const AppDetailAgentsIPick: Story = {
+  name: "1 · App detail — Agents I pick",
   render: () => (
     <PanelHarness
       access={{ mode: "specific", agentIds: new Set(["a-sage", "a-atlas"]) }}
@@ -136,8 +168,8 @@ export const AppDetailInstalledMixed: Story = {
   ),
 };
 
-export const AppDetailInstalledOnAll: Story = {
-  name: "1 · App detail — installed on all agents",
+export const AppDetailAnyAgent: Story = {
+  name: "1 · App detail — Any agent",
   render: () => (
     <PanelHarness
       access={{ mode: "all", agentIds: new Set() }}
@@ -146,12 +178,42 @@ export const AppDetailInstalledOnAll: Story = {
   ),
 };
 
-export const AppDetailPermittedOnly: Story = {
-  name: "1 · App detail — permitted only (not installed)",
+export const AppDetailNoAgentsYet: Story = {
+  name: "1 · App detail — no agents yet",
   render: () => (
     <PanelHarness
       access={{ mode: "all", agentIds: new Set() }}
       install={{ onAll: false, agentIds: new Set() }}
+    />
+  ),
+};
+
+/**
+ * Viewer read-only (PAP-17835). Controls are absent, not disabled: a
+ * policy-forbidden action is never rendered as something to try.
+ */
+export const AppDetailViewerReadOnly: Story = {
+  name: "1 · App detail — viewer read-only",
+  render: () => (
+    <PanelHarness
+      access={{ mode: "specific", agentIds: new Set(["a-sage"]) }}
+      install={{ onAll: false, agentIds: new Set(["a-sage"]) }}
+      capabilities={VIEWER_CAPABILITIES}
+    />
+  ),
+};
+
+/**
+ * A member who may pick agents but may not make the connection company-wide:
+ * "Any agent" is omitted from the choice entirely.
+ */
+export const AppDetailMemberWithoutCompanyInstall: Story = {
+  name: "1 · App detail — member without company-wide install",
+  render: () => (
+    <PanelHarness
+      access={{ mode: "specific", agentIds: new Set(["a-sage"]) }}
+      install={{ onAll: false, agentIds: new Set(["a-sage"]) }}
+      capabilities={{ ...FULL_CAPABILITIES, canSetCompanyInstall: false }}
     />
   ),
 };

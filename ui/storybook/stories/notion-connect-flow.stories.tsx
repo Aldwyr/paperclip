@@ -107,8 +107,6 @@ function ConnectedHost() {
         appToggleDisabled={false}
         onUpdateConfig={() => undefined}
         configUpdateDisabled={false}
-        onStartOAuth={() => undefined}
-        oauthStartDisabled={false}
       />
     </div>
   );
