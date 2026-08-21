@@ -9,6 +9,10 @@ export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
 export * from "./backends/codex-native-backend.js";
 export * from "./native-session-runtime.js";
+export {
+  DurablePrpControlPlane,
+  type DurablePrpControlPlaneOptions,
+} from "./control-plane/durable-prp-control-plane.js";
 export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
 export {

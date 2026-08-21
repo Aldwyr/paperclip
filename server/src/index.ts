@@ -39,6 +39,7 @@ import {
 } from "./services/managed-config.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
+import { setupRunnerPrpWebSocketServer } from "./realtime/runner-prp-ws.js";
 import { cloudActorHeaderSourceFromHeaders, resolveCloudTenantActor } from "./middleware/auth.js";
 import {
   feedbackService,
@@ -853,6 +854,7 @@ export async function startServer(): Promise<StartedServer> {
       return { userId: actor.userId, companyIds: actor.companyIds };
     },
   });
+  setupRunnerPrpWebSocketServer(server, { port: listenPort });
 
   try {
     const result = await workspaceOperationService(db as any)

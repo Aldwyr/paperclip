@@ -19,7 +19,7 @@ import {
   spawnRunner,
   waitForProcess,
   type RunnerProcessHandle,
-} from "../mock-core/durable-recovery.js";
+} from "../control-plane/durable-prp-control-plane.js";
 
 const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
@@ -38,9 +38,13 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions {
+  provider?: "codex" | "opencode";
   runnerBinary?: string;
   codexCommand?: string;
   codexArgs?: string[];
+  opencodeCommand?: string;
+  opencodeProxyPath?: string;
+  opencodeRuntimeDirectory?: string;
   environment?: NodeJS.ProcessEnv;
   closeGraceMs?: number;
   onDiagnostic?: (message: string) => void;
@@ -54,6 +58,11 @@ export interface CapabilityRunnerdCodexTransportOptions {
     turnId: string;
     itemId: string;
   };
+  /** Registers the run-bound PRP authority on Paperclip's shared HTTP server. */
+  controlPlaneRegistration?: (authority: DurablePrpControlPlane) => Promise<{
+    connectUrl: string;
+    release: () => Promise<void> | void;
+  }>;
 }
 
 export type RunnerdCodexTransportOptions = CapabilityRunnerdCodexTransportOptions;
@@ -148,6 +157,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #sessionId: string | null = null;
   #turnId = "";
   #closed = false;
+  #controlPlaneRelease: (() => Promise<void> | void) | null = null;
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
     this.#ownsRoot = options.stateDirectory === undefined;
@@ -225,7 +235,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
     this.#queue.close();
+    if (this.#controlPlaneRelease !== null) await this.#controlPlaneRelease();
     await this.#core?.stop();
+    this.#controlPlaneRelease = null;
     this.#handle?.child.kill("SIGKILL");
     if (this.#ownsRoot) rmSync(this.#root, { recursive: true, force: true });
     this.#publish();
@@ -268,6 +280,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#core = core;
     mkdirSync(resolve(this.#root, "runner"), { recursive: true, mode: 0o700 });
+    const provider = this.options.provider ?? "codex";
+    const opencodeProxyPath = this.options.opencodeProxyPath
+      ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
     core.queueCommand("run.prepare", {
       authorizedTools: {
         schema: "paperclip.runner.authorized-tools.v1",
@@ -276,17 +291,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         operations,
       },
       provider: {
-        command: this.options.codexCommand ?? "codex",
-        args: this.options.codexArgs ?? createIsolatedCodexAppServerArgs(this.options.environment),
+        kind: provider,
+        command: provider === "opencode" ? process.execPath : this.options.codexCommand ?? "codex",
+        args: provider === "opencode" ? [opencodeProxyPath] : this.options.codexArgs ?? createIsolatedCodexAppServerArgs(this.options.environment),
         cwd: String(params.cwd ?? tmpdir()),
         model: typeof params.model === "string" ? params.model : null,
         instructions: String(params.baseInstructions ?? "You are a Paperclip agent."),
       },
     });
     core.queueCommand("session.open", { reuse: "same_session" });
-    await core.start();
+    const registration = this.options.controlPlaneRegistration
+      ? await this.options.controlPlaneRegistration(core)
+      : null;
+    if (registration === null) await core.start();
+    else this.#controlPlaneRelease = registration.release;
     const handle = spawnRunner({
-      connectUrl: core.connectUrl,
+      connectUrl: registration?.connectUrl ?? core.connectUrl,
       stateDirectory: resolve(this.#root, "runner"),
       identity,
       ticket: core.issueBootstrapTicket(),
@@ -294,6 +314,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       p0ReserveBytes: 64 * 1024,
       maxRuntimeMs: 60 * 60 * 1_000,
       runnerBinaryPath: this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
+      environment: provider === "opencode"
+        ? {
+            ...this.options.environment,
+            PAPERCLIP_OPENCODE_COMMAND: this.options.opencodeCommand ?? "opencode",
+            PAPERCLIP_OPENCODE_RUNTIME_DIR: this.options.opencodeRuntimeDirectory ?? resolve(this.#root, "opencode"),
+            PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+            PAPERCLIP_RUN_ID: identity.runId,
+            PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+          }
+        : this.options.environment,
     });
     this.#handle = handle;
     this.#evidence.runnerPid = handle.child.pid ?? null;
@@ -330,9 +360,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#core = core;
     this.#eventIndex = core.store.state.committedEvents.length;
-    await core.start();
+    const registration = this.options.controlPlaneRegistration
+      ? await this.options.controlPlaneRegistration(core)
+      : null;
+    if (registration === null) await core.start();
+    else this.#controlPlaneRelease = registration.release;
     const handle = spawnRunner({
-      connectUrl: core.connectUrl,
+      connectUrl: registration?.connectUrl ?? core.connectUrl,
       stateDirectory: resolve(this.#root, "runner"),
       identity,
       ticket: core.issueBootstrapTicket(),

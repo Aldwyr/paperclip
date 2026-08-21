@@ -19,6 +19,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
+import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
@@ -457,6 +458,10 @@ function createRunnerdBackend(input: {
         turnId: `turn-${input.execution.binding.runId}`,
         itemId: `item-${input.execution.binding.runId}`,
       },
+      controlPlaneRegistration: (authority) => registerRunnerPrpAuthority({
+        runId: input.execution.binding.runId,
+        authority,
+      }),
     }).transport,
   });
 }
