@@ -3576,7 +3576,12 @@
     {
       "id": "real-control-plane-binding",
       "requirement": "advertised runner tools re-authorize the live company, issue, agent, and run before using real Paperclip services",
-      "deterministicOwner": "server/src/services/native-runtime/paperclip-runner-tool-authority.test.ts"
+      "deterministicOwner": "server/src/services/native-runtime/paperclip-runner-tool-authority.test.ts; server/src/services/native-runtime/paperclip-runner-real-server.integration.test.ts"
+    },
+    {
+      "id": "shared-paperclip-prp-route",
+      "requirement": "Rust runnerd authenticates to the shared Paperclip server route and completes a real bound semantic tool call",
+      "deterministicOwner": "server/src/realtime/runner-prp-ws.test.ts; server/src/services/native-runtime/paperclip-runner-real-server.integration.test.ts"
     },
     {
       "id": "real-control-plane-idempotency",
