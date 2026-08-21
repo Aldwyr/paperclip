@@ -70,7 +70,7 @@ const protocol = "paperclip.runner";
 const protocolVersion = 1;
 const secureFrameSchema = "paperclip.runner.secure-frame.v1";
 const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const coreStateSchema = "paperclip.runner.durable.mock-core-state.v1";
+const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
 const maxFrameBytes = 1024 * 1024;
 const authChallengeTtlMs = 5_000;
 
@@ -173,10 +173,11 @@ interface SecureChannel {
   sessionId: string;
 }
 
-interface MockCoreOptions {
+export interface DurablePrpControlPlaneOptions {
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
-  fault: DurableRecoveryFault;
+  /** Test-only transport fault. Production callers omit this. */
+  fault?: DurableRecoveryFault;
   expectedRunnerVersion?: string;
   expectedRunnerDigest?: string;
   onSemanticToolInput?: (input: { callId: string; operationId: string; input: unknown }) => Promise<unknown>;
@@ -618,7 +619,8 @@ class MockWebSocketConnection {
   }
 }
 
-export class DurableRecoveryMockCore {
+/** Authenticated, replay-safe PRP transport authority. Business operations are caller supplied. */
+export class DurablePrpControlPlane {
   readonly fault: DurableRecoveryFault;
   readonly identity: DurableRecoveryIdentity;
   readonly store: DurableCoreStore;
@@ -629,18 +631,19 @@ export class DurableRecoveryMockCore {
   #port: number | null = null;
   #faultTriggered = false;
   #replayCursorOverrideOnce = false;
-  #onSemanticToolInput?: MockCoreOptions["onSemanticToolInput"];
+  #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
   #connectionLeaseTtlMs: number;
   #faultTriggerResolve!: () => void;
   #faultTrigger = new Promise<void>((resolveFault) => {
     this.#faultTriggerResolve = resolveFault;
   });
 
-  constructor(options: MockCoreOptions) {
-    if (!DURABLE_RECOVERY_FAULTS.includes(options.fault)) {
-      throw new Error(`Unsupported Durable recovery fault: ${options.fault}`);
+  constructor(options: DurablePrpControlPlaneOptions) {
+    const fault = options.fault ?? "none";
+    if (!DURABLE_RECOVERY_FAULTS.includes(fault)) {
+      throw new Error(`Unsupported Durable recovery fault: ${fault}`);
     }
-    this.fault = options.fault;
+    this.fault = fault;
     this.identity = options.identity;
     this.store = new DurableCoreStore(options.stateDirectory, options.identity);
     this.#expectedRunnerVersion = options.expectedRunnerVersion ?? "0.3.0";
@@ -652,14 +655,14 @@ export class DurableRecoveryMockCore {
 
   get connectUrl(): string {
     if (this.#port === null) {
-      throw new Error("Durable recovery mock core is not listening.");
+      throw new Error("Durable PRP control plane is not listening.");
     }
     return `ws://127.0.0.1:${this.#port}/durableRecovery/connect`;
   }
 
   async start(port = 0): Promise<void> {
     if (this.#server !== null) {
-      throw new Error("Durable recovery mock core is already running.");
+      throw new Error("Durable PRP control plane is already running.");
     }
     const server = createServer((_request, response) => {
       response.writeHead(404).end();
@@ -675,7 +678,7 @@ export class DurableRecoveryMockCore {
     });
     const address = server.address();
     if (address === null || typeof address === "string") {
-      throw new Error("Durable recovery mock core did not bind a TCP port.");
+      throw new Error("Durable PRP control plane did not bind a TCP port.");
     }
     this.#port = address.port;
   }
@@ -1423,6 +1426,13 @@ export async function waitForProcess(
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Test-fixture compatibility wrapper that requires an explicit injected fault mode. */
+export class DurableRecoveryMockCore extends DurablePrpControlPlane {
+  constructor(options: DurablePrpControlPlaneOptions & { fault: DurableRecoveryFault }) {
+    super(options);
   }
 }
 

@@ -11,6 +11,12 @@ export * from "./backends/codex-native-backend.js";
 export * from "./native-session-runtime.js";
 export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
+export {
+  createRunnerdCodexTransport,
+  defaultCapabilityRunnerdBinary,
+  type RunnerdCodexTransport,
+  type RunnerdCodexTransportOptions,
+} from "./live/runnerd-codex-transport.js";
 export * from "./protocol/replay-contract.js";
 export * from "./protocol/replay-loader.js";
 export * from "./protocol/semantic-tool-receipts.js";

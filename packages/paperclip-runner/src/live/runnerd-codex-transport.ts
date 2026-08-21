@@ -14,7 +14,7 @@ import type {
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
 import {
-  DurableRecoveryMockCore,
+  DurablePrpControlPlane,
   durableRecoveryInternals,
   spawnRunner,
   waitForProcess,
@@ -56,10 +56,14 @@ export interface CapabilityRunnerdCodexTransportOptions {
   };
 }
 
+export type RunnerdCodexTransportOptions = CapabilityRunnerdCodexTransportOptions;
+
 export interface CapabilityRunnerdCodexTransport {
   transport: CodexAppServerTransport;
   evidence(): Readonly<CapabilityRunnerdProcessEvidence>;
 }
+
+export type RunnerdCodexTransport = CapabilityRunnerdCodexTransport;
 
 class NotificationQueue implements AsyncIterable<CodexRpcNotification> {
   #values: Array<{ value: CodexRpcNotification; bytes: number }> = [];
@@ -136,7 +140,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     success: false,
     contentItems: [{ type: "inputText", text: "No Paperclip control-plane tool handler is installed." }],
   });
-  #core: DurableRecoveryMockCore | null = null;
+  #core: DurablePrpControlPlane | null = null;
   #handle: RunnerProcessHandle | null = null;
   #pump: NodeJS.Timeout | null = null;
   #eventIndex = 0;
@@ -246,10 +250,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       inputSchema: record(tool.inputSchema),
       responseSchema: {},
     }));
-    const core = new DurableRecoveryMockCore({
+    const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
       identity,
-      fault: "none",
       onSemanticToolInput: async (call) => unwrapToolResponse(await this.#handler({
         id: call.callId,
         method: "item/tool/call",
@@ -300,7 +303,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     await this.#waitCommand("run.prepare");
     await this.#waitCommand("session.open");
     await this.#waitForProviderIdentity();
-    this.#diagnostic("runnerd authenticated to the external mock control plane over durable PRP");
+    this.#diagnostic("runnerd authenticated to the durable PRP control plane");
     return { thread: { id: this.#threadId, sessionId: this.#sessionId, model: params.model, modelProvider: "openai" } };
   }
 
@@ -309,10 +312,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (identity === undefined || !existsSync(resolve(this.#root, "runner", "runner-state.json"))) {
       throw new Error("PRP provider resume state is unavailable");
     }
-    const core = new DurableRecoveryMockCore({
+    const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
       identity,
-      fault: "none",
       onSemanticToolInput: async (call) => unwrapToolResponse(await this.#handler({
         id: call.callId,
         method: "item/tool/call",
@@ -456,10 +458,12 @@ export function defaultCapabilityRunnerdBinary(): string {
   return resolve(packageRoot, `runner/target/debug/paperclip-runnerd${executableSuffix}`);
 }
 
-/** Uses the same external mock control-plane -> authenticated PRP -> runnerd -> provider topology as evals. */
+/** Starts an authenticated durable PRP authority, runnerd, and Codex provider transport. */
 export function createCapabilityRunnerdCodexTransport(
   options: CapabilityRunnerdCodexTransportOptions = {},
 ): CapabilityRunnerdCodexTransport {
   const transport = new DurablePrpCodexTransport(options);
   return { transport, evidence: () => transport.evidence() };
 }
+
+export const createRunnerdCodexTransport = createCapabilityRunnerdCodexTransport;

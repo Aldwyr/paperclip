@@ -44,7 +44,7 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
     }
     expect(methods).toContain("turn/completed");
     expect(bundle.evidence().diagnostics).toContain(
-      "runnerd authenticated to the external mock control plane over durable PRP",
+      "runnerd authenticated to the durable PRP control plane",
     );
   } finally {
     await bundle.transport.close();

@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
 import type { NativeFinalizationResult } from "@paperclipai/shared";
 import type {
@@ -8,12 +11,14 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   createCodexNativeSessionBackend,
+  createRunnerdCodexTransport,
   executeNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
@@ -241,6 +246,7 @@ export async function executePaperclipNativeSession(input: {
   }) => Promise<void>;
   /** Test seam at the provider boundary; production always uses the package Codex backend. */
   backend?: NativeSessionBackend;
+  useRunnerd?: boolean;
 }): Promise<AdapterExecutionResult> {
   const leaseOwner = input.leaseOwner ?? `${input.runnerInstanceId}:${randomUUID()}`;
   const leaseNow = new Date();
@@ -290,9 +296,13 @@ export async function executePaperclipNativeSession(input: {
   });
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
   try {
+    const runnerdBackend = input.useRunnerd && input.backend === undefined
+      ? createRunnerdBackend(input)
+      : null;
     native = await executeNativeSession({
       input: input.execution,
       backend: input.backend
+        ?? runnerdBackend
         ?? createCodexNativeSessionBackend(input.execution, {
           runnerInstanceId: input.runnerInstanceId,
           onSpawn: input.onSpawn,
@@ -407,4 +417,41 @@ export async function executePaperclipNativeSession(input: {
     usageBasis: "per_run",
     nativeFinalization: finalization,
   };
+}
+
+function createRunnerdBackend(input: {
+  db: Db;
+  execution: NativeExecutionInputV1;
+  runnerInstanceId: string;
+  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+}): NativeSessionBackend {
+  const authority = new PaperclipRunnerToolAuthority(input.db, {
+    companyId: input.execution.binding.companyId,
+    issueId: input.execution.binding.issueId,
+    runId: input.execution.binding.runId,
+    agentId: input.execution.binding.agentId,
+  });
+  const root = resolve(
+    process.env.PAPERCLIP_RUNNER_STATE_DIR ?? resolve(tmpdir(), "paperclip-runner"),
+    input.execution.binding.runId,
+  );
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  return createCodexNativeSessionBackend(input.execution, {
+    runnerInstanceId: input.runnerInstanceId,
+    onSpawn: input.onSpawn,
+    dynamicTools: authority.definitions(),
+    dynamicToolHandler: (call) => authority.execute(call),
+    transportFactory: () => createRunnerdCodexTransport({
+      stateDirectory: root,
+      environment: process.env,
+      prpIdentity: {
+        runnerInstanceId: input.runnerInstanceId,
+        environmentLeaseId: input.execution.binding.executionWorkspaceId,
+        runId: input.execution.binding.runId,
+        normalizedSessionId: input.execution.session.normalizedSessionId ?? `session-${input.execution.binding.runId}`,
+        turnId: `turn-${input.execution.binding.runId}`,
+        itemId: `item-${input.execution.binding.runId}`,
+      },
+    }).transport,
+  });
 }
