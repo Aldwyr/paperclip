@@ -520,8 +520,8 @@ function buildAcpAuthMissingChecks(input: {
     checks.push({
       code: ADAPTER_AUTH_MISSING_CHECK_CODE,
       level: "warn",
-      message: "The sandbox has no ready authentication for this adapter.",
-      hint: "Provide credentials for this adapter, or start login in the sandbox.",
+      message: "This environment has no ready authentication for this adapter.",
+      hint: "Provide credentials for this adapter, or start login in the environment.",
     });
   }
   return checks;
@@ -544,7 +544,7 @@ function buildAcpLoginProbeUnavailableCheck(
     level: "warn",
     message,
     hint: targetIsSandbox
-      ? "Verify that the sandbox can run `claude` and retry the Test. Set engine=cli to use the Claude CLI lane."
+      ? "Verify that the environment can run `claude` and retry the Test. Set engine=cli to use the Claude CLI lane."
       : "Verify that `claude` can run in this environment and retry the Test. Set engine=cli to use the Claude CLI lane.",
   };
 }

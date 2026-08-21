@@ -37,6 +37,7 @@ import {
   resolveLocalDefaultEnvironmentId,
   resolveManagedSandboxEnvironmentId,
 } from "../lib/adapter-test-environment";
+import { environmentDisplayLabel } from "../lib/managed-sandbox-environment";
 import { extractModelName, extractProviderId } from "../lib/model-utils";
 import { queryKeys } from "../lib/queryKeys";
 import { useCompany } from "../context/CompanyContext";
@@ -679,9 +680,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   );
   const managedSandboxOnly = experimentalSettings?.enableManagedSandboxOnly === true;
   const inheritedEnvironmentLabel = instanceDefaultEnvironment
-    ? `${instanceDefaultEnvironment.name} (${instanceDefaultEnvironment.driver})`
+    ? environmentDisplayLabel(instanceDefaultEnvironment)
     : managedSandboxOnly
-      ? "Managed sandbox"
+      ? "Paperclip Computer"
       : "Local";
 
   // Fetch adapter models for the effective adapter type
@@ -1484,7 +1485,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   <option value="">Default: {inheritedEnvironmentLabel}</option>
                   {environmentOptions.map((environment) => (
                     <option key={environment.id} value={environment.id}>
-                      {environment.name} · {environment.driver}
+                      {environmentDisplayLabel(environment)}
                     </option>
                   ))}
                 </select>
@@ -2052,7 +2053,7 @@ function AdapterLoginTerminalState({
     return (
       <div className="flex items-center gap-2 text-(length:--text-micro) text-foreground">
         <Check className="size-3 shrink-0" />
-        <span>Authenticated. The sandbox has credentials now.</span>
+        <span>Authenticated. The environment has credentials now.</span>
       </div>
     );
   }
@@ -2180,7 +2181,7 @@ function DisplayedCodeLoginPanel({
   return (
     <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the sandbox</span>
+        <span className="text-xs font-medium text-foreground">Sign in to the environment</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2628,7 +2629,7 @@ function SubmittedBrowserCodeLoginPanel({
   return (
     <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the sandbox</span>
+        <span className="text-xs font-medium text-foreground">Sign in to the environment</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2790,7 +2791,7 @@ function SubmittedBrowserCodeLoginPanel({
         {isStored && (
           <div className="flex items-center gap-2 text-(length:--text-micro) text-foreground">
             <Check className="size-3 shrink-0" />
-            <span>Authenticated. The sandbox has credentials now.</span>
+            <span>Authenticated. The environment has credentials now.</span>
           </div>
         )}
 

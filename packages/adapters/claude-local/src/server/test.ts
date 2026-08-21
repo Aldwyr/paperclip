@@ -261,8 +261,8 @@ export async function testEnvironment(
             code: "claude_effort_flag_unsupported",
             level: "warn",
             message:
-              "Claude CLI in the sandbox does not advertise --effort; the probe omitted the configured reasoning effort.",
-            hint: "Upgrade the sandbox CLI/template to a newer Claude Code release to restore reasoning-effort control.",
+              "Claude CLI in the environment does not advertise --effort; the probe omitted the configured reasoning effort.",
+            hint: "Upgrade the environment CLI/template to a newer Claude Code release to restore reasoning-effort control.",
           });
         }
       }
@@ -346,8 +346,8 @@ export async function testEnvironment(
           checks.push({
             code: ADAPTER_AUTH_MISSING_CHECK_CODE,
             level: "warn",
-            message: "The sandbox has no ready authentication for this adapter.",
-            hint: "Provide credentials for this adapter, or start login in the sandbox.",
+            message: "This environment has no ready authentication for this adapter.",
+            hint: "Provide credentials for this adapter, or start login in the environment.",
           });
         }
       } else if ((probe.exitCode ?? 1) === 0) {
