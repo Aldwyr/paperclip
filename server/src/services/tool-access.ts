@@ -7242,6 +7242,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (connection.status === "archived") throw conflict("Archived app connections cannot start sign in");
     const sourceTemplateKey = typeof connection.config.sourceTemplateKey === "string" ? connection.config.sourceTemplateKey : null;
     const galleryEntry = sourceTemplateKey ? getConnectableAppDefinition(sourceTemplateKey) : null;
+    const authorizationProviderName = galleryEntry?.name ?? connection.name;
     assertOAuthRedirectConstraints(galleryEntry, input.redirectUri);
     const endpoints = await oauthEndpointsForConnection(connection, null, input.redirectUri);
     if (endpoints.grantType === "client_credentials") {
@@ -7350,7 +7351,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             addresseeUserId: input.subjectUserId,
             idempotencyKey,
             sourceRunId: binding.actorType === "agent" ? input.actor.sessionId ?? null : null,
-            title: `Connect your ${connection.name} to continue`,
+            title: `Connect your ${authorizationProviderName} to continue`,
             summary: `Connect ${connection.name} to continue`,
             createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
             payload,
