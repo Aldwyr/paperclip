@@ -365,9 +365,9 @@ export const toolsApi = {
     api.patch<ToolConnection>(`/tool-connections/${connectionId}`, input),
   // Removal is a credential-revoking teardown (PAP-17119), so the response
   // carries the cleanup receipt alongside the archived connection.
-  archiveConnection: (connectionId: string) =>
+  archiveConnection: (connectionId: string, options: { confirmComposioChildren?: boolean } = {}) =>
     api.delete<ToolConnection & { removal: ToolConnectionRemovalSummary }>(
-      `/tool-connections/${connectionId}`,
+      `/tool-connections/${connectionId}${options.confirmComposioChildren ? "?confirmComposioChildren=true" : ""}`,
     ),
   checkConnectionHealth: (connectionId: string) =>
     api.post<ToolConnectionHealthCheckResult>(`/tool-connections/${connectionId}/health-check`, {}),

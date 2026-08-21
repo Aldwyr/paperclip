@@ -1745,6 +1745,9 @@ function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStat
   }
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (code === "composio_connected_account_inactive") {
+      return { status: "degraded", message: error.message, code };
+    }
     if (typeof code === "string" && code.startsWith("remote_http_")) {
       return { status: "error", message: error.message, code };
     }
@@ -3695,10 +3698,24 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     connectionId: string,
     companyId?: string,
     actor?: ActorInfo,
+    removalOptions: { confirmComposioChildren?: boolean } = {},
   ): Promise<ToolConnectionRemovalResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     const now = new Date();
     const binding = actorBinding(actor);
+
+    if (isComposioConnection(connection)) {
+      const children = (await existingComposioChildren(connection)).filter((child) => child.status !== "archived");
+      if (children.length > 0 && removalOptions.confirmComposioChildren !== true) {
+        throw conflict("Deleting this Composio connection also removes its connected services. Confirm child removal to continue.", {
+          code: "composio_child_removal_confirmation_required",
+          childConnectionCount: children.length,
+        });
+      }
+      for (const child of children) {
+        await removeConnection(child.id, child.companyId, actor, { confirmComposioChildren: true });
+      }
+    }
 
     // Grants are read before they are revoked: a retried removal must still see
     // the credential refs of a grant an earlier pass already marked revoked.
@@ -4203,6 +4220,80 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return rows.filter((row) => composioChildConfig(row)?.parentConnectionId === parent.id);
   }
 
+  async function assertComposioConnectedAccountActive(child: typeof toolConnections.$inferSelect) {
+    const childConfig = composioChildConfig(child);
+    if (!childConfig) return;
+    const parent = await getConnectionRow(childConfig.parentConnectionId, child.companyId);
+    const client = await composioClientForParent(parent);
+    const accounts = await client.listConnectedAccounts({
+      toolkitSlugs: [childConfig.toolkitSlug],
+      userIds: [`paperclip:${child.companyId}`],
+      limit: 100,
+    });
+    const account = childConfig.connectedAccountId
+      ? accounts.items.find((candidate) => candidate.id === childConfig.connectedAccountId)
+      : accounts.items.find((candidate) => candidate.toolkit.slug === childConfig.toolkitSlug);
+    if (account?.status.toUpperCase() === "ACTIVE") return;
+    const status = account?.status.trim().toUpperCase() || "MISSING";
+    throw unprocessable(
+      `Composio reports the ${childConfig.toolkitSlug} connected account as ${status}. Reconnect it in Composio.`,
+      { code: "composio_connected_account_inactive", connectedAccountStatus: status },
+    );
+  }
+
+  async function disableComposioChildren(parent: typeof toolConnections.$inferSelect) {
+    const children = await existingComposioChildren(parent);
+    for (const child of children) {
+      if (child.status === "archived") continue;
+      const config = asRecord(child.config);
+      await db.update(toolConnections).set({
+        enabled: false,
+        config: child.enabled ? { ...config, disabledByComposioParent: true } : config,
+        updatedAt: now(),
+      }).where(eq(toolConnections.id, child.id));
+    }
+  }
+
+  async function restoreComposioChildren(parent: typeof toolConnections.$inferSelect) {
+    const children = await existingComposioChildren(parent);
+    const restorable = children.filter((child) =>
+      child.status !== "archived" && asRecord(child.config).disabledByComposioParent === true,
+    );
+    if (restorable.length === 0) return;
+
+    let accounts: Awaited<ReturnType<ComposioClient["listConnectedAccounts"]>>["items"] = [];
+    try {
+      const client = await composioClientForParent(parent);
+      accounts = (await client.listConnectedAccounts({
+        userIds: [`paperclip:${parent.companyId}`],
+        limit: 1000,
+      })).items;
+    } catch {
+      // Fail closed while Composio is unavailable. A later resume or reconnect
+      // can retry without exposing a child whose account state is unknown.
+      return;
+    }
+
+    for (const child of restorable) {
+      const childConfig = composioChildConfig(child)!;
+      const account = childConfig.connectedAccountId
+        ? accounts.find((candidate) => candidate.id === childConfig.connectedAccountId)
+        : accounts.find((candidate) => candidate.toolkit.slug === childConfig.toolkitSlug);
+      const config = { ...asRecord(child.config) };
+      delete config.disabledByComposioParent;
+      const active = account?.status.toUpperCase() === "ACTIVE";
+      await db.update(toolConnections).set({
+        enabled: active,
+        config: active ? config : { ...config, disabledByComposioParent: true },
+        healthStatus: active ? "unchecked" : "degraded",
+        healthMessage: active
+          ? null
+          : `Composio reports the ${childConfig.toolkitSlug} connected account as ${account?.status.toUpperCase() ?? "MISSING"}. Reconnect it in Composio.`,
+        updatedAt: now(),
+      }).where(eq(toolConnections.id, child.id));
+    }
+  }
+
   async function syncComposioChild(
     parent: typeof toolConnections.$inferSelect,
     account: { id: string; status: string; toolkit: { slug: string } },
@@ -4426,6 +4517,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     const connection = await getConnectionRow(connectionId);
     try {
       if (connection.transport === "mcp_remote") {
+        await assertComposioConnectedAccountActive(connection);
         await remoteTools(connection);
       } else if (isComposioConnection(connection)) {
         await validateComposioConnection(connection);
@@ -7572,6 +7664,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .returning();
     await syncCredentialBindings(updated);
     const health = await checkConnectionHealth(updated.id, actor);
+    if (isComposioConnection(updated) && updated.enabled && updated.status === "active") {
+      await restoreComposioChildren(updated);
+    }
     const catalogBefore = await db
       .select({ id: toolCatalogEntries.id, riskLevel: toolCatalogEntries.riskLevel })
       .from(toolCatalogEntries)
@@ -8580,6 +8675,10 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       await ensureDefaultOrganizationGrant(row);
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
+      if (isComposioConnection(row) && (input.enabled !== undefined || input.status !== undefined)) {
+        if (!row.enabled || row.status !== "active") await disableComposioChildren(row);
+        else await restoreComposioChildren(row);
+      }
       return toConnection(row);
     },
 

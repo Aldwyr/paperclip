@@ -80,6 +80,11 @@ export function AppDetail() {
     queryFn: () => toolsApi.getConnection(connectionId),
     enabled: !!connectionId && !!activeTab,
   });
+  const connectionsQuery = useQuery({
+    queryKey: queryKeys.tools.connections(selectedCompanyId ?? "__none__"),
+    queryFn: () => toolsApi.listConnections(selectedCompanyId!),
+    enabled: !!selectedCompanyId && activeTab === "setup",
+  });
   const installsQuery = useQuery({
     queryKey: queryKeys.tools.connectionInstalls(connectionId),
     queryFn: () => toolsApi.getConnectionInstalls(connectionId),
@@ -138,6 +143,11 @@ export function AppDetail() {
   });
 
   const connection = connectionQuery.data;
+  const composioChildConnectionCount = (connectionsQuery.data?.connections ?? []).filter(
+    (candidate) => candidate.status !== "archived"
+      && candidate.config?.provider === "composio"
+      && candidate.config?.parentConnectionId === connectionId,
+  ).length;
   const logoEntry = useMemo(
     () => galleryEntryFor((galleryQuery.data?.apps ?? []) as AppGalleryDisplayEntry[], connection),
     [galleryQuery.data, connection],
@@ -435,7 +445,9 @@ export function AppDetail() {
   });
 
   const removeApp = useMutation({
-    mutationFn: () => toolsApi.archiveConnection(connectionId),
+    mutationFn: () => toolsApi.archiveConnection(connectionId, {
+      confirmComposioChildren: composioChildConnectionCount > 0,
+    }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.connections(selectedCompanyId!) });
       queryClient.invalidateQueries({ queryKey: queryKeys.tools.applications(selectedCompanyId!) });
@@ -651,6 +663,7 @@ export function AppDetail() {
             connection={connection}
             appName={appName}
             galleryEntry={logoEntry}
+            childConnectionCount={composioChildConnectionCount}
             removing={removeApp.isPending}
             onRemove={() => removeApp.mutate()}
             onReplaced={() => {

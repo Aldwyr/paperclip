@@ -1323,6 +1323,7 @@ export function toolAccessRoutes(
       existing.id,
       existing.companyId,
       getActorInfo(req),
+      { confirmComposioChildren: req.query.confirmComposioChildren === "true" },
     );
     const applicationAfter = await svc.getApplication(existing.applicationId);
     // The receipt is counts and outcomes only. Removal is a revocation boundary
