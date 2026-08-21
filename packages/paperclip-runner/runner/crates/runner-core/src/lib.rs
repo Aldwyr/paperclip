@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub mod claude_managed_provider;
 pub mod codex_provider;
 pub mod durable;
 pub mod fake_harness;
 pub mod local_runner;
 pub mod process_supervisor;
 pub mod provider_bridge;
+pub mod provider_events;
 pub mod replay;
 
 use std::error::Error;

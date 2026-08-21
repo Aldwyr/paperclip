@@ -150,6 +150,36 @@ function ProgressItem({
   );
 }
 
+function valueRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function ProviderActivity({ item, callbacks }: {
+  item: Extract<CapabilityThreadItem, { kind: "provider_activity" }>;
+  callbacks: ThreadCallbacks;
+}) {
+  const payload = valueRecord(item.payload);
+  const steps = Array.isArray(payload.steps) ? payload.steps.map(valueRecord) : [];
+  const children = Array.isArray(payload.children) ? payload.children.map(valueRecord) : [];
+  const sources = Array.isArray(payload.sources) ? payload.sources.map(valueRecord) : [];
+  const output = typeof payload.output === "string" ? payload.output : "";
+  const glyph = item.status === "running" ? "⏳" : item.status === "failed" ? "✕" : item.status === "interrupted" ? "■" : "✓";
+  return (
+    <details id={item.id} className="pit-activity-item pit-provider-activity" data-thread-item="provider_activity" data-family={item.family} data-status={item.status} open={item.status === "running"}>
+      <summary className="pit-activity-summary"><span className="pit-activity-glyph" aria-hidden="true">{glyph}</span><span className="pit-activity-operation">{item.title}</span><span className="pit-activity-description">{item.summary}</span><span className="pit-activity-caret" aria-hidden="true">›</span></summary>
+      <div className="pit-activity-detail">
+        {steps.length > 0 ? <ol className="pit-provider-plan">{steps.map((step, index) => <li key={String(step.stepId ?? index)} data-plan-status={String(step.status ?? "pending")}><span aria-hidden="true">{step.status === "completed" ? "✓" : step.status === "blocked" ? "!" : step.status === "in_progress" ? "◐" : "○"}</span>{String(step.body ?? "")}</li>)}</ol> : null}
+        {children.length > 0 ? <ul className="pit-provider-tree">{children.map((child, index) => <li key={String(child.childId ?? index)}><strong>{String(child.role ?? "Child agent")}</strong><span>{String(child.status ?? "unknown")}</span><small>{String(child.summary ?? "")}</small></li>)}</ul> : null}
+        {sources.length > 0 ? <ul className="pit-provider-sources">{sources.map((source, index) => { const url = typeof source.url === "string" && /^https?:\/\//.test(source.url) ? source.url : null; return <li key={String(source.sourceId ?? index)}>{url === null ? <span>{String(source.title ?? "Unavailable source")}</span> : <a href={url} target="_blank" rel="noreferrer">{String(source.title ?? url)}</a>}<small>Provider-reported</small></li>; })}</ul> : null}
+        {output.length > 0 ? <pre className="pit-provider-output" aria-label="Command output">{output}</pre> : null}
+        {item.family === "model_identity" ? <dl className="pit-provider-fields"><dt>Requested</dt><dd>{String(payload.requestedModel ?? "—")}</dd><dt>Effective</dt><dd>{String(payload.effectiveModel ?? "—")}</dd></dl> : null}
+        {item.family === "artifact" && typeof payload.reference === "string" ? <button type="button" className="pit-link-button">Open {payload.reference}</button> : null}
+        <button type="button" className="pit-link-button" onClick={() => callbacks.onOpenEvidence(item.evidenceRef.section, item.evidenceRef.recordId)}>View in Evidence</button>
+      </div>
+    </details>
+  );
+}
+
 function FileDiff({ diff }: { diff: string | null }) {
   if (diff === null) return <p className="pit-workspace-binary">Binary or oversized file; textual diff unavailable.</p>;
   return (
@@ -376,6 +406,9 @@ function ThreadItemView({
 
     case "workspace_file_reference":
       return <WorkspaceFileReference item={item} />;
+
+    case "provider_activity":
+      return <ProviderActivity item={item} callbacks={callbacks} />;
 
     case "denial":
       return (

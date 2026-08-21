@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::codex_provider::CodexProviderConfig;
+use crate::codex_provider::ProviderConfig;
 use crate::process_supervisor::SupervisedProcess;
 use crate::provider_bridge::{AuthorizedToolSet, ProviderToolBridge, ToolResult};
 
@@ -198,9 +198,17 @@ pub struct DurableRunnerState {
     #[serde(default)]
     pub provider_tool_bridge: ProviderToolBridge,
     #[serde(default, alias = "codexProviderConfig")]
-    pub provider_config: Option<CodexProviderConfig>,
+    pub provider_config: Option<ProviderConfig>,
     #[serde(default, alias = "codexProviderThreadId")]
     pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub provider_event_cursor: Option<String>,
+    #[serde(default)]
+    pub provider_usage_cumulative: Option<Value>,
+    #[serde(default)]
+    pub provider_usage_run_baseline: Option<Value>,
+    #[serde(default)]
+    pub provider_budget_ceiling_usd: Option<f64>,
 }
 
 impl DurableRunnerState {
@@ -238,6 +246,10 @@ impl DurableRunnerState {
             provider_tool_bridge: ProviderToolBridge::default(),
             provider_config: None,
             provider_session_id: None,
+            provider_event_cursor: None,
+            provider_usage_cumulative: None,
+            provider_usage_run_baseline: None,
+            provider_budget_ceiling_usd: None,
         }
     }
 
@@ -662,12 +674,18 @@ fn redaction_key(key: &str) -> bool {
         "output_tokens",
         "cachedinputtokens",
         "cached_input_tokens",
+        "cachereadtokens",
+        "cache_read_tokens",
+        "cachewritetokens",
+        "cache_write_tokens",
         "reasoningoutputtokens",
         "reasoning_output_tokens",
         "reasoningtokens",
         "reasoning_tokens",
         "cachewriteinputtokens",
         "cache_write_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
         "totaltokens",
         "total_tokens",
     ]
@@ -1190,7 +1208,7 @@ fn execute_command_effect(
                     })?;
             }
             if let Some(value) = payload.get("provider") {
-                let provider: CodexProviderConfig =
+                let provider: ProviderConfig =
                     serde_json::from_value(value.clone()).map_err(|error| {
                         DurableRunnerError::invalid(format!(
                             "run.prepare provider is invalid: {error}"
@@ -1201,6 +1219,11 @@ fn execute_command_effect(
                         return Err(DurableRunnerError::invalid(
                             "provider configuration changed across a durable session",
                         ));
+                    }
+                }
+                if state.provider_budget_ceiling_usd.is_none() {
+                    if let ProviderConfig::ClaudeManaged(managed) = &provider {
+                        state.provider_budget_ceiling_usd = Some(managed.max_session_list_cost_usd);
                     }
                 }
                 state.provider_config = Some(provider);
@@ -1249,6 +1272,7 @@ fn execute_command_effect(
                 turn_id: state.turn_id.clone(),
                 item_id: state.item_id.clone(),
             });
+            state.provider_usage_run_baseline = state.provider_usage_cumulative.clone();
             state.run_id = run_id;
             state.turn_id = turn_id;
             state.item_id = item_id;
@@ -1282,12 +1306,13 @@ fn execute_command_effect(
             enqueue_event(
                 state,
                 config,
-                "mcp_app.tool_result",
+                "semantic_tool.result",
                 0,
                 json!({ "semantic_tool": {
                     "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
                     "phase": "result", "operationId": result.operation_id,
                     "callId": result.call_id, "result": result.result,
+                    "isError": result.is_error,
                 }}),
                 Some(&item_id),
             )?;
@@ -1298,15 +1323,17 @@ fn execute_command_effect(
             ))
         }
         "session.open" => {
+            let event_type = if state.reconnect_count > 0 { "session.resumed" } else { "session.started" };
             enqueue_event(
                 state,
                 config,
-                "session.started",
+                event_type,
                 0,
                 json!({
                     "normalizedSessionId": state.normalized_session_id,
                     "driverSessionId": "driver_durable_runner_fake",
                     "resumed": state.reconnect_count > 0,
+                    "providerDescriptor": provider_descriptor(state.provider_config.as_ref(), None),
                 }),
                 None,
             )?;
@@ -1483,6 +1510,39 @@ fn execute_command_effect(
             1,
             "provider thread read requested".to_owned(),
         )),
+        "session.budget.increase" => {
+            let value = payload.get("maxSessionListCostUsd").and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| DurableRunnerError::invalid(
+                    "session.budget.increase payload.maxSessionListCostUsd must be positive",
+                ))?;
+            if state.active_turn && state.lifecycle != "waiting_input" {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    "session budget cannot change while a turn is active".to_owned(),
+                ));
+            }
+            Ok((
+                "completed".to_owned(),
+                1,
+                format!("remote session spend ceiling increase to {value:.2} USD authorized"),
+            ))
+        }
+        "session.destroy" => {
+            if state.active_turn {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    "remote session cannot be deleted while a turn is active".to_owned(),
+                ));
+            }
+            Ok((
+                "completed".to_owned(),
+                1,
+                "remote session deletion authorized".to_owned(),
+            ))
+        }
         "runner.drain" => {
             state.lifecycle = "draining".to_owned();
             enqueue_event(

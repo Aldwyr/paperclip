@@ -47,6 +47,8 @@ export interface CapabilityRunnerdProcessEvidence {
   runnerPid: number | null;
   runnerProcessGroupId: number | null;
   codexPid: number | null;
+  providerExecutionKind: "local_process" | "remote_service" | null;
+  providerService: "anthropic_managed_agents" | null;
   runnerExited: boolean;
   runnerExitCode: number | null;
   runnerSignal: NodeJS.Signals | null;
@@ -55,7 +57,16 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions {
-  provider?: "codex" | "opencode";
+  provider?: "codex" | "opencode" | "claude_managed";
+  managedProfile?: {
+    profileId: string;
+    anthropicAgentId: string;
+    agentVersion: string;
+    environmentId: string;
+    betaVersion: "managed-agents-2026-04-01";
+    maxSessionListCostUsd: number;
+    model: string;
+  };
   runnerBinary?: string;
   codexCommand?: string;
   codexArgs?: string[];
@@ -172,6 +183,30 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+export function rehydrateRunnerdUsageNotification(
+  rawParams: Record<string, unknown>,
+  openedThreadId: string,
+  activeTurnId: string,
+): Record<string, unknown> {
+  return {
+    ...rawParams,
+    // The normalized PRP usage event carries the provider session identity
+    // rather than replaying the provider's original threadId field. Rehydrate
+    // the Codex notification contract so the strict driver does not reject
+    // valid accounting as a cross-thread event.
+    threadId: typeof rawParams.threadId === "string"
+      ? rawParams.threadId
+      : typeof rawParams.providerSessionId === "string"
+        ? rawParams.providerSessionId
+        : openedThreadId,
+    turnId: typeof rawParams.turnId === "string" ? rawParams.turnId : activeTurnId,
+    tokenUsage: {
+      total: record(rawParams.cumulative),
+      runDelta: record(rawParams.runDelta),
+    },
+  };
+}
+
 function commandDigest(value: unknown): string {
   return `sha256:${createHash("sha256").update(durableRecoveryInternals.canonicalJson(value)).digest("hex")}`;
 }
@@ -192,15 +227,33 @@ function authorizedToolSet(tools: readonly Readonly<Record<string, unknown>>[]):
   };
 }
 
-function unwrapToolResponse(response: Record<string, unknown>): unknown {
+function createSanitizedClaudeManagedEnvironment(environment: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const source = environment ?? process.env;
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "RUST_BACKTRACE", "ANTHROPIC_API_KEY",
+  ]) {
+    if (typeof source[key] === "string") result[key] = source[key];
+  }
+  return result;
+}
+
+function unwrapToolResponse(response: Record<string, unknown>): Record<string, unknown> {
   const items = Array.isArray(response.contentItems) ? response.contentItems : [];
   const value = record(items[0]).text;
-  if (typeof value !== "string") return response;
+  let result: unknown = response;
   try {
-    return JSON.parse(value);
+    if (typeof value === "string") result = JSON.parse(value);
   } catch {
-    return response;
+    result = response;
   }
+  return {
+    __paperclipSemanticToolOutcome: true,
+    result,
+    isError: response.success === false,
+  };
 }
 
 class DurablePrpCodexTransport implements CodexAppServerTransport {
@@ -236,10 +289,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerPid: null,
       runnerProcessGroupId: null,
       codexPid: null,
+      providerExecutionKind: null,
+      providerService: null,
       runnerExited: false,
       runnerExitCode: null,
       runnerSignal: null,
-      childEnvironmentKeys: Object.keys(createSanitizedCodexEnvironment(options.environment)).sort(),
+      childEnvironmentKeys: Object.keys(
+        options.provider === "claude_managed"
+          ? createSanitizedClaudeManagedEnvironment(options.environment)
+          : createSanitizedCodexEnvironment(options.environment),
+      ).sort(),
       diagnostics: ["lab transport selected authenticated durable PRP"],
     };
   }
@@ -261,6 +320,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (method === "thread/read") {
       if (this.#core === null) await this.#resume();
       return this.#commandResult("provider.thread.read", {});
+    }
+    if (method === "session/budget/increase") {
+      await this.#command("session.budget.increase", params);
+      return {};
+    }
+    if (method === "session/destroy") {
+      await this.#command("session.destroy", params);
+      return {};
     }
     if (method === "thread/resume") return { thread: { id: this.#threadId, sessionId: this.#sessionId } };
     throw new Error(`PRP Codex transport does not expose provider method ${method}`);
@@ -375,9 +442,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const opencodeProxyPath = this.options.opencodeProxyPath
       ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
     this.#authorizedTools = authorizedToolSet(dynamicTools);
+    const managed = this.options.managedProfile;
+    if (provider === "claude_managed" && managed === undefined) {
+      throw new Error("Claude Agent runner transport requires a managed profile snapshot");
+    }
     core.queueCommand("run.prepare", {
       authorizedTools: this.#authorizedTools,
-      provider: {
+      provider: provider === "claude_managed" ? {
+        kind: "claude_managed",
+        model: managed!.model,
+        profileId: managed!.profileId,
+        anthropicAgentId: managed!.anthropicAgentId,
+        agentVersion: managed!.agentVersion,
+        environmentId: managed!.environmentId,
+        betaVersion: managed!.betaVersion,
+        maxSessionListCostUsd: managed!.maxSessionListCostUsd,
+      } : {
         kind: provider,
         command: provider === "opencode" ? process.execPath : this.options.codexCommand ?? "codex",
         args: provider === "opencode" ? [opencodeProxyPath] : this.options.codexArgs ?? createIsolatedCodexAppServerArgs(this.options.environment),
@@ -412,7 +492,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             PAPERCLIP_RUN_ID: identity.runId,
             PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
           }
-        : this.options.environment,
+        : provider === "claude_managed"
+          ? createSanitizedClaudeManagedEnvironment(this.options.environment)
+          : this.options.environment,
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -429,7 +511,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         id: this.#threadId,
         sessionId: this.#sessionId,
         model: params.model,
-        modelProvider: provider === "opencode" && typeof params.model === "string"
+        modelProvider: provider === "claude_managed"
+          ? "anthropic"
+          : provider === "opencode" && typeof params.model === "string"
           ? params.model.split("/", 1)[0]
           : "openai",
       },
@@ -476,6 +560,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       maxRuntimeMs: 60 * 60 * 1_000,
       lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath: this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
+      environment: this.options.provider === "claude_managed"
+        ? createSanitizedClaudeManagedEnvironment(this.options.environment)
+        : this.options.environment,
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -564,7 +651,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     while (Date.now() < deadline) {
       this.#throwIfFailed();
       this.#pumpEvents();
-      if (this.#threadId.length > 0 && this.#evidence.codexPid !== null) return;
+      if (
+        this.#threadId.length > 0
+        && (this.#evidence.providerExecutionKind === "remote_service" || this.#evidence.codexPid !== null)
+      ) return;
       if (this.#handle?.child.exitCode !== null) throw new Error("runnerd exited before provider startup");
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
@@ -592,26 +682,65 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const events = this.#core?.store.state.committedEvents ?? [];
     while (this.#eventIndex < events.length) {
       const event = events[this.#eventIndex++];
-      if (event.eventType === "provider.started") {
+      if (event.eventType === "harness.ready") {
         const started = record(record(event.envelope.payload).payload);
-        const pid = started.pid;
+        const runtimeIdentity = record(started.runtimeIdentity);
+        const descriptor = record(started.providerDescriptor);
+        // Older durable snapshots serialized the enum fields in snake_case;
+        // the provider descriptor is the canonical fallback during recovery.
+        const pid = runtimeIdentity.processId ?? runtimeIdentity.process_id ?? descriptor.processId ?? started.pid;
         const threadId = started.threadId;
         const sessionId = started.sessionId;
         if (typeof pid === "number") {
           this.#evidence.codexPid = pid;
+        }
+        if (runtimeIdentity.executionKind === "local_process" || runtimeIdentity.executionKind === "remote_service") {
+          this.#evidence.providerExecutionKind = runtimeIdentity.executionKind;
+        }
+        if (runtimeIdentity.service === "anthropic_managed_agents") {
+          this.#evidence.providerService = "anthropic_managed_agents";
         }
         if (typeof threadId === "string") this.#threadId = threadId;
         if (typeof sessionId === "string") this.#sessionId = sessionId;
         this.#publish();
         continue;
       }
-      if (event.eventType !== "provider.event" && event.eventType !== "turn.completed") continue;
-      const notifications = unwrapRunnerdProviderNotifications(record(event.envelope.payload).payload);
+      const eventPayload = record(event.envelope.payload).payload;
+      const sessionUpdatePayload = record(eventPayload);
+      const canonicalMethod = ({
+        "turn.started": "turn/started",
+        "item.started": "item/started",
+        "item.delta": "item/agentMessage/delta",
+        "item.completed": "item/completed",
+        "turn.completed": "turn/completed",
+        "turn.failed": "turn/completed",
+        "turn.interrupted": "turn/completed",
+        "turn.cancelled": "turn/completed",
+        "usage.reported": "thread/tokenUsage/updated",
+        "session.updated": sessionUpdatePayload.status === "budget_reached"
+          ? "provider/budgetReached"
+          : "provider/sessionUpdated",
+      } as Record<string, string>)[event.eventType];
+      const notifications = event.eventType === "provider.event"
+        ? unwrapRunnerdProviderNotifications(eventPayload)
+        : canonicalMethod
+          ? [{ method: canonicalMethod, params: record(eventPayload) }]
+          : [];
       for (const payload of notifications) {
         const method = payload.method;
         if (typeof method !== "string") continue;
-        const params = record(payload.params);
-        const providerTurnId = params.turnId ?? record(params.turn).id;
+        const rawParams = record(payload.params);
+        const params = method === "thread/tokenUsage/updated"
+          ? rehydrateRunnerdUsageNotification(rawParams, this.#threadId, this.#turnId)
+          : method === "turn/started" || method === "turn/completed"
+            ? { ...rawParams, turnId: record(rawParams.turn).id ?? rawParams.turnId }
+            : rawParams;
+        if (params.turnId === undefined && typeof event.envelope.turnId === "string") {
+          params.turnId = event.envelope.turnId;
+        }
+        const providerTurnId = method === "turn/started" || method === "turn/completed"
+          ? record(params.turn).id ?? params.turnId
+          : params.turnId ?? record(params.turn).id;
         if (typeof providerTurnId === "string" && providerTurnId.length > 0) {
           this.#turnId = providerTurnId;
         }

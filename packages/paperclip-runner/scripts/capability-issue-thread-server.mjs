@@ -204,14 +204,29 @@ class RouteError extends Error {
 
 function harnessConfiguration(source, fallbackModel) {
   const provider = source.provider === undefined ? "codex" : String(source.provider).trim();
-  if (provider !== "codex" && provider !== "opencode") {
-    throw new RouteError(400, "invalid_provider", "Provider must be codex or opencode.");
+  if (provider !== "codex" && provider !== "opencode" && provider !== "claude_managed") {
+    throw new RouteError(400, "invalid_provider", "Provider must be codex, opencode, or claude_managed.");
   }
   const rawModel = source.model === undefined ? fallbackModel : source.model;
   const model = rawModel === undefined || rawModel === null ? "" : String(rawModel).trim();
   if (model.length > 256) throw new RouteError(400, "invalid_model", "Model is too long.");
   if (provider === "opencode" && (!model || !model.includes("/"))) {
     throw new RouteError(400, "invalid_model", "OpenCode requires a provider/model value.");
+  }
+  if (provider === "claude_managed" && !model) {
+    throw new RouteError(400, "invalid_model", "Claude Agent requires a model value.");
+  }
+  const managedProfileId = source.managedProfileId === undefined || source.managedProfileId === null
+    ? "default"
+    : String(source.managedProfileId).trim();
+  const maxSessionListCostUsd = source.maxSessionListCostUsd === undefined || source.maxSessionListCostUsd === null
+    ? 1
+    : Number(source.maxSessionListCostUsd);
+  if (provider === "claude_managed" && !managedProfileId) {
+    throw new RouteError(400, "invalid_managed_profile", "Claude Agent requires a qualified profile ID.");
+  }
+  if (provider === "claude_managed" && (!Number.isFinite(maxSessionListCostUsd) || maxSessionListCostUsd <= 0)) {
+    throw new RouteError(400, "invalid_spend_cap", "Claude Agent requires a positive session spend ceiling.");
   }
   const suppliedLifecycle = source.lifecyclePolicy && typeof source.lifecyclePolicy === "object"
     ? source.lifecyclePolicy
@@ -235,7 +250,38 @@ function harnessConfiguration(source, fallbackModel) {
     }
     lifecyclePolicy = { mode: "warm", idleTimeoutMs };
   }
-  return { provider, model: model || null, lifecyclePolicy };
+  return {
+    provider,
+    model: model || null,
+    ...(provider === "claude_managed" ? { managedProfileId, maxSessionListCostUsd } : {}),
+    lifecyclePolicy,
+  };
+}
+
+function resolveManagedProfile(configuration) {
+  if (configuration.provider !== "claude_managed") return undefined;
+  const profileId = process.env.PAPERCLIP_CLAUDE_MANAGED_PROFILE_ID?.trim() || configuration.managedProfileId;
+  if (profileId !== configuration.managedProfileId) {
+    throw new RouteError(400, "managed_profile_not_found", "The selected Claude Agent profile is not configured on this Runner Lab server.");
+  }
+  const anthropicAgentId = process.env.ANTHROPIC_MANAGED_AGENT_ID?.trim();
+  const agentVersion = process.env.ANTHROPIC_MANAGED_AGENT_VERSION?.trim();
+  const environmentId = process.env.ANTHROPIC_MANAGED_ENVIRONMENT_ID?.trim();
+  if (!process.env.ANTHROPIC_API_KEY || !anthropicAgentId || !agentVersion || !environmentId) {
+    throw new RouteError(
+      503,
+      "managed_profile_unavailable",
+      "The selected Claude Agent profile is not fully configured on this Runner Lab server.",
+    );
+  }
+  return {
+    profileId,
+    anthropicAgentId,
+    agentVersion,
+    environmentId,
+    betaVersion: "managed-agents-2026-04-01",
+    maxSessionListCostUsd: configuration.maxSessionListCostUsd,
+  };
 }
 
 export function createCapabilityIssueThreadMiddleware(options = {}) {
@@ -307,7 +353,9 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
   function liveView(runner, entry) {
     const snapshot = entry.session.snapshot();
     const provider = snapshot.config.provider ?? "codex";
-    const expectedAgentLabel = provider === "opencode" ? "Real OpenCode" : "Real Codex";
+    const expectedAgentLabel = provider === "claude_managed"
+      ? "Claude Agent"
+      : provider === "opencode" ? "Real OpenCode" : "Real Codex";
     const projected = view(runner, entry);
     if (
       projected.mode !== "live"
@@ -413,6 +461,9 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
       session = await service.create({
         ...input,
         provider: configuration.provider,
+        ...(configuration.provider === "claude_managed"
+          ? { managedProfile: resolveManagedProfile(configuration) }
+          : {}),
         lifecyclePolicy: configuration.lifecyclePolicy,
         ...(configuration.model === null ? {} : { requestedModel: configuration.model }),
       });
@@ -442,12 +493,18 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
     const configuration = {
       provider: snapshot.config.provider ?? "codex",
       model: snapshot.config.requestedModel ?? null,
+      ...(snapshot.config.managedProfile === undefined ? {} : {
+        managedProfileId: snapshot.config.managedProfile.profileId,
+        maxSessionListCostUsd: snapshot.config.managedProfile.maxSessionListCostUsd,
+      }),
       lifecyclePolicy: snapshot.config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
     };
     if (
       entry.configuration !== undefined
       && (entry.configuration.provider !== configuration.provider
         || entry.configuration.model !== configuration.model
+        || entry.configuration.managedProfileId !== configuration.managedProfileId
+        || entry.configuration.maxSessionListCostUsd !== configuration.maxSessionListCostUsd
         || JSON.stringify(entry.configuration.lifecyclePolicy) !== JSON.stringify(configuration.lifecyclePolicy))
     ) {
       throw new RouteError(
@@ -612,6 +669,8 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
       const requestedHarness = harnessConfiguration({
         provider: body.provider ?? url.searchParams.get("provider") ?? undefined,
         model: body.model ?? url.searchParams.get("model") ?? undefined,
+        managedProfileId: body.managedProfileId ?? url.searchParams.get("managedProfileId") ?? undefined,
+        maxSessionListCostUsd: body.maxSessionListCostUsd ?? url.searchParams.get("maxSessionListCostUsd") ?? undefined,
         lifecyclePolicy: body.lifecyclePolicy,
         lifecycleMode: body.lifecycleMode ?? url.searchParams.get("lifecycleMode") ?? undefined,
         idleTimeoutMs: body.idleTimeoutMs ?? url.searchParams.get("idleTimeoutMs") ?? undefined,
@@ -836,6 +895,21 @@ export function createCapabilityIssueThreadMiddleware(options = {}) {
         return;
       } else if (route === "interrupt") {
         await entry.session.interrupt("operator stopped the turn");
+      } else if (route === "managed-budget") {
+        const nextCap = Number(body.maxSessionListCostUsd);
+        if (!Number.isFinite(nextCap) || nextCap <= 0) {
+          throw new RouteError(400, "invalid_spend_cap", "The new managed-session spend ceiling must be positive.");
+        }
+        await entry.session.increaseManagedSessionBudget(nextCap);
+        if (entry.configuration) entry.configuration.maxSessionListCostUsd = nextCap;
+      } else if (route === "managed-session-delete") {
+        if (body.confirm !== true) {
+          throw new RouteError(400, "confirmation_required", "Remote session deletion requires explicit confirmation.");
+        }
+        await entry.session.deleteManagedRemoteSession();
+        await retire(service, entry.session.id, "remote managed session explicitly deleted");
+        send(response, 200, { deleted: true, sessionId: entry.session.id });
+        return;
       } else if (route === "reconnect") {
         entry.connection = { state: "reconnecting", attempt: entry.connection.attempt + 1 };
         await entry.session.reconnect();

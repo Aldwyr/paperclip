@@ -44,6 +44,10 @@ import {
 import type { NativeUserMessage } from "../../contracts/types.js";
 import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
 import {
+  canonicalProviderEventsFromCodex,
+  providerFamilyCapabilities,
+} from "../../provider-events.js";
+import {
   ProcessCodexAppServerTransport,
   createSanitizedCodexEnvironment,
   isCodexMethodUnavailable,
@@ -357,6 +361,22 @@ export class CodexAppServerDriver implements HarnessDriver {
       capabilities: {
         resume: this.#caps.resume,
         typedEvents: true,
+        typedEventFamilies: providerFamilyCapabilities({
+          plan: "available",
+          tool_execution: "available",
+          research: "available",
+          delegation: "available",
+          model_identity: "available",
+          context: "available",
+          artifact: "policy_disabled",
+          review: "available",
+          hook: "available",
+          memory: "available",
+          safety: "available",
+          terminal: "available",
+          wait: "available",
+          provider_notice: "available",
+        }),
         steering: this.#caps.steering,
         interruption: this.#caps.interruption,
         structuredResult: true,
@@ -1159,6 +1179,17 @@ class CodexHarnessSession implements HarnessSession {
     const threadId = text(params.threadId);
     const turnId = text(params.turnId, text(turn.id));
     const itemId = text(item.id, text(params.itemId));
+    if (
+      (threadId.length === 0 || threadId === this.#opened.threadId) &&
+      (turnId.length === 0 || this.#activeTurnId === null || turnId === this.#activeTurnId)
+    ) {
+      for (const canonical of canonicalProviderEventsFromCodex(notification.method, params)) {
+        this.#emit(canonical.eventType, canonical.payload, {
+          turnId: turnId || undefined,
+          itemId: canonical.itemId,
+        });
+      }
+    }
     if (notification.method === "error" || notification.method === "warning" || notification.method === "configWarning") {
       this.#emit("harness.diagnostic", {
         code: notification.method.replaceAll("/", "_"),
@@ -2100,6 +2131,15 @@ function isBoundCodexNotification(method: string): boolean {
     method === "error" ||
     method === "warning" ||
     method === "configWarning" ||
+    method === "guardianWarning" ||
+    method === "deprecationNotice" ||
+    method === "windows/worldWritableWarning" ||
+    method === "hook/started" ||
+    method === "hook/completed" ||
+    method === "thread/compacted" ||
+    method === "model/rerouted" ||
+    method === "model/verification" ||
+    method === "model/safetyBuffering/updated" ||
     method.startsWith("item/") ||
     method === "turn/diff/updated" ||
     method === "turn/plan/updated"

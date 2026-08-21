@@ -32,14 +32,15 @@ pub fn run_durable_runner(
     };
     if recovered {
         if let Some(runtime) = provider.as_ref() {
+            let descriptor = provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
             enqueue_event(
                 &mut state,
                 &config,
-                "provider.started",
+                "harness.ready",
                 0,
                 json!({
-                    "provider": match runtime.kind() { crate::codex_provider::ProviderKind::Codex => "codex", crate::codex_provider::ProviderKind::Opencode => "opencode" },
-                    "pid": runtime.process_id(),
+                    "providerDescriptor": descriptor,
+                    "runtimeIdentity": runtime.runtime_identity(),
                     "threadId": runtime.session_identity(),
                     "sessionId": runtime.provider_session_id(),
                     "resumed": true,
@@ -82,7 +83,9 @@ pub fn run_durable_runner(
         if started.elapsed() >= config.max_runtime && !state.active_turn {
             state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
             state.lifecycle = "recoverable_failure".to_owned();
-            state.record_diagnostic("transport reconnect deadline exceeded before a safe rotation could flush");
+            state.record_diagnostic(
+                "transport reconnect deadline exceeded before a safe rotation could flush",
+            );
             store.save(&state)?;
             return Err(DurableRunnerError::invalid(
                 "transport reconnect deadline exceeded; durable state is preserved",
@@ -240,7 +243,13 @@ pub fn run_durable_runner(
                 )?;
             }
             if should_suspend_for_idle(&state)? {
-                begin_automatic_suspend(&mut state, &store, &config, &mut provider, "idle_timeout")?;
+                begin_automatic_suspend(
+                    &mut state,
+                    &store,
+                    &config,
+                    &mut provider,
+                    "idle_timeout",
+                )?;
             }
             if provider.is_some() {
                 send_outbox(&mut client, &state, &mut sent_source_seq)?;
@@ -248,7 +257,9 @@ pub fn run_durable_runner(
             if (state.stop_after_flush || state.lifecycle == "revoked") && state.outbox.is_empty() {
                 if let Some(mut runtime) = provider.take() {
                     runtime.shutdown().map_err(|error| {
-                        DurableRunnerError::invalid(format!("failed to stop provider during durable exit: {error}"))
+                        DurableRunnerError::invalid(format!(
+                            "failed to stop provider during durable exit: {error}"
+                        ))
                     })?;
                 }
                 state.lifecycle = if state.lifecycle == "revoked" {
@@ -336,7 +347,9 @@ pub fn run_durable_runner(
                                     state.last_activity_at_unix_ms = current_unix_ms()?;
                                     let delivery = client
                                         .send_json(&command_result_envelope(&state, &processed))
-                                        .and_then(|()| send_outbox(&mut client, &state, &mut sent_source_seq));
+                                        .and_then(|()| {
+                                            send_outbox(&mut client, &state, &mut sent_source_seq)
+                                        });
                                     if let Err(error) = delivery {
                                         state.record_diagnostic(error.to_string());
                                         if state.lifecycle == "revoked" {
@@ -385,7 +398,9 @@ pub fn run_durable_runner(
                             // only the still-unacknowledged suffix once as part of the bounded
                             // revoke drain, rather than on every transport poll.
                             sent_source_seq = state.acked_source_seq;
-                            if let Err(error) = send_outbox(&mut client, &state, &mut sent_source_seq) {
+                            if let Err(error) =
+                                send_outbox(&mut client, &state, &mut sent_source_seq)
+                            {
                                 state.record_diagnostic(error.to_string());
                                 store.save(&state)?;
                                 connection_lease_token.take();
@@ -452,18 +467,90 @@ fn start_configured_provider(
         .authorized_tools()
         .cloned()
         .collect::<Vec<_>>();
-    crate::codex_provider::CodexProvider::start(
-        &provider_config,
-        tools.into_iter(),
-        resume_thread_id.as_deref(),
-    )
-    .map(|provider| {
-        state.provider_session_id = Some(provider.thread_id().to_owned());
-        Some(Box::new(provider) as Box<dyn crate::codex_provider::Provider>)
-    })
-    .map_err(|error| {
-        DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
-    })
+    let runtime: Box<dyn crate::codex_provider::Provider> = match provider_config {
+        crate::codex_provider::ProviderConfig::Local(local) => Box::new(
+            crate::codex_provider::CodexProvider::start(
+                &local,
+                tools.into_iter(),
+                resume_thread_id.as_deref(),
+            )
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("failed to start local provider: {error}"))
+            })?,
+        ),
+        crate::codex_provider::ProviderConfig::ClaudeManaged(mut managed) => Box::new(
+            {
+                if let Some(value) = state.provider_budget_ceiling_usd {
+                    managed.max_session_list_cost_usd = value;
+                }
+                crate::claude_managed_provider::ClaudeManagedProvider::start(
+                    &managed,
+                    tools,
+                    resume_thread_id.as_deref(),
+                    state.provider_event_cursor.as_deref(),
+                    state.provider_usage_cumulative.as_ref()
+                        .and_then(|value| value.get("requests"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to start Claude Agent provider: {error}"
+                    ))
+                })?
+            },
+        ),
+    };
+    state.provider_session_id = Some(runtime.session_identity().to_owned());
+    Ok(Some(runtime))
+}
+
+fn provider_kind_name(kind: crate::codex_provider::ProviderKind) -> &'static str {
+    match kind {
+        crate::codex_provider::ProviderKind::Codex => "codex",
+        crate::codex_provider::ProviderKind::Opencode => "opencode",
+        crate::codex_provider::ProviderKind::ClaudeManaged => "claude_managed",
+    }
+}
+
+fn provider_descriptor(
+    config: Option<&crate::codex_provider::ProviderConfig>,
+    runtime: Option<&dyn crate::codex_provider::Provider>,
+) -> Value {
+    let runtime_identity = runtime.map(|value| value.runtime_identity());
+    match config {
+        Some(crate::codex_provider::ProviderConfig::ClaudeManaged(value)) => json!({
+            "provider": "claude_managed",
+            "driver": "claude_managed_agents_api",
+            "model": value.model,
+            "executionKind": "remote_service",
+            "providerVersion": value.agent_version,
+            "service": "anthropic_managed_agents",
+            "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
+            "processId": Value::Null,
+        }),
+        Some(crate::codex_provider::ProviderConfig::Local(value)) => json!({
+            "provider": provider_kind_name(value.kind),
+            "driver": if value.kind == crate::codex_provider::ProviderKind::Opencode { "opencode_server" } else { "codex_app_server" },
+            "model": value.model,
+            "executionKind": "local_process",
+            "providerVersion": if value.kind == crate::codex_provider::ProviderKind::Opencode { "1.18.17" } else { "unqualified" },
+            "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
+            "processId": match runtime_identity {
+                Some(crate::codex_provider::ProviderRuntimeIdentity::LocalProcess { process_id, .. }) => Some(process_id),
+                _ => None,
+            },
+        }),
+        None => json!({
+            "provider": "codex",
+            "driver": "codex_app_server",
+            "model": Value::Null,
+            "executionKind": "local_process",
+            "providerVersion": "unqualified",
+            "providerSessionId": Value::Null,
+            "processId": Value::Null,
+        }),
+    }
 }
 
 fn process_command_and_provider(
@@ -478,23 +565,62 @@ fn process_command_and_provider(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let fresh = !state.processed_commands.contains_key(command_id);
+    let before = state.clone();
     let processed = process_command(state, store, config, command)?;
     if !fresh || processed.status != "completed" {
+        if !fresh
+            && processed.status == "completed"
+            && command.get("type").and_then(Value::as_str) == Some("semantic_tool.result")
+            && provider.as_ref().is_some_and(|runtime| runtime.kind() == crate::codex_provider::ProviderKind::ClaudeManaged)
+        {
+            let result: crate::provider_bridge::ToolResult = serde_json::from_value(command["payload"].clone())
+                .map_err(|error| DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}")))?;
+            provider.as_mut().expect("checked above").deliver_tool_result(&result)
+                .map_err(|error| DurableRunnerError::invalid(format!("failed to reconcile Claude Agent tool result: {error}")))?;
+        }
         return Ok(processed);
     }
     match command.get("type").and_then(Value::as_str) {
         Some("run.prepare") => {
             if provider.is_none() {
-                *provider = start_configured_provider(state)?;
+                *provider = match start_configured_provider(state) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        *state = before;
+                        state.lifecycle = "recoverable_failure".to_owned();
+                        state.recoverable_failure = Some(detail.clone());
+                        state.record_diagnostic(detail.clone());
+                        let mut failed = processed;
+                        failed.status = "failed".to_owned();
+                        failed.logical_effect_count = 0;
+                        failed.result = sanitize_value(&json!({
+                            "commandId": failed.command_id.clone(),
+                            "controllerSeq": failed.controller_seq,
+                            "status": "failed",
+                            "logicalEffectCount": 0,
+                            "detail": detail,
+                        }));
+                        state.last_controller_command_seq = failed.controller_seq;
+                        state.processed_commands.insert(
+                            failed.command_id.clone(),
+                            failed.clone(),
+                        );
+                        compact_processed_commands(state)?;
+                        store.save(state)?;
+                        return Ok(failed);
+                    }
+                };
                 if let Some(runtime) = provider.as_ref() {
+                    let descriptor = provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
                     enqueue_event(
                         state,
                         config,
-                        "provider.started",
+                        "harness.ready",
                         0,
                         json!({
-                            "provider": match runtime.kind() { crate::codex_provider::ProviderKind::Codex => "codex", crate::codex_provider::ProviderKind::Opencode => "opencode" },
-                            "pid": runtime.process_id(),
+                            "providerDescriptor": descriptor,
+                            "runtimeIdentity": runtime.runtime_identity(),
                             "threadId": runtime.session_identity(),
                             "sessionId": runtime.provider_session_id(),
                             "resumed": state.reconnect_count > 0,
@@ -520,13 +646,30 @@ fn process_command_and_provider(
             let cwd = state
                 .provider_config
                 .as_ref()
-                .map(|value| value.cwd.as_str())
+                .and_then(|value| value.local_cwd())
                 .unwrap_or(".");
-            runtime.start_turn(text, cwd).map_err(|error| {
-                DurableRunnerError::invalid(format!("Codex turn.start failed: {error}"))
+            let turn_id = state.turn_id.clone();
+            runtime.start_turn(text, cwd, &turn_id).map_err(|error| {
+                DurableRunnerError::invalid(format!("provider turn.start failed: {error}"))
             })?;
         }
-        Some("run.attach") => {}
+        Some("run.attach") => {
+            if let Some(runtime) = provider.as_mut() {
+                runtime
+                    .configure_tools(
+                        state
+                            .provider_tool_bridge
+                            .authorized_tools()
+                            .cloned()
+                            .collect(),
+                    )
+                    .map_err(|error| {
+                        *state = before;
+                        let _ = store.save(state);
+                        DurableRunnerError::invalid(format!("failed to replace provider tools: {error}"))
+                    })?;
+            }
+        }
         Some("semantic_tool.result") => {
             let result: crate::provider_bridge::ToolResult =
                 serde_json::from_value(command["payload"].clone()).map_err(|error| {
@@ -540,7 +683,7 @@ fn process_command_and_provider(
                 .deliver_tool_result(&result)
                 .map_err(|error| {
                     DurableRunnerError::invalid(format!(
-                        "failed to return tool result to Codex: {error}"
+                        "failed to return tool result to provider: {error}"
                     ))
                 })?;
         }
@@ -556,7 +699,7 @@ fn process_command_and_provider(
                 .ok_or_else(|| DurableRunnerError::invalid("turn.interrupt requires a provider"))?
                 .interrupt_turn(turn_id)
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("Codex turn.interrupt failed: {error}"))
+                    DurableRunnerError::invalid(format!("provider turn.interrupt failed: {error}"))
                 })?;
         }
         Some("provider.thread.read") => {
@@ -567,7 +710,7 @@ fn process_command_and_provider(
                 })?
                 .read()
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("Codex thread/read failed: {error}"))
+                    DurableRunnerError::invalid(format!("provider session read failed: {error}"))
                 })?;
             enqueue_event(
                 state,
@@ -579,11 +722,68 @@ fn process_command_and_provider(
             )?;
             store.save(state)?;
         }
+        Some("session.budget.increase") => {
+            let value = command.pointer("/payload/maxSessionListCostUsd").and_then(Value::as_f64)
+                .ok_or_else(|| DurableRunnerError::invalid(
+                    "session.budget.increase payload.maxSessionListCostUsd is required",
+                ))?;
+            provider.as_mut()
+                .ok_or_else(|| DurableRunnerError::invalid("session budget increase requires a provider"))?
+                .increase_budget(value)
+                .map_err(|error| {
+                    *state = before.clone();
+                    let _ = store.save(state);
+                    DurableRunnerError::invalid(format!("failed to increase remote session budget: {error}"))
+                })?;
+            enqueue_event(
+                state,
+                config,
+                "session.updated",
+                0,
+                json!({
+                    "update": "budget_increased",
+                    "maxSessionListCostUsd": value,
+                }),
+                None,
+            )?;
+            state.provider_budget_ceiling_usd = Some(value);
+            state.lifecycle = if state.active_turn {
+                "active".to_owned()
+            } else {
+                "warm_idle".to_owned()
+            };
+            store.save(state)?;
+        }
+        Some("session.destroy") => {
+            let mut runtime = provider.take()
+                .ok_or_else(|| DurableRunnerError::invalid("session.destroy requires a provider"))?;
+            if let Err(error) = runtime.destroy_session() {
+                *provider = Some(runtime);
+                *state = before;
+                let _ = store.save(state);
+                return Err(DurableRunnerError::invalid(format!(
+                    "failed to delete remote provider session: {error}"
+                )));
+            }
+            state.provider_session_id = None;
+            state.provider_event_cursor = None;
+            state.lifecycle = "stopped".to_owned();
+            state.stop_after_flush = true;
+            enqueue_event(
+                state,
+                config,
+                "session.closed",
+                0,
+                json!({ "remoteDeleted": true, "resumable": false }),
+                None,
+            )?;
+            store.save(state)?;
+        }
         Some("runner.shutdown") | Some("runner.suspend") => {
             if let Some(mut runtime) = provider.take() {
                 runtime.shutdown().map_err(|error| {
                     DurableRunnerError::invalid(format!(
-                        "failed to stop Codex provider during runner shutdown: {error}"
+                        "failed to stop provider during runner shutdown: {error}"
                     ))
                 })?;
             }
@@ -610,12 +810,12 @@ fn poll_provider(
                 let detail = error.to_string();
                 persist_provider_failure(state, store, &detail)?;
                 return Err(DurableRunnerError::invalid(format!(
-                    "Codex provider failed: {detail}"
+                    "provider failed: {detail}"
                 )));
             }
         };
         match event {
-            crate::codex_provider::CodexProviderEvent::ToolCall {
+            crate::codex_provider::ProviderEvent::ToolCall {
                 call_id,
                 operation_id,
                 input,
@@ -630,7 +830,7 @@ fn poll_provider(
                 enqueue_event(
                     state,
                     config,
-                    "mcp_app.tool_input",
+                    "semantic_tool.input",
                     0,
                     json!({
                         "semantic_tool": {
@@ -643,28 +843,69 @@ fn poll_provider(
                 )?;
                 store.save(state)?;
             }
-            crate::codex_provider::CodexProviderEvent::Notification { method, params } => {
+            crate::codex_provider::ProviderEvent::Notification { method, params } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
-                let event_type = if method == "turn/completed" {
-                    "turn.completed"
-                } else {
-                    "provider.event"
+                for (canonical_type, canonical_payload, canonical_item_id) in
+                    crate::provider_events::canonical_provider_events(&method, &params)
+                {
+                    enqueue_event(
+                        state,
+                        config,
+                        &canonical_type,
+                        if canonical_type.ends_with("completed") {
+                            1
+                        } else {
+                            2
+                        },
+                        canonical_payload,
+                        Some(&canonical_item_id),
+                    )?;
+                }
+                let event_type = match method.as_str() {
+                    "turn/started" => "turn.started",
+                    "turn/completed" => match params.pointer("/turn/status").and_then(Value::as_str) {
+                        Some("failed") => "turn.failed",
+                        Some("interrupted") => "turn.interrupted",
+                        Some("cancelled" | "canceled") => "turn.cancelled",
+                        _ => "turn.completed",
+                    },
+                    "item/started" => "item.started",
+                    "item/delta" => "item.delta",
+                    "item/completed" => "item.completed",
+                    "thread/tokenUsage/updated" => "usage.reported",
+                    "provider/budgetReached" => "session.updated",
+                    _ => "harness.diagnostic",
                 };
                 // Streaming deltas and startup chatter are intentionally coalescible,
                 // but terminal items and accounting must survive pressure intact.
                 let priority = match method.as_str() {
                     "turn/completed" | "thread/tokenUsage/updated" => 0,
-                    "item/completed" => 1,
+                    "turn/started" | "item/completed" => 1,
                     _ => 2,
                 };
-                enqueue_event(
-                    state,
-                    config,
-                    event_type,
-                    priority,
-                    json!({"method": method, "params": params}),
-                    Some(&state.item_id.clone()),
-                )?;
+                let payload = if method == "thread/tokenUsage/updated" {
+                    let cumulative = normalized_usage_measurement(&params);
+                    let baseline = state.provider_usage_run_baseline.as_ref().map(normalized_usage_measurement)
+                        .unwrap_or_else(empty_usage_measurement);
+                    let run_delta = usage_delta(&cumulative, &baseline);
+                    state.provider_usage_cumulative = Some(cumulative.clone());
+                    json!({
+                        "provider": provider_kind_name(runtime.kind()),
+                        "model": state.provider_config.as_ref().and_then(provider_model),
+                        "providerSessionId": runtime.provider_session_id(),
+                        "providerRequestId": params.get("request_id").or_else(|| params.get("requestId")).and_then(Value::as_str),
+                        "cumulative": cumulative,
+                        "runDelta": run_delta,
+                    })
+                } else if matches!(method.as_str(), "turn/started" | "item/started" | "item/delta" | "item/completed" | "turn/completed" | "provider/budgetReached") {
+                    params.clone()
+                } else {
+                    json!({ "providerMethod": method, "detail": "provider event was not part of the normalized public contract" })
+                };
+                enqueue_event(state, config, event_type, priority, payload, Some(&state.item_id.clone()))?;
+                if method == "provider/budgetReached" {
+                    state.lifecycle = "waiting_input".to_owned();
+                }
                 if method == "turn/completed" {
                     state.active_turn = false;
                     if state.lifecycle_mode == "warm" {
@@ -684,10 +925,7 @@ fn poll_provider(
                 }
                 store.save(state)?;
             }
-            crate::codex_provider::CodexProviderEvent::SemanticResult {
-                result,
-                item_id,
-            } => {
+            crate::codex_provider::ProviderEvent::SemanticResult { result, item_id } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
                 enqueue_event(
                     state,
@@ -699,22 +937,101 @@ fn poll_provider(
                 )?;
                 store.save(state)?;
             }
-            crate::codex_provider::CodexProviderEvent::Exited => {
-                persist_provider_failure(state, store, "Codex provider exited unexpectedly")?;
+            crate::codex_provider::ProviderEvent::Exited => {
+                persist_provider_failure(state, store, "local provider exited unexpectedly")?;
                 return Err(DurableRunnerError::invalid(
-                    "native_runner_process_exited: Codex provider exited unexpectedly",
+                    "native_runner_process_exited: local provider exited unexpectedly",
                 ));
             }
         }
+        if let Some(cursor) = runtime.durable_event_cursor() {
+            state.provider_event_cursor = Some(cursor.to_owned());
+            store.save(state)?;
+        }
     }
     Ok(())
+}
+
+fn provider_model(config: &crate::codex_provider::ProviderConfig) -> Option<&str> {
+    match config {
+        crate::codex_provider::ProviderConfig::Local(value) => value.model.as_deref(),
+        crate::codex_provider::ProviderConfig::ClaudeManaged(value) => Some(value.model.as_str()),
+    }
+}
+
+fn empty_usage_measurement() -> Value {
+    json!({
+        "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0,
+        "cacheWriteTokens": 0, "reasoningTokens": 0, "activeSeconds": 0.0, "requests": 0,
+        "providerCostUsd": 0.0,
+    })
+}
+
+fn usage_number(value: &Value, snake: &str, camel: &str) -> f64 {
+    value.get(snake).or_else(|| value.get(camel)).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn normalized_usage_measurement(value: &Value) -> Value {
+    let usage = value.get("usage")
+        .or_else(|| value.pointer("/tokenUsage/total"))
+        .or_else(|| value.get("tokenUsage"))
+        .unwrap_or(value);
+    let cost = usage.get("list_cost").or_else(|| usage.get("listCost"));
+    // Managed Agents reports list cost as an integer number of US cents.
+    // Local providers already publish providerCostUsd as dollars.
+    let provider_cost = cost.and_then(|value| value.get("amount")).and_then(|value| {
+        value.as_f64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    }).map(|cents| cents / 100.0)
+        .unwrap_or_else(|| {
+            let normalized = usage_number(usage, "provider_cost_usd", "providerCostUsd");
+            if normalized > 0.0 { normalized } else { usage_number(usage, "cost_usd", "costUsd") }
+        });
+    let cache_creation = usage.get("cache_creation").or_else(|| usage.get("cacheCreation"));
+    let cache_write_tokens = usage_number(usage, "cache_creation_input_tokens", "cacheWriteTokens")
+        + cache_creation.map(|value| {
+            usage_number(value, "ephemeral_5m_input_tokens", "ephemeral5mInputTokens")
+                + usage_number(value, "ephemeral_1h_input_tokens", "ephemeral1hInputTokens")
+        }).unwrap_or(0.0);
+    json!({
+        "inputTokens": usage_number(usage, "input_tokens", "inputTokens") as u64,
+        "outputTokens": usage_number(usage, "output_tokens", "outputTokens") as u64,
+        "cacheReadTokens": ({
+            let normalized = usage_number(usage, "cache_read_input_tokens", "cacheReadTokens");
+            if normalized > 0.0 { normalized } else { usage_number(usage, "cached_input_tokens", "cachedInputTokens") }
+        } as u64),
+        "cacheWriteTokens": cache_write_tokens as u64,
+        "reasoningTokens": usage_number(usage, "reasoning_tokens", "reasoningTokens") as u64,
+        "activeSeconds": usage_number(usage, "active_seconds", "activeSeconds"),
+        "requests": usage_number(usage, "requests", "requestCount") as u64,
+        "providerCostUsd": provider_cost,
+    })
+}
+
+fn usage_delta(cumulative: &Value, baseline: &Value) -> Value {
+    let integer_delta = |field: &str| cumulative.get(field).and_then(Value::as_u64).unwrap_or(0)
+        .saturating_sub(baseline.get(field).and_then(Value::as_u64).unwrap_or(0));
+    let number_delta = |field: &str| (cumulative.get(field).and_then(Value::as_f64).unwrap_or(0.0)
+        - baseline.get(field).and_then(Value::as_f64).unwrap_or(0.0)).max(0.0);
+    json!({
+        "inputTokens": integer_delta("inputTokens"),
+        "outputTokens": integer_delta("outputTokens"),
+        "cacheReadTokens": integer_delta("cacheReadTokens"),
+        "cacheWriteTokens": integer_delta("cacheWriteTokens"),
+        "reasoningTokens": integer_delta("reasoningTokens"),
+        "activeSeconds": number_delta("activeSeconds"),
+        "requests": integer_delta("requests"),
+        "providerCostUsd": number_delta("providerCostUsd"),
+    })
 }
 
 fn should_suspend_for_idle(state: &DurableRunnerState) -> Result<bool, DurableRunnerError> {
     should_suspend_for_idle_at(state, current_unix_ms()?)
 }
 
-fn should_suspend_for_idle_at(state: &DurableRunnerState, now_unix_ms: u64) -> Result<bool, DurableRunnerError> {
+fn should_suspend_for_idle_at(
+    state: &DurableRunnerState,
+    now_unix_ms: u64,
+) -> Result<bool, DurableRunnerError> {
     if state.lifecycle_mode != "warm"
         || state.stop_after_flush
         || !matches!(state.lifecycle.as_str(), "warm_idle" | "waiting_input")
@@ -739,7 +1056,9 @@ fn begin_automatic_suspend(
     }
     if let Some(mut runtime) = provider.take() {
         runtime.shutdown().map_err(|error| {
-            DurableRunnerError::invalid(format!("failed to checkpoint provider for suspension: {error}"))
+            DurableRunnerError::invalid(format!(
+                "failed to checkpoint provider for suspension: {error}"
+            ))
         })?;
     }
     state.lifecycle = "suspending".to_owned();
@@ -766,6 +1085,8 @@ fn begin_automatic_suspend(
 fn provider_failure_code(detail: &str) -> &'static str {
     if detail.contains("stdout frame exceeded") || detail.contains("provider_frame_too_large") {
         "provider_frame_too_large"
+    } else if detail.contains("terminated and cannot be resumed") {
+        "provider_session_terminated"
     } else {
         "provider_transport_failed"
     }
@@ -778,7 +1099,11 @@ fn persist_provider_failure(
 ) -> Result<(), DurableRunnerError> {
     let code = provider_failure_code(detail);
     state.recoverable_failure = Some(code.to_owned());
-    state.lifecycle = "recoverable_failure".to_owned();
+    state.lifecycle = if code == "provider_session_terminated" {
+        "terminated".to_owned()
+    } else {
+        "recoverable_failure".to_owned()
+    };
     state.record_diagnostic(format!("{code}: {detail}"));
     store.save(state)
 }
@@ -786,7 +1111,7 @@ fn persist_provider_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_provider::{CodexProviderEvent, Provider, ProviderKind};
+    use crate::codex_provider::{ProviderEvent, Provider, ProviderKind};
     use crate::local_runner::LocalRunnerError;
     use crate::provider_bridge::ToolResult;
     use std::net::TcpListener;
@@ -800,8 +1125,11 @@ mod tests {
         fn kind(&self) -> ProviderKind {
             ProviderKind::Codex
         }
-        fn process_id(&self) -> u32 {
-            1
+        fn runtime_identity(&self) -> crate::codex_provider::ProviderRuntimeIdentity {
+            crate::codex_provider::ProviderRuntimeIdentity::LocalProcess {
+                process_id: 1,
+                provider_session_id: "oversized".to_owned(),
+            }
         }
         fn session_identity(&self) -> &str {
             "test-thread"
@@ -809,7 +1137,7 @@ mod tests {
         fn provider_session_id(&self) -> Option<&str> {
             Some("test-session")
         }
-        fn start_turn(&mut self, _message: &str, _cwd: &str) -> Result<Value, LocalRunnerError> {
+        fn start_turn(&mut self, _message: &str, _cwd: &str, _turn_id: &str) -> Result<Value, LocalRunnerError> {
             unreachable!()
         }
         fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
@@ -818,7 +1146,7 @@ mod tests {
         fn read(&mut self) -> Result<Value, LocalRunnerError> {
             unreachable!()
         }
-        fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
             Err(LocalRunnerError::invalid(
                 "harness stdout frame exceeded 4194304 bytes",
             ))
@@ -834,11 +1162,43 @@ mod tests {
     #[test]
     fn usage_counts_remain_observable_while_credential_tokens_are_redacted() {
         let sanitized = crate::durable::sanitize_value(&json!({
-            "tokenUsage": { "total": { "inputTokens": 12, "outputTokens": 3 } },
+            "tokenUsage": { "total": {
+                "inputTokens": 12, "outputTokens": 3,
+                "cacheReadTokens": 0, "cacheWriteTokens": 5
+            } },
             "accessToken": "secret-value",
         }));
-        assert_eq!(sanitized.pointer("/tokenUsage/total/inputTokens"), Some(&json!(12)));
-        assert_eq!(sanitized.pointer("/accessToken"), Some(&json!("[REDACTED]")));
+        assert_eq!(
+            sanitized.pointer("/tokenUsage/total/inputTokens"),
+            Some(&json!(12))
+        );
+        assert_eq!(
+            sanitized.pointer("/tokenUsage/total/cacheReadTokens"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            sanitized.pointer("/tokenUsage/total/cacheWriteTokens"),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            sanitized.pointer("/accessToken"),
+            Some(&json!("[REDACTED]"))
+        );
+        assert_eq!(
+            normalized_usage_measurement(&json!({
+                "tokenUsage": { "total": {
+                    "inputTokens": 12, "outputTokens": 3,
+                    "cachedInputTokens": 7, "reasoningTokens": 2,
+                    "costUsd": 0.004
+                }}
+            })),
+            json!({
+                "inputTokens": 12, "outputTokens": 3, "cacheReadTokens": 7,
+                "cacheWriteTokens": 0, "reasoningTokens": 2,
+                "activeSeconds": 0.0, "requests": 0,
+                "providerCostUsd": 0.004
+            })
+        );
     }
 
     #[test]
@@ -851,7 +1211,10 @@ mod tests {
             }
         }));
         assert_eq!(sanitized.pointer("/item/id"), Some(&json!("image-1")));
-        assert_eq!(sanitized.pointer("/item/artifactPath"), Some(&json!("/tmp/frog.png")));
+        assert_eq!(
+            sanitized.pointer("/item/artifactPath"),
+            Some(&json!("/tmp/frog.png"))
+        );
         assert_eq!(
             sanitized.pointer("/item/imageUrl").and_then(Value::as_str),
             Some("[OMITTED data URL: 1200022 bytes]")
@@ -861,8 +1224,14 @@ mod tests {
 
     #[test]
     fn provider_failure_codes_are_stable() {
-        assert_eq!(provider_failure_code("harness stdout frame exceeded 4194304 bytes"), "provider_frame_too_large");
-        assert_eq!(provider_failure_code("invalid JSON-RPC"), "provider_transport_failed");
+        assert_eq!(
+            provider_failure_code("harness stdout frame exceeded 4194304 bytes"),
+            "provider_frame_too_large"
+        );
+        assert_eq!(
+            provider_failure_code("invalid JSON-RPC"),
+            "provider_transport_failed"
+        );
     }
 
     #[test]
@@ -886,7 +1255,7 @@ mod tests {
             state.lifecycle = lifecycle.to_owned();
             assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
         }
-        state.lifecycle = "warm_idle".to_owned();
+            state.lifecycle = "active".to_owned();
         state.stop_after_flush = true;
         assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
         let _ = fs::remove_dir_all(root);
@@ -901,7 +1270,9 @@ mod tests {
         let mut provider: Option<Box<dyn Provider>> = Some(Box::new(OversizedFrameProvider));
 
         let error = poll_provider(&mut provider, &mut state, &store, &runner_config).unwrap_err();
-        assert!(error.to_string().contains("stdout frame exceeded 4194304 bytes"));
+        assert!(error
+            .to_string()
+            .contains("stdout frame exceeded 4194304 bytes"));
         let (restored, recovered) = store.load_or_create(&runner_config).unwrap();
         assert!(recovered);
         assert_eq!(restored.lifecycle, "recoverable_failure");
@@ -950,14 +1321,23 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("providerConfig");
         object.remove("providerSessionId");
-        object.insert("codexProviderConfig".to_owned(), json!({
-            "command": "codex", "args": ["app-server"], "cwd": "/tmp",
-            "model": null, "instructions": "legacy"
-        }));
+        object.insert(
+            "codexProviderConfig".to_owned(),
+            json!({
+                "command": "codex", "args": ["app-server"], "cwd": "/tmp",
+                "model": null, "instructions": "legacy"
+            }),
+        );
         object.insert("codexProviderThreadId".to_owned(), json!("thread-legacy"));
         let restored: DurableRunnerState = serde_json::from_value(value).unwrap();
-        assert_eq!(restored.provider_config.unwrap().kind, crate::codex_provider::ProviderKind::Codex);
-        assert_eq!(restored.provider_session_id.as_deref(), Some("thread-legacy"));
+        assert_eq!(
+            restored.provider_config.unwrap().kind(),
+            crate::codex_provider::ProviderKind::Codex
+        );
+        assert_eq!(
+            restored.provider_session_id.as_deref(),
+            Some("thread-legacy")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1099,6 +1479,56 @@ mod tests {
             )
         )
         .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_bootstrap_failure_returns_a_failed_prepare_result() {
+        let root = temporary_root("provider-bootstrap-failure");
+        let config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let value = command(
+            "command_prepare_missing_provider",
+            1,
+            "run.prepare",
+            json!({
+                "provider": {
+                    "kind": "codex",
+                    "command": root.join("definitely-not-a-provider"),
+                    "args": [],
+                    "cwd": root,
+                    "model": null,
+                    "instructions": "test"
+                }
+            }),
+        );
+        let processed = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut None,
+            &value,
+        )
+        .unwrap();
+        assert_eq!(processed.status, "failed");
+        assert_eq!(processed.logical_effect_count, 0);
+        assert!(processed.result["detail"]
+            .as_str()
+            .unwrap()
+            .contains("failed to start local provider"));
+        assert_eq!(state.lifecycle, "recoverable_failure");
+        assert_eq!(state.last_controller_command_seq, 1);
+        assert!(state.outbox.is_empty());
+        let replay = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut None,
+            &value,
+        )
+        .unwrap();
+        assert_eq!(replay.status, "failed");
         let _ = fs::remove_dir_all(root);
     }
 

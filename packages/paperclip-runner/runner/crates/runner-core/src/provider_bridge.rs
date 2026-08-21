@@ -42,6 +42,8 @@ pub struct ToolResult {
     pub call_id: String,
     pub operation_id: String,
     pub result: Value,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -129,6 +131,18 @@ impl ProviderToolBridge {
                     tool.operation_id
                 )));
             }
+            jsonschema::validator_for(&tool.input_schema).map_err(|_| {
+                ProviderBridgeError::invalid(format!(
+                    "tool {} has an invalid input JSON Schema",
+                    tool.operation_id
+                ))
+            })?;
+            jsonschema::validator_for(&tool.response_schema).map_err(|_| {
+                ProviderBridgeError::invalid(format!(
+                    "tool {} has an invalid response JSON Schema",
+                    tool.operation_id
+                ))
+            })?;
             if !names.insert(tool.operation_id.clone()) {
                 return Err(ProviderBridgeError::invalid(
                     "authorized tool names must be unique",
@@ -166,9 +180,19 @@ impl ProviderToolBridge {
         if call_id.is_empty() || call_id.len() > 160 {
             return Err(ProviderBridgeError::invalid("tool call id is invalid"));
         }
-        if !self.authorized.contains_key(&operation_id) {
-            return Err(ProviderBridgeError::invalid(format!(
+        let authorized = self.authorized.get(&operation_id).ok_or_else(|| {
+            ProviderBridgeError::invalid(format!(
                 "provider requested unauthorized tool {operation_id}"
+            ))
+        })?;
+        let validator = jsonschema::validator_for(&authorized.input_schema).map_err(|_| {
+            ProviderBridgeError::invalid(format!(
+                "tool {operation_id} has an invalid durable input JSON Schema"
+            ))
+        })?;
+        if !validator.is_valid(&input) {
+            return Err(ProviderBridgeError::invalid(format!(
+                "provider arguments for {operation_id} failed JSON Schema validation"
             )));
         }
         let call = PendingToolCall {
@@ -212,6 +236,30 @@ impl ProviderToolBridge {
                 "tool result operation does not match its call",
             ));
         }
+        let authorized = self.authorized.get(&result.operation_id).ok_or_else(|| {
+            ProviderBridgeError::invalid("tool result operation is no longer authorized")
+        })?;
+        let validator = jsonschema::validator_for(&authorized.response_schema).map_err(|_| {
+            ProviderBridgeError::invalid(format!(
+                "tool {} has an invalid durable response JSON Schema",
+                result.operation_id
+            ))
+        })?;
+        if !result.is_error {
+            // Paperclip semantic dispatchers return an authoritative envelope;
+            // provider contracts describe the operation-specific value inside
+            // `result`. Direct values remain valid for compatibility with v1
+            // peers that do not wrap their semantic result.
+            let response = semantic_response_value(&result)?;
+            if let Some(response) = response {
+                if !validator.is_valid(response) {
+                    return Err(ProviderBridgeError::invalid(format!(
+                        "tool result for {} failed JSON Schema validation",
+                        result.operation_id
+                    )));
+                }
+            }
+        }
         self.pending.remove(&result.call_id);
         self.completed
             .insert(result.call_id.clone(), result.clone());
@@ -220,6 +268,36 @@ impl ProviderToolBridge {
 
     pub fn pending_calls(&self) -> impl Iterator<Item = &PendingToolCall> {
         self.pending.values()
+    }
+}
+
+fn semantic_response_value(result: &ToolResult) -> Result<Option<&Value>, ProviderBridgeError> {
+    let Some(envelope) = result.result.as_object() else {
+        return Ok(Some(&result.result));
+    };
+    let Some(ok) = envelope.get("ok").and_then(Value::as_bool) else {
+        return Ok(Some(&result.result));
+    };
+    if !envelope.contains_key("operationId") && !envelope.contains_key("callId") {
+        return Ok(Some(&result.result));
+    }
+    if envelope.get("operationId").and_then(Value::as_str) != Some(&result.operation_id)
+        || envelope.get("callId").and_then(Value::as_str) != Some(&result.call_id)
+    {
+        return Err(ProviderBridgeError::invalid(
+            "semantic result envelope does not match its provider call",
+        ));
+    }
+    if ok {
+        envelope.get("result").map(Some).ok_or_else(|| {
+            ProviderBridgeError::invalid("successful semantic result omitted result")
+        })
+    } else if envelope.get("denial").is_some() || envelope.get("error").is_some() {
+        Ok(None)
+    } else {
+        Err(ProviderBridgeError::invalid(
+            "failed semantic result omitted denial or error",
+        ))
     }
 }
 
@@ -275,6 +353,7 @@ mod tests {
                 call_id: "call-1".to_owned(),
                 operation_id: "get_task_context".to_owned(),
                 result: json!({"ok": true}),
+                is_error: false,
             })
             .unwrap();
         assert_eq!(value, json!({"ok": true}));
@@ -299,6 +378,7 @@ mod tests {
             call_id: "call-1".to_owned(),
             operation_id: "get_task_context".to_owned(),
             result: json!({"ok": true}),
+            is_error: false,
         };
         bridge.apply_result(result.clone()).unwrap();
         bridge.apply_result(result).unwrap();
@@ -306,7 +386,8 @@ mod tests {
             .apply_result(ToolResult {
                 call_id: "call-1".to_owned(),
                 operation_id: "get_task_context".to_owned(),
-                result: json!({"ok": false})
+                result: json!({"ok": false}),
+                is_error: false,
             })
             .is_err());
     }
@@ -319,5 +400,36 @@ mod tests {
         let encoded = serde_json::to_string(&bridge).unwrap();
         let recovered: ProviderToolBridge = serde_json::from_str(&encoded).unwrap();
         assert_eq!(recovered, bridge);
+    }
+
+    #[test]
+    fn validates_the_operation_value_inside_a_semantic_dispatch_envelope() {
+        let mut set = tools("sha256:catalog-a");
+        set.operations[0].response_schema = json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        let mut bridge = ProviderToolBridge::default();
+        bridge.prepare(set).unwrap();
+        bridge
+            .begin_call("call-1".into(), "get_task_context".into(), json!({}))
+            .unwrap();
+        bridge
+            .apply_result(ToolResult {
+                call_id: "call-1".into(),
+                operation_id: "get_task_context".into(),
+                result: json!({
+                    "ok": true,
+                    "operationId": "get_task_context",
+                    "callId": "call-1",
+                    "result": { "value": "accepted" },
+                    "stateRevision": 2
+                }),
+                is_error: false,
+            })
+            .unwrap();
+        assert_eq!(bridge.pending_calls().count(), 0);
     }
 }

@@ -91,6 +91,39 @@ describe("NativeExecutionInputV1", () => {
     expect(parseNativeExecutionInput(legacy).provider).toEqual({ kind: "codex", model: null });
   });
 
+  it("accepts an immutable Claude Managed Agent profile and rejects driver or beta drift", () => {
+    const claudeManaged = {
+      ...input,
+      session: { ...input.session, driverKind: "claude_managed_agents_api" },
+      provider: {
+        kind: "claude_managed",
+        model: "claude-sonnet-5",
+        managedProfile: {
+          profileId: "managed-profile-1",
+          anthropicAgentId: "agent_01",
+          agentVersion: "3",
+          environmentId: "environment_01",
+          betaVersion: "managed-agents-2026-04-01",
+        },
+        maxSessionListCostUsd: 1,
+      },
+    } as const;
+    const parsed = parseNativeExecutionInput(claudeManaged);
+    expect(parsed.provider).toEqual(claudeManaged.provider);
+    expect(buildNativeModelEnvelope(parsed).workspace).toBeNull();
+    expect(() => parseNativeExecutionInput({
+      ...claudeManaged,
+      session: { ...claudeManaged.session, driverKind: "codex_app_server" },
+    })).toThrow("does not match");
+    expect(() => parseNativeExecutionInput({
+      ...claudeManaged,
+      provider: {
+        ...claudeManaged.provider,
+        managedProfile: { ...claudeManaged.provider.managedProfile, betaVersion: "future-beta" },
+      },
+    })).toThrow("betaVersion");
+  });
+
   it("defaults legacy lifecycle state to per-turn and validates warm timeouts", () => {
     const legacy = structuredClone(input) as Record<string, unknown>;
     delete (legacy.session as Record<string, unknown>).lifecyclePolicy;

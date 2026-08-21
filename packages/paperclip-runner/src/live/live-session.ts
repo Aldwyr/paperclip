@@ -8,6 +8,7 @@ import type {
 } from "../drivers/codex/app-server-transport.js";
 import { redactCodexDiagnostic } from "../drivers/codex/app-server-transport.js";
 import { createSkilllessCodexThreadConfig } from "../drivers/codex/codex-app-server-driver.js";
+import { canonicalProviderEventsFromCodex } from "../provider-events.js";
 import type {
   CapabilityFixtureInteraction,
   CapabilityFixtureSeed,
@@ -109,9 +110,17 @@ export interface CapabilityLiveSessionConfigSnapshot {
   /** Exact model requested by the caller; omitted only for legacy interactive sessions. */
   requestedModel?: string;
   /** Safe harness identity used by server-side projections and eval metadata. */
-  provider?: "codex" | "opencode";
-  driver?: "codex_app_server" | "opencode_server";
+  provider?: "codex" | "opencode" | "claude_managed";
+  driver?: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
   providerVersion?: string | null;
+  managedProfile?: {
+    profileId: string;
+    anthropicAgentId: string;
+    agentVersion: string;
+    environmentId: string;
+    betaVersion: "managed-agents-2026-04-01";
+    maxSessionListCostUsd: number;
+  };
   scenario: CapabilitySemanticScenarioPolicy;
   capabilities: string[];
   explicitClaims: string[];
@@ -233,8 +242,9 @@ export interface CapabilityLiveSessionSnapshot {
 export interface CreateCapabilityLiveSessionInput {
   seed?: CapabilityFixtureSeed | CapabilityFixtureState;
   workingDirectory?: string;
-  provider?: "codex" | "opencode";
+  provider?: "codex" | "opencode" | "claude_managed";
   requestedModel?: string;
+  managedProfile?: CapabilityLiveSessionConfigSnapshot["managedProfile"];
   scenario?: CapabilitySemanticScenarioPolicy;
   capabilities?: string[];
   explicitClaims?: string[];
@@ -447,12 +457,15 @@ export function assertCapabilityLiveSessionSnapshot(
   if (
     persistedProvider !== undefined &&
     persistedProvider !== "codex" &&
-    persistedProvider !== "opencode"
+    persistedProvider !== "opencode" &&
+    persistedProvider !== "claude_managed"
   ) {
     throw new Error("capability_live_checkpoint_corrupt: invalid config.provider");
   }
   const provider = persistedProvider ?? "codex";
-  const expectedDriver = provider === "opencode" ? "opencode_server" : "codex_app_server";
+  const expectedDriver = provider === "opencode"
+    ? "opencode_server"
+    : provider === "claude_managed" ? "claude_managed_agents_api" : "codex_app_server";
   if (config.driver !== undefined && config.driver !== expectedDriver) {
     throw new Error("capability_live_checkpoint_corrupt: provider/driver mismatch");
   }
@@ -467,8 +480,22 @@ export function assertCapabilityLiveSessionSnapshot(
     if (provider === "opencode" && !requestedModel.includes("/")) {
       throw new Error("capability_live_checkpoint_corrupt: invalid OpenCode model");
     }
-  } else if (provider === "opencode") {
-    throw new Error("capability_live_checkpoint_corrupt: missing OpenCode model");
+  } else if (provider === "opencode" || provider === "claude_managed") {
+    throw new Error(`capability_live_checkpoint_corrupt: missing ${provider === "opencode" ? "OpenCode" : "Claude Agent"} model`);
+  }
+  if (provider === "claude_managed") {
+    const profile = record(config.managedProfile);
+    for (const field of ["profileId", "anthropicAgentId", "agentVersion", "environmentId"] as const) {
+      if (text(profile[field]).trim().length === 0) {
+        throw new Error(`capability_live_checkpoint_corrupt: missing managedProfile.${field}`);
+      }
+    }
+    if (profile.betaVersion !== "managed-agents-2026-04-01") {
+      throw new Error("capability_live_checkpoint_corrupt: invalid Managed Agents beta version");
+    }
+    if (typeof profile.maxSessionListCostUsd !== "number" || profile.maxSessionListCostUsd <= 0) {
+      throw new Error("capability_live_checkpoint_corrupt: invalid managed session spend ceiling");
+    }
   }
   if (
     config.providerVersion !== undefined &&
@@ -704,8 +731,13 @@ export class CapabilityLiveSessionService {
       config: {
         workingDirectory: input.workingDirectory ?? process.cwd(),
         provider: input.provider ?? "codex",
-        driver: input.provider === "opencode" ? "opencode_server" : "codex_app_server",
-        providerVersion: input.provider === "opencode" ? "1.18.17" : null,
+        driver: input.provider === "opencode"
+          ? "opencode_server"
+          : input.provider === "claude_managed" ? "claude_managed_agents_api" : "codex_app_server",
+        providerVersion: input.provider === "opencode"
+          ? "1.18.17"
+          : input.provider === "claude_managed" ? "managed-agents-2026-04-01" : null,
+        ...(input.managedProfile === undefined ? {} : { managedProfile: structuredClone(input.managedProfile) }),
         ...(input.requestedModel === undefined
           ? {}
           : { requestedModel: requireNonEmpty(input.requestedModel, "requested_model") }),
@@ -848,6 +880,7 @@ export class CapabilityLiveSessionService {
       seed: seedPort.snapshot(),
       workingDirectory: config.workingDirectory,
       provider: config.provider ?? "codex",
+      ...(config.managedProfile === undefined ? {} : { managedProfile: config.managedProfile }),
       ...(config.requestedModel === undefined ? {} : { requestedModel: config.requestedModel }),
       scenario: config.scenario,
       capabilities: config.capabilities,
@@ -1492,6 +1525,44 @@ export class CapabilityLiveSession {
     return this.snapshot();
   }
 
+  async increaseManagedSessionBudget(maxSessionListCostUsd: number): Promise<CapabilityLiveSessionSnapshot> {
+    if (this.#config.provider !== "claude_managed" || this.#transport === null) {
+      throw new Error("managed session budget updates require a connected Claude Agent session");
+    }
+    if (!Number.isFinite(maxSessionListCostUsd) || maxSessionListCostUsd <= 0) {
+      throw new Error("managed session spend ceiling must be positive");
+    }
+    await this.#transport.request("session/budget/increase", { maxSessionListCostUsd });
+    if (this.#config.managedProfile) this.#config.managedProfile.maxSessionListCostUsd = maxSessionListCostUsd;
+    this.#status = this.#activeTurnId === null ? "warm_idle" : "running";
+    this.#appendEvidence("session", this.#activeTurnId, {
+      action: "budget_increased",
+      maxSessionListCostUsd,
+    });
+    await this.#persist();
+    return this.snapshot();
+  }
+
+  async deleteManagedRemoteSession(): Promise<CapabilityLiveSessionSnapshot> {
+    if (this.#config.provider !== "claude_managed" || this.#transport === null) {
+      throw new Error("remote session deletion requires a connected Claude Agent session");
+    }
+    if (this.#activeTurnId !== null) {
+      throw new Error("interrupt the active turn before deleting the remote session");
+    }
+    await this.#transport.request("session/destroy", {});
+    this.#providerSessionId = null;
+    this.#authority.active = false;
+    this.#status = "closed";
+    this.#appendEvidence("cleanup", null, {
+      reason: "remote session explicitly deleted",
+      remoteDeleted: true,
+      resumable: false,
+    });
+    await this.#persist();
+    return this.snapshot();
+  }
+
   async resolveInteraction(input: CapabilityInteractionResolution): Promise<CapabilityLiveTurnResult> {
     const interaction = pendingInteractions(this.#port).find(
       (candidate) => candidate.id === input.interactionId,
@@ -1582,6 +1653,12 @@ export class CapabilityLiveSession {
     const transportBundle = this.#transportFactory({
       ...this.#transportOptions,
       provider: this.#config.provider ?? this.#transportOptions.provider ?? "codex",
+      ...(this.#config.provider === "claude_managed" && this.#config.managedProfile ? {
+        managedProfile: {
+          ...this.#config.managedProfile,
+          model: this.#config.requestedModel ?? "claude-sonnet-5",
+        },
+      } : {}),
       lifecyclePolicy: this.#config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
       stateDirectory: resolve(this.#config.workingDirectory, ".paperclip-runner-prp", identityDigest),
       prpIdentity: {
@@ -1901,6 +1978,13 @@ export class CapabilityLiveSession {
     const item = record(params.item);
     const turnId = text(params.turnId, text(turn.id));
     const providerEvent = capabilityProviderEventCategory(notification.method, params);
+    for (const canonical of canonicalProviderEventsFromCodex(notification.method, params)) {
+      this.#appendEvidence("provider_event", turnId || this.#activeTurnId, {
+        canonicalEventType: canonical.eventType,
+        itemId: canonical.itemId,
+        payload: canonical.payload,
+      });
+    }
     if (notification.method === "thread/tokenUsage/updated") {
       const tokenUsage = record(params.tokenUsage);
       this.#latestCumulativeUsage = record(
@@ -1941,7 +2025,14 @@ export class CapabilityLiveSession {
         }
       }
     }
-    if (notification.method === "turn/started") {
+    if (notification.method === "provider/budgetReached") {
+      this.#status = "waiting_input";
+      this.#appendEvidence("session", turnId || this.#activeTurnId, {
+        action: "budget_reached",
+        stopReason: "provider_quota",
+      });
+      this.#emit({ turnId: turnId || this.#activeTurnId, kind: "activity", reason: "provider_budget_reached" });
+    } else if (notification.method === "turn/started") {
       if (turnId.length > 0) this.#activeTurnId = turnId;
       this.#emit({ turnId: turnId || this.#activeTurnId, kind: "activity", reason: "turn_started" });
     } else if (notification.method === "item/agentMessage/delta") {

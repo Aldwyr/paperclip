@@ -11,7 +11,8 @@
     "moduleResolution": "Bundler",
     "rootDir": ".",
     "types": [
-      "vite/client"
+      "vite/client",
+      "node"
     ],
     "baseUrl": ".",
     "paths": {

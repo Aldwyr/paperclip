@@ -165,6 +165,45 @@ describe("Capability public issue-thread DTO", () => {
     expect(JSON.stringify(published)).not.toContain(PROVIDER_THREAD);
     expect(published.evidence.runner[0]!.detail).toContain("[withheld]");
   });
+
+  it("publishes semantic provider fields through a family allowlist and tails output", () => {
+    const view = projectedView();
+    view.turns[0]!.items.push({
+      kind: "provider_activity",
+      id: "provider-exec-1",
+      at: "2026-08-10T00:00:01.500Z",
+      family: "tool_execution",
+      eventType: "tool.execution.completed",
+      status: "completed",
+      title: "Run",
+      summary: "Tests passed",
+      payload: {
+        schema: "paperclip.tool.execution.v1",
+        executionId: "exec-1",
+        transport: "process",
+        operation: "execute",
+        status: "completed",
+        output: `prefix-${"x".repeat(9_000)}`,
+        outputBytes: 9_007,
+        outputTruncated: true,
+        outputDigest: "sha256:fixture",
+        nativePayload: CANARY,
+        stdin: "must-not-ship",
+      },
+      evidenceRef: { section: "runner", recordId: "evidence-000001" },
+    });
+
+    const published = toCapabilityPublicThreadView(view);
+    const item = published.turns[0]!.items.find((entry) => entry.kind === "provider_activity");
+    expect(item?.kind).toBe("provider_activity");
+    if (item?.kind !== "provider_activity") throw new Error("expected provider activity");
+    const payload = item.payload as Record<string, unknown>;
+    expect(String(payload.output)).toHaveLength(8 * 1024);
+    expect(payload.outputBytes).toBe(9_007);
+    expect(JSON.stringify(payload)).not.toContain(CANARY);
+    expect(payload).not.toHaveProperty("stdin");
+    expect(payload).not.toHaveProperty("nativePayload");
+  });
 });
 
 describe("Capability evidence redaction", () => {

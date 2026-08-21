@@ -465,7 +465,11 @@ function commandOutcome(outcome: CapabilityCommandOutcome): OperationSuccess {
       outcome.error.code,
     );
   }
-  return { result: outcome.result as unknown as CapabilityJsonValue, stateRevision: outcome.result.stateRevision };
+  // `commandKind` is internal control-plane routing metadata. The provider
+  // receives the operation-specific response contract, whose operationId is
+  // already carried by the authenticated semantic result envelope.
+  const { commandKind: _commandKind, ...result } = outcome.result;
+  return { result: result as unknown as CapabilityJsonValue, stateRevision: outcome.result.stateRevision };
 }
 
 function toDefinition(descriptor: CapabilitySemanticToolDescriptor): CapabilitySemanticToolDefinition {

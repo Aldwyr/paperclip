@@ -35,7 +35,7 @@ describe("resolveNativeRuntimeMode", () => {
       runtimeConfig: {},
       adapterConfig: { provider: "claude" },
       agent: { ...eligible.agent, adapterType: "paperclip_runner" },
-    })).toThrow(/provider must be codex or opencode/);
+    })).toThrow(/provider must be codex, opencode, or claude_managed/);
   });
 
   it("selects OpenCode only with a provider/model value", () => {

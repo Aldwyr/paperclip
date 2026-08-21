@@ -16,8 +16,8 @@ import {
   executeNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
-import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { and, desc, eq, sql } from "drizzle-orm";
+import { documentRevisions, heartbeatRuns, issueDocuments, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
@@ -25,11 +25,13 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { persistActivity, publishActivity } from "../activity-log.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
+import { documentService } from "../documents.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
   type NativeStatusDecision,
 } from "./status-arbiter.js";
+import { HttpError } from "../../errors.js";
 
 type ActiveNativeSession = {
   session: NativeSession;
@@ -47,6 +49,109 @@ type WarmNativeSession = {
 };
 
 const warmNativeSessions = new Map<string, WarmNativeSession>();
+
+const NATIVE_PROVIDER_HOST_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "CODEX_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "SystemRoot",
+  "PATHEXT",
+] as const;
+
+/**
+ * Provider bootstrap needs a small amount of host process context even when
+ * the agent has no configured env. In particular, an empty environment makes
+ * a bare `codex` command unresolvable. Agent-configured values remain
+ * authoritative and may intentionally override the host defaults.
+ */
+export function buildNativeProviderEnvironment(
+  configured: NodeJS.ProcessEnv,
+  host: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const inherited = Object.fromEntries(
+    NATIVE_PROVIDER_HOST_ENV_KEYS.flatMap((key) => {
+      const value = host[key];
+      return typeof value === "string" && value.length > 0 ? [[key, value]] : [];
+    }),
+  );
+  return { ...inherited, ...configured };
+}
+
+type PlanSynchronization = {
+  eventId: string;
+  planId: string;
+  providerRevision: number;
+  status: "synchronized" | "already_synchronized" | "conflict" | "invalid";
+  documentRevision: number | null;
+  currentRevisionId: string | null;
+};
+
+export function providerPlanMarkdown(payload: Record<string, unknown>): string {
+  const explanation = typeof payload.explanation === "string" ? payload.explanation.trim() : "";
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  const lines = steps.slice(0, 256).flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const step = value as Record<string, unknown>;
+    const body = typeof step.body === "string" ? step.body.trim().slice(0, 4_000) : "";
+    if (!body) return [];
+    const status = step.status === "completed" ? "x" : " ";
+    const suffix = step.status === "blocked" ? " _(blocked)_" : step.status === "in_progress" ? " _(in progress)_" : "";
+    return [`- [${status}] ${body}${suffix}`];
+  });
+  return [explanation, lines.join("\n")].filter(Boolean).join("\n\n").slice(0, 256_000);
+}
+
+async function synchronizeCompletedProviderPlan(input: {
+  db: Db;
+  execution: NativeExecutionInputV1;
+  event: { sourceEventId: string; turnId?: string; eventType: string; payload: Record<string, unknown> };
+}): Promise<PlanSynchronization | null> {
+  if (input.event.eventType !== "plan.updated" || input.event.payload.complete !== true) return null;
+  const planId = typeof input.event.payload.planId === "string" ? input.event.payload.planId : "";
+  const providerRevision = Number.isSafeInteger(input.event.payload.revision) ? Number(input.event.payload.revision) : 0;
+  const body = providerPlanMarkdown(input.event.payload);
+  if (!planId || providerRevision < 1 || !body) {
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "invalid", documentRevision: null, currentRevisionId: null };
+  }
+  const provenance = `runner-plan-sync:v1 run=${input.execution.binding.runId} turn=${input.event.turnId ?? "unknown"} provider=${input.execution.provider.kind} plan=${planId} revision=${providerRevision}`;
+  const existingRevision = await input.db.select({ revisionNumber: documentRevisions.revisionNumber, id: documentRevisions.id })
+    .from(documentRevisions)
+    .innerJoin(issueDocuments, eq(issueDocuments.documentId, documentRevisions.documentId))
+    .where(and(eq(issueDocuments.issueId, input.execution.binding.issueId), eq(issueDocuments.key, "plan"), eq(documentRevisions.changeSummary, provenance)))
+    .orderBy(desc(documentRevisions.revisionNumber)).limit(1).then((rows) => rows[0] ?? null);
+  if (existingRevision) {
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "already_synchronized", documentRevision: existingRevision.revisionNumber, currentRevisionId: existingRevision.id };
+  }
+  const documents = documentService(input.db);
+  const current = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
+  try {
+    const write = await documents.upsertIssueDocument({
+      issueId: input.execution.binding.issueId,
+      key: "plan",
+      title: "Plan",
+      format: "markdown",
+      body,
+      baseRevisionId: current?.latestRevisionId ?? null,
+      changeSummary: provenance,
+      createdByAgentId: input.execution.binding.agentId,
+      createdByRunId: input.execution.binding.runId,
+    });
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "synchronized", documentRevision: write.document.latestRevisionNumber, currentRevisionId: write.document.latestRevisionId };
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 409) throw error;
+    const latest = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "conflict", documentRevision: latest?.latestRevisionNumber ?? null, currentRevisionId: latest?.latestRevisionId ?? null };
+  }
+}
 
 class SessionToolAuthorityRouter {
   #authority: PaperclipRunnerToolAuthority;
@@ -75,12 +180,17 @@ function nativeSessionKey(execution: NativeExecutionInputV1): string {
 }
 
 function nativeSessionConfigDigest(execution: NativeExecutionInputV1): string {
+  const executionLocation = execution.provider.kind === "claude_managed"
+    ? { executionKind: "remote_service", workspace: null }
+    : {
+        executionKind: "local_process",
+        workspaceId: execution.binding.executionWorkspaceId,
+        cwd: execution.workspace.cwd,
+      };
   return `sha256:${createHash("sha256").update(JSON.stringify({
     companyId: execution.binding.companyId,
-    issueId: execution.binding.issueId,
-    agentId: execution.binding.agentId,
-    workspaceId: execution.binding.executionWorkspaceId,
-    cwd: execution.workspace.cwd,
+    normalizedSessionId: nativeSessionKey(execution),
+    executionLocation,
     provider: execution.provider,
     driverKind: execution.session.driverKind,
     lifecyclePolicy: execution.session.lifecyclePolicy,
@@ -397,6 +507,8 @@ export async function executePaperclipNativeSession(input: {
   backend?: NativeSessionBackend;
   useRunnerd?: boolean;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /** Resolved adapter env; the runner transport applies a provider allowlist before spawn. */
+  runnerEnvironment?: NodeJS.ProcessEnv;
 }): Promise<AdapterExecutionResult> {
   const leaseOwner = input.leaseOwner ?? `${input.runnerInstanceId}:${randomUUID()}`;
   const leaseNow = new Date();
@@ -434,6 +546,7 @@ export async function executePaperclipNativeSession(input: {
     return coordinator.attempt + 1;
   });
   const controlPlaneInstanceId = `${input.runnerInstanceId}:control`;
+  const planSynchronizations: PlanSynchronization[] = [];
   const controlPlane = new PaperclipControlPlanePort(input.db, {
     companyId: input.execution.binding.companyId,
     issueId: input.execution.binding.issueId,
@@ -444,9 +557,18 @@ export async function executePaperclipNativeSession(input: {
     sourceInstanceId: input.runnerInstanceId,
     controlPlaneSourceInstanceId: controlPlaneInstanceId,
   }, {
-    onCommittedEvent: input.onLog
-      ? async (event) => input.onLog!("stdout", `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`)
-      : undefined,
+    onCommittedEvent: async (event) => {
+      if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`);
+      const synchronization = await synchronizeCompletedProviderPlan({
+        db: input.db,
+        execution: input.execution,
+        event: event as { sourceEventId: string; turnId?: string; eventType: string; payload: Record<string, unknown> },
+      });
+      if (synchronization) {
+        planSynchronizations.push(synchronization);
+        if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.plan.synchronization", synchronization })}\n`);
+      }
+    },
   });
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
   const lifecyclePolicy = input.execution.session?.lifecyclePolicy
@@ -479,7 +601,7 @@ export async function executePaperclipNativeSession(input: {
         ?? createNativeSessionBackend(input.execution, {
           runnerInstanceId: input.runnerInstanceId,
           onSpawn: input.onSpawn,
-          environment: process.env,
+          environment: input.runnerEnvironment ?? process.env,
           opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
         }),
       controlPlane,
@@ -617,16 +739,19 @@ export async function executePaperclipNativeSession(input: {
     resultJson: {
       nativeResult: native.result as unknown as Record<string, unknown>,
       nativeTerminal: native.terminal as unknown as Record<string, unknown>,
+      planSynchronizations,
     },
     summary: native.result.summary,
     sessionId: native.normalizedSessionId,
     sessionDisplayId: native.providerSessionId ?? native.normalizedSessionId,
-    provider: input.execution.provider.kind === "opencode"
+    provider: input.execution.provider.kind === "claude_managed"
+      ? "anthropic"
+      : input.execution.provider.kind === "opencode"
       ? input.execution.provider.model?.split("/", 1)[0] ?? "opencode"
       : "openai",
     model: input.execution.provider.model,
     usage: normalizeNativeUsage(native.usage),
-    costUsd: numericUsageField(native.usage, ["costUsd", "cost"]),
+    costUsd: numericUsageField(native.usage, ["providerCostUsd", "costUsd", "cost"]),
     usageBasis: "per_run",
     nativeFinalization: finalization,
   };
@@ -661,6 +786,7 @@ function createRunnerdBackend(input: {
   execution: NativeExecutionInputV1;
   runnerInstanceId: string;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  runnerEnvironment?: NodeJS.ProcessEnv;
 }): NativeSessionBackend {
   const authority = new PaperclipRunnerToolAuthority(input.db, {
     companyId: input.execution.binding.companyId,
@@ -683,11 +809,19 @@ function createRunnerdBackend(input: {
     onSpawn: input.onSpawn,
     dynamicTools: authorityRouter.definitions(),
     dynamicToolHandler: (call) => authorityRouter.execute(call),
-    environment: process.env,
+    environment: input.runnerEnvironment ?? process.env,
     opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
     codexTransportFactory: () => createRunnerdCodexTransport({
+      provider: input.execution.provider.kind,
+      ...(input.execution.provider.kind === "claude_managed" ? {
+        managedProfile: {
+          ...input.execution.provider.managedProfile,
+          maxSessionListCostUsd: input.execution.provider.maxSessionListCostUsd,
+          model: input.execution.provider.model,
+        },
+      } : {}),
       stateDirectory: root,
-      environment: process.env,
+      environment: input.runnerEnvironment ?? process.env,
       lifecyclePolicy: input.execution.session.lifecyclePolicy,
       resumeDynamicTools: authorityRouter.definitions(),
       prpIdentity: {

@@ -22,6 +22,8 @@
         "semantic_tool.result",
         "session.snapshot",
         "session.close",
+        "session.budget.increase",
+        "session.destroy",
         "run.cancel",
         "runner.drain",
         "runner.suspend",

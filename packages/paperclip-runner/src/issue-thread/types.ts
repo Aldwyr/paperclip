@@ -223,6 +223,18 @@ export type CapabilityThreadItem =
       at: string;
       reference: PaperclipWorkspaceFileReference;
     }
+  | {
+      kind: "provider_activity";
+      id: string;
+      at: string;
+      family: "plan" | "tool_execution" | "research" | "delegation" | "model_identity" | "context" | "artifact" | "review" | "hook" | "memory" | "safety" | "terminal" | "wait" | "provider_notice";
+      eventType: string;
+      status: "running" | "completed" | "failed" | "interrupted" | "informational";
+      title: string;
+      summary: string;
+      payload: CapabilityJsonValue;
+      evidenceRef: CapabilityEvidenceRef;
+    }
   | ({ kind: "interaction"; id: string; at: string } & CapabilityThreadInteractionCard)
   | {
       kind: "document";

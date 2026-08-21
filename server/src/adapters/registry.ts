@@ -188,6 +188,155 @@ async function testPaperclipRunnerOpenCodeEnvironment(
   }
 }
 
+async function testPaperclipRunnerClaudeManagedEnvironment(
+  context: Parameters<typeof codexTestEnvironment>[0],
+) {
+  const testedAt = new Date().toISOString();
+  const required = [
+    ["managedProfileId", "Managed profile ID"],
+    ["anthropicAgentId", "Anthropic Agent ID"],
+    ["agentVersion", "Agent version"],
+    ["anthropicEnvironmentId", "Anthropic Environment ID"],
+    ["model", "Claude model"],
+  ] as const;
+  const missing = required.filter(([key]) =>
+    typeof context.config[key] !== "string" || String(context.config[key]).trim().length === 0
+  );
+  if (missing.length > 0 || context.config.managedAgentsRetentionAcknowledged !== true) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{
+        code: "claude_managed_profile_incomplete",
+        level: "error" as const,
+        message: missing.length > 0
+          ? `Claude Agent profile is missing: ${missing.map(([, label]) => label).join(", ")}.`
+          : "Claude Agent requires an administrator acknowledgement of beta status and provider retention.",
+      }],
+    };
+  }
+  const cap = Number(context.config.maxSessionListCostUsd);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "claude_managed_spend_cap_invalid", level: "error" as const, message: "Claude Agent requires a positive session spend ceiling." }],
+    };
+  }
+  const configuredEnv = context.config.env && typeof context.config.env === "object"
+    ? context.config.env as Record<string, unknown>
+    : {};
+  const key = typeof configuredEnv.ANTHROPIC_API_KEY === "string"
+    ? configuredEnv.ANTHROPIC_API_KEY.trim()
+    : process.env.ANTHROPIC_API_KEY?.trim();
+  if (!key) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{
+        code: "claude_managed_auth_missing",
+        level: "error" as const,
+        message: "ANTHROPIC_API_KEY is not available to the Paperclip server. Bind it through the company secret-reference environment configuration.",
+      }],
+    };
+  }
+  const headers = {
+    "x-api-key": key,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "managed-agents-2026-04-01",
+  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const [agentResponse, environmentResponse, versionsResponse] = await Promise.all([
+      fetch(`https://api.anthropic.com/v1/agents/${encodeURIComponent(String(context.config.anthropicAgentId))}?beta=true`, { headers, signal: controller.signal }),
+      fetch(`https://api.anthropic.com/v1/environments/${encodeURIComponent(String(context.config.anthropicEnvironmentId))}?beta=true`, { headers, signal: controller.signal }),
+      fetch(`https://api.anthropic.com/v1/agents/${encodeURIComponent(String(context.config.anthropicAgentId))}/versions?beta=true`, { headers, signal: controller.signal }),
+    ]);
+    if (!agentResponse.ok || !environmentResponse.ok || !versionsResponse.ok) {
+      return {
+        adapterType: "paperclip_runner",
+        status: "fail" as const,
+        testedAt,
+        checks: [{
+          code: "claude_managed_resource_probe_failed",
+          level: "error" as const,
+          message: `Anthropic resource probe failed (Agent HTTP ${agentResponse.status}; Environment HTTP ${environmentResponse.status}; versions HTTP ${versionsResponse.status}).`,
+        }],
+      };
+    }
+    const agent = await agentResponse.json() as Record<string, unknown>;
+    const environment = await environmentResponse.json() as Record<string, unknown>;
+    const versions = await versionsResponse.json() as Record<string, unknown>;
+    if (agent.id !== context.config.anthropicAgentId || environment.id !== context.config.anthropicEnvironmentId) {
+      throw new Error("Anthropic returned resource identities that do not match the configured profile");
+    }
+    const versionRows = Array.isArray(versions.data) ? versions.data : [];
+    const pinnedVersion = String(context.config.agentVersion);
+    if (!versionRows.some((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const value = (entry as Record<string, unknown>).version;
+      return String(value) === pinnedVersion;
+    })) {
+      throw new Error("The configured Anthropic Agent version does not exist");
+    }
+    const environmentConfig = environment.config && typeof environment.config === "object"
+      ? environment.config as Record<string, unknown>
+      : {};
+    const networking = environmentConfig.networking && typeof environmentConfig.networking === "object"
+      ? environmentConfig.networking as Record<string, unknown>
+      : {};
+    const packages = environmentConfig.packages && typeof environmentConfig.packages === "object"
+      ? environmentConfig.packages as Record<string, unknown>
+      : {};
+    const packageEntries = Object.entries(packages)
+      .filter(([key]) => key !== "type")
+      .flatMap(([, value]) => Array.isArray(value) ? value : []);
+    if (
+      environmentConfig.type !== "cloud"
+      || networking.type !== "limited"
+      || networking.allow_mcp_servers === true
+      || networking.allow_package_managers === true
+      || (Array.isArray(networking.allowed_hosts) && networking.allowed_hosts.length > 0)
+      || packageEntries.length > 0
+    ) {
+      throw new Error("Anthropic Environment drifted from Paperclip's no-network, no-package profile");
+    }
+    return {
+      adapterType: "paperclip_runner",
+      status: "warn" as const,
+      testedAt,
+      checks: [{
+        code: "claude_managed_profile_qualified",
+        level: "info" as const,
+        message: `Verified Claude Agent ${String(context.config.anthropicAgentId)} and Environment ${String(context.config.anthropicEnvironmentId)} without creating a session.`,
+      }, {
+        code: "claude_managed_retention_notice",
+        level: "warn" as const,
+        message: "Managed Agents is a stateful beta service and is not eligible for ZDR or HIPAA modes.",
+      }],
+    };
+  } catch (error) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{
+        code: "claude_managed_probe_failed",
+        level: "error" as const,
+        message: error instanceof Error && error.name === "AbortError"
+          ? "Anthropic resource probe timed out."
+          : "Anthropic resource probe failed before the profile could be verified.",
+      }],
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function compareSemver(left: string, right: string): number {
   const a = left.split(".").map(Number);
   const b = right.split(".").map(Number);
@@ -409,8 +558,12 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
     };
   },
   async testEnvironment(context) {
-    const provider = context.config.provider === "opencode" ? "opencode" : "codex";
-    const result = provider === "opencode"
+    const provider = context.config.provider === "opencode"
+      ? "opencode"
+      : context.config.provider === "claude_managed" ? "claude_managed" : "codex";
+    const result = provider === "claude_managed"
+      ? await testPaperclipRunnerClaudeManagedEnvironment(context)
+      : provider === "opencode"
       ? await testPaperclipRunnerOpenCodeEnvironment(context)
       : await codexTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
@@ -421,6 +574,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   models: [
     ...codexModels,
     { id: "openrouter/deepseek/deepseek-v4-flash-0731", label: "OpenRouter · DeepSeek V4 Flash 0731" },
+    { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   ],
   modelProfiles: codexModelProfiles,
   listModels: listCodexModels,
@@ -429,18 +583,24 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
-  getRuntimeCommandSpec: (config) => config.provider === "opencode"
+  getRuntimeCommandSpec: (config) => config.provider === "claude_managed"
+    ? { command: "paperclip-runnerd", detectCommand: null, installCommand: null }
+    : config.provider === "opencode"
     ? buildNpmRuntimeCommandSpec(config, "opencode", "opencode-ai@1.18.17")
     : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
-  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex or OpenCode through the native Paperclip runner and authenticated PRP control-plane connection. OpenCode requires a provider/model identifier and runtime OPENROUTER_API_KEY.\n`,
+  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, or a remote Claude Agent through the native Paperclip runner and authenticated PRP control-plane connection. Claude Agent credentials remain in runnerd; Anthropic never receives a Paperclip credential or endpoint.\n`,
   getConfigSchema: () => ({
     fields: [{
       key: "provider",
       label: "Provider",
       type: "select",
       default: "codex",
-      options: [{ value: "codex", label: "Codex" }, { value: "opencode", label: "OpenCode 1.18.17" }],
-      hint: "Select the native provider. OpenCode runs through its authenticated loopback server.",
+      options: [
+        { value: "codex", label: "Codex" },
+        { value: "opencode", label: "OpenCode 1.18.17" },
+        { value: "claude_managed", label: "Claude Agent" },
+      ],
+      hint: "Select a local harness or an Anthropic cloud-managed Claude Agent.",
     }, {
       key: "lifecycleMode",
       label: "Runner lifecycle",
@@ -459,17 +619,36 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       hint: "Warm sessions suspend resumably after this much inactivity.",
     }, {
       key: "model",
-      label: "OpenCode model",
+      label: "Model",
       type: "text",
       default: "openrouter/deepseek/deepseek-v4-flash-0731",
       placeholder: "openrouter/deepseek/deepseek-v4-flash-0731",
-      hint: "Required when provider is OpenCode; use provider/model form.",
+      hint: "OpenCode uses provider/model form. Claude Agent defaults to claude-sonnet-5.",
     }, {
       key: "command",
       label: "OpenCode command",
       type: "text",
       default: "opencode",
       hint: "OpenCode executable. Version 1.18.17 is qualified.",
+    }, {
+      key: "managedProfileId", label: "Managed Agent profile", type: "text", required: true,
+      hint: "Company-scoped profile identifier. Required for Claude Agent.",
+      meta: { provider: "claude_managed" },
+    }, {
+      key: "anthropicAgentId", label: "Anthropic Agent ID", type: "text", required: true,
+      meta: { provider: "claude_managed" },
+    }, {
+      key: "agentVersion", label: "Pinned Agent version", type: "text", required: true,
+      meta: { provider: "claude_managed" },
+    }, {
+      key: "anthropicEnvironmentId", label: "Anthropic Environment ID", type: "text", required: true,
+      meta: { provider: "claude_managed" },
+    }, {
+      key: "maxSessionListCostUsd", label: "Session spend ceiling (USD)", type: "number", default: 1,
+      hint: "Required hard ceiling for a managed session.", meta: { provider: "claude_managed" },
+    }, {
+      key: "managedAgentsRetentionAcknowledged", label: "Acknowledge beta retention", type: "toggle", default: false,
+      hint: "Managed Agents is stateful and is not eligible for ZDR or HIPAA modes.", meta: { provider: "claude_managed" },
     }],
   }),
   loginCapability: codexLoginCapability,

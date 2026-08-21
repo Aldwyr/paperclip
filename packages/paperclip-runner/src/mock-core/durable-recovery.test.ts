@@ -882,11 +882,29 @@ describe.sequential("Durable transport and recovery", () => {
   );
 
   it("passes only the bootstrap capability and platform basics to the runner", () => {
-    const environment = durableRecoveryInternals.runnerEnvironment("opaque-ticket");
+    const environment = durableRecoveryInternals.runnerEnvironment("opaque-ticket", {
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "sk-ant-live-only",
+      UNRELATED_SERVER_SECRET: "must-not-cross-runner-boundary",
+    });
 
     expect(environment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET).toBe("opaque-ticket");
+    expect(environment.ANTHROPIC_API_KEY).toBe("sk-ant-live-only");
+    expect(environment.UNRELATED_SERVER_SECRET).toBeUndefined();
     expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
     expect(environment.OPENAI_API_KEY).toBeUndefined();
     expect(environment.EMAIL_AGENTMAIL_GENERAL_API_KEY).toBeUndefined();
+  });
+
+  it("projects the authenticated result inside a discovered-capability gateway", () => {
+    const inner = { ok: true, operationId: "list_agents", callId: "call-1", result: { actors: [] } };
+    expect(durableRecoveryInternals.projectedSemanticResult("invoke_discovered_capability", {
+      success: true,
+      contentItems: [{ type: "inputText", text: JSON.stringify(inner) }],
+    })).toEqual(inner);
+    expect(durableRecoveryInternals.projectedSemanticResult("invoke_discovered_capability", {
+      success: true,
+      contentItems: [{ type: "inputText", text: "not-json" }],
+    })).toEqual({ success: true, contentItems: [{ type: "inputText", text: "not-json" }] });
   });
 });

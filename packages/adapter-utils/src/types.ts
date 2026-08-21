@@ -529,7 +529,8 @@ export type TranscriptEntry =
   | { kind: "stderr"; ts: string; text: string }
   | { kind: "system"; ts: string; text: string }
   | { kind: "stdout"; ts: string; text: string }
-  | { kind: "diff"; ts: string; changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation"; text: string };
+  | { kind: "diff"; ts: string; changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation"; text: string }
+  | { kind: "provider_activity"; ts: string; family: "plan" | "tool_execution" | "research" | "delegation" | "model_identity" | "context" | "artifact" | "review" | "hook" | "memory" | "safety" | "terminal" | "wait" | "provider_notice"; eventType: string; status: "running" | "completed" | "failed" | "interrupted" | "informational"; title: string; summary: string; payload: Record<string, unknown> };
 
 export type StdoutLineParser = (line: string, ts: string) => TranscriptEntry[];
 

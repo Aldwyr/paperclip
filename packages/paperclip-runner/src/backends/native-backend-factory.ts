@@ -34,6 +34,18 @@ export function createNativeSessionBackend(
       transportFactory: options.codexTransportFactory,
     });
   }
+  if (input.provider.kind === "claude_managed") {
+    if (!options.codexTransportFactory) {
+      throw new Error("Claude Agent native backend requires the runnerd remote-provider transport");
+    }
+    return createCodexNativeSessionBackend(input, {
+      runnerInstanceId: options.runnerInstanceId,
+      onSpawn: options.onSpawn,
+      dynamicTools: options.dynamicTools,
+      dynamicToolHandler: options.dynamicToolHandler,
+      transportFactory: options.codexTransportFactory,
+    });
+  }
   if (!options.opencodeRuntimeDirectory) {
     throw new Error("OpenCode native backend requires an instance runtime directory");
   }

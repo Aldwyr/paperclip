@@ -120,6 +120,44 @@ export const capabilitiesSchema = {
     "typedEvents": {
       "type": "boolean"
     },
+    "typedEventFamilies": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "family",
+          "version",
+          "availability",
+          "detailLevel"
+        ],
+        "properties": {
+          "family": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[a-z][a-z0-9_.-]*$"
+          },
+          "version": {
+            "const": 1
+          },
+          "availability": {
+            "enum": [
+              "available",
+              "unsupported",
+              "policy_disabled"
+            ]
+          },
+          "detailLevel": {
+            "enum": [
+              "summary",
+              "structured"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
     "semanticTools": {
       "type": "object",
       "required": [
@@ -238,6 +276,8 @@ export const commandSchema = {
         "semantic_tool.result",
         "session.snapshot",
         "session.close",
+        "session.budget.increase",
+        "session.destroy",
         "run.cancel",
         "runner.drain",
         "runner.suspend",
@@ -288,6 +328,1059 @@ export const commandSchema = {
     }
   },
   "additionalProperties": true
+} as const;
+
+export const providerDescriptorSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/provider-descriptor.schema.json",
+  "title": "PRP provider runtime descriptor",
+  "type": "object",
+  "required": [
+    "provider",
+    "driver",
+    "model",
+    "executionKind",
+    "providerVersion"
+  ],
+  "properties": {
+    "provider": {
+      "enum": [
+        "codex",
+        "opencode",
+        "claude_managed"
+      ]
+    },
+    "driver": {
+      "enum": [
+        "codex_app_server",
+        "opencode_server",
+        "claude_managed_agents_api"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "executionKind": {
+      "enum": [
+        "local_process",
+        "remote_service"
+      ]
+    },
+    "providerVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "service": {
+      "enum": [
+        "anthropic_managed_agents"
+      ]
+    },
+    "providerSessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "processId": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "executionKind": {
+            "const": "remote_service"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "service"
+        ],
+        "properties": {
+          "processId": {
+            "const": null
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "executionKind": {
+            "const": "local_process"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "service": false
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+} as const;
+
+export const providerEventSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json",
+  "title": "Provider-neutral runner activity payload",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/plan"
+    },
+    {
+      "$ref": "#/$defs/toolExecution"
+    },
+    {
+      "$ref": "#/$defs/research"
+    },
+    {
+      "$ref": "#/$defs/delegation"
+    },
+    {
+      "$ref": "#/$defs/modelRoute"
+    },
+    {
+      "$ref": "#/$defs/modelVerification"
+    },
+    {
+      "$ref": "#/$defs/contextCompacted"
+    },
+    {
+      "$ref": "#/$defs/artifactViewed"
+    },
+    {
+      "$ref": "#/$defs/artifactGenerated"
+    },
+    {
+      "$ref": "#/$defs/reviewMode"
+    },
+    {
+      "$ref": "#/$defs/hook"
+    },
+    {
+      "$ref": "#/$defs/memoryCitation"
+    },
+    {
+      "$ref": "#/$defs/safetyReview"
+    },
+    {
+      "$ref": "#/$defs/terminalInput"
+    },
+    {
+      "$ref": "#/$defs/wait"
+    },
+    {
+      "$ref": "#/$defs/providerNotice"
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "shortText": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "nullableShortText": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4000
+    },
+    "safePath": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).*$"
+    },
+    "safeUrl": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 8192,
+      "pattern": "^https?://"
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "schema",
+        "planId",
+        "revision",
+        "steps",
+        "complete",
+        "syncStatus"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.plan.updated.v1"
+        },
+        "planId": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "explanation": {
+          "$ref": "#/$defs/nullableShortText"
+        },
+        "steps": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": [
+              "stepId",
+              "body",
+              "status"
+            ],
+            "properties": {
+              "stepId": {
+                "$ref": "#/$defs/id"
+              },
+              "body": {
+                "$ref": "#/$defs/shortText"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed",
+                  "blocked"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "syncStatus": {
+          "enum": [
+            "streaming",
+            "pending",
+            "synchronized",
+            "conflict",
+            "not_applicable"
+          ]
+        },
+        "documentRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolExecution": {
+      "type": "object",
+      "required": [
+        "schema",
+        "executionId",
+        "transport",
+        "operation",
+        "status",
+        "output",
+        "outputBytes",
+        "outputTruncated",
+        "outputDigest"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.tool.execution.v1"
+        },
+        "executionId": {
+          "$ref": "#/$defs/id"
+        },
+        "transport": {
+          "enum": [
+            "process",
+            "mcp",
+            "dynamic",
+            "builtin"
+          ]
+        },
+        "operation": {
+          "enum": [
+            "read",
+            "search",
+            "list",
+            "execute",
+            "edit",
+            "unknown"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/nullableShortText"
+        },
+        "target": {
+          "$ref": "#/$defs/safePath"
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "readOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted"
+          ]
+        },
+        "durationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "exitCode": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "progress": {
+          "$ref": "#/$defs/nullableShortText"
+        },
+        "output": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 65536
+        },
+        "outputBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputTruncated": {
+          "type": "boolean"
+        },
+        "outputDigest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "research": {
+      "type": "object",
+      "required": [
+        "schema",
+        "researchId",
+        "action",
+        "status",
+        "sources"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.research.v1"
+        },
+        "researchId": {
+          "$ref": "#/$defs/id"
+        },
+        "action": {
+          "enum": [
+            "search",
+            "open_page",
+            "find_in_page",
+            "other"
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "query": {
+          "$ref": "#/$defs/nullableShortText"
+        },
+        "url": {
+          "$ref": "#/$defs/safeUrl"
+        },
+        "pattern": {
+          "$ref": "#/$defs/nullableShortText"
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": [
+              "sourceId",
+              "title",
+              "url",
+              "snippet"
+            ],
+            "properties": {
+              "sourceId": {
+                "$ref": "#/$defs/id"
+              },
+              "title": {
+                "$ref": "#/$defs/shortText"
+              },
+              "url": {
+                "$ref": "#/$defs/safeUrl"
+              },
+              "snippet": {
+                "$ref": "#/$defs/nullableShortText"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "delegation": {
+      "type": "object",
+      "required": [
+        "schema",
+        "delegationId",
+        "action",
+        "status",
+        "children"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.delegation.v1"
+        },
+        "delegationId": {
+          "$ref": "#/$defs/id"
+        },
+        "action": {
+          "enum": [
+            "spawn",
+            "message",
+            "resume",
+            "wait",
+            "close"
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "waiting",
+            "completed",
+            "failed",
+            "interrupted",
+            "closed"
+          ]
+        },
+        "children": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": [
+              "childId",
+              "role",
+              "model",
+              "status",
+              "summary",
+              "activitySummary"
+            ],
+            "properties": {
+              "childId": {
+                "$ref": "#/$defs/id"
+              },
+              "role": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 160
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 240
+              },
+              "status": {
+                "enum": [
+                  "running",
+                  "waiting",
+                  "completed",
+                  "failed",
+                  "interrupted",
+                  "closed"
+                ]
+              },
+              "summary": {
+                "$ref": "#/$defs/nullableShortText"
+              },
+              "activitySummary": {
+                "$ref": "#/$defs/nullableShortText"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "modelRoute": {
+      "type": "object",
+      "required": [
+        "schema",
+        "routeId",
+        "provider",
+        "requestedModel",
+        "fromModel",
+        "effectiveModel",
+        "reason"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.model.route_changed.v1"
+        },
+        "routeId": {
+          "$ref": "#/$defs/id"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "requestedModel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "fromModel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
+        },
+        "effectiveModel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "reason": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "modelVerification": {
+      "type": "object",
+      "required": [
+        "schema",
+        "verificationId",
+        "status",
+        "classes",
+        "buffering",
+        "summary"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.model.verification.v1"
+        },
+        "verificationId": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "classes": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "maxLength": 160
+          }
+        },
+        "buffering": {
+          "type": "boolean"
+        },
+        "summary": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "contextCompacted": {
+      "type": "object",
+      "required": [
+        "schema",
+        "compactionId",
+        "reason",
+        "preTokens",
+        "postTokens",
+        "sameSession"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.context.compacted.v1"
+        },
+        "compactionId": {
+          "$ref": "#/$defs/id"
+        },
+        "reason": {
+          "enum": [
+            "context_window",
+            "manual",
+            "provider",
+            "unknown"
+          ]
+        },
+        "preTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "postTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sameSession": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactViewed": {
+      "type": "object",
+      "required": [
+        "schema",
+        "artifactId",
+        "reference",
+        "mediaType",
+        "title"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.artifact.viewed.v1"
+        },
+        "artifactId": {
+          "$ref": "#/$defs/id"
+        },
+        "reference": {
+          "$ref": "#/$defs/safePath"
+        },
+        "mediaType": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "title": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifactGenerated": {
+      "type": "object",
+      "required": [
+        "schema",
+        "artifactId",
+        "status",
+        "reference",
+        "mediaType",
+        "registered",
+        "failure"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.artifact.generated.v1"
+        },
+        "artifactId": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "reference": {
+          "$ref": "#/$defs/safePath"
+        },
+        "mediaType": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 160
+        },
+        "registered": {
+          "type": "boolean"
+        },
+        "transparentBackground": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "failure": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewMode": {
+      "type": "object",
+      "required": [
+        "schema",
+        "reviewId",
+        "state",
+        "scope"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.review.mode_changed.v1"
+        },
+        "reviewId": {
+          "$ref": "#/$defs/id"
+        },
+        "state": {
+          "enum": [
+            "entered",
+            "exited"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "hook": {
+      "type": "object",
+      "required": [
+        "schema",
+        "hookId",
+        "event",
+        "scope",
+        "status",
+        "blocking",
+        "durationMs",
+        "summary"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.hook.v1"
+        },
+        "hookId": {
+          "$ref": "#/$defs/id"
+        },
+        "event": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "durationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "summary": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "memoryCitation": {
+      "type": "object",
+      "required": [
+        "schema",
+        "citationId",
+        "messageItemId",
+        "label",
+        "available",
+        "reference"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.memory.citation.v1"
+        },
+        "citationId": {
+          "$ref": "#/$defs/id"
+        },
+        "messageItemId": {
+          "$ref": "#/$defs/id"
+        },
+        "label": {
+          "$ref": "#/$defs/shortText"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "reference": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096
+        }
+      },
+      "additionalProperties": false
+    },
+    "safetyReview": {
+      "type": "object",
+      "required": [
+        "schema",
+        "reviewId",
+        "targetExecutionId",
+        "status",
+        "decision",
+        "summary"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.safety.review.v1"
+        },
+        "reviewId": {
+          "$ref": "#/$defs/id"
+        },
+        "targetExecutionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ]
+        },
+        "decision": {
+          "enum": [
+            "pending",
+            "allowed",
+            "denied",
+            "user_required",
+            "unknown"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/nullableShortText"
+        }
+      },
+      "additionalProperties": false
+    },
+    "terminalInput": {
+      "type": "object",
+      "required": [
+        "schema",
+        "executionId",
+        "origin",
+        "inputClass",
+        "byteCount"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.terminal.input_sent.v1"
+        },
+        "executionId": {
+          "$ref": "#/$defs/id"
+        },
+        "origin": {
+          "enum": [
+            "agent",
+            "user",
+            "system"
+          ]
+        },
+        "inputClass": {
+          "enum": [
+            "text",
+            "control",
+            "eof"
+          ]
+        },
+        "byteCount": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "wait": {
+      "type": "object",
+      "required": [
+        "schema",
+        "waitId",
+        "reason",
+        "status",
+        "plannedDurationMs",
+        "elapsedDurationMs"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.wait.v1"
+        },
+        "waitId": {
+          "$ref": "#/$defs/id"
+        },
+        "reason": {
+          "enum": [
+            "timer",
+            "provider",
+            "rate_limit",
+            "unknown"
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "interrupted",
+            "cancelled"
+          ]
+        },
+        "plannedDurationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "elapsedDurationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerNotice": {
+      "type": "object",
+      "required": [
+        "schema",
+        "noticeId",
+        "severity",
+        "category",
+        "scope",
+        "recoverable",
+        "userActionable",
+        "summary"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.provider.notice.v1"
+        },
+        "noticeId": {
+          "$ref": "#/$defs/id"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "scope": {
+          "enum": [
+            "turn",
+            "session",
+            "environment",
+            "account"
+          ]
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "userActionable": {
+          "type": "boolean"
+        },
+        "summary": {
+          "$ref": "#/$defs/shortText"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 } as const;
 
 export const workspaceDiffSchema = {
@@ -806,6 +1899,99 @@ export const semanticToolSchema = {
         }
       },
       "additionalProperties": true
+    }
+  }
+} as const;
+
+export const usageSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/usage.schema.json",
+  "title": "PRP provider usage receipt",
+  "type": "object",
+  "required": [
+    "provider",
+    "model",
+    "cumulative",
+    "runDelta"
+  ],
+  "properties": {
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "providerSessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "providerRequestId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "cumulative": {
+      "$ref": "#/$defs/measurement"
+    },
+    "runDelta": {
+      "$ref": "#/$defs/measurement"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "measurement": {
+      "type": "object",
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "activeSeconds",
+        "requests",
+        "providerCostUsd"
+      ],
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cacheReadTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cacheWriteTokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeSeconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "providerCostUsd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     }
   }
 } as const;
@@ -1429,11 +2615,37 @@ export const eventSchema = {
         "harness.ready",
         "harness.exited",
         "harness.diagnostic",
+        "plan.updated",
+        "tool.execution.started",
+        "tool.execution.progressed",
+        "tool.execution.completed",
+        "research.started",
+        "research.progressed",
+        "research.completed",
+        "delegation.started",
+        "delegation.updated",
+        "delegation.completed",
+        "model.route.changed",
+        "model.verification.updated",
+        "context.compacted",
+        "artifact.viewed",
+        "artifact.generated",
+        "review.mode.changed",
+        "hook.started",
+        "hook.completed",
+        "memory.citation.referenced",
+        "safety.review.started",
+        "safety.review.completed",
+        "terminal.input.sent",
+        "wait.started",
+        "wait.completed",
+        "provider.notice.recorded",
         "session.starting",
         "session.started",
         "session.resuming",
         "session.resumed",
         "session.reconciled",
+        "session.updated",
         "session.closed",
         "session.failed",
         "turn.submitted",
@@ -1447,6 +2659,9 @@ export const eventSchema = {
         "item.delta",
         "item.completed",
         "item.failed",
+        "usage.reported",
+        "semantic_tool.input",
+        "semantic_tool.result",
         "mcp_app.discovered",
         "mcp_app.resource.resolved",
         "mcp_app.initializing",
@@ -1535,6 +2750,283 @@ export const eventSchema = {
       "if": {
         "properties": {
           "eventType": {
+            "const": "plan.updated"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/plan"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "tool.execution.started",
+              "tool.execution.progressed",
+              "tool.execution.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/toolExecution"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "research.started",
+              "research.progressed",
+              "research.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/research"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "delegation.started",
+              "delegation.updated",
+              "delegation.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/delegation"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "model.route.changed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/modelRoute"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "model.verification.updated"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/modelVerification"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "context.compacted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/contextCompacted"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "artifact.viewed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/artifactViewed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "artifact.generated"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/artifactGenerated"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "review.mode.changed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/reviewMode"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "hook.started",
+              "hook.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/hook"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "memory.citation.referenced"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/memoryCitation"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "safety.review.started",
+              "safety.review.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/safetyReview"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "terminal.input.sent"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/terminalInput"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
+              "wait.started",
+              "wait.completed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/wait"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "provider.notice.recorded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "https://paperclip.dev/schemas/prp/v1/provider-event.schema.json#/$defs/providerNotice"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
             "const": "workspace.file.referenced"
           }
         }
@@ -1598,7 +3090,10 @@ export const eventSchema = {
       "if": {
         "properties": {
           "eventType": {
-            "const": "mcp_app.tool_input"
+            "enum": [
+              "semantic_tool.input",
+              "mcp_app.tool_input"
+            ]
           }
         }
       },
@@ -1632,7 +3127,10 @@ export const eventSchema = {
       "if": {
         "properties": {
           "eventType": {
-            "const": "mcp_app.tool_result"
+            "enum": [
+              "semantic_tool.result",
+              "mcp_app.tool_result"
+            ]
           }
         }
       },
@@ -1771,9 +3269,12 @@ export const prpSchemaBundle = {
   "identity": identitySchema,
   "capabilities": capabilitiesSchema,
   "command": commandSchema,
+  "provider-descriptor": providerDescriptorSchema,
+  "provider-event": providerEventSchema,
   "workspace-diff": workspaceDiffSchema,
   "workspace-file-reference": workspaceFileReferenceSchema,
   "semantic-tool": semanticToolSchema,
+  "usage": usageSchema,
   "stop-reason": stopReasonSchema,
   "terminal": terminalSchema,
   "request": requestSchema,

@@ -6,7 +6,7 @@ Status: canonical explanatory contract for the Paperclip runner V1 surface.
 
 This document keeps three independent meanings of **group** separate. PRP families describe wire evidence and controller commands; capability placement decides who owns an operation; behavioral eval groups organize the 106 scenario corpus. None of the three axes can be used as a substitute for another.
 
-The generated totals are **71 PRP events in 15 event families**, **16 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
+The generated totals are **103 PRP events in 31 event families**, **18 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
 
 ## Axis 1: PRP v1 event and command families
 
@@ -21,9 +21,25 @@ PRP records ordered, replayable execution evidence. It is not the model's Paperc
 | `sandbox` | Sandbox resource measurements. | `sandbox.metric` | 1 |
 | `workspace` | Workspace readiness. | `workspace.ready`<br>`workspace.change.updated`<br>`workspace.diff.recorded`<br>`workspace.file.referenced` | 4 |
 | `harness` | Provider harness startup, readiness, exit, and diagnostics. | `harness.starting`<br>`harness.ready`<br>`harness.exited`<br>`harness.diagnostic` | 4 |
-| `session` | Provider-neutral session open, resume, reconciliation, close, and failure. | `session.starting`<br>`session.started`<br>`session.resuming`<br>`session.resumed`<br>`session.reconciled`<br>`session.closed`<br>`session.failed` | 7 |
+| `plan` | Structured provider plan revisions and completion commits. | `plan.updated` | 1 |
+| `tool` | Provider-neutral process, MCP, dynamic, and built-in execution activity. | `tool.execution.started`<br>`tool.execution.progressed`<br>`tool.execution.completed` | 3 |
+| `research` | Provider-reported search, page-open, and in-page research activity. | `research.started`<br>`research.progressed`<br>`research.completed` | 3 |
+| `delegation` | Child-agent delegation lifecycle and aggregate status. | `delegation.started`<br>`delegation.updated`<br>`delegation.completed` | 3 |
+| `model` | Requested/effective model routing and verification state. | `model.route.changed`<br>`model.verification.updated` | 2 |
+| `context` | Context-window compaction markers without hidden summaries. | `context.compacted` | 1 |
+| `artifact` | Authorized artifact viewing and structured generated outputs. | `artifact.viewed`<br>`artifact.generated` | 2 |
+| `review` | Provider review-mode state, separate from Paperclip authority. | `review.mode.changed` | 1 |
+| `hook` | Bounded provider hook lifecycle and blocking outcomes. | `hook.started`<br>`hook.completed` | 2 |
+| `memory` | Authorized or unavailable memory citation references. | `memory.citation.referenced` | 1 |
+| `safety` | Provider safety review state attached to governed work. | `safety.review.started`<br>`safety.review.completed` | 2 |
+| `terminal` | Content-free terminal input activity metadata. | `terminal.input.sent` | 1 |
+| `wait` | Intentional provider waits, distinct from warm idle and human input. | `wait.started`<br>`wait.completed` | 2 |
+| `provider` | Redacted provider notices and actionable warnings. | `provider.notice.recorded` | 1 |
+| `session` | Provider-neutral session open, resume, reconciliation, close, and failure. | `session.starting`<br>`session.started`<br>`session.resuming`<br>`session.resumed`<br>`session.reconciled`<br>`session.updated`<br>`session.closed`<br>`session.failed` | 8 |
 | `turn` | Model turn submission through terminal turn disposition. | `turn.submitted`<br>`turn.accepted`<br>`turn.started`<br>`turn.completed`<br>`turn.failed`<br>`turn.interrupted`<br>`turn.cancelled` | 7 |
 | `item` | Provider-neutral model/tool item lifecycle. | `item.started`<br>`item.delta`<br>`item.completed`<br>`item.failed` | 4 |
+| `usage` | Provider/model-attributed usage and accounting boundaries. | `usage.reported` | 1 |
+| `semantic_tool` | Canonical authorized Paperclip tool input and result evidence. | `semantic_tool.input`<br>`semantic_tool.result` | 2 |
 | `mcp_app` | MCP App discovery, initialization, tool, action, host-context, and teardown evidence. | `mcp_app.discovered`<br>`mcp_app.resource.resolved`<br>`mcp_app.initializing`<br>`mcp_app.ready`<br>`mcp_app.tool_input`<br>`mcp_app.tool_result`<br>`mcp_app.action.requested`<br>`mcp_app.action.resolved`<br>`mcp_app.host_context.changed`<br>`mcp_app.failed`<br>`mcp_app.teardown` | 11 |
 | `runtime_request` | Runtime permission/input request lifecycle. | `runtime_request.created`<br>`runtime_request.resolved`<br>`runtime_request.expired`<br>`runtime_request.cancelled` | 4 |
 | `interaction` | Issue-thread interaction proposal, materialization, response, delivery, and rejection. | `interaction.request.proposed`<br>`interaction.request.materialized`<br>`interaction.request.rejected`<br>`interaction.response.progressed`<br>`interaction.response.resolved`<br>`interaction.response.delivered` | 6 |
@@ -37,7 +53,7 @@ PRP records ordered, replayable execution evidence. It is not the model's Paperc
 | Family | Purpose | Commands | Count |
 | --- | --- | --- | ---: |
 | `run` | Prepare or cancel a run. | `run.prepare`<br>`run.attach`<br>`run.cancel` | 3 |
-| `session` | Open, snapshot, or close a normalized provider session. | `session.open`<br>`session.snapshot`<br>`session.close` | 3 |
+| `session` | Open, snapshot, or close a normalized provider session. | `session.open`<br>`session.snapshot`<br>`session.close`<br>`session.budget.increase`<br>`session.destroy` | 5 |
 | `turn` | Start, steer, interrupt, or stop a model turn. | `turn.start`<br>`turn.steer`<br>`turn.interrupt`<br>`turn.stop` | 4 |
 | `request` | Resolve a pending runtime request. | `request.resolve` | 1 |
 | `interaction` | Acknowledge delivery of an interaction response. | `interaction.receipt` | 1 |

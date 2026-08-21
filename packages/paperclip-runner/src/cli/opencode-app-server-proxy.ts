@@ -71,6 +71,9 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
       arguments: call.arguments,
     }),
     onDiagnostic: (message) => process.stderr.write(`[opencode] ${message}\n`),
+    // runnerd gives this proxy its own process group. Keep `opencode serve` in
+    // that same group so runnerd's TERM/KILL fallback cannot orphan it.
+    isolateProcessGroup: false,
   });
   if (resume) {
     const threadId = text(params.threadId);
@@ -239,11 +242,17 @@ input.on("line", (line) => {
   void handle(message).catch((error) => send({ id: message.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } }));
 });
 
-async function shutdown(): Promise<void> {
-  await session?.close({ reason: "proxy_shutdown", force: true }).catch(() => {});
-  await eventPump?.catch(() => {});
-  process.exit(0);
+let shutdownPromise: Promise<void> | null = null;
+function shutdown(): Promise<void> {
+  shutdownPromise ??= (async () => {
+    for (const waiter of pending.values()) waiter.reject(new Error("OpenCode proxy is shutting down"));
+    pending.clear();
+    await session?.close({ reason: "proxy_shutdown", force: true }).catch(() => {});
+    await eventPump?.catch(() => {});
+  })().finally(() => process.exit(0));
+  return shutdownPromise;
 }
 
+input.on("close", () => { void shutdown(); });
 process.on("SIGTERM", () => { void shutdown(); });
 process.on("SIGINT", () => { void shutdown(); });

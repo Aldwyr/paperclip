@@ -334,6 +334,29 @@ function parsePrpEvent(
 ): TranscriptEntry[] {
   const eventType = text(event.eventType);
   const payload = record(event.payload);
+  const family = eventType.startsWith("plan.") ? "plan"
+    : eventType.startsWith("tool.execution.") ? "tool_execution"
+      : eventType.startsWith("research.") ? "research"
+        : eventType.startsWith("delegation.") ? "delegation"
+          : eventType.startsWith("model.") ? "model_identity"
+            : eventType.startsWith("context.") ? "context"
+              : eventType.startsWith("artifact.") ? "artifact"
+                : eventType.startsWith("review.") ? "review"
+                  : eventType.startsWith("hook.") ? "hook"
+                    : eventType.startsWith("memory.") ? "memory"
+                      : eventType.startsWith("safety.") ? "safety"
+                        : eventType.startsWith("terminal.") ? "terminal"
+                          : eventType.startsWith("wait.") ? "wait"
+                            : eventType.startsWith("provider.notice.") ? "provider_notice" : null;
+  if (family !== null) {
+    const rawStatus = text(payload.status);
+    const status = rawStatus === "running" || rawStatus === "pending" || eventType.endsWith("started") || eventType.endsWith("progressed") ? "running"
+      : rawStatus === "failed" || rawStatus === "denied" ? "failed"
+        : rawStatus === "interrupted" || rawStatus === "cancelled" ? "interrupted"
+          : eventType.endsWith("completed") || rawStatus === "completed" ? "completed" : "informational";
+    const title = ({ plan: "Plan", tool_execution: "Tool execution", research: "Research", delegation: "Delegation", model_identity: "Model", context: "Context", artifact: "Artifact", review: "Review mode", hook: "Hook", memory: "Memory citation", safety: "Safety review", terminal: "Terminal input", wait: "Intentional wait", provider_notice: "Provider notice" } as const)[family];
+    return [{ kind: "provider_activity", ts, family, eventType, status, title, summary: text(payload.summary, text(payload.name, text(payload.query, eventType))), payload }];
+  }
   if (eventType === "session.started" || eventType === "session.resumed") {
     const context = record(payload.context);
     const model = text(context.model, text(record(payload.model).name, "Paperclip runner"));

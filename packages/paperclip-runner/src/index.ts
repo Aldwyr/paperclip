@@ -11,6 +11,7 @@ export * from "./backends/codex-native-backend.js";
 export * from "./backends/opencode-native-backend.js";
 export * from "./backends/native-backend-factory.js";
 export * from "./native-session-runtime.js";
+export * from "./provider-events.js";
 export {
   DurablePrpControlPlane,
   type DurablePrpControlPlaneOptions,

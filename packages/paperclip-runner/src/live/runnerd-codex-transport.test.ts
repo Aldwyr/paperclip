@@ -7,9 +7,25 @@ import { expect, it } from "vitest";
 import {
   createCapabilityRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
+  rehydrateRunnerdUsageNotification,
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
 } from "./runnerd-codex-transport.js";
+
+it("rehydrates normalized usage with the provider thread binding", () => {
+  expect(rehydrateRunnerdUsageNotification({
+    providerSessionId: "thread-1",
+    cumulative: { inputTokens: 10 },
+    runDelta: { inputTokens: 3 },
+  }, "fallback-thread", "turn-1")).toMatchObject({
+    threadId: "thread-1",
+    turnId: "turn-1",
+    tokenUsage: {
+      total: { inputTokens: 10 },
+      runDelta: { inputTokens: 3 },
+    },
+  });
+});
 
 const fakeCodex = resolve(
   import.meta.dirname,

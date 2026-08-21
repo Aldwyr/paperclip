@@ -26,6 +26,7 @@ export interface NativeRunResult {
 export interface NativeSessionCapabilities {
   resume: boolean;
   typedEvents: boolean;
+  typedEventFamilies?: TypedEventFamilyCapability[];
   steering: boolean;
   interruption: boolean;
   structuredResult: boolean;
@@ -43,3 +44,4 @@ export interface NativeUserMessage {
   role: "user";
   text: string;
 }
+import type { TypedEventFamilyCapability } from "../provider-events.js";

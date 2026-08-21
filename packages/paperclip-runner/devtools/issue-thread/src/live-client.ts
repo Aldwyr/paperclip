@@ -42,8 +42,10 @@ export interface CapabilityCleanRoomIdentity {
 }
 
 export interface CapabilityHarnessConfiguration {
-  provider: "codex" | "opencode";
+  provider: "codex" | "opencode" | "claude_managed";
   model: string | null;
+  managedProfileId?: string | null;
+  maxSessionListCostUsd?: number | null;
   lifecyclePolicy:
     | { mode: "per_turn"; idleTimeoutMs: null }
     | { mode: "warm"; idleTimeoutMs: number };
@@ -93,7 +95,7 @@ async function readError(response: Response, path: string): Promise<CapabilityLi
   }
 }
 
-async function post(path: string, body: unknown): Promise<CapabilityLiveResponse> {
+async function post<T = CapabilityLiveResponse>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${BASE}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -101,7 +103,7 @@ async function post(path: string, body: unknown): Promise<CapabilityLiveResponse
     credentials: CREDENTIALS,
   });
   if (!response.ok) throw await readError(response, path);
-  return (await response.json()) as CapabilityLiveResponse;
+  return (await response.json()) as T;
 }
 
 /** Interim projection delivered while the turn is still running. */
@@ -173,6 +175,10 @@ export const capabilityLiveClient = {
     const query = new URLSearchParams({ provider: configuration.provider });
     if (sessionId !== null) query.set("sessionId", sessionId);
     if (configuration.model !== null) query.set("model", configuration.model);
+    if (configuration.managedProfileId) query.set("managedProfileId", configuration.managedProfileId);
+    if (configuration.maxSessionListCostUsd !== null && configuration.maxSessionListCostUsd !== undefined) {
+      query.set("maxSessionListCostUsd", String(configuration.maxSessionListCostUsd));
+    }
     query.set("lifecycleMode", configuration.lifecyclePolicy.mode);
     if (configuration.lifecyclePolicy.mode === "warm") {
       query.set("idleTimeoutMs", String(configuration.lifecyclePolicy.idleTimeoutMs));
@@ -198,6 +204,12 @@ export const capabilityLiveClient = {
   },
   stop(sessionId: string): Promise<CapabilityLiveResponse> {
     return post("/interrupt", { sessionId });
+  },
+  increaseManagedBudget(sessionId: string, maxSessionListCostUsd: number): Promise<CapabilityLiveResponse> {
+    return post("/managed-budget", { sessionId, maxSessionListCostUsd });
+  },
+  deleteManagedSession(sessionId: string): Promise<{ deleted: true; sessionId: string }> {
+    return post<{ deleted: true; sessionId: string }>("/managed-session-delete", { sessionId, confirm: true });
   },
   reset(sessionId: string): Promise<CapabilityLiveResponse> {
     return post("/reset", { sessionId });

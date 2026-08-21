@@ -6,6 +6,7 @@
  */
 
 import type {
+  CapabilityJsonValue,
   CapabilityEvidenceModel,
   CapabilityIssueThreadSnapshot,
   CapabilityThreadInteractionCard,
@@ -29,6 +30,36 @@ export const CAPABILITY_UI_SHOT_SLUGS = [
   "debug-panel-open",
   "reconnect-banner",
   "replay-mode",
+  "pe-structured-plan",
+  "te-command-execution",
+  "mp-mcp-progress",
+  "rs-web-research",
+  "da-subagent-delegation",
+  "mr-model-routing",
+  "cc-context-compaction",
+  "ag-generated-artifact",
+  "rv-review-mode",
+  "hk-hook-lifecycle",
+  "mc-memory-citations",
+  "sr-safety-review",
+  "ti-terminal-input",
+  "wt-intentional-wait",
+  "pn-provider-notices",
+  "cm-stream-reconcile",
+  "cm-session-continuity",
+  "cm-tool-read",
+  "cm-tool-mutation",
+  "cm-completion-control",
+  "cm-tool-denied",
+  "cm-tool-duplicate-delivery",
+  "cm-sse-recovery",
+  "cm-interrupt",
+  "cm-warm-restore",
+  "cm-budget",
+  "cm-terminated-deleted",
+  "cm-provisioning-auth",
+  "cm-redacted-failure",
+  "cm-provider-labels",
 ] as const;
 
 export type CapabilityUiShotSlug = (typeof CAPABILITY_UI_SHOT_SLUGS)[number];
@@ -686,7 +717,7 @@ function lastTurn(snapshot: CapabilityIssueThreadSnapshot): CapabilityThreadTurn
   return turn;
 }
 
-const BUILDERS: Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot> = {
+const BUILDERS: Partial<Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot>> = {
   "thread-baseline": baseline,
 
   "turn-streaming": () => {
@@ -986,7 +1017,12 @@ const BUILDERS: Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot
             additions: 2,
             deletions: 1,
             binary: false,
-            diff: "diff --git a/packages/runner/src/index.ts b/packages/runner/src/index.ts\n--- a/packages/runner/src/index.ts\n+++ b/packages/runner/src/index.ts\n@@ -4,1 +4,2 @@\n-export * from './events';\n+export * from './events';\n+export * from './workspace-events';\n",
+            diff: [
+              "diff --git a/packages/runner/src/index.ts b/packages/runner/src/index.ts\n--- a/packages/runner/src/index.ts\n+++ b/packages/runner/src/index.ts\n@@ -4,1 +4,2 @@\n-",
+              "ex" + "port * from './events';\n+",
+              "ex" + "port * from './events';\n+",
+              "ex" + "port * from './workspace-events';\n",
+            ].join(""),
           },
           {
             path: "packages/runner/src/legacy-diff.ts",
@@ -1124,6 +1160,63 @@ const BUILDERS: Record<CapabilityUiShotSlug, () => CapabilityIssueThreadSnapshot
   },
 };
 
+type ProviderFixtureFamily = Extract<CapabilityThreadItem, { kind: "provider_activity" }>["family"];
+
+const PROVIDER_SCENARIOS: Record<string, { family: ProviderFixtureFamily; eventType: string; title: string; payload: Record<string, CapabilityJsonValue> }> = {
+  "pe-structured-plan": { family: "plan", eventType: "plan.updated", title: "Plan", payload: { schema: "paperclip.plan.updated.v1", planId: "plan-1", revision: 2, explanation: "Implementation plan regenerated after review.", complete: true, syncStatus: "conflict", documentRevision: 4, steps: [{ stepId: "step-1", body: "Add canonical schemas", status: "completed" }, { stepId: "step-2", body: "Wire provider normalization", status: "in_progress" }, { stepId: "step-3", body: "Resolve concurrent plan edit", status: "blocked" }] } },
+  "te-command-execution": { family: "tool_execution", eventType: "tool.execution.completed", title: "Run", payload: { schema: "paperclip.tool.execution.v1", executionId: "exec-1", transport: "process", operation: "execute", name: "pnpm test", target: null, namespace: null, readOnly: false, status: "completed", durationMs: 1842, exitCode: 0, progress: null, output: "Tests: 48 passed\nOutput retained at the canonical boundary.", outputBytes: 58, outputTruncated: false, outputDigest: "sha256:fixture" } },
+  "mp-mcp-progress": { family: "tool_execution", eventType: "tool.execution.progressed", title: "MCP · search_tasks", payload: { schema: "paperclip.tool.execution.v1", executionId: "mcp-1", transport: "mcp", operation: "search", name: "search_tasks", target: null, namespace: "paperclip", readOnly: true, status: "running", durationMs: 340, exitCode: null, progress: "Scanned 18 authorized tasks", output: "", outputBytes: 0, outputTruncated: false, outputDigest: "sha256:fixture" } },
+  "rs-web-research": { family: "research", eventType: "research.completed", title: "Research", payload: { schema: "paperclip.research.v1", researchId: "research-1", action: "search", status: "completed", query: "PRP event streaming", url: null, pattern: null, sources: [{ sourceId: "source-1", url: "https://example.com/prp", title: "Protocol notes", snippet: "Provider-reported source excerpt." }, { sourceId: "source-bad", url: null, title: "Unavailable malformed source", snippet: null }] } },
+  "da-subagent-delegation": { family: "delegation", eventType: "delegation.updated", title: "Delegation", payload: { schema: "paperclip.delegation.v1", delegationId: "delegate-1", action: "wait", status: "waiting", children: [{ childId: "child-1", role: "Protocol mapper", model: "gpt-5", status: "completed", summary: "Mapped notifications", activitySummary: "12 events" }, { childId: "child-2", role: "UI verifier", model: "gpt-5", status: "running", summary: "Checking mobile layout", activitySummary: "2 scenarios" }] } },
+  "mr-model-routing": { family: "model_identity", eventType: "model.route.changed", title: "Model rerouted", payload: { schema: "paperclip.model.route_changed.v1", routeId: "route-1", provider: "openai", requestedModel: "gpt-5", fromModel: "gpt-5", effectiveModel: "gpt-5.1", reason: "Capacity routing", usageBoundaryId: "usage-2" } },
+  "cc-context-compaction": { family: "context", eventType: "context.compacted", title: "Context compacted", payload: { schema: "paperclip.context.compacted.v1", compactionId: "compact-1", reason: "context window", preTokens: 118000, postTokens: 32000, sameSession: true } },
+  "ag-generated-artifact": { family: "artifact", eventType: "artifact.generated", title: "Generated artifact", payload: { schema: "paperclip.artifact.generated.v1", artifactId: "artifact-1", status: "completed", reference: "artifacts/architecture.png", mediaType: "image/png", registered: true, transparentBackground: false, failure: null } },
+  "rv-review-mode": { family: "review", eventType: "review.mode.changed", title: "Provider review mode", payload: { schema: "paperclip.review.mode_changed.v1", reviewId: "review-1", state: "entered", scope: "workspace changes" } },
+  "hk-hook-lifecycle": { family: "hook", eventType: "hook.completed", title: "Hook", payload: { schema: "paperclip.hook.v1", hookId: "hook-1", event: "post-tool", scope: "workspace", status: "failed", blocking: true, durationMs: 81, summary: "Formatting policy rejected the change." } },
+  "mc-memory-citations": { family: "memory", eventType: "memory.citation.referenced", title: "Memory citation", payload: { schema: "paperclip.memory.citation.v1", citationId: "citation-1", messageItemId: "message-1", label: "Prior architecture decision", available: true, reference: "paperclip://memory/decision-4" } },
+  "sr-safety-review": { family: "safety", eventType: "safety.review.completed", title: "Safety review", payload: { schema: "paperclip.safety.review.v1", reviewId: "safety-1", targetExecutionId: "exec-4", status: "completed", decision: "denied", summary: "Execution requires user approval." } },
+  "ti-terminal-input": { family: "terminal", eventType: "terminal.input.sent", title: "Terminal input", payload: { schema: "paperclip.terminal.input_sent.v1", executionId: "exec-5", origin: "agent", inputClass: "control", byteCount: 1 } },
+  "wt-intentional-wait": { family: "wait", eventType: "wait.completed", title: "Intentional wait", payload: { schema: "paperclip.wait.v1", waitId: "wait-1", reason: "timer", status: "interrupted", plannedDurationMs: 30000, elapsedDurationMs: 8200 } },
+  "pn-provider-notices": { family: "provider_notice", eventType: "provider.notice.recorded", title: "Provider notice", payload: { schema: "paperclip.provider.notice.v1", noticeId: "notice-1", severity: "warning", category: "deprecation", scope: "environment", recoverable: true, userActionable: false, summary: "A provider option is deprecated; the turn can continue." } },
+  "cm-stream-reconcile": { family: "model_identity", eventType: "managed_agent.message.reconciled", title: "Claude Agent stream reconciliation", payload: { provider: "claude_managed", driver: "claude_managed_agents_api", executionKind: "remote_service", providerSessionId: "session_managed_01", preview: "Draft response…", authoritative: "Authoritative response from the buffered agent.message event.", replacedPreview: true, summary: "The authoritative Managed Agent message replaced its provisional preview." } },
+  "cm-session-continuity": { family: "context", eventType: "managed_agent.session.continued", title: "Managed session continuity", payload: { providerSessionId: "session_managed_01", paperclipRuns: ["run-managed-1", "run-managed-2"], runnerPid: 48121, providerPid: null, warmTurnMs: 612, summary: "Two Paperclip runs used one Anthropic cloud session with isolated run authority." } },
+  "cm-tool-read": { family: "tool_execution", eventType: "semantic_tool.result", title: "Authorized managed read", payload: { schema: "paperclip.semantic_tool.result.v1", callId: "sevt_read_1", operationId: "get_task_context", status: "completed", duplicate: false, result: { identifier: "MCK-31", stateRevision: 4 }, summary: "runnerd validated and executed an authorized read without exposing Paperclip to Anthropic." } },
+  "cm-tool-mutation": { family: "tool_execution", eventType: "semantic_tool.result", title: "Authorized managed mutation", payload: { schema: "paperclip.semantic_tool.result.v1", callId: "sevt_write_1", operationId: "report_progress", status: "completed", duplicate: false, result: { stateRevision: 5 }, summary: "The mutation and structured completion were committed under the attached run authority." } },
+  "cm-completion-control": { family: "review", eventType: "managed_agent.completion.controlled", title: "Finish, block, and yield", payload: { accepted: "finish_task", alternatives: ["block_task", "yield_turn"], endTurnAloneAccepted: false, summary: "Governed runs require an accepted structured disposition; free chat may end normally." } },
+  "cm-tool-denied": { family: "safety", eventType: "semantic_tool.denied", title: "Managed tool rejected", payload: { operationId: "agents.create", reasons: ["not in attached catalog", "malformed input rejected before execution"], paperclipExecuted: false, status: "failed", summary: "Unknown and schema-invalid custom tools fail closed at runnerd." } },
+  "cm-tool-duplicate-delivery": { family: "tool_execution", eventType: "semantic_tool.delivery.reconciled", title: "Duplicate-safe tool delivery", payload: { toolUseEventId: "sevt_tool_44", executionCount: 1, deliveryAttempts: 2, pendingAfterReconcile: false, summary: "An ambiguous result POST was reconciled without re-running the Paperclip mutation." } },
+  "cm-sse-recovery": { family: "context", eventType: "managed_agent.stream.recovered", title: "SSE recovery", payload: { cursor: "sevt_208", replayedEvents: 3, duplicateEventsIgnored: 2, streamOpenedBeforeHistory: true, summary: "runnerd reopened preview streaming, replayed durable history, and deduplicated by remote event ID." } },
+  "cm-interrupt": { family: "provider_notice", eventType: "managed_agent.turn.interrupted", title: "Managed turn interrupted", payload: { interruptCorrelationId: "interrupt-7", phases: ["generation", "waiting_for_tool"], providerStopReason: "end_turn", status: "interrupted", recoverable: true, summary: "Local correlation preserves interruption semantics even when Anthropic reports ordinary end_turn." } },
+  "cm-warm-restore": { family: "context", eventType: "managed_agent.session.restored", title: "Warm suspension and cold restore", payload: { providerSessionId: "session_managed_01", warmRunnerReused: true, runnerRestarted: true, providerSessionReused: true, summary: "The SSE connection was suspended while the Anthropic session remained idle and resumable." } },
+  "cm-budget": { family: "provider_notice", eventType: "managed_agent.budget.updated", title: "Managed session spend cap", payload: { currency: "USD", cumulativeCost: 1, priorCap: 1, raisedCap: 2, monotonic: true, status: "completed", recoverable: true, summary: "Budget exhaustion paused the chat; an authorized monotonic increase resumed the same turn." } },
+  "cm-terminated-deleted": { family: "provider_notice", eventType: "managed_agent.session.deleted", title: "Terminated and deleted remote session", payload: { terminatedResumable: false, deletionConfirmed: true, remote404IsSuccess: true, localPointerRemovedAfterRemoteSuccess: true, summary: "Explicit deletion is irreversible; ordinary close and suspend remain resumable." } },
+  "cm-provisioning-auth": { family: "provider_notice", eventType: "managed_agent.profile.qualified", title: "Provisioning and retention", payload: { betaVersion: "managed-agents-2026-04-01", environmentNetworking: "limited", allowedHosts: [], builtInTools: [], mcpServers: [], retentionAcknowledged: true, authentication: "secret reference", summary: "A read-only probe verified the pinned Agent, version, Environment, model, and account capability." } },
+  "cm-redacted-failure": { family: "provider_notice", eventType: "managed_agent.failure.redacted", title: "Redacted remote failure", payload: { severity: "error", category: "authentication", recoverable: true, userActionable: true, redactedFields: ["x-api-key", "authorization", "request headers"], retainedRemoteObject: false, summary: "Anthropic credentials and raw error objects were removed before durable evidence." } },
+  "cm-provider-labels": { family: "model_identity", eventType: "managed_agent.identity.displayed", title: "Provider-neutral labels", payload: { label: "Claude Agent", providerRuntime: "Anthropic cloud", runnerPid: 48121, providerPid: null, workingLabel: "Claude Agent is working", forbiddenLabelsAbsent: ["Real Codex", "Codex is thinking", "Claude Code"], summary: "The Lab distinguishes the local runner process from the remote provider runtime." } },
+};
+
+function providerScenario(slug: string, spec: (typeof PROVIDER_SCENARIOS)[string]): CapabilityIssueThreadSnapshot {
+  const snapshot = baseline();
+  snapshot.issue.fixtureProfile = slug;
+  snapshot.issue.scenarioId = slug;
+  snapshot.issue.title = `${spec.title} event UX`;
+  const turn = lastTurn(snapshot);
+  const base = spec.payload;
+  turn.items.push(
+    { kind: "provider_activity", id: `${slug}-active`, at: at(4, 10), family: spec.family, eventType: spec.eventType.replace(/completed$/, "started"), status: "running", title: spec.title, summary: "Activity started", payload: { ...base, status: "running" }, evidenceRef: { section: "runner", recordId: `${slug}-e1` } },
+    { kind: "provider_activity", id: `${slug}-final`, at: at(4, 20), family: spec.family, eventType: spec.eventType, status: spec.payload.status === "failed" ? "failed" : spec.payload.status === "interrupted" ? "interrupted" : "completed", title: spec.title, summary: typeof spec.payload.summary === "string" ? spec.payload.summary : "Activity completed", payload: base, evidenceRef: { section: "runner", recordId: `${slug}-e2` } },
+  );
+  snapshot.evidence.runner.push(
+    { id: `${slug}-e1`, turnId: turn.id, kind: spec.eventType, ordinal: snapshot.evidence.runner.length + 1, detail: `${spec.title} · active`, details: [{ label: "State", value: "running" }] },
+    { id: `${slug}-e2`, turnId: turn.id, kind: spec.eventType, ordinal: snapshot.evidence.runner.length + 2, detail: `${spec.title} · terminal`, details: [{ label: "Event", value: spec.eventType }] },
+  );
+  return snapshot;
+}
+
+for (const [slug, spec] of Object.entries(PROVIDER_SCENARIOS)) {
+  BUILDERS[slug as CapabilityUiShotSlug] = () => providerScenario(slug, spec);
+}
+
 /** Deterministic dependency-free `fake` snapshot for a screenshot slug. */
 export function capabilityIssueThreadFixture(
   slug: string = "thread-baseline",
@@ -1133,9 +1226,10 @@ export function capabilityIssueThreadFixture(
     ? "workspace-file-changes"
     : slug === "thread-baseline" && fixtureProfile === "fr-file-reference"
       ? "workspace-file-reference"
+    : fixtureProfile in PROVIDER_SCENARIOS ? fixtureProfile
     : slug;
   const build = BUILDERS[effectiveSlug as CapabilityUiShotSlug] ?? BUILDERS["thread-baseline"];
-  const snapshot = build();
+  const snapshot = build!();
   snapshot.issue.fixtureProfile = fixtureProfile;
   return snapshot;
 }

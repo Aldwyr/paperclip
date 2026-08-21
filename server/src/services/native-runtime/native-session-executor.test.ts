@@ -28,11 +28,42 @@ vi.mock("@paperclipai/paperclip-runner", () => ({
 }));
 
 import {
+  buildNativeProviderEnvironment,
   cancelNativeSession,
   executePaperclipNativeSession,
   nativeSessionFailureDisposition,
   nativeSessionFailureSourceCode,
+  providerPlanMarkdown,
 } from "./native-session-executor.js";
+
+describe("native provider bootstrap environment", () => {
+  it("inherits the host executable and credential-home context", () => {
+    expect(buildNativeProviderEnvironment({}, {
+      PATH: "/opt/homebrew/bin:/usr/bin",
+      HOME: "/Users/runner",
+      CODEX_HOME: "/Users/runner/.codex",
+      PAPERCLIP_INTERNAL_SECRET: "must-not-leak",
+    })).toEqual({
+      PATH: "/opt/homebrew/bin:/usr/bin",
+      HOME: "/Users/runner",
+      CODEX_HOME: "/Users/runner/.codex",
+    });
+  });
+
+  it("lets explicitly configured agent env override host defaults", () => {
+    expect(buildNativeProviderEnvironment({
+      PATH: "/agent/bin",
+      OPENAI_API_KEY: "configured-provider-key",
+    }, {
+      PATH: "/host/bin",
+      HOME: "/Users/runner",
+    })).toEqual({
+      PATH: "/agent/bin",
+      HOME: "/Users/runner",
+      OPENAI_API_KEY: "configured-provider-key",
+    });
+  });
+});
 
 const execution = {
   provider: { kind: "codex", model: null },
@@ -44,6 +75,30 @@ const execution = {
   },
   completionContract: { id: "contract", sha256: "sha" },
 } as NativeExecutionInputV1;
+
+describe("provider plan synchronization", () => {
+  it("renders a bounded Markdown checklist without embedding provenance", () => {
+    const markdown = providerPlanMarkdown({
+      explanation: "Release safely",
+      steps: [
+        { body: "Prepare", status: "completed" },
+        { body: "Deploy", status: "in_progress" },
+        { body: "Verify", status: "blocked" },
+      ],
+      runId: "must-not-appear",
+      providerThreadId: "native-secret",
+    });
+    expect(markdown).toBe([
+      "Release safely",
+      "",
+      "- [x] Prepare",
+      "- [ ] Deploy _(in progress)_",
+      "- [ ] Verify _(blocked)_",
+    ].join("\n"));
+    expect(markdown).not.toContain("must-not-appear");
+    expect(markdown).not.toContain("native-secret");
+  });
+});
 
 function leaseDb(boundExecution: NativeExecutionInputV1 = execution): Db {
   const coordinator = {

@@ -30,11 +30,12 @@ pub enum ProviderKind {
     #[default]
     Codex,
     Opencode,
+    ClaudeManaged,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexProviderConfig {
+pub struct LocalProviderConfig {
     #[serde(default)]
     pub kind: ProviderKind,
     pub command: PathBuf,
@@ -45,21 +46,137 @@ pub struct CodexProviderConfig {
     pub instructions: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeManagedProviderConfig {
+    pub model: String,
+    pub profile_id: String,
+    pub anthropic_agent_id: String,
+    pub agent_version: String,
+    pub environment_id: String,
+    pub beta_version: String,
+    pub max_session_list_cost_usd: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProviderConfig {
+    Local(LocalProviderConfig),
+    ClaudeManaged(ClaudeManagedProviderConfig),
+}
+
+impl ProviderConfig {
+    pub fn kind(&self) -> ProviderKind {
+        match self {
+            Self::Local(config) => config.kind,
+            Self::ClaudeManaged(_) => ProviderKind::ClaudeManaged,
+        }
+    }
+
+    pub fn local_cwd(&self) -> Option<&str> {
+        match self {
+            Self::Local(config) => Some(&config.cwd),
+            Self::ClaudeManaged(_) => None,
+        }
+    }
+}
+
+impl Serialize for ProviderConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Local(config) => config.serialize(serializer),
+            Self::ClaudeManaged(config) => {
+                let mut value = serde_json::to_value(config).map_err(serde::ser::Error::custom)?;
+                value
+                    .as_object_mut()
+                    .expect("managed config serializes as an object")
+                    .insert(
+                        "kind".to_owned(),
+                        Value::String("claude_managed".to_owned()),
+                    );
+                value.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or("codex");
+        if kind == "claude_managed" {
+            value
+                .as_object_mut()
+                .expect("provider config must be an object")
+                .remove("kind");
+            serde_json::from_value(value)
+                .map(Self::ClaudeManaged)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Local)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "executionKind")]
+pub enum ProviderRuntimeIdentity {
+    #[serde(rename = "local_process")]
+    LocalProcess {
+        process_id: u32,
+        provider_session_id: String,
+    },
+    #[serde(rename = "remote_service")]
+    RemoteService {
+        service: String,
+        provider_session_id: String,
+        process_id: Option<u32>,
+    },
+}
+
 pub trait Provider {
     fn kind(&self) -> ProviderKind;
-    fn process_id(&self) -> u32;
+    fn runtime_identity(&self) -> ProviderRuntimeIdentity;
     fn session_identity(&self) -> &str;
     fn provider_session_id(&self) -> Option<&str>;
-    fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError>;
+    fn durable_event_cursor(&self) -> Option<&str> {
+        None
+    }
+    fn configure_tools(&mut self, _tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
+        Ok(())
+    }
+    fn increase_budget(&mut self, _max_list_cost_usd: f64) -> Result<Value, LocalRunnerError> {
+        Err(LocalRunnerError::invalid(
+            "provider does not support a remote session budget",
+        ))
+    }
+    fn destroy_session(&mut self) -> Result<(), LocalRunnerError> {
+        Err(LocalRunnerError::invalid(
+            "provider does not support remote session deletion",
+        ))
+    }
+    fn start_turn(
+        &mut self,
+        message: &str,
+        cwd: &str,
+        turn_id: &str,
+    ) -> Result<Value, LocalRunnerError>;
     fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError>;
     fn read(&mut self) -> Result<Value, LocalRunnerError>;
-    fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError>;
+    fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError>;
     fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError>;
     fn shutdown(&mut self) -> Result<(), LocalRunnerError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum CodexProviderEvent {
+pub enum ProviderEvent {
     ToolCall {
         call_id: String,
         operation_id: String,
@@ -91,7 +208,7 @@ impl CodexProvider {
     }
 
     pub fn start(
-        config: &CodexProviderConfig,
+        config: &LocalProviderConfig,
         tools: impl Iterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
@@ -213,10 +330,10 @@ impl CodexProvider {
         )
     }
 
-    pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+    pub fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
         let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
             return if self.process.try_wait()?.is_some() {
-                Ok(Some(CodexProviderEvent::Exited))
+                Ok(Some(ProviderEvent::Exited))
             } else {
                 Ok(None)
             };
@@ -245,7 +362,7 @@ impl CodexProvider {
             }
             self.pending_tool_requests
                 .insert(call_id.clone(), message["id"].clone());
-            return Ok(Some(CodexProviderEvent::ToolCall {
+            return Ok(Some(ProviderEvent::ToolCall {
                 call_id,
                 operation_id,
                 input: params.get("arguments").cloned().unwrap_or(Value::Null),
@@ -257,7 +374,7 @@ impl CodexProvider {
                 let result = params.get("result").cloned().ok_or_else(|| {
                     LocalRunnerError::invalid("OpenCode semantic result omitted result")
                 })?;
-                return Ok(Some(CodexProviderEvent::SemanticResult {
+                return Ok(Some(ProviderEvent::SemanticResult {
                     result,
                     item_id: params
                         .get("itemId")
@@ -265,7 +382,7 @@ impl CodexProvider {
                         .map(str::to_owned),
                 }));
             }
-            return Ok(Some(CodexProviderEvent::Notification {
+            return Ok(Some(ProviderEvent::Notification {
                 method: method.to_owned(),
                 params: message.get("params").cloned().unwrap_or(Value::Null),
             }));
@@ -276,17 +393,20 @@ impl CodexProvider {
     pub fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
         let request_id = self
             .pending_tool_requests
-            .remove(&result.call_id)
+            .get(&result.call_id)
+            .cloned()
             .ok_or_else(|| {
                 LocalRunnerError::invalid("Codex tool result has no pending JSON-RPC request")
             })?;
         self.process.send(&json!({
             "id": request_id,
             "result": {
-                "success": true,
+                "success": !result.is_error,
                 "contentItems": [{"type": "inputText", "text": serde_json::to_string(&result.result).unwrap_or_else(|_| "null".to_owned())}]
             }
-        }))
+        }))?;
+        self.pending_tool_requests.remove(&result.call_id);
+        Ok(())
     }
 
     /// Stops the provider process group at an explicit runner lifecycle boundary.
@@ -328,8 +448,11 @@ impl Provider for CodexProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
     }
-    fn process_id(&self) -> u32 {
-        CodexProvider::process_id(self)
+    fn runtime_identity(&self) -> ProviderRuntimeIdentity {
+        ProviderRuntimeIdentity::LocalProcess {
+            process_id: CodexProvider::process_id(self),
+            provider_session_id: self.thread_id().to_owned(),
+        }
     }
     fn session_identity(&self) -> &str {
         self.thread_id()
@@ -337,7 +460,12 @@ impl Provider for CodexProvider {
     fn provider_session_id(&self) -> Option<&str> {
         self.session_id()
     }
-    fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
+    fn start_turn(
+        &mut self,
+        message: &str,
+        cwd: &str,
+        _turn_id: &str,
+    ) -> Result<Value, LocalRunnerError> {
         CodexProvider::start_turn(self, message, cwd)
     }
     fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
@@ -346,7 +474,7 @@ impl Provider for CodexProvider {
     fn read(&mut self) -> Result<Value, LocalRunnerError> {
         self.read_thread()
     }
-    fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+    fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
         CodexProvider::poll(self)
     }
     fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {

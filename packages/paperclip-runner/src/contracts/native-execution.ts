@@ -27,6 +27,24 @@ export type NativeSessionLifecyclePolicy =
   | { mode: "per_turn"; idleTimeoutMs: null }
   | { mode: "warm"; idleTimeoutMs: number };
 
+export interface NativeManagedAgentProfileSnapshot {
+  profileId: string;
+  anthropicAgentId: string;
+  agentVersion: string;
+  environmentId: string;
+  betaVersion: "managed-agents-2026-04-01";
+}
+
+export type NativeProviderConfig =
+  | { kind: "codex"; model: string | null }
+  | { kind: "opencode"; model: string }
+  | {
+      kind: "claude_managed";
+      model: string;
+      managedProfile: NativeManagedAgentProfileSnapshot;
+      maxSessionListCostUsd: number;
+    };
+
 export interface NativeExecutionInputV1 {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
   binding: {
@@ -52,14 +70,11 @@ export interface NativeExecutionInputV1 {
   };
   session: {
     normalizedSessionId: string | null;
-    driverKind: "codex_app_server" | "opencode_server";
+    driverKind: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
     protocolVersion: 1;
     lifecyclePolicy: NativeSessionLifecyclePolicy;
   };
-  provider: {
-    kind: "codex" | "opencode";
-    model: string | null;
-  };
+  provider: NativeProviderConfig;
   completionContract: {
     id: string;
     sha256: string;
@@ -74,7 +89,8 @@ export interface NativeExecutionInputV1 {
 export interface NativeModelEnvelopeV1 {
   schema: typeof NATIVE_MODEL_ENVELOPE_SCHEMA;
   task: NativeExecutionInputV1["task"];
-  workspace: Pick<NativeExecutionInputV1["workspace"], "cwd">;
+  /** Remote providers have no Paperclip workspace mounted in their service. */
+  workspace: Pick<NativeExecutionInputV1["workspace"], "cwd"> | null;
   completionContract: StrictCompletionContractInput;
   interactionResponses: NativeInteractionResponseEnvelope[];
 }
@@ -164,7 +180,11 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
 
   if (task.workMode !== "standard") throw new NativeExecutionInputError("input.task.workMode must be standard");
   if (
-    (session.driverKind !== "codex_app_server" && session.driverKind !== "opencode_server")
+    (
+      session.driverKind !== "codex_app_server"
+      && session.driverKind !== "opencode_server"
+      && session.driverKind !== "claude_managed_agents_api"
+    )
     || session.protocolVersion !== 1
   ) {
     throw new NativeExecutionInputError("input.session must select a supported protocol version 1 driver");
@@ -190,13 +210,20 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
   const provider = input.provider === undefined
     ? { kind: "codex", model: null }
     : record(input.provider, "input.provider");
-  exactKeys(provider, ["kind", "model"], "input.provider");
-  if (provider.kind !== "codex" && provider.kind !== "opencode") {
-    throw new NativeExecutionInputError("input.provider.kind must be codex or opencode");
+  if (provider.kind !== "codex" && provider.kind !== "opencode" && provider.kind !== "claude_managed") {
+    throw new NativeExecutionInputError("input.provider.kind must be codex, opencode, or claude_managed");
   }
+  exactKeys(
+    provider,
+    provider.kind === "claude_managed"
+      ? ["kind", "model", "managedProfile", "maxSessionListCostUsd"]
+      : ["kind", "model"],
+    "input.provider",
+  );
   if (
     (provider.kind === "codex" && session.driverKind !== "codex_app_server")
     || (provider.kind === "opencode" && session.driverKind !== "opencode_server")
+    || (provider.kind === "claude_managed" && session.driverKind !== "claude_managed_agents_api")
   ) {
     throw new NativeExecutionInputError("input.provider.kind does not match input.session.driverKind");
   }
@@ -205,6 +232,49 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     : text(provider.model, "input.provider.model");
   if (provider.kind === "opencode" && (providerModel === null || !providerModel.includes("/"))) {
     throw new NativeExecutionInputError("input.provider.model is required for opencode in provider/model form");
+  }
+  let parsedProvider: NativeProviderConfig;
+  if (provider.kind === "claude_managed") {
+    if (providerModel === null) {
+      throw new NativeExecutionInputError("input.provider.model is required for claude_managed");
+    }
+    const managedProfile = record(provider.managedProfile, "input.provider.managedProfile");
+    exactKeys(
+      managedProfile,
+      ["profileId", "anthropicAgentId", "agentVersion", "environmentId", "betaVersion"],
+      "input.provider.managedProfile",
+    );
+    if (managedProfile.betaVersion !== "managed-agents-2026-04-01") {
+      throw new NativeExecutionInputError(
+        "input.provider.managedProfile.betaVersion must be managed-agents-2026-04-01",
+      );
+    }
+    if (
+      typeof provider.maxSessionListCostUsd !== "number"
+      || !Number.isFinite(provider.maxSessionListCostUsd)
+      || provider.maxSessionListCostUsd <= 0
+    ) {
+      throw new NativeExecutionInputError("input.provider.maxSessionListCostUsd must be a positive finite number");
+    }
+    parsedProvider = {
+      kind: "claude_managed",
+      model: providerModel,
+      managedProfile: {
+        profileId: text(managedProfile.profileId, "input.provider.managedProfile.profileId"),
+        anthropicAgentId: text(
+          managedProfile.anthropicAgentId,
+          "input.provider.managedProfile.anthropicAgentId",
+        ),
+        agentVersion: text(managedProfile.agentVersion, "input.provider.managedProfile.agentVersion"),
+        environmentId: text(managedProfile.environmentId, "input.provider.managedProfile.environmentId"),
+        betaVersion: "managed-agents-2026-04-01",
+      },
+      maxSessionListCostUsd: provider.maxSessionListCostUsd,
+    };
+  } else if (provider.kind === "opencode") {
+    parsedProvider = { kind: "opencode", model: providerModel! };
+  } else {
+    parsedProvider = { kind: "codex", model: providerModel };
   }
   if (!Array.isArray(contract.criteria) || contract.criteria.length === 0) {
     throw new NativeExecutionInputError("input.completionContract.contract.criteria must not be empty");
@@ -274,10 +344,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
       protocolVersion: 1,
       lifecyclePolicy,
     },
-    provider: {
-      kind: provider.kind,
-      model: providerModel,
-    },
+    provider: parsedProvider,
     completionContract: {
       id: text(completionContract.id, "input.completionContract.id"),
       sha256: text(completionContract.sha256, "input.completionContract.sha256"),
@@ -297,7 +364,7 @@ export function buildNativeModelEnvelope(input: NativeExecutionInputV1): NativeM
   return {
     schema: NATIVE_MODEL_ENVELOPE_SCHEMA,
     task: structuredClone(input.task),
-    workspace: { cwd: input.workspace.cwd },
+    workspace: input.provider.kind === "claude_managed" ? null : { cwd: input.workspace.cwd },
     completionContract: structuredClone(input.completionContract.contract),
     interactionResponses: structuredClone(input.interactionResponses),
   };

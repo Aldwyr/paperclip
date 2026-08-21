@@ -656,8 +656,11 @@ function turnStreamBody(payload: unknown, interim: unknown[] = []): string {
 async function stubCleanRoom(page: Page, identifiers: string[]) {
   let opened = 0;
   await page.route(CLEAN_ROOM_API, async (route) => {
-    const identifier = identifiers[Math.min(opened, identifiers.length - 1)] ?? "MCK-1000";
-    opened += 1;
+    const requestedSessionId = new URL(route.request().url()).searchParams.get("sessionId");
+    const identifier = requestedSessionId?.replace(/^session-/, "")
+      ?? identifiers[Math.min(opened, identifiers.length - 1)]
+      ?? "MCK-1000";
+    if (requestedSessionId === null) opened += 1;
     await route.fulfill({
       status: route.request().method() === "POST" ? 201 : 200,
       contentType: "application/json",
@@ -698,6 +701,40 @@ test.describe("Capability clean-room chat", () => {
     await expect(chips.getByTestId("runner-chip")).toContainText("Real runnerd");
     await expect(chips.getByTestId("control-plane-chip")).toHaveText("Mock Paperclip");
     await expect(page.locator('[data-composer-state="ready"]')).toHaveCount(1);
+  });
+
+  test("Claude Agent options and remote-runtime controls use provider-neutral labels", async ({ page }) => {
+    await page.addInitScript(() => window.localStorage.clear());
+    await page.route(CLEAN_ROOM_API, async (route) => {
+      const payload = cleanRoomPayload("MCK-1401");
+      payload.view.identity = {
+        ...payload.view.identity,
+        agentLabel: "Real Claude Agent",
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...payload,
+          configuration: {
+            provider: "claude_managed",
+            model: "claude-sonnet-5",
+            managedProfileId: "qualified",
+            maxSessionListCostUsd: 1,
+            lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+          },
+        }),
+      });
+    });
+    await page.goto("/#/chat");
+    await expect(page.locator('[data-thread-state="settled"]')).toBeVisible();
+
+    await expect(page.getByTestId("agent-chip")).toHaveText("Real Claude Agent");
+    await expect(page.getByTestId("chat-active-harness")).toContainText("Anthropic cloud · no provider PID");
+    await expect(page.getByTestId("chat-managed-increase-budget")).toBeVisible();
+    await expect(page.getByTestId("chat-managed-delete-session")).toBeVisible();
+    await expect(page.getByTestId("chat-managed-retention-notice")).toContainText("not eligible for ZDR or HIPAA");
+    await expect(page.locator("body")).not.toContainText("Codex is thinking");
   });
 
   test("evidence stays collapsed until it is asked for", async ({ page }) => {
@@ -829,9 +866,9 @@ test.describe("Capability clean-room chat", () => {
 
     await history.getByRole("button", { name: /MCK-1000/ }).click();
     await expect(page.locator(".pit-identifier")).toHaveText("MCK-1000");
-    await expect(page.getByTestId("composer-reason")).toHaveText("Historical session is read-only");
+    await expect(page.locator("#composer-input")).toBeEnabled();
 
-    await history.getByRole("button", { name: /MCK-2000.*current/ }).click();
+    await history.getByRole("button", { name: /MCK-2000/ }).click();
     await expect(page.locator(".pit-identifier")).toHaveText("MCK-2000");
     await expect(page.locator("#composer-input")).toBeEnabled();
   });
@@ -852,7 +889,7 @@ test.describe("Capability clean-room chat", () => {
 
     const error = page.getByTestId("surface-error");
     await expect(error).toBeVisible();
-    await expect(error).toContainText("could not start a real Codex session");
+    await expect(error).toContainText("could not start the selected provider");
     await expect(page.getByTestId("surface-error-retry")).toBeVisible();
     await expect(page.locator("[data-turn-id]")).toHaveCount(0);
   });

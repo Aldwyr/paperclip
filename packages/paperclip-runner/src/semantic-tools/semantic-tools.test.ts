@@ -286,6 +286,7 @@ describe("Capability semantic catalog and authorization", () => {
       input: { idempotencyKey: "progress-1", body: "Semantic catalog is active." },
     });
     expect(progress).toMatchObject({ ok: true });
+    expect(JSON.stringify(progress)).not.toContain("commandKind");
     expect(adapter.snapshot().comments).toEqual([
       expect.objectContaining({ body: "Semantic catalog is active." }),
     ]);

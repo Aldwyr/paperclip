@@ -140,6 +140,31 @@ function createRequestConfirmation(
 }
 
 describe("buildAssistantPartsFromTranscript", () => {
+  it("keeps canonical provider activity structured for the task-thread widget", () => {
+    const result = buildAssistantPartsFromTranscript([{
+      kind: "provider_activity",
+      ts: "2026-08-21T12:00:00.000Z",
+      family: "plan",
+      eventType: "plan.updated",
+      status: "completed",
+      title: "Plan",
+      summary: "Plan synchronized",
+      payload: { steps: [{ stepId: "s1", body: "Validate schemas", status: "completed" }] },
+    }]);
+    expect(result.parts).toHaveLength(1);
+    expect(result.parts[0]).toMatchObject({
+      type: "tool-call",
+      toolName: "paperclip_provider_activity",
+      args: {
+        family: "plan",
+        eventType: "plan.updated",
+        payload: { steps: [{ body: "Validate schemas" }] },
+      },
+      result: { status: "completed" },
+    });
+    expect(JSON.stringify(result.parts)).not.toContain("reasoning");
+  });
+
   it("maps assistant text, reasoning, and tool activity while omitting noisy stderr", () => {
     const result = buildAssistantPartsFromTranscript([
       { kind: "assistant", ts: "2026-04-06T12:00:00.000Z", text: "Working on it. " },

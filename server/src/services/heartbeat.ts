@@ -85,6 +85,7 @@ export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import {
+  buildNativeProviderEnvironment,
   buildNativeExecutionInput,
   cancelNativeSession,
   dispatchNativeSessionResumptions,
@@ -303,6 +304,7 @@ import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-loc
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
+import { managedAgentProfileService } from "./managed-agent-profiles.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
@@ -14062,6 +14064,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
+    let nativeSessionResumeScheduled = false;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -15923,6 +15926,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             agentId: agent.id,
             interactionIds: interactionId ? [interactionId] : [],
           });
+          const managedProfile = nativeRuntimeResolution.profile.backend === "claude_managed_agents_api"
+            ? await managedAgentProfileService(db).requireQualified(
+                agent.companyId,
+                readNonEmptyString(parseObject(runtimeConfig).managedProfileId) ?? "",
+              )
+            : null;
+          if (managedProfile) {
+            const rawApiKeyBinding = parseObject(parseObject(agent.adapterConfig).env).ANTHROPIC_API_KEY;
+            const boundSecretId = typeof rawApiKeyBinding === "object" && rawApiKeyBinding !== null
+              ? readNonEmptyString((rawApiKeyBinding as Record<string, unknown>).secretId)
+              : null;
+            if (boundSecretId !== managedProfile.apiKeySecretId) {
+              throw new ConfigurationIncompleteFailure(
+                "configuration incomplete: Claude Agent profile API key is not bound at env.ANTHROPIC_API_KEY",
+                {
+                  configurationIncomplete: {
+                    reason: "managed_agent_profile_secret_binding_mismatch",
+                    companyId: agent.companyId,
+                    agentId: agent.id,
+                    profileId: managedProfile.id,
+                    requiredEnvKeys: ["ANTHROPIC_API_KEY"],
+                  },
+                },
+              );
+            }
+          }
           nativeExecution = buildNativeExecutionInput({
             companyId: agent.companyId,
             runId: run.id,
@@ -15941,11 +15970,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               branchName: executionWorkspace.branchName,
             },
             normalizedSessionId: nativeSessionId,
-            provider: nativeRuntimeResolution.profile.backend === "opencode_server" ? "opencode" : "codex",
-            model: typeof parseObject(agent.adapterConfig).model === "string"
-              ? String(parseObject(agent.adapterConfig).model)
-              : null,
-            lifecyclePolicy: parseObject(agent.adapterConfig).lifecycleMode === "warm"
+            provider: nativeRuntimeResolution.profile.backend === "opencode_server"
+              ? "opencode"
+              : nativeRuntimeResolution.profile.backend === "claude_managed_agents_api"
+                ? "claude_managed"
+                : "codex",
+            model: typeof parseObject(runtimeConfig).model === "string"
+              ? String(parseObject(runtimeConfig).model)
+              : managedProfile?.defaultModel ?? null,
+            ...(nativeRuntimeResolution.profile.backend === "claude_managed_agents_api" ? {
+              managedProfile: {
+                profileId: managedProfile!.id,
+                anthropicAgentId: managedProfile!.anthropicAgentId,
+                agentVersion: managedProfile!.agentVersion,
+                environmentId: managedProfile!.environmentId,
+                betaVersion: "managed-agents-2026-04-01" as const,
+              },
+              maxSessionListCostUsd: Number(
+                parseObject(runtimeConfig).maxSessionListCostUsd
+                  ?? managedProfile!.defaultMaxListCostCents / 100,
+              ),
+            } : {}),
+            lifecyclePolicy: parseObject(runtimeConfig).lifecycleMode === "warm"
               ? {
                   mode: "warm",
                   idleTimeoutMs: Number.isSafeInteger(parseObject(agent.adapterConfig).idleTimeoutMs)
@@ -16223,6 +16269,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             backend: options.nativeSessionBackendFactory?.(nativeExecution),
             useRunnerd: agent.adapterType === "paperclip_runner",
             onLog,
+            // Bootstrap the provider with executable/home discovery while
+            // keeping the agent's configured provider values authoritative.
+            runnerEnvironment: buildNativeProviderEnvironment(adapterEnv),
             onSpawn: async (meta) => {
               await persistRunProcessMetadata(run.id, meta);
             },
@@ -16306,7 +16355,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .limit(1)
               .then((rows) => rows[0]?.phase === "retryable_failure" && rows[0]?.resultId === null)
           : false;
-        if (nativeResumeScheduled) throw new NativeSessionResumeScheduledError(adapterErr);
+        if (nativeResumeScheduled) {
+          nativeSessionResumeScheduled = true;
+          throw new NativeSessionResumeScheduledError(adapterErr);
+        }
         // Adapter (or its restore finally) threw — or the finalize record
         // write itself threw. Either way the workspace may be in a partial
         // state. Best-effort record finalize=failed so the dependent readiness
@@ -17058,7 +17110,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // terminal". When the teardown reaches this point with the run still
           // running or queued, force a terminal status before the lease is
           // released, so the UI never shows a finished task as "Live".
-          if (latestRun) {
+          if (latestRun && !nativeSessionResumeScheduled) {
             latestRun = await terminalizeRunOnLeaseRelease(latestRun).catch((terminalizeErr) => {
               logger.error(
                 { err: terminalizeErr, runId: run.id },
@@ -17067,14 +17119,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               return latestRun;
             });
           }
-          await releaseEnvironmentLeasesForRun({
-            runId: run.id,
-            companyId: run.companyId,
-            agentId: run.agentId,
-            status: latestRun?.status,
-            failureReason: latestRun?.error ?? undefined,
-          });
-          await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          if (!nativeSessionResumeScheduled) {
+            await releaseEnvironmentLeasesForRun({
+              runId: run.id,
+              companyId: run.companyId,
+              agentId: run.agentId,
+              status: latestRun?.status,
+              failureReason: latestRun?.error ?? undefined,
+            });
+            await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          }
           if (runScratch && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
             const scratchForCleanup = runScratch;
             let scratchCleanup: Awaited<ReturnType<typeof cleanupHeartbeatRunScratch>> | null = null;
@@ -17128,7 +17182,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
           activeRunExecutions.delete(run.id);
-          await startNextQueuedRunForAgent(run.agentId);
+          if (!nativeSessionResumeScheduled) {
+            await startNextQueuedRunForAgent(run.agentId);
+          }
         }
   }
 

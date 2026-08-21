@@ -25,6 +25,10 @@ import type { NativeSessionCapabilities, NativeUserMessage } from "../../contrac
 import type { PrpEvent, PrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
+import {
+  canonicalProviderEventsFromOpenCodePart,
+  providerFamilyCapabilities,
+} from "../../provider-events.js";
 import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge, type OpenCodeMcpBridge } from "./mcp-bridge.js";
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
@@ -49,6 +53,8 @@ export interface OpenCodeServerDriverOptions {
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   dynamicToolHandler?: DynamicToolHandler;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  /** Keep false when an outer supervisor already owns the process group. */
+  isolateProcessGroup?: boolean;
   onDiagnostic?: (message: string) => void;
   fetch?: typeof globalThis.fetch;
   now?: () => Date;
@@ -67,6 +73,14 @@ interface OpenCodeRuntime {
 const CAPABILITIES: NativeSessionCapabilities = {
   resume: true,
   typedEvents: true,
+  typedEventFamilies: providerFamilyCapabilities({
+    tool_execution: "available",
+    research: "available",
+    delegation: "available",
+    context: "available",
+    artifact: "policy_disabled",
+    provider_notice: "available",
+  }),
   steering: false,
   interruption: true,
   structuredResult: true,
@@ -521,6 +535,16 @@ class OpenCodeHarnessSession implements HarnessSession {
       return;
     }
     if (type === "session.error" && turnId) {
+      this.#emit("provider.notice.recorded", {
+        schema: "paperclip.provider.notice.v1",
+        noticeId: `${turnId}:session-error`,
+        severity: "error",
+        category: "session_error",
+        scope: "turn",
+        recoverable: false,
+        userActionable: true,
+        summary: redact(text(record(properties.error).message, "OpenCode session failed."), this.#runtime.sensitiveValues).slice(0, 4000),
+      }, { turnId, itemId: `${turnId}:session-error` });
       this.#emit("turn.failed", { status: "failed", error: bounded(properties.error ?? properties) }, { turnId });
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#activeTurnId = null;
@@ -531,6 +555,9 @@ class OpenCodeHarnessSession implements HarnessSession {
   #emitAssistantPart(part: Record<string, unknown>, turnId: string): void {
     const partId = text(part.id, `${turnId}:part`);
     const partType = text(part.type, "unknown");
+    for (const canonical of canonicalProviderEventsFromOpenCodePart(part)) {
+      this.#emit(canonical.eventType, canonical.payload, { turnId, itemId: canonical.itemId });
+    }
     if (partType === "patch") {
       const paths = Array.isArray(part.files) ? part.files : [];
       const files = paths.slice(0, 2_000).flatMap((value): Record<string, unknown>[] => {
@@ -649,11 +676,12 @@ async function startRuntime(input: {
     OPENCODE_SERVER_USERNAME: username,
     OPENCODE_SERVER_PASSWORD: password,
   });
+  const isolateProcessGroup = input.options.isolateProcessGroup ?? true;
   const child = spawn(input.options.command ?? "opencode", ["serve", "--hostname", "127.0.0.1", "--port", String(port)], {
     cwd: input.cwd,
     env: environment,
     stdio: ["ignore", "ignore", "pipe"],
-    detached: globalThis.process.platform !== "win32",
+    detached: globalThis.process.platform !== "win32" && isolateProcessGroup,
   });
   let diagnostics = "";
   child.stderr?.on("data", (chunk) => {
@@ -667,7 +695,7 @@ async function startRuntime(input: {
     });
     if (child.pid) await input.options.onSpawn?.({
       pid: child.pid,
-      processGroupId: globalThis.process.platform === "win32" ? null : child.pid,
+      processGroupId: globalThis.process.platform === "win32" || !isolateProcessGroup ? null : child.pid,
       startedAt: new Date().toISOString(),
     });
     const baseUrl = `http://127.0.0.1:${port}`;
@@ -688,14 +716,14 @@ async function startRuntime(input: {
         await bridge.close().catch(() => {});
         if (child.exitCode === null && child.signalCode === null && child.pid) {
           try {
-            if (globalThis.process.platform === "win32") child.kill("SIGTERM");
+            if (globalThis.process.platform === "win32" || !isolateProcessGroup) child.kill("SIGTERM");
             else globalThis.process.kill(-child.pid, "SIGTERM");
           } catch { child.kill("SIGTERM"); }
         }
         await waitForExit(child, 2_000);
         if (child.exitCode === null && child.signalCode === null && child.pid) {
           try {
-            if (globalThis.process.platform === "win32") child.kill("SIGKILL");
+            if (globalThis.process.platform === "win32" || !isolateProcessGroup) child.kill("SIGKILL");
             else globalThis.process.kill(-child.pid, "SIGKILL");
           } catch { child.kill("SIGKILL"); }
         }

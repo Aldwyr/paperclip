@@ -18,7 +18,7 @@ describe("OpenCodeServerDriver", () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-driver-"));
     const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
     roots.push(root, workspace);
-    const spawns: Array<{ pid: number }> = [];
+    const spawns: Array<{ pid: number; processGroupId: number | null }> = [];
     const diagnostics: string[] = [];
     const driver = new OpenCodeServerDriver({
       model: "openrouter/deepseek/deepseek-v4-flash-0731",
@@ -82,6 +82,25 @@ describe("OpenCodeServerDriver", () => {
     expect(config).not.toContain("test-openrouter-key");
     expect(diagnostics.join("\n")).not.toContain("test-openrouter-key");
     expect(diagnostics.join("\n")).toContain("[REDACTED]");
+  });
+
+  it("keeps OpenCode in an outer supervisor process group when requested", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-driver-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    let processGroupId: number | null | undefined;
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      isolateProcessGroup: false,
+      onSpawn: async (meta) => { processGroupId = meta.processGroupId; },
+    });
+    const session = await driver.openSession({ runId: "run-supervised", normalizedSessionId: "supervised", workingDirectory: workspace });
+    expect(processGroupId).toBeNull();
+    await session.close({ reason: "test" });
   });
 
   it("validates provider/model form", async () => {

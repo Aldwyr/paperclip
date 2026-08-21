@@ -44,6 +44,41 @@ import { CAPABILITY_ISSUE_THREAD_VIEW_SCHEMA } from "./types.js";
 
 const INTERACTION_RESULT_SCHEMA = "paperclip.semantic-interaction-result.v1";
 
+const PROVIDER_FAMILY_PREFIXES = {
+  "plan.": "plan", "tool.execution.": "tool_execution", "research.": "research",
+  "delegation.": "delegation", "model.": "model_identity", "context.": "context",
+  "artifact.": "artifact", "review.": "review", "hook.": "hook",
+  "memory.": "memory", "safety.": "safety", "terminal.": "terminal",
+  "wait.": "wait", "provider.notice.": "provider_notice",
+} as const;
+
+function providerActivityItem(entry: CapabilityLiveEvidenceEntry): Extract<CapabilityThreadItem, { kind: "provider_activity" }> | null {
+  if (entry.data.canonical !== true) return null;
+  const eventType = readString(entry.data.event);
+  const family = Object.entries(PROVIDER_FAMILY_PREFIXES).find(([prefix]) => eventType.startsWith(prefix))?.[1];
+  if (family === undefined) return null;
+  const payload = readRecord(entry.data.payload);
+  const rawStatus = readString(payload.status);
+  const status = rawStatus === "running" || rawStatus === "pending" ? "running"
+    : rawStatus === "failed" || rawStatus === "denied" ? "failed"
+      : rawStatus === "interrupted" || rawStatus === "cancelled" ? "interrupted"
+        : eventType === "plan.updated" && payload.complete === true ? "completed"
+          : eventType.endsWith("started") || eventType.endsWith("progressed") ? "running"
+          : eventType.endsWith("completed") || rawStatus === "completed" ? "completed" : "informational";
+  const title = ({
+    plan: "Plan", tool_execution: "Tool execution", research: "Research", delegation: "Delegation",
+    model_identity: "Model", context: "Context compacted", artifact: "Artifact", review: "Review mode",
+    hook: "Hook", memory: "Memory citation", safety: "Safety review", terminal: "Terminal input",
+    wait: "Intentional wait", provider_notice: "Provider notice",
+  } as const)[family];
+  const summary = readString(payload.summary) || readString(payload.name) || readString(payload.query) || eventType.replaceAll(".", " · ");
+  return {
+    kind: "provider_activity", id: `provider-${entry.id}`, at: entry.at, family, eventType,
+    status, title, summary, payload: entry.data.payload ?? null,
+    evidenceRef: { section: "runner", recordId: entry.id },
+  };
+}
+
 const DURABLE_COMMENT_OPERATIONS = new Set<CapabilitySemanticOperationId>([
   "report_progress",
   "answer_status_question",
@@ -719,9 +754,11 @@ export function projectCapabilityIssueThread(
   const { snapshot } = input;
   const mode = input.mode ?? "live";
   const agentLabel = mode === "live"
-    ? snapshot.config.provider === "opencode" || snapshot.config.driver === "opencode_server"
-      ? "Real OpenCode"
-      : "Real Codex"
+    ? snapshot.config.provider === "claude_managed" || snapshot.config.driver === "claude_managed_agents_api"
+      ? "Claude Agent"
+      : snapshot.config.provider === "opencode" || snapshot.config.driver === "opencode_server"
+        ? "Real OpenCode"
+        : "Real Codex"
     : mode === "replay" ? "Replay" : "Fake agent";
   const connection = input.connection ?? { state: "connected", attempt: 0 };
   const state = parseMockState(snapshot.mockState);
@@ -816,6 +853,11 @@ export function projectCapabilityIssueThread(
     } else {
       group.count += 1;
     }
+  }
+  for (const entry of snapshot.evidence) {
+    if (entry.kind !== "provider_event" || entry.turnId === null) continue;
+    const item = providerActivityItem(entry);
+    if (item !== null) turnFor(entry.turnId, entry.at).items.push(item);
   }
   for (const group of progressGroups.values()) {
     const copy = PROGRESS_EVENTS[group.event];

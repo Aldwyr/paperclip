@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use paperclip_runner_core::codex_provider::{
-    CodexProvider, CodexProviderConfig, CodexProviderEvent, Provider, ProviderKind,
+    CodexProvider, LocalProviderConfig, Provider, ProviderEvent, ProviderKind,
 };
 use paperclip_runner_core::provider_bridge::{AuthorizedTool, ToolResult};
 use serde_json::json;
@@ -10,7 +10,7 @@ use serde_json::json;
 #[test]
 fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
     let mut provider = CodexProvider::start(
-        &CodexProviderConfig {
+        &LocalProviderConfig {
             kind: ProviderKind::Codex,
             command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
             args: Vec::new(),
@@ -37,7 +37,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             "fake Codex did not issue its tool call"
         );
         match provider.poll().unwrap() {
-            Some(CodexProviderEvent::ToolCall {
+            Some(ProviderEvent::ToolCall {
                 call_id,
                 operation_id,
                 input,
@@ -49,6 +49,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
                         call_id,
                         operation_id,
                         result: json!({"ok": true, "task": {"id": "task-1"}}),
+                        is_error: false,
                     })
                     .unwrap();
                 break;
@@ -64,12 +65,12 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             "fake Codex did not complete after its tool result"
         );
         match provider.poll().unwrap() {
-            Some(CodexProviderEvent::SemanticResult { result, item_id }) => {
+            Some(ProviderEvent::SemanticResult { result, item_id }) => {
                 assert_eq!(result["reportedWorkDisposition"], "done");
                 assert_eq!(item_id.as_deref(), Some("semantic-result"));
                 saw_semantic_result = true;
             }
-            Some(CodexProviderEvent::Notification { method, .. }) if method == "turn/completed" => {
+            Some(ProviderEvent::Notification { method, .. }) if method == "turn/completed" => {
                 assert!(
                     saw_semantic_result,
                     "semantic result must precede terminal completion"
@@ -84,7 +85,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
 #[test]
 fn provider_contract_preserves_the_opencode_tag() {
     let mut provider = CodexProvider::start(
-        &CodexProviderConfig {
+        &LocalProviderConfig {
             kind: ProviderKind::Opencode,
             command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
             args: Vec::new(),
@@ -110,7 +111,7 @@ fn provider_contract_preserves_the_opencode_tag() {
 #[test]
 fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_event() {
     let mut provider = CodexProvider::start(
-        &CodexProviderConfig {
+        &LocalProviderConfig {
             kind: ProviderKind::Codex,
             command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
             args: vec!["--large-event".to_owned()],
@@ -141,9 +142,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
             "large provider event was not received"
         );
         match provider.poll().unwrap() {
-            Some(CodexProviderEvent::Notification { method, params })
-                if method == "item/completed" =>
-            {
+            Some(ProviderEvent::Notification { method, params }) if method == "item/completed" => {
                 assert!(
                     params
                         .pointer("/item/imageUrl")
@@ -154,7 +153,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
                 );
                 saw_large_event = true;
             }
-            Some(CodexProviderEvent::ToolCall { operation_id, .. }) => {
+            Some(ProviderEvent::ToolCall { operation_id, .. }) => {
                 assert_eq!(operation_id, "get_task_context");
                 saw_authorized_tool = true;
             }
@@ -170,7 +169,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
 #[test]
 fn codex_provider_rejects_an_event_above_the_four_megabyte_hard_limit() {
     let mut provider = CodexProvider::start(
-        &CodexProviderConfig {
+        &LocalProviderConfig {
             kind: ProviderKind::Codex,
             command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
             args: vec!["--oversized-event".to_owned()],

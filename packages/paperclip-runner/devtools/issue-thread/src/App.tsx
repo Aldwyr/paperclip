@@ -48,12 +48,13 @@ const REPLAY_STEP_MS = 800;
 const PENDING_ANNOUNCEMENT = "A request is waiting for your answer.";
 const ANSWERED_ANNOUNCEMENT = "Your answer was recorded.";
 const SETTLED_ANNOUNCEMENT = "The pending request is resolved.";
-const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts", "wc-workspace-changes", "fr-file-reference"];
+const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts", "wc-workspace-changes", "fr-file-reference", "pe-structured-plan", "te-command-execution", "mp-mcp-progress", "rs-web-research", "da-subagent-delegation", "mr-model-routing", "cc-context-compaction", "ag-generated-artifact", "rv-review-mode", "hk-hook-lifecycle", "mc-memory-citations", "sr-safety-review", "ti-terminal-input", "wt-intentional-wait", "pn-provider-notices", "cm-stream-reconcile", "cm-session-continuity", "cm-tool-read", "cm-tool-mutation", "cm-completion-control", "cm-tool-denied", "cm-tool-duplicate-delivery", "cm-sse-recovery", "cm-interrupt", "cm-warm-restore", "cm-budget", "cm-terminated-deleted", "cm-provisioning-auth", "cm-redacted-failure", "cm-provider-labels"];
 const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
 const CHAT_HARNESS_KEY = "paperclip-runner.capability.chat.harness.v1";
 const MODEL_PRESETS = {
   codex: ["gpt-5.4-mini", "gpt-5.4"],
   opencode: ["openrouter/deepseek/deepseek-v4-flash-0731"],
+  claude_managed: ["claude-sonnet-5"],
 } as const;
 
 interface EmbeddedEvalCheck {
@@ -118,6 +119,9 @@ function defaultHarness(provider: CapabilityHarnessConfiguration["provider"] = "
   return {
     provider,
     model: MODEL_PRESETS[provider][0],
+    ...(provider === "claude_managed"
+      ? { managedProfileId: "default", maxSessionListCostUsd: 1 }
+      : {}),
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
   };
 }
@@ -125,13 +129,25 @@ function defaultHarness(provider: CapabilityHarnessConfiguration["provider"] = "
 function readHarnessConfiguration(): CapabilityHarnessConfiguration {
   try {
     const value = JSON.parse(window.localStorage.getItem(CHAT_HARNESS_KEY) ?? "null") as Partial<CapabilityHarnessConfiguration> | null;
-    if (value && (value.provider === "codex" || value.provider === "opencode") && typeof value.model === "string") {
+    if (value && (value.provider === "codex" || value.provider === "opencode" || value.provider === "claude_managed") && typeof value.model === "string") {
       const lifecyclePolicy = value.lifecyclePolicy?.mode === "per_turn"
         ? { mode: "per_turn" as const, idleTimeoutMs: null }
         : value.lifecyclePolicy?.mode === "warm" && Number.isSafeInteger(value.lifecyclePolicy.idleTimeoutMs) && Number(value.lifecyclePolicy.idleTimeoutMs) > 0
           ? { mode: "warm" as const, idleTimeoutMs: Number(value.lifecyclePolicy.idleTimeoutMs) }
           : { mode: "warm" as const, idleTimeoutMs: 300_000 };
-      return { provider: value.provider, model: value.model, lifecyclePolicy };
+      return {
+        provider: value.provider,
+        model: value.model,
+        ...(value.provider === "claude_managed" ? {
+          managedProfileId: typeof value.managedProfileId === "string" && value.managedProfileId.trim()
+            ? value.managedProfileId.trim()
+            : "default",
+          maxSessionListCostUsd: typeof value.maxSessionListCostUsd === "number" && value.maxSessionListCostUsd > 0
+            ? value.maxSessionListCostUsd
+            : 1,
+        } : {}),
+        lifecyclePolicy,
+      };
     }
   } catch {
     // Invalid preferences fall back to the qualified defaults.
@@ -224,7 +240,7 @@ function currentTurnActivity(snapshot: CapabilityIssueThreadSnapshot): string {
   const turn = snapshot.turns.at(-1);
   if (turn === undefined) return `Dispatching turn to ${harness}`;
   const activity = [...turn.items].reverse().find((item) =>
-    item.kind === "tool_activity" || item.kind === "progress_activity" ||
+    item.kind === "tool_activity" || item.kind === "progress_activity" || item.kind === "provider_activity" ||
     (item.kind === "agent_message" && item.streaming),
   );
   if (activity?.kind === "tool_activity") {
@@ -315,6 +331,7 @@ export function App() {
   const [playing, setPlaying] = useState(false);
   /** True while a turn stream is open, so the surface never reads as settled. */
   const [streamingTurn, setStreamingTurn] = useState(false);
+  const [managedBudgetInput, setManagedBudgetInput] = useState("1.00");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const cancelResetRef = useRef<HTMLButtonElement | null>(null);
   /** Last announced pending request, so the live region tracks transitions. */
@@ -728,6 +745,16 @@ export function App() {
       setActionError("OpenCode models must use provider/model form.");
       return;
     }
+    if (harness.provider === "claude_managed") {
+      if (!harness.managedProfileId?.trim()) {
+        setActionError("Choose a qualified Managed Agent profile before starting a Claude Agent chat.");
+        return;
+      }
+      if (!(typeof harness.maxSessionListCostUsd === "number" && harness.maxSessionListCostUsd > 0)) {
+        setActionError("Claude Agent chats require a positive session spend ceiling.");
+        return;
+      }
+    }
     const configuration = { ...harness, model };
     persistHarnessConfiguration(configuration);
     setConfirmReset(false);
@@ -740,6 +767,46 @@ export function App() {
       .then(adoptCleanRoom)
       .catch((cause) => setActionError(describe(cause)));
   }, [abandonTurn, adoptCleanRoom, harness, snapshot]);
+
+  const increaseManagedBudget = useCallback(() => {
+    if (snapshot === null || activeHarness?.provider !== "claude_managed") return;
+    const nextCap = Number(managedBudgetInput);
+    const currentCap = activeHarness.maxSessionListCostUsd ?? 0;
+    if (!Number.isFinite(nextCap) || nextCap <= currentCap) {
+      setActionError(`Enter a spend ceiling greater than the current $${currentCap.toFixed(2)} cap.`);
+      return;
+    }
+    void capabilityLiveClient.increaseManagedBudget(snapshot.sessionId, nextCap)
+      .then((next) => {
+        setSnapshot(next.view);
+        setActiveHarness((current) => current === null ? current : {
+          ...current,
+          maxSessionListCostUsd: nextCap,
+        });
+        setActionError(null);
+        setAnnouncement(`Claude Agent session spend ceiling raised to $${nextCap.toFixed(2)}.`);
+      })
+      .catch((cause) => setActionError(describe(cause)));
+  }, [activeHarness, managedBudgetInput, snapshot]);
+
+  const deleteManagedSession = useCallback(() => {
+    if (snapshot === null || activeHarness?.provider !== "claude_managed") return;
+    if (!window.confirm("Permanently delete this Anthropic Managed Agent session? It cannot be resumed.")) return;
+    abandonTurn();
+    const deletedSessionId = snapshot.sessionId;
+    void capabilityLiveClient.deleteManagedSession(deletedSessionId)
+      .then(() => capabilityLiveClient.newCleanRoom(null, harness))
+      .then((next) => {
+        setChatHistory((current) => {
+          const retained = current.filter((item) => item.sessionId !== deletedSessionId);
+          persistChatHistory(retained);
+          return retained;
+        });
+        adoptCleanRoom(next);
+        setAnnouncement("Remote Claude Agent session deleted. A new clean room is ready.");
+      })
+      .catch((cause) => setActionError(describe(cause)));
+  }, [abandonTurn, activeHarness, adoptCleanRoom, harness, snapshot]);
 
   const selectChatHistory = useCallback((sessionId: string) => {
     const live = liveRoomRef.current;
@@ -997,6 +1064,7 @@ export function App() {
             >
               <option value="codex">Codex</option>
               <option value="opencode">OpenCode</option>
+              <option value="claude_managed">Claude Agent</option>
             </select>
           </label>
           <label>
@@ -1036,6 +1104,38 @@ export function App() {
               />
             </label>
           ) : null}
+          {harness.provider === "claude_managed" || activeHarness?.provider === "claude_managed" ? (
+            <>
+              <label>
+                <span>Managed profile</span>
+                <input
+                  data-testid="chat-managed-profile"
+                  value={harness.managedProfileId ?? ""}
+                  disabled={streamingTurn}
+                  placeholder="qualified profile ID"
+                  onChange={(event) => setHarness((current) => ({
+                    ...current,
+                    managedProfileId: event.target.value,
+                  }))}
+                />
+              </label>
+              <label>
+                <span>Session cap (USD)</span>
+                <input
+                  data-testid="chat-managed-spend-cap"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  value={harness.maxSessionListCostUsd ?? 1}
+                  disabled={streamingTurn}
+                  onChange={(event) => setHarness((current) => ({
+                    ...current,
+                    maxSessionListCostUsd: Number(event.target.value),
+                  }))}
+                />
+              </label>
+            </>
+          ) : null}
           <label className="pit-harness-model">
             <span>Model</span>
             <input
@@ -1061,10 +1161,51 @@ export function App() {
             Start new chat
           </button>
           <span className="pit-harness-active" data-testid="chat-active-harness">
-            Active: {activeHarness?.provider ?? "starting"}
+            Active: {activeHarness?.provider === "claude_managed" ? "Claude Agent" : activeHarness?.provider ?? "starting"}
             {activeHarness?.model ? ` · ${activeHarness.model}` : ""}
+            {activeHarness?.provider === "claude_managed" ? " · Anthropic cloud · no provider PID" : ""}
             {activeHarness ? ` · ${activeHarness.lifecyclePolicy.mode === "warm" ? `warm ${Math.round(activeHarness.lifecyclePolicy.idleTimeoutMs / 1_000)}s` : "turn by turn"}` : ""}
           </span>
+          {activeHarness?.provider === "claude_managed" && snapshot !== null && historicSessionId === null ? (
+            <div className="pit-managed-session-actions" aria-label="Active Claude Agent session controls">
+              <label>
+                <span>Raise active cap (USD)</span>
+                <input
+                  data-testid="chat-managed-active-spend-cap"
+                  type="number"
+                  min={(activeHarness.maxSessionListCostUsd ?? 1) + 0.01}
+                  step="0.01"
+                  value={managedBudgetInput}
+                  disabled={streamingTurn}
+                  onChange={(event) => setManagedBudgetInput(event.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className="pit-button"
+                data-testid="chat-managed-increase-budget"
+                disabled={streamingTurn}
+                onClick={increaseManagedBudget}
+              >
+                Raise cap
+              </button>
+              <button
+                type="button"
+                className="pit-button"
+                data-variant="danger"
+                data-testid="chat-managed-delete-session"
+                disabled={streamingTurn}
+                onClick={deleteManagedSession}
+              >
+                Delete remote session
+              </button>
+            </div>
+          ) : null}
+          {harness.provider === "claude_managed" || activeHarness?.provider === "claude_managed" ? (
+            <p className="pit-harness-notice" role="note" data-testid="chat-managed-retention-notice">
+              Managed Agent sessions are retained by Anthropic and are not eligible for ZDR or HIPAA modes. Paperclip tools still execute only in runnerd.
+            </p>
+          ) : null}
         </section>
       ) : null}
 
@@ -1169,6 +1310,8 @@ export function App() {
             <div
               className="pit-thread-scroll"
               ref={scrollRef}
+              tabIndex={0}
+              aria-label="Conversation"
               onScroll={(event) => {
                 const element = event.currentTarget;
                 const distance =

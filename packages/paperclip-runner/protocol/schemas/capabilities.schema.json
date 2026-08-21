@@ -34,6 +34,21 @@
     "runtimeRequests": { "type": "boolean" },
     "structuredResult": { "type": "boolean" },
     "typedEvents": { "type": "boolean" },
+    "typedEventFamilies": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["family", "version", "availability", "detailLevel"],
+        "properties": {
+          "family": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[a-z][a-z0-9_.-]*$" },
+          "version": { "const": 1 },
+          "availability": { "enum": ["available", "unsupported", "policy_disabled"] },
+          "detailLevel": { "enum": ["summary", "structured"] }
+        },
+        "additionalProperties": false
+      }
+    },
     "semanticTools": {
       "type": "object",
       "required": ["schema", "schemaVersion", "operations"],

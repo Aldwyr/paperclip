@@ -1326,13 +1326,19 @@ export class DurablePrpControlPlane {
 
     const semantic = (event.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
     if (
-      newlyCommitted && eventType === "mcp_app.tool_input" && this.#onSemanticToolInput && semantic?.phase === "input" &&
+      newlyCommitted && (eventType === "semantic_tool.input" || eventType === "mcp_app.tool_input") && this.#onSemanticToolInput && semantic?.phase === "input" &&
       typeof semantic.callId === "string" && typeof semantic.operationId === "string"
     ) {
       const call = { callId: semantic.callId, operationId: semantic.operationId, input: semantic.input };
-      void this.#onSemanticToolInput(call).then((result) => {
+      void this.#onSemanticToolInput(call).then((value) => {
+        const outcome = typeof value === "object" && value !== null && !Array.isArray(value)
+          ? value as Record<string, unknown>
+          : {};
+        const wrapped = outcome.__paperclipSemanticToolOutcome === true;
+        const result = wrapped ? outcome.result : value;
+        const isError = wrapped && outcome.isError === true;
         const runScope = createHash("sha256").update(this.identity.runId).digest("hex").slice(0, 12);
-        this.queueCommand("semantic_tool.result", { ...call, result }, `command_tool_${runScope}_${call.callId}`, true);
+        this.queueCommand("semantic_tool.result", { ...call, result, isError }, `command_tool_${runScope}_${call.callId}`, true);
       });
     }
 
@@ -1386,7 +1392,8 @@ function runnerEnvironment(ticket: string, source: NodeJS.ProcessEnv = process.e
   for (const key of [
     "PATH", "SystemRoot", "WINDIR", "PATHEXT", "LANG", "LC_ALL", "TZ",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
-    "OPENROUTER_API_KEY", "PAPERCLIP_OPENCODE_COMMAND", "PAPERCLIP_OPENCODE_RUNTIME_DIR",
+    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "RUST_BACKTRACE",
+    "PAPERCLIP_OPENCODE_COMMAND", "PAPERCLIP_OPENCODE_RUNTIME_DIR",
     "PAPERCLIP_RUNNER_INSTANCE_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_NORMALIZED_SESSION_ID",
   ]) {
     const value = source[key];
@@ -1644,7 +1651,9 @@ export async function runDurableToolBridgeConformance(
   try {
     const deadline = Date.now() + (options.realCodex ? 150_000 : 10_000);
     while (Date.now() < deadline) {
-      const input = core.store.state.committedEvents.find((event) => event.eventType === "mcp_app.tool_input");
+        const input = core.store.state.committedEvents.find((event) =>
+          event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input"
+        );
       const semantic = ((input?.envelope.payload as Record<string, unknown> | undefined)?.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
       if (semantic && typeof semantic.callId === "string" && typeof semantic.operationId === "string") {
         callId = semantic.callId;
@@ -1722,6 +1731,7 @@ export class DurableEvalInfrastructureError extends Error {
 function evalLifecycleDiagnostics(
   core: DurableRecoveryMockCore,
   handle: RunnerProcessHandle,
+  runnerStateDirectory?: string,
 ): Record<string, unknown> {
   const commands = core.store.state.commands.map((command) => ({
     commandId: command.commandId,
@@ -1735,6 +1745,15 @@ function evalLifecycleDiagnostics(
     priority: event.priority,
     deliveryCount: event.deliveryCount,
   }));
+  let runnerDiagnostics: unknown[] = [];
+  if (runnerStateDirectory) {
+    try {
+      const state = JSON.parse(readFileSync(resolve(runnerStateDirectory, "runner-state.json"), "utf8")) as { diagnostics?: unknown[] };
+      runnerDiagnostics = Array.isArray(state.diagnostics) ? state.diagnostics.slice(-20) : [];
+    } catch {
+      // A runner that failed before its first durable save has no state diagnostics.
+    }
+  }
   return {
     runnerPid: handle.child.pid ?? null,
     runnerExitCode: handle.child.exitCode,
@@ -1743,7 +1762,24 @@ function evalLifecycleDiagnostics(
     ackedSourceSeq: core.store.state.ackedSourceSeq,
     commands,
     recentEvents: events,
+    runnerDiagnostics,
   };
+}
+
+function projectedSemanticResult(operationId: unknown, result: unknown): unknown {
+  if (operationId !== "invoke_discovered_capability") return result;
+  const contentItems = (result as { contentItems?: unknown } | null)?.contentItems;
+  if (!Array.isArray(contentItems)) return result;
+  for (const item of contentItems) {
+    const text = (item as { text?: unknown } | null)?.text;
+    if (typeof text !== "string") continue;
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      // Preserve the bounded gateway response when its content is not JSON.
+    }
+  }
+  return result;
 }
 
 /** Production-topology eval: the only Paperclip process in the sandbox is runnerd. */
@@ -1810,7 +1846,11 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
         const args = (call.input ?? {}) as Record<string, unknown>;
         const operationId = String(args.operationId ?? "");
         if (!loadedOperations.has(operationId)) return { ok: false, denial: { code: "operation_not_loaded", message: "Operation was not loaded by capability discovery." } };
-        return dispatcher.dispatch({ runId: identity.runId, callId: call.callId, operationId, input: args.input });
+        const invoked = await dispatcher.dispatch({ runId: identity.runId, callId: call.callId, operationId, input: args.input });
+        return {
+          success: invoked.ok,
+          contentItems: [{ type: "inputText", text: JSON.stringify(invoked) }],
+        };
       }
       return dispatcher.dispatch({ runId: identity.runId, ...call });
     },
@@ -1870,7 +1910,7 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
         "provider_turn_timeout",
         `durable provider turn timed out after ${input.turnTimeoutMs}ms`,
         true,
-        evalLifecycleDiagnostics(core, handle),
+        evalLifecycleDiagnostics(core, handle, runnerStateDirectory),
       );
     }
     core.queueCommand("runner.shutdown", {}, undefined, true);
@@ -1882,7 +1922,7 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
         "runner_shutdown_timeout",
         `runnerd did not exit within 30000ms after runner.shutdown: ${error instanceof Error ? error.message : String(error)}`,
         true,
-        evalLifecycleDiagnostics(core, handle),
+        evalLifecycleDiagnostics(core, handle, runnerStateDirectory),
       );
     }
     if (exited.code !== 0) {
@@ -1890,7 +1930,7 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
         "runner_exit_failure",
         `runnerd exited ${String(exited.code)}: ${exited.stderr}`,
         false,
-        { ...evalLifecycleDiagnostics(core, handle), stderr: exited.stderr.slice(-16_384) },
+        { ...evalLifecycleDiagnostics(core, handle, runnerStateDirectory), stderr: exited.stderr.slice(-16_384) },
       );
     }
     const records = core.store.state.committedEvents.map((committed) => committed.envelope.payload as Record<string, unknown>);
@@ -1925,7 +1965,7 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
           at: new Date().toISOString(), turnId: identity.turnId,
           data: semantic.phase === "input"
             ? { callId: semantic.callId, operationId: projectedOperationId, input: projectedInput }
-            : { callId: semantic.callId, operationId: projectedOperationId, result: semantic.result },
+            : { callId: semantic.callId, operationId: projectedOperationId, result: projectedSemanticResult(semantic.operationId, semantic.result) },
         });
       }
       if (record.eventType === "provider.event") {
@@ -1947,6 +1987,17 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
             outputTokens: total.outputTokens ?? 0,
             cachedInputTokens: total.cachedInputTokens ?? 0,
             reasoningTokens: total.reasoningTokens ?? 0,
+          };
+        }
+      }
+      if (record.eventType === "usage.reported") {
+        const runDelta = payload?.runDelta as Record<string, number> | undefined;
+        if (runDelta) {
+          usage = {
+            inputTokens: runDelta.inputTokens ?? 0,
+            outputTokens: runDelta.outputTokens ?? 0,
+            cachedInputTokens: runDelta.cacheReadTokens ?? 0,
+            reasoningTokens: runDelta.reasoningTokens ?? 0,
           };
         }
       }
@@ -1972,7 +2023,7 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       evidenceIndex += 1;
       evidence.push({
         id: `evidence-${evidenceIndex}`, kind: "tool_result", at: new Date().toISOString(), turnId: identity.turnId,
-        data: { callId: payload.callId, operationId: projectedOperationId, result: payload.result },
+        data: { callId: payload.callId, operationId: projectedOperationId, result: projectedSemanticResult(payload.operationId, payload.result) },
       });
     }
     if (!assistantText) assistantText = "Provider completed the requested Paperclip operation.";
@@ -2223,4 +2274,5 @@ export const durableRecoveryInternals = {
   tokenDigest,
   canonicalJson,
   durableRecoveryIdentity,
+  projectedSemanticResult,
 };

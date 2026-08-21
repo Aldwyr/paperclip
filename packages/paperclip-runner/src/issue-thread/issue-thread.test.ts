@@ -24,6 +24,7 @@ const REQUIRED_ITEM_KINDS: Array<CapabilityThreadItem["kind"]> = [
   "tool_activity",
   "workspace_changes",
   "workspace_file_reference",
+  "provider_activity",
   "interaction",
   "document",
   "deliverable",
@@ -62,8 +63,8 @@ function credentialLike(value: unknown): string[] {
 
 describe("Capability issue-thread fixtures", () => {
   it("exposes every screenshot slug exactly once", () => {
-    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(14);
-    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(14);
+    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(44);
+    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(44);
   });
 
   it("builds a schema-valid snapshot for every slug", () => {
@@ -164,6 +165,20 @@ describe("Capability issue-thread fixtures", () => {
   it("keeps credentials out of every fixture", () => {
     for (const slug of CAPABILITY_UI_SHOT_SLUGS) {
       expect(credentialLike(capabilityIssueThreadFixture(slug)), slug).toEqual([]);
+    }
+  });
+
+  it("gives every provider-event scenario correlated active and terminal activity", () => {
+    for (const slug of CAPABILITY_UI_SHOT_SLUGS.filter((entry) => /^(?:pe|te|mp|rs|da|mr|cc|ag|rv|hk|mc|sr|ti|wt|pn|cm)-/.test(entry))) {
+      const snapshot = capabilityIssueThreadFixture(slug);
+      const activity = allItems(snapshot).filter((item) => item.kind === "provider_activity");
+      expect(activity.length, slug).toBeGreaterThanOrEqual(2);
+      expect(activity.some((item) => item.kind === "provider_activity" && item.status === "running"), slug).toBe(true);
+      expect(activity.some((item) => item.kind === "provider_activity" && item.status !== "running"), slug).toBe(true);
+      for (const item of activity) {
+        if (item.kind !== "provider_activity") continue;
+        expect(snapshot.evidence.runner.some((entry) => entry.id === item.evidenceRef.recordId), slug).toBe(true);
+      }
     }
   });
 
@@ -442,6 +457,38 @@ describe("Capability live projection", () => {
       .toMatchObject({ author: "Real OpenCode" });
     expect(view.composer.helper).toBe("OpenCode is working — send to steer, or stop the turn.");
     expect(JSON.stringify(view)).not.toContain("Codex");
+  });
+
+  it("projects dynamic canonical provider evidence through the same provider-activity contract", async () => {
+    const snapshot = await liveSnapshot();
+    snapshot.evidence.push({
+      id: "provider-plan-1",
+      kind: "provider_event",
+      at: "2026-08-09T09:00:20.000Z",
+      turnId: "turn-1",
+      data: {
+        canonical: true,
+        event: "plan.updated",
+        itemId: "plan-1",
+        payload: {
+          schema: "paperclip.plan.updated.v1",
+          planId: "plan-1",
+          revision: 1,
+          explanation: "Plan generated",
+          complete: true,
+          syncStatus: "synchronized",
+          documentRevision: 2,
+          steps: [{ stepId: "step-1", body: "Ship it", status: "completed" }],
+        },
+      },
+    });
+    const view = projectCapabilityIssueThread({ snapshot });
+    expect(allItems(view).find((item) => item.kind === "provider_activity")).toMatchObject({
+      family: "plan",
+      eventType: "plan.updated",
+      status: "completed",
+      payload: { complete: true },
+    });
   });
 
   it("hides the synthetic interaction-result message from the thread", async () => {

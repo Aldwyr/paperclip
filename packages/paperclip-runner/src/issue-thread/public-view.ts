@@ -165,6 +165,91 @@ function publicToolResult(value: CapabilityJsonValue | null): CapabilityJsonValu
   };
 }
 
+function safeProviderScalar(value: CapabilityJsonValue | undefined, limit = MAX_DETAIL_CHARS): CapabilityJsonValue | undefined {
+  if (typeof value === "string") return clamp(value, limit);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  return undefined;
+}
+
+/** Closed, family-specific projection for canonical provider activity. */
+function publicProviderPayload(
+  family: Extract<CapabilityThreadItem, { kind: "provider_activity" }>['family'],
+  value: CapabilityJsonValue,
+): CapabilityJsonValue {
+  const source = asRecord(value);
+  const common = (keys: readonly string[]) => Object.fromEntries(keys.flatMap((key) => {
+    if (key === "output" && typeof source[key] === "string") {
+      return [[key, source[key].slice(-(8 * 1024))]];
+    }
+    const projected = safeProviderScalar(source[key], key === "output" ? 8 * 1024 : 4_000);
+    return projected === undefined ? [] : [[key, projected]];
+  }));
+  switch (family) {
+    case "plan":
+      return {
+        ...common(["schema", "planId", "revision", "explanation", "complete", "syncStatus", "documentRevision"]),
+        steps: (Array.isArray(source.steps) ? source.steps : []).slice(0, 256).map((entry) => {
+          const step = asRecord(entry);
+          return {
+            stepId: clamp(typeof step.stepId === "string" ? step.stepId : "step", 160),
+            body: clamp(typeof step.body === "string" ? step.body : "", 4_000),
+            status: clamp(typeof step.status === "string" ? step.status : "pending", 32),
+          };
+        }),
+      };
+    case "tool_execution":
+      return common(["schema", "executionId", "transport", "operation", "name", "target", "namespace", "readOnly", "status", "durationMs", "exitCode", "progress", "output", "outputBytes", "outputTruncated", "outputDigest"]);
+    case "research":
+      return {
+        ...common(["schema", "researchId", "action", "status", "query", "url", "pattern"]),
+        sources: (Array.isArray(source.sources) ? source.sources : []).slice(0, 64).map((entry) => {
+          const candidate = asRecord(entry);
+          const url = typeof candidate.url === "string" && /^https?:\/\//.test(candidate.url)
+            ? clamp(candidate.url, 2_048) : null;
+          return { sourceId: clamp(typeof candidate.sourceId === "string" ? candidate.sourceId : "source", 160), url, title: clamp(typeof candidate.title === "string" ? candidate.title : "Provider-reported source", 500), snippet: typeof candidate.snippet === "string" ? clamp(candidate.snippet, 4_000) : null };
+        }),
+      };
+    case "delegation":
+      return {
+        ...common(["schema", "delegationId", "action", "status"]),
+        children: (Array.isArray(source.children) ? source.children : []).slice(0, 64).map((entry) => {
+          const child = asRecord(entry);
+          return Object.fromEntries(["childId", "role", "provider", "model", "status", "summary", "activitySummary", "durationMs"].flatMap((key) => {
+            const projected = safeProviderScalar(child[key], 4_000);
+            return projected === undefined ? [] : [[key, projected]];
+          }));
+        }),
+      };
+    case "model_identity":
+      return common(["schema", "routeId", "verificationId", "provider", "requestedModel", "fromModel", "effectiveModel", "reason", "usageBoundaryId", "status", "buffering", "summary"]);
+    case "context":
+      return common(["schema", "compactionId", "reason", "preTokens", "postTokens", "sameSession"]);
+    case "artifact": {
+      const projected = common(["schema", "artifactId", "status", "reference", "mediaType", "title", "registered", "transparentBackground", "failure"]);
+      const reference = projected.reference;
+      if (typeof reference === "string" && (reference.startsWith("/") || reference.split("/").includes(".."))) projected.reference = null;
+      return projected;
+    }
+    case "review":
+      return common(["schema", "reviewId", "state", "scope"]);
+    case "hook":
+      return common(["schema", "hookId", "event", "scope", "status", "blocking", "durationMs", "summary"]);
+    case "memory": {
+      const projected = common(["schema", "citationId", "messageItemId", "label", "available", "reference"]);
+      if (typeof projected.reference === "string" && !projected.reference.startsWith("paperclip://")) projected.reference = null;
+      return projected;
+    }
+    case "safety":
+      return common(["schema", "reviewId", "targetExecutionId", "status", "decision", "summary"]);
+    case "terminal":
+      return common(["schema", "executionId", "origin", "inputClass", "byteCount"]);
+    case "wait":
+      return common(["schema", "waitId", "reason", "status", "plannedDurationMs", "elapsedDurationMs"]);
+    case "provider_notice":
+      return common(["schema", "noticeId", "severity", "category", "scope", "recoverable", "userActionable", "summary"]);
+  }
+}
+
 function publicInteractionPayload(
   payload: CapabilityThreadInteractionPayload,
 ): CapabilityThreadInteractionPayload {
@@ -343,6 +428,15 @@ function publicItem(item: CapabilityThreadItem, aliases: Aliases): CapabilityThr
           contentDigest: item.reference.contentDigest,
         },
       };
+    case "provider_activity": {
+      const payload = publicProviderPayload(item.family, item.payload);
+      return {
+        kind: "provider_activity", id, at: item.at, family: item.family,
+        eventType: clamp(item.eventType, 160), status: item.status,
+        title: clamp(item.title), summary: clamp(item.summary, MAX_BODY_CHARS),
+        payload, evidenceRef: publicRef(item.evidenceRef, aliases),
+      };
+    }
     case "interaction":
       return {
         kind: "interaction",

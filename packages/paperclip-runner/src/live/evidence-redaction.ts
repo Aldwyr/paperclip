@@ -44,6 +44,7 @@ export type CapabilityEvidenceKind =
 const MAX_DISPOSITION_CHARS = 500;
 const MAX_COMMAND_CHARS = 64_000;
 const MAX_PROVIDER_VALUE_CHARS = 16_000;
+const MAX_CANONICAL_OUTPUT_CHARS = 64 * 1024;
 const MAX_FIELD_NAMES = 32;
 const MAX_ENTITY_REFS = 64;
 
@@ -287,6 +288,23 @@ export function redactCapabilityEvidenceData(
 ): Record<string, CapabilityJsonValue> {
   switch (kind) {
     case "provider_event": {
+      const canonicalEventType = asString(data.canonicalEventType);
+      if (/^(?:plan\.updated|tool\.execution\.(?:started|progressed|completed)|research\.(?:started|progressed|completed)|delegation\.(?:started|updated|completed)|model\.(?:route\.changed|verification\.updated)|context\.compacted|artifact\.(?:viewed|generated)|review\.mode\.changed|hook\.(?:started|completed)|memory\.citation\.referenced|safety\.review\.(?:started|completed)|terminal\.input\.sent|wait\.(?:started|completed)|provider\.notice\.recorded)$/.test(canonicalEventType)) {
+        const payload = asRecord(data.payload);
+        const safePayload = safeProviderValue(payload, "payload") as Record<string, CapabilityJsonValue>;
+        if (typeof payload.output === "string") {
+          const redactedOutput = safeProviderValue(payload.output, "output");
+          safePayload.output = typeof redactedOutput === "string" && redactedOutput.length > MAX_CANONICAL_OUTPUT_CHARS
+            ? redactedOutput.slice(-MAX_CANONICAL_OUTPUT_CHARS)
+            : redactedOutput;
+        }
+        return {
+          event: canonicalEventType,
+          canonical: true,
+          itemId: clamp(asString(data.itemId), 160),
+          payload: safePayload,
+        };
+      }
       const event = capabilityProviderEventCategory(asString(data.method), asRecord(data.params));
       const item = asRecord(asRecord(data.params).item);
       return {

@@ -162,15 +162,33 @@ type LatestIssueRun = Pick<
 } | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
-type StrandedRecoveryCause =
+export type StrandedRecoveryCause =
   | "stranded_assigned_issue"
   | "process_lost"
   | "provider_quota"
   | "codex_output_inactivity_monitor"
   | "workspace_validation_failed"
   | "configuration_incomplete"
+  | "native_session_interrupted"
+  | "native_runner_process_exited"
+  | "provider_transport_failed"
+  | "provider_frame_too_large"
   | "execution_review_participant_recovery"
   | typeof SUCCESSFUL_RUN_MISSING_STATE_REASON;
+
+const NATIVE_RUNNER_RECOVERY_CAUSES = new Set<StrandedRecoveryCause>([
+  "native_session_interrupted",
+  "native_runner_process_exited",
+  "provider_transport_failed",
+  "provider_frame_too_large",
+]);
+
+export function shouldRouteRecoveryToOriginalAgent(cause: StrandedRecoveryCause): boolean {
+  return cause === "process_lost"
+    || cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+    || cause === "codex_output_inactivity_monitor"
+    || NATIVE_RUNNER_RECOVERY_CAUSES.has(cause);
+}
 
 type StrandedPreviousStatus = "todo" | "in_progress" | "in_review";
 
@@ -273,6 +291,9 @@ function resolveStrandedRecoveryCause(
   if (latestRun?.errorCode === "process_lost") return "process_lost";
   if (latestRun?.errorCode === "codex_output_inactivity_monitor") {
     return "codex_output_inactivity_monitor";
+  }
+  if (NATIVE_RUNNER_RECOVERY_CAUSES.has(latestRun?.errorCode as StrandedRecoveryCause)) {
+    return latestRun!.errorCode as StrandedRecoveryCause;
   }
   return "stranded_assigned_issue";
 }
@@ -2578,9 +2599,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
-    const routeToOriginal = input.recoveryCause === "process_lost" ||
-      input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
-      input.recoveryCause === "codex_output_inactivity_monitor";
+    const routeToOriginal = shouldRouteRecoveryToOriginalAgent(input.recoveryCause);
     if (input.recoveryCause === "provider_quota") {
       const retryAgentId = await resolveInvokableRecoveryAgentId(input.issue, originalAgentId);
       if (!retryAgentId) {

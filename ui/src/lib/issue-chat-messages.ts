@@ -66,7 +66,8 @@ export interface IssueChatTranscriptEntry {
     | "stderr"
     | "system"
     | "stdout"
-    | "diff";
+    | "diff"
+    | "provider_activity";
   ts: string;
   text?: string;
   delta?: boolean;
@@ -85,6 +86,12 @@ export interface IssueChatTranscriptEntry {
   cachedTokens?: number;
   costUsd?: number;
   changeType?: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
+  family?: "plan" | "tool_execution" | "research" | "delegation" | "model_identity" | "context" | "artifact" | "review" | "hook" | "memory" | "safety" | "terminal" | "wait" | "provider_notice";
+  eventType?: string;
+  status?: "running" | "completed" | "failed" | "interrupted" | "informational";
+  title?: string;
+  summary?: string;
+  payload?: Record<string, unknown>;
 }
 
 const ISSUE_CHAT_TRANSCRIPT_MAX_VISIBLE_ENTRIES = 30;
@@ -683,6 +690,7 @@ function computeSegmentTimings(entries: readonly IssueChatTranscriptEntry[]): Se
       entry.kind === "tool_call" ||
       entry.kind === "tool_result" ||
       entry.kind === "diff" ||
+      entry.kind === "provider_activity" ||
       (entry.kind === "result" && ((entry.isError && !!entry.errors?.length) || !!entry.text));
     const isText = entry.kind === "assistant" && !!entry.text;
 
@@ -857,6 +865,26 @@ export function buildAssistantPartsFromTranscript(entries: readonly IssueChatTra
 
     if (entry.kind === "assistant" && entry.text) {
       orderedParts.push({ type: "text", text: entry.text });
+      continue;
+    }
+    if (entry.kind === "provider_activity") {
+      const toolCallId = `provider-activity-${index}`;
+      const args = normalizeToolArgs({
+        family: entry.family ?? "provider_notice",
+        eventType: entry.eventType ?? "provider.notice.recorded",
+        status: entry.status ?? "informational",
+        title: entry.title ?? "Provider activity",
+        summary: entry.summary ?? "",
+        payload: entry.payload ?? {},
+      });
+      orderedParts.push({
+        type: "tool-call",
+        toolCallId,
+        toolName: "paperclip_provider_activity",
+        args,
+        argsText: "",
+        ...(entry.status === "running" ? {} : { result: { status: entry.status ?? "informational" } }),
+      });
       continue;
     }
     if (entry.kind === "thinking" && entry.text) {

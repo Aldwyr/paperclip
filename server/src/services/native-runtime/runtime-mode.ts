@@ -17,7 +17,11 @@ export type NativeRuntimeResolution =
       kind: "native";
       resolverVersion: typeof NATIVE_RUNTIME_RESOLVER_VERSION;
       reason: "eligible_opt_in";
-      profile: { mode: "native"; backend: "codex_app_server" | "opencode_server"; protocolVersion: 1 };
+      profile: {
+        mode: "native";
+        backend: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
+        protocolVersion: 1;
+      };
       authorityDecision: NativeStatusDecision;
     };
 
@@ -47,13 +51,28 @@ export function resolveNativeRuntimeMode(input: {
   const nativeRunner = record(record(input.runtimeConfig).nativeRunner);
   const runnerAdapterSelected = input.agent.adapterType === "paperclip_runner";
   const runnerProvider = record(input.adapterConfig).provider ?? "codex";
-  if (runnerAdapterSelected && runnerProvider !== "codex" && runnerProvider !== "opencode") {
-    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex or opencode");
+  if (runnerAdapterSelected && !["codex", "opencode", "claude_managed"].includes(String(runnerProvider))) {
+    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex, opencode, or claude_managed");
   }
   if (runnerAdapterSelected && runnerProvider === "opencode") {
     const model = record(input.adapterConfig).model;
     if (typeof model !== "string" || !model.includes("/") || model.trim().endsWith("/")) {
       throw new NativeRuntimeEligibilityError("paperclip_runner OpenCode provider requires model in provider/model form");
+    }
+  }
+  if (runnerAdapterSelected && runnerProvider === "claude_managed") {
+    const config = record(input.adapterConfig);
+    for (const key of ["managedProfileId", "anthropicAgentId", "agentVersion", "anthropicEnvironmentId", "model"]) {
+      if (typeof config[key] !== "string" || String(config[key]).trim().length === 0) {
+        throw new NativeRuntimeEligibilityError(`paperclip_runner Claude Agent provider requires ${key}`);
+      }
+    }
+    if (config.managedAgentsRetentionAcknowledged !== true) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner Claude Agent provider requires retention acknowledgement");
+    }
+    const cap = Number(config.maxSessionListCostUsd);
+    if (!Number.isFinite(cap) || cap <= 0) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner Claude Agent provider requires a positive spend ceiling");
     }
   }
   const mode = runnerAdapterSelected ? "native" : nativeRunner.mode;
@@ -90,7 +109,7 @@ export function resolveNativeRuntimeMode(input: {
     throw new NativeRuntimeEligibilityError("run must be bound to a standard issue");
   }
   if (
-    (!input.workspaceId && !runnerAdapterSelected)
+    (!input.workspaceId && !runnerAdapterSelected && runnerProvider !== "claude_managed")
     || input.target?.kind && input.target.kind !== "local"
   ) {
     throw new NativeRuntimeEligibilityError("a realized local workspace is required");
@@ -109,7 +128,11 @@ export function resolveNativeRuntimeMode(input: {
     reason: "eligible_opt_in",
     profile: {
       mode: "native",
-      backend: runnerProvider === "opencode" ? "opencode_server" : "codex_app_server",
+      backend: runnerProvider === "opencode"
+        ? "opencode_server"
+        : runnerProvider === "claude_managed"
+          ? "claude_managed_agents_api"
+          : "codex_app_server",
       protocolVersion: 1,
     },
     authorityDecision: rollout,
@@ -144,7 +167,11 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
         reason: "eligible_opt_in",
         profile: {
           mode: "native",
-          backend: input.persisted.driverKind === "opencode_server" ? "opencode_server" : "codex_app_server",
+          backend: input.persisted.driverKind === "opencode_server"
+            ? "opencode_server"
+            : input.persisted.driverKind === "claude_managed_agents_api"
+              ? "claude_managed_agents_api"
+              : "codex_app_server",
           protocolVersion: 1,
         },
         authorityDecision: resolveNativeMigrationStatus({

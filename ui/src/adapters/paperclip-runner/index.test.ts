@@ -92,4 +92,13 @@ describe("paperclip runner transcript projection", () => {
     expect(event("run.result.proposed", { summary: "Human-readable completion." }))
       .toEqual([{ kind: "assistant", ts: expect.any(String), text: "Human-readable completion.", channel: "final" }]);
   });
+
+  it("projects canonical provider events as structured activity instead of JSON prose", () => {
+    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType: "plan.updated", payload: { schema: "paperclip.plan.updated.v1", planId: "plan-1", revision: 1, complete: true, explanation: "Ship safely", steps: [{ stepId: "s1", body: "Validate", status: "completed" }] } },
+    }), "2026-08-21T12:00:00.000Z");
+    expect(entries).toEqual([expect.objectContaining({ kind: "provider_activity", family: "plan", eventType: "plan.updated", title: "Plan" })]);
+    expect(entries).not.toEqual([expect.objectContaining({ kind: "assistant" })]);
+  });
 });
