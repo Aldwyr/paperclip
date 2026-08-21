@@ -79,8 +79,8 @@ export function TaskChatRunnerTurn({
   if (status === "queued") {
     return (
       <div className="flex flex-col gap-1 py-1" data-testid="task-chat-runner-turn" data-phase="startup">
-        <CurrentActivity items={items} />
         {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
+        <CurrentActivity items={items} />
       </div>
     );
   }
@@ -96,6 +96,7 @@ export function TaskChatRunnerTurn({
         expanded={open}
         onToggle={() => setOpen((value) => !value)}
       />
+      {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
       <div className="tc-turn-fold" data-folded={open ? "false" : "true"} aria-hidden={!open}>
         <div>
           <div className="flex flex-col gap-2 py-2">
@@ -113,7 +114,6 @@ export function TaskChatRunnerTurn({
           {!final ? <CurrentActivity items={items} /> : null}
         </div>
       ) : null}
-      {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
       {final ? (
         <div className="tc-enter-bubble w-full" data-testid="task-chat-final-response">
           <div className="break-words px-1 py-2 text-sm text-foreground" data-testid="task-chat-agent-bubble">

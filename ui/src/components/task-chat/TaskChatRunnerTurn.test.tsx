@@ -35,6 +35,9 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-current-activity"] svg')).toBeNull();
     expect(container.textContent).not.toContain("Working");
     expect(container.textContent).not.toContain("Waiting for transcript");
+    const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
+    const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
+    expect(identity?.compareDocumentPosition(activity!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
   it("keeps progress separate from the replace-in-place current command", () => {
@@ -45,6 +48,9 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-progress-update"]')?.textContent).toContain("Running the exact command now.");
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Running a command");
     expect(container.textContent).toContain("STREAM-$i");
+    const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
+    const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
+    expect(identity?.compareDocumentPosition(activity!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
   it("streams the final response in its durable slot and hides current activity", () => {
