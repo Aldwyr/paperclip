@@ -53,6 +53,8 @@ import type {
   UpdateToolMcpGateway,
   CreateToolTrustRuleFromActionRequest,
   ToolRedactedValueSummary,
+  ConnectionGrant,
+  ConnectionGrantsResponse,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -305,6 +307,34 @@ export const toolsApi = {
     api.put<ToolConnectionInstallSnapshot>(
       `/tool-connections/${connectionId}/installs`,
       { installs },
+    ),
+  // --- Identity grants (PAP-17835): who a connection acts as. The response
+  // carries server-computed capabilities and the audience member directory, so
+  // the UI never rebuilds the permission matrix from `membershipRole`.
+  listConnectionGrants: (connectionId: string) =>
+    api.get<ConnectionGrantsResponse>(`/tool-connections/${connectionId}/grants`),
+  revokeConnectionGrant: (connectionId: string, grantId: string) =>
+    api.delete<ConnectionGrant>(`/tool-connections/${connectionId}/grants/${grantId}`),
+  // An empty `memberUserIds` is the canonical "all organization members".
+  // Replacement is atomic server-side, so this never partially widens access.
+  replaceConnectionGrantMembers: (connectionId: string, grantId: string, memberUserIds: string[]) =>
+    api.put<ConnectionGrant>(
+      `/tool-connections/${connectionId}/grants/${grantId}/members`,
+      { memberUserIds },
+    ),
+  /**
+   * Start the signed-in user's own personal authorization. `subjectUserId` must
+   * be the caller: the server refuses any other subject, so there is no way to
+   * initiate consent on someone else's behalf.
+   */
+  startPersonalAuthorization: (
+    companyId: string,
+    connectionId: string,
+    input: { subjectUserId: string; scopes?: string[]; returnTo?: string },
+  ) =>
+    api.post<{ url: string }>(
+      `/companies/${companyId}/tools/connections/${connectionId}/start-authorization`,
+      input,
     ),
   createConnection: (companyId: string, input: CreateToolConnectionInput) =>
     api.post<ToolConnection>(`/companies/${companyId}/tools/connections`, input),

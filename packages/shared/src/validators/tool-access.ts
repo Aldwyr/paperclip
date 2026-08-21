@@ -215,6 +215,18 @@ export const putToolConnectionInstallsSchema = z.object({
 
 export type PutToolConnectionInstalls = z.infer<typeof putToolConnectionInstallsSchema>;
 
+/**
+ * Audience replacement for an organization grant (PAP-17835). An empty array is
+ * the canonical encoding of "all organization members" — the UI never exposes
+ * "empty list" as the mental model, so the wire format carries the emptiness and
+ * the copy layer translates it.
+ */
+export const replaceConnectionGrantMembersSchema = z.object({
+  memberUserIds: z.array(z.string().trim().min(1).max(500)).max(1000),
+}).strict();
+
+export type ReplaceConnectionGrantMembersInput = z.infer<typeof replaceConnectionGrantMembersSchema>;
+
 export const connectionTokenIssuancePathSchema = z.enum(CONNECTION_TOKEN_ISSUANCE_PATHS);
 
 export const connectionTokenScopeSchema = z.union([
@@ -347,6 +359,13 @@ export const connectToolAppSchema = z.object({
   applicationId: z.string().uuid().optional(),
   authMode: genericMcpAuthModeSchema.optional(),
   oauthClient: genericMcpOAuthClientSchema.optional(),
+  /**
+   * Which identity this credential becomes (PAP-17835). `user` means "Just me":
+   * the credential is committed to the caller's own personal grant and never to
+   * the connection row's shared secret refs or the default organization grant.
+   * Omitted keeps the historical shared-credential behaviour.
+   */
+  grantKind: connectionGrantKindSchema.optional(),
 }).superRefine((value, ctx) => {
   if (value.configValues) rejectSensitiveConfigKeys(value.configValues, ctx, ["configValues"]);
   if (value.credentialValues) rejectUnsafeHeaderCredentials(value.credentialValues, ctx, ["credentialValues"]);

@@ -3179,6 +3179,77 @@ describeEmbeddedPostgres("tool access service", () => {
     );
   });
 
+  it("commits a 'Just me' key to the caller's own grant and never to the connection or an organization grant", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "query_insight", annotations: { readOnlyHint: true } }]);
+
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "posthog",
+      connectionMethodKey: "mcp-api-key",
+      credentialValues: { "credentials.authorization": "phx_personal-secret" },
+      configValues: { projectId: "12345", mode: "tools" },
+      grantKind: "user",
+    }, { actorType: "user", actorId: "carol" });
+
+    const { grants } = await service.listConnectionGrants(connected.connectionId, company.id);
+    const connection = await service.getConnection(connected.connectionId, company.id);
+
+    // The identity is the caller's, and it is the only grant: creating an
+    // organization grant first and "moving" the secret later is exactly what the
+    // design forbids, so there must be no organization grant at all.
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ kind: "user", subjectUserId: "carol", status: "active" });
+    expect(grants[0]!.credentialSecretRefs.length).toBeGreaterThan(0);
+    expect(grants.some((grant) => grant.kind === "organization")).toBe(false);
+
+    // The personal secret is not reachable as the connection's shared credential.
+    expect(connection.credentialSecretRefs).toEqual([]);
+    expect(connection.credentialPolicy).toBe("per_user");
+
+    // ...and the secret ids the personal grant holds appear nowhere on the row's
+    // shared secret-ref list, which is what an organization grant would copy.
+    const personalSecretIds = new Set(grants[0]!.credentialSecretRefs.map((ref) => ref.secretId));
+    for (const ref of connection.credentialSecretRefs) {
+      expect(personalSecretIds.has(ref.secretId)).toBe(false);
+    }
+  });
+
+  it("keeps the shared-credential default when no grant kind is chosen", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "query_insight", annotations: { readOnlyHint: true } }]);
+
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "posthog",
+      connectionMethodKey: "mcp-api-key",
+      credentialValues: { "credentials.authorization": "phx_shared-secret" },
+      configValues: { projectId: "12345", mode: "tools" },
+    }, { actorType: "user", actorId: "board" });
+
+    const { grants } = await service.listConnectionGrants(connected.connectionId, company.id);
+    const connection = await service.getConnection(connected.connectionId, company.id);
+
+    expect(grants).toHaveLength(1);
+    expect(grants[0]).toMatchObject({ kind: "organization", isDefault: true });
+    expect(grants[0]!.credentialSecretRefs.length).toBeGreaterThan(0);
+    expect(connection.credentialPolicy).toBe("shared");
+  });
+
+  it("refuses a personal identity when no named user is making the request", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    mockToolsList([{ name: "query_insight", annotations: { readOnlyHint: true } }]);
+
+    await expect(service.connectGalleryApp(company.id, {
+      galleryKey: "posthog",
+      connectionMethodKey: "mcp-api-key",
+      credentialValues: { "credentials.authorization": "phx_agent-secret" },
+      configValues: { projectId: "12345", mode: "tools" },
+      grantKind: "user",
+    }, { actorType: "agent", actorId: "agent-1" })).rejects.toMatchObject({ status: 400 });
+  });
+
   it("requires an explicit PostHog method and projects validated project filters", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);

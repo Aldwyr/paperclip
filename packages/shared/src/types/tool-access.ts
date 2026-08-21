@@ -177,6 +177,48 @@ export interface ConnectionGrant {
   updatedAt: Date;
   members?: ConnectionGrantMember[];
   delegations?: ConnectionGrantDelegation[];
+  /**
+   * Server-computed authorization for this grant (PAP-17835). The UI renders the
+   * §3 permission matrix from these booleans; it must never rebuild policy from
+   * `membershipRole` strings, because grant authorization also depends on
+   * creator/subject identity that the client cannot evaluate.
+   */
+  capabilities?: ConnectionGrantCapabilities;
+}
+
+export interface ConnectionGrantCapabilities {
+  canRevoke: boolean;
+  canEditAudience: boolean;
+}
+
+/**
+ * Connection-level capabilities for the personal-connections UX. Policy-forbidden
+ * actions are omitted from the UI entirely; `false` here means "do not render",
+ * not "render disabled".
+ */
+export interface ToolConnectionCapabilities {
+  canConfigure: boolean;
+  canCreateOrganizationGrant: boolean;
+  canSetCompanyInstall: boolean;
+  canConnectAsCurrentUser: boolean;
+  canManageAgentInstalls: boolean;
+  canViewOtherPersonalIdentities: boolean;
+  editableAgentIds: string[];
+}
+
+export interface ConnectionGrantsResponse {
+  connection: { id: string; uid: string };
+  grants: ConnectionGrant[];
+  capabilities: ToolConnectionCapabilities;
+  currentUserId: string | null;
+  members: ConnectionAudienceMember[];
+}
+
+/** A company member that can appear in an organization grant's audience. */
+export interface ConnectionAudienceMember {
+  userId: string;
+  name: string | null;
+  email: string | null;
 }
 
 export interface ConnectionGrantDelegation {
