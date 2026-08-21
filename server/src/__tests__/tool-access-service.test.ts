@@ -10,6 +10,7 @@ import {
   companyMemberships,
   companySecretBindings,
   connectionGrantMembers,
+  connectionGrantDelegations,
   connectionGrants,
   connectionTokenIssuances,
   companySecrets,
@@ -37,7 +38,7 @@ import {
   toolRuntimeSlots,
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { getConnectableAppDefinition } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -866,6 +867,75 @@ describeEmbeddedPostgres("tool access service", () => {
       .send({});
     expect(revoked.status).toBe(409);
     expect(revoked.body).toMatchObject({ code: "grant_revoked", grantId: grant.id });
+  });
+
+  it("allows only the personal grant owner to create named-agent delegations and audits revocation", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { connection } = await createBrokerConnection(db, company.id);
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: "alice",
+      status: "active",
+      isDefault: false,
+    }).returning().then((rows) => rows[0]!);
+    const service = createTestToolAccessService(db);
+
+    await expect(service.createConnectionGrantDelegation(connection.id, grant.id, agent.id, "mallory"))
+      .rejects.toThrow("Only the active personal grant owner can create a delegation");
+    const delegation = await service.createConnectionGrantDelegation(connection.id, grant.id, agent.id, "alice");
+    expect(delegation).toMatchObject({ grantId: grant.id, agentId: agent.id, createdByUserId: "alice" });
+
+    await service.revokeConnectionGrantDelegation(
+      connection.id,
+      grant.id,
+      delegation.id,
+      { actorType: "user", actorId: "manager" },
+    );
+    expect(await db.select().from(connectionGrantDelegations).where(eq(connectionGrantDelegations.id, delegation.id)))
+      .toHaveLength(0);
+    expect(await db.select().from(toolAccessAuditEvents).where(eq(toolAccessAuditEvents.connectionId, connection.id)))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ action: "connection_grant.delegated", actorId: "alice" }),
+        expect.objectContaining({ action: "connection_grant.delegation_revoked", actorId: "manager" }),
+      ]));
+  });
+
+  it("fails autonomous token minting closed until the named agent has a standing delegation", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await db.update(heartbeatRuns).set({ invocationSource: "automation" }).where(eq(heartbeatRuns.id, run.id));
+    const { connection } = await createBrokerConnection(db, company.id);
+    await allowConnectionForAgent(db, company.id, agent.id, connection.id);
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
+    const grant = await db.insert(connectionGrants).values({
+      companyId: company.id,
+      connectionId: connection.id,
+      kind: "user",
+      subjectUserId: "user-for-run",
+      status: "active",
+      isDefault: false,
+    }).returning().then((rows) => rows[0]!);
+    const app = createRouteApp(db, agentJwtActor(company.id, agent.id, run.id));
+
+    const denied = await request(app)
+      .post(`/api/agents/me/connections/${connection.id}/token`)
+      .send({});
+    expect(denied.status).toBe(409);
+    expect(denied.body).toMatchObject({
+      code: "standing_delegation_required",
+      grantId: grant.id,
+      remediation: { action: "delegate_personal_grant", grantId: grant.id, agentId: agent.id },
+    });
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issue.id)))
+      .toEqual([expect.objectContaining({
+        status: "pending",
+        addresseeUserId: "user-for-run",
+        idempotencyKey: `connection-delegation:${connection.id}:user-for-run:${agent.id}`,
+      })]);
   });
 
   it("enforces organization grant audiences at token mint time", async () => {
@@ -3558,6 +3628,14 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(grant).toMatchObject({ kind: "user", status: "active" });
     expect(grant.credentialSecretRefs.map((ref) => ref.configPath).sort()).toEqual(["oauth.access_token", "oauth.refresh_token"]);
     expect(grant.credentialSecretRefs.map((ref) => ref.secretId).sort()).not.toEqual(workspaceSecretIds);
+    const personalSecrets = await db.select().from(companySecrets).where(
+      inArray(companySecrets.id, grant.credentialSecretRefs.map((ref) => ref.secretId)),
+    );
+    expect(personalSecrets).toHaveLength(2);
+    expect(personalSecrets).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scope: "user", ownerUserId: "user-for-run" }),
+    ]));
+    expect(personalSecrets.every((secret) => secret.userSecretDefinitionId !== null)).toBe(true);
     const [unchangedConnection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
     expect(unchangedConnection.credentialSecretRefs.map((ref) => ref.secretId).sort()).toEqual(workspaceSecretIds);
     const [resolved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction.id));

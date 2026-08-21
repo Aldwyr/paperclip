@@ -495,6 +495,7 @@ export type {
   ToolConnectionStatus,
   ToolConnectionKind,
   ConnectionGrant,
+  ConnectionGrantDelegation,
   ConnectionGrantKind,
   ConnectionGrantMember,
   ConnectionGrantMemberSubjectType,

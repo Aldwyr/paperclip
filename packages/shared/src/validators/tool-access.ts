@@ -45,6 +45,10 @@ export const toolConnectionAuthKindSchema = z.enum(["oauth", "api_key", "none"])
 export const toolConnectionOwnershipSchema = z.enum(["platform_shared", "platform_provisioned", "customer", "dcr"]);
 export const connectionGrantKindSchema = z.enum(["organization", "user"]);
 export const connectionGrantStatusSchema = z.enum(["active", "revoked", "expired", "needs_reauthorization"]);
+export const createConnectionGrantDelegationSchema = z.object({
+  agentId: z.string().uuid(),
+});
+export type CreateConnectionGrantDelegation = z.infer<typeof createConnectionGrantDelegationSchema>;
 export const toolConnectionCredentialPolicySchema = z.enum(["shared", "per_user", "per_user_with_fallback"]);
 export const toolConnectionStatusSchema = z.enum(["draft", "active", "disabled", "archived"]);
 export const toolConnectionInstallTargetTypeSchema = z.enum(["company", "agent"]);

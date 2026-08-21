@@ -5,11 +5,14 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   connectionGrantMembers,
+  connectionGrantDelegations,
   connectionGrants,
   connectionTokenIssuances,
   authUsers,
+  companies,
   companySecretBindings,
   companySecrets,
+  userSecretDefinitions,
   heartbeatRuns,
   issues,
   issueThreadInteractions,
@@ -2249,7 +2252,8 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       projectId: runSnapshotString(snapshot, "projectId") ?? runSnapshotString(paperclipIssue, "projectId"),
       routineId: runSnapshotString(snapshot, "routineId"),
       responsibleUserId: runSnapshotString(snapshot, "responsibleUserId", "responsible_user_id")
-        ?? runSnapshotString(paperclipIssue, "responsibleUserId", "responsible_user_id"),
+        ?? runSnapshotString(paperclipIssue, "responsibleUserId", "responsible_user_id")
+        ?? run.responsibleUserId,
     };
   }
 
@@ -2323,6 +2327,72 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       entityType: "tool_connection",
       entityId: input.connectionId,
       details: { path: input.path, outcome: input.outcome, reasonCode: input.reasonCode ?? null, ...(input.details ?? {}) },
+    });
+  }
+
+  async function createStandingDelegationAsk(input: {
+    connection: typeof toolConnections.$inferSelect;
+    issueId: string | null;
+    runId: string;
+    agentId: string;
+    ownerUserId: string;
+  }) {
+    if (!input.issueId) return;
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies)
+      .where(eq(companies.id, input.connection.companyId)).limit(1);
+    const idempotencyKey = `connection-delegation:${input.connection.id}:${input.ownerUserId}:${input.agentId}`;
+    const payload = {
+      version: 1 as const,
+      prompt: `Allow this agent to use your ${input.connection.name} account for autonomous runs`,
+      acceptLabel: "Review delegation",
+      rejectLabel: "Not now",
+      detailsMarkdown: "This autonomous run is paused. Paperclip will not use your personal identity until you explicitly delegate it to this named agent.",
+      target: {
+        type: "custom" as const,
+        key: `connection:${input.connection.uid}:delegation:${input.ownerUserId}:${input.agentId}`,
+        revisionId: input.connection.updatedAt.toISOString(),
+        label: `Delegate ${input.connection.name}`,
+        href: `/${company?.issuePrefix ?? ""}/apps/${input.connection.id}/setup`,
+      },
+    };
+    const [existing] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, input.connection.companyId),
+      eq(issueThreadInteractions.issueId, input.issueId),
+      eq(issueThreadInteractions.idempotencyKey, idempotencyKey),
+    )).limit(1);
+    if (existing) {
+      await db.update(issueThreadInteractions).set({
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        addresseeUserId: input.ownerUserId,
+        payload,
+        result: null,
+        resolvedAt: null,
+        updatedAt: new Date(),
+      }).where(eq(issueThreadInteractions.id, existing.id));
+      return;
+    }
+    await db.insert(issueThreadInteractions).values({
+      companyId: input.connection.companyId,
+      issueId: input.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      idempotencyKey,
+      sourceRunId: input.runId,
+      title: `Delegate your ${input.connection.name}`,
+      summary: "An explicit standing delegation is required for this autonomous run.",
+      createdByAgentId: input.agentId,
+      addresseeUserId: input.ownerUserId,
+      payload,
     });
   }
 
@@ -5374,6 +5444,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     value: string;
     actor?: ActorInfo;
     existingRefs?: typeof connectionGrants.$inferSelect.credentialSecretRefs;
+    ownerUserId?: string;
   }) {
     const existing = input.existingRefs === undefined
       ? oauthSecretRef(input.connection, input.configPath)
@@ -5381,6 +5452,45 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     if (existing) {
       await secrets.rotate(existing.secretId, { value: input.value }, actorForSecret(input.actor));
       return existing;
+    }
+    if (input.ownerUserId) {
+      const definitionKey = `tool_oauth.${input.connection.id}.${input.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}`;
+      let [definition] = await db.select().from(userSecretDefinitions).where(and(
+        eq(userSecretDefinitions.companyId, input.companyId),
+        eq(userSecretDefinitions.key, definitionKey),
+        isNull(userSecretDefinitions.deletedAt),
+      )).limit(1);
+      if (!definition) {
+        [definition] = await db.insert(userSecretDefinitions).values({
+          companyId: input.companyId,
+          key: definitionKey,
+          name: `${input.connection.name} ${input.label}`,
+          description: `Personal OAuth ${input.label.toLowerCase()} for ${input.connection.name}.`,
+          provider: "local_encrypted",
+          managedMode: "paperclip_managed",
+          createdByAgentId: input.actor?.actorType === "agent" ? input.actor.actorId : null,
+          createdByUserId: input.actor?.actorType === "user" ? input.actor.actorId : null,
+        }).onConflictDoNothing().returning();
+        if (!definition) {
+          [definition] = await db.select().from(userSecretDefinitions).where(and(
+            eq(userSecretDefinitions.companyId, input.companyId),
+            eq(userSecretDefinitions.key, definitionKey),
+            isNull(userSecretDefinitions.deletedAt),
+          )).limit(1);
+        }
+      }
+      if (!definition) throw new Error("Failed to create personal OAuth secret definition");
+      const secret = await secrets.createCurrentUserSecretValue(input.companyId, input.ownerUserId, {
+        definitionId: definition.id,
+        value: input.value,
+      }, actorForSecret(input.actor));
+      return {
+        secretId: secret.id,
+        versionSelector: "latest" as const,
+        configPath: input.configPath,
+        required: input.configPath === "oauth.access_token",
+        label: input.label,
+      };
     }
     const secret = await secrets.create(input.companyId, {
       name: `${input.connection.name} ${input.label} ${randomUUID().slice(0, 8)}`,
@@ -7459,6 +7569,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       value: token.accessToken,
       actor: input.actor,
       existingRefs: stateRow.subjectUserId ? subjectCredentialSecretRefs : undefined,
+      ownerUserId: stateRow.subjectUserId ?? undefined,
     });
     const nextCredentialSecretRefs = [
       ...subjectCredentialSecretRefs.filter((ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token"),
@@ -7473,6 +7584,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         value: token.refreshToken,
         actor: input.actor,
         existingRefs: stateRow.subjectUserId ? subjectCredentialSecretRefs : undefined,
+        ownerUserId: stateRow.subjectUserId ?? undefined,
       }));
     } else {
       const existingRefreshRef = subjectCredentialSecretRefs.find((ref) => ref.configPath === "oauth.refresh_token");
@@ -8047,7 +8159,85 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
         eq(connectionGrants.companyId, connection.companyId),
         eq(connectionGrants.connectionId, connection.id),
       )).orderBy(desc(connectionGrants.isDefault), desc(connectionGrants.updatedAt));
-      return { connection: { id: connection.id, uid: connection.uid }, grants };
+      const grantIds = grants.map((grant) => grant.id);
+      const delegations = grantIds.length === 0 ? [] : await db.select().from(connectionGrantDelegations).where(and(
+        eq(connectionGrantDelegations.companyId, connection.companyId),
+        inArray(connectionGrantDelegations.grantId, grantIds),
+      ));
+      return {
+        connection: { id: connection.id, uid: connection.uid },
+        grants: grants.map((grant) => ({
+          ...grant,
+          delegations: delegations.filter((delegation) => delegation.grantId === grant.id),
+        })),
+      };
+    },
+
+    createConnectionGrantDelegation: async (
+      idOrUid: string,
+      grantId: string,
+      agentId: string,
+      ownerUserId: string,
+    ) => {
+      const connection = await getConnectionRow(idOrUid);
+      const [grant] = await db.select().from(connectionGrants).where(and(
+        eq(connectionGrants.id, grantId),
+        eq(connectionGrants.companyId, connection.companyId),
+        eq(connectionGrants.connectionId, connection.id),
+        eq(connectionGrants.kind, "user"),
+        eq(connectionGrants.subjectUserId, ownerUserId),
+        eq(connectionGrants.status, "active"),
+      )).limit(1);
+      if (!grant) throw forbidden("Only the active personal grant owner can create a delegation");
+      const [targetAgent] = await db.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, agentId),
+        eq(agents.companyId, connection.companyId),
+      )).limit(1);
+      if (!targetAgent) throw notFound("Agent not found");
+      const [existing] = await db.select().from(connectionGrantDelegations).where(and(
+        eq(connectionGrantDelegations.grantId, grant.id),
+        eq(connectionGrantDelegations.agentId, agentId),
+      )).limit(1);
+      if (existing) return existing;
+      const [delegation] = await db.insert(connectionGrantDelegations).values({
+        companyId: connection.companyId,
+        grantId: grant.id,
+        agentId,
+        createdByUserId: ownerUserId,
+      }).returning();
+      await db.insert(toolAccessAuditEvents).values({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        actorType: "user",
+        actorId: ownerUserId,
+        action: "connection_grant.delegated",
+        outcome: "success",
+        reasonCode: "delegation_created",
+        details: { grantId: grant.id, delegationId: delegation!.id, agentId },
+      });
+      return delegation!;
+    },
+
+    revokeConnectionGrantDelegation: async (idOrUid: string, grantId: string, delegationId: string, actor?: ActorInfo) => {
+      const connection = await getConnectionRow(idOrUid);
+      const [delegation] = await db.delete(connectionGrantDelegations).where(and(
+        eq(connectionGrantDelegations.id, delegationId),
+        eq(connectionGrantDelegations.companyId, connection.companyId),
+        eq(connectionGrantDelegations.grantId, grantId),
+      )).returning();
+      if (!delegation) throw notFound("Connection grant delegation not found");
+      const binding = actorBinding(actor);
+      await db.insert(toolAccessAuditEvents).values({
+        companyId: connection.companyId,
+        connectionId: connection.id,
+        actorType: binding.actorType ?? "system",
+        actorId: binding.actorId,
+        action: "connection_grant.delegation_revoked",
+        outcome: "success",
+        reasonCode: "delegation_revoked",
+        details: { grantId, delegationId, agentId: delegation.agentId },
+      });
+      return delegation;
     },
 
     addConnectionInstallation: async (idOrUid: string, input: {
@@ -8092,18 +8282,38 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     revokeConnectionGrant: async (idOrUid: string, grantId: string, actor?: ActorInfo) => {
       const connection = await getConnectionRow(idOrUid);
       const binding = actorBinding(actor);
-      const [grant] = await db.update(connectionGrants).set({
-        status: "revoked",
-        isDefault: false,
-        revokedAt: new Date(),
-        revokedByAgentId: binding.actorType === "agent" ? binding.actorId : null,
-        revokedByUserId: binding.actorType === "user" ? binding.actorId : null,
-        updatedAt: new Date(),
-      }).where(and(
-        eq(connectionGrants.id, grantId),
-        eq(connectionGrants.companyId, connection.companyId),
-        eq(connectionGrants.connectionId, connection.id),
-      )).returning();
+      const grant = await db.transaction(async (tx) => {
+        const removedDelegations = await tx.delete(connectionGrantDelegations).where(and(
+          eq(connectionGrantDelegations.companyId, connection.companyId),
+          eq(connectionGrantDelegations.grantId, grantId),
+        )).returning();
+        const [updated] = await tx.update(connectionGrants).set({
+          status: "revoked",
+          isDefault: false,
+          revokedAt: new Date(),
+          revokedByAgentId: binding.actorType === "agent" ? binding.actorId : null,
+          revokedByUserId: binding.actorType === "user" ? binding.actorId : null,
+          updatedAt: new Date(),
+        }).where(and(
+          eq(connectionGrants.id, grantId),
+          eq(connectionGrants.companyId, connection.companyId),
+          eq(connectionGrants.connectionId, connection.id),
+        )).returning();
+        if (!updated) throw notFound("Connection grant not found");
+        if (removedDelegations.length > 0) {
+          await tx.insert(toolAccessAuditEvents).values(removedDelegations.map((delegation) => ({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            actorType: binding.actorType ?? "system",
+            actorId: binding.actorId,
+            action: "connection_grant.delegation_revoked",
+            outcome: "success",
+            reasonCode: "grant_revoked",
+            details: { grantId, delegationId: delegation.id, agentId: delegation.agentId },
+          })));
+        }
+        return updated;
+      });
       if (!grant) throw notFound("Connection grant not found");
       await db.insert(toolAccessAuditEvents).values({
         companyId: connection.companyId,
@@ -9090,6 +9300,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
 
       const actingUserId = runContext.responsibleUserId;
+      const autonomous = runContext.run.invocationSource === "automation" || runContext.run.invocationSource === "timer";
       const subject = connection.credentialPolicy === "shared" || !actingUserId
         ? { type: "app" as const }
         : { type: "user" as const, userId: actingUserId };
@@ -9111,6 +9322,32 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       }
       if (!grant) {
         grant = await ensureDefaultOrganizationGrant(connection);
+      }
+
+      if (grant.kind === "user" && autonomous) {
+        const [delegation] = await db.select({ id: connectionGrantDelegations.id }).from(connectionGrantDelegations).where(and(
+          eq(connectionGrantDelegations.companyId, connection.companyId),
+          eq(connectionGrantDelegations.grantId, grant.id),
+          eq(connectionGrantDelegations.agentId, input.agentId),
+        )).limit(1);
+        if (!delegation) {
+          if (actingUserId) {
+            await createStandingDelegationAsk({
+              connection,
+              issueId: runContext.issueId,
+              runId: input.runId,
+              agentId: input.agentId,
+              ownerUserId: actingUserId,
+            });
+          }
+          await fail(409, "Standing delegation is required for this autonomous run", "denied", "standing_delegation_required", {
+            connection: { id: connection.id, uid: connection.uid, name: connection.name },
+            grantId: grant.id,
+            subject: actingUserId ? { type: "user", userId: actingUserId } : { type: "app" },
+            agentId: input.agentId,
+            remediation: { action: "delegate_personal_grant", grantId: grant.id, agentId: input.agentId },
+          });
+        }
       }
 
       if (grant.kind === "organization") {

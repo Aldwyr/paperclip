@@ -176,6 +176,16 @@ export interface ConnectionGrant {
   createdAt: Date;
   updatedAt: Date;
   members?: ConnectionGrantMember[];
+  delegations?: ConnectionGrantDelegation[];
+}
+
+export interface ConnectionGrantDelegation {
+  id: string;
+  companyId: string;
+  grantId: string;
+  agentId: string;
+  createdByUserId: string;
+  createdAt: Date;
 }
 
 export interface ConnectionGrantMember {
@@ -260,6 +270,7 @@ export const CONNECTION_RECOVERABLE_ERROR_CODES = [
   "installation_required",
   "connection_not_installed",
   "subject_not_permitted",
+  "standing_delegation_required",
 ] as const;
 
 export type ConnectionRecoverableErrorCode = typeof CONNECTION_RECOVERABLE_ERROR_CODES[number];

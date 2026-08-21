@@ -7,6 +7,7 @@ import {
   approvals,
   companies,
   connectionGrantMembers,
+  connectionGrantDelegations,
   connectionGrants,
   documents,
   heartbeatRuns,
@@ -2638,17 +2639,86 @@ export function createToolGatewayService(
     });
   }
 
+  async function createStandingDelegationInteraction(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+    userId: string,
+  ) {
+    if (!session.issueId || !session.agentId || !session.runId) return;
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies)
+      .where(eq(companies.id, session.companyId)).limit(1);
+    const href = `/${company?.issuePrefix ?? ""}/apps/${connection.id}/setup`;
+    const idempotencyKey = `connection-delegation:${connection.id}:${userId}:${session.agentId}`;
+    const payload = {
+      version: 1 as const,
+      prompt: `Allow this agent to use your ${connection.name} account for autonomous runs`,
+      acceptLabel: "Review delegation",
+      rejectLabel: "Not now",
+      detailsMarkdown: "This autonomous run is paused. Paperclip will not use your personal identity until you explicitly delegate it to this named agent.",
+      target: {
+        type: "custom" as const,
+        key: `connection:${connection.uid}:delegation:${userId}:${session.agentId}`,
+        revisionId: connection.updatedAt.toISOString(),
+        label: `Delegate ${connection.name}`,
+        href,
+      },
+    };
+    const [existing] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, session.companyId),
+      eq(issueThreadInteractions.issueId, session.issueId),
+      eq(issueThreadInteractions.idempotencyKey, idempotencyKey),
+    )).limit(1);
+    if (existing) {
+      await db.update(issueThreadInteractions).set({
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        addresseeUserId: userId,
+        payload,
+        result: null,
+        resolvedAt: null,
+        updatedAt: new Date(),
+      }).where(eq(issueThreadInteractions.id, existing.id));
+      return;
+    }
+    await db.insert(issueThreadInteractions).values({
+      companyId: session.companyId,
+      issueId: session.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      idempotencyKey,
+      sourceRunId: session.runId,
+      title: `Delegate your ${connection.name}`,
+      summary: "An explicit standing delegation is required for this autonomous run.",
+      createdByAgentId: session.agentId,
+      addresseeUserId: userId,
+      payload,
+    });
+  }
+
   async function resolveConnectionGrant(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
   ): Promise<typeof connectionGrants.$inferSelect> {
     const [run] = session.runId
-      ? await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId }).from(heartbeatRuns).where(and(
+      ? await db.select({
+          responsibleUserId: heartbeatRuns.responsibleUserId,
+          invocationSource: heartbeatRuns.invocationSource,
+        }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, session.runId),
           eq(heartbeatRuns.companyId, session.companyId),
         )).limit(1)
       : [];
     const actingUserId = run?.responsibleUserId ?? null;
+    const autonomous = run?.invocationSource === "automation" || run?.invocationSource === "timer";
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
       const [grant] = await db.select().from(connectionGrants).where(and(
@@ -2690,7 +2760,33 @@ export function createToolGatewayService(
 
     const userGrant = connection.credentialPolicy === "shared" ? undefined : await findUserGrant();
     const resolution = resolveCredentialGrantKind(connection.credentialPolicy, actingUserId, Boolean(userGrant));
-    if (resolution === "user" && userGrant) return userGrant;
+    if (resolution === "user" && userGrant) {
+      if (autonomous) {
+        if (!session.agentId) {
+          throw new ToolGatewayHttpError(409, "Standing delegation requires a named agent", "standing_delegation_required", {
+            connectionId: connection.id,
+            grantId: userGrant.id,
+            actingUserId,
+          });
+        }
+        const [delegation] = await db.select({ id: connectionGrantDelegations.id }).from(connectionGrantDelegations).where(and(
+          eq(connectionGrantDelegations.companyId, connection.companyId),
+          eq(connectionGrantDelegations.grantId, userGrant.id),
+          eq(connectionGrantDelegations.agentId, session.agentId),
+        )).limit(1);
+        if (!delegation) {
+          await createStandingDelegationInteraction(session, connection, actingUserId!);
+          throw new ToolGatewayHttpError(409, "Standing delegation is required for this autonomous run", "standing_delegation_required", {
+            connectionId: connection.id,
+            grantId: userGrant.id,
+            actingUserId,
+            agentId: session.agentId,
+            remediation: { action: "delegate_personal_grant", grantId: userGrant.id, agentId: session.agentId },
+          });
+        }
+      }
+      return userGrant;
+    }
     if (resolution === "user_authorization_required") {
       if (actingUserId) await createUserAuthorizationInteraction(session, connection, actingUserId);
       throw new ToolGatewayHttpError(409, "User authorization is required", "user_authorization_required", {
