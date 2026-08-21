@@ -504,6 +504,7 @@ export type {
   ConnectionGrantsResponse,
   ConnectionGrantStatus,
   ToolConnectionCapabilities,
+  ToolConnectionCreateCapabilities,
   ToolCredentialSecretRef,
   ToolInvocation,
   ToolInvocationApprovalState,

@@ -24,6 +24,7 @@ import type {
   ToolApplication,
   ToolConnection,
   ToolConnectionAuthKind,
+  ToolConnectionCreateCapabilities,
 } from "@paperclipai/shared";
 import { credentialConfigPath, getAppDefinitionForUrl, getAvailableConnectionMethod, getAvailableConnectionMethods } from "@paperclipai/shared";
 import { useNavigate, useParams, useSearchParams } from "@/lib/router";
@@ -935,6 +936,7 @@ export function AppsConnect({ byoOnly = false }: { byoOnly?: boolean } = {}) {
           setInstallChoice={setInstallChoice}
           installAgentIds={installAgentIds}
           setInstallAgentIds={setInstallAgentIds}
+          capabilities={galleryQuery.data?.capabilities}
           submitLabel={accessSubmitLabel}
           // Leaving Access abandons the app choice entirely, so this resets the
           // draft and returns to the gallery the operator came from.
@@ -2202,7 +2204,10 @@ export function AccessStep({
   setInstallChoice: (choice: "specific" | "all") => void;
   installAgentIds: Set<string>;
   setInstallAgentIds: (ids: Set<string>) => void;
-  capabilities?: { canSetCompanyInstall: boolean; editableAgentIds: string[] } | null;
+  capabilities?: Pick<ToolConnectionCreateCapabilities, "canSetCompanyInstall"> & {
+    companyInstallReason?: string | null;
+    editableAgentIds?: string[];
+  } | null;
   submitLabel: string;
   onBack: () => void;
   onContinue: () => void;
@@ -2285,7 +2290,8 @@ export function AccessStep({
                   title: "Any agent",
                   description: canSetCompanyInstall
                     ? "Make this connection available to every agent."
-                    : "Only someone who can configure this connection can choose this.",
+                    : capabilities?.companyInstallReason ??
+                      "Only someone who can configure this connection can choose this.",
                   disabled: !canSetCompanyInstall,
                 },
               ]}

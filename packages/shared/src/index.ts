@@ -1353,6 +1353,7 @@ export type {
   ConnectionGrantsResponse,
   ConnectionGrantStatus,
   ToolConnectionCapabilities,
+  ToolConnectionCreateCapabilities,
   ConnectionTokenScope,
   ConnectionTokenRequest,
   ConnectionTokenAttribution,

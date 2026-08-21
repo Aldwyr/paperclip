@@ -3158,6 +3158,10 @@ describeEmbeddedPostgres("tool access service", () => {
     const res = await request(app).get(`/api/companies/${company.id}/tools/gallery`);
 
     expect(res.status).toBe(200);
+    expect(res.body.capabilities).toEqual({
+      canSetCompanyInstall: true,
+      companyInstallReason: null,
+    });
     expect(res.body.apps.map((app: { slug: string }) => app.slug)).toEqual([
       "zapier",
       "github",
@@ -3208,6 +3212,19 @@ describeEmbeddedPostgres("tool access service", () => {
         }),
       ]),
     );
+  });
+
+  it("returns server-derived create capabilities for a non-manager member", async () => {
+    const company = await createCompany(db);
+    const app = createRouteApp(db, boardSessionActor(company.id, "member"));
+
+    const res = await request(app).get(`/api/companies/${company.id}/tools/gallery`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.capabilities).toEqual({
+      canSetCompanyInstall: false,
+      companyInstallReason: "Only someone who can configure this connection can choose this.",
+    });
   });
 
   it("previews remote mcp.json headers as secret replacement fields without echoing values", async () => {

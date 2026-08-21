@@ -56,6 +56,7 @@ import type {
   ConnectionGrant,
   ConnectionGrantDelegation,
   ConnectionGrantsResponse,
+  ToolConnectionCreateCapabilities,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -76,7 +77,10 @@ export type ToolRuntimeHealthResponse = ToolRuntimeHealthSummary;
 export type ToolTrustRulesResponse = { trustRules: ToolPolicy[] };
 export type ToolPoliciesResponse = { policies: ToolPolicy[] };
 export type ToolProfilesResponse = { profiles: ToolProfileWithDetails[] };
-export type ToolGalleryResponse = { apps: AppDefinition[] };
+export type ToolGalleryResponse = {
+  apps: AppDefinition[];
+  capabilities: ToolConnectionCreateCapabilities;
+};
 export type ToolMcpGatewaysResponse = { gateways: ToolMcpGatewayWithTokens[] };
 export type CreateGatewayTokenInput = Omit<CreateToolMcpGatewayToken, "expiresAt"> & {
   expiresAt?: string | Date | null;

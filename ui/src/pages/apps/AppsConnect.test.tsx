@@ -7,7 +7,7 @@ import { CONNECTABLE_APP_DEFINITIONS } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
-import { AccessStep, AppsConnect } from "./AppsConnect";
+import { AppsConnect } from "./AppsConnect";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
@@ -166,6 +166,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       apps: [
         ZAPIER,
       ],
+      capabilities: {
+        canSetCompanyInstall: true,
+        companyInstallReason: null,
+      },
     });
     listApplicationsMock.mockResolvedValue({ applications: [] });
     listConnectionsMock.mockResolvedValue({ connections: [] });
@@ -426,36 +430,19 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
    * reason — not hidden. Disabling it is only half the job; Continue has to
    * refuse it too, or the forbidden choice is still submittable by keyboard.
    *
-   * Driven through `AccessStep` directly because the create flow has no
-   * connection to read per-connection capabilities from yet (see the
-   * `capabilities` prop, currently supplied by no caller).
+   * Driven through AppsConnect so this proves the pre-connection capability
+   * returned with the gallery reaches the real create flow.
    */
   it("disables Any agent and blocks Continue when the member cannot install company-wide", async () => {
-    const root = createRoot(container);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => {
-      root.render(
-        <QueryClientProvider client={client}>
-          <AccessStep
-            appName="Zapier"
-            providerName="Zapier"
-            companyId="company-1"
-            authKind="api_key"
-            grantKind="organization"
-            setGrantKind={() => {}}
-            installChoice="all"
-            setInstallChoice={() => {}}
-            installAgentIds={new Set()}
-            setInstallAgentIds={() => {}}
-            capabilities={{ canSetCompanyInstall: false, editableAgentIds: ["agent-1"] }}
-            submitLabel="Save and continue"
-            onBack={() => {}}
-            onContinue={() => {}}
-          />
-        </QueryClientProvider>,
-      );
+    mockParams.appKey = "zapier";
+    listGalleryMock.mockResolvedValueOnce({
+      apps: [ZAPIER],
+      capabilities: {
+        canSetCompanyInstall: false,
+        companyInstallReason: "Your company policy limits this choice to connection managers.",
+      },
     });
-    await flushReact();
+    await render();
 
     const anyAgent = Array.from(
       document.body.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
@@ -465,7 +452,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(anyAgent).toBeTruthy();
     expect(anyAgent?.disabled).toBe(true);
     expect(anyAgent?.textContent).toContain(
-      "Only someone who can configure this connection can choose this.",
+      "Your company policy limits this choice to connection managers.",
     );
     // "Agents I pick" is the live alternative, so the step is not a dead end.
     const pick = Array.from(
@@ -474,8 +461,6 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(pick?.disabled).toBe(false);
     // Continue refuses the forbidden choice even though it is the current one.
     expect(buttonByText("Save and continue")?.disabled).toBe(true);
-
-    await act(async () => root.unmount());
   });
 
   it("opens the selected app directly on its setup route", async () => {

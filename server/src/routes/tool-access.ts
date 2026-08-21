@@ -9,6 +9,7 @@ import {
   type DeploymentExposure,
   type DeploymentMode,
   type PermissionKey,
+  type ToolConnectionCreateCapabilities,
   connectToolAppSchema,
   createConnectionGrantDelegationSchema,
   createToolStdioCommandTemplateSchema,
@@ -51,6 +52,9 @@ import {
   OAUTH_CLIENT_ID_METADATA_DOCUMENT_PATH,
   oauthClientIdMetadataDocument,
 } from "../services/tool-access.js";
+
+const COMPANY_INSTALL_DENIAL_REASON =
+  "Only someone who can configure this connection can choose this.";
 
 /** Allowlist (e.g. Google Sheets allowed spreadsheet ids) lives in connection config. */
 function allowlistIds(config: Record<string, unknown> | null | undefined): string[] {
@@ -279,6 +283,17 @@ export function toolAccessRoutes(
     ));
   }
 
+  async function describeConnectionCreateCapabilities(
+    req: Request,
+    companyId: string,
+  ): Promise<ToolConnectionCreateCapabilities> {
+    const canSetCompanyInstall = await isToolConnectionManagerQuiet(req, companyId);
+    return {
+      canSetCompanyInstall,
+      companyInstallReason: canSetCompanyInstall ? null : COMPANY_INSTALL_DENIAL_REASON,
+    };
+  }
+
   /**
    * Server-computed capabilities for the connection identity/install surfaces.
    * The UI renders the §3 matrix from these booleans instead of reconstructing
@@ -444,6 +459,7 @@ export function toolAccessRoutes(
     assertCompanyAccess(req, companyId);
     const googleSheetsAvailability = googleSheetsRobotEmailFromEnv();
     res.json({
+      capabilities: await describeConnectionCreateCapabilities(req, companyId),
       apps: CONNECTABLE_APP_DEFINITIONS.map((app) =>
         app.slug === "google-sheets"
           ? {

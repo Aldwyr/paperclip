@@ -206,6 +206,16 @@ export interface ToolConnectionCapabilities {
   editableAgentIds: string[];
 }
 
+/**
+ * Capabilities needed before a tool connection exists. These are returned by
+ * the company-scoped app gallery read so create flows do not have to infer
+ * authorization from membership roles or wait for a connection id.
+ */
+export interface ToolConnectionCreateCapabilities {
+  canSetCompanyInstall: boolean;
+  companyInstallReason: string | null;
+}
+
 export interface ConnectionGrantsResponse {
   connection: { id: string; uid: string };
   grants: ConnectionGrant[];
