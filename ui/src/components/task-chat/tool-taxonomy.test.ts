@@ -84,6 +84,14 @@ describe("toolTaxonomy", () => {
     expect(toolTaxonomy(undefined).icon).toBe(Wrench);
     expect(toolTaxonomy(null).icon).toBe(Wrench);
   });
+
+  it("labels the semantic completion tool as Finishing", () => {
+    expect(toolTaxonomy("paperclip_finish")).toEqual({
+      family: "other",
+      icon: Wrench,
+      verbLabel: "Finishing",
+    });
+  });
 });
 
 describe("toolTaxonomy multi-word ACP titles", () => {

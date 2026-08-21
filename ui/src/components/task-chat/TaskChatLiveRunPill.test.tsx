@@ -89,4 +89,20 @@ describe("TaskChatLiveRunPill", () => {
     expect(pill?.textContent).toContain("for 42 seconds");
     expect(pill?.textContent).toContain("ran 1 command");
   });
+
+  it("keeps the paperclip runner Working header static", () => {
+    act(() => {
+      root.render(
+        <TaskChatLiveRunPill
+          status="running"
+          startedAtMs={Date.now() - 2_000}
+          toolSummary={null}
+          runnerStyle
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Workingfor 2s");
+    expect(container.querySelector(".shimmer-text")).toBeNull();
+  });
 });

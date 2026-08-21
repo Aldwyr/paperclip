@@ -104,6 +104,9 @@ function classify(n: string): Exclude<ToolFamily, "mcp"> {
 export function toolTaxonomy(name: string | undefined | null): ToolTaxonomyEntry {
   const raw = (name ?? "").trim();
   if (!raw) return { family: "other", ...FAMILY_META.other };
+  if (raw.toLowerCase() === "paperclip_finish") {
+    return { family: "other", icon: Wrench, verbLabel: "Finishing" };
+  }
   const mcpTool = mcpToolSegment(raw);
   if (mcpTool) return { family: "mcp", icon: McpIcon, verbLabel: `Using ${mcpTool}` };
   const family = classify(raw.toLowerCase());

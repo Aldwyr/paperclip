@@ -24,13 +24,15 @@ describe("TaskChatRunnerTurn", () => {
 
   const render = (items: TaskChatItem[], status = "running", runId = "run-1") => act(() => root.render(
     <ThemeProvider>
-      <TaskChatRunnerTurn runId={runId} items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} />
+      <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} />
     </ThemeProvider>,
   ));
 
   it("shows immediate Thinking before the first runner event", () => {
     render([], "queued");
     expect(container.textContent).toContain("Thinking");
+    expect(container.textContent).toContain("Runner");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"] svg')).toBeNull();
     expect(container.textContent).not.toContain("Working");
     expect(container.textContent).not.toContain("Waiting for transcript");
   });
@@ -51,7 +53,7 @@ describe("TaskChatRunnerTurn", () => {
       { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "Completed successfully.", channel: "final", streaming: true },
     ]);
     expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain("Completed successfully.");
-    expect(container.querySelector('[data-testid="task-chat-agent-avatar"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="task-chat-agent-avatar"]')).toHaveLength(1);
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
   });
 

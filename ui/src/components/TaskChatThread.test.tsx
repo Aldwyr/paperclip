@@ -580,7 +580,7 @@ describe("TaskChatThread mobile composer dock (PAP-495)", () => {
 });
 
 describe("TaskChatThread live transcript", () => {
-  it("keeps a persisted runner reply hidden while the live turn still owns that response", () => {
+  it("keeps an unlinked persisted runner reply hidden while the live turn still owns that response", () => {
     transcriptState.transcriptByRun.set("run-runner", [
       {
         kind: "assistant",
@@ -600,7 +600,7 @@ describe("TaskChatThread live transcript", () => {
       body: "Completed the requested streaming test.",
       presentation: null,
       metadata: null,
-      runId: "run-runner",
+      runId: null,
       createdAt: new Date("2026-08-21T15:44:22.000Z"),
       updatedAt: new Date("2026-08-21T15:44:22.000Z"),
     };

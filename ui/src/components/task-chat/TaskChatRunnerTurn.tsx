@@ -1,9 +1,8 @@
 import { useRef, useState } from "react";
-import { Brain } from "lucide-react";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { cn } from "@/lib/utils";
 import type { TaskChatItem, TaskChatMessageItem, TaskChatThinkingItem, TaskChatToolItem } from "./task-chat-model";
-import { TaskChatBubble } from "./TaskChatBubble";
+import { TaskChatAgentIdentity } from "./TaskChatBubble";
 import { TaskChatLiveRunPill } from "./TaskChatLiveRunPill";
 import { TaskChatLiveTail } from "./TaskChatLiveTail";
 import { paperclipRunnerHistoryItems } from "./transcript-adapter";
@@ -24,8 +23,7 @@ function CurrentActivity({ items }: { items: readonly TaskChatItem[] }) {
   );
   if (!activity || activity.kind === "thinking") {
     return (
-      <div className="flex items-center gap-2 px-1 py-1.5 text-sm text-muted-foreground" data-testid="task-chat-current-activity">
-        <Brain className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <div className="px-1 py-1.5 text-sm text-muted-foreground" data-testid="task-chat-current-activity">
         <span className="shimmer-text shimmer-text-muted">Thinking</span>
       </div>
     );
@@ -44,6 +42,8 @@ function CurrentActivity({ items }: { items: readonly TaskChatItem[] }) {
 
 export function TaskChatRunnerTurn({
   runId,
+  agentName,
+  agentIcon,
   items,
   status,
   startedAtMs,
@@ -52,6 +52,8 @@ export function TaskChatRunnerTurn({
 }: {
   /** Stable identity used to clear replay-latched final text for the next turn. */
   runId?: string | null;
+  agentName?: string | null;
+  agentIcon?: string | null;
   items: readonly TaskChatItem[];
   status: string;
   startedAtMs: number | null;
@@ -76,8 +78,9 @@ export function TaskChatRunnerTurn({
 
   if (status === "queued") {
     return (
-      <div className="py-1" data-testid="task-chat-runner-turn" data-phase="startup">
+      <div className="flex flex-col gap-1 py-1" data-testid="task-chat-runner-turn" data-phase="startup">
         <CurrentActivity items={items} />
+        {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
       </div>
     );
   }
@@ -110,9 +113,12 @@ export function TaskChatRunnerTurn({
           {!final ? <CurrentActivity items={items} /> : null}
         </div>
       ) : null}
+      {agentName ? <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} /> : null}
       {final ? (
-        <div data-testid="task-chat-final-response">
-          <TaskChatBubble item={final} />
+        <div className="tc-enter-bubble w-full" data-testid="task-chat-final-response">
+          <div className="break-words px-1 py-2 text-sm text-foreground" data-testid="task-chat-agent-bubble">
+            <MarkdownBody softBreaks linkIssueReferences>{final.text}</MarkdownBody>
+          </div>
         </div>
       ) : null}
     </div>

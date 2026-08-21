@@ -60,6 +60,25 @@ function toMs(value: Date | string | null | undefined): number {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
+function normalizedMessageText(value: string | null | undefined): string {
+  return (value ?? "").trim().replace(/\s+/g, " ");
+}
+
+function isRunnerResponseComment(params: {
+  comment: TaskChatThreadProps["comments"][number];
+  runId: string;
+  runStartedAtMs: number | null;
+  finalText: string | null;
+}): boolean {
+  const { comment, runId, runStartedAtMs, finalText } = params;
+  if (comment.deletedAt || comment.authorType === "user") return false;
+  if (comment.runId === runId) return true;
+  if (comment.runId || !finalText) return false;
+  const commentAtMs = toMs(comment.createdAt);
+  if (runStartedAtMs != null && commentAtMs < runStartedAtMs - 5_000) return false;
+  return normalizedMessageText(comment.body) === normalizedMessageText(finalText);
+}
+
 // PAP-462 B4: backstop for how long the just-settled run's transcript stays
 // mounted when neither a settled turn nor a reply comment ever arrives to hand
 // off to (e.g. a stopped run with no tool activity). Normal completions hand off
@@ -276,6 +295,20 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : settlingRun && runs.find((run) => run.id === settlingRun.id)?.adapterType === "paperclip_runner"
       ? settlingRun.id
       : null;
+  const heldPaperclipRunnerStartedAtMs = heldPaperclipRunnerRunId === liveRun?.id
+    ? (liveRun.startedAt ? toMs(liveRun.startedAt) : null) ?? toMs(liveRun.createdAt)
+    : settlingRun?.startedAtMs ?? null;
+  const heldPaperclipRunnerFinalText = useMemo(() => {
+    if (!heldPaperclipRunnerRunId) return null;
+    const entries = transcriptByRun.get(heldPaperclipRunnerRunId) ?? [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry.kind === "assistant" && entry.channel === "final" && entry.text.trim()) {
+        return entry.text;
+      }
+    }
+    return null;
+  }, [heldPaperclipRunnerRunId, transcriptByRun]);
 
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
   // they settle. Runs already terminal at mount collapse instantly.
@@ -313,7 +346,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       // The live/settling runner lane already renders this run's final answer.
       // Keep a just-persisted duplicate out of the backbone until the complete
       // canonical bubble + Worked header can replace that lane atomically.
-      if (comment.runId === heldPaperclipRunnerRunId) return;
+      if (
+        heldPaperclipRunnerRunId &&
+        isRunnerResponseComment({
+          comment,
+          runId: heldPaperclipRunnerRunId,
+          runStartedAtMs: heldPaperclipRunnerStartedAtMs,
+          finalText: heldPaperclipRunnerFinalText,
+        })
+      ) return;
       const item = commentItems[index];
       if (!item) return;
       entries.push({ ms: toMs(comment.createdAt), order: 1, id: item.id, item });
@@ -370,7 +411,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
-  }, [comments, commentItems, interactions, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId]);
+  }, [comments, commentItems, interactions, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText]);
 
   // Boolean gate (stable across the host's per-render brief objects) so the
   // heavy assembly memo doesn't recompute on every parent render.
@@ -509,10 +550,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // Hand off once the settled turn or its reply comment is in the thread; a
   // stopped run that yields neither is released by the backstop timeout so the
   // tail never lingers indefinitely.
-  const settlingHasComment = settlingRun != null &&
-    comments.some((comment) => comment.runId === settlingRun.id && !comment.deletedAt);
   const settlingIsPaperclipRunner = settlingRun != null &&
     runs.find((run) => run.id === settlingRun.id)?.adapterType === "paperclip_runner";
+  const settlingHasComment = settlingRun != null && comments.some((comment) =>
+    settlingIsPaperclipRunner
+      ? isRunnerResponseComment({
+          comment,
+          runId: settlingRun.id,
+          runStartedAtMs: settlingRun.startedAtMs,
+          finalText: heldPaperclipRunnerFinalText,
+        })
+      : comment.runId === settlingRun.id && !comment.deletedAt,
+  );
   const settledRunRendered = settlingRun != null &&
     (settlingIsPaperclipRunner
       ? settlingHasComment && settledRunIds.has(settlingRun.id)
@@ -587,6 +636,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // tailStreaming: true while live, false through the settle gap — so the tail
   // renders identically either side of the run finishing.
   const tailAgentName = liveRun?.agentName ?? linkedRunMetaById.get(tailRunId ?? "")?.agentName;
+  const tailAgentId = liveRun?.agentId
+    ?? linkedRunMetaById.get(tailRunId ?? "")?.agentId
+    ?? issueAssigneeAgentId;
+  const tailAgent = tailAgentId ? agentMap?.get(tailAgentId) : undefined;
+  const visibleTailAgentName = tailAgentName ?? tailAgent?.name ?? null;
+  const visibleTailAgentIcon = tailAgent?.icon ?? null;
   const tailItems = useMemo(
     () =>
       tailRunId
@@ -764,6 +819,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     {paperclipRunnerTail || optimisticRunnerStartup ? (
                       <TaskChatRunnerTurn
                         runId={tailRunId}
+                        agentName={visibleTailAgentName}
+                        agentIcon={visibleTailAgentIcon}
                         items={tailItems}
                         status={optimisticRunnerStartup ? "queued" : tailStatus}
                         startedAtMs={tailStartedAtMs}

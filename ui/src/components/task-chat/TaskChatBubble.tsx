@@ -50,6 +50,37 @@ function initialsForName(name: string) {
   return name.slice(0, 2).toUpperCase();
 }
 
+export function TaskChatAgentIdentity({
+  agentName,
+  agentIcon,
+  onBehalfOfUserName,
+}: {
+  agentName: string;
+  agentIcon?: string | null;
+  onBehalfOfUserName?: string;
+}) {
+  return (
+    <span className="flex items-center gap-2 px-1" data-testid="task-chat-agent-identity">
+      <Avatar size="sm" className="shrink-0" data-testid="task-chat-agent-avatar">
+        {agentIcon ? (
+          <AvatarFallback>
+            <AgentIcon icon={agentIcon} className="h-3.5 w-3.5" />
+          </AvatarFallback>
+        ) : (
+          <AvatarFallback>{initialsForName(agentName)}</AvatarFallback>
+        )}
+      </Avatar>
+      <span className="text-sm font-semibold text-foreground">{agentName}</span>
+      {onBehalfOfUserName ? (
+        <CommentAttributionChip
+          agentName={agentName}
+          userName={onBehalfOfUserName}
+        />
+      ) : null}
+    </span>
+  );
+}
+
 /**
  * Author-typed message row — the primary legibility signal. Human messages sit
  * right in a solid accent bubble; agent messages sit directly on the page
@@ -109,24 +140,11 @@ export function TaskChatBubble({
     <div className={cn("flex w-full flex-col gap-1", animateEntry && "tc-enter-bubble", isHuman ? "items-end" : "items-start")}>
       {beforeTurn ? <div className="w-full pb-1">{beforeTurn}</div> : null}
       {!isHuman && item.authorName ? (
-        <span className="flex items-center gap-2 px-1">
-          <Avatar size="sm" className="shrink-0" data-testid="task-chat-agent-avatar">
-            {item.agentIcon ? (
-              <AvatarFallback>
-                <AgentIcon icon={item.agentIcon} className="h-3.5 w-3.5" />
-              </AvatarFallback>
-            ) : (
-              <AvatarFallback>{initialsForName(item.authorName)}</AvatarFallback>
-            )}
-          </Avatar>
-          <span className="text-sm font-semibold text-foreground">{item.authorName}</span>
-          {item.onBehalfOfUserName ? (
-            <CommentAttributionChip
-              agentName={item.authorName}
-              userName={item.onBehalfOfUserName}
-            />
-          ) : null}
-        </span>
+        <TaskChatAgentIdentity
+          agentName={item.authorName}
+          agentIcon={item.agentIcon}
+          onBehalfOfUserName={item.onBehalfOfUserName}
+        />
       ) : null}
       {bodyText.length > 0 ? (
         <div
