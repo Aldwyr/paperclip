@@ -526,30 +526,54 @@ export function App() {
 
   const respond = useCallback(
     (response: CapabilityInteractionResponse) => {
-      setSnapshot((current) => {
-        if (current === null) return current;
-        if (route.mode === "live") {
-          void capabilityLiveClient
-            .respond(current.sessionId, response.interactionId, response.outcome, response.result)
-            .then((next) => setSnapshot(next.view))
-            .catch((cause) => setActionError(describe(cause)));
-          return {
+      if (snapshot === null) return;
+      if (route.mode !== "live") {
+        setSnapshot(applyFakeInteractionResponse(snapshot, response));
+        setAnnouncement(ANSWERED_ANNOUNCEMENT);
+        return;
+      }
+
+      // Network effects must never live inside a React state updater. Strict
+      // Mode intentionally invokes updater functions more than once in
+      // development, which previously submitted every interaction twice: the
+      // first request resolved it and the duplicate produced "not pending".
+      const sessionId = snapshot.sessionId;
+      setActionError(null);
+      setSnapshot((current) => current === null ? current : {
+        ...current,
+        turns: current.turns.map((turn) => ({
+          ...turn,
+          items: turn.items.map((item) =>
+            item.kind === "interaction" && item.interactionId === response.interactionId
+              ? { ...item, state: "submitting" as const, stateLabel: "Submitting…" }
+              : item,
+          ),
+        })),
+      });
+      void capabilityLiveClient
+        .respond(sessionId, response.interactionId, response.outcome, response.result)
+        .then((next) => {
+          setSnapshot(next.view);
+          setAnnouncement(ANSWERED_ANNOUNCEMENT);
+        })
+        .catch((cause) => {
+          setActionError(describe(cause));
+          setSnapshot((current) => current === null ? current : {
             ...current,
             turns: current.turns.map((turn) => ({
               ...turn,
               items: turn.items.map((item) =>
-                item.kind === "interaction" && item.interactionId === response.interactionId
-                  ? { ...item, state: "submitting" as const, stateLabel: "Submitting…" }
+                item.kind === "interaction" &&
+                item.interactionId === response.interactionId &&
+                item.state === "submitting"
+                  ? { ...item, state: "pending" as const, stateLabel: "Waiting for you" }
                   : item,
               ),
             })),
-          };
-        }
-        return applyFakeInteractionResponse(current, response);
-      });
-      setAnnouncement(ANSWERED_ANNOUNCEMENT);
+          });
+        });
     },
-    [route.mode],
+    [route.mode, snapshot],
   );
 
   /**

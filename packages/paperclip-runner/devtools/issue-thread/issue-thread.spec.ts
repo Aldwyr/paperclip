@@ -1010,7 +1010,9 @@ test.describe("pending-request live region", () => {
     await expect(live).toHaveText(PENDING_ANNOUNCEMENT);
     await expect(page.locator('[data-composer-state="waiting"]')).toBeVisible();
 
+    let interactionRequests = 0;
     await page.route("**/api/capability/ui/interaction", async (route) => {
+      interactionRequests += 1;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1026,6 +1028,7 @@ test.describe("pending-request live region", () => {
     await card.getByRole("button", { name: "Submit answers" }).click();
 
     await expect(card).toHaveAttribute("data-interaction-state", "answered");
+    expect(interactionRequests).toBe(1);
     await expect(page.locator('[data-composer-state="ready"]')).toHaveCount(1);
     await expect(live).not.toContainText(PENDING_ANNOUNCEMENT);
     await expect(live).toHaveText("Your answer was recorded.");
