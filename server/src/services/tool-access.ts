@@ -3039,10 +3039,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .where(and(eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, profileKey)))
       .limit(1);
     if (!profile) {
+      const [sameName] = await dbClient
+        .select({ id: toolProfiles.id })
+        .from(toolProfiles)
+        .where(and(
+          eq(toolProfiles.companyId, connection.companyId),
+          eq(toolProfiles.name, connection.name),
+        ))
+        .limit(1);
+      const profileName = sameName
+        ? `${connection.name} (${connection.id.replace(/-/g, "").slice(0, 8)})`
+        : connection.name;
       [profile] = await dbClient.insert(toolProfiles).values({
         companyId: connection.companyId,
         profileKey,
-        name: connection.name,
+        name: profileName,
         description: `Access profile for ${connection.name}.`,
         status: "active",
         defaultAction: "deny",
@@ -3082,10 +3093,21 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       .limit(1);
     const createdProfile = !profile;
     if (!profile) {
+      const [sameName] = await db
+        .select({ id: toolProfiles.id })
+        .from(toolProfiles)
+        .where(and(
+          eq(toolProfiles.companyId, input.connection.companyId),
+          eq(toolProfiles.name, input.connection.name),
+        ))
+        .limit(1);
+      const profileName = sameName
+        ? `${input.connection.name} (${input.connection.id.replace(/-/g, "").slice(0, 8)})`
+        : input.connection.name;
       [profile] = await db.insert(toolProfiles).values({
         companyId: input.connection.companyId,
         profileKey,
-        name: input.connection.name,
+        name: profileName,
         description: `Access profile for ${input.connection.name}.`,
         status: "active",
         defaultAction: "deny",

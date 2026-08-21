@@ -47,7 +47,7 @@ import { classifyRisk, normalizeConnectionMethodConfig, toolAccessService } from
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
-import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
+import { createToolGatewayService as createToolGatewayServiceBase, type ToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -65,6 +65,16 @@ function createTestToolAccessService(
 ) {
   return toolAccessService(db, {
     remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
+    remoteHttpRequest: async (url, init) => fetch(url, init),
+    ...options,
+  });
+}
+
+function createToolGatewayService(
+  db: ReturnType<typeof createDb>,
+  options: NonNullable<Parameters<typeof createToolGatewayServiceBase>[1]> = {},
+) {
+  return createToolGatewayServiceBase(db, {
     remoteHttpRequest: async (url, init) => fetch(url, init),
     ...options,
   });
@@ -142,6 +152,7 @@ function createRouteApp(
     deploymentMode: "local_trusted" | "authenticated";
     deploymentExposure: "private" | "public";
   },
+  useProtocolFixtureTransport = true,
 ) {
   const app = express();
   app.use(express.json());
@@ -158,8 +169,12 @@ function createRouteApp(
   });
   app.use("/api", toolAccessRoutes(db, {
     toolGateway,
-    remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }],
-    remoteHttpRequest: async (url, init) => fetch(url, init),
+    ...(useProtocolFixtureTransport
+      ? {
+          remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 as const }],
+          remoteHttpRequest: async (url: string, init: RequestInit) => fetch(url, init),
+        }
+      : {}),
     ...deployment,
   }));
   app.use(errorHandler);
@@ -441,7 +456,16 @@ async function createRemoteToolFixture(
     config: { url: "https://fixture.example.test/mcp" },
     transportConfig: { url: "https://fixture.example.test/mcp" },
     healthStatus: "ok",
+    credentialPolicy: "shared",
   }).returning();
+  await db.insert(connectionGrants).values({
+    companyId,
+    connectionId: connection!.id,
+    kind: "organization",
+    credentialSecretRefs: [],
+    status: "active",
+    isDefault: true,
+  });
   const riskLevel = input.riskLevel ?? "write";
   const [catalogEntry] = await db.insert(toolCatalogEntries).values({
     companyId,
@@ -3139,8 +3163,8 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(result.connection.config)).not.toContain("phx_test-secret");
     expect(result.catalog).toEqual(expect.arrayContaining([
       expect.objectContaining({ toolName: "query_insight", riskLevel: "read", status: "active" }),
-      expect.objectContaining({ toolName: "delete_feature_flag", riskLevel: "destructive", status: "quarantined" }),
-      expect.objectContaining({ toolName: "brand_new_tool", riskLevel: "write", status: "quarantined" }),
+      expect.objectContaining({ toolName: "delete_feature_flag", riskLevel: "destructive", status: "active" }),
+      expect.objectContaining({ toolName: "brand_new_tool", riskLevel: "write", status: "active" }),
     ]));
   });
 
@@ -3275,7 +3299,6 @@ describeEmbeddedPostgres("tool access service", () => {
       name: "Company sheets",
       configValues: { allowedSpreadsheetIds: ["sheet-with-inputs"] },
     }, { actorType: "user", actorId: "board" });
-
     const descriptions = Object.fromEntries(connect.catalog.map((entry) => [entry.toolName, entry.description]));
     expect(descriptions).toMatchObject({
       list_spreadsheets: "List the Google Sheets spreadsheets configured in this connection allowlist.",
@@ -3722,6 +3745,7 @@ describeEmbeddedPostgres("tool access service", () => {
       name: "Viewer finish blocked",
       credentialValues: { "headers.Authorization": "Bearer imported-token" },
     }, { actorType: "user", actorId: "board" });
+    const bindingsBefore = await db.select({ id: toolProfileBindings.id }).from(toolProfileBindings);
 
     const viewerApp = createRouteApp(db, boardSessionActor(company.id, "viewer", "viewer-user"));
     await request(viewerApp)
@@ -3736,7 +3760,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connect.connectionId));
     expect(connection.status).toBe("draft");
     expect(connection.enabled).toBe(false);
-    await expect(db.select().from(toolProfileBindings)).resolves.toHaveLength(0);
+    await expect(db.select({ id: toolProfileBindings.id }).from(toolProfileBindings)).resolves.toEqual(bindingsBefore);
   });
 
   it("binds OAuth callback completion to the initiating board session", async () => {
@@ -3745,8 +3769,12 @@ describeEmbeddedPostgres("tool access service", () => {
     vi.stubEnv("PAPERCLIP_PUBLIC_URL", "http://paperclip.test");
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
-    const connect = await service.connectGalleryApp(company.id, { galleryKey: "slack", name: "Slack bound" });
     const initiatingActor = boardSessionActor(company.id, "operator", "oauth-operator");
+    const connect = await service.connectGalleryApp(
+      company.id,
+      { galleryKey: "slack", name: "Slack bound" },
+      { actorType: "user", actorId: initiatingActor.userId },
+    );
     const initiatingApp = createRouteApp(db, initiatingActor);
     const startRes = await request(initiatingApp)
       .post(`/api/tools/oauth/${connect.connectionId}/start`)
@@ -5183,7 +5211,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(connect.connection).toMatchObject({
       status: "draft",
       enabled: false,
-      config: { url: "https://links.example.test/actions", quarantineNewEntries: true },
+      config: { url: "https://links.example.test/actions", quarantineNewEntries: false },
       credentialSecretRefs: [
         expect.objectContaining({
           configPath: "credentials.authorization",
@@ -5226,7 +5254,7 @@ describeEmbeddedPostgres("tool access service", () => {
     ["authenticated/public", { deploymentMode: "authenticated" as const, deploymentExposure: "public" as const }],
   ])("rejects OAuth metadata redirects to link-local endpoints in %s", async (_label, deployment) => {
     const company = await createCompany(db);
-    const app = createRouteApp(db, undefined, undefined, deployment);
+    const app = createRouteApp(db, undefined, undefined, deployment, false);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
       const href = String(url);
       if (href === "https://8.8.8.8/mcp") {

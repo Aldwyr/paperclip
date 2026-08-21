@@ -42,6 +42,7 @@ function createTestToolGatewayService(db: ReturnType<typeof createDb>, options: 
   return createToolGatewayService(db, {
     ...options,
     toolActionSigningSecret: options.toolActionSigningSecret ?? testToolActionSigningSecret,
+    remoteHttpRequest: options.remoteHttpRequest ?? (async (url, init) => fetch(url, init)),
   });
 }
 
