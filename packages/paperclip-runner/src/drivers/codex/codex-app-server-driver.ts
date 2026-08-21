@@ -1124,7 +1124,15 @@ class CodexHarnessSession implements HarnessSession {
     const turn = record(params.turn);
     const item = itemFromParams(params);
     const threadId = text(params.threadId);
-    const turnId = text(params.turnId, text(turn.id));
+    const explicitTurnId = text(params.turnId, text(turn.id));
+    // Current Codex app-server builds omit turnId from some item notifications. This driver
+    // permits only one active turn, so a same-thread item can be bound to that turn without
+    // ambiguity. Pre-turn, cross-thread, stale, and post-terminal notifications still fail closed.
+    const turnId = explicitTurnId || (
+      notification.method.startsWith("item/") || notification.method === "thread/tokenUsage/updated"
+        ? this.#activeTurnId ?? ""
+        : ""
+    );
     const itemId = text(item.id, text(params.itemId));
     if (notification.method === "error" || notification.method === "warning" || notification.method === "configWarning") {
       this.#emit("harness.diagnostic", {
