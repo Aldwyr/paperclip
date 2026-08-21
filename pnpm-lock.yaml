@@ -34,9 +34,6 @@ importers:
       '@playwright/test':
         specifier: ^1.62.1
         version: 1.62.1
-      agentmail:
-        specifier: ^0.5.14
-        version: 0.5.20
       cross-env:
         specifier: ^10.1.0
         version: 10.1.0
@@ -5637,15 +5634,6 @@ packages:
   agentkeepalive@4.6.0:
     resolution: {integrity: sha512-kja8j7PjmncONqaTsB8fQ+wE2mSU2DJ9D4XKoJ5PFWIdRMa6SLSN1ff4mOr4jCbfRSsxR4keIiySJU0N9T5hIQ==}
     engines: {node: '>= 8.0.0'}
-
-  agentmail@0.5.20:
-    resolution: {integrity: sha512-EA1QAwxkkbH2fUZ8hC/hWZzDsGBV7b50c5LEHcwFi8/e6SArB+U50fDXBMxcbn8jh/UDeNEJZncdYxicrN64SQ==}
-    engines: {node: '>=18.0.0'}
-    peerDependencies:
-      '@x402/fetch': ^2
-    peerDependenciesMeta:
-      '@x402/fetch':
-        optional: true
 
   aggregate-error@3.1.0:
     resolution: {integrity: sha512-4I7Td01quW/RpocfNayFdFVk1qSuoh0E7JrbRJ16nH01HhKFQ88INq9Sd+nd72zqRySlr9BmDA8xlEJ6vJMrYA==}
@@ -13574,13 +13562,6 @@ snapshots:
     dependencies:
       humanize-ms: 1.2.1
     optional: true
-
-  agentmail@0.5.20:
-    dependencies:
-      ws: 8.21.3
-    transitivePeerDependencies:
-      - bufferutil
-      - utf-8-validate
 
   aggregate-error@3.1.0:
     dependencies:
