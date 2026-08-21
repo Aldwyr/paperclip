@@ -12,7 +12,7 @@ import { persistActivity, publishActivity } from "../activity-log.js";
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
   "request_human_input",
-  "list_documents", "read_document", "list_document_revisions",
+  "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
 
@@ -92,6 +92,7 @@ export class PaperclipRunnerToolAuthority {
       }
       case "list_document_revisions":
         return { revisions: await documentService(this.db).listIssueDocumentRevisions(this.binding.issueId, requiredString(input.key)) };
+      case "write_document": return this.#writeDocument(input);
       case "list_agents":
         return { actors: (await agentService(this.db).list(this.binding.companyId)).map(redactedActor) };
       case "get_agent": {
@@ -175,6 +176,62 @@ export class PaperclipRunnerToolAuthority {
       );
       const result = { commentId: comment.id, issueId: this.binding.issueId, disposition: "applied" };
       receipts[idempotencyKey] = { operationId: "report_progress", input, result } satisfies ToolReceipt;
+      await tx.update(heartbeatRuns).set({
+        resultJson: { ...resultJson, semanticToolReceipts: receipts },
+        updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, this.binding.runId));
+      return result;
+    });
+  }
+
+  async #writeDocument(input: Record<string, unknown>): Promise<unknown> {
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    return this.#withMutationReceipt("write_document", idempotencyKey, input, async (tx) => {
+      const write = await documentService(tx).upsertIssueDocument({
+        issueId: this.binding.issueId,
+        key: requiredString(input.key),
+        title: requiredString(input.title),
+        format: "markdown",
+        body: requiredString(input.body),
+        baseRevisionId: input.baseRevisionId === null ? null : requiredString(input.baseRevisionId),
+        changeSummary: input.changeSummary === null || input.changeSummary === undefined
+          ? null
+          : requiredString(input.changeSummary),
+        createdByAgentId: this.binding.agentId,
+        createdByRunId: this.binding.runId,
+      });
+      return {
+        disposition: "applied",
+        created: write.created,
+        document: write.document,
+      };
+    });
+  }
+
+  async #withMutationReceipt(
+    operationId: string,
+    idempotencyKey: string,
+    input: Record<string, unknown>,
+    effect: (tx: Db) => Promise<unknown>,
+  ): Promise<unknown> {
+    return this.db.transaction(async (tx) => {
+      const [run] = await tx.select().from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId)))
+        .for("update").limit(1);
+      if (!run || run.status !== "running" || run.agentId !== this.binding.agentId) {
+        throw new Error("paperclip_runner_tool_binding_not_authorized");
+      }
+      const resultJson = record(run.resultJson);
+      const receipts = record(resultJson.semanticToolReceipts);
+      const prior = receipts[idempotencyKey] as ToolReceipt | undefined;
+      if (prior !== undefined) {
+        if (prior.operationId !== operationId || canonicalJson(prior.input) !== canonicalJson(input)) {
+          throw new Error("paperclip_runner_tool_idempotency_conflict");
+        }
+        return prior.result;
+      }
+      const result = JSON.parse(JSON.stringify(await effect(tx as unknown as Db))) as unknown;
+      receipts[idempotencyKey] = { operationId, input, result } satisfies ToolReceipt;
       await tx.update(heartbeatRuns).set({
         resultJson: { ...resultJson, semanticToolReceipts: receipts },
         updatedAt: new Date(),

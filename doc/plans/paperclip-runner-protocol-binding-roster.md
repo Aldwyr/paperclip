@@ -6,9 +6,9 @@ This roster is the implementation ledger for binding the canonical Paperclip Run
 
 - Canonical protocol actions: **41**
 - Actions in the Codex semantic catalog: **28**
-- Actions advertised by the production Paperclip authority: **13**
-- Actions with a real Paperclip service binding: **13**
-- Actions audited through the shared Paperclip-server PRP route: **1 full real-service vertical slice; 12 additional bound operations unit-audited**
+- Actions advertised by the production Paperclip authority: **14**
+- Actions with a real Paperclip service binding: **14**
+- Actions audited through the shared Paperclip-server PRP route: **1 full real-service vertical slice; 13 additional bound operations unit-audited**
 - Existing semantic conformance bridge: five route-backed test operations (`report_progress`, `write_document`, confirmation-only `request_human_input`, `set_dependencies`, and `finish_task`). It is test-only and is not a production binding.
 
 The generated action metadata currently says `realServiceBinding: unbound` and `prpBindingStatus: audit_pending` for every action. `realBindingStatus: live_codex` means only that a Codex scenario exercised the mock semantic implementation; it must not be interpreted as a production Paperclip binding.
@@ -19,13 +19,13 @@ The generated action metadata currently says `realServiceBinding: unbound` and `
 | --- | --- | --- | --- |
 | Active task reads | `get_task_context`, `get_task_history`, `search_tasks` | issue, comment, project, and assignment services | bound; run/issue/agent/company assignment checked on every call |
 | Task mutations | `report_progress`, `answer_status_question`, `finish_task`, `block_task`, `request_review`, `set_dependencies`, `create_task` | issue/comment services and native status arbiter | `report_progress` bound with durable run receipt; remaining actions withheld pending mutation/status-arbiter audit |
-| Documents and deliverables | `list_documents`, `read_document`, `list_document_revisions`, `write_document`, `register_deliverable` | document and attachment services | three reads bound; mutations withheld pending idempotency audit |
+| Documents and deliverables | `list_documents`, `read_document`, `list_document_revisions`, `write_document`, `register_deliverable` | document and attachment services | three reads and `write_document` bound; write uses the real optimistic-revision service and a run-locked durable receipt. Deliverable registration remains withheld |
 | Human interaction | `request_human_input` | interaction service and continuation scheduler | bound for confirmation, checkbox, questions, suggested tasks, and item verdicts |
 | Agents | `list_agents`, `get_agent` | agent service with company scope | bound with credential/config redaction and company checks |
 | Approvals | `list_approvals`, `get_approval`, `get_approval_context`, `request_approval`, `decide_approval`, `comment_on_approval` | approval service | three reads bound; mutations withheld. `decide_approval` is board-user-only in the current product and must not be agent-advertised |
 | Workspace | `get_workspace_runtime`, `control_workspace_service` | workspace runtime service | unbound |
 | Scheduling | `schedule_wake` | wakeup service | unbound |
-| Discovery | tool search and tool schema lookup | authorized catalog projection | runner-local authorized projection; production authority supplies only the 13 bound definitions |
+| Discovery | tool search and tool schema lookup | authorized catalog projection | runner-local authorized projection; production authority supplies only the 14 bound definitions |
 | Administrative surface | `administer_company`, `export_company`, `list_company_skills`, `sync_company_skills`, `list_projects`, `list_goals`, `list_routines`, `manage_routine`, `list_cases`, `upsert_case`, `inspect_operation_result` | existing company-scoped API/services; individually authorization-gated | protocol-only/scenario mock |
 | Secrets | `list_secret_metadata`, `read_secret_value` | secrets service; metadata/value claims separated and output redacted | protocol-only/scenario mock |
 | Escape hatch | `generic_api_request` | no production binding planned until a narrow allowlist is designed | test-only |
@@ -60,4 +60,4 @@ an embedded real Paperclip database and active native heartbeat run are routed
 through the shared server endpoint to Rust runnerd and the fake Codex
 app-server; Codex calls `get_task_context`, and the result is read from the real
 run-bound Paperclip authority. The remaining advertised operations still need
-their own route-level cases before the roster can call all 13 fully audited.
+their own route-level cases before the roster can call all 14 fully audited.

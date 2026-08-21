@@ -24,6 +24,7 @@ const PRODUCTION_BINDINGS: Readonly<Record<string, { service: string; evidence: 
   list_documents: { service: "documentService.listIssueDocuments", evidence: "bound issue document read" },
   read_document: { service: "documentService.getIssueDocumentByKey", evidence: "bound issue/key document read" },
   list_document_revisions: { service: "documentService.listIssueDocumentRevisions", evidence: "bound issue/key revision read" },
+  write_document: { service: "documentService.upsertIssueDocument + heartbeatRuns semanticToolReceipts", evidence: "real revision mutation + optimistic concurrency + idempotent replay test" },
   list_agents: { service: "agentService.list (redacted projection)", evidence: "company-scoped actor projection" },
   get_agent: { service: "agentService.getById (redacted projection)", evidence: "company equality + redacted actor projection" },
   list_approvals: { service: "approvalService.list", evidence: "company-scoped approval projection" },
