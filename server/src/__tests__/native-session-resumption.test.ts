@@ -241,6 +241,7 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
   const projectId = randomUUID();
   const projectWorkspaceId = randomUUID();
   const executionWorkspaceId = randomUUID();
+  const newerExecutionWorkspaceId = randomUUID();
   const issueId = randomUUID();
   const freshIssueId = randomUUID();
   const runId = randomUUID();
@@ -403,8 +404,23 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
       cwd: repoRoot,
       providerType: "local_fs",
     });
+    await db.insert(executionWorkspaces).values({
+      id: newerExecutionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      sourceIssueId: issueId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Newer issue workspace",
+      status: "active",
+      cwd: repoRoot,
+      providerType: "local_fs",
+    });
     await db.update(issues).set({
-      executionWorkspaceId,
+      // Simulate a newer run moving the issue-level pointer before the older native run is
+      // recovered. The older run must still restore its own immutable workspace binding.
+      executionWorkspaceId: newerExecutionWorkspaceId,
       executionWorkspacePreference: "reuse_existing",
       executionWorkspaceSettings: { mode: "shared_workspace" },
     }).where(eq(issues.id, issueId));
@@ -523,8 +539,15 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
     expect(new Set(effects.map((effect) => effect.decisionId))).toEqual(new Set([decisions[0]!.id]));
     expect(effects.map((effect) => effect.effectKind).sort()).toEqual(["issue_status_projection", "release_checkout"]);
     await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
-      expect.objectContaining({ status: "done", statusVersion: 1, lastStatusDecisionId: decisions[0]!.id }),
+      expect.objectContaining({
+        status: "done",
+        statusVersion: 1,
+        lastStatusDecisionId: decisions[0]!.id,
+        executionWorkspaceId: newerExecutionWorkspaceId,
+      }),
     ]);
+    await expect(db.select().from(executionWorkspaces).where(eq(executionWorkspaces.companyId, companyId)))
+      .resolves.toHaveLength(2);
     await expect(db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).resolves.toEqual([
       expect.objectContaining({ phase: "committed", resultId: expect.any(String), assessmentId: expect.any(String), decisionId: decisions[0]!.id }),
     ]);

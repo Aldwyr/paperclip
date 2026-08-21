@@ -14433,12 +14433,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         context.paperclipTaskMarkdownCompact = redactedWakeContext.paperclipTaskMarkdownCompact;
       }
     }
-    const requestedExecutionWorkspaceId = readNonEmptyString(issueRef?.executionWorkspaceId);
+    // A native run's execution input is immutable once persisted. Recovery must therefore
+    // restore the workspace bound to that input rather than consulting the issue's current
+    // workspace pointer: a newer run may already have moved or cleared the issue binding while
+    // this older provider session is still recoverable.
+    const persistedRunnerProfile = parseObject(run.runnerProfileJson);
+    const persistedNativeExecutionInput =
+      run.runtimeMode === "native" && persistedRunnerProfile.nativeExecutionInput !== undefined
+        ? parseNativeExecutionInput(persistedRunnerProfile.nativeExecutionInput)
+        : null;
+    const nativeRecoveryExecutionWorkspaceId =
+      persistedNativeExecutionInput?.binding.executionWorkspaceId ?? null;
+    const requestedExecutionWorkspaceId = nativeRecoveryExecutionWorkspaceId
+      ?? readNonEmptyString(issueRef?.executionWorkspaceId);
     const existingExecutionWorkspace =
       requestedExecutionWorkspaceId ? await executionWorkspacesSvc.getById(requestedExecutionWorkspaceId) : null;
     const workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
-      issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
+      issueExecutionWorkspacePreference: nativeRecoveryExecutionWorkspaceId
+        ? "reuse_existing"
+        : issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
     });
     const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
@@ -15187,7 +15201,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         cleanupReason: null,
       });
     }
-    if (issueId && persistedExecutionWorkspace) {
+    if (issueId && persistedExecutionWorkspace && !nativeRecoveryExecutionWorkspaceId) {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
       const shouldSwitchIssueToExistingWorkspace =
         issueRef?.executionWorkspacePreference === "reuse_existing" ||
@@ -15887,9 +15901,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
         nativeRunnerInstanceId = run.runnerInstanceId ?? randomUUID();
         const nativeSessionId = run.nativeSessionId ?? randomUUID();
-        const persistedProfile = parseObject(run.runnerProfileJson);
-        if (persistedProfile.nativeExecutionInput !== undefined) {
-          nativeExecution = parseNativeExecutionInput(persistedProfile.nativeExecutionInput);
+        const persistedProfile = persistedRunnerProfile;
+        if (persistedNativeExecutionInput) {
+          nativeExecution = persistedNativeExecutionInput;
           if (
             nativeExecution.binding.companyId !== agent.companyId
             || nativeExecution.binding.runId !== run.id
