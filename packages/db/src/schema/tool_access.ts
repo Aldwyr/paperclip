@@ -211,6 +211,27 @@ export const connectionGrantMembers = pgTable(
   ],
 );
 
+export const connectionGrantDelegations = pgTable(
+  "connection_grant_delegations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    grantId: uuid("grant_id").notNull(),
+    agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+    createdByUserId: text("created_by_user_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.companyId, table.grantId],
+      foreignColumns: [connectionGrants.companyId, connectionGrants.id],
+      name: "connection_grant_delegations_company_grant_fk",
+    }).onDelete("cascade"),
+    index("connection_grant_delegations_company_agent_idx").on(table.companyId, table.agentId),
+    uniqueIndex("connection_grant_delegations_grant_agent_uq").on(table.grantId, table.agentId),
+  ],
+);
+
 export const toolConnectionInstalls = pgTable(
   "tool_connection_installs",
   {

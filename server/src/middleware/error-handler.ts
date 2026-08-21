@@ -100,6 +100,7 @@ export function errorHandler(
       "installation_required",
       "connection_not_installed",
       "subject_not_permitted",
+      "standing_delegation_required",
     ]).has(typeof details?.code === "string" ? details.code : "");
     recordResponsibleUserDenialFromHttpError(req, details);
     if (err.status >= 500) {

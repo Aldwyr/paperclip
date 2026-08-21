@@ -13,6 +13,7 @@ import {
   companyMemberships,
   companies,
   connectionGrantMembers,
+  connectionGrantDelegations,
   connectionGrants,
   createDb,
   heartbeatRuns,
@@ -1891,6 +1892,66 @@ rl.on("line", (line) => {
       });
       const result = await gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
       expect(result).toMatchObject({ status: "completed", result: { content: "connected" } });
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("requires an explicit named-agent delegation for autonomous personal-identity runs", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    await db.update(heartbeatRuns).set({
+      responsibleUserId: "alice",
+      invocationSource: "automation",
+    }).where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: {
+        jsonrpc: "2.0",
+        id: fakeRequest.body?.id,
+        result: { content: [{ type: "text", text: "delegated" }] },
+      },
+    }));
+    try {
+      const { connection } = await createRemoteMcpTool(db, company.id, {
+        url: fake.url,
+        toolName: "whoami",
+        riskLevel: "read",
+      });
+      await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
+      const grant = await db.insert(connectionGrants).values({
+        companyId: company.id,
+        connectionId: connection.id,
+        kind: "user",
+        subjectUserId: "alice",
+        credentialSecretRefs: [],
+        status: "active",
+        isDefault: false,
+      }).returning().then((rows) => rows[0]!);
+      await allowAllToolsForAgent(db, company.id, agent.id);
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find((item) => item.providerType === "mcp_remote_http")!;
+
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "standing_delegation_required" });
+      expect(fake.requests).toHaveLength(0);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issue.id)))
+        .toEqual([expect.objectContaining({
+          status: "pending",
+          addresseeUserId: "alice",
+          idempotencyKey: `connection-delegation:${connection.id}:alice:${agent.id}`,
+        })]);
+
+      await db.insert(connectionGrantDelegations).values({
+        companyId: company.id,
+        grantId: grant.id,
+        agentId: agent.id,
+        createdByUserId: "alice",
+      });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .resolves.toMatchObject({ status: "completed", result: { content: "delegated" } });
       expect(fake.requests).toHaveLength(1);
     } finally {
       await fake.close();

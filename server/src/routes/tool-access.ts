@@ -10,6 +10,7 @@ import {
   type DeploymentMode,
   type PermissionKey,
   connectToolAppSchema,
+  createConnectionGrantDelegationSchema,
   createToolStdioCommandTemplateSchema,
   createToolApplicationSchema,
   createToolConnectionSchema,
@@ -781,6 +782,60 @@ export function toolAccessRoutes(
       details: { connectionId: connection.id, kind: grant.kind },
     });
     res.json(grant);
+  });
+
+  router.post("/tool-connections/:connectionId/grants/:grantId/delegations", validate(createConnectionGrantDelegationSchema), async (req, res) => {
+    assertBoard(req);
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    const ownerUserId = req.actor.userId;
+    if (!ownerUserId) throw forbidden("A named user is required to delegate a personal grant");
+    const agentId = req.body.agentId;
+    const delegation = await svc.createConnectionGrantDelegation(
+      connection.id,
+      req.params.grantId as string,
+      agentId,
+      ownerUserId,
+    );
+    await logActivity(db, {
+      companyId: connection.companyId,
+      actorType: "user",
+      actorId: ownerUserId,
+      action: "tool_connection.grant_delegated",
+      entityType: "connection_grant",
+      entityId: req.params.grantId as string,
+      details: { connectionId: connection.id, delegationId: delegation.id, agentId },
+    });
+    res.status(201).json(delegation);
+  });
+
+  router.delete("/tool-connections/:connectionId/grants/:grantId/delegations/:delegationId", async (req, res) => {
+    assertBoard(req);
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return;
+    const { grants } = await svc.listConnectionGrants(connection.id, connection.companyId);
+    const grant = grants.find((candidate) => candidate.id === req.params.grantId);
+    if (!grant) throw notFound("Connection grant not found");
+    const canRevokeOwnDelegation = Boolean(req.actor.userId && grant.subjectUserId === req.actor.userId);
+    if (!canRevokeOwnDelegation && !await isToolConnectionManager(req, connection.companyId)) {
+      throw forbidden("Only the personal grant owner or a connection manager can revoke a delegation");
+    }
+    const delegation = await svc.revokeConnectionGrantDelegation(
+      connection.id,
+      grant.id,
+      req.params.delegationId as string,
+      getActorInfo(req),
+    );
+    await logActivity(db, {
+      companyId: connection.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "tool_connection.grant_delegation_revoked",
+      entityType: "connection_grant",
+      entityId: grant.id,
+      details: { connectionId: connection.id, delegationId: delegation.id, agentId: delegation.agentId },
+    });
+    res.json(delegation);
   });
 
   router.get("/tool-connections/:connectionId/usage", async (req, res) => {

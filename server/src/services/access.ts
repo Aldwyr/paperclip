@@ -2,9 +2,14 @@ import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companyMemberships,
+  companySecrets,
+  connectionGrantDelegations,
+  connectionGrantMembers,
+  connectionGrants,
   instanceUserRoles,
   issues,
   principalPermissionGrants,
+  toolAccessAuditEvents,
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict } from "../errors.js";
@@ -27,6 +32,78 @@ type MemberArchiveInput = {
 
 export function accessService(db: Db) {
   const authorization = authorizationService(db);
+
+  async function sweepMemberConnectionAccess(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    companyId: string,
+    userId: string,
+    now: Date,
+  ) {
+    const ownedGrants = await tx.select({
+      id: connectionGrants.id,
+      connectionId: connectionGrants.connectionId,
+      credentialSecretRefs: connectionGrants.credentialSecretRefs,
+    }).from(connectionGrants).where(and(
+      eq(connectionGrants.companyId, companyId),
+      eq(connectionGrants.kind, "user"),
+      eq(connectionGrants.subjectUserId, userId),
+    ));
+    const grantIds = ownedGrants.map((grant) => grant.id);
+    const secretIds = [...new Set(ownedGrants.flatMap((grant) =>
+      grant.credentialSecretRefs.map((ref) => ref.secretId),
+    ))];
+    const removedDelegations = grantIds.length === 0 ? [] : await tx
+      .delete(connectionGrantDelegations)
+      .where(and(
+        eq(connectionGrantDelegations.companyId, companyId),
+        inArray(connectionGrantDelegations.grantId, grantIds),
+      ))
+      .returning();
+    if (grantIds.length > 0) {
+      await tx.update(connectionGrants).set({
+        status: "revoked",
+        isDefault: false,
+        revokedAt: now,
+        revokedByUserId: null,
+        revokedByAgentId: null,
+        updatedAt: now,
+      }).where(and(
+        eq(connectionGrants.companyId, companyId),
+        inArray(connectionGrants.id, grantIds),
+      ));
+      if (secretIds.length > 0) {
+        await tx.delete(companySecrets).where(and(
+          eq(companySecrets.companyId, companyId),
+          eq(companySecrets.scope, "user"),
+          eq(companySecrets.ownerUserId, userId),
+          inArray(companySecrets.id, secretIds),
+        ));
+      }
+    }
+    await tx.delete(connectionGrantMembers).where(and(
+      eq(connectionGrantMembers.companyId, companyId),
+      eq(connectionGrantMembers.subjectType, "user"),
+      eq(connectionGrantMembers.subjectId, userId),
+    ));
+    if (removedDelegations.length > 0) {
+      const connectionByGrant = new Map(ownedGrants.map((grant) => [grant.id, grant.connectionId]));
+      await tx.insert(toolAccessAuditEvents).values(removedDelegations.map((delegation) => ({
+        companyId,
+        connectionId: connectionByGrant.get(delegation.grantId) ?? null,
+        actorType: "system",
+        actorId: null,
+        action: "connection_grant.delegation_revoked",
+        outcome: "success",
+        reasonCode: "membership_removed",
+        details: {
+          grantId: delegation.grantId,
+          delegationId: delegation.id,
+          agentId: delegation.agentId,
+          ownerUserId: userId,
+        },
+      })));
+    }
+  }
 
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
@@ -216,6 +293,9 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      if (existing.status === "active" && nextStatus !== "active" && existing.principalType === "user") {
+        await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
+      }
       const updated = await tx
         .update(companyMemberships)
         .set({
@@ -356,6 +436,7 @@ export function accessService(db: Db) {
       await assertAssignableArchiveTarget(companyId, input.reassignment, tx);
 
       const now = new Date();
+      await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       const assignmentPatch = {
         assigneeAgentId: input.reassignment?.assigneeAgentId ?? null,
         assigneeUserId: input.reassignment?.assigneeUserId ?? null,
@@ -489,9 +570,13 @@ export function accessService(db: Db) {
         }
       }
       if (toArchive.length > 0) {
+        const now = new Date();
+        for (const membership of toArchive) {
+          await sweepMemberConnectionAccess(tx, membership.companyId, membership.principalId, now);
+        }
         await tx
           .update(companyMemberships)
-          .set({ status: "archived", updatedAt: new Date() })
+          .set({ status: "archived", updatedAt: now })
           .where(inArray(companyMemberships.id, toArchive.map((row) => row.id)));
         await tx
           .delete(principalPermissionGrants)
