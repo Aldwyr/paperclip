@@ -2,4 +2,5 @@
 // the server after changing runner internals; the workspace export resolves through dist. The
 // server build replaces this compiled shim with the package's built distribution, so published
 // server installs do not need a separate paperclip-runner npm bootstrap.
+// Keep runtime behavior in the package; this file is only the server build boundary.
 export * from "@paperclipai/paperclip-runner";

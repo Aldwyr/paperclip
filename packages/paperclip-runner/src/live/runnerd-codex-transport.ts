@@ -394,9 +394,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #startTurn(params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const input = Array.isArray(params.input) ? params.input.map(record) : [];
     const message = input.map((item) => typeof item.text === "string" ? item.text : "").join("\n");
-    this.#turnId = `turn_lab_${randomUUID().replaceAll("-", "")}`;
+    const pendingTurnId = `turn_lab_${randomUUID().replaceAll("-", "")}`;
+    this.#turnId = pendingTurnId;
     await this.#command("turn.start", { text: message });
-    this.#pumpEvents();
+    // Command completion only means runnerd accepted the command. Codex assigns
+    // the authoritative turn identity in the subsequent turn/started event, so
+    // do not expose the temporary transport identity to the strict driver.
+    const deadline = Date.now() + 30_000;
+    while (this.#turnId === pendingTurnId && Date.now() < deadline) {
+      this.#pumpEvents();
+      if (this.#turnId !== pendingTurnId) break;
+      if (this.#handle?.child.exitCode !== null) throw new Error("runnerd exited before provider turn startup");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    if (this.#turnId === pendingTurnId) throw new Error("runnerd did not report the provider turn identity");
     return { turn: { id: this.#turnId, status: "inProgress" } };
   }
 
@@ -476,9 +487,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const method = payload.method;
       if (typeof method !== "string") continue;
       const params = record(payload.params);
-      if (method === "turn/started") {
-        const providerTurnId = record(params.turn).id;
-        if (typeof providerTurnId === "string") this.#turnId = providerTurnId;
+      const providerTurnId = params.turnId ?? record(params.turn).id;
+      if (typeof providerTurnId === "string" && providerTurnId.length > 0) {
+        this.#turnId = providerTurnId;
       }
       this.#queue.push({ method, params });
     }
