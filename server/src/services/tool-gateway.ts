@@ -2610,6 +2610,7 @@ export function createToolGatewayService(
         effectiveResolverPolicy: "human_only",
         resolverPolicyProvenance: "explicit",
         effectiveResolverPolicySource: "requested",
+        addresseeUserId: userId,
         payload,
         result: null,
         resolvedAt: null,
@@ -2632,6 +2633,7 @@ export function createToolGatewayService(
       title: `Connect your ${connection.name}`,
       summary: "Personal authorization is required before this run can continue.",
       createdByAgentId: session.agentId,
+      addresseeUserId: userId,
       payload,
     });
   }
@@ -2667,7 +2669,7 @@ export function createToolGatewayService(
         eq(connectionGrants.status, "active"),
       )).limit(1);
       if (!grant) {
-        throw new ToolGatewayHttpError(409, "Organization authorization is required", "user_authorization_required", {
+        throw new ToolGatewayHttpError(409, "Organization authorization is required", "organization_authorization_required", {
           connectionId: connection.id,
         });
       }

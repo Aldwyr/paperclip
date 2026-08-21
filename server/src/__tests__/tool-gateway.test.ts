@@ -1523,6 +1523,19 @@ rl.on("line", (line) => {
       .rejects.toMatchObject({ status: 403, reasonCode: "grant_audience_denied" });
     expect(await db.select().from(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id))).toHaveLength(0);
 
+    await db.insert(connectionGrantMembers).values({
+      companyId: company.id,
+      grantId: organizationGrant.id,
+      subjectType: "user",
+      subjectId: "alice",
+    });
+    expect(await executeIdentity()).toBe("organization");
+
+    await db.delete(toolRuntimeSlots).where(eq(toolRuntimeSlots.connectionId, localTool.connection.id));
+    await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, organizationGrant.id));
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .rejects.toMatchObject({ status: 409, reasonCode: "organization_authorization_required" });
+
     await db.delete(connectionGrantMembers).where(eq(connectionGrantMembers.grantId, organizationGrant.id));
     await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, localTool.connection.id));
     await db.update(heartbeatRuns).set({ responsibleUserId: null }).where(eq(heartbeatRuns.id, run.id));
@@ -1860,6 +1873,7 @@ rl.on("line", (line) => {
         continuationPolicy: "wake_assignee",
         requestedResolverPolicy: "human_only",
         effectiveResolverPolicy: "human_only",
+        addresseeUserId: "carol",
       });
       expect(interaction!.payload).toMatchObject({
         prompt: `Connect your ${connection.name} account to continue`,
