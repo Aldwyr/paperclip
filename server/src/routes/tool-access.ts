@@ -110,6 +110,19 @@ function classifyConnectionUpdate(
   return events;
 }
 
+export function filterVisibleToolConnections<T extends {
+  status?: string;
+  createdByUserId?: string | null;
+}>(
+  connections: T[],
+  actor: { userId?: string | null; canManageConnections: boolean },
+): T[] {
+  return connections.filter((connection) =>
+    connection.status !== "draft"
+    || actor.canManageConnections
+    || Boolean(actor.userId && connection.createdByUserId === actor.userId));
+}
+
 export function toolAccessRoutes(
   db: Db,
   options: {
@@ -815,7 +828,14 @@ export function toolAccessRoutes(
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    res.json({ connections: await svc.listConnections(companyId) });
+    const connections = await svc.listConnections(companyId);
+    const canManageConnections = await isToolConnectionManagerQuiet(req, companyId);
+    res.json({
+      connections: filterVisibleToolConnections(connections, {
+        userId: req.actor.userId,
+        canManageConnections,
+      }),
+    });
   });
 
   router.post("/companies/:companyId/tools/connections", validate(createToolConnectionSchema), async (req, res) => {

@@ -6819,6 +6819,64 @@ describeEmbeddedPostgres("tool access service", () => {
     }
   });
 
+  it("does not expose another user's draft connection to a regular member", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const application = await service.createApplication(company.id, {
+      name: "Shared OAuth app",
+      type: "mcp_http",
+    });
+    const otherDraft = await service.createConnection(company.id, {
+      applicationId: application.id,
+      name: "Other user's draft",
+      transport: "mcp_remote",
+      authKind: "oauth",
+      status: "draft",
+      config: { url: "https://other-draft.example/mcp" },
+    }, { actorType: "user", actorId: "other-user" });
+    const ownDraft = await service.createConnection(company.id, {
+      applicationId: application.id,
+      name: "Member's draft",
+      transport: "mcp_remote",
+      authKind: "oauth",
+      status: "draft",
+      config: { url: "https://own-draft.example/mcp" },
+    }, { actorType: "user", actorId: "member-user" });
+    const activeConnection = await service.createConnection(company.id, {
+      applicationId: application.id,
+      name: "Active connection",
+      transport: "mcp_remote",
+      authKind: "oauth",
+      status: "active",
+      enabled: true,
+      config: { url: "https://active.example/mcp" },
+    }, { actorType: "user", actorId: "other-user" });
+
+    const memberApp = createRouteApp(db, boardSessionActor(company.id, "member", "member-user"));
+    const memberRes = await request(memberApp)
+      .get(`/api/companies/${company.id}/tools/connections`)
+      .expect(200);
+
+    expect(memberRes.body.connections).toHaveLength(2);
+    expect(memberRes.body.connections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: ownDraft.id }),
+      expect.objectContaining({ id: activeConnection.id }),
+    ]));
+    expect(memberRes.body.connections).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: otherDraft.id }),
+    ]));
+
+    const ownerApp = createRouteApp(db, boardSessionActor(company.id, "owner", "owner-user"));
+    const ownerRes = await request(ownerApp)
+      .get(`/api/companies/${company.id}/tools/connections`)
+      .expect(200);
+    expect(ownerRes.body.connections).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: otherDraft.id }),
+      expect.objectContaining({ id: ownDraft.id }),
+      expect.objectContaining({ id: activeConnection.id }),
+    ]));
+  });
+
   it("keeps direct profile and policy mutation routes viewer-safe", async () => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
