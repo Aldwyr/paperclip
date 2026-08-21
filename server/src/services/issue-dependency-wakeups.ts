@@ -75,8 +75,9 @@ export function buildIssueBlockersResolvedWakeStateKey(input: {
  * dependent issue. The check is level-triggered:
  *
  * - The state key matches an in-flight wake, or a `completed` wake requested
- *   after the latest blocker update. This suppresses a duplicate wake for the
- *   SAME ready state and lets a later reopen/close cycle create a new wake.
+ *   after the latest blocker terminal transition. This suppresses a duplicate
+ *   wake for the SAME ready state and lets a later reopen/close cycle create a
+ *   new wake without treating unrelated blocker edits as a new cycle.
  * - Each legacy per-edge key matches only a wake that is still in flight
  *   (`queued`, `deferred_issue_execution`, `claimed`). This prevents a duplicate
  *   wake while an old-format wake is still pending after a deploy, but it never
@@ -96,10 +97,14 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     dependentIssueId: input.dependentIssueId,
     blockerIssueIds: input.blockerIssueIds,
   });
-  const blockerUpdatedAtRows =
+  const blockerTerminalStateRows =
     input.blockerIssueIds.length > 0
       ? await db
-          .select({ updatedAt: issues.updatedAt })
+          .select({
+            status: issues.status,
+            completedAt: issues.completedAt,
+            cancelledAt: issues.cancelledAt,
+          })
           .from(issues)
           .where(
             and(
@@ -108,8 +113,15 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
             ),
           )
       : [];
-  const latestBlockerUpdatedAt = blockerUpdatedAtRows.reduce<Date | null>(
-    (latest, row) => (!latest || row.updatedAt > latest ? row.updatedAt : latest),
+  const latestBlockerTerminalTransitionAt = blockerTerminalStateRows.reduce<Date | null>(
+    (latest, row) => {
+      const transitionedAt = row.status === "done"
+        ? row.completedAt
+        : row.status === "cancelled"
+          ? row.cancelledAt
+          : null;
+      return transitionedAt && (!latest || transitionedAt > latest) ? transitionedAt : latest;
+    },
     null,
   );
   const legacyKeys = [
@@ -158,8 +170,8 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
       (wake) =>
         wake.idempotencyKey !== stateKey ||
         wake.status !== "completed" ||
-        !latestBlockerUpdatedAt ||
-        wake.requestedAt >= latestBlockerUpdatedAt,
+        !latestBlockerTerminalTransitionAt ||
+        wake.requestedAt >= latestBlockerTerminalTransitionAt,
     ) ?? null
   );
 }
