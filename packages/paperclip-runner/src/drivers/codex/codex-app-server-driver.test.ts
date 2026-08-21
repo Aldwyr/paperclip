@@ -940,6 +940,42 @@ describe("Codex app-server Codex driver", () => {
     expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
   });
 
+  it("advertises and dispatches run-authorized control-plane tools", async () => {
+    const transport = new FakeCodexTransport();
+    const handler = vi.fn(async (call) => ({ task: { id: "issue-1" }, callId: call.callId }));
+    const session = await makeDriver([transport], {
+      dynamicTools: [{
+        name: "get_task_context",
+        description: "Read the assigned task.",
+        inputSchema: { type: "object", additionalProperties: false },
+      }],
+      dynamicToolHandler: handler,
+    }).openSession({ runId: "run-tools", normalizedSessionId: "normalized-tools", workingDirectory: "/workspace" });
+    await session.startTurn({ message: { role: "user", text: "Inspect the task." } });
+
+    expect(transport.calls.find((call) => call.method === "thread/start")?.params.dynamicTools)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ name: "get_task_context" })]));
+    const response = await transport.invoke({
+      id: "rpc-tool",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-context",
+        tool: "get_task_context",
+        arguments: {},
+      },
+    });
+    expect(response).toMatchObject({ success: true });
+    expect(JSON.parse(String((response.contentItems as Array<Record<string, unknown>>)[0]?.text)))
+      .toEqual({ task: { id: "issue-1" }, callId: "call-context" });
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
+      tool: "get_task_context",
+      callId: "call-context",
+      arguments: {},
+    }));
+  });
+
   it("fails closed when an agent message changes a tool-committed result", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({

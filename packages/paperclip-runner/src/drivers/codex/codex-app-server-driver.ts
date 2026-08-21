@@ -92,6 +92,16 @@ export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
   conversationMode?: "task" | "direct";
   transportFactory?: () => CodexAppServerTransport;
+  /** Additional control-plane tools exposed to the provider for this run. */
+  dynamicTools?: readonly Readonly<Record<string, unknown>>[];
+  /** Executes an admitted additional tool call. Completion tools remain driver-owned. */
+  dynamicToolHandler?: (call: {
+    tool: string;
+    callId: string;
+    threadId: string;
+    turnId: string;
+    arguments: unknown;
+  }) => Promise<unknown>;
   environment?: NodeJS.ProcessEnv;
   now?: () => Date;
   runnerInstanceId?: string;
@@ -215,6 +225,16 @@ function blockToolSpec(): Record<string, unknown> {
     name: CODEX_BLOCK_TOOL_NAME,
     description: "Return the one semantic result when the task cannot continue.",
     inputSchema: CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
+  };
+}
+
+function dynamicToolResponse(value: unknown): Record<string, unknown> {
+  return {
+    success: true,
+    contentItems: [{
+      type: "inputText",
+      text: typeof value === "string" ? value : JSON.stringify(value),
+    }],
   };
 }
 
@@ -359,7 +379,9 @@ export class CodexAppServerDriver implements HarnessDriver {
         ...(this.#direct() ? {} : { baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS }),
         dynamicTools: this.#direct()
           ? []
-          : this.#caps.dynamicTools ? [finishToolSpec(), blockToolSpec()] : [],
+          : this.#caps.dynamicTools
+            ? [...(this.#options.dynamicTools ?? []), finishToolSpec(), blockToolSpec()]
+            : [],
         experimentalRawEvents: false,
         persistExtendedHistory: false,
       });
@@ -577,7 +599,9 @@ export class CodexAppServerDriver implements HarnessDriver {
         ).sort(),
         dynamicToolNames: this.#direct()
           ? []
-          : this.#caps.dynamicTools ? [...CODEX_SEMANTIC_TOOL_NAMES] : [],
+          : this.#caps.dynamicTools
+            ? [...(this.#options.dynamicTools ?? []).map((tool) => text(tool.name)), ...CODEX_SEMANTIC_TOOL_NAMES]
+            : [],
         modelInputKinds: ["text"],
         liveConsole: {
           conversationMode: this.#direct() ? "direct" : "task",
@@ -612,6 +636,8 @@ export class CodexAppServerDriver implements HarnessDriver {
       now: this.#options.now ?? (() => new Date()),
       runnerInstanceId: this.#options.runnerInstanceId ?? "runner-codex",
       capabilities: this.#caps,
+      dynamicTools: this.#options.dynamicTools ?? [],
+      dynamicToolHandler: this.#options.dynamicToolHandler,
     });
   }
 }
@@ -626,6 +652,8 @@ class CodexHarnessSession implements HarnessSession {
   readonly #now: () => Date;
   readonly #runnerInstanceId: string;
   readonly #capabilities: CodexCapabilities;
+  readonly #dynamicTools: readonly Readonly<Record<string, unknown>>[];
+  readonly #dynamicToolHandler: CodexAppServerDriverOptions["dynamicToolHandler"];
   readonly #events = new AsyncQueue<PrpEvent>();
   #sourceSequence: number;
   #activeTurnId: string | null;
@@ -666,6 +694,8 @@ class CodexHarnessSession implements HarnessSession {
     now: () => Date;
     runnerInstanceId: string;
     capabilities: CodexCapabilities;
+    dynamicTools: readonly Readonly<Record<string, unknown>>[];
+    dynamicToolHandler?: CodexAppServerDriverOptions["dynamicToolHandler"];
   }) {
     this.#transport = input.transport;
     this.#runId = input.runId;
@@ -678,6 +708,8 @@ class CodexHarnessSession implements HarnessSession {
     this.#now = input.now;
     this.#runnerInstanceId = input.runnerInstanceId;
     this.#capabilities = input.capabilities;
+    this.#dynamicTools = input.dynamicTools;
+    this.#dynamicToolHandler = input.dynamicToolHandler;
     this.#goal = input.goal === undefined ? null : structuredClone(input.goal);
     for (const entry of input.lineage ?? [input.opened.lineage]) {
       this.#lineage.set(entry.threadId, structuredClone(entry));
@@ -1282,6 +1314,23 @@ class CodexHarnessSession implements HarnessSession {
         return rejectedToolCall("Semantic tool call was outside the active thread and turn.");
       }
       if (!isSemanticTool(tool)) {
+        const admitted = this.#dynamicTools.some((candidate) => candidate.name === tool);
+        if (admitted && this.#dynamicToolHandler !== undefined) {
+          try {
+            return dynamicToolResponse(await this.#dynamicToolHandler({
+              tool,
+              callId,
+              threadId,
+              turnId,
+              arguments: request.params.arguments,
+            }));
+          } catch (error) {
+            return {
+              success: false,
+              contentItems: [{ type: "inputText", text: boundedText(error instanceof Error ? error.message : error) }],
+            };
+          }
+        }
         this.#diagnoseUnsupported(`dynamic tool ${tool}`);
         return rejectedToolCall("Unsupported tool.");
       }

@@ -2,6 +2,7 @@ import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
+import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 
 /**
@@ -17,6 +18,15 @@ export function createCodexNativeSessionBackend(
       processGroupId: number | null;
       startedAt: string;
     }) => Promise<void>;
+    transportFactory?: () => CodexAppServerTransport;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
+    dynamicToolHandler?: (call: {
+      tool: string;
+      callId: string;
+      threadId: string;
+      turnId: string;
+      arguments: unknown;
+    }) => Promise<unknown>;
   } = {},
 ): NativeSessionBackend {
   return new HarnessDriverBackend(new CodexAppServerDriver({
@@ -33,5 +43,8 @@ export function createCodexNativeSessionBackend(
     }),
     runnerInstanceId: options.runnerInstanceId ?? `paperclip-native-${input.binding.runId}`,
     onSpawn: options.onSpawn,
+    transportFactory: options.transportFactory,
+    dynamicTools: options.dynamicTools,
+    dynamicToolHandler: options.dynamicToolHandler,
   }));
 }
