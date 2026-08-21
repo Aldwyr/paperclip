@@ -1,7 +1,13 @@
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
+import {
+  createRunnerdCodexTransport,
+  defaultCapabilityRunnerdBinary,
+  type DurablePrpControlPlane,
+} from "../vendor/paperclip-runner/index.js";
 import {
   registerRunnerPrpAuthority,
   runnerPrpWebSocketInternals,
@@ -48,4 +54,59 @@ describe("runner PRP websocket route", () => {
     expect(Buffer.concat(writes).toString("utf8")).toContain("404 Not Found");
     server.close();
   });
+
+  it("carries an authorized runnerd tool call over the shared Paperclip route", async () => {
+    const server = createServer();
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Expected a TCP listener.");
+    setupRunnerPrpWebSocketServer(server, { port: address.port });
+    const runId = "00000000-0000-4000-8000-000000000779";
+    const bundle = createRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: resolve(import.meta.dirname, "../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
+      codexArgs: [],
+      prpIdentity: {
+        runnerInstanceId: "runner-server-route",
+        environmentLeaseId: "lease-server-route",
+        runId,
+        normalizedSessionId: "session-server-route",
+        turnId: "turn-server-route",
+        itemId: "item-server-route",
+      },
+      controlPlaneRegistration: (authority) => registerRunnerPrpAuthority({ runId, authority }),
+    });
+    let toolCalls = 0;
+    bundle.transport.setServerRequestHandler(async () => {
+      toolCalls += 1;
+      return {
+        success: true,
+        contentItems: [{ type: "inputText", text: JSON.stringify({ task: { title: "Real route" } }) }],
+      };
+    });
+
+    try {
+      await bundle.transport.request("initialize", {});
+      await bundle.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [{
+          name: "get_task_context",
+          description: "Read the authorized task context.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        }],
+      });
+      await bundle.transport.request("turn/start", {
+        input: [{ type: "text", text: "Read the task context." }],
+      });
+      for await (const notification of bundle.transport.notifications()) {
+        if (notification.method === "turn/completed") break;
+      }
+      expect(toolCalls).toBe(1);
+      expect(bundle.evidence().diagnostics).toContain("runnerd authenticated to the durable PRP control plane");
+    } finally {
+      await bundle.transport.close();
+      server.closeAllConnections();
+      server.close();
+    }
+  }, 30_000);
 });
