@@ -5,7 +5,12 @@ import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { issueStatusText } from "@/lib/status-colors";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { Link } from "@/lib/router";
-import { deriveOriginatingActor, type Issue, type IssueLabel } from "@paperclipai/shared";
+import {
+  deriveOriginatingActor,
+  isArtifactReviewDocumentKey,
+  type Issue,
+  type IssueLabel,
+} from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "../../api/access";
 import { agentsApi } from "../../api/agents";
@@ -93,6 +98,7 @@ import {
 } from "./helpers";
 import { PropertyPicker } from "./property-picker";
 import { PropertyChip, PropertyRow, PropertySection } from "./primitives";
+import { issueReviewPolicyBadge } from "../../lib/review-policy";
 import { IssueCasesPanel } from "../IssueCasesPanel";
 import { ExpandRelationListButton, RemovableIssueReferencePill } from "./relation-controls";
 import { Badge } from "@/components/ui/badge";
@@ -147,6 +153,13 @@ interface IssuePropertiesProps {
   onRetryExternalObjects?: () => void;
   onCheckMonitorNow?: () => void;
   checkingMonitorNow?: boolean;
+  documentDeepLink?: IssuePropertiesDocumentDeepLink | null;
+}
+
+export interface IssuePropertiesDocumentDeepLink {
+  requestId: number;
+  tab: "plans" | "artifacts";
+  documentKey: string;
 }
 
 const ISSUE_BLOCKER_SEARCH_LIMIT = 50;
@@ -165,6 +178,7 @@ export function IssueProperties({
   onRetryExternalObjects,
   onCheckMonitorNow,
   checkingMonitorNow = false,
+  documentDeepLink,
 }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
   const { isMobile } = useSidebar();
@@ -216,10 +230,15 @@ export function IssueProperties({
     enabled: taskChatShellEnabled,
   });
   const { data: paneTabDocuments } = useIssueDocuments(taskChatShellEnabled ? issue.id : null);
+  // Proxy `artifact-review-*` documents surface only through their Work
+  // product row, so they must not summon the Plan or Documents surfaces.
+  const paneTabStandaloneDocuments = (paneTabDocuments ?? []).filter(
+    (doc) => !isArtifactReviewDocumentKey(doc.key),
+  );
   const hasPlanTab =
     Boolean(paneTabPlanDocument)
     || (paneTabAcceptedPlans?.length ?? 0) > 0
-    || (paneTabDocuments?.length ?? 0) > 0
+    || paneTabStandaloneDocuments.length > 0
     || issue.workMode === "planning";
   // Artifacts covers the same three sources the tab body composes: work
   // products, documents (redundant with the Plan tab, intentionally), and
@@ -227,7 +246,7 @@ export function IssueProperties({
   // no longer summon the tab.
   const hasArtifactsTab =
     (paneTabWorkProducts?.length ?? 0) > 0
-    || (paneTabDocuments?.length ?? 0) > 0
+    || paneTabStandaloneDocuments.length > 0
     || selectAgentArtifactAttachments(paneTabAttachments, paneTabWorkProducts).length > 0;
   const [paneTab, setPaneTab] = useState("properties");
   // Once a plan document exists, surface it: switch the pane to the Plan tab so
@@ -244,6 +263,11 @@ export function IssueProperties({
       setPaneTab("plans");
     }
   }, [hasPlanTab]);
+  useEffect(() => {
+    if (!documentDeepLink) return;
+    paneTabUserChosenRef.current = true;
+    setPaneTab(documentDeepLink.tab);
+  }, [documentDeepLink]);
   const [assigneeOpen, setAssigneeOpen] = useState(false);
   const [assigneeSearch, setAssigneeSearch] = useState("");
   /** When a run is live, a selection is staged here until the operator confirms
@@ -848,6 +872,10 @@ export function IssueProperties({
   const approverTrigger = approverValues.length > 0
     ? <span className="text-sm truncate min-w-0" title={approverLabel}>{approverLabel}</span>
     : <span className="text-sm text-muted-foreground">None</span>;
+  // PAP-16506 P4: who may give the `in_review` verdict. Only an agent sets this,
+  // and only the two opt-in constraints are worth a row — the default (`null` ≡
+  // "anyone can approve") is what every issue already does, so it shows nothing.
+  const reviewPolicyBadge = issueReviewPolicyBadge(issue.reviewPolicy);
   const nextRunnableExecutionStage = (() => {
     if (issue.executionState?.status === "changes_requested" && issue.executionState.currentStageType) {
       return issue.executionState.currentStageType;
@@ -2302,6 +2330,16 @@ export function IssueProperties({
       </PropertySection>
 
       <PropertySection title="Execution">
+        {/* Read-only: agents set the policy, the board does not. */}
+        {reviewPolicyBadge ? (
+          <PropertyRow label="Approvals">
+            <PropertyChip title={reviewPolicyBadge.description}>
+              <reviewPolicyBadge.Icon className="shrink-0 text-muted-foreground" aria-hidden />
+              <span className="min-w-0 truncate">{reviewPolicyBadge.label}</span>
+            </PropertyChip>
+          </PropertyRow>
+        ) : null}
+
         <PropertyPicker
           inline={inline}
           label="Reviewers"
@@ -2640,7 +2678,10 @@ export function IssueProperties({
       ) : null}
       {hasArtifactsTab ? (
         <TabsContent value="artifacts">
-          <IssuePropertiesArtifactsTab issue={issue} />
+          <IssuePropertiesArtifactsTab
+            issue={issue}
+            documentDeepLink={documentDeepLink?.tab === "artifacts" ? documentDeepLink : null}
+          />
         </TabsContent>
       ) : null}
     </Tabs>
