@@ -115,6 +115,8 @@ import type {
 import {
   SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION,
   SETUP_TOKEN_PTY_EXIT_NOTIFICATION,
+  DUPLEX_CHANNEL_DATA_NOTIFICATION,
+  DUPLEX_CHANNEL_EXIT_NOTIFICATION,
   JSONRPC_VERSION,
   JSONRPC_ERROR_CODES,
   PLUGIN_RPC_ERROR_CODES,
@@ -1394,6 +1396,33 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           // identifier while the route is open.
           if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
           notifyHost(SETUP_TOKEN_PTY_EXIT_NOTIFICATION, {
+            workerSessionId,
+            exitCode: typeof exitCode === "number" ? exitCode : null,
+          });
+        },
+      },
+
+      duplexChannel: {
+        data(hostRouteId: string, workerSessionId: string, chunk: string): void {
+          // Forward one raw data chunk of a persistent duplex channel. The
+          // notification echoes the host route identifier and the worker session
+          // identifier, so the host routes the chunk to the exact live pair while
+          // the route is open. The host drops an unknown or a mismatched pair and
+          // never logs the raw bytes. This notification carries no invocation id,
+          // because it fires after the open reply returns.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
+          if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
+          if (typeof chunk !== "string" || chunk.length === 0) return;
+          notifyHost(DUPLEX_CHANNEL_DATA_NOTIFICATION, { hostRouteId, workerSessionId, chunk });
+        },
+        exit(hostRouteId: string, workerSessionId: string, exitCode: number | null): void {
+          // Forward the child exit of a persistent duplex channel. The host
+          // resolves the open route's wait promise by the exact live pair while
+          // the route is open.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
+          if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
+          notifyHost(DUPLEX_CHANNEL_EXIT_NOTIFICATION, {
+            hostRouteId,
             workerSessionId,
             exitCode: typeof exitCode === "number" ? exitCode : null,
           });

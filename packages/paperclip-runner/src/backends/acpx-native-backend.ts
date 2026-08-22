@@ -3,6 +3,7 @@ import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import { AcpxRuntimeDriver, type AcpxRuntimeDriverOptions } from "../drivers/acpx/acpx-runtime-driver.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
+import { nativeSystemInstructions, nativeTaskConstraints } from "./runtime-context.js";
 
 export function createAcpxNativeSessionBackend(
   input: NativeExecutionInput,
@@ -13,6 +14,8 @@ export function createAcpxNativeSessionBackend(
   }
   return new HarnessDriverBackend(new AcpxRuntimeDriver({
     ...options,
+    systemInstructions: nativeSystemInstructions(input),
+    runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
     agent: input.provider.agent,
     model: input.provider.model,
     taskEnvelope: createCodexTaskEnvelope({
@@ -22,7 +25,7 @@ export function createAcpxNativeSessionBackend(
       constraints: [
         "Work only inside the supplied working directory.",
         "Use only runner-authorized semantic Paperclip tools.",
-        "Do not discover user or project configuration, skills, plugins, or MCP servers.",
+        ...nativeTaskConstraints(input),
         "Return one semantic completion result through paperclip_finish or paperclip_block.",
       ],
     }),

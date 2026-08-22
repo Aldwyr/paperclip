@@ -7,7 +7,7 @@ export const nativeFinalizationResultV1Schema = z.object({
   runId: z.string().uuid(),
   issueId: z.string().uuid(),
   companyId: z.string().uuid(),
-  result: z.record(z.unknown()),
+  result: z.record(z.string(), z.unknown()),
   terminal: z.object({
     schema: z.literal("paperclip.prp.terminal.v1"),
     turnTerminalState: z.enum(["completed", "failed", "interrupted", "cancelled"]),

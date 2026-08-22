@@ -34,6 +34,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       name: descriptor.kind,
       version: descriptor.version,
       capabilities: structuredClone(descriptor.capabilities),
+      runtimeContextCapabilities: descriptor.runtimeContextCapabilities === undefined ? undefined : structuredClone(descriptor.runtimeContextCapabilities),
     };
   }
 

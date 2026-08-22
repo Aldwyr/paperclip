@@ -24,6 +24,7 @@ import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
@@ -87,7 +88,9 @@ import {
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
-import { getStartupTraceContext } from "../instrumentation.js";
+import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js";
+import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.js";
+import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
@@ -104,6 +107,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import {
   buildNativeProviderEnvironment,
   buildNativeExecutionInput,
+  buildNativeRuntimeContext,
   cancelNativeSession,
   dispatchNativeSessionResumptions,
   ensureNativeCompletionContract,
@@ -204,9 +208,11 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  isUnresolvedWorkspaceBaseRefError,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   type RuntimeServiceRef,
+  type UnresolvedWorkspaceBaseRefError,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import {
@@ -255,6 +261,11 @@ import {
   isProcessGroupAlive,
   terminateLocalService,
 } from "./local-service-supervisor.js";
+import {
+  GIT_BRANCH_OWNERSHIP_METADATA_KEY,
+  GIT_BRANCH_OWNERSHIP_METADATA_VERSION,
+  isRuntimeOwnedGitBranch,
+} from "./execution-workspace-branch-ownership.js";
 import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
@@ -317,6 +328,7 @@ import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "./recovery/service.js";
+import { collectDispositionRepairSourceState } from "./recovery/disposition-repair.js";
 import {
   buildIssueReviewPathLostIdempotencyKey,
   decideIssueReviewPathRecovery,
@@ -336,6 +348,7 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
+import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
 import {
   redactQuarantinedBodyForHigherTrust,
   sanitizeQuarantinedCommentForHigherTrust,
@@ -579,6 +592,14 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE =
   "execution_review_participant_recovery";
 const GITHUB_PR_WORKFLOW_SKILL_KEY =
   "paperclipai/bundled/software-development/github-pr-workflow";
+// Error codes that mark a pre-dispatch setup failure. The adapter process never
+// started, so no agent could post an issue comment. The setup catch writes one
+// of these codes when a failure happens before `adapter.execute`.
+const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
+  "setup_failed",
+  CONFIGURATION_INCOMPLETE_FAILURE_CODE,
+  WORKSPACE_VALIDATION_FAILURE_CODE,
+]);
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const PUSH_CAPABILITY_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
 // Keep this in sync with local adapters that require a git workspace before launch.
@@ -589,6 +610,7 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "gemini_local",
   "grok_local",
   "hermes_local",
+  "kimi_local",
   "opencode_local",
   "pi_local",
 ]);
@@ -664,6 +686,35 @@ export class ConfigurationIncompleteFailure extends Error {
     this.name = "ConfigurationIncompleteFailure";
     this.resultJson = resultJson;
   }
+}
+
+// Build the configuration-incomplete result payload for a workspace base ref
+// that never resolved to a commit. The setup catch maps this to errorCode
+// `configuration_incomplete`, so the recovery path routes it to a human owner
+// instead of a dispatched-then-failed run. The `fingerprint` uses the canonical
+// remote ref, not the operator spelling. Two equivalent spellings of one remote
+// branch (`fix/foo` and `origin/fix/foo`) share one fingerprint, so a repeated
+// failure reuses one active recovery action and does not reset the attempt
+// count or post a duplicate notice. A different branch makes a new action.
+function buildUnresolvedWorkspaceBaseRefResultJson(
+  run: typeof heartbeatRuns.$inferSelect,
+  error: UnresolvedWorkspaceBaseRefError,
+): Record<string, unknown> {
+  const context = parseObject(run.contextSnapshot);
+  return {
+    configurationIncomplete: {
+      reason: "workspace_base_ref_unresolved",
+      companyId: run.companyId,
+      agentId: run.agentId,
+      issueId: readNonEmptyString(context.issueId) ?? null,
+      projectId: readNonEmptyString(context.projectId) ?? null,
+      requestedRef: error.requestedRef,
+      attemptedRefs: error.attemptedRefs,
+      fetchError: error.fetchError,
+      fingerprint: `workspace_base_ref:${error.recoveryIdentityRef}`,
+      missingBindings: [],
+    },
+  };
 }
 
 export interface SharedWorkspaceHolder {
@@ -929,6 +980,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "cursor",
   "gemini_local",
   "hermes_local",
+  "kimi_local",
   "opencode_local",
   "pi_local",
 ]);
@@ -1606,6 +1658,7 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   existingMetadata: Record<string, unknown> | null | undefined;
   source: string;
   createdByRuntime: boolean;
+  strategyType: "project_primary" | "git_worktree";
   configSnapshot: Record<string, unknown> | null;
   shouldReuseExisting: boolean;
   shouldRefreshConfigSnapshot?: boolean;
@@ -1618,6 +1671,11 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
     source: input.source,
     createdByRuntime: input.createdByRuntime,
   } as Record<string, unknown>;
+  if (input.strategyType === "git_worktree") {
+    base[GIT_BRANCH_OWNERSHIP_METADATA_KEY] = GIT_BRANCH_OWNERSHIP_METADATA_VERSION;
+  } else {
+    delete base[GIT_BRANCH_OWNERSHIP_METADATA_KEY];
+  }
 
   const existingSnapshot = parseObject(base.baseRefSnapshot);
   if (typeof existingSnapshot.resolvedSha !== "string" && input.baseRefSha) {
@@ -1645,6 +1703,15 @@ export function mergeExecutionWorkspaceMetadataForPersistence(input: {
   }
 
   return mergeExecutionWorkspaceConfig(base, input.configSnapshot);
+}
+
+export function resolveExecutionWorkspaceBranchOwnership(
+  executionWorkspace: Pick<
+    RealizedExecutionWorkspace,
+    "created" | "branchCreatedByRuntime"
+  >,
+) {
+  return executionWorkspace.branchCreatedByRuntime;
 }
 
 export function stripWorkspaceRuntimeFromExecutionRunConfig(
@@ -5052,13 +5119,26 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  requestedExistingBranch?: string | null;
+  existingExecutionWorkspaceBranchName?: string | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(
     input.issueExecutionWorkspaceId,
   );
+  // An explicitly pinned existing branch outranks an inherited reuse_existing
+  // binding: a persisted workspace on any other branch (or with no recorded
+  // branch) is stale for this issue, so dispatch realizes the pinned branch.
+  const requestedExistingBranch = readNonEmptyString(
+    input.requestedExistingBranch,
+  );
+  const existingWorkspaceMatchesRequestedBranch =
+    requestedExistingBranch === null ||
+    readNonEmptyString(input.existingExecutionWorkspaceBranchName) ===
+      requestedExistingBranch;
   const requestedShouldReuseExisting =
     input.issueExecutionWorkspacePreference === "reuse_existing" &&
-    requestedExecutionWorkspaceId !== null;
+    requestedExecutionWorkspaceId !== null &&
+    existingWorkspaceMatchesRequestedBranch;
 
   return {
     requestedExecutionWorkspaceId,
@@ -11548,6 +11628,23 @@ export function heartbeatService(
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
+    // A pre-dispatch setup failure means the adapter process never started. No
+    // agent could post an issue comment, so a missing-comment retry would only
+    // repeat the same setup failure.
+    if (
+      run.errorCode != null &&
+      PRE_ADAPTER_SETUP_FAILURE_CODES.has(run.errorCode)
+    ) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     const postedComment = await findRunIssueComment(
       run.id,
       run.companyId,
@@ -12414,6 +12511,7 @@ export function heartbeatService(
         reason: string;
         errorCode:
           | "agent_not_invokable"
+          | "heartbeat_wake_on_demand_disabled"
           | "budget_blocked"
           | "issue_not_found"
           | "issue_reassigned"
@@ -12423,7 +12521,8 @@ export function heartbeatService(
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
           | "issue_paused"
-          | "issue_dependencies_blocked";
+          | "issue_dependencies_blocked"
+          | "issue_disposition_repair_superseded";
         issueId: string | null;
         details: Record<string, unknown>;
       };
@@ -12483,15 +12582,29 @@ export function heartbeatService(
       };
     }
 
+    if (!isHeartbeatWakeOnDemandEnabled(agent)) {
+      return {
+        allowed: false,
+        reason: "Scheduled retry suppressed because on-demand agent wakes are disabled",
+        errorCode: "heartbeat_wake_on_demand_disabled",
+        issueId,
+        details: { agentId: agent.id },
+      };
+    }
+
     if (!issueId) return { allowed: true };
 
     const issue = await db
       .select({
         id: issues.id,
+        companyId: issues.companyId,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         executionRunId: issues.executionRunId,
+        executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -12506,6 +12619,35 @@ export function heartbeatService(
         issueId,
         details: { issueId },
       };
+    }
+
+    if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) {
+      const expectedFingerprint = readNonEmptyString(contextSnapshot.dispositionRepairFingerprint);
+      const sourceState = await collectDispositionRepairSourceState(db, {
+        issue,
+        excludeRunId: run.id,
+        excludeWakeupRequestId: run.wakeupRequestId,
+      });
+      if (
+        !expectedFingerprint ||
+        sourceState.fingerprint !== expectedFingerprint ||
+        sourceState.hasActiveExecutionPath ||
+        sourceState.hasDurableWaitingPath
+      ) {
+        return {
+          allowed: false,
+          reason: "Scheduled disposition repair suppressed because the source state changed or gained a durable path",
+          errorCode: "issue_disposition_repair_superseded",
+          issueId,
+          details: {
+            issueId,
+            expectedFingerprint,
+            currentFingerprint: sourceState.fingerprint,
+            hasActiveExecutionPath: sourceState.hasActiveExecutionPath,
+            durablePathReason: sourceState.durablePathReason,
+          },
+        };
+      }
     }
 
     if (issue.assigneeAgentId !== run.agentId) {
@@ -14096,13 +14238,7 @@ export function heartbeatService(
     return {
       enabled: asBoolean(heartbeat.enabled, false),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
-      wakeOnDemand: asBoolean(
-        heartbeat.wakeOnDemand ??
-          heartbeat.wakeOnAssignment ??
-          heartbeat.wakeOnOnDemand ??
-          heartbeat.wakeOnAutomation,
-        true,
-      ),
+      wakeOnDemand: isHeartbeatWakeOnDemandEnabled(agent),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(
         heartbeat.maxConcurrentRuns,
       ),
@@ -14798,10 +14934,27 @@ export function heartbeatService(
       reviewParticipant?.type === "agent" &&
       reviewParticipant.agentId === run.agentId;
 
+    const recoveryActionId = readNonEmptyString(context.recoveryActionId);
+    const authorizedSourceScopedRecovery = wakeReason === "source_scoped_recovery_action" && recoveryActionId
+      ? await db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.id, recoveryActionId),
+          eq(issueRecoveryActions.companyId, run.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+          eq(issueRecoveryActions.ownerAgentId, run.agentId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ))
+        .limit(1)
+        .then((rows) => Boolean(rows[0]))
+      : false;
+
     if (
       issue.assigneeAgentId !== run.agentId &&
       !isInteractionWake &&
       !isCurrentReviewParticipant &&
+      !authorizedSourceScopedRecovery &&
       !isNonAssigneeWorkspaceBusyRetry(retryReason, context)
     ) {
       return {
@@ -17452,6 +17605,16 @@ export function heartbeatService(
                 name: agent.name,
                 companyId: agent.companyId,
               },
+              recordedBranchOwnership:
+                existingExecutionWorkspace?.status !== "archived" &&
+                existingExecutionWorkspace?.branchName
+                  ? {
+                      branchName: existingExecutionWorkspace.branchName,
+                      createdByRuntime: isRuntimeOwnedGitBranch(
+                        existingExecutionWorkspace.metadata,
+                      ),
+                    }
+                  : null,
               heartbeatRunId: run.id,
               enableWorkspaceBranchReconcileForward:
                 resolvedInstanceSettings.experimental
@@ -17479,7 +17642,11 @@ export function heartbeatService(
               ? (reusableExistingExecutionWorkspace?.metadata ?? null)
               : null,
           source: executionWorkspace.source,
-          createdByRuntime: executionWorkspace.created,
+          // Attaching a new worktree to a pre-existing branch reports a fresh
+          // workspace, but must not make cleanup own the operator's branch.
+          createdByRuntime:
+            resolveExecutionWorkspaceBranchOwnership(executionWorkspace),
+          strategyType: executionWorkspace.strategy,
           configSnapshot,
           shouldReuseExisting:
             resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace,
@@ -17770,6 +17937,26 @@ export function heartbeatService(
         lease: acquiredEnvironment.lease,
         leaseContext: acquiredEnvironment.leaseContext,
       };
+      const duplexTelemetryRecorder = createHostDuplexTelemetryRecorder({
+        tracer: getStartupTracer(),
+        incrementCounter: (metric) => {
+          void incrementToolRuntimeMetricCounter(db, {
+            companyId: run.companyId,
+            metric,
+          }).catch(() => {});
+        },
+        emitTransportEvent: (event) => {
+          void (async () => {
+            const seq = await nextRunEventSeq(run.id);
+            await appendRunEvent(run, seq, {
+              eventType: event.name,
+              stream: "system",
+              level: event.dimensions.outcome === "error" ? "warn" : "info",
+              payload: { ...event.dimensions },
+            });
+          })().catch(() => {});
+        },
+      });
       const realizationResult = await envOrchestrator.realizeForRun({
         environment: selectedEnvironment,
         lease: activeEnvironmentLease.lease,
@@ -17780,6 +17967,7 @@ export function heartbeatService(
         executionWorkspace,
         effectiveExecutionWorkspaceMode,
         persistedExecutionWorkspace,
+        duplexTelemetryRecorder,
       });
       activeEnvironmentLease = {
         ...activeEnvironmentLease,
@@ -18616,6 +18804,13 @@ export function heartbeatService(
                   })
                 : null;
             const pinnedPlanMarkdown = pinnedPlan?.body ?? "";
+            const nativeRuntimeContext = await buildNativeRuntimeContext({
+              db,
+              agent,
+              runId: run.id,
+              runtimeConfig,
+              runtimeSkillEntries,
+            });
             nativeExecution = buildNativeExecutionInput({
               companyId: agent.companyId,
               runId: run.id,
@@ -18781,6 +18976,7 @@ export function heartbeatService(
                 schemaVersion: completionContract.row.schemaVersion,
                 contract: completionContract.contract,
               },
+              runtimeContext: nativeRuntimeContext,
             });
             if (
               previousNativeRun &&
@@ -20184,6 +20380,8 @@ export function heartbeatService(
           : null;
         const configurationIncompleteSetupFailure =
           isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
+        const unresolvedBaseRefSetupFailure =
+          isUnresolvedWorkspaceBaseRefError(outerErr) ? outerErr : null;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(
             (await getRun(runId).catch(() => null))?.errorCode,
@@ -20191,6 +20389,9 @@ export function heartbeatService(
         const setupFailureErrorCode =
           workspaceValidationSetupFailure?.code ??
           configurationIncompleteSetupFailure?.code ??
+          (unresolvedBaseRefSetupFailure
+            ? CONFIGURATION_INCOMPLETE_FAILURE_CODE
+            : null) ??
           recordedResponsibleUserDenialCode ??
           "setup_failed";
         logger.error(
@@ -20213,7 +20414,12 @@ export function heartbeatService(
                     resultJson:
                       workspaceValidationSetupFailure?.resultJson ??
                       configurationIncompleteSetupFailure?.resultJson ??
-                      null,
+                      (unresolvedBaseRefSetupFailure
+                        ? buildUnresolvedWorkspaceBaseRefResultJson(
+                            run,
+                            unresolvedBaseRefSetupFailure,
+                          )
+                        : null),
                   },
                 ),
               }
@@ -20947,7 +21153,6 @@ export function heartbeatService(
             previousStatus: issue.status,
             notice: buildExecutionReviewParticipantRecoveryNoticeSeed(),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
-            recoveryOwnerAgentId: currentParticipant.agentId,
           };
         }
 
@@ -21040,6 +21245,13 @@ export function heartbeatService(
         (run.status === "failed" ||
           run.status === "timed_out" ||
           run.status === "cancelled");
+
+      if (
+        readNonEmptyString(parseObject(run.contextSnapshot).retryReason) ===
+        ISSUE_DISPOSITION_REPAIR_RETRY_REASON
+      ) {
+        return { kind: "released" as const };
+      }
 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
@@ -21245,7 +21457,6 @@ export function heartbeatService(
                   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
                 ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE
                 : undefined,
-        recoveryOwnerAgentId: promotionResult.recoveryOwnerAgentId,
       });
       return;
     }

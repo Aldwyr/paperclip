@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { rebindNativeSessionCheckpoint } from "./native-session-resume.js";
+import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
 const companyId = "10000000-0000-4000-8000-000000000001";
 const issueId = "20000000-0000-4000-8000-000000000002";
@@ -29,6 +30,7 @@ function execution(runId: string, cwd = "/workspace") {
         criteria: [{ id: "objective", requirement: "Answer the current turn" }],
       },
     },
+    runtimeContext: nativeRuntimeContextFixture(),
   });
 }
 
@@ -52,6 +54,7 @@ function planningExecution(runId: string, revisionId: string) {
       reviewContext: {},
     },
     completionContract: execution(runId).completionContract,
+    runtimeContext: nativeRuntimeContextFixture(),
   });
 }
 

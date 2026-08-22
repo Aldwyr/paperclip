@@ -38,6 +38,9 @@ import {
 } from "../drivers/acpx/qualified-profiles.js";
 import { createSanitizedAcpxEnvironment } from "../drivers/acpx/environment.js";
 import { createSanitizedClaudeManagedEnvironment } from "../drivers/claude-managed/environment.js";
+import type { NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
+import { nativeMcpLaunchBinding } from "../drivers/native-mcp.js";
+import { prepareIsolatedCodexHome } from "../drivers/runtime-context-materializer.js";
 
 export { createSanitizedClaudeManagedEnvironment } from "../drivers/claude-managed/environment.js";
 
@@ -141,6 +144,7 @@ export interface CapabilityRunnerdCodexTransportOptions {
   lifecyclePolicy?:
     | { mode: "per_turn"; idleTimeoutMs: null }
     | { mode: "warm"; idleTimeoutMs: number };
+  runtimeContext?: NativeRuntimeContextSnapshot | null;
   /** Current run's authority catalog, used when a suspended session is rebound. */
   resumeDynamicTools?: readonly Readonly<Record<string, unknown>>[];
   prpIdentity?: {
@@ -499,6 +503,9 @@ export function createSanitizedAwsAgentCoreEnvironment(
     "AWS_ROLE_SESSION_NAME",
     "AWS_CONTAINER_CREDENTIALS_FULL_URI",
     "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "PAPERCLIP_NATIVE_MCP_NAME",
+    "PAPERCLIP_NATIVE_MCP_URL",
+    "PAPERCLIP_NATIVE_MCP_TOKEN",
   ]) {
     if (typeof source[key] === "string") result[key] = source[key];
   }
@@ -900,6 +907,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#core = core;
     mkdirSync(resolve(this.#root, "runner"), { recursive: true, mode: 0o700 });
     const provider = this.options.provider ?? "codex";
+    const runtimeContext = this.options.runtimeContext ?? null;
+    const codexHome = resolve(this.#root, "codex-home");
+    if (provider === "codex") {
+      await prepareIsolatedCodexHome({
+        context: runtimeContext,
+        codexHome,
+        sourceCodexHome: this.options.environment?.CODEX_HOME,
+        nativeMcp: nativeMcpLaunchBinding(this.options.environment),
+      });
+    }
     const opencodeProxyPath =
       this.options.opencodeProxyPath ??
       fileURLToPath(
@@ -941,6 +958,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               environmentId: managed!.environmentId,
               betaVersion: managed!.betaVersion,
               maxSessionListCostUsd: managed!.maxSessionListCostUsd,
+              instructions: String(params.baseInstructions ?? "You are a Paperclip agent."),
+              runtimeContext,
             }
           : provider === "aws_agentcore"
             ? {
@@ -964,6 +983,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 maxIterations: agentCore!.maxIterations,
                 maxOutputTokens: agentCore!.maxOutputTokens,
                 timeoutSeconds: agentCore!.timeoutSeconds,
+                instructions: String(params.baseInstructions ?? "You are a Paperclip agent."),
+                runtimeContext,
               }
             : provider === "acpx"
               ? {
@@ -988,6 +1009,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                     params.baseInstructions ?? "You are a Paperclip agent.",
                   ),
                   permissionPolicy: "interactive",
+                  runtimeContext,
                 }
               : {
                   kind: provider,
@@ -1001,6 +1023,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                       : (this.options.codexArgs ??
                         createIsolatedCodexAppServerArgs(
                           this.options.environment,
+                          runtimeContext ? [codexHome, runtimeContext.instructions.bundle.rootPath, ...runtimeContext.skills.map((skill) => skill.bundle.rootPath)] : [],
                         )),
                   cwd: String(params.cwd ?? tmpdir()),
                   model: typeof params.model === "string" ? params.model : null,
@@ -1016,6 +1039,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                     provider === "codex" &&
                     record(params.config)
                       .include_collaboration_mode_instructions !== false,
+                  includeSkillInstructions: provider === "codex" && runtimeContext !== null,
+                  runtimeContext,
                 },
     });
     core.queueCommand("session.open", { reuse: "same_session" });
@@ -1067,7 +1092,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 ? createSanitizedAwsAgentCoreEnvironment(
                     this.options.environment,
                   )
-                : this.options.environment,
+                : createSanitizedCodexEnvironment({ ...this.options.environment, HOME: codexHome, CODEX_HOME: codexHome }),
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -1117,6 +1142,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
     this.#durableTurnId = identity.turnId;
     const attachingNewRun = identity.runId !== desiredIdentity.runId;
+    const provider = this.options.provider ?? "codex";
+    const codexHome = resolve(this.#root, "codex-home");
+    if (provider === "codex") {
+      await prepareIsolatedCodexHome({
+        context: this.options.runtimeContext ?? null,
+        codexHome,
+        sourceCodexHome: this.options.environment?.CODEX_HOME,
+        nativeMcp: nativeMcpLaunchBinding(this.options.environment),
+      });
+    }
     const core = new DurablePrpControlPlane({
       stateDirectory: controlPlaneDirectory,
       identity,
@@ -1164,7 +1199,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                   this.options.environment,
                   this.options.acpxAgent ?? "pi",
                 )
-              : this.options.environment,
+              : provider === "codex"
+                ? createSanitizedCodexEnvironment({ ...this.options.environment, HOME: codexHome, CODEX_HOME: codexHome })
+                : this.options.environment,
     });
     this.#handle = handle;
     this.#watchRunner(handle);

@@ -12,6 +12,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
+import { isPlatformManagedEnvironment } from "../lib/managed-sandbox-environment";
 import {
   AgentStatusBadge,
   AgentStatusCapsule,
@@ -153,8 +154,9 @@ function describeEnvironment(
   environment: Environment,
   capabilities?: EnvironmentCapabilities | null,
 ): EnvironmentDescriptor {
-  const detail =
-    environment.driver === "sandbox"
+  const detail = isPlatformManagedEnvironment(environment)
+    ? "Managed by Paperclip"
+    : environment.driver === "sandbox"
       ? `${getSandboxProviderLabel(environment, capabilities)} sandbox provider`
       : environment.driver === "local"
         ? "Paperclip host"

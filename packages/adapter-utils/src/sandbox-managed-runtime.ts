@@ -959,7 +959,7 @@ export async function prepareSandboxManagedRuntime(input: {
             //    wipes the target tree EXCEPT `.paperclip-runtime`, so the overlay tar,
             //    which sits under `.paperclip-runtime`, survives to run its own extract.
             if (gitSnapshot) {
-              await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to sandbox");
+              await emitRuntimeStatus(input.onRuntimeProgress, "git_sync", "Syncing git history to environment");
               const gitTarPath = path.join(tempDir, "git-workspace.tar");
               const remoteGitTar = path.posix.join(runtimeRootDir, "git-workspace-upload.tar");
               await withShallowGitWorkspaceClone({
@@ -986,7 +986,7 @@ export async function prepareSandboxManagedRuntime(input: {
             // 2. workspace-overlay tar. A git-backed overlay merges on top of the just
             //    extracted git tree (no wipe); a plain workspace wipes every child except
             //    the preserved names first. The extract runs AFTER the git extract.
-            await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to sandbox");
+            await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing workspace to environment");
             const workspaceTarPath = path.join(tempDir, "workspace.tar");
             const workspaceArchiveDir = gitSnapshot ? path.join(tempDir, "workspace-overlay") : input.workspaceLocalDir;
             if (gitSnapshot) {
@@ -1043,7 +1043,7 @@ export async function prepareSandboxManagedRuntime(input: {
       inboundTaskIsRequired.push(true);
       inboundTasks.push(() =>
         runStepSpan(`stage.asset.${asset.key}`, async () => {
-          await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing runtime assets to sandbox");
+          await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing runtime assets to environment");
           const remoteAssetDir = path.posix.join(runtimeRootDir, asset.key);
           const remoteAssetTar = path.posix.join(runtimeRootDir, `${asset.key}-upload.tar`);
           // Every asset — default OR custom-provisioned (e.g. an adapter credential
@@ -1137,7 +1137,7 @@ export async function prepareSandboxManagedRuntime(input: {
               throw new Error(`additional source projectId is not a simple path segment: ${projectId}`);
             }
             const remoteProjectDir = path.posix.join(runtimeRootDir, label);
-            await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to sandbox");
+            await emitRuntimeStatus(input.onRuntimeProgress, "config_sync", "Syncing referenced project to environment");
             await stageConfinedSyncIn({
               files: [{
                 sourcePath: localPath,
@@ -1237,7 +1237,7 @@ export async function prepareSandboxManagedRuntime(input: {
               let remoteWorkspaceStatus = "dirty";
               try {
                 if (gitSnapshot) {
-                  await emitRuntimeStatus(input.onRuntimeProgress, "export", "Exporting git changes from sandbox");
+                  await emitRuntimeStatus(input.onRuntimeProgress, "export", "Exporting git changes from environment");
                   importedRef = createImportedGitRef("sandbox");
                   const remoteGitBundle = path.posix.join(runtimeRootDir, "git-delta.bundle");
                   const remoteWorkspaceStatusPath = path.posix.join(runtimeRootDir, "workspace-status.txt");
@@ -1269,9 +1269,35 @@ export async function prepareSandboxManagedRuntime(input: {
                       undefined,
                       { sink: input.onRuntimeProgress, phase: "export" },
                     );
-                    const bundleBytes = await input.client.readFile(remoteGitBundle, gitExport.options);
-                    const bundleBuffer = toBuffer(bundleBytes);
-                    await gitExport.finish(bundleBuffer.byteLength, bundleBuffer.byteLength);
+                    if (nativeSyncOut) {
+                      // Native outbound: the provider copies the bundle straight from
+                      // the sandbox into the host restore temp directory. This maps to
+                      // one `kind: "file"` mapping. The host does not buffer the full
+                      // bundle in RAM and does not move the bytes through the base64
+                      // read loop. The git import step below reads the bundle from
+                      // `localBundlePath`. The provider transfer reports no byte counts,
+                      // so the "Exporting git history" progress degrades to
+                      // start-and-finish only (mirrors the workspace restore below).
+                      const operations: SandboxSyncOperation[] = [{
+                        operationId: nextSyncOperationId(),
+                        files: [{
+                          sourcePath: remoteGitBundle,
+                          targetPath: localBundlePath,
+                          kind: "file",
+                        }],
+                      }];
+                      assertSyncOperationsConfined(operations, {
+                        sourceRoots: [runtimeRootDir],
+                        targetRoots: [tempDir],
+                      });
+                      await input.client.syncOut!(operations);
+                      await gitExport.finish(0, 0);
+                    } else {
+                      const bundleBytes = await input.client.readFile(remoteGitBundle, gitExport.options);
+                      const bundleBuffer = toBuffer(bundleBytes);
+                      await gitExport.finish(bundleBuffer.byteLength, bundleBuffer.byteLength);
+                      await fs.writeFile(localBundlePath, bundleBuffer);
+                    }
                     await input.client.remove(remoteGitBundle).catch(() => undefined);
                     if (!forceFullBundle) {
                       remoteWorkspaceStatus = await input.client.readFile(remoteWorkspaceStatusPath)
@@ -1280,7 +1306,6 @@ export async function prepareSandboxManagedRuntime(input: {
                       remoteWorkspaceStatus = remoteWorkspaceStatus === "clean" ? "clean" : "dirty";
                       await input.client.remove(remoteWorkspaceStatusPath).catch(() => undefined);
                     }
-                    await fs.writeFile(localBundlePath, bundleBuffer);
                     return fetchGitBundleIntoLocalRef({
                       localDir: input.workspaceLocalDir,
                       bundlePath: localBundlePath,
@@ -1298,7 +1323,7 @@ export async function prepareSandboxManagedRuntime(input: {
                   }
                 }
 
-                await emitRuntimeStatus(input.onRuntimeProgress, "restore", "Restoring workspace from sandbox");
+                await emitRuntimeStatus(input.onRuntimeProgress, "restore", "Restoring workspace from environment");
                 const extractedDir = path.join(tempDir, "workspace");
                 if (nativeSyncOut) {
                   // Native outbound: the provider materializes the sandbox workspace into
@@ -1380,7 +1405,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     : undefined,
                 });
               } finally {
-                await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing sandbox workspace");
+                await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing workspace");
                 if (importedRef) {
                   await deleteLocalGitRef({ localDir: input.workspaceLocalDir, ref: importedRef });
                 }

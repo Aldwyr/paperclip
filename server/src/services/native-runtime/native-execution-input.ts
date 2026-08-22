@@ -1,8 +1,9 @@
 import type {
   NativeAcpxAgent,
-  NativeExecutionInputV2,
+  NativeExecutionInputV3,
   NativeInteractionResponseEnvelope,
   NativePlanningContext,
+  NativeRuntimeContextSnapshot,
   StrictCompletionContractInput,
 } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -59,7 +60,7 @@ export function buildNativeExecutionInput(input: {
   };
   maxEstimatedSessionCostUsd?: number;
   invocationLimits?: { maxIterations: number; maxOutputTokens: number; timeoutSeconds: number };
-  lifecyclePolicy?: NativeExecutionInputV2["session"]["lifecyclePolicy"];
+  lifecyclePolicy?: NativeExecutionInputV3["session"]["lifecyclePolicy"];
   executionMode?: "default" | "plan";
   planningContext?: NativePlanningContext | null;
   interactionResponses?: NativeInteractionResponseEnvelope[];
@@ -69,7 +70,8 @@ export function buildNativeExecutionInput(input: {
     schemaVersion: string;
     contract: StrictCompletionContractInput;
   };
-}): NativeExecutionInputV2 {
+  runtimeContext: NativeRuntimeContextSnapshot;
+}): NativeExecutionInputV3 {
   if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning") {
     throw new Error("native_execution_input_invalid: issue work mode must be standard or planning");
   }
@@ -82,7 +84,7 @@ export function buildNativeExecutionInput(input: {
       )
     : null;
   return parseNativeExecutionInput({
-    schema: "paperclip.native-execution-input.v2",
+    schema: "paperclip.native-execution-input.v3",
     executionMode,
     planningContext: input.planningContext ?? null,
     binding: {
@@ -160,5 +162,6 @@ export function buildNativeExecutionInput(input: {
     completionContract: input.completionContract,
     interactionResponses: input.interactionResponses ?? [],
     credentialBindings: [],
-  }) as NativeExecutionInputV2;
+    runtimeContext: input.runtimeContext,
+  }) as NativeExecutionInputV3;
 }

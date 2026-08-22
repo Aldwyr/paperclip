@@ -27,6 +27,7 @@ import {
   type PersistedHarnessSession,
 } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "../../contracts/types.js";
+import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
 import type { PrpEvent, PrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
@@ -61,6 +62,8 @@ export interface AcpxRuntimeDriverOptions {
   agent: QualifiedAcpxAgent;
   model: string;
   runtimeDirectory: string;
+  systemInstructions?: string;
+  runtimeContext?: NativeRuntimeContextSnapshot | null;
   taskEnvelope?: CodexTaskEnvelope;
   environment?: NodeJS.ProcessEnv;
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
@@ -114,6 +117,7 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       displayName: `${displayAgent(this.#options.agent)} via ACPX`,
       version: QUALIFIED_ACPX_VERSION,
       protocolVersion: "acp/v1",
+      runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
       capabilities: structuredClone(BASE_CAPABILITIES),
     };
   }
@@ -169,6 +173,8 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       workingDirectory: input.workingDirectory,
       agent: this.#options.agent,
       model: this.#options.model,
+      systemInstructions: this.#options.systemInstructions,
+      runtimeContext: this.#options.runtimeContext,
       ...(snapshot?.providerIdentity?.kind === "acpx"
         ? { expectedIdentity: snapshot.providerIdentity }
         : {}),

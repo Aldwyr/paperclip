@@ -1586,6 +1586,9 @@ function runnerEnvironment(
     "PAPERCLIP_RUNNER_INSTANCE_ID",
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PAPERCLIP_NATIVE_MCP_NAME",
+    "PAPERCLIP_NATIVE_MCP_URL",
+    "PAPERCLIP_NATIVE_MCP_TOKEN",
     // Short-lived, controller-selected sidecar capture. These never enter the
     // canonical PRP environment or provider payload; runnerd alone consumes them.
     "PAPERCLIP_PROVIDER_TRACE_PATH",

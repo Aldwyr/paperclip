@@ -148,6 +148,163 @@ describe("Daytona sandbox provider plugin", () => {
     });
   });
 
+  it("declares the duplex-command-stream capability and the four channel handlers", () => {
+    // Daytona carries the callback bridge on one duplex channel, so it declares
+    // the opt-in capability. The host resolves it `true` only when the worker also
+    // verifies the `duplexChannelOpen` handler, which the four handlers provide.
+    expect(manifest.environmentDrivers?.[0]?.sandboxCapabilities).toMatchObject({
+      duplexCommandStream: true,
+    });
+    expect(plugin.definition.onDuplexChannelOpen).toBeTypeOf("function");
+    expect(plugin.definition.onDuplexChannelWrite).toBeTypeOf("function");
+    expect(plugin.definition.onDuplexChannelStop).toBeTypeOf("function");
+    expect(plugin.definition.onDuplexChannelClose).toBeTypeOf("function");
+  });
+
+  it("bumps the plugin version so the server reconciles the stored manifest", () => {
+    // The bundled-plugin boot reconcile refreshes the stored manifest for an
+    // existing install only when the version changes. The duplex capability needs
+    // the bump to reach an existing install.
+    expect(manifest.version).toBe("0.1.5");
+  });
+
+  it("opens a duplex channel, forwards a host write, and closes it on lease release", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    // A fake PTY handle records each host write, drives the data stream on demand,
+    // and records the kill and the disconnect.
+    const inputs: string[] = [];
+    let killed = 0;
+    let disconnected = 0;
+    let ptyOnData: ((data: Uint8Array) => void) | null = null;
+    const handle = {
+      async waitForConnection() {},
+      async sendInput(data: string | Uint8Array) {
+        inputs.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+      },
+      wait() {
+        return new Promise<{ exitCode?: number }>(() => {});
+      },
+      async kill() {
+        killed += 1;
+      },
+      async disconnect() {
+        disconnected += 1;
+      },
+    };
+    const sandbox = createMockSandbox();
+    (sandbox.process as Record<string, unknown>).createPty = vi.fn(
+      async (options: { onData: (data: Uint8Array) => void }) => {
+        ptyOnData = options.onData;
+        return handle;
+      },
+    );
+    mockCreate.mockResolvedValue(sandbox);
+
+    // Capture the data and the exit the worker forwards through `ctx.duplexChannel`.
+    const dataChunks: Array<{ hostRouteId: string; workerSessionId: string; chunk: string }> = [];
+    const restore = __setDaytonaPluginContextForTest({
+      duplexChannel: {
+        data: (hostRouteId: string, workerSessionId: string, chunk: string) =>
+          dataChunks.push({ hostRouteId, workerSessionId, chunk }),
+        exit: () => {},
+      },
+    } as unknown as PluginContext);
+
+    try {
+      await plugin.definition.onEnvironmentAcquireLease?.({
+        driverKey: "daytona",
+        companyId: "company-1",
+        environmentId: "env-1",
+        runId: "run-1",
+        agentId: "agent-1",
+        executionWorkspaceId: "workspace-1",
+        adapterType: "codex_local",
+        config: { image: "node:20", timeoutMs: 300000, reuseLease: true },
+      });
+
+      const open = await plugin.definition.onDuplexChannelOpen?.({
+        hostRouteId: "route-1",
+        driverKey: "daytona",
+        companyId: "company-1",
+        environmentId: "env-1",
+        providerLeaseId: "sandbox-123",
+        command: ["node", "/paperclip/gateway.mjs"],
+      });
+      expect(open?.workerSessionId).toMatch(/^duplex-/);
+      // The open reply echoes the host route id, so the host binds the exact pair.
+      expect(open?.hostRouteId).toBe("route-1");
+      const workerSessionId = open?.workerSessionId ?? "";
+
+      // The launch wrapper sets raw mode with echo off and redirects diagnostics.
+      // It quotes each command argument and the diagnostics path as a shell word.
+      expect(inputs[0]).toContain("stty raw -echo");
+      expect(inputs[0]).toContain("exec 'node' '/paperclip/gateway.mjs'");
+      expect(inputs[0]).toMatch(/2>'\/tmp\/paperclip-duplex-.+\.log'/);
+
+      // A host write on the exact pair reaches the process on the same channel.
+      await plugin.definition.onDuplexChannelWrite?.({
+        hostRouteId: "route-1",
+        workerSessionId,
+        data: '{"version":1,"type":"heartbeat"}\n',
+      });
+      expect(inputs[1]).toBe('{"version":1,"type":"heartbeat"}\n');
+
+      // A write whose pair does not match the bound entry applies no bytes. The
+      // worker acts only on the exact live pair.
+      const inputsBeforeForeign = inputs.length;
+      await plugin.definition.onDuplexChannelWrite?.({
+        hostRouteId: "route-foreign",
+        workerSessionId,
+        data: "foreign\n",
+      });
+      expect(inputs.length).toBe(inputsBeforeForeign);
+      // A stop whose pair does not match the bound entry stops nothing.
+      const killedBeforeForeign = killed;
+      await plugin.definition.onDuplexChannelStop?.({
+        hostRouteId: "route-foreign",
+        workerSessionId,
+      });
+      expect(killed).toBe(killedBeforeForeign);
+
+      // Process output reaches the host as a data notification bound to the exact
+      // pair, so it echoes the host route id and the worker session id.
+      (ptyOnData as ((data: Uint8Array) => void) | null)?.(
+        new TextEncoder().encode('{"version":1,"type":"ready","address":"127.0.0.1:1"}\n'),
+      );
+      expect(dataChunks).toEqual([
+        {
+          hostRouteId: "route-1",
+          workerSessionId,
+          chunk: '{"version":1,"type":"ready","address":"127.0.0.1:1"}\n',
+        },
+      ]);
+
+      // Lease release closes the channel: it kills the child and releases the
+      // pseudo-terminal socket.
+      await plugin.definition.onEnvironmentReleaseLease?.({
+        driverKey: "daytona",
+        companyId: "company-1",
+        environmentId: "env-1",
+        providerLeaseId: "sandbox-123",
+        config: { image: "node:20", timeoutMs: 300000, reuseLease: true },
+      });
+      expect(killed).toBeGreaterThanOrEqual(1);
+      expect(disconnected).toBe(1);
+
+      // The channel entry is gone, so a later write is a no-op and reaches no
+      // process.
+      const inputsBefore = inputs.length;
+      await plugin.definition.onDuplexChannelWrite?.({
+        hostRouteId: "route-1",
+        workerSessionId,
+        data: "late\n",
+      });
+      expect(inputs.length).toBe(inputsBefore);
+    } finally {
+      restore();
+    }
+  });
+
   it("normalizes config and validates the API key fallback", async () => {
     process.env.DAYTONA_API_KEY = "host-key";
 
@@ -2625,7 +2782,7 @@ describe("Daytona sandbox provider plugin", () => {
       expect(sandbox.delete).not.toHaveBeenCalled();
 
       resolveFirstExecute();
-      await cancelPromise.then(() => {
+      await cancelPromise!.then(() => {
         cancelResolved = true;
       });
       await expect(queuedExecutePromise).rejects.toThrow(/no longer active/);
@@ -4363,13 +4520,13 @@ describe("daytona native file-sync hooks", () => {
     // Both commands ran, VERBATIM (first arg is the exact authored string — the
     // provider never rewrote/concatenated a shell fragment onto it: C1/C3).
     const findCall = (cmd: string) =>
-      sandbox.process.executeCommand.mock.calls.find(([c]: [string]) => c === cmd);
+      sandbox.process.executeCommand.mock.calls.find(([c]) => c === cmd);
     expect(findCall("codex-auth-merge --first")).toBeDefined();
     expect(findCall("chmod 600 config.txt")).toBeDefined();
 
     // Ordered: the first command's exec precedes the second's (C4 array order).
     const orderOf = (cmd: string) => {
-      const idx = sandbox.process.executeCommand.mock.calls.findIndex(([c]: [string]) => c === cmd);
+      const idx = sandbox.process.executeCommand.mock.calls.findIndex(([c]) => c === cmd);
       return sandbox.process.executeCommand.mock.invocationCallOrder[idx];
     };
     expect(orderOf("codex-auth-merge --first")).toBeLessThan(orderOf("chmod 600 config.txt"));
@@ -4418,7 +4575,7 @@ describe("daytona native file-sync hooks", () => {
 
     // Fail-fast: the command after the failing one never executed.
     expect(
-      sandbox.process.executeCommand.mock.calls.some(([c]: [string]) => c === "should-not-run"),
+      sandbox.process.executeCommand.mock.calls.some(([c]) => c === "should-not-run"),
     ).toBe(false);
   });
 
@@ -4465,7 +4622,7 @@ describe("daytona native file-sync hooks", () => {
     expect(sandbox.fs.uploadFiles).toHaveBeenCalledTimes(1);
     const [uploads] = sandbox.fs.uploadFiles.mock.calls[0] as [Array<{ source: string; destination: string }>];
     expect(uploads).toHaveLength(2);
-    const mvCalls = sandbox.process.executeCommand.mock.calls.filter(([cmd]: [string]) =>
+    const mvCalls = sandbox.process.executeCommand.mock.calls.filter(([cmd]) =>
       String(cmd).includes("mv -f"),
     );
     expect(mvCalls).toHaveLength(1);
@@ -4473,7 +4630,7 @@ describe("daytona native file-sync hooks", () => {
 
     // Both extract commands ran, in array order, AFTER the upload (git first).
     const orderOf = (cmd: string) => {
-      const idx = sandbox.process.executeCommand.mock.calls.findIndex(([c]: [string]) => c === cmd);
+      const idx = sandbox.process.executeCommand.mock.calls.findIndex(([c]) => c === cmd);
       return sandbox.process.executeCommand.mock.invocationCallOrder[idx];
     };
     expect(orderOf(gitExtract)).toBeLessThan(orderOf(overlayExtract));
@@ -4569,7 +4726,7 @@ describe("daytona native file-sync hooks", () => {
 
     // Fail-fast: the overlay extract and the remove-deleted command never ran.
     const ran = (cmd: string) =>
-      sandbox.process.executeCommand.mock.calls.some(([c]: [string]) => c === cmd);
+      sandbox.process.executeCommand.mock.calls.some(([c]) => c === cmd);
     expect(ran("git-history-extract")).toBe(true);
     expect(ran("workspace-overlay-extract")).toBe(false);
     expect(ran("remove-deleted-paths")).toBe(false);
@@ -4600,7 +4757,7 @@ describe("daytona native file-sync hooks", () => {
         }),
       ).rejects.toThrow(/not a confined absolute path|escapes the workspace remote dir/);
       // The command never ran — lexical confinement rejected it before exec.
-      expect(sandbox.process.executeCommand.mock.calls.some(([c]: [string]) => c === "run-me")).toBe(
+      expect(sandbox.process.executeCommand.mock.calls.some(([c]) => c === "run-me")).toBe(
         false,
       );
     }
@@ -4639,7 +4796,7 @@ describe("daytona native file-sync hooks", () => {
         ],
       }),
     ).rejects.toThrow(/symlink-escape guard|command failed/i);
-    expect(sandbox.process.executeCommand.mock.calls.some(([c]: [string]) => c === "run-me")).toBe(
+    expect(sandbox.process.executeCommand.mock.calls.some(([c]) => c === "run-me")).toBe(
       false,
     );
   });

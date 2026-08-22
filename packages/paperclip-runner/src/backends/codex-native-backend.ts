@@ -4,6 +4,7 @@ import type { NativeSessionBackend } from "../contracts/native-session-backend.j
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
+import { nativeSystemInstructions, nativeTaskConstraints } from "./runtime-context.js";
 
 /**
  * Package-owned factory used by the Paperclip seam. Core supplies only the
@@ -30,6 +31,8 @@ export function createCodexNativeSessionBackend(
   } = {},
 ): NativeSessionBackend {
   return new HarnessDriverBackend(new CodexAppServerDriver({
+    baseInstructions: nativeSystemInstructions(input),
+    includeSkillInstructions: "runtimeContext" in input,
     requestedCollaborationMode: "executionMode" in input ? input.executionMode : "default",
     taskEnvelope: createCodexTaskEnvelope({
       objective: input.completionContract.contract.objective,
@@ -43,8 +46,7 @@ export function createCodexNativeSessionBackend(
           "Complete one structured provider plan item; Paperclip will synchronize it after completion.",
           "Keep the final response to a short synchronization summary instead of repeating the full plan.",
         ] : []),
-        "Do not discover or invoke skills.",
-        "Do not call a control-plane API.",
+        ...nativeTaskConstraints(input),
         "Return one semantic completion result.",
       ],
     }),

@@ -67,6 +67,11 @@ async function consumeTurn(session: NativeSession, controlPlane: ControlPlanePor
 export async function executeNativeSession(options: ExecuteNativeSessionOptions): Promise<NativeSessionExecutionResult> {
   const input = parseNativeExecutionInput(options.input);
   const descriptor = await options.backend.descriptor();
+  if ("runtimeContext" in input) {
+    const capabilities = descriptor.runtimeContextCapabilities;
+    const unsupported = (["instructions", "skills", "mcp"] as const).filter((key) => capabilities?.[key] !== "native");
+    if (unsupported.length) throw new Error(`native_runtime_context_unsupported: ${descriptor.name} does not natively realize ${unsupported.join(", ")}`);
+  }
   const persistedSession = options.existingSession
     ? null
     : options.persistedSession ?? await options.controlPlane.loadSessionCheckpoint?.() ?? null;

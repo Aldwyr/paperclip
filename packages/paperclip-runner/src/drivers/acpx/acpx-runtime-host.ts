@@ -28,6 +28,9 @@ import {
   type QualifiedAcpxAgent,
   type QualifiedAcpxProfile,
 } from "./qualified-profiles.js";
+import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
+import { nativeMcpLaunchBinding } from "../native-mcp.js";
+import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.js";
 
 const PI_PERMISSION_TOOL = "__paperclip_runtime_permission";
 
@@ -75,6 +78,8 @@ export interface AcpxRuntimeHostOptions {
   workingDirectory: string;
   agent: QualifiedAcpxAgent;
   model: string;
+  systemInstructions?: string;
+  runtimeContext?: NativeRuntimeContextSnapshot | null;
   expectedIdentity?: {
     kind: "acpx";
     normalizedSessionId: string;
@@ -184,6 +189,7 @@ export class AcpxRuntimeHost {
         enableInstallTelemetry: false,
       })}\n`, { mode: 0o600 });
     }
+    await materializeNativeRuntimeSkills(options.runtimeContext ?? null, join(agentHome, "skills"));
     const ephemeralCredentialFiles = options.agent === "codex"
       ? await stageManagedCodexCredential(agentHome, options)
       : [];
@@ -225,24 +231,35 @@ export class AcpxRuntimeHost {
         PI_ACP_PI_COMMAND: piCommand!,
         PI_ACP_PI_ARGS_JSON: JSON.stringify([
           "--no-extensions", "--extension", piExtension,
-          "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          ...(options.runtimeContext ? [] : ["--no-skills"]),
+          "--no-prompt-templates", "--no-themes", "--no-context-files",
         ]),
         PAPERCLIP_RUNNER_BRIDGE_URL: bridge.url,
         PAPERCLIP_RUNNER_BRIDGE_TOKEN: bridge.secret,
         PAPERCLIP_WORKSPACE_ROOT: cwd,
         PAPERCLIP_RUNTIME_ROOT: root,
+        ...(options.runtimeContext ? {
+          PAPERCLIP_INSTRUCTION_ROOT: options.runtimeContext.instructions.bundle.rootPath,
+          PAPERCLIP_ASSIGNED_SKILLS_ROOT: join(agentHome, "skills"),
+        } : {}),
       } : {}),
       ...(options.agent === "claude" ? { CLAUDE_CONFIG_DIR: agentHome } : {}),
       ...(options.agent === "codex" ? { CODEX_HOME: agentHome } : {}),
       PAPERCLIP_ACPX_PROFILE: options.agent,
     }, options.agent);
     const safeSessionEnvironment = withoutCredentials(agentEnvironment);
+    const nativeMcp = nativeMcpLaunchBinding(options.environment ?? process.env);
     const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = options.agent === "pi" ? [] : [{
       type: "http",
       name: "paperclip",
       url: bridge.url,
       headers: [{ name: "Authorization", value: `Bearer ${bridge.secret}` }],
-    }];
+    }, ...(nativeMcp ? [{
+      type: "http" as const,
+      name: nativeMcp.name,
+      url: nativeMcp.url,
+      headers: [{ name: "Authorization", value: `Bearer ${nativeMcp.token}` }],
+    }] : [])];
     const routeAgentStderr = createAgentStderrRouter(
       agentEnvironment,
       options.onUsage,
@@ -298,7 +315,7 @@ export class AcpxRuntimeHost {
         cwd,
         sessionOptions: {
           model: options.model,
-          systemPrompt: { append: paperclipAcpSystemPrompt() },
+          systemPrompt: { append: options.systemInstructions ?? paperclipAcpSystemPrompt() },
           env: safeSessionEnvironment,
         },
       });

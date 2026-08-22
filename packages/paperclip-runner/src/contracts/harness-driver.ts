@@ -30,6 +30,13 @@ export interface HarnessDriverDescriptor {
   version: string;
   protocolVersion?: string;
   capabilities: NativeSessionCapabilities;
+  runtimeContextCapabilities?: NativeRuntimeContextCapabilities;
+}
+
+export interface NativeRuntimeContextCapabilities {
+  instructions: "native" | "unsupported";
+  skills: "native" | "unsupported";
+  mcp: "native" | "unsupported";
 }
 
 export interface OpenHarnessSessionInput {

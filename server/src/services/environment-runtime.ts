@@ -7,6 +7,7 @@ import type {
   EnvironmentLease,
   EnvironmentLeaseStatus,
   ExecutionWorkspace,
+  InstanceExperimentalSettings,
   IssueExecutionWorkspaceSettings,
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
@@ -32,6 +33,7 @@ import {
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
+import { instanceSettingsService } from "./instance-settings.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -321,6 +323,29 @@ export function buildEnvironmentLeaseContext(input: {
   };
 }
 
+/**
+ * The per-run duplex bridge input. The host resolves it for each new run before
+ * it selects the sandbox callback bridge transport. When `enableDuplexBridge` is
+ * false the host keeps the file bridge with no manifest change and no redeploy.
+ * The transport selection reads this input in a later phase; this phase only
+ * delivers the setting and the per-run read.
+ */
+export interface ResolvedSandboxDuplexBridgeInput {
+  /** True only when the instance opts in to the sandbox duplex command stream. */
+  enableDuplexBridge: boolean;
+}
+
+/**
+ * Map the experimental instance setting `enableSandboxDuplexBridge` into the
+ * per-run duplex bridge input. The setting is the kill switch. It defaults off,
+ * so an absent or false setting keeps the file bridge.
+ */
+export function resolveSandboxDuplexBridgeInput(
+  experimental: Pick<InstanceExperimentalSettings, "enableSandboxDuplexBridge">,
+): ResolvedSandboxDuplexBridgeInput {
+  return { enableDuplexBridge: experimental.enableSandboxDuplexBridge === true };
+}
+
 function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
@@ -498,8 +523,12 @@ export interface EnvironmentDriverSyncInput extends EnvironmentDriverLeaseInput 
 }
 
 export interface EnvironmentDriverOpenDuplexChannelInput extends EnvironmentDriverLeaseInput {
-  /** The command line the sandbox runs as the duplex channel child process. */
-  command: string;
+  /**
+   * The command argument vector the sandbox runs as the duplex channel child
+   * process. Element 0 is the program. The worker runs the vector with no
+   * shell, so a shell metacharacter in an element cannot inject a command.
+   */
+  command: readonly string[];
 }
 
 export interface EnvironmentRuntimeDriver {
@@ -3137,6 +3166,17 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+
+    /**
+     * Read the sandbox duplex bridge kill switch for a new run. The host calls it
+     * per run before it selects the callback bridge transport. It reads the
+     * experimental instance setting `enableSandboxDuplexBridge` and maps it into
+     * the resolved bridge input. The default-off setting keeps the file bridge.
+     */
+    async readSandboxDuplexBridgeInput(): Promise<ResolvedSandboxDuplexBridgeInput> {
+      const experimental = await instanceSettingsService(db).getExperimental();
+      return resolveSandboxDuplexBridgeInput(experimental);
+    },
 
     async acquireRunLease(input: {
       companyId: string;

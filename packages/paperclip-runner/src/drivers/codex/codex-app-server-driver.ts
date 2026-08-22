@@ -99,6 +99,8 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 
 export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
+  baseInstructions?: string;
+  includeSkillInstructions?: boolean;
   conversationMode?: "task" | "direct";
   requestedCollaborationMode?: "default" | "plan";
   /**
@@ -319,9 +321,11 @@ export function createSkilllessCodexThreadConfig(
 function collaborationThreadConfig(
   _mode: "default" | "plan",
   includeCollaborationModeInstructions = true,
+  includeSkillInstructions = false,
 ) {
   return {
     ...SKILLLESS_BASE_CONFIG,
+    "skills.include_instructions": includeSkillInstructions,
     include_collaboration_mode_instructions:
       includeCollaborationModeInstructions,
   };
@@ -333,6 +337,7 @@ function tomlString(value: string): string {
 
 export function createIsolatedCodexAppServerArgs(
   source: NodeJS.ProcessEnv = process.env,
+  readOnlyRoots: string[] = [],
 ): string[] {
   const deniedHostRoots = [
     ...new Set(
@@ -349,6 +354,7 @@ export function createIsolatedCodexAppServerArgs(
     `\":minimal\"=\"read\"`,
     `\":tmpdir\"=\"none\"`,
     ...deniedHostRoots.map((path) => `${tomlString(path)}=\"none\"`),
+    ...readOnlyRoots.map((path) => `${tomlString(resolve(path))}=\"read\"`),
     `\":workspace_roots\"={\".\"=\"write\"}`,
   ].join(",");
   const planningFilesystemRules = [
@@ -356,6 +362,7 @@ export function createIsolatedCodexAppServerArgs(
     `\":minimal\"=\"read\"`,
     `\":tmpdir\"=\"none\"`,
     ...deniedHostRoots.map((path) => `${tomlString(path)}=\"none\"`),
+    ...readOnlyRoots.map((path) => `${tomlString(resolve(path))}=\"read\"`),
     `\":workspace_roots\"={\".\"=\"read\"}`,
   ].join(",");
   const commandEnv = Object.entries(commandEnvironment(source))
@@ -390,6 +397,7 @@ function securedThreadParams(
   source: NodeJS.ProcessEnv = process.env,
   mode: "default" | "plan" = "default",
   includeCollaborationModeInstructions = true,
+  includeSkillInstructions = false,
 ): Record<string, unknown> {
   const permissionProfile =
     mode === "plan"
@@ -400,6 +408,7 @@ function securedThreadParams(
     config: collaborationThreadConfig(
       mode,
       includeCollaborationModeInstructions,
+      includeSkillInstructions,
     ),
     permissions: permissionProfile,
     runtimeWorkspaceRoots: [workingDirectory],
@@ -432,6 +441,10 @@ export class CodexAppServerDriver implements HarnessDriver {
     return this.#options.conversationMode === "direct";
   }
 
+  #baseInstructions(): string {
+    return this.#options.baseInstructions ?? CODEX_SKILLLESS_BASE_INSTRUCTIONS;
+  }
+
   async descriptor(): Promise<HarnessDriverDescriptor> {
     const unsupported = Object.entries(this.#caps)
       .filter(([, supported]) => !supported)
@@ -441,6 +454,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       displayName: "Codex app-server",
       version: DRIVER_VERSION,
       protocolVersion: CODEX_CODEX_PROTOCOL_VERSION,
+      runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
       capabilities: {
         resume: this.#caps.resume,
         typedEvents: true,
@@ -493,11 +507,12 @@ export class CodexAppServerDriver implements HarnessDriver {
           this.#options.environment,
           requestedMode,
           this.#options.includeCollaborationModeInstructions ?? true,
+          this.#options.includeSkillInstructions ?? false,
         ),
         approvalPolicy: "never",
         ...(this.#direct()
           ? {}
-          : { baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS }),
+          : { baseInstructions: this.#baseInstructions() }),
         dynamicTools: this.#direct()
           ? []
           : this.#caps.dynamicTools
@@ -587,10 +602,11 @@ export class CodexAppServerDriver implements HarnessDriver {
           this.#options.environment,
           this.#options.requestedCollaborationMode ?? "default",
           this.#options.includeCollaborationModeInstructions ?? true,
+          this.#options.includeSkillInstructions ?? false,
         ),
         baseInstructions: this.#direct()
           ? ""
-          : CODEX_SKILLLESS_BASE_INSTRUCTIONS,
+          : this.#baseInstructions(),
         persistExtendedHistory: false,
       });
       const collaborationMode = await this.#negotiateCollaborationMode(
@@ -816,7 +832,7 @@ export class CodexAppServerDriver implements HarnessDriver {
           networkAccess: false,
         },
         approvalPolicy: boundedCodexValue(response.approvalPolicy ?? "never"),
-        baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS,
+        baseInstructions: this.#baseInstructions(),
         instructionSources: Array.isArray(response.instructionSources)
           ? response.instructionSources
               .filter((value): value is string => typeof value === "string")
@@ -824,7 +840,7 @@ export class CodexAppServerDriver implements HarnessDriver {
               .map((value) => boundedText(value))
           : [],
         instructionPolicy: {
-          skillInstructions: false,
+          skillInstructions: this.#options.includeSkillInstructions ?? false,
           appInstructions: false,
           collaborationInstructions:
             this.#options.includeCollaborationModeInstructions ?? true,

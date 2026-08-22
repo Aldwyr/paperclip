@@ -44,7 +44,7 @@ export interface CodexModelContextSnapshot {
   baseInstructions: string;
   instructionSources: string[];
   instructionPolicy: {
-    skillInstructions: false;
+    skillInstructions: boolean;
     appInstructions: false;
     collaborationInstructions: boolean;
   };

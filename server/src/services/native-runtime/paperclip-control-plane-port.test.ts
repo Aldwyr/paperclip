@@ -36,6 +36,7 @@ import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embed
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
+import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
 describe("PaperclipControlPlanePort conformance", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -368,6 +369,7 @@ describe("PaperclipControlPlanePort conformance", () => {
         schemaVersion: "paperclip.completion-contract.v1",
         contract: { revision: "phase6-v1", objective: "Complete one native task", criteria: [{ id: "objective", requirement: "Complete the task" }] },
       },
+      runtimeContext: nativeRuntimeContextFixture(),
     });
     const port = new PaperclipControlPlanePort(db, {
       companyId: identity.companyId,

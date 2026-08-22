@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 
@@ -22,6 +22,7 @@ import type {
   PersistedHarnessSession,
 } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "../../contracts/types.js";
+import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import type { PrpEvent, PrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-file-reference.js";
@@ -30,6 +31,8 @@ import {
   providerFamilyCapabilities,
 } from "../../provider-events.js";
 import { canonicalOpenCodeMcpToolName, startOpenCodeMcpBridge, type OpenCodeMcpBridge } from "./mcp-bridge.js";
+import { nativeMcpLaunchBinding } from "../native-mcp.js";
+import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.js";
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
 export const QUALIFIED_OPENCODE_VERSION = "1.18.17" as const;
@@ -49,6 +52,8 @@ export interface OpenCodeServerDriverOptions {
   runnerInstanceId?: string;
   command?: string;
   runtimeDirectory: string;
+  systemInstructions?: string;
+  runtimeContext?: NativeRuntimeContextSnapshot | null;
   environment?: NodeJS.ProcessEnv;
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   dynamicToolHandler?: DynamicToolHandler;
@@ -107,6 +112,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
       displayName: "OpenCode server",
       version: QUALIFIED_OPENCODE_VERSION,
       protocolVersion: "http+sse/v1",
+      runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
       capabilities: structuredClone(CAPABILITIES),
     };
   }
@@ -193,6 +199,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
           runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-opencode-${input.runId}`,
           model: this.#options.model,
           taskEnvelope: this.#options.taskEnvelope ?? createCodexTaskEnvelope({ objective: "Complete the supplied task." }),
+          systemInstructions: this.#options.systemInstructions ?? CODEX_SKILLLESS_BASE_INSTRUCTIONS,
           dynamicToolHandler: this.#options.dynamicToolHandler,
           snapshot,
           now: this.#options.now ?? (() => new Date()),
@@ -221,6 +228,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #runnerInstanceId: string;
   readonly #model: string;
   readonly #taskEnvelope: CodexTaskEnvelope;
+  readonly #systemInstructions: string;
   readonly #dynamicToolHandler?: DynamicToolHandler;
   readonly #now: () => Date;
   readonly #events = new AsyncQueue<PrpEvent>();
@@ -252,6 +260,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     runnerInstanceId: string;
     model: string;
     taskEnvelope: CodexTaskEnvelope;
+    systemInstructions: string;
     dynamicToolHandler?: DynamicToolHandler;
     snapshot: PersistedHarnessSession | null;
     now: () => Date;
@@ -266,6 +275,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#runnerInstanceId = input.runnerInstanceId;
     this.#model = input.model;
     this.#taskEnvelope = input.taskEnvelope;
+    this.#systemInstructions = input.systemInstructions;
     this.#dynamicToolHandler = input.dynamicToolHandler;
     this.#now = input.now;
     this.#sourceSequence = input.snapshot?.lastSourceSequence ?? 0;
@@ -336,7 +346,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         // at this HTTP boundary.
         providerID,
         modelID,
-        system: CODEX_SKILLLESS_BASE_INSTRUCTIONS,
+        system: this.#systemInstructions,
         parts: [{ type: "text", text: prompt }],
       }),
     });
@@ -647,14 +657,24 @@ async function startRuntime(input: {
     mkdir(cacheHome, { recursive: true, mode: 0o700 }),
     mkdir(isolatedHome, { recursive: true, mode: 0o700 }),
   ]);
+  await materializeNativeRuntimeSkills(input.options.runtimeContext ?? null, join(isolatedHome, ".claude", "skills"));
+  const assignedMcp = nativeMcpLaunchBinding(input.options.environment ?? process.env);
+  const instructionRoot = input.options.runtimeContext?.instructions.bundle.rootPath;
   const config = {
     $schema: "https://opencode.ai/config.json",
     model: input.options.model,
     small_model: input.options.model,
     share: "disabled",
-    instructions: [],
+    instructions: instructionRoot
+      ? [join(instructionRoot, input.options.runtimeContext!.instructions.entryPath)]
+      : [],
     plugin: [],
-    permission: { "*": "allow", external_directory: "deny" },
+    permission: {
+      "*": "allow",
+      external_directory: instructionRoot
+        ? { "*": "deny", [`${instructionRoot}/**`]: "allow" }
+        : "deny",
+    },
     mcp: {
       paperclip: {
         type: "remote",
@@ -664,6 +684,16 @@ async function startRuntime(input: {
         headers: { Authorization: `Bearer ${bridge.secret}` },
         timeout: 30_000,
       },
+      ...(assignedMcp ? {
+        [assignedMcp.name]: {
+          type: "remote",
+          url: assignedMcp.url,
+          enabled: true,
+          oauth: false,
+          headers: { Authorization: `Bearer ${assignedMcp.token}` },
+          timeout: 30_000,
+        },
+      } : {}),
     },
   };
   await writeFile(join(configHome, "opencode", "opencode.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -727,11 +757,13 @@ async function startRuntime(input: {
             else globalThis.process.kill(-child.pid, "SIGKILL");
           } catch { child.kill("SIGKILL"); }
         }
+        await rm(join(configHome, "opencode", "opencode.json"), { force: true }).catch(() => undefined);
       },
     };
   } catch (error) {
     await bridge.close().catch(() => {});
     child.kill("SIGKILL");
+    await rm(join(configHome, "opencode", "opencode.json"), { force: true }).catch(() => undefined);
     throw error;
   }
 }

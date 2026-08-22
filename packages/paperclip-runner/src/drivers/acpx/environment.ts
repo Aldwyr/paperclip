@@ -22,6 +22,7 @@ export function createSanitizedAcpxEnvironment(
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "no_proxy", "all_proxy",
     "RUST_BACKTRACE",
+    "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
     ...credentialNames,
   ]);
   for (const [key, value] of Object.entries(source)) {

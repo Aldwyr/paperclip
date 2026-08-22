@@ -11,6 +11,7 @@ import type {
 import type {
   HarnessRuntimeRequest,
   HarnessThreadLineageEntry,
+  NativeRuntimeContextCapabilities,
   PersistedHarnessTurnTerminal,
 } from "./harness-driver.js";
 
@@ -19,6 +20,7 @@ export interface NativeSessionBackendDescriptor {
   name: string;
   version: string;
   capabilities: NativeSessionCapabilities;
+  runtimeContextCapabilities?: NativeRuntimeContextCapabilities;
 }
 
 export interface OpenNativeSessionInput {

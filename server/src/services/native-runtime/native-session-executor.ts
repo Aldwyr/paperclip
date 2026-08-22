@@ -1214,6 +1214,7 @@ function createRunnerdBackend(input: {
       stateDirectory: root,
       environment: input.runnerEnvironment ?? process.env,
       lifecyclePolicy: input.execution.session.lifecyclePolicy,
+      runtimeContext: "runtimeContext" in input.execution ? input.execution.runtimeContext : null,
       resumeDynamicTools: authorityRouter.definitions(),
       prpIdentity: {
         runnerInstanceId: input.runnerInstanceId,

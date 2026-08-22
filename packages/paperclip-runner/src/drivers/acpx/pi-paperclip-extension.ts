@@ -34,20 +34,57 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
   const token = requiredSecret(process.env.PAPERCLIP_RUNNER_BRIDGE_TOKEN);
   const workspace = resolve(requiredValue(process.env.PAPERCLIP_WORKSPACE_ROOT, "workspace root"));
   const runtimeRoot = resolve(requiredValue(process.env.PAPERCLIP_RUNTIME_ROOT, "runtime root"));
+  const readOnlyRoots = [process.env.PAPERCLIP_INSTRUCTION_ROOT, process.env.PAPERCLIP_ASSIGNED_SKILLS_ROOT]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .map((value) => resolve(value));
   const rpc = createMcpClient(endpoint, token);
+  await initializeMcpClient(rpc, "paperclip-pi-extension");
+  await registerMcpTools(pi, rpc, { privatePermissionTool: true, prefix: "" });
+  const assignedUrl = process.env.PAPERCLIP_NATIVE_MCP_URL?.trim();
+  const assignedToken = process.env.PAPERCLIP_NATIVE_MCP_TOKEN?.trim();
+  if (assignedUrl || assignedToken) {
+    const assigned = createMcpClient(requiredMcpEndpoint(assignedUrl), requiredSecret(assignedToken));
+    await initializeMcpClient(assigned, "paperclip-pi-assigned-mcp");
+    await registerMcpTools(pi, assigned, { privatePermissionTool: false, prefix: "assigned__" });
+  }
 
-  await rpc("initialize", {
-    protocolVersion: "2025-03-26",
-    capabilities: {},
-    clientInfo: { name: "paperclip-pi-extension", version: "1" },
-  }, "paperclip-pi-initialize");
+  pi.on("tool_call", async (event) => {
+    if (BUILTIN_READ_TOOLS.has(event.toolName)) {
+      const unsafe = referencedPaths(event.input).find((candidate) => !safeWorkspaceTarget(workspace, runtimeRoot, readOnlyRoots, candidate, false));
+      return unsafe ? { block: true, reason: "Paperclip denied a path outside the authorized workspace." } : undefined;
+    }
+    if (!BUILTIN_GOVERNED_TOOLS.has(event.toolName)) return undefined;
+    const pathTarget = referencedPaths(event.input)[0] ?? null;
+    if (pathTarget !== null && !safeWorkspaceTarget(workspace, runtimeRoot, [], pathTarget, true)) {
+      return { block: true, reason: "Paperclip denied a protected or outside-workspace target." };
+    }
+    const command = event.toolName === "bash" ? commandText(event.input) : null;
+    if (command !== null && unsafeCommandPath(command, workspace, runtimeRoot)) {
+      return { block: true, reason: "Paperclip denied a command that names a protected or outside-workspace path." };
+    }
+    const target = command === null ? pathTarget : `command-sha256:${createHash("sha256").update(command).digest("hex")}`;
+    const response = await rpc("tools/call", {
+      name: PRIVATE_PERMISSION_TOOL,
+      arguments: { operation: event.toolName, target: target === null ? null : relative(workspace, resolve(workspace, target)), inputClass: event.toolName === "bash" ? "command" : "workspace_mutation" },
+    }, `permission:${event.toolCallId}`);
+    const decision = decodedResult(response).decision;
+    return decision === "accept" || decision === "accept_for_session" ? undefined : { block: true, reason: decision === "cancel" ? "Paperclip cancelled this operation." : "Paperclip declined this operation." };
+  });
+}
+
+async function initializeMcpClient(rpc: ReturnType<typeof createMcpClient>, clientName: string): Promise<void> {
+  await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: clientName, version: "1" } }, `${clientName}-initialize`);
   await rpc("notifications/initialized", {}, null);
+}
+
+async function registerMcpTools(pi: ExtensionAPI, rpc: ReturnType<typeof createMcpClient>, options: { privatePermissionTool: boolean; prefix: string }): Promise<void> {
   const catalog = await rpc("tools/list", {}, "paperclip-pi-tools");
   for (const tool of catalog.result?.tools ?? []) {
-    if (!safeTool(tool) || tool.name === PRIVATE_PERMISSION_TOOL) continue;
+    if (!safeTool(tool) || (options.privatePermissionTool && tool.name === PRIVATE_PERMISSION_TOOL)) continue;
+    const registeredName = `${options.prefix}${tool.name}`;
     pi.registerTool({
-      name: tool.name,
-      label: semanticLabel(tool.name),
+      name: registeredName,
+      label: semanticLabel(registeredName),
       description: tool.description ?? `Paperclip semantic operation ${tool.name}`,
       parameters: (tool.inputSchema ?? { type: "object", additionalProperties: true }) as ToolDefinition["parameters"],
       async execute(toolCallId, input, signal) {
@@ -59,42 +96,11 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
               ? [{ type: "text" as const, text: item.text.slice(0, MAX_RESPONSE_BYTES) }]
               : [],
           ) ?? [],
-          details: { operationId: tool.name, callId: toolCallId },
+          details: { operationId: tool.name, registeredName, callId: toolCallId },
         };
       },
     });
   }
-
-  pi.on("tool_call", async (event) => {
-    if (BUILTIN_READ_TOOLS.has(event.toolName)) {
-      const unsafe = referencedPaths(event.input).find((candidate) => !safeWorkspaceTarget(workspace, runtimeRoot, candidate, false));
-      return unsafe ? { block: true, reason: "Paperclip denied a path outside the authorized workspace." } : undefined;
-    }
-    if (!BUILTIN_GOVERNED_TOOLS.has(event.toolName)) return undefined;
-    const pathTarget = referencedPaths(event.input)[0] ?? null;
-    if (pathTarget !== null && !safeWorkspaceTarget(workspace, runtimeRoot, pathTarget, true)) {
-      return { block: true, reason: "Paperclip denied a protected or outside-workspace target." };
-    }
-    const command = event.toolName === "bash" ? commandText(event.input) : null;
-    if (command !== null && unsafeCommandPath(command, workspace, runtimeRoot)) {
-      return { block: true, reason: "Paperclip denied a command that names a protected or outside-workspace path." };
-    }
-    const target = command === null
-      ? pathTarget
-      : `command-sha256:${createHash("sha256").update(command).digest("hex")}`;
-    const response = await rpc("tools/call", {
-      name: PRIVATE_PERMISSION_TOOL,
-      arguments: {
-        operation: event.toolName,
-        target: target === null ? null : relative(workspace, resolve(workspace, target)),
-        inputClass: event.toolName === "bash" ? "command" : "workspace_mutation",
-      },
-    }, `permission:${event.toolCallId}`);
-    const decision = decodedResult(response).decision;
-    return decision === "accept" || decision === "accept_for_session"
-      ? undefined
-      : { block: true, reason: decision === "cancel" ? "Paperclip cancelled this operation." : "Paperclip declined this operation." };
-  });
 }
 
 function createMcpClient(endpoint: URL, token: string) {
@@ -161,13 +167,14 @@ function inside(root: string, candidate: string): boolean {
   return result === "" || (!result.startsWith("..") && !isAbsolute(result));
 }
 
-function safeWorkspaceTarget(workspace: string, runtimeRoot: string, candidate: string, mayCreate: boolean): boolean {
+function safeWorkspaceTarget(workspace: string, runtimeRoot: string, readOnlyRoots: string[], candidate: string, mayCreate: boolean): boolean {
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(workspace, candidate);
-  if (!inside(workspace, absolute) || inside(runtimeRoot, absolute)) return false;
+  const authorizedRoot = [workspace, ...readOnlyRoots].find((root) => inside(root, absolute));
+  if (!authorizedRoot || (inside(runtimeRoot, absolute) && !readOnlyRoots.some((root) => inside(root, absolute)))) return false;
   try {
     const existing = existsSync(absolute) ? absolute : mayCreate ? dirname(absolute) : absolute;
     const physical = realpathSync(existing);
-    return inside(workspace, physical) && !inside(runtimeRoot, physical);
+    return inside(authorizedRoot, physical) && (!inside(runtimeRoot, physical) || readOnlyRoots.some((root) => inside(root, physical)));
   } catch {
     return false;
   }
@@ -204,6 +211,12 @@ function requiredLoopbackEndpoint(value: string | undefined): URL {
   if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || endpoint.pathname !== "/mcp") {
     throw new Error("Paperclip Pi extension requires an authenticated loopback bridge");
   }
+  return endpoint;
+}
+
+function requiredMcpEndpoint(value: string | undefined): URL {
+  const endpoint = new URL(requiredValue(value, "assigned MCP URL"));
+  if (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && ["127.0.0.1", "localhost"].includes(endpoint.hostname))) throw new Error("Paperclip assigned MCP requires HTTPS or loopback HTTP");
   return endpoint;
 }
 

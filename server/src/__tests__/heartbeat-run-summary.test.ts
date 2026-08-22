@@ -303,6 +303,18 @@ describe("mergeHeartbeatRunResultJson", () => {
     );
   });
 
+  it("posts only the final adapter summary when raw output contains intermediate narration", () => {
+    const merged = mergeHeartbeatRunResultJson(
+      { stdout: "Intermediate setup that must not be published" },
+      "## Final update\n\n- Remediation verified",
+    );
+
+    expect(buildHeartbeatRunIssueComment(merged)).toBe(
+      "## Final update\n\n- Remediation verified",
+    );
+    expect(buildHeartbeatRunIssueComment(merged)).not.toContain("Intermediate setup");
+  });
+
   it("creates a result payload when only a summary exists", () => {
     expect(mergeHeartbeatRunResultJson(null, "done")).toEqual({
       summary: "done",

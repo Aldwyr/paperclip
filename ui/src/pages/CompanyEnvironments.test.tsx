@@ -290,6 +290,21 @@ function getEnvironmentFormPage(): HTMLElement | null {
   return document.body.querySelector("[data-testid='environment-form-page']");
 }
 
+// Opens the edit page for the environment at `index`. The environment list
+// depends on an async query. Under a loaded test worker that query can resolve
+// after the first flush, so a direct click can miss the Edit control and never
+// open the form page. This helper first waits for the control, then clicks it,
+// then waits for the form page.
+async function openEnvironmentEditPage(container: HTMLElement, index = 0) {
+  await waitForAssertion(() => {
+    expect(editButtons(container)[index]).toBeTruthy();
+  });
+  await act(async () => click(editButtons(container)[index]));
+  await waitForAssertion(() => {
+    expect(getEnvironmentFormPage()).not.toBeNull();
+  });
+}
+
 function renderCompanyEnvironments(queryClient: QueryClient, initialPath = ENVIRONMENTS_PATH) {
   return (
     <QueryClientProvider client={queryClient}>
@@ -631,7 +646,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await flushReact();
 
     await act(async () => {
-      click(findAction(container, "Add environment"));
+      click(container.querySelector('[aria-label="Add environment"]'));
     });
 
     await waitForAssertion(() => {
@@ -844,7 +859,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await flushReact();
 
     // Daytona supports setup + capture -> "Configure image" on its edit page.
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Configure image");
     });
@@ -853,7 +868,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
 
     // E2B does not advertise interactive setup.
-    await act(async () => click(editButtons(container)[1]));
+    await openEnvironmentEditPage(container, 1);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Unsupported provider");
     });
@@ -862,7 +877,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
 
     // Provider advertises setup but cannot capture an image.
-    await act(async () => click(editButtons(container)[2]));
+    await openEnvironmentEditPage(container, 2);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Setup capture unavailable");
     });
@@ -916,7 +931,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain(command);
     });
@@ -956,7 +971,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain(command);
       expect(getEnvironmentFormPage()?.textContent).toContain("Browser terminal");
@@ -1037,7 +1052,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     let terminalScreen: HTMLElement | null = null;
     await waitForAssertion(() => {
       terminalScreen = getEnvironmentFormPage()?.querySelector<HTMLElement>(
@@ -1096,7 +1111,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Setup expired");
     });
@@ -1122,7 +1137,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Setup connection details could not be refreshed.");
     });
@@ -1159,7 +1174,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Browser terminal is not available for this provider connection.");
     });
@@ -1205,7 +1220,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage();
       expect(dialog?.textContent).toContain("Active template");
@@ -1267,7 +1282,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage()!;
       expect(dialog.textContent).toContain("Capturing template");
@@ -1308,11 +1323,70 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage()!;
       expect(dialog.textContent).toContain("Active template");
       expect(dialog.textContent).toContain("Not in use — the environment configuration changed");
+    });
+  });
+
+  it("names the changed boot-source field in the out-of-sync banner for a boot-source drift", async () => {
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockEnvironmentsApi.list.mockResolvedValue([
+      { id: "env-1", name: "Daytona", driver: "sandbox", description: null, config: { provider: "daytona" } },
+    ]);
+    mockEnvironmentsApi.capabilities.mockResolvedValue(supportedDaytonaCapabilities());
+    mockEnvironmentsApi.customImageTemplate.mockResolvedValue({
+      activeTemplate: createTemplate({ id: "template-active" }),
+      activeTemplateMatchesConfig: false,
+      activeTemplateDrift: {
+        classification: "boot_source_drift",
+        driftedPaths: [{ path: "snapshot", from: "a", to: "b" }],
+      },
+      activeSession: null,
+      latestSession: null,
+    });
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+
+    await openEnvironmentEditPage(container);
+    await waitForAssertion(() => {
+      const dialog = getEnvironmentFormPage()!;
+      expect(dialog.textContent).toContain("Not in use — Base image changed: snapshot `a` -> `b`");
+      expect(dialog.textContent).not.toContain("the environment configuration changed");
+    });
+  });
+
+  it("keeps the generic out-of-sync banner for an unclassified drift", async () => {
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockEnvironmentsApi.list.mockResolvedValue([
+      { id: "env-1", name: "Daytona", driver: "sandbox", description: null, config: { provider: "daytona" } },
+    ]);
+    mockEnvironmentsApi.capabilities.mockResolvedValue(supportedDaytonaCapabilities());
+    mockEnvironmentsApi.customImageTemplate.mockResolvedValue({
+      activeTemplate: createTemplate({ id: "template-active" }),
+      activeTemplateMatchesConfig: false,
+      activeTemplateDrift: { classification: "unclassified", driftedPaths: [{ path: "apiUrl" }] },
+      activeSession: null,
+      latestSession: null,
+    });
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+
+    await openEnvironmentEditPage(container);
+    await waitForAssertion(() => {
+      const dialog = getEnvironmentFormPage()!;
+      expect(dialog.textContent).toContain("Not in use — the environment configuration changed");
+      expect(dialog.textContent).not.toContain("Base image changed");
     });
   });
 
@@ -1335,7 +1409,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage()!;
       expect(dialog.textContent).toContain("Active template");
@@ -1378,7 +1452,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage();
       expect(dialog?.textContent).toContain("Active template");
@@ -1437,7 +1511,7 @@ describe("CompanyEnvironments — test provider button", () => {
     });
     await flushReact();
 
-    await act(async () => click(editButtons(container)[0]));
+    await openEnvironmentEditPage(container);
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage()!;
       expect(dialog.textContent).toContain("relink this image or capture a new one");
@@ -1473,7 +1547,7 @@ describe("CompanyEnvironments — test provider button", () => {
         root!.render(renderCompanyEnvironments(queryClient));
       });
       await flushReact();
-      await act(async () => click(editButtons(container)[0]));
+      await openEnvironmentEditPage(container);
       await waitForAssertion(() => {
         expect(findButton(getEnvironmentFormPage()!, "Relink")).toBeTruthy();
       });
@@ -1510,7 +1584,7 @@ describe("CompanyEnvironments — test provider button", () => {
         root!.render(renderCompanyEnvironments(queryClient));
       });
       await flushReact();
-      await act(async () => click(editButtons(container)[0]));
+      await openEnvironmentEditPage(container);
       await waitForAssertion(() => {
         expect(findButton(getEnvironmentFormPage()!, "Relink")).toBeTruthy();
       });
