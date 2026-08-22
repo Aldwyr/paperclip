@@ -133,17 +133,53 @@ Open **Google Auth Platform → Clients → Create Client**:
 6. Copy the client id and newly displayed secret directly into the matching
    deployment secret manager.
 
-Use these deployment bindings for the Paperclip ID connector module:
-
-```text
-GOOGLE_GMAIL_CLIENT_ID
-GOOGLE_GMAIL_CLIENT_SECRET
-GOOGLE_GMAIL_REDIRECT_URI
-GOOGLE_GMAIL_CONNECTOR_ENABLED
-```
-
 Never paste either credential into an issue, document, chat, screenshot,
-committed `.env`, build log, or browser-visible configuration.
+committed `.env`, build log, or browser-visible configuration. Step 7 lists the
+deployment variables that receive them.
+
+### 7. Configure the Paperclip ID broker deployment
+
+Set these on the Paperclip ID service that owns the redirect URI above. This is
+the broker half of the configuration; the originating Paperclip instance is
+configured separately under [Configure each originating Paperclip
+instance](#configure-each-originating-paperclip-instance).
+
+| Variable | Development | Staging | Production |
+| --- | --- | --- | --- |
+| `GOOGLE_GMAIL_CLIENT_ID` | Dev client id | Staging client id | Production client id |
+| `GOOGLE_GMAIL_CLIENT_SECRET` | Dev client secret | Staging client secret | Production client secret |
+| `GOOGLE_GMAIL_REDIRECT_URI` | `http://localhost:3000/api/connect/oauth/google/callback` | `https://id-staging.paperclip.app/api/connect/oauth/google/callback` | `https://id.paperclip.app/api/connect/oauth/google/callback` |
+| `GOOGLE_GMAIL_CONNECTOR_ENABLED` | `true` once dev testing starts | `true` after dev sign-off | `true` only after Google verification and Security review |
+| `CONNECTOR_ENVIRONMENT` | `development` | `staging` | `production` |
+
+The three credential variables must be set together. Setting some but not all
+of them fails validation at boot, and enabling the connector without all three
+fails as well.
+
+`GOOGLE_GMAIL_REDIRECT_URI` is also checked at boot: its path must equal
+`/api/connect/oauth/google/callback` exactly, or the service refuses to start.
+A redirect URI that points at a path this service does not serve is accepted by
+Google and then fails on Google's own error page at the moment a user consents,
+where no Paperclip log can see it.
+
+`GOOGLE_GMAIL_CONNECTOR_ENABLED` is the kill switch, and it is off unless it is
+set to `true`, `1`, `yes`, or `on` (case-insensitive). While it is off, every
+`/api/connect` route answers `503 CONNECTOR_DISABLED` without touching the
+database or Google.
+
+Set `CONNECTOR_ENVIRONMENT` explicitly in every environment. Every signed
+connector request declares its own environment, and the broker accepts the
+request only when that value matches both this deployment's environment and the
+environment recorded on the enrolled instance. That three-way match is what
+makes a leaked staging instance key inert against production, so it must equal
+the instance's `PAPERCLIP_ID_CONNECTOR_ENVIRONMENT`.
+
+Do not rely on the fallback. When `CONNECTOR_ENVIRONMENT` is unset, the broker
+derives the value from the `BASE_URL` host (`id` to production, `id-staging` to
+staging, anything else to development). A staging or production deployment on
+any other hostname therefore brokers as `development`, and every signed request
+from a correctly configured instance fails the environment check. The value is
+never derived from `NODE_ENV`, which is `production` on staging too.
 
 ## Connector request requirements
 
@@ -261,19 +297,23 @@ The first Gmail release is personal-only:
 ### Development
 
 1. Enable the connector only in development.
-2. Use an isolated Gmail test mailbox.
-3. Connect from localhost and one explicitly enrolled Tailscale HTTPS origin.
-4. From the board Test panel, run `list_labels` and a bounded
+2. Confirm the broker's `CONNECTOR_ENVIRONMENT` and the instance's
+   `PAPERCLIP_ID_CONNECTOR_ENVIRONMENT` both read `development`. A mismatch
+   fails every signed request with an environment error before Google is ever
+   contacted, which looks nothing like a Google misconfiguration.
+3. Use an isolated Gmail test mailbox.
+4. Connect from localhost and one explicitly enrolled Tailscale HTTPS origin.
+5. From the board Test panel, run `list_labels` and a bounded
    `search_threads` query.
-5. Install the reviewed profile on one test agent and repeat one read-only call
+6. Install the reviewed profile on one test agent and repeat one read-only call
    in a fresh agent run.
-6. Create a draft through an Ask-first approval and verify no send action is
+7. Create a draft through an Ask-first approval and verify no send action is
    exposed.
-7. Force access-token expiry and verify refresh changes only the originating
+8. Force access-token expiry and verify refresh changes only the originating
    instance's encrypted secret version.
-8. Revoke the grant and verify the next call fails closed.
-9. Confirm sanitized logs, activity, API payloads, agent context, and browser
-   history contain no credential or authorization code.
+9. Revoke the grant and verify the next call fails closed.
+10. Confirm sanitized logs, activity, API payloads, agent context, and browser
+    history contain no credential or authorization code.
 
 ### Staging
 
@@ -304,6 +344,8 @@ seven-day testing-token expiry.
 | Refresh fails after seven days | The external app is still in Testing. Reauthorize the test user; do not treat this as token-rotation failure. |
 | One required capability is missing | Inspect the returned granted scope set. Keep the grant inactive if either exact required scope is absent. |
 | Local or Tailscale return is rejected | Enroll the exact origin on Paperclip ID. Only loopback HTTP is allowed; Tailscale must use HTTPS. |
+| Every signed request fails on environment | The broker's `CONNECTOR_ENVIRONMENT`, the enrolled instance record, and the instance's `PAPERCLIP_ID_CONNECTOR_ENVIRONMENT` must all agree. An unset broker value is derived from the `BASE_URL` host and silently becomes `development`. |
+| Every `/api/connect` route returns 503 | `GOOGLE_GMAIL_CONNECTOR_ENABLED` is not one of `true`, `1`, `yes`, or `on`. The response is `CONNECTOR_DISABLED`; no database or Google call is attempted. |
 | Login starts asking for Gmail | Stop the rollout. The login and Gmail clients or route namespaces have been mixed. |
 | Connector is unavailable | Keep the grant in `needs_reauthorization` or an actionable unavailable state. Never use a login token or another environment's client. |
 
