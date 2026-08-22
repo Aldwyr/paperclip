@@ -10,14 +10,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use aws_config::sts::AssumeRoleProvider;
+use aws_sdk_bedrockagentcore::error::SdkError;
 use aws_sdk_bedrockagentcore::types::{
-    HarnessBedrockApiFormat, HarnessBedrockModelConfig, HarnessContentBlock,
-    HarnessContentBlockDelta, HarnessContentBlockStart, HarnessConversationRole,
-    HarnessInlineFunctionConfig, HarnessMessage, HarnessModelConfiguration, HarnessTool,
+    HarnessContentBlock, HarnessContentBlockDelta, HarnessContentBlockStart,
+    HarnessConversationRole, HarnessInlineFunctionConfig, HarnessMessage, HarnessTool,
     HarnessToolConfiguration, HarnessToolResultBlock, HarnessToolResultContentBlock,
     HarnessToolType, HarnessToolUseBlock, HarnessToolUseStatus, HarnessToolUseType,
     InvokeHarnessStreamOutput,
 };
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::{Document, Number};
 use aws_types::region::Region;
 use jsonschema::validator_for;
@@ -32,6 +33,13 @@ use crate::local_runner::LocalRunnerError;
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 const MAX_AGENTCORE_TOOLS: usize = 64;
+// Harness invocations can spend substantial time starting a new runtime before
+// response headers (and therefore the event stream) are available. Allow a
+// bounded cold start, but leave enough of the eval's outer deadline for the
+// durable runner to classify the failure and service runner.shutdown cleanly.
+const AGENTCORE_INVOCATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const AGENTCORE_INLINE_TOOL_ALLOWLIST: &str = "@*/pc_*";
 #[derive(Clone, Debug)]
 struct RemoteToolUse {
     remote_name: String,
@@ -132,7 +140,7 @@ impl NetworkWorker {
             })
             .map_err(|_| LocalRunnerError::invalid("AgentCore network worker stopped"))?;
         reply_rx
-            .recv_timeout(Duration::from_secs(45))
+            .recv_timeout(AGENTCORE_INVOCATION_DELIVERY_TIMEOUT)
             .map_err(|_| {
                 LocalRunnerError::invalid(
                     "AgentCore invocation delivery is ambiguous and requires Memory reconciliation",
@@ -242,17 +250,11 @@ fn network_loop(
                 let actor_id = actor_id.clone();
                 let events = events.clone();
                 runtime.spawn(async move {
-                    let model = HarnessBedrockModelConfig::builder()
-                        .model_id(config.model.clone())
-                        .max_tokens(config.max_output_tokens as i32)
-                        .api_format(HarnessBedrockApiFormat::ConverseStream)
-                        .build();
-                    let Ok(model) = model else {
-                        let _ = events.send(NetworkEvent::Failure(
-                            "invalid AgentCore model configuration".to_owned(),
-                        ));
-                        return;
-                    };
+                    // The qualified Harness version is the immutable model
+                    // authority. Supplying a redundant invocation override
+                    // changes AgentCore's authorization path and can require
+                    // caller-side Marketplace permissions, bypassing the
+                    // execution role qualified during provisioning.
                     let response = client
                         .invoke_harness()
                         .harness_arn(config.harness_arn.clone())
@@ -261,8 +263,11 @@ fn network_loop(
                         .runtime_user_id(actor_id.clone())
                         .actor_id(actor_id.clone())
                         .set_messages(Some(messages))
-                        .model(HarnessModelConfiguration::BedrockModelConfig(model))
                         .set_tools(Some(tools))
+                        // Invocation-scoped inline functions live behind an
+                        // AgentCore server namespace. Unqualified names are
+                        // silently withheld, so admit each authorized tool as
+                        // `@*/<collision-resistant pc_ name>` and nothing else.
                         .set_allowed_tools(Some(allowed_tools))
                         .set_skills(Some(Vec::new()))
                         .max_iterations(config.max_iterations as i32)
@@ -278,7 +283,7 @@ fn network_loop(
                     let mut response = match response {
                         Ok(value) => value,
                         Err(error) => {
-                            let detail = redact_aws_error(&error.to_string());
+                            let detail = classify_aws_sdk_error(&error);
                             let _ = reply.send(Err(detail.clone()));
                             let _ = events.send(NetworkEvent::Failure(detail));
                             return;
@@ -293,9 +298,8 @@ fn network_loop(
                             }
                             Ok(None) => break,
                             Err(error) => {
-                                let _ = events.send(NetworkEvent::Failure(redact_aws_error(
-                                    &error.to_string(),
-                                )));
+                                let _ = events
+                                    .send(NetworkEvent::Failure(classify_aws_sdk_error(&error)));
                                 break;
                             }
                         }
@@ -312,7 +316,10 @@ fn network_loop(
                     match client
                         .stop_runtime_session()
                         .runtime_session_id(session_id.clone())
-                        .agent_runtime_arn(config.agent_runtime_arn.clone())
+                        // Harness-owned Runtime sessions must be addressed by
+                        // the Harness ARN and named Harness endpoint. AWS
+                        // rejects direct use of the generated Runtime ARN.
+                        .agent_runtime_arn(config.harness_arn.clone())
                         .qualifier(config.endpoint_qualifier.clone())
                         .client_token(token)
                         .send()
@@ -375,7 +382,12 @@ fn normalize_stream_event(
             if let Some((call_id, remote_name, input)) =
                 tool_blocks.remove(&value.content_block_index())
             {
-                match serde_json::from_str::<Value>(&input) {
+                let parsed = if input.trim().is_empty() {
+                    Ok(json!({}))
+                } else {
+                    serde_json::from_str::<Value>(&input)
+                };
+                match parsed {
                     Ok(input) => {
                         let _ = events.send(NetworkEvent::ToolUse {
                             call_id,
@@ -913,9 +925,12 @@ impl Provider for AwsAgentCoreHarnessProvider {
                 })?;
             let tool_result = HarnessToolResultBlock::builder()
                 .tool_use_id(call_id.clone())
-                .content(HarnessToolResultContentBlock::Json(json_to_document(
-                    &delivered.result,
-                )?))
+                // Although the AgentCore data-plane model advertises JSON
+                // result blocks, the managed Harness runtime currently
+                // rejects them with `content_type=<json_> | unsupported type`.
+                // Preserve the complete structured result as compact JSON in
+                // the supported text variant.
+                .content(encode_tool_result_content(&delivered.result)?)
                 .status(if delivered.is_error {
                     HarnessToolUseStatus::Error
                 } else {
@@ -1057,7 +1072,7 @@ fn encode_tools(
             .config(HarnessToolConfiguration::InlineFunction(inline))
             .build()
             .map_err(|_| LocalRunnerError::invalid("failed to build AgentCore tool"))?;
-        allowed.push(remote_name);
+        allowed.push(format!("@*/{remote_name}"));
         encoded.push(harness_tool);
     }
     Ok((encoded, allowed, reverse, schemas))
@@ -1144,6 +1159,58 @@ fn redact_aws_error(value: &str) -> String {
     }
 }
 
+fn classify_aws_error_code(code: &str) -> String {
+    match code {
+        "AccessDeniedException" | "UnauthorizedException" => {
+            "AWS AgentCore access denied".to_owned()
+        }
+        "ResourceNotFoundException" => "AWS AgentCore resource not found".to_owned(),
+        "ThrottlingException" | "TooManyRequestsException" => {
+            "AWS AgentCore request throttled".to_owned()
+        }
+        "ConflictException" => "AWS AgentCore resource conflict".to_owned(),
+        "RequestTimeoutException" | "TimeoutException" => {
+            "AWS AgentCore request timed out".to_owned()
+        }
+        "ValidationException" => "AWS AgentCore request validation failed".to_owned(),
+        "ServiceUnavailableException" | "InternalServerException" => {
+            "AWS AgentCore service unavailable".to_owned()
+        }
+        _ => "AWS AgentCore request failed".to_owned(),
+    }
+}
+
+fn classify_aws_sdk_error<E, R>(error: &SdkError<E, R>) -> String
+where
+    E: ProvideErrorMetadata,
+{
+    if let Some(code) = error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+    {
+        return classify_aws_error_code(code);
+    }
+    match error {
+        SdkError::ConstructionFailure(_) => "AWS AgentCore request construction failed".to_owned(),
+        SdkError::TimeoutError(_) => "AWS AgentCore request timed out".to_owned(),
+        SdkError::DispatchFailure(context) if context.is_timeout() => {
+            "AWS AgentCore request dispatch timed out".to_owned()
+        }
+        SdkError::DispatchFailure(context) if context.is_io() => {
+            "AWS AgentCore request network I/O failed".to_owned()
+        }
+        SdkError::DispatchFailure(context) if context.is_user() => {
+            "AWS AgentCore request was rejected before dispatch".to_owned()
+        }
+        SdkError::DispatchFailure(_) => {
+            "AWS AgentCore credential or transport setup failed".to_owned()
+        }
+        SdkError::ResponseError(_) => "AWS AgentCore response decoding failed".to_owned(),
+        SdkError::ServiceError(_) => redact_aws_error(&error.to_string()),
+        _ => "AWS AgentCore request failed".to_owned(),
+    }
+}
+
 fn is_resource_not_found(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("resourcenotfound")
@@ -1184,6 +1251,14 @@ fn json_to_document(value: &Value) -> Result<Document, LocalRunnerError> {
     })
 }
 
+fn encode_tool_result_content(
+    value: &Value,
+) -> Result<HarnessToolResultContentBlock, LocalRunnerError> {
+    serde_json::to_string(value)
+        .map(HarnessToolResultContentBlock::Text)
+        .map_err(|_| LocalRunnerError::invalid("failed to serialize AgentCore tool result"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1287,22 @@ mod tests {
     }
 
     #[test]
+    fn tool_allowlist_is_confined_to_the_paperclip_inline_namespace() {
+        let tool = AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the assigned task context".to_owned(),
+            input_schema: json!({"type":"object"}),
+            response_schema: json!({"type":"object"}),
+        };
+        let (_, allowed, remote, _) = encode_tools(&[tool]).unwrap();
+        assert_eq!(AGENTCORE_INLINE_TOOL_ALLOWLIST, "@*/pc_*");
+        assert!(remote.keys().all(|name| name.starts_with("pc_")));
+        assert_eq!(allowed.len(), 1);
+        assert!(allowed[0].starts_with("@*/pc_"));
+    }
+
+    #[test]
     fn rejects_more_than_sixty_four_tools() {
         let tool = AuthorizedTool {
             operation_id: "op".to_owned(),
@@ -1233,6 +1324,14 @@ mod tests {
         assert_eq!(
             redact_aws_error("AccessDeniedException: signed request"),
             "AWS AgentCore access denied"
+        );
+        assert_eq!(
+            classify_aws_error_code("ValidationException"),
+            "AWS AgentCore request validation failed"
+        );
+        assert_eq!(
+            classify_aws_error_code("UnrecognizedFutureError"),
+            "AWS AgentCore request failed"
         );
     }
 
@@ -1344,5 +1443,76 @@ mod tests {
             }
             other => panic!("unexpected normalized event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn eventstream_empty_tool_input_is_normalized_to_an_empty_object() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut blocks = BTreeMap::new();
+        let start = HarnessToolUseBlockStart::builder()
+            .tool_use_id("tool-use-empty")
+            .name("pc_get_task_context_abc123")
+            .r#type(HarnessToolUseType::ToolUse)
+            .build()
+            .unwrap();
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockStart(
+                HarnessContentBlockStartEvent::builder()
+                    .content_block_index(1)
+                    .start(HarnessContentBlockStart::ToolUse(start))
+                    .build()
+                    .unwrap(),
+            ),
+            &mut blocks,
+            &sender,
+        );
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockDelta(
+                HarnessContentBlockDeltaEvent::builder()
+                    .content_block_index(1)
+                    .delta(HarnessContentBlockDelta::ToolUse(
+                        HarnessToolUseBlockDelta::builder()
+                            .input("")
+                            .build()
+                            .unwrap(),
+                    ))
+                    .build()
+                    .unwrap(),
+            ),
+            &mut blocks,
+            &sender,
+        );
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockStop(
+                HarnessContentBlockStopEvent::builder()
+                    .content_block_index(1)
+                    .build()
+                    .unwrap(),
+            ),
+            &mut blocks,
+            &sender,
+        );
+        match receiver.try_recv().unwrap() {
+            NetworkEvent::ToolUse {
+                call_id,
+                remote_name,
+                input,
+            } => {
+                assert_eq!(call_id, "tool-use-empty");
+                assert_eq!(remote_name, "pc_get_task_context_abc123");
+                assert_eq!(input, json!({}));
+            }
+            other => panic!("unexpected normalized event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_results_use_the_harness_supported_text_content_variant() {
+        let value = json!({"ok": true, "nested": {"value": 7}});
+        let content = encode_tool_result_content(&value).unwrap();
+        let text = content
+            .as_text()
+            .expect("AgentCore managed Harness requires text tool results");
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), value);
     }
 }

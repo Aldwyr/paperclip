@@ -55,6 +55,7 @@ import {
   type CodexAppServerTransport,
   type CodexRpcNotification,
   type CodexRpcServerRequest,
+  type CodexTraceInterpretation,
   type CodexTransportProcessInfo,
 } from "./app-server-transport.js";
 
@@ -80,7 +81,8 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    for (const waiter of this.#waiters.splice(0)) waiter({ value: undefined, done: true });
+    for (const waiter of this.#waiters.splice(0))
+      waiter({ value: undefined, done: true });
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
@@ -99,6 +101,12 @@ export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
   conversationMode?: "task" | "direct";
   requestedCollaborationMode?: "default" | "plan";
+  /**
+   * Include Codex's built-in collaboration instructions. Defaults to true so
+   * interactive runs receive native commentary/preambles. Deterministic evals
+   * may opt out explicitly without changing the production default.
+   */
+  includeCollaborationModeInstructions?: boolean;
   transportFactory?: () => CodexAppServerTransport;
   /** Additional control-plane tools exposed to the provider for this run. */
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
@@ -167,14 +175,20 @@ function text(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
-function boundedText(value: unknown, fallback = "unknown", maxCharacters = 1024): string {
+function boundedText(
+  value: unknown,
+  fallback = "unknown",
+  maxCharacters = 1024,
+): string {
   const candidate = text(value, fallback);
   return candidate.length <= maxCharacters
     ? candidate
     : `${candidate.slice(0, maxCharacters)}...[truncated]`;
 }
 
-function itemFromParams(params: Record<string, unknown>): Record<string, unknown> {
+function itemFromParams(
+  params: Record<string, unknown>,
+): Record<string, unknown> {
   return record(params.item);
 }
 
@@ -189,7 +203,9 @@ function userInput(message: NativeUserMessage): Record<string, unknown> {
   return { type: "text", text: message.text, text_elements: [] };
 }
 
-function terminalState(status: string): "completed" | "failed" | "interrupted" | "cancelled" {
+function terminalState(
+  status: string,
+): "completed" | "failed" | "interrupted" | "cancelled" {
   if (status === "failed") return "failed";
   if (status === "interrupted") return "interrupted";
   if (status === "cancelled") return "cancelled";
@@ -212,7 +228,10 @@ function tryParseResult(value: unknown): PrpStructuredRunResult | null {
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const object = record(value);
-  if (Object.keys(object).length > 0 || (typeof value === "object" && value !== null)) {
+  if (
+    Object.keys(object).length > 0 ||
+    (typeof value === "object" && value !== null)
+  ) {
     return `{${Object.keys(object)
       .sort()
       .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
@@ -232,29 +251,34 @@ function finishToolSpec(): Record<string, unknown> {
 function blockToolSpec(): Record<string, unknown> {
   return {
     name: CODEX_BLOCK_TOOL_NAME,
-    description: "Return the one semantic result when the task cannot continue.",
+    description:
+      "Return the one semantic result when the task cannot continue.",
     inputSchema: CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
   };
 }
 
-export function codexSemanticToolSpecs(): readonly Readonly<Record<string, unknown>>[] {
+export function codexSemanticToolSpecs(): readonly Readonly<
+  Record<string, unknown>
+>[] {
   return [finishToolSpec(), blockToolSpec()];
 }
 
 function dynamicToolResponse(value: unknown): Record<string, unknown> {
   return {
     success: true,
-    contentItems: [{
-      type: "inputText",
-      text: typeof value === "string" ? value : JSON.stringify(value),
-    }],
+    contentItems: [
+      {
+        type: "inputText",
+        text: typeof value === "string" ? value : JSON.stringify(value),
+      },
+    ],
   };
 }
 
 const SKILLLESS_BASE_CONFIG = {
   "skills.include_instructions": false,
   include_apps_instructions: false,
-  include_collaboration_mode_instructions: false,
+  include_collaboration_mode_instructions: true,
   "features.apps": false,
   "features.plugins": false,
   "features.multi_agent": false,
@@ -262,9 +286,18 @@ const SKILLLESS_BASE_CONFIG = {
   "features.image_generation": false,
 } as const;
 
-function commandEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+function commandEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   const environment: Record<string, string> = {};
-  for (const key of ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "LANG", "LC_ALL"] as const) {
+  for (const key of [
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "WINDIR",
+    "LANG",
+    "LC_ALL",
+  ] as const) {
     const value = source[key];
     if (value !== undefined) environment[key] = value;
   }
@@ -274,14 +307,23 @@ function commandEnvironment(source: NodeJS.ProcessEnv = process.env): Record<str
 export function createSkilllessCodexThreadConfig(
   _workingDirectory: string,
   _source: NodeJS.ProcessEnv = process.env,
+  includeCollaborationModeInstructions = true,
 ): Record<string, unknown> {
-  return { ...SKILLLESS_BASE_CONFIG };
-}
-
-function collaborationThreadConfig(mode: "default" | "plan") {
   return {
     ...SKILLLESS_BASE_CONFIG,
-    include_collaboration_mode_instructions: mode === "plan",
+    include_collaboration_mode_instructions:
+      includeCollaborationModeInstructions,
+  };
+}
+
+function collaborationThreadConfig(
+  _mode: "default" | "plan",
+  includeCollaborationModeInstructions = true,
+) {
+  return {
+    ...SKILLLESS_BASE_CONFIG,
+    include_collaboration_mode_instructions:
+      includeCollaborationModeInstructions,
   };
 }
 
@@ -292,9 +334,16 @@ function tomlString(value: string): string {
 export function createIsolatedCodexAppServerArgs(
   source: NodeJS.ProcessEnv = process.env,
 ): string[] {
-  const deniedHostRoots = [...new Set([source.HOME, source.CODEX_HOME]
-    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-    .map((value) => resolve(value)))];
+  const deniedHostRoots = [
+    ...new Set(
+      [source.HOME, source.CODEX_HOME]
+        .filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+        .map((value) => resolve(value)),
+    ),
+  ];
   const filesystemRules = [
     `\":root\"=\"none\"`,
     `\":minimal\"=\"read\"`,
@@ -340,11 +389,18 @@ function securedThreadParams(
   workingDirectory: string,
   source: NodeJS.ProcessEnv = process.env,
   mode: "default" | "plan" = "default",
+  includeCollaborationModeInstructions = true,
 ): Record<string, unknown> {
-  const permissionProfile = mode === "plan" ? PLANNING_PERMISSION_PROFILE : SKILLLESS_PERMISSION_PROFILE;
+  const permissionProfile =
+    mode === "plan"
+      ? PLANNING_PERMISSION_PROFILE
+      : SKILLLESS_PERMISSION_PROFILE;
   return {
     cwd: workingDirectory,
-    config: collaborationThreadConfig(mode),
+    config: collaborationThreadConfig(
+      mode,
+      includeCollaborationModeInstructions,
+    ),
     permissions: permissionProfile,
     runtimeWorkspaceRoots: [workingDirectory],
   };
@@ -421,20 +477,34 @@ export class CodexAppServerDriver implements HarnessDriver {
   }
 
   async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
-    const workingDirectory = validateWorkingDirectory(input.workingDirectory, this.#options.environment);
+    const workingDirectory = validateWorkingDirectory(
+      input.workingDirectory,
+      this.#options.environment,
+    );
     const transport = this.#transport();
     try {
       await this.#persistProcessOwnership(transport);
       const initialize = await this.#initialize(transport);
-      const requestedMode = this.#options.requestedCollaborationMode ?? "default";
+      const requestedMode =
+        this.#options.requestedCollaborationMode ?? "default";
       const response = await transport.request("thread/start", {
-        ...securedThreadParams(workingDirectory, this.#options.environment, requestedMode),
+        ...securedThreadParams(
+          workingDirectory,
+          this.#options.environment,
+          requestedMode,
+          this.#options.includeCollaborationModeInstructions ?? true,
+        ),
         approvalPolicy: "never",
-        ...(this.#direct() ? {} : { baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS }),
+        ...(this.#direct()
+          ? {}
+          : { baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS }),
         dynamicTools: this.#direct()
           ? []
           : this.#caps.dynamicTools
-            ? [...(this.#options.dynamicTools ?? []), ...codexSemanticToolSpecs()]
+            ? [
+                ...(this.#options.dynamicTools ?? []),
+                ...codexSemanticToolSpecs(),
+              ]
             : [],
         experimentalRawEvents: false,
         persistExtendedHistory: false,
@@ -444,9 +514,15 @@ export class CodexAppServerDriver implements HarnessDriver {
         response,
         requestedMode,
       );
-      const opened = this.#openedThread(response, initialize, workingDirectory, collaborationMode);
+      const opened = this.#openedThread(
+        response,
+        initialize,
+        workingDirectory,
+        collaborationMode,
+      );
       const goal = await this.#discoverGoal(transport, opened.threadId);
-      if (opened.context.liveConsole) opened.context.liveConsole.goals = this.#caps.goals;
+      if (opened.context.liveConsole)
+        opened.context.liveConsole.goals = this.#caps.goals;
       return this.#session({
         transport,
         runId: input.runId,
@@ -469,10 +545,20 @@ export class CodexAppServerDriver implements HarnessDriver {
       return { recovered: false, reason: "resume capability is unavailable" };
     }
     if (!this.#caps.read) {
-      return { recovered: false, reason: "read capability is required for safe resume" };
+      return {
+        recovered: false,
+        reason: "read capability is required for safe resume",
+      };
     }
-    if (!snapshot.runId || !snapshot.normalizedSessionId || !snapshot.driverSessionId) {
-      return { recovered: false, reason: "persisted session identity is incomplete" };
+    if (
+      !snapshot.runId ||
+      !snapshot.normalizedSessionId ||
+      !snapshot.driverSessionId
+    ) {
+      return {
+        recovered: false,
+        reason: "persisted session identity is incomplete",
+      };
     }
     const transport = this.#transport();
     try {
@@ -485,7 +571,10 @@ export class CodexAppServerDriver implements HarnessDriver {
       const existingThread = record(existing.thread);
       if (text(existingThread.id) !== snapshot.driverSessionId) {
         await transport.close();
-        return { recovered: false, reason: "provider read a different session" };
+        return {
+          recovered: false,
+          reason: "provider read a different session",
+        };
       }
       const workingDirectory = validateWorkingDirectory(
         text(existingThread.cwd),
@@ -497,8 +586,11 @@ export class CodexAppServerDriver implements HarnessDriver {
           workingDirectory,
           this.#options.environment,
           this.#options.requestedCollaborationMode ?? "default",
+          this.#options.includeCollaborationModeInstructions ?? true,
         ),
-        baseInstructions: this.#direct() ? "" : CODEX_SKILLLESS_BASE_INSTRUCTIONS,
+        baseInstructions: this.#direct()
+          ? ""
+          : CODEX_SKILLLESS_BASE_INSTRUCTIONS,
         persistExtendedHistory: false,
       });
       const collaborationMode = await this.#negotiateCollaborationMode(
@@ -506,20 +598,32 @@ export class CodexAppServerDriver implements HarnessDriver {
         response,
         this.#options.requestedCollaborationMode ?? "default",
       );
-      const opened = this.#openedThread(response, initialize, workingDirectory, collaborationMode);
+      const opened = this.#openedThread(
+        response,
+        initialize,
+        workingDirectory,
+        collaborationMode,
+      );
       if (opened.threadId !== snapshot.driverSessionId) {
         await transport.close();
-        return { recovered: false, reason: "provider resumed a different session" };
+        return {
+          recovered: false,
+          reason: "provider resumed a different session",
+        };
       }
       if (
         snapshot.providerSessionId &&
         opened.providerSessionId !== snapshot.providerSessionId
       ) {
         await transport.close();
-        return { recovered: false, reason: "provider resumed a different provider session" };
+        return {
+          recovered: false,
+          reason: "provider resumed a different provider session",
+        };
       }
       const goal = await this.#discoverGoal(transport, opened.threadId);
-      if (opened.context.liveConsole) opened.context.liveConsole.goals = this.#caps.goals;
+      if (opened.context.liveConsole)
+        opened.context.liveConsole.goals = this.#caps.goals;
       return {
         recovered: true,
         session: this.#session({
@@ -564,14 +668,17 @@ export class CodexAppServerDriver implements HarnessDriver {
     try {
       const response = await transport.request("collaborationMode/list", {});
       const preset = Array.isArray(response.data)
-        ? response.data.map(record).find((candidate) => text(candidate.mode) === "plan")
+        ? response.data
+            .map(record)
+            .find((candidate) => text(candidate.mode) === "plan")
         : undefined;
       if (!preset) throw new Error("plan preset is absent");
       const model = text(
         preset.model,
         text(threadResponse.model, text(record(threadResponse.thread).model)),
       );
-      if (model.length === 0) throw new Error("plan preset did not resolve a model");
+      if (model.length === 0)
+        throw new Error("plan preset did not resolve a model");
       return {
         mode: "plan",
         settings: {
@@ -589,9 +696,12 @@ export class CodexAppServerDriver implements HarnessDriver {
     }
   }
 
-  async #persistProcessOwnership(transport: CodexAppServerTransport): Promise<void> {
+  async #persistProcessOwnership(
+    transport: CodexAppServerTransport,
+  ): Promise<void> {
     if (!this.#options.onSpawn) return;
-    const processInfo: CodexTransportProcessInfo | undefined = transport.processInfo?.();
+    const processInfo: CodexTransportProcessInfo | undefined =
+      transport.processInfo?.();
     if (!processInfo || processInfo.exited || processInfo.pid === null) return;
     await this.#options.onSpawn({
       pid: processInfo.pid,
@@ -600,9 +710,15 @@ export class CodexAppServerDriver implements HarnessDriver {
     });
   }
 
-  async #initialize(transport: CodexAppServerTransport): Promise<Record<string, unknown>> {
+  async #initialize(
+    transport: CodexAppServerTransport,
+  ): Promise<Record<string, unknown>> {
     const initialized = await transport.request("initialize", {
-      clientInfo: { name: "paperclip-runner", title: "Paperclip Runner", version: DRIVER_VERSION },
+      clientInfo: {
+        name: "paperclip-runner",
+        title: "Paperclip Runner",
+        version: DRIVER_VERSION,
+      },
       capabilities: { experimentalApi: true, requestAttestation: false },
     });
     transport.notify("initialized");
@@ -645,18 +761,22 @@ export class CodexAppServerDriver implements HarnessDriver {
   ): OpenedCodexThread {
     const thread = record(response.thread);
     const threadId = text(thread.id);
-    if (threadId.length === 0) throw new Error("Codex thread response omitted thread.id");
+    if (threadId.length === 0)
+      throw new Error("Codex thread response omitted thread.id");
     const activePermissionProfile = record(thread.activePermissionProfile);
     const permissionProfileId = text(activePermissionProfile.id);
     const requestedMode = this.#options.requestedCollaborationMode ?? "default";
-    const requiredPermissionProfile = requestedMode === "plan"
-      ? PLANNING_PERMISSION_PROFILE
-      : SKILLLESS_PERMISSION_PROFILE;
+    const requiredPermissionProfile =
+      requestedMode === "plan"
+        ? PLANNING_PERMISSION_PROFILE
+        : SKILLLESS_PERMISSION_PROFILE;
     if (
       permissionProfileId.length > 0 &&
       permissionProfileId !== requiredPermissionProfile
     ) {
-      throw new Error("Codex thread did not activate the required filesystem permission profile");
+      throw new Error(
+        "Codex thread did not activate the required filesystem permission profile",
+      );
     }
     const configuredPermissionProfile = {
       ...activePermissionProfile,
@@ -664,7 +784,9 @@ export class CodexAppServerDriver implements HarnessDriver {
     };
     const returnedWorkingDirectory = text(response.cwd, workingDirectory);
     if (resolve(returnedWorkingDirectory) !== workingDirectory) {
-      throw new Error("Codex thread response changed the assigned working directory");
+      throw new Error(
+        "Codex thread response changed the assigned working directory",
+      );
     }
     return {
       threadId,
@@ -679,7 +801,10 @@ export class CodexAppServerDriver implements HarnessDriver {
           version: DRIVER_VERSION,
         },
         model: boundedText(response.model),
-        modelProvider: boundedText(response.modelProvider, boundedText(thread.modelProvider)),
+        modelProvider: boundedText(
+          response.modelProvider,
+          boundedText(thread.modelProvider),
+        ),
         workingDirectory,
         collaborationMode: collaborationMode === null ? "default" : "plan",
         sandbox: {
@@ -701,7 +826,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         instructionPolicy: {
           skillInstructions: false,
           appInstructions: false,
-          collaborationInstructions: requestedMode === "plan",
+          collaborationInstructions:
+            this.#options.includeCollaborationModeInstructions ?? true,
         },
         environmentKeys: Object.keys(
           commandEnvironment(this.#options.environment),
@@ -709,7 +835,12 @@ export class CodexAppServerDriver implements HarnessDriver {
         dynamicToolNames: this.#direct()
           ? []
           : this.#caps.dynamicTools
-            ? [...(this.#options.dynamicTools ?? []).map((tool) => text(tool.name)), ...CODEX_SEMANTIC_TOOL_NAMES]
+            ? [
+                ...(this.#options.dynamicTools ?? []).map((tool) =>
+                  text(tool.name),
+                ),
+                ...CODEX_SEMANTIC_TOOL_NAMES,
+              ]
             : [],
         modelInputKinds: ["text"],
         liveConsole: {
@@ -780,7 +911,10 @@ class CodexHarnessSession implements HarnessSession {
   readonly #terminalTurns = new Map<string, string>();
   readonly #workspaceChangesByTurn = new Map<string, Record<string, unknown>>();
   readonly #emittedFileReferences = new Set<string>();
-  readonly #itemChannels = new Map<string, "progress" | "final" | "summary" | "detail" | "unknown">();
+  readonly #itemChannels = new Map<
+    string,
+    "progress" | "final" | "summary" | "detail" | "unknown"
+  >();
   readonly #pendingRuntimeRequests = new Map<string, PendingRuntimeRequest>();
   readonly #lineage = new Map<string, HarnessThreadLineageEntry>();
   #goal: HarnessThreadGoal | null = null;
@@ -829,12 +963,22 @@ class CodexHarnessSession implements HarnessSession {
       this.#lineage.set(entry.threadId, structuredClone(entry));
     }
     if (!this.#lineage.has(input.opened.lineage.threadId)) {
-      this.#lineage.set(input.opened.lineage.threadId, structuredClone(input.opened.lineage));
+      this.#lineage.set(
+        input.opened.lineage.threadId,
+        structuredClone(input.opened.lineage),
+      );
     }
     if (input.semanticResult) {
-      const validation = validatePrpStructuredRunResult(input.semanticResult.result);
-      if (!validation.ok || canonicalJson(validation.result) !== input.semanticResult.fingerprint) {
-        throw new HarnessReconciliationError("persisted semantic result fingerprint is invalid");
+      const validation = validatePrpStructuredRunResult(
+        input.semanticResult.result,
+      );
+      if (
+        !validation.ok ||
+        canonicalJson(validation.result) !== input.semanticResult.fingerprint
+      ) {
+        throw new HarnessReconciliationError(
+          "persisted semantic result fingerprint is invalid",
+        );
       }
       this.#result = structuredClone(validation.result);
       this.#resultFingerprint = input.semanticResult.fingerprint;
@@ -842,13 +986,22 @@ class CodexHarnessSession implements HarnessSession {
       this.#resultTurnId = input.semanticResult.turnId;
     }
     for (const terminal of input.terminalTurns ?? []) {
-      if (!terminal.turnId || !terminal.fingerprint || this.#terminalTurns.has(terminal.turnId)) {
-        throw new HarnessReconciliationError("persisted terminal turn fingerprints are invalid");
+      if (
+        !terminal.turnId ||
+        !terminal.fingerprint ||
+        this.#terminalTurns.has(terminal.turnId)
+      ) {
+        throw new HarnessReconciliationError(
+          "persisted terminal turn fingerprints are invalid",
+        );
       }
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
     }
-    this.#terminal = this.#conversationMode === "task" && this.#terminalTurns.size > 0;
-    this.#transport.setServerRequestHandler((request) => this.#handleServerRequest(request));
+    this.#terminal =
+      this.#conversationMode === "task" && this.#terminalTurns.size > 0;
+    this.#transport.setServerRequestHandler((request) =>
+      this.#handleServerRequest(request),
+    );
     this.#emit(input.resumed ? "session.resumed" : "session.started", {
       driverSessionId: input.opened.threadId,
       providerSessionId: input.opened.providerSessionId,
@@ -861,20 +1014,28 @@ class CodexHarnessSession implements HarnessSession {
         { turnId: stale.turnId, itemId: stale.itemId },
       );
     }
-    this.#emit("item.completed", {
-      kind: "thread_lineage",
-      text: `Root thread ${input.opened.threadId}`,
-      lineage: input.opened.lineage,
-    }, { itemId: `thread:${input.opened.threadId}` });
-    this.#emit("item.completed", {
-      kind: "model",
-      text: `${input.opened.context.model} (${input.opened.context.modelProvider})`,
-      model: {
-        name: input.opened.context.model,
-        provider: input.opened.context.modelProvider,
-        codexVersion: input.opened.context.codexVersion,
+    this.#emit(
+      "item.completed",
+      {
+        kind: "thread_lineage",
+        text: `Root thread ${input.opened.threadId}`,
+        lineage: input.opened.lineage,
       },
-    }, { itemId: `${input.opened.threadId}:model` });
+      { itemId: `thread:${input.opened.threadId}` },
+    );
+    this.#emit(
+      "item.completed",
+      {
+        kind: "model",
+        text: `${input.opened.context.model} (${input.opened.context.modelProvider})`,
+        model: {
+          name: input.opened.context.model,
+          provider: input.opened.context.modelProvider,
+          codexVersion: input.opened.context.codexVersion,
+        },
+      },
+      { itemId: `${input.opened.threadId}:model` },
+    );
     void this.#pumpNotifications();
   }
 
@@ -887,7 +1048,11 @@ class CodexHarnessSession implements HarnessSession {
   }
 
   async attachRun(input: { runId: string }): Promise<void> {
-    if (this.#activeTurnId !== null || this.#turnStartPending || this.#pendingRuntimeRequests.size > 0) {
+    if (
+      this.#activeTurnId !== null ||
+      this.#turnStartPending ||
+      this.#pendingRuntimeRequests.size > 0
+    ) {
       throw new Error("codex_run_attach_busy");
     }
     if (!input.runId) throw new Error("codex_run_attach_invalid");
@@ -921,8 +1086,16 @@ class CodexHarnessSession implements HarnessSession {
   async startTurn(input: {
     message: NativeUserMessage;
     requestedCollaborationMode?: "default" | "plan";
-  }): Promise<{ turnId: string; effectiveCollaborationMode: "default" | "plan" }> {
-    if (this.#terminal || this.#protocolFailed || this.#activeTurnId !== null || this.#turnStartPending) {
+  }): Promise<{
+    turnId: string;
+    effectiveCollaborationMode: "default" | "plan";
+  }> {
+    if (
+      this.#terminal ||
+      this.#protocolFailed ||
+      this.#activeTurnId !== null ||
+      this.#turnStartPending
+    ) {
       throw this.#unsupported(
         "turn start",
         this.#protocolFailureCode === null
@@ -930,11 +1103,18 @@ class CodexHarnessSession implements HarnessSession {
           : `session failed protocol validation: ${this.#protocolFailureCode} (${this.#protocolFailureMessage ?? "no detail"})`,
       );
     }
-    const taskText = this.#conversationMode === "direct"
-      ? input.message.text
-      : JSON.stringify({ task: this.#taskEnvelope, message: input.message.text });
+    const taskText =
+      this.#conversationMode === "direct"
+        ? input.message.text
+        : JSON.stringify({
+            task: this.#taskEnvelope,
+            message: input.message.text,
+          });
     const effectiveCollaborationMode = this.#opened.context.collaborationMode;
-    if (input.requestedCollaborationMode && input.requestedCollaborationMode !== effectiveCollaborationMode) {
+    if (
+      input.requestedCollaborationMode &&
+      input.requestedCollaborationMode !== effectiveCollaborationMode
+    ) {
       throw new Error(
         `collaboration_mode_mismatch: requested ${input.requestedCollaborationMode}, effective ${effectiveCollaborationMode}`,
       );
@@ -945,7 +1125,8 @@ class CodexHarnessSession implements HarnessSession {
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
       text: input.message.text,
-      requestedCollaborationMode: input.requestedCollaborationMode ?? effectiveCollaborationMode,
+      requestedCollaborationMode:
+        input.requestedCollaborationMode ?? effectiveCollaborationMode,
       effectiveCollaborationMode,
     });
     this.#turnStartPending = true;
@@ -955,24 +1136,31 @@ class CodexHarnessSession implements HarnessSession {
       response = await this.#transport.request("turn/start", {
         threadId: this.#opened.threadId,
         cwd: this.#opened.context.workingDirectory,
-        permissions: requestedMode === "plan"
-          ? PLANNING_PERMISSION_PROFILE
-          : SKILLLESS_PERMISSION_PROFILE,
+        permissions:
+          requestedMode === "plan"
+            ? PLANNING_PERMISSION_PROFILE
+            : SKILLLESS_PERMISSION_PROFILE,
         runtimeWorkspaceRoots: [this.#opened.context.workingDirectory],
         ...(this.#opened.collaborationMode === null
           ? {}
           : { collaborationMode: this.#opened.collaborationMode }),
         input: [userInput({ role: "user", text: taskText })],
-        ...(this.#conversationMode === "direct" ? {} : { outputSchema: CODEX_RESULT_OUTPUT_SCHEMA }),
+        ...(this.#conversationMode === "direct"
+          ? {}
+          : { outputSchema: CODEX_RESULT_OUTPUT_SCHEMA }),
       });
     } finally {
       this.#turnStartPending = false;
     }
     const turn = record(response.turn);
     const turnId = text(turn.id);
-    if (turnId.length === 0) throw new Error("Codex turn response omitted turn.id");
+    if (turnId.length === 0)
+      throw new Error("Codex turn response omitted turn.id");
     if (this.#activeTurnId !== null && this.#activeTurnId !== turnId) {
-      this.#failProtocol("turn_start_mismatch", "turn/start response disagreed with turn/started");
+      this.#failProtocol(
+        "turn_start_mismatch",
+        "turn/start response disagreed with turn/started",
+      );
       throw new Error("Codex turn identity changed during start");
     }
     this.#activeTurnId ??= turnId;
@@ -987,13 +1175,20 @@ class CodexHarnessSession implements HarnessSession {
     };
   }
 
-  async steer(input: { turnId: string; message: NativeUserMessage; correlationId?: string }): Promise<void> {
+  async steer(input: {
+    turnId: string;
+    message: NativeUserMessage;
+    correlationId?: string;
+  }): Promise<void> {
     this.#requireCapability("steering");
     this.#requireActiveTurn(input.turnId, "steering");
     if (input.correlationId) {
-      const acknowledgedTurnId = this.#acknowledgedSteeringCorrelations.get(input.correlationId);
+      const acknowledgedTurnId = this.#acknowledgedSteeringCorrelations.get(
+        input.correlationId,
+      );
       if (acknowledgedTurnId) {
-        if (acknowledgedTurnId !== input.turnId) throw new HarnessOperationAlreadyTerminalError("steering");
+        if (acknowledgedTurnId !== input.turnId)
+          throw new HarnessOperationAlreadyTerminalError("steering");
         return;
       }
     }
@@ -1008,18 +1203,25 @@ class CodexHarnessSession implements HarnessSession {
         throw new HarnessOperationAlreadyTerminalError("steering");
       }
       if (input.correlationId) {
-        this.#acknowledgedSteeringCorrelations.set(input.correlationId, input.turnId);
+        this.#acknowledgedSteeringCorrelations.set(
+          input.correlationId,
+          input.turnId,
+        );
       }
-      this.#emit("item.completed", {
-        kind: "steering_acknowledgement",
-        text: "Steering acknowledged for the active turn.",
-        status: "acknowledged",
-      }, {
-        turnId: input.turnId,
-        itemId: input.correlationId
-          ? `${input.turnId}:steer:${input.correlationId}`
-          : `${input.turnId}:steer:${++this.#steerSequence}`,
-      });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "steering_acknowledgement",
+          text: "Steering acknowledged for the active turn.",
+          status: "acknowledged",
+        },
+        {
+          turnId: input.turnId,
+          itemId: input.correlationId
+            ? `${input.turnId}:steer:${input.correlationId}`
+            : `${input.turnId}:steer:${++this.#steerSequence}`,
+        },
+      );
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
       const detail = redactCodexDiagnostic(String(error));
@@ -1037,11 +1239,15 @@ class CodexHarnessSession implements HarnessSession {
     this.#requireCapability("interruption");
     if (this.#turnStartPending && this.#activeTurnId === null) {
       this.#interruptQueued = true;
-      this.#emit("item.completed", {
-        kind: "interrupt_acknowledgement",
-        text: "Interrupt queued until the provider assigns the turn identity.",
-        status: "queued",
-      }, { itemId: `interrupt:queued:${++this.#interruptSequence}` });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "interrupt_acknowledgement",
+          text: "Interrupt queued until the provider assigns the turn identity.",
+          status: "queued",
+        },
+        { itemId: `interrupt:queued:${++this.#interruptSequence}` },
+      );
       return;
     }
     if (this.#terminal || this.#activeTurnId === null) {
@@ -1061,15 +1267,19 @@ class CodexHarnessSession implements HarnessSession {
       if (this.#activeTurnId !== turnId) {
         throw new HarnessOperationAlreadyTerminalError("interruption");
       }
-      this.#emit("item.completed", {
-        kind: "interrupt_acknowledgement",
-        text: "Interrupt accepted for the active turn.",
-        status: "acknowledged",
-        reason: boundedText(reason),
-      }, {
-        turnId,
-        itemId: `${turnId}:interrupt:${++this.#interruptSequence}`,
-      });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "interrupt_acknowledgement",
+          text: "Interrupt accepted for the active turn.",
+          status: "acknowledged",
+          reason: boundedText(reason),
+        },
+        {
+          turnId,
+          itemId: `${turnId}:interrupt:${++this.#interruptSequence}`,
+        },
+      );
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
       throw this.#unsupported("interruption", error);
@@ -1078,7 +1288,8 @@ class CodexHarnessSession implements HarnessSession {
 
   pendingRuntimeRequests(): HarnessRuntimeRequest[] {
     return [...this.#pendingRuntimeRequests.values()].map(({ request }) =>
-      structuredClone(request));
+      structuredClone(request),
+    );
   }
 
   async resolveRuntimeRequest(input: {
@@ -1094,7 +1305,10 @@ class CodexHarnessSession implements HarnessSession {
         `request ${input.requestId} is no longer pending`,
       );
     }
-    if (pending.request.turnId !== input.turnId || this.#activeTurnId !== input.turnId) {
+    if (
+      pending.request.turnId !== input.turnId ||
+      this.#activeTurnId !== input.turnId
+    ) {
       throw new HarnessStaleTurnError(input.turnId);
     }
     const resolution = parseHarnessRuntimeRequestResolution(
@@ -1105,7 +1319,9 @@ class CodexHarnessSession implements HarnessSession {
     this.#pendingRuntimeRequests.delete(input.requestId);
     this.#emit(
       "runtime_request.resolved",
-      harnessRuntimeRequestOutcome(pending.request, { action: resolution.action }),
+      harnessRuntimeRequestOutcome(pending.request, {
+        action: resolution.action,
+      }),
       { turnId: input.turnId, itemId: pending.request.itemId },
     );
     pending.settle(response);
@@ -1126,28 +1342,41 @@ class CodexHarnessSession implements HarnessSession {
           ...params,
           objective: input.objective,
           status: "active",
-          ...(input.tokenBudget !== undefined ? { tokenBudget: input.tokenBudget } : {}),
+          ...(input.tokenBudget !== undefined
+            ? { tokenBudget: input.tokenBudget }
+            : {}),
         };
       } else {
-        params = { ...params, status: input.action === "pause" ? "paused" : "active" };
+        params = {
+          ...params,
+          status: input.action === "pause" ? "paused" : "active",
+        };
       }
     }
     try {
       const response = await this.#transport.request(method, params);
-      const goal = input.action === "clear" ? null : parseThreadGoal(response.goal);
+      const goal =
+        input.action === "clear" ? null : parseThreadGoal(response.goal);
       if (!["get", "clear"].includes(input.action) && goal === null) {
         throw new Error(`${method} omitted its goal`);
       }
       this.#goal = goal;
       const kind = input.action === "clear" ? "goal_cleared" : "goal";
-      this.#emit("item.completed", {
-        kind,
-        text: goal === null
-          ? input.action === "clear" ? "Thread goal cleared." : "No thread goal is configured."
-          : `Thread goal ${goal.status}: ${goal.objective}`,
-        action: input.action,
-        goal,
-      }, { itemId: `${this.#opened.threadId}:goal:${this.#sourceSequence + 1}` });
+      this.#emit(
+        "item.completed",
+        {
+          kind,
+          text:
+            goal === null
+              ? input.action === "clear"
+                ? "Thread goal cleared."
+                : "No thread goal is configured."
+              : `Thread goal ${goal.status}: ${goal.objective}`,
+          action: input.action,
+          goal,
+        },
+        { itemId: `${this.#opened.threadId}:goal:${this.#sourceSequence + 1}` },
+      );
       return goal === null ? null : structuredClone(goal);
     } catch (error) {
       throw this.#unsupported(`goal ${input.action}`, error);
@@ -1175,21 +1404,31 @@ class CodexHarnessSession implements HarnessSession {
     const snapshot = await this.read();
     const thread = record(snapshot.thread);
     if (text(thread.id) !== this.#opened.threadId) {
-      throw new HarnessReconciliationError("thread/read returned a different driver session");
+      throw new HarnessReconciliationError(
+        "thread/read returned a different driver session",
+      );
     }
     const providerSessionId = text(thread.sessionId);
     if (
       this.#opened.providerSessionId !== null &&
       providerSessionId !== this.#opened.providerSessionId
     ) {
-      throw new HarnessReconciliationError("thread/read returned a different provider session");
+      throw new HarnessReconciliationError(
+        "thread/read returned a different provider session",
+      );
     }
     const turns = Array.isArray(thread.turns) ? thread.turns.map(record) : [];
-    const reconciledUsage = boundedPayload(record(thread.tokenUsage ?? snapshot.tokenUsage));
+    const reconciledUsage = boundedPayload(
+      record(thread.tokenUsage ?? snapshot.tokenUsage),
+    );
     if (Object.keys(reconciledUsage).length > 0) this.#usage = reconciledUsage;
-    const activeTurns = turns.filter((turn) => text(turn.status) === "inProgress");
+    const activeTurns = turns.filter(
+      (turn) => text(turn.status) === "inProgress",
+    );
     const expectedTurnId = this.#activeTurnId;
-    const unexpectedActive = activeTurns.find((turn) => text(turn.id) !== expectedTurnId);
+    const unexpectedActive = activeTurns.find(
+      (turn) => text(turn.id) !== expectedTurnId,
+    );
     if (unexpectedActive !== undefined) {
       throw new HarnessReconciliationError(
         `thread/read exposed active turn ${text(unexpectedActive.id)} instead of persisted active turn ${expectedTurnId ?? "none"}`,
@@ -1198,7 +1437,9 @@ class CodexHarnessSession implements HarnessSession {
 
     let reconciledTerminalTurnId: string | null = null;
     if (expectedTurnId !== null) {
-      const expectedTurn = turns.find((turn) => text(turn.id) === expectedTurnId);
+      const expectedTurn = turns.find(
+        (turn) => text(turn.id) === expectedTurnId,
+      );
       if (expectedTurn === undefined) {
         throw new HarnessReconciliationError(
           `persisted active turn ${expectedTurnId} is missing from thread/read`,
@@ -1207,7 +1448,9 @@ class CodexHarnessSession implements HarnessSession {
       const status = text(expectedTurn.status);
       if (status === "inProgress") {
         this.#activeTurnId = expectedTurnId;
-      } else if (["completed", "failed", "interrupted", "cancelled"].includes(status)) {
+      } else if (
+        ["completed", "failed", "interrupted", "cancelled"].includes(status)
+      ) {
         reconciledTerminalTurnId = expectedTurnId;
         this.#mapTerminalTurn(expectedTurn, expectedTurnId, true);
       } else {
@@ -1220,7 +1463,11 @@ class CodexHarnessSession implements HarnessSession {
     for (const [turnId, fingerprint] of this.#terminalTurns) {
       const observed = turns.find((turn) => text(turn.id) === turnId);
       if (observed === undefined) continue;
-      if (!["completed", "failed", "interrupted", "cancelled"].includes(text(observed.status))) {
+      if (
+        !["completed", "failed", "interrupted", "cancelled"].includes(
+          text(observed.status),
+        )
+      ) {
         throw new HarnessReconciliationError(
           `previously terminal turn ${turnId} is no longer terminal in thread/read`,
         );
@@ -1254,14 +1501,17 @@ class CodexHarnessSession implements HarnessSession {
       runId: this.#runId,
       normalizedSessionId: this.#normalizedSessionId,
       activeTurnId: this.#activeTurnId,
-      semanticResult: this.#result === null || this.#resultFingerprint === null || this.#resultTurnId === null
-        ? null
-        : {
-            result: structuredClone(this.#result),
-            fingerprint: this.#resultFingerprint,
-            callId: this.#resultCallId,
-            turnId: this.#resultTurnId,
-          },
+      semanticResult:
+        this.#result === null ||
+        this.#resultFingerprint === null ||
+        this.#resultTurnId === null
+          ? null
+          : {
+              result: structuredClone(this.#result),
+              fingerprint: this.#resultFingerprint,
+              callId: this.#resultCallId,
+              turnId: this.#resultTurnId,
+            },
       terminalTurns: [...this.#terminalTurns].map(([turnId, fingerprint]) => ({
         turnId,
         fingerprint,
@@ -1297,6 +1547,52 @@ class CodexHarnessSession implements HarnessSession {
   }
 
   #mapNotification(notification: CodexRpcNotification): void {
+    const sourceSequenceBefore = this.#sourceSequence;
+    let rejected = false;
+    try {
+      this.#mapNotificationBody(notification);
+    } catch (error) {
+      rejected = true;
+      throw error;
+    } finally {
+      const correlation = notification.paperclipTrace;
+      if (correlation !== undefined) {
+        const emittedEventIds: string[] = [];
+        for (
+          let sourceSeq = sourceSequenceBefore + 1;
+          sourceSeq <= this.#sourceSequence;
+          sourceSeq += 1
+        ) {
+          emittedEventIds.push(
+            `${this.#runnerInstanceId}:${this.#runId}:${sourceSeq}`,
+          );
+        }
+        const disposition: CodexTraceInterpretation["disposition"] = rejected
+          ? "rejected"
+          : emittedEventIds.length > 0
+            ? "mapped"
+            : "ignored";
+        try {
+          this.#transport.recordTraceInterpretation?.({
+            sourceEventId: correlation.sourceEventId,
+            sourceEventType: correlation.sourceEventType,
+            providerMethod: notification.method,
+            disposition,
+            emittedEventIds,
+            reason: rejected
+              ? "Codex driver rejected the rehydrated provider notification"
+              : emittedEventIds.length > 0
+                ? "Codex driver normalized the rehydrated provider notification into persisted canonical PRP events"
+                : "Codex driver accepted the rehydrated provider notification but emitted no canonical PRP event",
+          });
+        } catch {
+          // Trace delivery is deliberately outside run authority.
+        }
+      }
+    }
+  }
+
+  #mapNotificationBody(notification: CodexRpcNotification): void {
     if (!isBoundCodexNotification(notification.method)) return;
     const params = notification.params;
     const turn = record(params.turn);
@@ -1306,19 +1602,30 @@ class CodexHarnessSession implements HarnessSession {
     const itemId = text(item.id, text(params.itemId));
     if (
       (threadId.length === 0 || threadId === this.#opened.threadId) &&
-      (turnId.length === 0 || this.#activeTurnId === null || turnId === this.#activeTurnId)
+      (turnId.length === 0 ||
+        this.#activeTurnId === null ||
+        turnId === this.#activeTurnId)
     ) {
-      for (const canonical of canonicalProviderEventsFromCodex(notification.method, params)) {
+      for (const canonical of canonicalProviderEventsFromCodex(
+        notification.method,
+        params,
+      )) {
         this.#emit(canonical.eventType, canonical.payload, {
           turnId: turnId || undefined,
           itemId: canonical.itemId,
         });
       }
     }
-    if (notification.method === "error" || notification.method === "warning" || notification.method === "configWarning") {
+    if (
+      notification.method === "error" ||
+      notification.method === "warning" ||
+      notification.method === "configWarning"
+    ) {
       this.#emit("harness.diagnostic", {
         code: notification.method.replaceAll("/", "_"),
-        message: redactCodexDiagnostic(text(params.message, JSON.stringify(boundedCodexValue(params)))),
+        message: redactCodexDiagnostic(
+          text(params.message, JSON.stringify(boundedCodexValue(params))),
+        ),
       });
       return;
     }
@@ -1335,33 +1642,45 @@ class CodexHarnessSession implements HarnessSession {
         return;
       }
       this.#lineage.set(lineage.threadId, lineage);
-      this.#emit("item.started", {
-        kind: "thread_lineage",
-        text: `${lineage.nickname ?? lineage.role ?? "Child agent"} started.`,
-        lineage,
-      }, { itemId: `thread:${lineage.threadId}` });
+      this.#emit(
+        "item.started",
+        {
+          kind: "thread_lineage",
+          text: `${lineage.nickname ?? lineage.role ?? "Child agent"} started.`,
+          lineage,
+        },
+        { itemId: `thread:${lineage.threadId}` },
+      );
       return;
     }
     if (notification.method === "thread/status/changed") {
       const lineage = this.#lineage.get(threadId);
       if (lineage === undefined || threadId === this.#opened.threadId) return;
       lineage.status = threadStatus(params.status);
-      this.#emit("item.delta", {
-        kind: "thread_lineage",
-        text: `${lineage.nickname ?? lineage.role ?? "Child agent"}: ${lineage.status}`,
-        lineage,
-      }, { itemId: `thread:${lineage.threadId}` });
+      this.#emit(
+        "item.delta",
+        {
+          kind: "thread_lineage",
+          text: `${lineage.nickname ?? lineage.role ?? "Child agent"}: ${lineage.status}`,
+          lineage,
+        },
+        { itemId: `thread:${lineage.threadId}` },
+      );
       return;
     }
     if (notification.method === "thread/closed") {
       const lineage = this.#lineage.get(threadId);
       if (lineage === undefined || threadId === this.#opened.threadId) return;
       lineage.status = "closed";
-      this.#emit("item.completed", {
-        kind: "thread_lineage",
-        text: `${lineage.nickname ?? lineage.role ?? "Child agent"} closed.`,
-        lineage,
-      }, { itemId: `thread:${lineage.threadId}` });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "thread_lineage",
+          text: `${lineage.nickname ?? lineage.role ?? "Child agent"} closed.`,
+          lineage,
+        },
+        { itemId: `thread:${lineage.threadId}` },
+      );
       return;
     }
     if (notification.method === "thread/goal/updated") {
@@ -1369,23 +1688,34 @@ class CodexHarnessSession implements HarnessSession {
       const goal = parseThreadGoal(params.goal);
       if (goal === null) return;
       this.#goal = goal;
-      this.#emit("item.completed", {
-        kind: "goal",
-        text: `Thread goal ${goal.status}: ${goal.objective}`,
-        action: "notification",
-        goal,
-      }, { turnId: turnId || undefined, itemId: `${threadId}:goal:update:${this.#sourceSequence + 1}` });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "goal",
+          text: `Thread goal ${goal.status}: ${goal.objective}`,
+          action: "notification",
+          goal,
+        },
+        {
+          turnId: turnId || undefined,
+          itemId: `${threadId}:goal:update:${this.#sourceSequence + 1}`,
+        },
+      );
       return;
     }
     if (notification.method === "thread/goal/cleared") {
       if (threadId !== this.#opened.threadId) return;
       this.#goal = null;
-      this.#emit("item.completed", {
-        kind: "goal_cleared",
-        text: "Thread goal cleared.",
-        action: "notification",
-        goal: null,
-      }, { itemId: `${threadId}:goal:clear:${this.#sourceSequence + 1}` });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "goal_cleared",
+          text: "Thread goal cleared.",
+          action: "notification",
+          goal: null,
+        },
+        { itemId: `${threadId}:goal:clear:${this.#sourceSequence + 1}` },
+      );
       return;
     }
     if (notification.method === "serverRequest/resolved") {
@@ -1395,7 +1725,9 @@ class CodexHarnessSession implements HarnessSession {
       this.#pendingRuntimeRequests.delete(requestId);
       this.#emit(
         "runtime_request.cancelled",
-        harnessRuntimeRequestOutcome(pending.request, { reason: "provider_resolved" }),
+        harnessRuntimeRequestOutcome(pending.request, {
+          reason: "provider_resolved",
+        }),
         { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
       pending.settle(safeRequestResponse(pending.request.method, "cancel"));
@@ -1417,12 +1749,19 @@ class CodexHarnessSession implements HarnessSession {
         (!this.#turnStartPending && this.#activeTurnId === null) ||
         (this.#activeTurnId !== null && this.#activeTurnId !== turnId)
       ) {
-        this.#failProtocol("turn_binding_mismatch", "Provider started an unexpected turn.");
+        this.#failProtocol(
+          "turn_binding_mismatch",
+          "Provider started an unexpected turn.",
+        );
         return;
       }
       this.#activeTurnId = turnId;
       this.#turnStarted = true;
-      this.#emit("turn.started", { status: text(turn.status, "inProgress") }, { turnId });
+      this.#emit(
+        "turn.started",
+        { status: text(turn.status, "inProgress") },
+        { turnId },
+      );
       return;
     }
     if (notification.method === "turn/completed") {
@@ -1438,28 +1777,36 @@ class CodexHarnessSession implements HarnessSession {
       if (!this.#notificationNamesActiveTurn(turnId, "item start")) return;
       const channel = this.#channelForStartedItem(item);
       if (itemId) this.#itemChannels.set(itemId, channel);
-      this.#emit("item.started", boundedPayload({
-        kind: text(item.type, "unknown"),
-        channel,
-        providerPhase: text(item.phase) || undefined,
-        text: itemText(item),
-        item,
-      }), { turnId, itemId });
+      this.#emit(
+        "item.started",
+        boundedPayload({
+          kind: text(item.type, "unknown"),
+          channel,
+          providerPhase: text(item.phase) || undefined,
+          text: itemText(item),
+          item,
+        }),
+        { turnId, itemId },
+      );
       return;
     }
     if (notification.method === "item/completed") {
       if (!this.#notificationNamesActiveTurn(turnId, "item completion")) return;
       if (!this.#captureResultFromItem(item, turnId)) return;
       const channel = itemId
-        ? this.#itemChannels.get(itemId) ?? this.#channelForStartedItem(item)
+        ? (this.#itemChannels.get(itemId) ?? this.#channelForStartedItem(item))
         : this.#channelForStartedItem(item);
-      this.#emit("item.completed", boundedPayload({
-        kind: text(item.type, "unknown"),
-        channel,
-        providerPhase: text(item.phase) || undefined,
-        text: itemText(item),
-        item,
-      }), { turnId, itemId });
+      this.#emit(
+        "item.completed",
+        boundedPayload({
+          kind: text(item.type, "unknown"),
+          channel,
+          providerPhase: text(item.phase) || undefined,
+          text: itemText(item),
+          item,
+        }),
+        { turnId, itemId },
+      );
       if (text(item.type) === "agentMessage") {
         for (const reference of paperclipWorkspaceFileReferencesFromText(
           this.#opened.context.workingDirectory,
@@ -1468,11 +1815,16 @@ class CodexHarnessSession implements HarnessSession {
         )) {
           if (this.#emittedFileReferences.has(reference.referenceId)) continue;
           this.#emittedFileReferences.add(reference.referenceId);
-          this.#emit("workspace.file.referenced", { ...reference }, { turnId, itemId: reference.referenceId });
+          this.#emit(
+            "workspace.file.referenced",
+            { ...reference },
+            { turnId, itemId: reference.referenceId },
+          );
         }
       }
       if (itemId) this.#itemChannels.delete(itemId);
-      if (text(item.type) === "fileChange") this.#recordWorkspaceChanges(turnId, item.changes, true);
+      if (text(item.type) === "fileChange")
+        this.#recordWorkspaceChanges(turnId, item.changes, true);
       return;
     }
     const deltaKinds: Record<string, string> = {
@@ -1490,18 +1842,23 @@ class CodexHarnessSession implements HarnessSession {
     if (deltaKind !== undefined) {
       if (!this.#notificationNamesActiveTurn(turnId, "item update")) return;
       const methodChannel = this.#channelForDelta(notification.method);
-      const channel = methodChannel !== "unknown"
-        ? methodChannel
-        : itemId
-          ? this.#itemChannels.get(itemId) ?? "unknown"
-          : "unknown";
-      this.#emit("item.delta", boundedPayload({
-        kind: deltaKind,
-        channel,
-        providerMethod: notification.method,
-        text: text(params.delta, text(params.patch, text(params.output))),
-        update: params,
-      }), { turnId, itemId: itemId || `${turnId}:${deltaKind}` });
+      const channel =
+        methodChannel !== "unknown"
+          ? methodChannel
+          : itemId
+            ? (this.#itemChannels.get(itemId) ?? "unknown")
+            : "unknown";
+      this.#emit(
+        "item.delta",
+        boundedPayload({
+          kind: deltaKind,
+          channel,
+          providerMethod: notification.method,
+          text: text(params.delta, text(params.patch, text(params.output))),
+          update: params,
+        }),
+        { turnId, itemId: itemId || `${turnId}:${deltaKind}` },
+      );
       if (notification.method === "item/fileChange/patchUpdated") {
         this.#recordWorkspaceChanges(turnId, params.changes, false);
       }
@@ -1513,15 +1870,21 @@ class CodexHarnessSession implements HarnessSession {
       // is being attached, before the next turn has started. Keep the snapshot,
       // but do not turn that benign replay into a fatal turn-binding violation.
       if (this.#activeTurnId === null || turnId !== this.#activeTurnId) return;
-      this.#emit("item.completed", { kind: "usage", usage: this.#usage }, {
-        turnId,
-        itemId: `${turnId}:usage:${this.#sourceSequence + 1}`,
-      });
+      this.#emit(
+        "item.completed",
+        { kind: "usage", usage: this.#usage },
+        {
+          turnId,
+          itemId: `${turnId}:usage:${this.#sourceSequence + 1}`,
+        },
+      );
       return;
     }
   }
 
-  #channelForStartedItem(item: Record<string, unknown>): "progress" | "final" | "summary" | "detail" | "unknown" {
+  #channelForStartedItem(
+    item: Record<string, unknown>,
+  ): "progress" | "final" | "summary" | "detail" | "unknown" {
     const type = text(item.type);
     const phase = text(item.phase).toLowerCase();
     if (type === "agentMessage") {
@@ -1533,63 +1896,101 @@ class CodexHarnessSession implements HarnessSession {
     return "unknown";
   }
 
-  #channelForDelta(method: string): "progress" | "final" | "summary" | "detail" | "unknown" {
+  #channelForDelta(
+    method: string,
+  ): "progress" | "final" | "summary" | "detail" | "unknown" {
     if (method === "item/reasoning/summaryTextDelta") return "summary";
     if (method === "item/reasoning/textDelta") return "detail";
     return "unknown";
   }
 
-  #recordWorkspaceChanges(turnId: string, value: unknown, complete: boolean): void {
+  #recordWorkspaceChanges(
+    turnId: string,
+    value: unknown,
+    complete: boolean,
+  ): void {
     const changes = Array.isArray(value) ? value : [];
-    const files = changes.slice(0, 2_000).flatMap((candidate): Record<string, unknown>[] => {
-      const change = record(candidate);
-      const path = text(change.path).replaceAll("\\", "/");
-      if (!path || path.startsWith("/") || path.split("/").includes("..")) return [];
-      const kind = change.kind;
-      const kindRecord = record(kind);
-      const kindText = text(kind, text(kindRecord.type, Object.keys(kindRecord)[0] ?? "update"));
-      const update = record(kindRecord.update ?? change.update);
-      const previousPath = text(update.move_path, text(update.movePath)) || null;
-      const operation = previousPath
-        ? "rename"
-        : kindText.toLowerCase().includes("add")
-          ? "create"
-          : kindText.toLowerCase().includes("delete")
-            ? "delete"
-            : "modify";
-      const diff = text(change.diff).slice(0, 262_144) || null;
-      const diffLines = diff?.split("\n") ?? [];
-      return [{
-        path,
-        operation,
-        previousPath,
-        additions: diff === null ? null : diffLines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length,
-        deletions: diff === null ? null : diffLines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length,
-        binary: diff === null,
-        diff,
-      }];
-    });
+    const files = changes
+      .slice(0, 2_000)
+      .flatMap((candidate): Record<string, unknown>[] => {
+        const change = record(candidate);
+        const path = text(change.path).replaceAll("\\", "/");
+        if (!path || path.startsWith("/") || path.split("/").includes(".."))
+          return [];
+        const kind = change.kind;
+        const kindRecord = record(kind);
+        const kindText = text(
+          kind,
+          text(kindRecord.type, Object.keys(kindRecord)[0] ?? "update"),
+        );
+        const update = record(kindRecord.update ?? change.update);
+        const previousPath =
+          text(update.move_path, text(update.movePath)) || null;
+        const operation = previousPath
+          ? "rename"
+          : kindText.toLowerCase().includes("add")
+            ? "create"
+            : kindText.toLowerCase().includes("delete")
+              ? "delete"
+              : "modify";
+        const diff = text(change.diff).slice(0, 262_144) || null;
+        const diffLines = diff?.split("\n") ?? [];
+        return [
+          {
+            path,
+            operation,
+            previousPath,
+            additions:
+              diff === null
+                ? null
+                : diffLines.filter(
+                    (line) => line.startsWith("+") && !line.startsWith("+++"),
+                  ).length,
+            deletions:
+              diff === null
+                ? null
+                : diffLines.filter(
+                    (line) => line.startsWith("-") && !line.startsWith("---"),
+                  ).length,
+            binary: diff === null,
+            diff,
+          },
+        ];
+      });
     if (files.length === 0) return;
-    const unknown = files.some((file) => file.additions === null || file.deletions === null);
+    const unknown = files.some(
+      (file) => file.additions === null || file.deletions === null,
+    );
     const payload = {
       schema: "paperclip.workspace.diff.v1",
       changeSetId: `${turnId}:workspace`,
-      revision: Number(record(this.#workspaceChangesByTurn.get(turnId)).revision ?? 0) + 1,
+      revision:
+        Number(record(this.#workspaceChangesByTurn.get(turnId)).revision ?? 0) +
+        1,
       source: "harness_reported",
       complete,
       files,
       totals: {
         files: files.length,
-        additions: unknown ? null : files.reduce((sum, file) => sum + Number(file.additions), 0),
-        deletions: unknown ? null : files.reduce((sum, file) => sum + Number(file.deletions), 0),
+        additions: unknown
+          ? null
+          : files.reduce((sum, file) => sum + Number(file.additions), 0),
+        deletions: unknown
+          ? null
+          : files.reduce((sum, file) => sum + Number(file.deletions), 0),
       },
       patchArtifactRef: null,
     };
     this.#workspaceChangesByTurn.set(turnId, payload);
-    this.#emit("workspace.change.updated", payload, { turnId, itemId: `${turnId}:workspace` });
+    this.#emit("workspace.change.updated", payload, {
+      turnId,
+      itemId: `${turnId}:workspace`,
+    });
   }
 
-  async #handleServerRequest(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
+  async #handleServerRequest(
+    request: CodexRpcServerRequest,
+  ): Promise<Record<string, unknown>> {
     if (request.method === "item/tool/call") {
       const tool = text(request.params.tool);
       const threadId = text(request.params.threadId);
@@ -1603,16 +2004,32 @@ class CodexHarnessSession implements HarnessSession {
         turnId !== this.#activeTurnId ||
         callId.length === 0
       ) {
-        this.#failProtocol("tool_binding_mismatch", "Semantic tool call did not name the active thread and turn.");
-        return rejectedToolCall("Semantic tool call was outside the active thread and turn.");
+        this.#failProtocol(
+          "tool_binding_mismatch",
+          "Semantic tool call did not name the active thread and turn.",
+        );
+        return rejectedToolCall(
+          "Semantic tool call was outside the active thread and turn.",
+        );
       }
       if (!isSemanticTool(tool)) {
-        const admitted = this.#dynamicTools.some((candidate) => candidate.name === tool);
+        const admitted = this.#dynamicTools.some(
+          (candidate) => candidate.name === tool,
+        );
         if (admitted && this.#dynamicToolHandler !== undefined) {
-          this.#emit("item.started", {
-            kind: "dynamicToolCall",
-            item: { type: "tool_use", id: callId, name: tool, input: request.params.arguments },
-          }, { turnId, itemId: callId });
+          this.#emit(
+            "item.started",
+            {
+              kind: "dynamicToolCall",
+              item: {
+                type: "tool_use",
+                id: callId,
+                name: tool,
+                input: request.params.arguments,
+              },
+            },
+            { turnId, itemId: callId },
+          );
           try {
             const result = await this.#dynamicToolHandler({
               tool,
@@ -1621,17 +2038,38 @@ class CodexHarnessSession implements HarnessSession {
               turnId,
               arguments: request.params.arguments,
             });
-            this.#emit("item.completed", {
-              kind: "dynamicToolCall",
-              item: { type: "tool_result", id: callId, tool_use_id: callId, result },
-            }, { turnId, itemId: callId });
+            this.#emit(
+              "item.completed",
+              {
+                kind: "dynamicToolCall",
+                item: {
+                  type: "tool_result",
+                  id: callId,
+                  tool_use_id: callId,
+                  result,
+                },
+              },
+              { turnId, itemId: callId },
+            );
             return dynamicToolResponse(result);
           } catch (error) {
-            const message = boundedText(error instanceof Error ? error.message : error);
-            this.#emit("item.completed", {
-              kind: "dynamicToolCall",
-              item: { type: "tool_result", id: callId, tool_use_id: callId, error: message, is_error: true },
-            }, { turnId, itemId: callId });
+            const message = boundedText(
+              error instanceof Error ? error.message : error,
+            );
+            this.#emit(
+              "item.completed",
+              {
+                kind: "dynamicToolCall",
+                item: {
+                  type: "tool_result",
+                  id: callId,
+                  tool_use_id: callId,
+                  error: message,
+                  is_error: true,
+                },
+              },
+              { turnId, itemId: callId },
+            );
             return {
               success: false,
               contentItems: [{ type: "inputText", text: message }],
@@ -1642,32 +2080,49 @@ class CodexHarnessSession implements HarnessSession {
         return rejectedToolCall("Unsupported tool.");
       }
       if (!isRetainableCodexPayload(request.params.arguments)) {
-        return rejectedToolCall("Semantic result exceeded the retained payload limit.");
+        return rejectedToolCall(
+          "Semantic result exceeded the retained payload limit.",
+        );
       }
-      const validation = validatePrpStructuredRunResult(request.params.arguments);
+      const validation = validatePrpStructuredRunResult(
+        request.params.arguments,
+      );
       if (!validation.ok) {
         return {
           success: false,
-          contentItems: [{ type: "inputText", text: "Invalid semantic result." }],
+          contentItems: [
+            { type: "inputText", text: "Invalid semantic result." },
+          ],
         };
       }
-      if (!toolAcceptsDisposition(tool, validation.result.reportedWorkDisposition)) {
+      if (
+        !toolAcceptsDisposition(tool, validation.result.reportedWorkDisposition)
+      ) {
         return {
           success: false,
-          contentItems: [{
-            type: "inputText",
-            text:
-              tool === CODEX_BLOCK_TOOL_NAME
-                ? "paperclip_block requires reportedWorkDisposition=blocked."
-                : "paperclip_finish accepts only done or needs_review.",
-          }],
+          contentItems: [
+            {
+              type: "inputText",
+              text:
+                tool === CODEX_BLOCK_TOOL_NAME
+                  ? "paperclip_block requires reportedWorkDisposition=blocked."
+                  : "paperclip_finish accepts only done or needs_review.",
+            },
+          ],
         };
       }
       const admission = this.#admitResult(validation.result, callId, turnId);
       if (admission === "conflict") {
-        return rejectedToolCall("A different semantic result was already committed.");
+        return rejectedToolCall(
+          "A different semantic result was already committed.",
+        );
       }
-      return { success: true, contentItems: [{ type: "inputText", text: "Semantic completion accepted." }] };
+      return {
+        success: true,
+        contentItems: [
+          { type: "inputText", text: "Semantic completion accepted." },
+        ],
+      };
     }
 
     const requestKind = runtimeRequestKind(request.method);
@@ -1680,12 +2135,18 @@ class CodexHarnessSession implements HarnessSession {
       this.#terminal ||
       this.#protocolFailed
     ) {
-      this.#failProtocol("runtime_request_binding_mismatch", "Runtime request did not name the active thread and turn.");
+      this.#failProtocol(
+        "runtime_request_binding_mismatch",
+        "Runtime request did not name the active thread and turn.",
+      );
       return safeRequestResponse(request.method);
     }
     const requestId = String(request.id);
     if (this.#pendingRuntimeRequests.has(requestId)) {
-      this.#failProtocol("runtime_request_duplicate", "Provider reused a pending runtime request identity.");
+      this.#failProtocol(
+        "runtime_request_duplicate",
+        "Provider reused a pending runtime request identity.",
+      );
       return safeRequestResponse(request.method);
     }
     const runtimeRequest: HarnessRuntimeRequest = {
@@ -1698,20 +2159,34 @@ class CodexHarnessSession implements HarnessSession {
       prompt: runtimeRequestPrompt(requestKind, request.params),
       details: record(redactCodexValue(boundedCodexValue(request.params))),
     };
-    this.#emit("runtime_request.created", {
-      request: { ...runtimeRequest, type: runtimeRequest.method },
-    }, {
-      turnId: requestTurnId,
-      itemId: runtimeRequest.itemId,
-    });
+    this.#emit(
+      "runtime_request.created",
+      {
+        request: { ...runtimeRequest, type: runtimeRequest.method },
+      },
+      {
+        turnId: requestTurnId,
+        itemId: runtimeRequest.itemId,
+      },
+    );
     return new Promise<Record<string, unknown>>((settle) => {
-      this.#pendingRuntimeRequests.set(requestId, { request: runtimeRequest, settle });
+      this.#pendingRuntimeRequests.set(requestId, {
+        request: runtimeRequest,
+        settle,
+      });
     });
   }
 
-  #captureResultFromItem(item: Record<string, unknown>, turnId: string): boolean {
+  #captureResultFromItem(
+    item: Record<string, unknown>,
+    turnId: string,
+  ): boolean {
     if (this.#conversationMode === "direct") return true;
-    if (text(item.type) !== "agentMessage" || !isRetainableCodexPayload(item.text)) return true;
+    if (
+      text(item.type) !== "agentMessage" ||
+      !isRetainableCodexPayload(item.text)
+    )
+      return true;
     const result = tryParseResult(item.text);
     if (result !== null && isRetainableCodexPayload(result)) {
       const admission = this.#admitResult(result, text(item.id), turnId);
@@ -1740,14 +2215,18 @@ class CodexHarnessSession implements HarnessSession {
     this.#resultCallId = itemId || null;
     this.#resultTurnId = turnId || this.#activeTurnId;
     result.verification.forEach((verification, index) => {
-      this.#emit("item.completed", {
-        kind: "verification",
-        text: `${verification.status}: ${verification.commandOrCheck}`,
-        verification,
-      }, {
-        turnId: turnId || this.#activeTurnId || undefined,
-        itemId: `${itemId || "semantic-result"}:verification:${index + 1}`,
-      });
+      this.#emit(
+        "item.completed",
+        {
+          kind: "verification",
+          text: `${verification.status}: ${verification.commandOrCheck}`,
+          verification,
+        },
+        {
+          turnId: turnId || this.#activeTurnId || undefined,
+          itemId: `${itemId || "semantic-result"}:verification:${index + 1}`,
+        },
+      );
     });
     this.#emit("run.result.proposed", result, {
       turnId: turnId || this.#activeTurnId || undefined,
@@ -1811,10 +2290,14 @@ class CodexHarnessSession implements HarnessSession {
     this.#terminalTurns.set(turnId, this.#terminalFingerprint(turn));
     const workspace = this.#workspaceChangesByTurn.get(turnId);
     if (workspace !== undefined) {
-      this.#emit("workspace.diff.recorded", { ...workspace, complete: true }, {
-        turnId,
-        itemId: `${turnId}:workspace`,
-      });
+      this.#emit(
+        "workspace.diff.recorded",
+        { ...workspace, complete: true },
+        {
+          turnId,
+          itemId: `${turnId}:workspace`,
+        },
+      );
     }
     const eventType =
       status === "failed"
@@ -1825,10 +2308,14 @@ class CodexHarnessSession implements HarnessSession {
             ? "turn.cancelled"
             : "turn.completed";
     this.#cancelPendingRequests("turn_terminal");
-    this.#emit(eventType, boundedPayload({
-      status,
-      error: turn.error ?? null,
-    }), { turnId });
+    this.#emit(
+      eventType,
+      boundedPayload({
+        status,
+        error: turn.error ?? null,
+      }),
+      { turnId },
+    );
     this.#activeTurnId = null;
     this.#turnStarted = false;
     this.#finalize(status);
@@ -1861,34 +2348,44 @@ class CodexHarnessSession implements HarnessSession {
       };
     }
     const semanticResult = this.#result ?? candidate;
-    if (this.#terminalFingerprint(turn, semanticResult) !== expectedFingerprint) {
+    if (
+      this.#terminalFingerprint(turn, semanticResult) !== expectedFingerprint
+    ) {
       return {
         code: "conflicting_turn_terminal",
         message: "changed from its committed terminal fingerprint",
       };
     }
     if (candidate !== null && this.#result === null) {
-      this.#admitResult(candidate, text(this.#resultItemFromTurn(turn)?.id), text(turn.id));
+      this.#admitResult(
+        candidate,
+        text(this.#resultItemFromTurn(turn)?.id),
+        text(turn.id),
+      );
     }
     return null;
   }
 
-  #resultItemFromTurn(turn: Record<string, unknown>): Record<string, unknown> | null {
+  #resultItemFromTurn(
+    turn: Record<string, unknown>,
+  ): Record<string, unknown> | null {
     if (!Array.isArray(turn.items)) return null;
     return (
       turn.items
         .map(record)
         .reverse()
-        .find((value) =>
-          text(value.type) === "agentMessage" &&
-          isRetainableCodexPayload(value.text) &&
-          tryParseResult(value.text) !== null
-        ) ??
-      null
+        .find(
+          (value) =>
+            text(value.type) === "agentMessage" &&
+            isRetainableCodexPayload(value.text) &&
+            tryParseResult(value.text) !== null,
+        ) ?? null
     );
   }
 
-  #resultFromTurn(turn: Record<string, unknown>): PrpStructuredRunResult | null {
+  #resultFromTurn(
+    turn: Record<string, unknown>,
+  ): PrpStructuredRunResult | null {
     const item = this.#resultItemFromTurn(turn);
     return item === null ? null : tryParseResult(item.text);
   }
@@ -1926,17 +2423,24 @@ class CodexHarnessSession implements HarnessSession {
       this.#activeTurnId === null ||
       turnId !== this.#activeTurnId
     ) {
-      this.#failProtocol("turn_binding_mismatch", `Provider ${kind} did not name the active turn.`);
+      this.#failProtocol(
+        "turn_binding_mismatch",
+        `Provider ${kind} did not name the active turn.`,
+      );
       return false;
     }
     return true;
   }
 
   #requireCapability(operation: keyof CodexCapabilities): void {
-    if (!this.#capabilities[operation]) throw this.#unsupported(operation, "capability not advertised");
+    if (!this.#capabilities[operation])
+      throw this.#unsupported(operation, "capability not advertised");
   }
 
-  #unsupported(operation: string, detail: unknown): HarnessCapabilityUnavailableError {
+  #unsupported(
+    operation: string,
+    detail: unknown,
+  ): HarnessCapabilityUnavailableError {
     const error = new HarnessCapabilityUnavailableError(
       operation,
       redactCodexDiagnostic(String(detail)),
@@ -1945,7 +2449,10 @@ class CodexHarnessSession implements HarnessSession {
     return error;
   }
 
-  #diagnoseUnsupported(operation: string, detail = "operation is not available"): void {
+  #diagnoseUnsupported(
+    operation: string,
+    detail = "operation is not available",
+  ): void {
     this.#emit("harness.diagnostic", {
       code: "unsupported_operation",
       operation,
@@ -1966,7 +2473,11 @@ class CodexHarnessSession implements HarnessSession {
     });
     if (!this.#terminal && this.#activeTurnId !== null) {
       const turnId = this.#activeTurnId;
-      this.#emit("turn.failed", { status: "failed", error: { code } }, { turnId });
+      this.#emit(
+        "turn.failed",
+        { status: "failed", error: { code } },
+        { turnId },
+      );
       this.#terminalTurns.set(turnId, canonicalJson({ protocolFailure: code }));
       this.#activeTurnId = null;
     }
@@ -2018,7 +2529,10 @@ function validateWorkingDirectory(
   const codexHome = environment.CODEX_HOME?.trim();
   if (codexHome) {
     const resolvedCodexHome = resolve(codexHome);
-    if (pathContains(resolved, resolvedCodexHome) || pathContains(resolvedCodexHome, resolved)) {
+    if (
+      pathContains(resolved, resolvedCodexHome) ||
+      pathContains(resolvedCodexHome, resolved)
+    ) {
       throw new Error("Codex working directory cannot overlap host CODEX_HOME");
     }
   }
@@ -2026,8 +2540,13 @@ function validateWorkingDirectory(
   if (configuredRoot !== undefined && configuredRoot.trim().length > 0) {
     const root = resolve(configuredRoot);
     const pathFromRoot = relative(root, resolved);
-    if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
-      throw new Error("Codex working directory is outside the assigned workspace");
+    if (
+      pathFromRoot === ".." ||
+      pathFromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
+    ) {
+      throw new Error(
+        "Codex working directory is outside the assigned workspace",
+      );
     }
   }
   return resolved;
@@ -2035,10 +2554,13 @@ function validateWorkingDirectory(
 
 function pathContains(parent: string, candidate: string): boolean {
   const fromParent = relative(parent, candidate);
-  return fromParent === "" || (
-    fromParent !== ".." &&
-    !fromParent.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) &&
-    !parse(fromParent).root
+  return (
+    fromParent === "" ||
+    (fromParent !== ".." &&
+      !fromParent.startsWith(
+        `..${process.platform === "win32" ? "\\" : "/"}`,
+      ) &&
+      !parse(fromParent).root)
   );
 }
 
@@ -2053,7 +2575,8 @@ function boundedCodexValue(value: unknown, depth = 0): unknown {
     const bounded = value
       .slice(0, 128)
       .map((entry) => boundedCodexValue(entry, depth + 1));
-    if (value.length > 128) bounded.push({ truncated: true, omittedItems: value.length - 128 });
+    if (value.length > 128)
+      bounded.push({ truncated: true, omittedItems: value.length - 128 });
     return bounded;
   }
   if (typeof value !== "object" || value === null) return value;
@@ -2063,20 +2586,26 @@ function boundedCodexValue(value: unknown, depth = 0): unknown {
       .slice(0, 128)
       .map(([key, entry]) => [key, boundedCodexValue(entry, depth + 1)]),
   );
-  if (Object.keys(object).length > 128) bounded.truncatedEntries = Object.keys(object).length - 128;
+  if (Object.keys(object).length > 128)
+    bounded.truncatedEntries = Object.keys(object).length - 128;
   const serialized = JSON.stringify(bounded);
   return Buffer.byteLength(serialized) <= MAX_RETAINED_CODEX_PAYLOAD_BYTES
     ? bounded
     : { truncated: true, byteSize: Buffer.byteLength(serialized) };
 }
 
-function boundedPayload(value: Record<string, unknown>): Record<string, unknown> {
+function boundedPayload(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
   return record(boundedCodexValue(value));
 }
 
 function isRetainableCodexPayload(value: unknown): boolean {
   try {
-    return Buffer.byteLength(JSON.stringify(value)) <= MAX_RETAINED_CODEX_PAYLOAD_BYTES;
+    return (
+      Buffer.byteLength(JSON.stringify(value)) <=
+      MAX_RETAINED_CODEX_PAYLOAD_BYTES
+    );
   } catch {
     return false;
   }
@@ -2100,32 +2629,49 @@ function redactCodexValue(value: unknown, depth = 0): unknown {
   if (depth > 8) return "[TRUNCATED]";
   if (typeof value === "string") return redactCodexDiagnostic(value);
   if (Array.isArray(value)) {
-    return value.slice(0, 128).map((entry) => redactCodexValue(entry, depth + 1));
+    return value
+      .slice(0, 128)
+      .map((entry) => redactCodexValue(entry, depth + 1));
   }
   const object = record(value);
   return Object.fromEntries(
-    Object.entries(object).slice(0, 128).map(([key, entry]) => [
-      key,
-      /(?:api[_-]?key|token|secret|password|authorization)/i.test(key)
-        ? "[REDACTED]"
-        : redactCodexValue(entry, depth + 1),
-    ]),
+    Object.entries(object)
+      .slice(0, 128)
+      .map(([key, entry]) => [
+        key,
+        /(?:api[_-]?key|token|secret|password|authorization)/i.test(key)
+          ? "[REDACTED]"
+          : redactCodexValue(entry, depth + 1),
+      ]),
   );
 }
 
 function rejectedToolCall(message: string): Record<string, unknown> {
-  return { success: false, contentItems: [{ type: "inputText", text: message }] };
+  return {
+    success: false,
+    contentItems: [{ type: "inputText", text: message }],
+  };
 }
 
 function runtimeRequestKind(method: string): HarnessRuntimeRequestKind | null {
-  if (method === "item/commandExecution/requestApproval" || method === "execCommandApproval") {
+  if (
+    method === "item/commandExecution/requestApproval" ||
+    method === "execCommandApproval"
+  ) {
     return "command_approval";
   }
-  if (method === "item/fileChange/requestApproval" || method === "applyPatchApproval") {
+  if (
+    method === "item/fileChange/requestApproval" ||
+    method === "applyPatchApproval"
+  ) {
     return "file_approval";
   }
-  if (method === "item/permissions/requestApproval") return "permission_approval";
-  if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") {
+  if (method === "item/permissions/requestApproval")
+    return "permission_approval";
+  if (
+    method === "item/tool/requestUserInput" ||
+    method === "tool/requestUserInput"
+  ) {
     return "user_input";
   }
   if (method === "mcpServer/elicitation/request") return "elicitation";
@@ -2157,9 +2703,14 @@ function runtimeRequestResponse(
   request: HarnessRuntimeRequest,
   resolution: HarnessRuntimeRequestResolution,
 ): Record<string, unknown> {
-  if (request.requestKind === "command_approval" || request.requestKind === "file_approval") {
+  if (
+    request.requestKind === "command_approval" ||
+    request.requestKind === "file_approval"
+  ) {
     if (resolution.action === "submit") {
-      throw new Error(`${request.requestKind} does not accept submitted form data`);
+      throw new Error(
+        `${request.requestKind} does not accept submitted form data`,
+      );
     }
     const decisions = {
       accept: "accept",
@@ -2171,7 +2722,9 @@ function runtimeRequestResponse(
   }
   if (request.requestKind === "permission_approval") {
     if (resolution.action === "submit") {
-      throw new Error("permission approval does not accept submitted form data");
+      throw new Error(
+        "permission approval does not accept submitted form data",
+      );
     }
     return {
       permissions: {},
@@ -2187,9 +2740,16 @@ function runtimeRequestResponse(
     return { answers: structuredClone(resolution.answers) };
   }
   if (resolution.action === "submit" && "content" in resolution) {
-    return { action: "accept", content: structuredClone(resolution.content), _meta: null };
+    return {
+      action: "accept",
+      content: structuredClone(resolution.content),
+      _meta: null,
+    };
   }
-  if (resolution.action === "submit" || resolution.action === "accept_for_session") {
+  if (
+    resolution.action === "submit" ||
+    resolution.action === "accept_for_session"
+  ) {
     throw new Error("elicitation submissions require content");
   }
   return { action: resolution.action, content: null, _meta: null };
@@ -2203,7 +2763,14 @@ function parseThreadGoal(value: unknown): HarnessThreadGoal | null {
   if (
     threadId.length === 0 ||
     objective.length === 0 ||
-    !["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"].includes(status)
+    ![
+      "active",
+      "paused",
+      "blocked",
+      "usageLimited",
+      "budgetLimited",
+      "complete",
+    ].includes(status)
   ) {
     return null;
   }
@@ -2213,7 +2780,8 @@ function parseThreadGoal(value: unknown): HarnessThreadGoal | null {
     status: status as HarnessThreadGoal["status"],
     tokenBudget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : null,
     tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
-    timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
+    timeUsedSeconds:
+      typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
     createdAt: typeof goal.createdAt === "number" ? goal.createdAt : 0,
     updatedAt: typeof goal.updatedAt === "number" ? goal.updatedAt : 0,
   };
@@ -2229,18 +2797,31 @@ function lineageFromThread(value: unknown): HarnessThreadLineageEntry {
   const source = record(thread.source);
   const subAgent = source.subAgent ?? source.subagent;
   const subAgentRecord = record(subAgent);
-  const spawn = record(subAgentRecord.thread_spawn ?? subAgentRecord.threadSpawn);
-  const parentThreadId = text(
-    spawn.parent_thread_id ?? spawn.parentThreadId,
-    text(thread.forkedFromId),
-  ) || null;
+  const spawn = record(
+    subAgentRecord.thread_spawn ?? subAgentRecord.threadSpawn,
+  );
+  const parentThreadId =
+    text(
+      spawn.parent_thread_id ?? spawn.parentThreadId,
+      text(thread.forkedFromId),
+    ) || null;
   return {
     threadId: text(thread.id),
     providerSessionId: text(thread.sessionId) || null,
     parentThreadId,
-    depth: typeof spawn.depth === "number" ? spawn.depth : parentThreadId === null ? 0 : 1,
-    nickname: text(thread.agentNickname, text(spawn.agent_nickname ?? spawn.agentNickname)) || null,
-    role: text(thread.agentRole, text(spawn.agent_role ?? spawn.agentRole)) || null,
+    depth:
+      typeof spawn.depth === "number"
+        ? spawn.depth
+        : parentThreadId === null
+          ? 0
+          : 1,
+    nickname:
+      text(
+        thread.agentNickname,
+        text(spawn.agent_nickname ?? spawn.agentNickname),
+      ) || null,
+    role:
+      text(thread.agentRole, text(spawn.agent_role ?? spawn.agentRole)) || null,
     status: threadStatus(thread.status),
   };
 }
@@ -2274,17 +2855,27 @@ function isBoundCodexNotification(method: string): boolean {
   );
 }
 
-function safeRequestResponse(method: string, action: "decline" | "cancel" = "decline"): Record<string, unknown> {
+function safeRequestResponse(
+  method: string,
+  action: "decline" | "cancel" = "decline",
+): Record<string, unknown> {
   if (method === "item/permissions/requestApproval") {
     return { permissions: {}, scope: "turn" };
   }
   if (method === "mcpServer/elicitation/request") {
     return { action, content: null, _meta: null };
   }
-  if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") {
+  if (
+    method === "item/tool/requestUserInput" ||
+    method === "tool/requestUserInput"
+  ) {
     return { answers: {} };
   }
-  if (method.includes("requestApproval") || method === "execCommandApproval" || method === "applyPatchApproval") {
+  if (
+    method.includes("requestApproval") ||
+    method === "execCommandApproval" ||
+    method === "applyPatchApproval"
+  ) {
     return { decision: action };
   }
   return {};

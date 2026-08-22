@@ -28,6 +28,7 @@ fn codex_plan_mode_is_qualified_and_selected_on_turn_start() {
             model: None,
             instructions: "Author a plan without editing files.".to_owned(),
             collaboration_mode: "plan".to_owned(),
+            include_collaboration_mode_instructions: true,
         },
         vec![test_tool()].into_iter(),
         None,
@@ -48,6 +49,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             model: None,
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: true,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -124,6 +126,7 @@ fn provider_contract_preserves_the_opencode_tag() {
             model: Some("openrouter/deepseek/deepseek-v4-flash-0731".to_owned()),
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: false,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -151,6 +154,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
             model: None,
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: true,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -210,6 +214,7 @@ fn codex_provider_rejects_an_event_above_the_four_megabyte_hard_limit() {
             model: None,
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: true,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),

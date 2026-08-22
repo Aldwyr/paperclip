@@ -273,6 +273,9 @@ type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   queueState?: "queued";
   queueTargetRunId?: string | null;
   queueReason?: "hold" | "active_run" | "other";
+  consumedByRunId?: string | null;
+  conversationAnchorAt?: Date | string | null;
+  conversationAnchorSequence?: number;
 };
 
 const FEEDBACK_TERMS_URL = import.meta.env.VITE_FEEDBACK_TERMS_URL?.trim() || "https://paperclip.ing/tos";
@@ -1224,9 +1227,37 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     const runMetaByCommentId = new Map<string, { runId: string; runAgentId: string | null; interruptedRunId: string | null }>();
     const followUpCommentIds = new Set<string>();
     const agentIdByRunId = new Map<string, string>();
+    const inputPlacementByCommentId = new Map<
+      string,
+      { runId: string; anchorAt: string; sequence: number; anchorMs: number }
+    >();
 
     for (const run of resolvedLinkedRuns) {
       agentIdByRunId.set(run.runId, run.agentId);
+      const batchedIds = Array.isArray(run.wakeCommentIds)
+        ? run.wakeCommentIds.filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          )
+        : [];
+      const fallbackId =
+        typeof run.wakeCommentId === "string" && run.wakeCommentId.length > 0
+          ? run.wakeCommentId
+          : typeof run.contextCommentId === "string" && run.contextCommentId.length > 0
+            ? run.contextCommentId
+            : null;
+      const inputIds = batchedIds.length > 0 ? batchedIds : fallbackId ? [fallbackId] : [];
+      const anchorAt = run.startedAt ?? run.createdAt;
+      const anchorMs = new Date(anchorAt).getTime();
+      inputIds.forEach((commentId, sequence) => {
+        const existing = inputPlacementByCommentId.get(commentId);
+        if (existing && existing.anchorMs <= anchorMs) return;
+        inputPlacementByCommentId.set(commentId, {
+          runId: run.runId,
+          anchorAt,
+          sequence,
+          anchorMs,
+        });
+      });
     }
     for (const evt of resolvedActivity) {
       if (evt.action !== "issue.comment_added" || !evt.runId) continue;
@@ -1253,7 +1284,18 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
     return comments.map((comment) => {
       const meta = runMetaByCommentId.get(comment.id);
-      const nextComment: IssueDetailComment = meta ? { ...comment, ...meta } : { ...comment };
+      const inputPlacement = inputPlacementByCommentId.get(comment.id);
+      const nextComment: IssueDetailComment = {
+        ...comment,
+        ...(meta ?? {}),
+        ...(inputPlacement
+          ? {
+              consumedByRunId: inputPlacement.runId,
+              conversationAnchorAt: inputPlacement.anchorAt,
+              conversationAnchorSequence: inputPlacement.sequence,
+            }
+          : {}),
+      };
       if (followUpCommentIds.has(comment.id)) {
         nextComment.followUpRequested = true;
       }

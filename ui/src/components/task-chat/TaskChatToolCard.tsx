@@ -41,7 +41,7 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
           expandable ? "cursor-pointer transition-colors hover:bg-muted/60 hover:text-foreground" : "cursor-default",
         )}
       >
-        <RowIcon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        <RowIcon className="h-3.5 w-3.5 shrink-0" aria-hidden data-testid="task-chat-tool-icon" />
         <span className="shrink-0 font-medium leading-none">{item.name}</span>
         {item.target ? (
           <span className="min-w-0 truncate font-mono text-(length:--text-micro) leading-none">{item.target}</span>

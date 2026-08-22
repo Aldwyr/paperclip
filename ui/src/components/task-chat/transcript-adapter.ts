@@ -161,7 +161,10 @@ function scalarValue(value: unknown): string | undefined {
 }
 
 function titleCaseKey(value: string): string {
-  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function safeHttpHref(value: unknown): string | null {
@@ -177,19 +180,19 @@ function safeHttpHref(value: unknown): string | null {
 
 const PROVIDER_DETAIL_KEYS: Record<TaskChatProviderActivityItem["family"], readonly string[]> = {
   plan: ["revision", "syncStatus", "documentRevision", "complete"],
-  tool_execution: ["transport", "operation", "name", "target", "progress", "durationMs", "exitCode", "outputBytes"],
-  research: ["action", "query", "pattern", "url"],
-  delegation: ["action"],
+  tool_execution: ["transport", "operation", "name", "target", "namespace", "readOnly", "status", "progress", "durationMs", "exitCode", "outputBytes"],
+  research: ["action", "status", "query", "pattern", "url"],
+  delegation: ["action", "status"],
   model_identity: ["provider", "requestedModel", "fromModel", "effectiveModel", "reason", "status", "buffering", "summary"],
   context: ["reason", "preTokens", "postTokens", "sameSession"],
   artifact: ["status", "reference", "mediaType", "title", "registered", "transparentBackground", "failure"],
   review: ["state", "scope"],
   hook: ["event", "scope", "status", "blocking", "durationMs", "summary"],
   memory: ["label", "available", "reference"],
-  safety: ["status", "decision", "summary"],
+  safety: ["status", "decision", "targetExecutionId", "summary"],
   terminal: ["origin", "inputClass", "byteCount"],
   wait: ["reason", "status", "plannedDurationMs", "elapsedDurationMs"],
-  provider_notice: ["level", "code", "message", "action"],
+  provider_notice: ["severity", "category", "scope", "recoverable", "userActionable", "summary"],
 };
 
 function providerActivityKey(entry: Extract<TranscriptEntry, { kind: "provider_activity" }>): string {
@@ -327,31 +330,42 @@ export function transcriptToTaskChatItems(
   for (const [i, entry] of entries.entries()) {
     switch (entry.kind) {
       case "thinking": {
-        if (!entry.text) break;
+        const lifecycleOnly = !entry.text;
         if (thinkingIndex >= 0 && thinkingChannel === entry.channel) {
           const it = items[thinkingIndex];
           if (it.kind === "thinking") {
-            it.lines.push(...entry.text.split("\n"));
+            if (entry.text) {
+              it.lines.push(...entry.text.split("\n"));
+              it.lifecycleOnly = false;
+            }
             const startTs = thinkingStartTs.get(thinkingIndex);
             const label = thoughtDurationLabel(startTs, entry.ts);
             if (label) it.summaryLabel = label;
+            if (entry.lifecycle === "completed") it.streaming = false;
           }
         } else {
           items.push({
             id: `${runId}:think:${i}`,
             kind: "thinking",
-            lines: entry.text.split("\n"),
-            streaming: running,
+            lines: entry.text ? entry.text.split("\n") : [],
+            streaming: running && entry.lifecycle !== "completed",
             // Settled history folds its thinking behind the header (v7);
             // the in-flight run streams it expanded.
             collapsed: !running,
             channel: entry.channel,
+            lifecycleOnly,
           });
           thinkingIndex = items.length - 1;
           thinkingChannel = entry.channel;
           thinkingStartTs.set(thinkingIndex, entry.ts);
           messageIndex = -1;
           messageChannel = undefined;
+        }
+        if (entry.lifecycle === "completed") {
+          const it = items[thinkingIndex];
+          if (it?.kind === "thinking") it.streaming = false;
+          thinkingIndex = -1;
+          thinkingChannel = undefined;
         }
         break;
       }
@@ -694,10 +708,62 @@ export function paperclipRunnerHistoryItems(parsed: readonly TaskChatItem[]): Ta
   });
 }
 
+/**
+ * Semantic rows for the Paperclip runner's Codex-style activity disclosure.
+ *
+ * This is intentionally narrower than the stored transcript and the runner
+ * inspector: it keeps work a person can understand or act on while excluding
+ * transport/lifecycle bookkeeping, usage, terminal authority, and the final
+ * response. Logical provider/tool lifecycles have already been coalesced by
+ * `transcriptToTaskChatItems`, so each returned item is one visible "thing".
+ */
+export function paperclipRunnerActivityItems(parsed: readonly TaskChatItem[]): TaskChatItem[] {
+  return parsed.filter((item) => {
+    switch (item.kind) {
+      case "message":
+        return Boolean(item.interstitial && item.text.trim());
+      case "thinking":
+        // A textless reasoning lifecycle drives the live "Thinking…" label,
+        // but repeating it as an empty child row adds no information.
+        return item.lines.some((line) => line.trim().length > 0);
+      case "tool": {
+        const normalizedName = (item.rawName ?? item.name).replaceAll("-", "_").toLowerCase();
+        return normalizedName !== "paperclip_finish";
+      }
+      case "marker":
+        return item.variant === "interrupted";
+      case "protocol":
+        return item.surface === "provider_activity"
+          || item.surface === "workspace_change"
+          || item.surface === "workspace_file"
+          || item.surface === "resource";
+      case "usage":
+      case "status":
+      case "activity_phase":
+      case "interaction":
+      case "turn":
+      case "brief":
+        return false;
+    }
+  });
+}
+
 function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { kind: "thinking" } | { kind: "marker" } | TaskChatProtocolItem)[]): string {
   const counts = new Map<string, number>();
+  const providerCounts = new Map<TaskChatProviderActivityItem["family"], number>();
   let generic = 0;
+  let workspaceFiles = 0;
   for (const item of items) {
+    if (item.kind === "protocol") {
+      if (item.surface === "provider_activity") {
+        providerCounts.set(item.family, (providerCounts.get(item.family) ?? 0) + 1);
+      } else if (item.surface === "workspace_change") {
+        workspaceFiles += item.totals.files || item.files.length;
+      } else if (item.surface === "workspace_file") {
+        workspaceFiles += 1;
+      }
+      continue;
+    }
     if (item.kind !== "tool") continue;
     if (isGenericToolName(item.rawName ?? item.name)) {
       generic += 1;
@@ -719,6 +785,31 @@ function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { 
   const known = new Set(["read", "edit", "terminal", "grep", "search"]);
   const other = [...counts].reduce((n, [family, count]) => n + (known.has(family) ? 0 : count), 0) + generic;
   if (other) phrases.push(`Called ${other} ${other === 1 ? "tool" : "tools"}`);
+  const providerCount = (family: TaskChatProviderActivityItem["family"]) => providerCounts.get(family) ?? 0;
+  const addProvider = (family: TaskChatProviderActivityItem["family"], singular: string, plural: (count: number) => string) => {
+    const count = providerCount(family);
+    if (count) phrases.push(count === 1 ? singular : plural(count));
+  };
+  addProvider("plan", "Updated the plan", (count) => `Updated ${count} plans`);
+  addProvider("research", "Searched once", (count) => `Searched ${count} times`);
+  addProvider("delegation", "Used a subagent", (count) => `Used ${count} subagents`);
+  addProvider("model_identity", "Updated the model", (count) => `Updated the model ${count} times`);
+  addProvider("context", "Compacted context", (count) => `Compacted context ${count} times`);
+  addProvider("artifact", "Handled an artifact", (count) => `Handled ${count} artifacts`);
+  addProvider("review", "Changed review mode", (count) => `Changed review mode ${count} times`);
+  addProvider("hook", "Ran a hook", (count) => `Ran ${count} hooks`);
+  addProvider("memory", "Referenced memory", (count) => `Referenced memory ${count} times`);
+  addProvider("safety", "Ran a safety review", (count) => `Ran ${count} safety reviews`);
+  addProvider("terminal", "Sent terminal input", (count) => `Sent terminal input ${count} times`);
+  addProvider("wait", "Waited", (count) => `Waited ${count} times`);
+  addProvider("provider_notice", "Received a provider notice", (count) => `Received ${count} provider notices`);
+  // A canonical tool-execution row can be the only tool representation for a
+  // provider. Avoid double-counting when the adapter also produced a native
+  // TaskChatToolItem for the same execution.
+  if ([...counts.values()].reduce((total, count) => total + count, generic) === 0) {
+    addProvider("tool_execution", "Ran a tool", (count) => `Ran ${count} tools`);
+  }
+  if (workspaceFiles > 0) phrases.push(`Changed ${workspaceFiles} ${workspaceFiles === 1 ? "file" : "files"}`);
   if (phrases.length > 0) return phrases.join(", ");
   const protocolCount = items.filter((item) => item.kind === "protocol").length;
   if (protocolCount > 0) return protocolCount === 1 ? "Runner activity" : `${protocolCount} runner updates`;

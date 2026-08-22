@@ -44,7 +44,7 @@ describe("provider-neutral events", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["item/completed", { item: { id: "plan-1", type: "plan", text: "Ship it" } }],
       ["item/completed", { item: { id: "exec-1", type: "commandExecution", status: "completed", output: "ok" } }],
-      ["item/completed", { item: { id: "web-1", type: "webSearch", action: { type: "search", query: "PRP" } } }],
+      ["item/completed", { item: { id: "web-1", type: "webSearch", action: { type: "search", query: "PRP" }, results: [{ ref_id: "source-1", title: "Protocol notes", url: "https://example.com/prp", snippet: "Canonical event details" }] } }],
       ["item/completed", { item: { id: "child-1", type: "collabAgentToolCall", tool: "spawnAgent" } }],
       ["model/rerouted", { turnId: "turn-1", fromModel: "gpt-5", toModel: "gpt-5.1", reason: "capacity" }],
       ["thread/compacted", { itemId: "compact-1" }],
@@ -61,6 +61,27 @@ describe("provider-neutral events", () => {
     expect(mapped).toHaveLength(cases.length);
     for (const event of mapped) expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
     expect(JSON.stringify(mapped.find((entry) => entry.eventType === "terminal.input.sent"))).not.toContain("secret input");
+    expect(mapped.find((entry) => entry.eventType === "research.completed")?.payload.sources).toEqual([{
+      sourceId: "source-1",
+      title: "Protocol notes",
+      url: "https://example.com/prp",
+      snippet: "Canonical event details",
+    }]);
+  });
+
+  it("bounds and filters Codex research sources before they enter PRP", () => {
+    const event = canonicalProviderEventsFromCodex("item/completed", {
+      item: {
+        id: "web-1",
+        type: "webSearch",
+        results: [
+          { ref_id: "good", title: "Good", url: "https://example.com/good", snippet: "x".repeat(5000) },
+          { ref_id: "unsafe", title: "Unsafe", url: "file:///etc/passwd" },
+        ],
+      },
+    })[0]!;
+    expect(event.payload.sources).toEqual([expect.objectContaining({ sourceId: "good", url: "https://example.com/good", snippet: "x".repeat(4000) })]);
+    expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
   });
 
   it("classifies only structured OpenCode parts and never assistant prose", () => {

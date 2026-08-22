@@ -40,6 +40,7 @@ import {
   type AcpxRuntimeFactory,
   type AcpxRuntimeIdentity,
   type AcpxRuntimePermissionContext,
+  type AcpxRuntimeUsage,
 } from "./acpx-runtime-host.js";
 import {
   ACPX_DRIVER_KIND,
@@ -183,6 +184,7 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       },
       runtimeFactory: this.#options.runtimeFactory,
       onSpawn: this.#options.onSpawn,
+      onUsage: (usage) => session?.acceptUsage(usage),
       onDiagnostic: this.#options.onDiagnostic,
     });
     try {
@@ -441,6 +443,22 @@ class AcpxHarnessSession implements HarnessSession {
       }, { turnId, itemId: call.callId });
       throw error;
     }
+  }
+
+  acceptUsage(usage: AcpxRuntimeUsage): void {
+    const turnId = this.#activeTurnId;
+    if (!turnId) return;
+    this.#captureUsage({
+      cumulative: {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cachedReadTokens: usage.cachedReadTokens,
+        cachedWriteTokens: usage.cachedWriteTokens,
+        thoughtTokens: usage.thoughtTokens,
+        totalTokens: usage.totalTokens,
+      },
+      cost: usage.cost,
+    }, turnId, `${turnId}:usage-live:${this.#sourceSequence + 1}`);
   }
 
   async read(): Promise<Record<string, unknown>> {

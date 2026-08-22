@@ -85,7 +85,8 @@
     "patchedDependencies": {
       "embedded-postgres@18.1.0-beta.16": "patches/embedded-postgres@18.1.0-beta.16.patch",
       "acpx@0.13.1": "patches/acpx@0.13.1.patch",
-      "pi-acp@0.0.33": "patches/pi-acp@0.0.33.patch"
+      "pi-acp@0.0.33": "patches/pi-acp@0.0.33.patch",
+      "@agentclientprotocol/claude-agent-acp@0.70.0": "patches/@agentclientprotocol__claude-agent-acp@0.70.0.patch"
     },
     "overrides": {
       "rollup": ">=4.59.0",

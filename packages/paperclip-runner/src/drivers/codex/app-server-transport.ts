@@ -3,6 +3,20 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 export interface CodexRpcNotification {
   method: string;
   params: Record<string, unknown>;
+  /** Internal-only correlation retained outside provider params and canonical PRP payloads. */
+  paperclipTrace?: {
+    sourceEventId: string;
+    sourceEventType: string;
+  };
+}
+
+export interface CodexTraceInterpretation {
+  sourceEventId: string;
+  sourceEventType: string;
+  providerMethod: string;
+  disposition: "mapped" | "ignored" | "rejected";
+  emittedEventIds: string[];
+  reason: string;
 }
 
 export interface CodexRpcServerRequest extends CodexRpcNotification {
@@ -14,7 +28,10 @@ export type CodexServerRequestHandler = (
 ) => Promise<Record<string, unknown>>;
 
 export interface CodexAppServerTransport {
-  request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+  request(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
   notify(method: string, params?: Record<string, unknown>): void;
   notifications(): AsyncIterable<CodexRpcNotification>;
   setServerRequestHandler(handler: CodexServerRequestHandler): void;
@@ -25,6 +42,8 @@ export interface CodexAppServerTransport {
     turnId: string;
     itemId: string;
   }): Promise<void>;
+  /** Records post-rehydration driver mapping without affecting run authority. */
+  recordTraceInterpretation?(input: CodexTraceInterpretation): void;
 }
 
 export interface CodexTransportProcessInfo {
@@ -58,7 +77,10 @@ class BoundedAsyncQueue<T> implements AsyncIterable<T> {
       waiter.resolve({ value, done: false });
       return true;
     }
-    if (this.#values.length >= this.maxValues || this.#queuedBytes + bytes > this.maxBytes) {
+    if (
+      this.#values.length >= this.maxValues ||
+      this.#queuedBytes + bytes > this.maxBytes
+    ) {
       return false;
     }
     this.#values.push({ value, bytes });
@@ -115,10 +137,15 @@ class BoundedLineDecoder {
       const end = newline < 0 ? incoming.length : newline;
       const segment = incoming.subarray(offset, end);
       if (this.#buffer.length + segment.length > this.maxLineBytes) {
-        this.#fail(new Error(`codex app-server line exceeded ${this.maxLineBytes} bytes`));
+        this.#fail(
+          new Error(
+            `codex app-server line exceeded ${this.maxLineBytes} bytes`,
+          ),
+        );
         return;
       }
-      if (segment.length > 0) this.#buffer = Buffer.concat([this.#buffer, segment]);
+      if (segment.length > 0)
+        this.#buffer = Buffer.concat([this.#buffer, segment]);
       if (newline < 0) return;
       const line = this.#buffer;
       this.#buffer = Buffer.alloc(0);
@@ -131,7 +158,9 @@ class BoundedLineDecoder {
   end(): void {
     if (this.#closed) return;
     if (this.#buffer.length > 0) {
-      this.#fail(new Error("codex app-server ended with an unterminated JSON-RPC line"));
+      this.#fail(
+        new Error("codex app-server ended with an unterminated JSON-RPC line"),
+      );
     }
     this.#closed = true;
   }
@@ -185,7 +214,9 @@ export function createSanitizedCodexEnvironment(
   return environment;
 }
 
-export function sanitizedEnvironmentKeys(source: NodeJS.ProcessEnv = process.env): string[] {
+export function sanitizedEnvironmentKeys(
+  source: NodeJS.ProcessEnv = process.env,
+): string[] {
   return Object.keys(createSanitizedCodexEnvironment(source)).sort();
 }
 
@@ -195,10 +226,22 @@ export function redactCodexDiagnostic(message: string): string {
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, "Basic [REDACTED]")
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
-    .replace(/([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi, "$1[REDACTED]")
-    .replace(/(["'](?:api[_-]?key|token|secret|password|authorization)["']\s*:\s*["'])[^"']+/gi, "$1[REDACTED]")
-    .replace(/(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+/gi, "$1=[REDACTED]")
-    .replace(/(PAPERCLIP_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY)=[^\s]+/g, "$1=[REDACTED]");
+    .replace(
+      /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
+      /(["'](?:api[_-]?key|token|secret|password|authorization)["']\s*:\s*["'])[^"']+/gi,
+      "$1[REDACTED]",
+    )
+    .replace(
+      /(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+/gi,
+      "$1=[REDACTED]",
+    )
+    .replace(
+      /(PAPERCLIP_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY)=[^\s]+/g,
+      "$1=[REDACTED]",
+    );
 }
 
 function proxyContainsCredentials(value: string): boolean {
@@ -318,7 +361,10 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
 
   constructor(options: ProcessCodexTransportOptions = {}) {
     this.#onDiagnostic = options.onDiagnostic;
-    this.#maxLineBytes = positiveLimit(options.maxLineBytes, DEFAULT_MAX_LINE_BYTES);
+    this.#maxLineBytes = positiveLimit(
+      options.maxLineBytes,
+      DEFAULT_MAX_LINE_BYTES,
+    );
     this.#maxPendingRequests = positiveLimit(
       options.maxPendingRequests,
       DEFAULT_MAX_PENDING_REQUESTS,
@@ -327,7 +373,8 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       options.maxInflightServerRequests,
       DEFAULT_MAX_INFLIGHT_SERVER_REQUESTS,
     );
-    this.#processGroup = options.processGroup === true && process.platform !== "win32";
+    this.#processGroup =
+      options.processGroup === true && process.platform !== "win32";
     this.#startedAt = new Date().toISOString();
     this.#closeGraceMs = positiveLimit(options.closeGraceMs, 1_000);
     this.#onProcess = options.onProcess;
@@ -335,17 +382,24 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       this.#resolveExit = resolve;
     });
     this.#notifications = new BoundedAsyncQueue(
-      positiveLimit(options.maxQueuedNotifications, DEFAULT_MAX_QUEUED_NOTIFICATIONS),
+      positiveLimit(
+        options.maxQueuedNotifications,
+        DEFAULT_MAX_QUEUED_NOTIFICATIONS,
+      ),
       positiveLimit(
         options.maxQueuedNotificationBytes,
         DEFAULT_MAX_QUEUED_NOTIFICATION_BYTES,
       ),
     );
-    this.#process = spawn(options.command ?? "codex", options.args ?? ["app-server"], {
-      env: options.environment ?? createSanitizedCodexEnvironment(),
-      stdio: "pipe",
-      detached: this.#processGroup,
-    });
+    this.#process = spawn(
+      options.command ?? "codex",
+      options.args ?? ["app-server"],
+      {
+        env: options.environment ?? createSanitizedCodexEnvironment(),
+        stdio: "pipe",
+        detached: this.#processGroup,
+      },
+    );
     this.#onProcess?.(this.processInfo());
     this.#stdoutDecoder = new BoundedLineDecoder(
       this.#maxLineBytes,
@@ -355,11 +409,18 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     this.#stderrDecoder = new BoundedLineDecoder(
       MAX_DIAGNOSTIC_LINE_BYTES,
       (line) => this.#onDiagnostic?.(redactCodexDiagnostic(line)),
-      () => this.#onDiagnostic?.("codex app-server diagnostic line exceeded retention limit"),
+      () =>
+        this.#onDiagnostic?.(
+          "codex app-server diagnostic line exceeded retention limit",
+        ),
     );
-    this.#process.stdout.on("data", (chunk: Buffer) => this.#stdoutDecoder.write(chunk));
+    this.#process.stdout.on("data", (chunk: Buffer) =>
+      this.#stdoutDecoder.write(chunk),
+    );
     this.#process.stdout.on("end", () => this.#stdoutDecoder.end());
-    this.#process.stderr.on("data", (chunk: Buffer) => this.#stderrDecoder.write(chunk));
+    this.#process.stderr.on("data", (chunk: Buffer) =>
+      this.#stderrDecoder.write(chunk),
+    );
     this.#process.stderr.on("end", () => this.#stderrDecoder.end());
     this.#process.on("error", (error) => this.#fatal(error));
     this.#process.on("exit", (code, signal) => {
@@ -378,11 +439,17 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     });
   }
 
-  request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (this.#closed) return Promise.reject(new Error("codex app-server transport is closed"));
+  request(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (this.#closed)
+      return Promise.reject(new Error("codex app-server transport is closed"));
     if (this.#pending.size >= this.#maxPendingRequests) {
       return Promise.reject(
-        new Error(`codex app-server pending request limit ${this.#maxPendingRequests} exceeded`),
+        new Error(
+          `codex app-server pending request limit ${this.#maxPendingRequests} exceeded`,
+        ),
       );
     }
     const id = this.#nextId++;
@@ -422,13 +489,17 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       if (firstClose) this.#signal("SIGTERM");
       const exited = await Promise.race([
         this.#exitPromise.then(() => true),
-        new Promise<false>((resolve) => setTimeout(() => resolve(false), this.#closeGraceMs)),
+        new Promise<false>((resolve) =>
+          setTimeout(() => resolve(false), this.#closeGraceMs),
+        ),
       ]);
       if (!exited && !this.#exited) {
         this.#signal("SIGKILL");
         await Promise.race([
           this.#exitPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, this.#closeGraceMs)),
+          new Promise<void>((resolve) =>
+            setTimeout(resolve, this.#closeGraceMs),
+          ),
         ]);
       }
     }
@@ -437,7 +508,7 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
   processInfo(): CodexTransportProcessInfo {
     return {
       pid: this.#process.pid ?? null,
-      processGroupId: this.#processGroup ? this.#process.pid ?? null : null,
+      processGroupId: this.#processGroup ? (this.#process.pid ?? null) : null,
       startedAt: this.#startedAt,
       exited: this.#exited,
       exitCode: this.#exitCode,
@@ -462,7 +533,9 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     if (this.#closed) throw new Error("codex app-server transport is closed");
     const serialized = JSON.stringify(message);
     if (Buffer.byteLength(serialized) > this.#maxLineBytes) {
-      throw new Error(`outbound codex JSON-RPC line exceeded ${this.#maxLineBytes} bytes`);
+      throw new Error(
+        `outbound codex JSON-RPC line exceeded ${this.#maxLineBytes} bytes`,
+      );
     }
     this.#process.stdin.write(`${serialized}\n`);
   }
@@ -476,56 +549,87 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
       return;
     }
     if (!isRecord(value)) {
-      this.#fatal(new Error("codex app-server emitted a non-object JSON-RPC message"));
+      this.#fatal(
+        new Error("codex app-server emitted a non-object JSON-RPC message"),
+      );
       return;
     }
     const message = value;
     const hasResult = Object.hasOwn(message, "result");
     const hasError = Object.hasOwn(message, "error");
     if (typeof message.id === "number" && (hasResult || hasError)) {
-      if (!Number.isSafeInteger(message.id) || message.id <= 0 || hasResult === hasError) {
-        this.#fatal(new Error("codex app-server emitted a malformed JSON-RPC response"));
+      if (
+        !Number.isSafeInteger(message.id) ||
+        message.id <= 0 ||
+        hasResult === hasError
+      ) {
+        this.#fatal(
+          new Error("codex app-server emitted a malformed JSON-RPC response"),
+        );
         return;
       }
       const pending = this.#pending.get(message.id);
       if (pending === undefined) {
-        this.#fatal(new Error("codex app-server responded to an unknown request id"));
+        this.#fatal(
+          new Error("codex app-server responded to an unknown request id"),
+        );
         return;
       }
       this.#pending.delete(message.id);
       if (hasError) {
-        pending.reject(new CodexRpcError(
-          redactCodexDiagnostic(boundedJson(message.error)),
-          rpcErrorCode(message.error),
-        ));
+        pending.reject(
+          new CodexRpcError(
+            redactCodexDiagnostic(boundedJson(message.error)),
+            rpcErrorCode(message.error),
+          ),
+        );
       } else if (isRecord(message.result)) {
         pending.resolve(message.result);
       } else {
-        const error = new Error("codex app-server response result was not an object");
+        const error = new Error(
+          "codex app-server response result was not an object",
+        );
         pending.reject(error);
         this.#fatal(error);
       }
       return;
     }
-    if (typeof message.method !== "string" || message.method.length === 0 || hasResult || hasError) {
-      this.#fatal(new Error("codex app-server emitted a malformed JSON-RPC message"));
+    if (
+      typeof message.method !== "string" ||
+      message.method.length === 0 ||
+      hasResult ||
+      hasError
+    ) {
+      this.#fatal(
+        new Error("codex app-server emitted a malformed JSON-RPC message"),
+      );
       return;
     }
     if (message.params !== undefined && !isRecord(message.params)) {
-      this.#fatal(new Error("codex app-server message params were not an object"));
+      this.#fatal(
+        new Error("codex app-server message params were not an object"),
+      );
       return;
     }
     const params = message.params ?? {};
     if (message.id !== undefined) {
       if (!isValidServerRequestId(message.id)) {
-        this.#fatal(new Error("codex app-server request id had an invalid type"));
+        this.#fatal(
+          new Error("codex app-server request id had an invalid type"),
+        );
         return;
       }
-      this.#handleServerRequest({ id: message.id, method: message.method, params });
+      this.#handleServerRequest({
+        id: message.id,
+        method: message.method,
+        params,
+      });
       return;
     }
     if (!this.#notifications.push({ method: message.method, params }, bytes)) {
-      this.#fatal(new Error("codex app-server notification queue limit exceeded"));
+      this.#fatal(
+        new Error("codex app-server notification queue limit exceeded"),
+      );
     }
   }
 
@@ -533,26 +637,34 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
     if (this.#inflightServerRequests >= this.#maxInflightServerRequests) {
       this.#write({
         id: request.id,
-        error: { code: -32_001, message: "Client request queue limit exceeded." },
+        error: {
+          code: -32_001,
+          message: "Client request queue limit exceeded.",
+        },
       });
       return;
     }
     this.#inflightServerRequests += 1;
-    void this.#serverRequestHandler(request).then(
-      (result) => {
-        if (!this.#closed) this.#write({ id: request.id, result });
-      },
-      (error: unknown) => {
-        if (!this.#closed) {
-          this.#write({
-            id: request.id,
-            error: { code: -32_000, message: redactCodexDiagnostic(String(error)) },
-          });
-        }
-      },
-    ).finally(() => {
-      this.#inflightServerRequests -= 1;
-    });
+    void this.#serverRequestHandler(request)
+      .then(
+        (result) => {
+          if (!this.#closed) this.#write({ id: request.id, result });
+        },
+        (error: unknown) => {
+          if (!this.#closed) {
+            this.#write({
+              id: request.id,
+              error: {
+                code: -32_000,
+                message: redactCodexDiagnostic(String(error)),
+              },
+            });
+          }
+        },
+      )
+      .finally(() => {
+        this.#inflightServerRequests -= 1;
+      });
   }
 
   #fatal(error: Error): void {
@@ -583,7 +695,9 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 function isValidServerRequestId(value: unknown): value is string | number {
   return (
     (typeof value === "number" && Number.isSafeInteger(value)) ||
-    (typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 256)
+    (typeof value === "string" &&
+      value.length > 0 &&
+      Buffer.byteLength(value) <= 256)
   );
 }
 

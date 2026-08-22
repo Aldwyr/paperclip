@@ -641,6 +641,8 @@ fn provider_descriptor(
             "provider": provider_kind_name(value.kind),
             "driver": if value.kind == crate::codex_provider::ProviderKind::Opencode { "opencode_server" } else { "codex_app_server" },
             "model": value.model,
+            "collaborationMode": value.collaboration_mode,
+            "collaborationInstructions": value.include_collaboration_mode_instructions,
             "executionKind": "local_process",
             "providerVersion": if value.kind == crate::codex_provider::ProviderKind::Opencode { "1.18.17" } else { "unqualified" },
             "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
@@ -1044,6 +1046,49 @@ fn poll_provider(
                 )));
             }
         };
+        let trace_frame_id = runtime.take_provider_trace_frame_id();
+        let trace_first_source_seq = state.next_source_seq;
+        let (trace_rule_id, trace_disposition, trace_dropped_fields, trace_reason) = match &event {
+            crate::codex_provider::ProviderEvent::ToolCall { .. } => (
+                "provider.tool_call",
+                "mapped",
+                Vec::new(),
+                "Provider tool call mapped to semantic_tool.input",
+            ),
+            crate::codex_provider::ProviderEvent::SemanticResult { .. } => (
+                "provider.semantic_result",
+                "mapped",
+                Vec::new(),
+                "Provider semantic result mapped independently from final prose",
+            ),
+            crate::codex_provider::ProviderEvent::RuntimeRequest { .. } => (
+                "provider.runtime_request",
+                "mapped",
+                Vec::new(),
+                "Provider request mapped to runtime_request.created",
+            ),
+            crate::codex_provider::ProviderEvent::Notification { method, .. } if matches!(
+                method.as_str(),
+                "turn/started" | "turn/completed" | "item/started" | "item/delta" | "item/completed" | "thread/tokenUsage/updated" | "provider/budgetReached" | "acpx/process"
+            ) => (
+                "provider.notification.known",
+                "mapped",
+                Vec::new(),
+                "Known provider notification mapped to canonical PRP event",
+            ),
+            crate::codex_provider::ProviderEvent::Notification { .. } => (
+                "provider.notification.unknown",
+                "generic",
+                vec!["params".to_owned()],
+                "Unknown provider notification retained as harness.diagnostic without provider-only fields",
+            ),
+            crate::codex_provider::ProviderEvent::Exited => (
+                "provider.process.exited",
+                "rejected",
+                Vec::new(),
+                "Provider exited before a new frame could be mapped",
+            ),
+        };
         match event {
             crate::codex_provider::ProviderEvent::ToolCall {
                 call_id,
@@ -1230,6 +1275,20 @@ fn poll_provider(
                     "native_runner_process_exited: local provider exited unexpectedly",
                 ));
             }
+        }
+        if let Some(frame_id) = trace_frame_id {
+            let emitted_event_ids = (trace_first_source_seq..state.next_source_seq)
+                .map(|source_seq| format!("event_{}_{source_seq:06}", state.runner_instance_id))
+                .collect::<Vec<_>>();
+            runtime.record_provider_trace_interpretation(
+                frame_id,
+                "rust_durable_normalization",
+                trace_rule_id,
+                trace_disposition,
+                emitted_event_ids,
+                trace_dropped_fields,
+                trace_reason,
+            );
         }
         if let Some(cursor) = runtime.durable_event_cursor() {
             state.provider_event_cursor = Some(cursor.to_owned());

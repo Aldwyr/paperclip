@@ -16,6 +16,7 @@ const artifactsRoot = resolve(scratchRoot, "artifacts");
 const publicationRoot = process.env.PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR === undefined
   ? undefined
   : resolve(process.env.PAPERCLIP_CLEAN_CONSUMER_OUTPUT_DIR);
+const pnpmInvocation = resolvePnpmInvocation();
 await mkdir(artifactsRoot, { recursive: true });
 
 try {
@@ -92,7 +93,10 @@ try {
 
 async function pack(packageRoot, destination) {
   const before = new Set(await readdir(destination));
-  run("pnpm", ["pack", "--pack-destination", destination], packageRoot, { quiet: true });
+  // Every package was already built in the workspace. Ignore package-local
+  // prepack scripts here so installed, patched dependencies can be archived
+  // without depending on their unpublished development toolchains.
+  run("npm", ["pack", "--ignore-scripts", "--pack-destination", destination], packageRoot, { quiet: true });
   const created = (await readdir(destination))
     .filter((entry) => entry.endsWith(".tgz") && !before.has(entry))
     .sort();
@@ -103,21 +107,67 @@ async function pack(packageRoot, destination) {
 }
 
 async function packRunnerRuntimeDependencies(destination) {
-  const ajvRoot = resolve(runnerRoot, "node_modules/ajv");
-  const ajvModules = dirname(await realpath(ajvRoot));
-  const packageNames = [
-    "ajv",
-    "fast-deep-equal",
-    "fast-uri",
-    "json-schema-traverse",
-    "require-from-string",
-  ];
-  const tarballs = {};
-  for (const packageName of packageNames) {
-    const packageRoot = packageName === "ajv" ? ajvRoot : resolve(ajvModules, packageName);
-    tarballs[packageName] = await pack(packageRoot, destination);
+  const runnerManifest = JSON.parse(await readFile(resolve(runnerRoot, "package.json"), "utf8"));
+  const overrides = {};
+  const packed = new Map();
+  const queued = new Set();
+  const queue = [];
+
+  const enqueue = async (packageRoot, overrideKey) => {
+    const concreteRoot = await realpath(packageRoot);
+    const manifest = JSON.parse(await readFile(resolve(concreteRoot, "package.json"), "utf8"));
+    if (typeof manifest.name !== "string" || typeof manifest.version !== "string") {
+      throw new Error(`Runtime dependency at ${concreteRoot} has no exact package identity`);
+    }
+    const identity = `${manifest.name}@${manifest.version}`;
+    let tarball = packed.get(identity);
+    if (tarball === undefined) {
+      tarball = await pack(concreteRoot, destination);
+      packed.set(identity, tarball);
+    }
+    overrides[overrideKey] = tarball;
+    if (!queued.has(identity)) {
+      queued.add(identity);
+      queue.push({ root: concreteRoot, manifest });
+    }
+  };
+
+  for (const packageName of Object.keys(runnerManifest.dependencies ?? {}).sort()) {
+    await enqueue(resolve(runnerRoot, "node_modules", packageName), packageName);
   }
-  return tarballs;
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const required = current.manifest.dependencies ?? {};
+    const optional = current.manifest.optionalDependencies ?? {};
+    const peers = current.manifest.peerDependencies ?? {};
+    const optionalPeers = current.manifest.peerDependenciesMeta ?? {};
+    for (const dependencyName of Object.keys({ ...required, ...optional, ...peers }).sort()) {
+      const dependencyRoot = await resolveInstalledDependencyRoot(current.root, dependencyName);
+      if (dependencyRoot === null) {
+        if (dependencyName in optional || optionalPeers[dependencyName]?.optional === true) continue;
+        throw new Error(`${current.manifest.name}@${current.manifest.version} dependency ${dependencyName} is not installed`);
+      }
+      await enqueue(
+        dependencyRoot,
+        `${current.manifest.name}@${current.manifest.version}>${dependencyName}`,
+      );
+    }
+  }
+  return overrides;
+}
+
+async function resolveInstalledDependencyRoot(packageRoot, dependencyName) {
+  let cursor = packageRoot;
+  while (true) {
+    const candidate = resolve(cursor, "node_modules", dependencyName);
+    try {
+      return await realpath(candidate);
+    } catch {
+      const parent = dirname(cursor);
+      if (parent === cursor) return null;
+      cursor = parent;
+    }
+  }
 }
 
 async function stageRunnerdArtifact(destination) {
@@ -136,7 +186,7 @@ async function stageRunnerdArtifact(destination) {
 
 function localOverrides(tarballs) {
   return Object.fromEntries(
-    Object.entries(tarballs).map(([packageName, tarball]) => [packageName, `file:${tarball}`]),
+    Object.entries(tarballs).map(([selector, tarball]) => [selector, `file:${tarball}`]),
   );
 }
 
@@ -436,10 +486,8 @@ function installAndRun(consumerRoot, extraEnv = {}) {
 
 function run(command, args, cwd, { quiet = false, env = {} } = {}) {
   const usesPnpm = command === "pnpm";
-  const executable = usesPnpm
-    ? (process.platform === "win32" ? "corepack.cmd" : "corepack")
-    : command;
-  const effectiveArgs = usesPnpm ? ["pnpm@9.15.4", ...args] : args;
+  const executable = usesPnpm ? pnpmInvocation.executable : command;
+  const effectiveArgs = usesPnpm ? [...pnpmInvocation.prefixArgs, ...args] : args;
   const result = spawnSync(executable, effectiveArgs, {
     cwd,
     encoding: "utf8",
@@ -456,6 +504,29 @@ function run(command, args, cwd, { quiet = false, env = {} } = {}) {
     if (result.signal !== null) process.stderr.write(`Terminated by signal ${result.signal}\n`);
     throw new Error(`${command} ${args.join(" ")} failed in ${cwd}`);
   }
+}
+
+function resolvePnpmInvocation() {
+  const corepack = process.platform === "win32" ? "corepack.cmd" : "corepack";
+  const corepackProbe = spawnSync(corepack, ["pnpm@9.15.4", "--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (corepackProbe.status === 0 && corepackProbe.stdout.trim() === "9.15.4") {
+    return { executable: corepack, prefixArgs: ["pnpm@9.15.4"] };
+  }
+
+  const direct = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  const directProbe = spawnSync(direct, ["--version"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (directProbe.status === 0 && directProbe.stdout.trim() === "9.15.4") {
+    return { executable: direct, prefixArgs: [] };
+  }
+  throw new Error(
+    "Clean-consumer verification requires pnpm 9.15.4 via corepack or the active PATH",
+  );
 }
 
 function capture(command, args, cwd) {

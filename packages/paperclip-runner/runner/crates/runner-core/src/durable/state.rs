@@ -1528,6 +1528,32 @@ fn execute_command_effect(
             1,
             "provider turn interruption requested".to_owned(),
         )),
+        "request.resolve" if state.provider_config.is_some() => {
+            let request_id = payload
+                .get("requestId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("request.resolve payload.requestId is required")
+                })?;
+            let action = payload
+                .pointer("/resolution/action")
+                .or_else(|| payload.get("action"))
+                .and_then(Value::as_str)
+                .unwrap_or("cancel");
+            if !["accept", "accept_for_session", "decline", "cancel"].contains(&action) {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    "provider runtime request resolution action is unsupported".to_owned(),
+                ));
+            }
+            Ok((
+                "completed".to_owned(),
+                0,
+                format!("provider runtime request {request_id} resolution admitted"),
+            ))
+        }
         "provider.thread.read" => Ok((
             "completed".to_owned(),
             1,

@@ -3,6 +3,7 @@ import type { TranscriptEntry } from "@/adapters";
 import {
   assembleThreadItems,
   attachSettledTurns,
+  buildActivityPhases,
   buildMergedTurnSummary,
   buildTurnSummary,
   coalesceSettledTurns,
@@ -10,6 +11,7 @@ import {
   flattenSelfTalk,
   isNestableLiveChild,
   ISSUE_BRIEF_ITEM_ID,
+  paperclipRunnerActivityItems,
   paperclipRunnerHistoryItems,
   prependIssueBrief,
   settledRunChildren,
@@ -199,6 +201,102 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     expect(provider && provider.surface === "provider_activity" ? provider.outputTruncated : false).toBe(true);
     expect(file && file.surface === "workspace_file" ? file.preview?.length : 0).toBe(8 * 1024);
     expect(file && file.surface === "workspace_file" ? file.previewTruncated : false).toBe(true);
+  });
+
+  it("turns canonical research sources into safe links and exposes notice metadata", () => {
+    const items = transcriptToTaskChatItems([
+      { kind: "provider_activity", ts: TS, family: "research", eventType: "research.completed", status: "completed", title: "Research", summary: "PRP", payload: { researchId: "research-1", sources: [{ title: "Protocol notes", url: "https://example.com/prp", snippet: "Canonical event details" }, { title: "Unsafe", url: "file:///etc/passwd" }] } },
+      { kind: "provider_activity", ts: TS, family: "provider_notice", eventType: "provider.notice.recorded", status: "informational", title: "Provider notice", summary: "Update configuration", payload: { noticeId: "notice-1", severity: "warning", category: "config", scope: "environment", recoverable: true, userActionable: false } },
+    ], opts);
+    const research = items.find((item) => item.kind === "protocol" && item.surface === "provider_activity" && item.family === "research");
+    const notice = items.find((item) => item.kind === "protocol" && item.surface === "provider_activity" && item.family === "provider_notice");
+    expect(research?.kind === "protocol" && research.surface === "provider_activity" ? research.links : []).toEqual([{
+      label: "Protocol notes",
+      href: "https://example.com/prp",
+      description: "Canonical event details",
+    }]);
+    expect(notice?.kind === "protocol" && notice.surface === "provider_activity" ? notice.details : []).toEqual(expect.arrayContaining([
+      { label: "Severity", value: "warning", mono: false },
+      { label: "Category", value: "config", mono: false },
+      { label: "Scope", value: "environment", mono: false },
+      { label: "Recoverable", value: "Yes", mono: false },
+      { label: "User Actionable", value: "No", mono: false },
+    ]));
+  });
+
+  it("retains every canonical provider family for live and settled rendering", () => {
+    const families = [
+      "plan", "tool_execution", "research", "delegation", "model_identity", "context", "artifact",
+      "review", "hook", "memory", "safety", "terminal", "wait", "provider_notice",
+    ] as const;
+    const entries = families.map((family, index): TranscriptEntry => ({
+      kind: "provider_activity",
+      ts: new Date(Date.parse(TS) + index).toISOString(),
+      family,
+      eventType: `${family}.fixture`,
+      status: index % 2 === 0 ? "running" : "completed",
+      title: family,
+      summary: `Visible ${family}`,
+      payload: { [`${family}Id`]: `${family}-1` },
+    }));
+    const items = transcriptToTaskChatItems(entries, { ...opts, running: true });
+    expect(items.map((item) => item.kind === "protocol" && item.surface === "provider_activity" ? item.family : null))
+      .toEqual(families);
+  });
+});
+
+describe("buildActivityPhases provider summaries", () => {
+  it("includes canonical provider work in the folded activity summary", () => {
+    const provider = (id: string, family: "research" | "hook"): TaskChatItem => ({
+      id,
+      kind: "protocol",
+      surface: "provider_activity",
+      family,
+      eventType: `${family}.completed`,
+      status: "completed",
+      title: family,
+      details: [],
+      steps: [],
+      links: [],
+      children: [],
+    });
+    const phases = buildActivityPhases([
+      { id: "finish", kind: "tool", name: "Paperclip_finish", status: "completed" },
+      provider("research-1", "research"),
+      provider("research-2", "research"),
+      provider("research-3", "research"),
+      provider("hook-1", "hook"),
+      {
+        id: "workspace",
+        kind: "protocol",
+        surface: "workspace_change",
+        changeSetId: "change-1",
+        revision: 1,
+        source: "runner_verified",
+        complete: true,
+        files: [],
+        totals: { files: 2, additions: 1, deletions: 1 },
+        patchArtifactRef: null,
+      },
+    ], false);
+    expect(phases[0]?.summary).toBe("Called 1 tool, Searched 3 times, Ran a hook, Changed 2 files");
+  });
+
+  it("counts canonical tool execution when no native tool row exists", () => {
+    const phases = buildActivityPhases([{
+      id: "provider-tool",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "tool_execution",
+      eventType: "tool.execution.completed",
+      status: "completed",
+      title: "Tool execution",
+      details: [],
+      steps: [],
+      links: [],
+      children: [],
+    }], false);
+    expect(phases[0]?.summary).toBe("Ran a tool");
   });
 });
 
@@ -448,6 +546,21 @@ describe("settledRunChildren (PAP-361)", () => {
 });
 
 describe("paperclip runner semantic channels", () => {
+  it("turns empty reasoning lifecycle frames into a visible thinking item", () => {
+    const parsed = transcriptToTaskChatItems([
+      { kind: "thinking", ts: "2026-08-21T12:00:00.000Z", text: "", lifecycle: "started", channel: "summary" },
+      { kind: "thinking", ts: "2026-08-21T12:00:02.000Z", text: "", lifecycle: "completed", channel: "summary" },
+    ], { runId: "run-empty-reasoning", running: true });
+
+    expect(parsed).toEqual([expect.objectContaining({
+      kind: "thinking",
+      lines: [],
+      streaming: false,
+      lifecycleOnly: true,
+      summaryLabel: "Thought for 2s",
+    })]);
+  });
+
   it("keeps progress/final messages and reasoning summary/detail in distinct items", () => {
     const parsed = transcriptToTaskChatItems([
       { kind: "assistant", ts: TS, text: "Checking.", channel: "progress", delta: true },
@@ -481,6 +594,61 @@ describe("paperclip runner semantic channels", () => {
       "runner",
     ]);
     expect(items).toHaveLength(7);
+  });
+
+  it("projects one semantic activity row per useful logical item", () => {
+    const items: TaskChatItem[] = [
+      { id: "progress", kind: "message", author: "agent", text: "Looking this up.", interstitial: true, channel: "progress" },
+      { id: "final", kind: "message", author: "agent", text: "Finished.", channel: "final" },
+      { id: "empty-thinking", kind: "thinking", lines: [], lifecycleOnly: true },
+      { id: "thinking", kind: "thinking", lines: ["Provider-authored summary"] },
+      { id: "tool", kind: "tool", name: "Search", rawName: "web_search", status: "completed" },
+      { id: "finish", kind: "tool", name: "Paperclip_finish", rawName: "paperclip_finish", status: "completed" },
+      { id: "session", kind: "marker", variant: "session_start", label: "Session started" },
+      { id: "interrupt", kind: "marker", variant: "interrupted", label: "Interrupted" },
+      { id: "usage", kind: "usage", usage: { used: 20, size: 100 } },
+      {
+        id: "research",
+        kind: "protocol",
+        surface: "provider_activity",
+        family: "research",
+        eventType: "research.completed",
+        status: "completed",
+        title: "Research",
+        details: [],
+        steps: [],
+        links: [],
+        children: [],
+      },
+      {
+        id: "result",
+        kind: "protocol",
+        surface: "run_result",
+        disposition: "done",
+        summary: "Finished.",
+        objectiveSatisfied: true,
+        verification: [],
+        remainingWork: [],
+        blocker: null,
+        artifacts: [],
+      },
+      {
+        id: "terminal",
+        kind: "protocol",
+        surface: "run_terminal",
+        turnState: "completed",
+        runState: "succeeded",
+        disposition: "done",
+      },
+    ];
+
+    expect(paperclipRunnerActivityItems(items).map((item) => item.id)).toEqual([
+      "progress",
+      "thinking",
+      "tool",
+      "interrupt",
+      "research",
+    ]);
   });
 });
 

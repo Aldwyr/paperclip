@@ -59,10 +59,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("authorized tool was not registered".into());
                 }
                 let config = request.pointer("/params/config").and_then(Value::as_object);
-                planning_thread = config
-                    .and_then(|value| value.get("include_collaboration_mode_instructions"))
-                    .and_then(Value::as_bool)
-                    == Some(true);
+                planning_thread = request
+                    .pointer("/params/permissions")
+                    .and_then(Value::as_str)
+                    == Some("paperclip-runner-workspace-read-only");
                 for key in [
                     "skills.include_instructions",
                     "include_apps_instructions",

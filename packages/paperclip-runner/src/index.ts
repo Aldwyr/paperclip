@@ -5,6 +5,7 @@ export * from "./contracts/native-execution.js";
 export * from "./contracts/local-runner.js";
 export * from "./contracts/durable-recovery.js";
 export * from "./contracts/codex.js";
+export * from "./contracts/provider-trace.js";
 export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
 export * from "./backends/codex-native-backend.js";

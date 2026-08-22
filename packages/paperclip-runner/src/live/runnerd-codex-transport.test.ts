@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -6,6 +7,7 @@ import { expect, it } from "vitest";
 
 import {
   createCapabilityRunnerdCodexTransport,
+  createSanitizedClaudeManagedEnvironment,
   createSanitizedAwsAgentCoreEnvironment,
   defaultCapabilityRunnerdBinary,
   rehydrateRunnerdUsageNotification,
@@ -13,9 +15,27 @@ import {
   unwrapRunnerdProviderNotifications,
 } from "./runnerd-codex-transport.js";
 
+it("passes only runtime basics and the Anthropic key to a Claude Managed runner", () => {
+  const sanitized = createSanitizedClaudeManagedEnvironment({
+    PATH: "/bin",
+    HOME: "/Users/tester",
+    ANTHROPIC_API_KEY: "anthropic-canary",
+    PAPERCLIP_API_KEY: "paperclip-canary",
+    PAPERCLIP_API_URL: "https://paperclip.example.test",
+    OPENROUTER_API_KEY: "openrouter-canary",
+    AWS_SECRET_ACCESS_KEY: "aws-canary",
+  });
+  expect(sanitized).toEqual({
+    PATH: "/bin",
+    HOME: "/Users/tester",
+    ANTHROPIC_API_KEY: "anthropic-canary",
+  });
+});
+
 it("passes only workload-identity metadata to the AgentCore runner", () => {
   const sanitized = createSanitizedAwsAgentCoreEnvironment({
     PATH: "/bin",
+    HOME: "/Users/tester",
     AWS_PROFILE: "paperclip-dev",
     AWS_REGION: "us-east-1",
     AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
@@ -28,6 +48,7 @@ it("passes only workload-identity metadata to the AgentCore runner", () => {
   });
   expect(sanitized).toEqual({
     PATH: "/bin",
+    HOME: "/Users/tester",
     AWS_PROFILE: "paperclip-dev",
     AWS_REGION: "us-east-1",
     AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
@@ -36,11 +57,17 @@ it("passes only workload-identity metadata to the AgentCore runner", () => {
 });
 
 it("rehydrates normalized usage with the provider thread binding", () => {
-  expect(rehydrateRunnerdUsageNotification({
-    providerSessionId: "thread-1",
-    cumulative: { inputTokens: 10 },
-    runDelta: { inputTokens: 3 },
-  }, "fallback-thread", "turn-1")).toMatchObject({
+  expect(
+    rehydrateRunnerdUsageNotification(
+      {
+        providerSessionId: "thread-1",
+        cumulative: { inputTokens: 10 },
+        runDelta: { inputTokens: 3 },
+      },
+      "fallback-thread",
+      "turn-1",
+    ),
+  ).toMatchObject({
     threadId: "thread-1",
     turnId: "turn-1",
     tokenUsage: {
@@ -56,27 +83,34 @@ const fakeCodex = resolve(
 );
 
 it("unwraps a coalesced provider notification without losing its turn identity", () => {
-  expect(unwrapRunnerdProviderNotification({
-    coalescedCount: 2,
-    latest: {
-      method: "turn/started",
-      params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
-    },
-  })).toEqual({
+  expect(
+    unwrapRunnerdProviderNotification({
+      coalescedCount: 2,
+      latest: {
+        method: "turn/started",
+        params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
+      },
+    }),
+  ).toEqual({
     method: "turn/started",
     params: { threadId: "thread-1", turn: { id: "provider-turn-1" } },
   });
 });
 
 it("replays every provider notification from a durable coalesced batch", () => {
-  expect(unwrapRunnerdProviderNotifications({
-    coalescedCount: 3,
-    events: [
-      { method: "item/started", params: { item: { id: "reasoning-1" } } },
-      { method: "item/reasoning/summaryTextDelta", params: { delta: "Checking the task" } },
-      { method: "item/completed", params: { item: { id: "reasoning-1" } } },
-    ],
-  })).toEqual([
+  expect(
+    unwrapRunnerdProviderNotifications({
+      coalescedCount: 3,
+      events: [
+        { method: "item/started", params: { item: { id: "reasoning-1" } } },
+        {
+          method: "item/reasoning/summaryTextDelta",
+          params: { delta: "Checking the task" },
+        },
+        { method: "item/completed", params: { item: { id: "reasoning-1" } } },
+      ],
+    }),
+  ).toEqual([
     expect.objectContaining({ method: "item/started" }),
     expect.objectContaining({ method: "item/reasoning/summaryTextDelta" }),
     expect.objectContaining({ method: "item/completed" }),
@@ -91,20 +125,31 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
   });
   bundle.transport.setServerRequestHandler(async (request) => ({
     success: true,
-    contentItems: [{
-      type: "inputText",
-      text: JSON.stringify({ ok: true, result: { task: { title: "PRP lab task" } } }),
-    }],
+    contentItems: [
+      {
+        type: "inputText",
+        text: JSON.stringify({
+          ok: true,
+          result: { task: { title: "PRP lab task" } },
+        }),
+      },
+    ],
   }));
   try {
     await bundle.transport.request("initialize", {});
     const opened = await bundle.transport.request("thread/start", {
       cwd: tmpdir(),
-      dynamicTools: [{
-        name: "get_task_context",
-        description: "Read the active task.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      }],
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
     });
     expect(opened.thread).toMatchObject({ modelProvider: "openai" });
     await bundle.transport.request("turn/start", {
@@ -122,7 +167,141 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
   } finally {
     await bundle.transport.close();
   }
-  expect(bundle.evidence()).toMatchObject({ runnerExited: true, runnerExitCode: 0 });
+  expect(bundle.evidence()).toMatchObject({
+    runnerExited: true,
+    runnerExitCode: 0,
+  });
+}, 30_000);
+
+it("captures exact provider frames and correlates Rust and TypeScript interpretation stages", async () => {
+  const traceDirectory = await mkdtemp(
+    join(tmpdir(), "runnerd-provider-trace-"),
+  );
+  const tracePath = join(traceDirectory, "trace.ndjson");
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: [],
+    stateDirectory: join(traceDirectory, "state"),
+    environment: {
+      PAPERCLIP_PROVIDER_TRACE_PATH: tracePath,
+      PAPERCLIP_PROVIDER_TRACE_MAX_BYTES: String(64 * 1024 * 1024),
+    },
+  });
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [{ type: "inputText", text: JSON.stringify({ ok: true }) }],
+  }));
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "Return a final response." }],
+    });
+    let persistedSequence = 0;
+    for await (const notification of bundle.transport.notifications()) {
+      if (notification.paperclipTrace) {
+        persistedSequence += 1;
+        bundle.transport.recordTraceInterpretation?.({
+          sourceEventId: notification.paperclipTrace.sourceEventId,
+          sourceEventType: notification.paperclipTrace.sourceEventType,
+          providerMethod: notification.method,
+          disposition: "mapped",
+          emittedEventIds: [`runner:test:${persistedSequence}`],
+          reason: "Test driver normalized the rehydrated notification",
+        });
+      }
+      if (notification.method === "turn/completed") break;
+    }
+  } finally {
+    await bundle.transport.close();
+  }
+
+  const nativeEntries = (await readFile(tracePath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const rehydratedEntries = (await readFile(`${tracePath}.rehydration`, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  const frames = nativeEntries.filter((entry) => entry.kind === "frame");
+  expect(frames.map((entry) => entry.frameId)).toEqual(
+    frames.map((_, index) => index + 1),
+  );
+  expect(frames.map((entry) => entry.direction)).toEqual(
+    expect.arrayContaining(["client_to_provider", "provider_to_client"]),
+  );
+  for (const frame of frames) {
+    const raw = Buffer.from(String(frame.rawBase64), "base64");
+    expect(raw.byteLength).toBe(frame.byteLength);
+    expect(`sha256:${createHash("sha256").update(raw).digest("hex")}`).toBe(
+      frame.digest,
+    );
+  }
+  const decodedFrames = frames.map((frame) =>
+    JSON.parse(Buffer.from(String(frame.rawBase64), "base64").toString("utf8")),
+  ) as Array<Record<string, unknown>>;
+  expect(
+    decodedFrames.find((frame) => frame.method === "thread/start"),
+  ).toMatchObject({
+    params: {
+      config: { include_collaboration_mode_instructions: true },
+    },
+  });
+  const stages = new Set(
+    [...nativeEntries, ...rehydratedEntries]
+      .filter((entry) => entry.kind === "interpretation")
+      .map((entry) => entry.stage),
+  );
+  expect([...stages]).toEqual(
+    expect.arrayContaining([
+      "rust_native_transport",
+      "rust_jsonrpc_parse",
+      "rust_durable_normalization",
+      "typescript_runnerd_rehydration",
+      "typescript_codex_driver_normalization",
+    ]),
+  );
+  expect(
+    rehydratedEntries.some(
+      (entry) =>
+        entry.stage === "typescript_codex_driver_normalization" &&
+        Array.isArray(entry.emittedEventIds) &&
+        entry.emittedEventIds.some((eventId) =>
+          String(eventId).startsWith("runner:test:"),
+        ),
+    ),
+  ).toBe(true);
+  for (const channel of ["rust_native", "typescript_runnerd_rehydration"]) {
+    const channelEntries = [...nativeEntries, ...rehydratedEntries].filter(
+      (entry) => entry.debugChannel === channel,
+    );
+    expect(channelEntries.map((entry) => entry.debugSequence)).toEqual(
+      channelEntries.map((_, index) => index + 1),
+    );
+    const status = channelEntries.at(-1);
+    expect(status).toMatchObject({
+      kind: "trace_status",
+      status: "complete",
+      acknowledgedDebugSequence: channelEntries.length - 1,
+    });
+  }
+
+  await rm(traceDirectory, { recursive: true, force: true });
 }, 30_000);
 
 it("steers the active provider turn through the durable PRP command path", async () => {
@@ -211,32 +390,50 @@ it("attaches a second governed run to one warm runner and provider process", asy
     codexArgs: [],
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
   });
-  bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
   try {
     await bundle.transport.request("initialize", {});
     await bundle.transport.request("thread/start", {
       cwd: tmpdir(),
-      dynamicTools: [{
-        name: "get_task_context",
-        description: "Read the active task.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      }],
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
     });
     const runnerPid = bundle.evidence().runnerPid;
     const providerPid = bundle.evidence().codexPid;
-    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    const notifications = bundle.transport
+      .notifications()
+      [Symbol.asyncIterator]();
     const waitForCompletion = async (label: string) => {
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
         const next = await Promise.race([
           notifications.next(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${label} notification timeout`)), 1_000)),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`${label} notification timeout`)),
+              1_000,
+            ),
+          ),
         ]);
         if (next.value?.method === "turn/completed") return;
       }
       throw new Error(`${label} completion timeout`);
     };
-    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "first run" }] });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "first run" }],
+    });
     await waitForCompletion("first run");
 
     await bundle.transport.attachRun?.({
@@ -244,10 +441,16 @@ it("attaches a second governed run to one warm runner and provider process", asy
       turnId: "turn-binding-second",
       itemId: "item-binding-second",
     });
-    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "second run" }] });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "second run" }],
+    });
     await waitForCompletion("second run");
 
-    expect(bundle.evidence()).toMatchObject({ runnerPid, codexPid: providerPid, runnerExited: false });
+    expect(bundle.evidence()).toMatchObject({
+      runnerPid,
+      codexPid: providerPid,
+      runnerExited: false,
+    });
   } finally {
     await bundle.transport.close();
   }
@@ -270,16 +473,33 @@ it("cold-restores a suspended provider session under a new run binding", async (
     stateDirectory,
     lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
   };
-  const dynamicTools = [{
-    name: "get_task_context",
-    description: "Read the active task.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  }];
-  const first = createCapabilityRunnerdCodexTransport({ ...options, prpIdentity: baseIdentity });
-  first.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  const dynamicTools = [
+    {
+      name: "get_task_context",
+      description: "Read the active task.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  ];
+  const first = createCapabilityRunnerdCodexTransport({
+    ...options,
+    prpIdentity: baseIdentity,
+  });
+  first.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
   try {
-    await first.transport.request("thread/start", { cwd: tmpdir(), dynamicTools });
-    await first.transport.request("turn/start", { input: [{ type: "text", text: "first process" }] });
+    await first.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools,
+    });
+    await first.transport.request("turn/start", {
+      input: [{ type: "text", text: "first process" }],
+    });
     for await (const event of first.transport.notifications()) {
       if (event.method === "turn/completed") break;
     }
@@ -297,24 +517,36 @@ it("cold-restores a suspended provider session under a new run binding", async (
       itemId: "item-cold-restored",
     },
   });
-  restored.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  restored.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
   try {
     const read = await restored.transport.request("thread/read", {});
     expect(read.thread).toMatchObject({ id: "fake-thread" });
-    const durable = JSON.parse(await readFile(
-      join(stateDirectory, "runner", "runner-state.json"),
-      "utf8",
-    )) as { providerToolBridge?: { authorized?: Record<string, unknown> } };
-    expect(Object.keys(durable.providerToolBridge?.authorized ?? {})).toEqual(expect.arrayContaining([
-      "get_task_context",
-      "paperclip_finish",
-      "paperclip_block",
-    ]));
-    await restored.transport.request("turn/start", { input: [{ type: "text", text: "restored process" }] });
+    const durable = JSON.parse(
+      await readFile(
+        join(stateDirectory, "runner", "runner-state.json"),
+        "utf8",
+      ),
+    ) as { providerToolBridge?: { authorized?: Record<string, unknown> } };
+    expect(Object.keys(durable.providerToolBridge?.authorized ?? {})).toEqual(
+      expect.arrayContaining([
+        "get_task_context",
+        "paperclip_finish",
+        "paperclip_block",
+      ]),
+    );
+    await restored.transport.request("turn/start", {
+      input: [{ type: "text", text: "restored process" }],
+    });
     for await (const event of restored.transport.notifications()) {
       if (event.method === "turn/completed") break;
     }
-    expect(restored.evidence()).toMatchObject({ runnerExited: false, codexPid: expect.any(Number) });
+    expect(restored.evidence()).toMatchObject({
+      runnerExited: false,
+      codexPid: expect.any(Number),
+    });
   } finally {
     await restored.transport.close();
     await rm(stateDirectory, { recursive: true, force: true });
@@ -327,29 +559,47 @@ it("rejects the notification stream promptly when runnerd exits after accepting 
     codexCommand: fakeCodex,
     codexArgs: ["--linger-after-turn-start"],
   });
-  bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
   try {
     await bundle.transport.request("initialize", {});
     await bundle.transport.request("thread/start", {
       cwd: tmpdir(),
-      dynamicTools: [{
-        name: "get_task_context",
-        description: "Read the active task.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      }],
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
     });
     await bundle.transport.request("turn/start", {
       input: [{ type: "text", text: "Wait for another instruction." }],
     });
-    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    const notifications = bundle.transport
+      .notifications()
+      [Symbol.asyncIterator]();
     expect((await notifications.next()).value?.method).toBe("turn/started");
     const runnerPid = bundle.evidence().runnerPid;
     expect(runnerPid).not.toBeNull();
     process.kill(runnerPid!, "SIGKILL");
-    await expect(Promise.race([
-      notifications.next(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("notification stream hung")), 2_000)),
-    ])).rejects.toThrow("native_runner_process_exited");
+    await expect(
+      Promise.race([
+        notifications.next(),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("notification stream hung")),
+            2_000,
+          ),
+        ),
+      ]),
+    ).rejects.toThrow("native_runner_process_exited");
   } finally {
     await bundle.transport.close();
   }

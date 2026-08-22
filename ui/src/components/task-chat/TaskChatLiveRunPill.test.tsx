@@ -90,43 +90,4 @@ describe("TaskChatLiveRunPill", () => {
     expect(pill?.textContent).toContain("ran 1 command");
   });
 
-  it("keeps the paperclip runner Working header static", () => {
-    act(() => {
-      root.render(
-        <TaskChatLiveRunPill
-          status="running"
-          startedAtMs={Date.now() - 2_000}
-          toolSummary={null}
-          runnerStyle
-        />,
-      );
-    });
-
-    expect(container.textContent).toContain("Workingfor 2s");
-    expect(container.querySelector(".shimmer-text")).toBeNull();
-  });
-
-  it("only exposes the runner disclosure caret after the run settles", () => {
-    const render = (status: string) => act(() => {
-      root.render(
-        <TaskChatLiveRunPill
-          status={status}
-          startedAtMs={1_000}
-          finishedAtMs={status === "succeeded" ? 3_000 : null}
-          toolSummary={null}
-          runnerStyle
-          expanded={false}
-          onToggle={() => undefined}
-        />,
-      );
-    });
-
-    render("running");
-    expect(container.querySelector('[data-testid="task-chat-live-run-pill"]')?.tagName).toBe("DIV");
-    expect(container.querySelector('[data-testid="task-chat-live-run-pill"] svg')).toBeNull();
-
-    render("succeeded");
-    expect(container.querySelector('[data-testid="task-chat-live-run-pill"]')?.tagName).toBe("BUTTON");
-    expect(container.querySelector('[data-testid="task-chat-live-run-pill"] svg')).not.toBeNull();
-  });
 });

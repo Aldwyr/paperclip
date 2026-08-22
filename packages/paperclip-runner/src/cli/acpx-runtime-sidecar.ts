@@ -3,8 +3,12 @@ import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { isAbsolute, relative, resolve } from "node:path";
 
-import type { AcpPermissionDecision, AcpRuntimeEvent } from "acpx/runtime";
+import type { AcpPermissionDecision, AcpRuntimeEvent, AcpRuntimeStatus } from "acpx/runtime";
 
+import {
+  CODEX_BLOCK_TOOL_NAME,
+  CODEX_COMPLETION_TOOL_NAME,
+} from "../contracts/codex.js";
 import { AcpxRuntimeHost } from "../drivers/acpx/acpx-runtime-host.js";
 import { resolveQualifiedAcpxProfile, type QualifiedAcpxAgent } from "../drivers/acpx/qualified-profiles.js";
 import {
@@ -19,6 +23,7 @@ import {
   type AcpxSidecarRequest,
   type AcpxSidecarResponse,
 } from "../drivers/acpx/sidecar-protocol.js";
+import { validatePrpStructuredRunResult } from "../protocol/replay-contract.js";
 
 interface PendingResolution<T> {
   turnId: string;
@@ -89,7 +94,12 @@ async function dispatch(request: AcpxSidecarRequest): Promise<Record<string, unk
     host = await openRuntime(params);
     const identity = host.identity();
     emit("runtime.process", { role: "sidecar", pid: process.pid, processGroupId: null, startedAt: new Date().toISOString() });
-    return { identity, sidecarPid: process.pid, status: await host.status() };
+    return {
+      identity,
+      sidecarPid: process.pid,
+      agentProcess: host.processIdentity(),
+      status: sanitizeRuntimeStatus(await host.status()),
+    };
   }
   if (request.command === "run.attach") {
     requireHost();
@@ -150,10 +160,10 @@ async function dispatch(request: AcpxSidecarRequest): Promise<Record<string, unk
     return { resolved: true };
   }
   if (request.command === "session.read") {
-    return { identity: requireHost().identity(), status: await requireHost().status() };
+    return { identity: requireHost().identity(), status: sanitizeRuntimeStatus(await requireHost().status()) };
   }
   if (request.command === "session.snapshot") {
-    return { identity: requireHost().identity(), status: await requireHost().status(), runId, turnId, sequence };
+    return { identity: requireHost().identity(), status: sanitizeRuntimeStatus(await requireHost().status()), runId, turnId, sequence };
   }
   if (request.command === "session.suspend") {
     if (turnId) throw new Error("ACPX session is not at a safe suspension point");
@@ -182,6 +192,19 @@ async function openRuntime(params: AcpxSidecarOpenParams): Promise<AcpxRuntimeHo
       role: "acp_agent",
       ...identity,
     }),
+    onUsage: (usage) => {
+      if (!turnId) return;
+      const { cost, ...breakdown } = usage;
+      emit("runtime.event", {
+        type: "status",
+        text: "Usage updated.",
+        tag: "usage_update",
+        used: usage.totalTokens ?? null,
+        size: null,
+        cost: cost ?? null,
+        breakdown,
+      });
+    },
     onDiagnostic: (message) => diagnostic("acp_agent_stderr", message),
   });
 }
@@ -201,6 +224,21 @@ async function pumpTurn(currentTurnId: string, runtimeTurn: ReturnType<AcpxRunti
 
 function waitForTool(call: { tool: string; callId: string; arguments: unknown }): Promise<unknown> {
   if (!turnId || tools.has(call.callId)) throw new Error("ACPX tool call is unbound or duplicated");
+  if (call.tool === CODEX_COMPLETION_TOOL_NAME || call.tool === CODEX_BLOCK_TOOL_NAME) {
+    const validation = validatePrpStructuredRunResult(call.arguments);
+    if (!validation.ok) throw new Error("ACPX semantic result failed PRP schema validation");
+    if (
+      (call.tool === CODEX_BLOCK_TOOL_NAME && validation.result.reportedWorkDisposition !== "blocked")
+      || (call.tool === CODEX_COMPLETION_TOOL_NAME && validation.result.reportedWorkDisposition === "blocked")
+    ) throw new Error("ACPX semantic result disposition does not match its terminal operation");
+    emit("runtime.event", {
+      type: "semantic_result",
+      callId: call.callId,
+      operationId: call.tool,
+      result: validation.result,
+    });
+    return Promise.resolve({ accepted: true });
+  }
   emit("runtime.tool_called", {
     callId: call.callId,
     operationId: call.tool,
@@ -274,6 +312,40 @@ function sanitizeRuntimeEvent(event: AcpRuntimeEvent): Record<string, unknown> {
   if (event.type === "error") return { type: "error", code: event.code ?? null, message: safeText(event.message), retryable: event.retryable ?? false };
   if (event.type === "done") return { type: "done", stopReason: event.stopReason ?? null };
   return { type: "provider_notice", category: "unclassified_acp_unknown", summary: "The qualified ACP agent emitted an unclassified runtime update." };
+}
+
+function sanitizeRuntimeStatus(status: AcpRuntimeStatus): Record<string, unknown> {
+  const cumulative = status.usage?.cumulative;
+  const cost = status.usage?.cost;
+  return boundedSidecarValue({
+    summary: status.summary ? safeText(status.summary).slice(0, 4000) : null,
+    acpxRecordId: text(status.acpxRecordId).slice(0, 240) || null,
+    backendSessionId: text(status.backendSessionId).slice(0, 240) || null,
+    agentSessionId: text(status.agentSessionId).slice(0, 240) || null,
+    models: {
+      currentModelId: text(status.models?.currentModelId).slice(0, 240) || null,
+      availableModelCount: Math.min(status.models?.availableModelIds.length ?? 0, 100_000),
+    },
+    usage: {
+      cumulative: cumulative ? {
+        inputTokens: safeNonNegativeNumber(cumulative.inputTokens),
+        outputTokens: safeNonNegativeNumber(cumulative.outputTokens),
+        cachedReadTokens: safeNonNegativeNumber(cumulative.cachedReadTokens),
+        cachedWriteTokens: safeNonNegativeNumber(cumulative.cachedWriteTokens),
+        thoughtTokens: safeNonNegativeNumber(cumulative.thoughtTokens),
+        totalTokens: safeNonNegativeNumber(cumulative.totalTokens),
+      } : null,
+      cost: cost ? {
+        amount: safeNonNegativeNumber(cost.amount),
+        currency: text(cost.currency).slice(0, 16) || null,
+      } : null,
+      requestCount: Math.min(Object.keys(status.usage?.perRequest ?? {}).length, 100_000),
+    },
+  }, 32 * 1024);
+}
+
+function safeNonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function safeOutput(value: unknown): Record<string, unknown> {

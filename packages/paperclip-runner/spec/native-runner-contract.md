@@ -2205,8 +2205,10 @@ Do not depend on its experimental network WebSocket as the Paperclip WAN transpo
 3. Send protocol initialization.
 4. Confirm server capabilities/version.
 5. Register client-defined semantic tools if configured.
-6. Disable automatic skill, app, collaboration, plugin, memory, and
-   multi-agent instruction injection in thread config.
+6. Disable automatic skill, app, plugin, memory, and multi-agent instruction
+   injection in thread config. Enable Codex's built-in collaboration
+   instructions by default; permit an explicit eval-only opt-out without
+   changing the production default.
 7. Create or resume thread.
 8. emit `session.started` or `session.resumed`.
 9. Persist thread/session parameters in the normalized session binding.

@@ -61,10 +61,14 @@ The model receives one text input containing `paperclip.skillless_task.v1`:
 - task constraints; and
 - the expected canonical result schema name.
 
-The thread config explicitly disables automatic skill, app, and collaboration
-instruction blocks. The model input accepts only text, never a Codex `skill`
-input. The driver captures the returned instruction-source list and requires it
-to be empty for the skillless assertion.
+The thread config explicitly disables automatic skill and app instruction
+blocks. Codex's built-in collaboration instructions are enabled by default so
+interactive runs receive native commentary and tool preambles; a driver caller
+may explicitly disable them for a specialized deterministic fixture. This
+does not enable skills, apps, plugins, memories, or extra model-input kinds.
+The model input accepts only text, never a Codex `skill` input. The driver
+captures the returned instruction-source list and requires it to be empty for
+the skillless assertion.
 
 The trusted app-server process has an allowlisted environment. It retains host
 `HOME` and `CODEX_HOME` only so the provider can authenticate. Model-issued

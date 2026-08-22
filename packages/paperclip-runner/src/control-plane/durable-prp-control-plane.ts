@@ -41,6 +41,7 @@ import {
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
 import { createSanitizedAcpxEnvironment } from "../drivers/acpx/environment.js";
+import { createSanitizedClaudeManagedEnvironment } from "../drivers/claude-managed/environment.js";
 
 import {
   DURABLE_RECOVERY_FAULTS,
@@ -78,6 +79,10 @@ const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
 const maxFrameBytes = 1024 * 1024;
 const authChallengeTtlMs = 5_000;
+
+function durableEvalConnectionLeaseTtlMs(turnTimeoutMs: number): number {
+  return Math.max(60 * 60 * 1_000, turnTimeoutMs + 60_000);
+}
 
 interface BootstrapTicketRecord {
   recordId: string;
@@ -185,7 +190,11 @@ export interface DurablePrpControlPlaneOptions {
   fault?: DurableRecoveryFault;
   expectedRunnerVersion?: string;
   expectedRunnerDigest?: string;
-  onSemanticToolInput?: (input: { callId: string; operationId: string; input: unknown }) => Promise<unknown>;
+  onSemanticToolInput?: (input: {
+    callId: string;
+    operationId: string;
+    input: unknown;
+  }) => Promise<unknown>;
   connectionLeaseTtlMs?: number;
 }
 
@@ -202,7 +211,9 @@ export interface RunnerProcessHandle {
 }
 
 function domainDigest(domain: string, parts: readonly Buffer[]): Buffer {
-  const digest = createHash("sha256").update(domain).update(Buffer.from([0]));
+  const digest = createHash("sha256")
+    .update(domain)
+    .update(Buffer.from([0]));
   for (const part of parts) {
     const length = Buffer.alloc(8);
     length.writeBigUInt64BE(BigInt(part.length));
@@ -211,8 +222,14 @@ function domainDigest(domain: string, parts: readonly Buffer[]): Buffer {
   return digest.digest();
 }
 
-function domainHmac(key: Buffer, domain: string, parts: readonly Buffer[]): Buffer {
-  const digest = createHmac("sha256", key).update(domain).update(Buffer.from([0]));
+function domainHmac(
+  key: Buffer,
+  domain: string,
+  parts: readonly Buffer[],
+): Buffer {
+  const digest = createHmac("sha256", key)
+    .update(domain)
+    .update(Buffer.from([0]));
   for (const part of parts) {
     const length = Buffer.alloc(8);
     length.writeBigUInt64BE(BigInt(part.length));
@@ -221,7 +238,10 @@ function domainHmac(key: Buffer, domain: string, parts: readonly Buffer[]): Buff
   return digest.digest();
 }
 
-function credentialMaterial(token: string): { credentialId: string; authKey: Buffer } {
+function credentialMaterial(token: string): {
+  credentialId: string;
+  authKey: Buffer;
+} {
   const bytes = Buffer.from(token);
   return {
     credentialId: `sha256:${domainDigest("paperclip-runner-credential-id-v1", [bytes]).toString("hex")}`,
@@ -253,12 +273,14 @@ function safeDate(offsetMs: number): string {
 
 function authKeyFromDigest(digest: string): Buffer {
   const hex = digest.match(/^sha256:([0-9a-f]{64})$/)?.[1];
-  if (hex === undefined) throw new Error("Stored transport authentication key is malformed.");
+  if (hex === undefined)
+    throw new Error("Stored transport authentication key is malformed.");
   return Buffer.from(hex, "hex");
 }
 
 function proofMatches(expected: Buffer, supplied: unknown): boolean {
-  if (typeof supplied !== "string" || !/^[0-9a-f]{64}$/.test(supplied)) return false;
+  if (typeof supplied !== "string" || !/^[0-9a-f]{64}$/.test(supplied))
+    return false;
   return timingSafeEqual(expected, Buffer.from(supplied, "hex"));
 }
 
@@ -275,8 +297,12 @@ function createSecureChannel(
   ];
   const binding = domainDigest("paperclip-runner-session-binding-v1", parts);
   return {
-    sendKey: domainHmac(authKey, "paperclip-runner-core-to-client-key-v1", [binding]),
-    receiveKey: domainHmac(authKey, "paperclip-runner-client-to-core-key-v1", [binding]),
+    sendKey: domainHmac(authKey, "paperclip-runner-core-to-client-key-v1", [
+      binding,
+    ]),
+    receiveKey: domainHmac(authKey, "paperclip-runner-client-to-core-key-v1", [
+      binding,
+    ]),
     sendCounter: 0n,
     receiveCounter: 0n,
     sessionId: `sha256:${binding.toString("hex")}`,
@@ -295,12 +321,21 @@ function secureAad(
   direction: "client_to_core" | "core_to_client",
   counter: bigint,
 ): Buffer {
-  return Buffer.from(`${secureFrameSchema}\0${channel.sessionId}\0${direction}\0${counter}`);
+  return Buffer.from(
+    `${secureFrameSchema}\0${channel.sessionId}\0${direction}\0${counter}`,
+  );
 }
 
-function encryptSecureJson(channel: SecureChannel, value: unknown): Record<string, unknown> {
+function encryptSecureJson(
+  channel: SecureChannel,
+  value: unknown,
+): Record<string, unknown> {
   const counter = channel.sendCounter;
-  const cipher = createCipheriv("aes-256-gcm", channel.sendKey, secureNonce("P3S1", counter));
+  const cipher = createCipheriv(
+    "aes-256-gcm",
+    channel.sendKey,
+    secureNonce("P3S1", counter),
+  );
   cipher.setAAD(secureAad(channel, "core_to_client", counter));
   const ciphertext = Buffer.concat([
     cipher.update(Buffer.from(JSON.stringify(value))),
@@ -315,7 +350,10 @@ function encryptSecureJson(channel: SecureChannel, value: unknown): Record<strin
   };
 }
 
-function decryptSecureJson(channel: SecureChannel, value: unknown): Record<string, unknown> {
+function decryptSecureJson(
+  channel: SecureChannel,
+  value: unknown,
+): Record<string, unknown> {
   if (typeof value !== "object" || value === null) {
     throw new Error("Secure frame must be an object.");
   }
@@ -332,7 +370,8 @@ function decryptSecureJson(channel: SecureChannel, value: unknown): Record<strin
     throw new Error("Secure frame metadata or counter is invalid.");
   }
   const sealed = Buffer.from(frame.ciphertext, "hex");
-  if (sealed.length < 16) throw new Error("Secure frame authentication tag is missing.");
+  if (sealed.length < 16)
+    throw new Error("Secure frame authentication tag is missing.");
   const ciphertext = sealed.subarray(0, -16);
   const tag = sealed.subarray(-16);
   const counter = channel.receiveCounter;
@@ -343,7 +382,10 @@ function decryptSecureJson(channel: SecureChannel, value: unknown): Record<strin
   );
   decipher.setAAD(secureAad(channel, "client_to_core", counter));
   decipher.setAuthTag(tag);
-  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  const plaintext = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
   channel.receiveCounter += 1n;
   return JSON.parse(plaintext.toString("utf8")) as Record<string, unknown>;
 }
@@ -379,10 +421,14 @@ function verifyPrivateDirectory(path: string): void {
   }
   if (process.platform !== "win32") {
     if ((metadata.mode & 0o777) !== 0o700) {
-      throw new Error(`Private state directory does not use mode 0700: ${path}`);
+      throw new Error(
+        `Private state directory does not use mode 0700: ${path}`,
+      );
     }
     if (process.geteuid !== undefined && metadata.uid !== process.geteuid()) {
-      throw new Error(`Private state directory is not owned by the daemon user: ${path}`);
+      throw new Error(
+        `Private state directory is not owned by the daemon user: ${path}`,
+      );
     }
   }
 }
@@ -396,7 +442,9 @@ function verifyPrivateRegularFile(file: Stats, path: string): void {
       throw new Error(`Private state file does not use mode 0600: ${path}`);
     }
     if (process.geteuid !== undefined && file.uid !== process.geteuid()) {
-      throw new Error(`Private state file is not owned by the daemon user: ${path}`);
+      throw new Error(
+        `Private state file is not owned by the daemon user: ${path}`,
+      );
     }
   }
 }
@@ -404,7 +452,10 @@ function verifyPrivateRegularFile(file: Stats, path: string): void {
 function readPrivateFile(path: string): string | null {
   let descriptor: number;
   try {
-    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    descriptor = openSync(
+      path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return null;
     throw error;
@@ -421,7 +472,9 @@ function syncParentDirectory(path: string): void {
   if (process.platform === "win32") return;
   const descriptor = openSync(
     dirname(path),
-    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+    constants.O_RDONLY |
+      (constants.O_DIRECTORY ?? 0) |
+      (constants.O_NOFOLLOW ?? 0),
   );
   try {
     fsyncSync(descriptor);
@@ -431,7 +484,10 @@ function syncParentDirectory(path: string): void {
 }
 
 function atomicPrivateWrite(path: string, contents: string): void {
-  const temporary = resolve(dirname(path), `.${path.split(/[\\/]/).at(-1)}.${randomUUID()}.tmp`);
+  const temporary = resolve(
+    dirname(path),
+    `.${path.split(/[\\/]/).at(-1)}.${randomUUID()}.tmp`,
+  );
   let descriptor: number | null = null;
   let created = false;
   try {
@@ -473,7 +529,9 @@ class DurableCoreStore {
     try {
       const metadata = lstatSync(directory);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-        throw new Error(`Private state directory is not a real directory: ${directory}`);
+        throw new Error(
+          `Private state directory is not a real directory: ${directory}`,
+        );
       }
     } catch (error) {
       if (!isNodeError(error, "ENOENT")) throw error;
@@ -489,7 +547,9 @@ class DurableCoreStore {
         this.#state.schema !== coreStateSchema ||
         canonicalJson(this.#state.identity) !== canonicalJson(identity)
       ) {
-        throw new Error("Mock core state does not match the requested Durable recovery identity.");
+        throw new Error(
+          "Mock core state does not match the requested Durable recovery identity.",
+        );
       }
     } else {
       this.#state = initialCoreState(identity);
@@ -540,7 +600,10 @@ class MockWebSocketConnection {
   }
 
   sendJson(value: unknown): void {
-    const wire = this.secureChannel === null ? value : encryptSecureJson(this.secureChannel, value);
+    const wire =
+      this.secureChannel === null
+        ? value
+        : encryptSecureJson(this.secureChannel, value);
     this.sendText(JSON.stringify(wire));
   }
 
@@ -603,7 +666,9 @@ class MockWebSocketConnection {
       if (this.#buffer.length < cursor + 4 + length) return;
       const mask = this.#buffer.subarray(cursor, cursor + 4);
       cursor += 4;
-      const payload = Buffer.from(this.#buffer.subarray(cursor, cursor + length));
+      const payload = Buffer.from(
+        this.#buffer.subarray(cursor, cursor + length),
+      );
       this.#buffer = this.#buffer.subarray(cursor + length);
       for (let index = 0; index < payload.length; index += 1) {
         payload[index] = payload[index]! ^ mask[index % 4]!;
@@ -624,7 +689,9 @@ class MockWebSocketConnection {
 
   #sendControl(opcode: number, payload: Buffer): void {
     if (payload.length > 125 || this.#closed) return;
-    this.socket.write(Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]));
+    this.socket.write(
+      Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]),
+    );
   }
 }
 
@@ -677,7 +744,9 @@ export class DurablePrpControlPlane {
       response.writeHead(404).end();
     });
     this.#server = server;
-    server.on("upgrade", (request, socket, head) => this.handleUpgrade(request, socket, "/durableRecovery/connect", head));
+    server.on("upgrade", (request, socket, head) =>
+      this.handleUpgrade(request, socket, "/durableRecovery/connect", head),
+    );
     await new Promise<void>((resolveListen, rejectListen) => {
       server.once("error", rejectListen);
       server.listen(port, "127.0.0.1", () => {
@@ -701,7 +770,9 @@ export class DurablePrpControlPlane {
     this.#server = null;
     this.#port = null;
     if (server !== null) {
-      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await new Promise<void>((resolveClose) =>
+        server.close(() => resolveClose()),
+      );
     }
   }
 
@@ -713,7 +784,9 @@ export class DurablePrpControlPlane {
   }
 
   activeRunnerConnectionCount(): number {
-    return [...this.#connections].filter((connection) => connection.secureChannel !== null).length;
+    return [...this.#connections].filter(
+      (connection) => connection.secureChannel !== null,
+    ).length;
   }
 
   issueBootstrapTicket(ttlMs = 5_000): string {
@@ -745,7 +818,9 @@ export class DurablePrpControlPlane {
     const controllerSeq = this.store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
       schema: "paperclip.prp.command.v1",
-      commandId: commandId ?? `command_durableRecovery_${controllerSeq.toString().padStart(3, "0")}`,
+      commandId:
+        commandId ??
+        `command_durableRecovery_${controllerSeq.toString().padStart(3, "0")}`,
       controllerSeq,
       type,
       issuedAt: `2026-08-07T23:30:${controllerSeq.toString().padStart(2, "0")}.000Z`,
@@ -783,7 +858,8 @@ export class DurablePrpControlPlane {
     expectedPath = "/api/runner/v1/connect",
     head: Buffer<ArrayBufferLike> = Buffer.alloc(0),
   ): void {
-    const requestPath = new URL(request.url ?? "/", "http://paperclip.invalid").pathname;
+    const requestPath = new URL(request.url ?? "/", "http://paperclip.invalid")
+      .pathname;
     if (requestPath !== expectedPath) {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
@@ -830,7 +906,10 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
-    if (envelope.protocol !== protocol || envelope.version !== protocolVersion) {
+    if (
+      envelope.protocol !== protocol ||
+      envelope.version !== protocolVersion
+    ) {
       connection.close();
       return;
     }
@@ -860,7 +939,9 @@ export class DurablePrpControlPlane {
     }
   }
 
-  #authorizeHello(payload: Record<string, unknown>): PendingAuthorization | null {
+  #authorizeHello(
+    payload: Record<string, unknown>,
+  ): PendingAuthorization | null {
     const credentialId = payload.credentialId;
     if (typeof credentialId !== "string") return null;
     const ticket = this.store.state.tickets[credentialId];
@@ -918,7 +999,8 @@ export class DurablePrpControlPlane {
       (authorization.kind === "bootstrap" &&
         (authorization.runnerVersion !== this.#expectedRunnerVersion ||
           authorization.runnerDigest !== this.#expectedRunnerDigest)) ||
-      (authorization.kind === "lease" && authorization.protocolVersion !== protocolVersion)
+      (authorization.kind === "lease" &&
+        authorization.protocolVersion !== protocolVersion)
     ) {
       return null;
     }
@@ -968,7 +1050,10 @@ export class DurablePrpControlPlane {
     };
   }
 
-  #authHello(connection: MockWebSocketConnection, envelope: Record<string, unknown>): void {
+  #authHello(
+    connection: MockWebSocketConnection,
+    envelope: Record<string, unknown>,
+  ): void {
     if (connection.pendingChallenge !== null) {
       connection.close();
       return;
@@ -998,10 +1083,12 @@ export class DurablePrpControlPlane {
       runnerVersion: payload.runnerVersion,
       runnerDigest: payload.runnerDigest,
       selectedVersion: protocolVersion,
-      credentialLeaseId: authorization.kind === "lease" ? authorization.leaseId : null,
+      credentialLeaseId:
+        authorization.kind === "lease" ? authorization.leaseId : null,
       credentialExpiresAt: authorization.expiresAt,
       credentialExpiresAtUnixMs: authorization.expiresAtUnixMs,
-      revocationEpoch: authorization.kind === "lease" ? authorization.revocationEpoch : 0,
+      revocationEpoch:
+        authorization.kind === "lease" ? authorization.revocationEpoch : 0,
     };
     const canonicalChallenge = canonicalJson(challengePayload);
     const serverProof = domainHmac(
@@ -1028,7 +1115,10 @@ export class DurablePrpControlPlane {
     });
   }
 
-  #authResponse(connection: MockWebSocketConnection, envelope: Record<string, unknown>): void {
+  #authResponse(
+    connection: MockWebSocketConnection,
+    envelope: Record<string, unknown>,
+  ): void {
     const pending = connection.pendingChallenge;
     const payload = envelope.payload as Record<string, unknown> | undefined;
     if (
@@ -1044,7 +1134,10 @@ export class DurablePrpControlPlane {
     // WebSocket callbacks run synchronously on the mock core's event loop. Re-reading,
     // validating, consuming, minting, and persisting here forms one state mutation
     // boundary, so another proof cannot interleave with bootstrap consumption.
-    const authorization = this.#reauthorizePendingChallenge(pending, Date.now());
+    const authorization = this.#reauthorizePendingChallenge(
+      pending,
+      Date.now(),
+    );
     if (authorization === null) {
       connection.close();
       return;
@@ -1052,7 +1145,10 @@ export class DurablePrpControlPlane {
     const expectedClientProof = domainHmac(
       authorization.authKey,
       "paperclip-runner-client-proof-v1",
-      [Buffer.from(pending.canonicalChallenge), Buffer.from(pending.serverProof)],
+      [
+        Buffer.from(pending.canonicalChallenge),
+        Buffer.from(pending.serverProof),
+      ],
     );
     if (!proofMatches(expectedClientProof, payload.clientProof)) {
       connection.close();
@@ -1065,7 +1161,10 @@ export class DurablePrpControlPlane {
       authorization.ticket.usedAt = new Date().toISOString();
       leaseToken = `lease_${randomUUID()}`;
       const material = credentialMaterial(leaseToken);
-      const ttlMs = this.fault === "lease-expiry" && !this.#faultTriggered ? 50 : this.#connectionLeaseTtlMs;
+      const ttlMs =
+        this.fault === "lease-expiry" && !this.#faultTriggered
+          ? 50
+          : this.#connectionLeaseTtlMs;
       const expiresAtUnixMs = Date.now() + ttlMs;
       lease = {
         recordId: `connection_lease_record_${randomUUID()}`,
@@ -1096,7 +1195,10 @@ export class DurablePrpControlPlane {
     this.#welcome(connection, leaseToken);
   }
 
-  #welcome(connection: MockWebSocketConnection, leaseToken: string | null): void {
+  #welcome(
+    connection: MockWebSocketConnection,
+    leaseToken: string | null,
+  ): void {
     const lease = connection.lease;
     if (lease === null || connection.connectionId === null) {
       connection.close();
@@ -1173,13 +1275,17 @@ export class DurablePrpControlPlane {
     }
   }
 
-  #wireCommand(command: DurableRecoveryCoreCommand): Omit<DurableRecoveryCoreCommand, "status" | "result"> {
+  #wireCommand(
+    command: DurableRecoveryCoreCommand,
+  ): Omit<DurableRecoveryCoreCommand, "status" | "result"> {
     const { status: _status, result: _result, ...wire } = command;
     return wire;
   }
 
   #nextPendingCommand(): DurableRecoveryCoreCommand[] {
-    const command = this.store.state.commands.find((candidate) => candidate.status === "pending");
+    const command = this.store.state.commands.find(
+      (candidate) => candidate.status === "pending",
+    );
     return command === undefined ? [] : [command];
   }
 
@@ -1190,7 +1296,9 @@ export class DurablePrpControlPlane {
     payload: Record<string, unknown>,
   ): Record<string, unknown> {
     if (connection.lease === null || connection.connectionId === null) {
-      throw new Error("Cannot send control data before transport authentication.");
+      throw new Error(
+        "Cannot send control data before transport authentication.",
+      );
     }
     return {
       protocol,
@@ -1236,7 +1344,9 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
-    const command = this.store.state.commands.find((candidate) => candidate.commandId === commandId);
+    const command = this.store.state.commands.find(
+      (candidate) => candidate.commandId === commandId,
+    );
     if (command === undefined) {
       connection.close();
       return;
@@ -1272,7 +1382,11 @@ export class DurablePrpControlPlane {
     const runId = payload.runId;
     const turnId = payload.turnId;
     const itemId = payload.itemId;
-    if (typeof runId !== "string" || typeof turnId !== "string" || typeof itemId !== "string") {
+    if (
+      typeof runId !== "string" ||
+      typeof turnId !== "string" ||
+      typeof itemId !== "string"
+    ) {
       throw new Error("completed run.attach omitted its identity binding");
     }
     const next = { ...this.identity, runId, turnId, itemId };
@@ -1286,7 +1400,10 @@ export class DurablePrpControlPlane {
     }
   }
 
-  #event(connection: MockWebSocketConnection, envelope: Record<string, unknown>): void {
+  #event(
+    connection: MockWebSocketConnection,
+    envelope: Record<string, unknown>,
+  ): void {
     const event = envelope.payload as Record<string, unknown> | undefined;
     const sourceSeq = event?.sourceSeq;
     const sourceEventId = event?.sourceEventId;
@@ -1335,25 +1452,48 @@ export class DurablePrpControlPlane {
     }
     this.store.save();
 
-    const semantic = (event.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
+    const semantic = (event.payload as Record<string, unknown> | undefined)
+      ?.semantic_tool as Record<string, unknown> | undefined;
     if (
-      newlyCommitted && (eventType === "semantic_tool.input" || eventType === "mcp_app.tool_input") && this.#onSemanticToolInput && semantic?.phase === "input" &&
-      typeof semantic.callId === "string" && typeof semantic.operationId === "string"
+      newlyCommitted &&
+      (eventType === "semantic_tool.input" ||
+        eventType === "mcp_app.tool_input") &&
+      this.#onSemanticToolInput &&
+      semantic?.phase === "input" &&
+      typeof semantic.callId === "string" &&
+      typeof semantic.operationId === "string"
     ) {
-      const call = { callId: semantic.callId, operationId: semantic.operationId, input: semantic.input };
+      const call = {
+        callId: semantic.callId,
+        operationId: semantic.operationId,
+        input: semantic.input,
+      };
       void this.#onSemanticToolInput(call).then((value) => {
-        const outcome = typeof value === "object" && value !== null && !Array.isArray(value)
-          ? value as Record<string, unknown>
-          : {};
+        const outcome =
+          typeof value === "object" && value !== null && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
         const wrapped = outcome.__paperclipSemanticToolOutcome === true;
         const result = wrapped ? outcome.result : value;
         const isError = wrapped && outcome.isError === true;
-        const runScope = createHash("sha256").update(this.identity.runId).digest("hex").slice(0, 12);
-        this.queueCommand("semantic_tool.result", { ...call, result, isError }, `command_tool_${runScope}_${call.callId}`, true);
+        const runScope = createHash("sha256")
+          .update(this.identity.runId)
+          .digest("hex")
+          .slice(0, 12);
+        this.queueCommand(
+          "semantic_tool.result",
+          { ...call, result, isError },
+          `command_tool_${runScope}_${call.callId}`,
+          true,
+        );
       });
     }
 
-    if (this.fault === "revoke" && eventType === "run.terminal" && !this.#faultTriggered) {
+    if (
+      this.fault === "revoke" &&
+      eventType === "run.terminal" &&
+      !this.#faultTriggered
+    ) {
       if (connection.lease !== null) {
         connection.lease.revokedAt = new Date().toISOString();
         connection.lease.revocationEpoch += 1;
@@ -1378,7 +1518,8 @@ export class DurablePrpControlPlane {
     }
 
     const shouldLoseAck =
-      !this.#faultTriggered && (this.fault === "lost-ack" || this.fault === "runner-restart");
+      !this.#faultTriggered &&
+      (this.fault === "lost-ack" || this.fault === "runner-restart");
     if (shouldLoseAck) {
       this.#replayCursorOverrideOnce = true;
       this.#triggerFault();
@@ -1389,23 +1530,66 @@ export class DurablePrpControlPlane {
     }
 
     connection.sendJson(
-      this.#controlEnvelope(connection, `ack_${this.store.state.ackedSourceSeq}`, "ack", {
-        ackedSourceSeq: this.store.state.ackedSourceSeq,
-      }),
+      this.#controlEnvelope(
+        connection,
+        `ack_${this.store.state.ackedSourceSeq}`,
+        "ack",
+        {
+          ackedSourceSeq: this.store.state.ackedSourceSeq,
+        },
+      ),
     );
   }
 }
 
-function runnerEnvironment(ticket: string, source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+function runnerEnvironment(
+  ticket: string,
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: ticket,
   };
   for (const key of [
-    "PATH", "SystemRoot", "WINDIR", "PATHEXT", "LANG", "LC_ALL", "TZ",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
-    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "RUST_BACKTRACE",
-    "PAPERCLIP_OPENCODE_COMMAND", "PAPERCLIP_OPENCODE_RUNTIME_DIR",
-    "PAPERCLIP_RUNNER_INSTANCE_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PATH",
+    "HOME",
+    "SystemRoot",
+    "WINDIR",
+    "PATHEXT",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "RUST_BACKTRACE",
+    // AgentCore resolves an AWS profile or workload identity inside runnerd,
+    // then assumes the immutable invocation role. These are locator/config
+    // values, not exported access keys or session credentials.
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "PAPERCLIP_OPENCODE_COMMAND",
+    "PAPERCLIP_OPENCODE_RUNTIME_DIR",
+    "PAPERCLIP_RUNNER_INSTANCE_ID",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_NORMALIZED_SESSION_ID",
+    // Short-lived, controller-selected sidecar capture. These never enter the
+    // canonical PRP environment or provider payload; runnerd alone consumes them.
+    "PAPERCLIP_PROVIDER_TRACE_PATH",
+    "PAPERCLIP_PROVIDER_TRACE_MAX_BYTES",
   ]) {
     const value = source[key];
     if (value !== undefined) environment[key] = value;
@@ -1468,7 +1652,10 @@ export function spawnRunner(options: {
   if (options.lifecyclePolicy !== undefined) {
     args.push("--lifecycle-mode", options.lifecyclePolicy.mode);
     if (options.lifecyclePolicy.mode === "warm") {
-      args.push("--idle-timeout-ms", String(options.lifecyclePolicy.idleTimeoutMs));
+      args.push(
+        "--idle-timeout-ms",
+        String(options.lifecyclePolicy.idleTimeoutMs),
+      );
     }
   }
   const child = spawn(options.runnerBinaryPath ?? runnerBinary, args, {
@@ -1484,10 +1671,14 @@ export function spawnRunner(options: {
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
     stderr = `${stderr}${chunk}`.slice(-16_384);
   });
-  const completion = new Promise<RunnerProcessResult>((resolveCompletion, rejectCompletion) => {
-    child.once("error", rejectCompletion);
-    child.once("exit", (code, signal) => resolveCompletion({ code, signal, stdout, stderr }));
-  });
+  const completion = new Promise<RunnerProcessResult>(
+    (resolveCompletion, rejectCompletion) => {
+      child.once("error", rejectCompletion);
+      child.once("exit", (code, signal) =>
+        resolveCompletion({ code, signal, stdout, stderr }),
+      );
+    },
+  );
   return { child, completion };
 }
 
@@ -1513,7 +1704,9 @@ export async function waitForProcess(
 
 /** Test-fixture compatibility wrapper that requires an explicit injected fault mode. */
 export class DurableRecoveryMockCore extends DurablePrpControlPlane {
-  constructor(options: DurablePrpControlPlaneOptions & { fault: DurableRecoveryFault }) {
+  constructor(
+    options: DurablePrpControlPlaneOptions & { fault: DurableRecoveryFault },
+  ) {
     super(options);
   }
 }
@@ -1529,8 +1722,13 @@ function durableRecoveryIdentity(): DurableRecoveryIdentity {
   };
 }
 
-function queueScenario(core: DurableRecoveryMockCore, fault: DurableRecoveryFault): void {
-  core.queueCommand("run.prepare", { workspace: "durable-recovery-durable-fixture" });
+function queueScenario(
+  core: DurableRecoveryMockCore,
+  fault: DurableRecoveryFault,
+): void {
+  core.queueCommand("run.prepare", {
+    workspace: "durable-recovery-durable-fixture",
+  });
   core.queueCommand("session.open", { reuse: "same_session" });
   if (fault === "harness-restart") {
     core.queueCommand("fault.harness_restart", {});
@@ -1556,13 +1754,18 @@ function readRunnerState(stateDirectory: string): DurableRecoveryRunnerState {
   ) as DurableRecoveryRunnerState;
 }
 
-function assertContinuous(events: readonly DurableRecoveryCommittedEvent[]): boolean {
+function assertContinuous(
+  events: readonly DurableRecoveryCommittedEvent[],
+): boolean {
   return events
     .toSorted((left, right) => left.sourceSeq - right.sourceSeq)
     .every((event, index) => event.sourceSeq === index + 1);
 }
 
-function secretLeakCount(paths: readonly string[], secrets: readonly string[]): number {
+function secretLeakCount(
+  paths: readonly string[],
+  secrets: readonly string[],
+): number {
   let leaks = 0;
   for (const path of paths) {
     const source = readFileSync(path, "utf8");
@@ -1573,7 +1776,10 @@ function secretLeakCount(paths: readonly string[], secrets: readonly string[]): 
   return leaks;
 }
 
-function persistedCapabilityShape(path: string, fieldNames: readonly string[]): boolean {
+function persistedCapabilityShape(
+  path: string,
+  fieldNames: readonly string[],
+): boolean {
   const source = readFileSync(path, "utf8");
   return fieldNames.some((fieldName) => source.includes(`\"${fieldName}\"`));
 }
@@ -1607,32 +1813,71 @@ export async function runDurableToolBridgeConformance(
   const runnerStateDirectory = resolve(root, "runner");
   mkdirSync(runnerStateDirectory, { recursive: true, mode: 0o700 });
   const authority = new CapabilityMockControlPlaneAdapter({
-    actors: [{ id: "actor-1", companyId: "company-1", name: "Bridge agent", role: "engineer", status: "active", budgetId: "budget-1", capabilityGrants: [] }],
+    actors: [
+      {
+        id: "actor-1",
+        companyId: "company-1",
+        name: "Bridge agent",
+        role: "engineer",
+        status: "active",
+        budgetId: "budget-1",
+        capabilityGrants: [],
+      },
+    ],
   });
   await authority.start();
   await authority.openFixtureRun({
-    identity: { runId: identity.runId, sessionId: identity.normalizedSessionId, companyId: "company-1", issueId: "task-1", agentId: "actor-1" },
-    backendKind: "mock", sourceInstanceId: "durable-tool-bridge", capabilities: [],
+    identity: {
+      runId: identity.runId,
+      sessionId: identity.normalizedSessionId,
+      companyId: "company-1",
+      issueId: "task-1",
+      agentId: "actor-1",
+    },
+    backendKind: "mock",
+    sourceInstanceId: "durable-tool-bridge",
+    capabilities: [],
   });
   const dispatcher = new CapabilitySemanticDispatcher(authority);
   const core = new DurableRecoveryMockCore({
-    stateDirectory: resolve(root, "mock-core"), identity, fault: "none",
-    onSemanticToolInput: (call) => dispatcher.dispatch({ runId: identity.runId, ...call }),
+    stateDirectory: resolve(root, "mock-core"),
+    identity,
+    fault: "none",
+    onSemanticToolInput: (call) =>
+      dispatcher.dispatch({ runId: identity.runId, ...call }),
   });
   const authorized = dispatcher.listTools(identity.runId);
-  const operations: Array<{ operationId: string; version: number; description: string; inputSchema: unknown; responseSchema: unknown }> = authorized.map((tool) => {
+  const operations: Array<{
+    operationId: string;
+    version: number;
+    description: string;
+    inputSchema: unknown;
+    responseSchema: unknown;
+  }> = authorized.map((tool) => {
     const descriptor = capabilitySemanticToolDescriptor(tool.name);
     if (!descriptor) throw new Error(`missing descriptor for ${tool.name}`);
-    return { operationId: tool.name, version: 1, description: tool.description, inputSchema: tool.inputSchema, responseSchema: descriptor.outputSchema };
+    return {
+      operationId: tool.name,
+      version: 1,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      responseSchema: descriptor.outputSchema,
+    };
   });
   const catalogDigest = `sha256:${createHash("sha256").update(canonicalJson(operations)).digest("hex")}`;
-  const providerCommand = options.realCodex ? (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex") : fakeCodexBinary;
+  const providerCommand = options.realCodex
+    ? (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex")
+    : fakeCodexBinary;
   const providerArgs = options.realCodex
     ? [
-        "-c", 'default_permissions="paperclip-runner-workspace-only"',
-        "-c", `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
-        "-c", "permissions.paperclip-runner-workspace-only.network.enabled=false",
-        "-c", "shell_environment_policy.inherit=\"none\"",
+        "-c",
+        'default_permissions="paperclip-runner-workspace-only"',
+        "-c",
+        `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
+        "-c",
+        "permissions.paperclip-runner-workspace-only.network.enabled=false",
+        "-c",
+        'shell_environment_policy.inherit="none"',
         "app-server",
       ]
     : [];
@@ -1644,17 +1889,27 @@ export async function runDurableToolBridgeConformance(
       operations,
     },
     provider: {
-      command: providerCommand, args: providerArgs, cwd: tmpdir(), model: options.model ?? null,
-      instructions: "You are in a Paperclip protocol conformance run. Call get_task_context exactly once, use its result, then reply briefly. Do not use shell or filesystem tools.",
+      command: providerCommand,
+      args: providerArgs,
+      cwd: tmpdir(),
+      model: options.model ?? null,
+      instructions:
+        "You are in a Paperclip protocol conformance run. Call get_task_context exactly once, use its result, then reply briefly. Do not use shell or filesystem tools.",
     },
   });
   core.queueCommand("session.open", { reuse: "same_session" });
-  core.queueCommand("turn.start", { text: "Call get_task_context now and report the task title." });
+  core.queueCommand("turn.start", {
+    text: "Call get_task_context now and report the task title.",
+  });
   await core.start();
   const ticket = core.issueBootstrapTicket();
   const handle = spawnRunner({
-    connectUrl: core.connectUrl, stateDirectory: runnerStateDirectory,
-    identity, ticket, maxOutboxBytes: 64 * 1024, p0ReserveBytes: 32 * 1024,
+    connectUrl: core.connectUrl,
+    stateDirectory: runnerStateDirectory,
+    identity,
+    ticket,
+    maxOutboxBytes: 64 * 1024,
+    p0ReserveBytes: 32 * 1024,
     maxRuntimeMs: options.realCodex ? 180_000 : 10_000,
   });
   let callId = "";
@@ -1662,32 +1917,52 @@ export async function runDurableToolBridgeConformance(
   try {
     const deadline = Date.now() + (options.realCodex ? 150_000 : 10_000);
     while (Date.now() < deadline) {
-        const input = core.store.state.committedEvents.find((event) =>
-          event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input"
-        );
-      const semantic = ((input?.envelope.payload as Record<string, unknown> | undefined)?.payload as Record<string, unknown> | undefined)?.semantic_tool as Record<string, unknown> | undefined;
-      if (semantic && typeof semantic.callId === "string" && typeof semantic.operationId === "string") {
+      const input = core.store.state.committedEvents.find(
+        (event) =>
+          event.eventType === "semantic_tool.input" ||
+          event.eventType === "mcp_app.tool_input",
+      );
+      const semantic = (
+        (input?.envelope.payload as Record<string, unknown> | undefined)
+          ?.payload as Record<string, unknown> | undefined
+      )?.semantic_tool as Record<string, unknown> | undefined;
+      if (
+        semantic &&
+        typeof semantic.callId === "string" &&
+        typeof semantic.operationId === "string"
+      ) {
         callId = semantic.callId;
         operationId = semantic.operationId;
         break;
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
-    if (!callId) throw new Error("runnerd did not forward the provider tool call");
+    if (!callId)
+      throw new Error("runnerd did not forward the provider tool call");
     const resultDeadline = Date.now() + 10_000;
     while (Date.now() < resultDeadline) {
-      const resultCommand = core.store.state.commands.find((command) => command.type === "semantic_tool.result");
-      const turnCompleted = core.store.state.committedEvents.some((event) => event.eventType === "turn.completed");
+      const resultCommand = core.store.state.commands.find(
+        (command) => command.type === "semantic_tool.result",
+      );
+      const turnCompleted = core.store.state.committedEvents.some(
+        (event) => event.eventType === "turn.completed",
+      );
       if (resultCommand?.status === "completed" && turnCompleted) break;
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
     core.queueCommand("runner.shutdown", {}, undefined, true);
     const exited = await waitForProcess(handle);
-    const resultCommand = core.store.state.commands.find((command) => command.type === "semantic_tool.result");
+    const resultCommand = core.store.state.commands.find(
+      (command) => command.type === "semantic_tool.result",
+    );
     return {
-      operationId, callId, toolInputCommitted: true,
+      operationId,
+      callId,
+      toolInputCommitted: true,
       toolResultCompleted: resultCommand?.status === "completed",
-      providerTurnCompleted: core.store.state.committedEvents.some((event) => event.eventType === "turn.completed"),
+      providerTurnCompleted: core.store.state.committedEvents.some(
+        (event) => event.eventType === "turn.completed",
+      ),
       runnerExitCode: exited.code,
     };
   } finally {
@@ -1709,12 +1984,22 @@ export interface DurableEvalSessionInput {
   explicitClaims: string[];
   turnTimeoutMs: number;
   toolExposure?: "eager" | "lazy";
-  provider?: "codex" | "opencode" | "aws_agentcore" | "acpx";
+  /** Defaults on for Codex; set false only for an eval that needs the baseline prompt. */
+  includeCollaborationModeInstructions?: boolean;
+  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   acpxAgent?: QualifiedAcpxAgent;
   acpxSidecarPath?: string;
   opencodeVersion?: string;
   opencodeCommand?: string;
   opencodeProxyPath?: string;
+  managedProfile?: {
+    profileId: string;
+    anthropicAgentId: string;
+    agentVersion: string;
+    environmentId: string;
+    betaVersion: "managed-agents-2026-04-01";
+    maxSessionListCostUsd: number;
+  };
   agentCoreProfile?: {
     profileId: string;
     region: string;
@@ -1738,6 +2023,7 @@ export interface DurableEvalSessionInput {
 
 export type DurableEvalInfrastructureFailureClass =
   | "provider_turn_timeout"
+  | "provider_budget_reached"
   | "runner_shutdown_timeout"
   | "runner_exit_failure";
 
@@ -1769,7 +2055,8 @@ function evalLifecycleDiagnostics(
     commandId: command.commandId,
     type: command.type,
     status: command.status,
-    deliveryCount: core.store.state.commandDeliveryCounts[command.commandId] ?? 0,
+    deliveryCount:
+      core.store.state.commandDeliveryCounts[command.commandId] ?? 0,
   }));
   const events = core.store.state.committedEvents.slice(-20).map((event) => ({
     sourceSeq: event.sourceSeq,
@@ -1780,11 +2067,52 @@ function evalLifecycleDiagnostics(
   let runnerDiagnostics: unknown[] = [];
   if (runnerStateDirectory) {
     try {
-      const state = JSON.parse(readFileSync(resolve(runnerStateDirectory, "runner-state.json"), "utf8")) as { diagnostics?: unknown[] };
-      runnerDiagnostics = Array.isArray(state.diagnostics) ? state.diagnostics.slice(-20) : [];
+      const state = JSON.parse(
+        readFileSync(
+          resolve(runnerStateDirectory, "runner-state.json"),
+          "utf8",
+        ),
+      ) as { diagnostics?: unknown[] };
+      runnerDiagnostics = Array.isArray(state.diagnostics)
+        ? state.diagnostics.slice(-20)
+        : [];
     } catch {
       // A runner that failed before its first durable save has no state diagnostics.
     }
+  }
+  let providerDescriptor: Record<string, unknown> | null = null;
+  let usageRunDelta: Record<string, unknown> | null = null;
+  for (
+    let index = core.store.state.committedEvents.length - 1;
+    index >= 0;
+    index -= 1
+  ) {
+    const event = core.store.state.committedEvents[index]?.envelope.payload as
+      Record<string, unknown> | undefined;
+    const payload = event?.payload as Record<string, unknown> | undefined;
+    if (usageRunDelta === null && event?.eventType === "usage.reported") {
+      const candidate = payload?.runDelta;
+      if (
+        typeof candidate === "object" &&
+        candidate !== null &&
+        !Array.isArray(candidate)
+      ) {
+        usageRunDelta = structuredClone(candidate as Record<string, unknown>);
+      }
+    }
+    if (providerDescriptor === null && event?.eventType === "harness.ready") {
+      const candidate = payload?.providerDescriptor;
+      if (
+        typeof candidate === "object" &&
+        candidate !== null &&
+        !Array.isArray(candidate)
+      ) {
+        providerDescriptor = structuredClone(
+          candidate as Record<string, unknown>,
+        );
+      }
+    }
+    if (providerDescriptor !== null && usageRunDelta !== null) break;
   }
   return {
     runnerPid: handle.child.pid ?? null,
@@ -1795,12 +2123,22 @@ function evalLifecycleDiagnostics(
     commands,
     recentEvents: events,
     runnerDiagnostics,
+    providerDescriptor,
+    providerSessionId:
+      typeof providerDescriptor?.providerSessionId === "string"
+        ? providerDescriptor.providerSessionId
+        : null,
+    usageRunDelta,
   };
 }
 
-function projectedSemanticResult(operationId: unknown, result: unknown): unknown {
+function projectedSemanticResult(
+  operationId: unknown,
+  result: unknown,
+): unknown {
   if (operationId !== "invoke_discovered_capability") return result;
-  const contentItems = (result as { contentItems?: unknown } | null)?.contentItems;
+  const contentItems = (result as { contentItems?: unknown } | null)
+    ?.contentItems;
   if (!Array.isArray(contentItems)) return result;
   for (const item of contentItems) {
     const text = (item as { text?: unknown } | null)?.text;
@@ -1814,14 +2152,63 @@ function projectedSemanticResult(operationId: unknown, result: unknown): unknown
   return result;
 }
 
-function sanitizedAwsEvalEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function claudeManagedEvalProviderConfiguration(
+  model: string,
+  profile: NonNullable<DurableEvalSessionInput["managedProfile"]>,
+): Record<string, unknown> {
+  return {
+    kind: "claude_managed",
+    model,
+    profileId: profile.profileId,
+    anthropicAgentId: profile.anthropicAgentId,
+    agentVersion: profile.agentVersion,
+    environmentId: profile.environmentId,
+    betaVersion: profile.betaVersion,
+    maxSessionListCostUsd: profile.maxSessionListCostUsd,
+  };
+}
+
+function managedProviderBudgetReached(
+  events: readonly { envelope: Record<string, unknown> }[],
+): boolean {
+  return events.some((committed) => {
+    const event = committed.envelope.payload as
+      Record<string, unknown> | undefined;
+    if (event?.eventType !== "session.updated") return false;
+    const payload = event.payload as Record<string, unknown> | undefined;
+    return payload?.status === "budget_reached";
+  });
+}
+
+function sanitizedAwsEvalEnvironment(
+  source: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const key of [
-    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-    "RUST_BACKTRACE", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "RUST_BACKTRACE",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   ]) {
     if (typeof source[key] === "string") result[key] = source[key];
   }
@@ -1829,7 +2216,9 @@ function sanitizedAwsEvalEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessE
 }
 
 /** Production-topology eval: the only Paperclip process in the sandbox is runnerd. */
-export async function runDurableEvalSession(input: DurableEvalSessionInput): Promise<Record<string, unknown>> {
+export async function runDurableEvalSession(
+  input: DurableEvalSessionInput,
+): Promise<Record<string, unknown>> {
   const identity = {
     runnerInstanceId: `runner_${createHash("sha256").update(input.attemptId).digest("hex").slice(0, 16)}`,
     environmentLeaseId: `lease_${createHash("sha256").update(`${input.attemptId}:lease`).digest("hex").slice(0, 16)}`,
@@ -1844,14 +2233,19 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
   const authority = new CapabilityMockControlPlaneAdapter(input.seed);
   const initialState = JSON.stringify(authority.snapshot());
   await authority.start();
-  const companyId = authority.snapshot().actors.find((actor) => actor.id === input.actorId)?.companyId ?? "company-1";
+  const companyId =
+    authority.snapshot().actors.find((actor) => actor.id === input.actorId)
+      ?.companyId ?? "company-1";
   await authority.openFixtureRun({
     identity: {
-      runId: identity.runId, sessionId: identity.normalizedSessionId,
+      runId: identity.runId,
+      sessionId: identity.normalizedSessionId,
       companyId,
-      issueId: input.taskId, agentId: input.actorId,
+      issueId: input.taskId,
+      agentId: input.actorId,
     },
-    backendKind: "mock", sourceInstanceId: identity.runnerInstanceId,
+    backendKind: "mock",
+    sourceInstanceId: identity.runnerInstanceId,
     capabilities: input.capabilities,
   });
   const dispatcher = new CapabilitySemanticDispatcher(authority, {
@@ -1861,38 +2255,86 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
   const authorized = dispatcher.listTools(identity.runId);
   const loadedOperations = new Set<string>();
   const discoveryEvidence: Array<Record<string, unknown>> = [];
-  const operations: Array<{ operationId: string; version: number; description: string; inputSchema: unknown; responseSchema: unknown }> = authorized.map((tool) => {
+  const operations: Array<{
+    operationId: string;
+    version: number;
+    description: string;
+    inputSchema: unknown;
+    responseSchema: unknown;
+  }> = authorized.map((tool) => {
     const descriptor = capabilitySemanticToolDescriptor(tool.name);
     if (!descriptor) throw new Error(`missing descriptor for ${tool.name}`);
-    return { operationId: tool.name, version: 1, description: tool.description, inputSchema: tool.inputSchema, responseSchema: descriptor.outputSchema };
+    return {
+      operationId: tool.name,
+      version: 1,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      responseSchema: descriptor.outputSchema,
+    };
   });
-  const exposedOperations = input.toolExposure === "lazy"
-    ? operations.filter((operation) => authorized.find((tool) => tool.name === operation.operationId)?.annotations.exposure === "always")
-    : operations;
+  const exposedOperations =
+    input.toolExposure === "lazy"
+      ? operations.filter(
+          (operation) =>
+            authorized.find((tool) => tool.name === operation.operationId)
+              ?.annotations.exposure === "always",
+        )
+      : operations;
   if (input.toolExposure === "lazy") {
-    exposedOperations.push(...CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS.map((gateway) => ({
-      operationId: gateway.name, version: 1, description: gateway.description,
-      inputSchema: gateway.inputSchema, responseSchema: gateway.outputSchema,
-    })));
+    exposedOperations.push(
+      ...CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS.map((gateway) => ({
+        operationId: gateway.name,
+        version: 1,
+        description: gateway.description,
+        inputSchema: gateway.inputSchema,
+        responseSchema: gateway.outputSchema,
+      })),
+    );
   }
   const core = new DurableRecoveryMockCore({
-    stateDirectory: resolve(root, "mock-core"), identity, fault: "none",
+    stateDirectory: resolve(root, "mock-core"),
+    identity,
+    fault: "none",
     onSemanticToolInput: async (call) => {
       if (call.operationId === "discover_capabilities") {
         const args = (call.input ?? {}) as Record<string, unknown>;
-        const found = dispatcher.discoverTools(identity.runId, String(args.query ?? ""), {
-          ...(typeof args.namespace === "string" ? { namespace: args.namespace } : {}),
-          ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+        const found = dispatcher.discoverTools(
+          identity.runId,
+          String(args.query ?? ""),
+          {
+            ...(typeof args.namespace === "string"
+              ? { namespace: args.namespace }
+              : {}),
+            ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+          },
+        );
+        for (const operation of found.operations)
+          loadedOperations.add(operation.name);
+        discoveryEvidence.push({
+          action: "loaded",
+          query: found.query,
+          namespace: found.namespace ?? "",
+          operationIds: found.operations.map((operation) => operation.name),
         });
-        for (const operation of found.operations) loadedOperations.add(operation.name);
-        discoveryEvidence.push({ action: "loaded", query: found.query, namespace: found.namespace ?? "", operationIds: found.operations.map((operation) => operation.name) });
         return found;
       }
       if (call.operationId === "invoke_discovered_capability") {
         const args = (call.input ?? {}) as Record<string, unknown>;
         const operationId = String(args.operationId ?? "");
-        if (!loadedOperations.has(operationId)) return { ok: false, denial: { code: "operation_not_loaded", message: "Operation was not loaded by capability discovery." } };
-        const invoked = await dispatcher.dispatch({ runId: identity.runId, callId: call.callId, operationId, input: args.input });
+        if (!loadedOperations.has(operationId))
+          return {
+            ok: false,
+            denial: {
+              code: "operation_not_loaded",
+              message: "Operation was not loaded by capability discovery.",
+            },
+          };
+        const invoked = await dispatcher.dispatch({
+          runId: identity.runId,
+          callId: call.callId,
+          operationId,
+          input: args.input,
+        });
         return {
           success: invoked.ok,
           contentItems: [{ type: "inputText", text: JSON.stringify(invoked) }],
@@ -1900,99 +2342,212 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       }
       return dispatcher.dispatch({ runId: identity.runId, ...call });
     },
-    connectionLeaseTtlMs: input.turnTimeoutMs + 60_000,
+    // The connection lease is an ownership/security boundary, not a provider-turn
+    // deadline. ACP turns are handled synchronously by runnerd today, so a slow
+    // provider cannot receive runner.shutdown until the turn returns. Keep the
+    // eval lease aligned with the production live transport and let the separate
+    // turn timeout classify/cancel provider work without invalidating otherwise
+    // durable evidence during shutdown.
+    connectionLeaseTtlMs: durableEvalConnectionLeaseTtlMs(input.turnTimeoutMs),
   });
   const providerArgs = [
-    "-c", 'default_permissions="paperclip-runner-workspace-only"',
-    "-c", `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
-    "-c", "permissions.paperclip-runner-workspace-only.network.enabled=false",
-    "-c", "shell_environment_policy.inherit=\"none\"",
+    "-c",
+    'default_permissions="paperclip-runner-workspace-only"',
+    "-c",
+    `permissions.paperclip-runner-workspace-only.filesystem={":root"="none",":minimal"="read",":tmpdir"="write",${JSON.stringify(tmpdir())}="write"}`,
+    "-c",
+    "permissions.paperclip-runner-workspace-only.network.enabled=false",
+    "-c",
+    'shell_environment_policy.inherit="none"',
     "app-server",
   ];
   const providerKind = input.provider ?? "codex";
-  if (providerKind === "aws_agentcore" && input.agentCoreProfile === undefined) {
-    throw new Error("AWS AgentCore eval requires an immutable qualified profile snapshot");
+  if (providerKind === "claude_managed" && input.managedProfile === undefined) {
+    throw new Error(
+      "Claude Managed eval requires an immutable managed profile snapshot",
+    );
   }
-  const opencodeProxyPath = input.opencodeProxyPath
-    ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
-  const acpxSidecarPath = input.acpxSidecarPath
-    ?? fileURLToPath(new URL("../cli/acpx-runtime-sidecar.js", import.meta.url));
-  const acpxProfile = providerKind === "acpx"
-    ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", input.model)
-    : null;
+  if (
+    providerKind === "aws_agentcore" &&
+    input.agentCoreProfile === undefined
+  ) {
+    throw new Error(
+      "AWS AgentCore eval requires an immutable qualified profile snapshot",
+    );
+  }
+  const opencodeProxyPath =
+    input.opencodeProxyPath ??
+    fileURLToPath(
+      new URL("../cli/opencode-app-server-proxy.js", import.meta.url),
+    );
+  const acpxSidecarPath =
+    input.acpxSidecarPath ??
+    fileURLToPath(new URL("../cli/acpx-runtime-sidecar.js", import.meta.url));
+  const acpxProfile =
+    providerKind === "acpx"
+      ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", input.model)
+      : null;
   core.queueCommand("run.prepare", {
     authorizedTools: {
-      schema: "paperclip.runner.authorized-tools.v1", schemaVersion: 1,
+      schema: "paperclip.runner.authorized-tools.v1",
+      schemaVersion: 1,
       catalogDigest: `sha256:${createHash("sha256").update(canonicalJson(operations)).digest("hex")}`,
       operations: exposedOperations,
     },
-    provider: providerKind === "aws_agentcore" ? {
-      kind: "aws_agentcore",
-      model: input.model,
-      ...input.agentCoreProfile,
-    } : providerKind === "acpx" ? {
-      kind: "acpx",
-      agent: acpxProfile!.agent,
-      model: input.model,
-      acpxVersion: acpxProfile!.acpxVersion,
-      agentServerPackage: acpxProfile!.agentServerPackage,
-      agentServerVersion: acpxProfile!.agentServerVersion,
-      agentRuntimePackage: acpxProfile!.agentRuntimePackage,
-      agentRuntimeVersion: acpxProfile!.agentRuntimeVersion,
-      commandDigest: acpxProfile!.commandDigest,
-      sidecarCommand: process.execPath,
-      sidecarArgs: [acpxSidecarPath],
-      runtimeDirectory: resolve(root, "acpx"),
-      normalizedSessionId: identity.normalizedSessionId,
-      runId: identity.runId,
-      cwd: tmpdir(),
-      instructions: "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
-      permissionPolicy: "interactive",
-    } : {
-      kind: providerKind,
-      command: providerKind === "opencode" ? process.execPath : process.env.PAPERCLIP_CODEX_COMMAND ?? "codex",
-      args: providerKind === "opencode" ? [opencodeProxyPath] : providerArgs,
-      cwd: tmpdir(), model: input.model,
-      instructions: "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
-    },
+    provider:
+      providerKind === "claude_managed"
+        ? claudeManagedEvalProviderConfiguration(
+            input.model,
+            input.managedProfile!,
+          )
+        : providerKind === "aws_agentcore"
+          ? {
+              kind: "aws_agentcore",
+              model: input.model,
+              ...input.agentCoreProfile,
+            }
+          : providerKind === "acpx"
+            ? {
+                kind: "acpx",
+                agent: acpxProfile!.agent,
+                model: input.model,
+                acpxVersion: acpxProfile!.acpxVersion,
+                agentServerPackage: acpxProfile!.agentServerPackage,
+                agentServerVersion: acpxProfile!.agentServerVersion,
+                agentRuntimePackage: acpxProfile!.agentRuntimePackage,
+                agentRuntimeVersion: acpxProfile!.agentRuntimeVersion,
+                commandDigest: acpxProfile!.commandDigest,
+                sidecarCommand: process.execPath,
+                sidecarArgs: [acpxSidecarPath],
+                runtimeDirectory: resolve(root, "acpx"),
+                normalizedSessionId: identity.normalizedSessionId,
+                runId: identity.runId,
+                cwd: tmpdir(),
+                instructions:
+                  "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
+                permissionPolicy: "interactive",
+              }
+            : {
+                kind: providerKind,
+                command:
+                  providerKind === "opencode"
+                    ? process.execPath
+                    : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex"),
+                args:
+                  providerKind === "opencode"
+                    ? [opencodeProxyPath]
+                    : providerArgs,
+                cwd: tmpdir(),
+                model: input.model,
+                instructions:
+                  "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
+                collaborationMode: "default",
+                includeCollaborationModeInstructions:
+                  providerKind === "codex" &&
+                  (input.includeCollaborationModeInstructions ?? true),
+              },
   });
   core.queueCommand("session.open", { reuse: "same_session" });
   core.queueCommand("turn.start", { text: input.prompt });
   await core.start();
   const handle = spawnRunner({
-    connectUrl: core.connectUrl, stateDirectory: runnerStateDirectory, identity,
-    ticket: core.issueBootstrapTicket(), maxOutboxBytes: 256 * 1024,
-    p0ReserveBytes: 64 * 1024, maxRuntimeMs: input.turnTimeoutMs + 30_000,
+    connectUrl: core.connectUrl,
+    stateDirectory: runnerStateDirectory,
+    identity,
+    ticket: core.issueBootstrapTicket(),
+    maxOutboxBytes: 256 * 1024,
+    p0ReserveBytes: 64 * 1024,
+    maxRuntimeMs: input.turnTimeoutMs + 30_000,
     runnerBinaryPath: input.runnerBinaryPath,
-    environment: providerKind === "opencode"
-      ? {
-          ...process.env,
-          PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
-          PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
-          PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
-          PAPERCLIP_RUN_ID: identity.runId,
-          PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
-        }
-      : providerKind === "aws_agentcore"
-        ? sanitizedAwsEvalEnvironment(process.env)
-        : providerKind === "acpx"
-          ? createSanitizedAcpxEnvironment(process.env, acpxProfile!.agent)
-        : process.env,
+    environment:
+      providerKind === "opencode"
+        ? {
+            ...process.env,
+            PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
+            PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
+            PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+            PAPERCLIP_RUN_ID: identity.runId,
+            PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+          }
+        : providerKind === "claude_managed"
+          ? createSanitizedClaudeManagedEnvironment(process.env)
+          : providerKind === "aws_agentcore"
+            ? sanitizedAwsEvalEnvironment(process.env)
+            : providerKind === "acpx"
+              ? createSanitizedAcpxEnvironment(process.env, acpxProfile!.agent)
+              : process.env,
   });
   try {
+    const resolvedEvalRuntimeRequests = new Set<string>();
+    let providerTerminalFailure: {
+      failureClass: "provider_turn_timeout" | "provider_budget_reached";
+      message: string;
+      retryable: boolean;
+    } | null = null;
     const deadline = Date.now() + input.turnTimeoutMs;
     while (Date.now() < deadline) {
-      if (core.store.state.committedEvents.some((event) => event.eventType === "turn.completed")) break;
+      if (providerKind === "acpx") {
+        for (const committed of core.store.state.committedEvents) {
+          const event = committed.envelope.payload as
+            Record<string, unknown> | undefined;
+          if (event?.eventType !== "runtime_request.created") continue;
+          const payload = event.payload as Record<string, unknown> | undefined;
+          const request = payload?.request as
+            Record<string, unknown> | undefined;
+          const requestId =
+            typeof request?.requestId === "string" ? request.requestId : "";
+          const requestTurnId =
+            typeof request?.turnId === "string"
+              ? request.turnId
+              : identity.turnId;
+          if (!requestId || resolvedEvalRuntimeRequests.has(requestId))
+            continue;
+          resolvedEvalRuntimeRequests.add(requestId);
+          core.queueCommand(
+            "request.resolve",
+            {
+              requestId,
+              turnId: requestTurnId,
+              resolution: { action: "decline" },
+            },
+            `command_eval_permission_${createHash("sha256").update(requestId).digest("hex").slice(0, 16)}`,
+            true,
+          );
+        }
+      }
+      const budgetReached =
+        providerKind === "claude_managed" &&
+        managedProviderBudgetReached(core.store.state.committedEvents);
+      if (budgetReached) {
+        providerTerminalFailure = {
+          failureClass: "provider_budget_reached",
+          message: `Claude Managed session reached its $${input.managedProfile!.maxSessionListCostUsd.toFixed(2)} provider list-cost ceiling`,
+          retryable: false,
+        };
+        break;
+      }
+      if (
+        core.store.state.committedEvents.some(
+          (event) => event.eventType === "turn.completed",
+        )
+      )
+        break;
       await new Promise((resolveWait) => setTimeout(resolveWait, 20));
     }
-    if (!core.store.state.committedEvents.some((event) => event.eventType === "turn.completed")) {
-      throw new DurableEvalInfrastructureError(
-        "provider_turn_timeout",
-        `durable provider turn timed out after ${input.turnTimeoutMs}ms`,
-        true,
-        evalLifecycleDiagnostics(core, handle, runnerStateDirectory),
-      );
+    if (
+      providerTerminalFailure === null &&
+      !core.store.state.committedEvents.some(
+        (event) => event.eventType === "turn.completed",
+      )
+    ) {
+      providerTerminalFailure = {
+        failureClass: "provider_turn_timeout",
+        message: `durable provider turn timed out after ${input.turnTimeoutMs}ms`,
+        retryable: true,
+      };
     }
+    // Managed sessions are retained by normal runner shutdown. Never issue
+    // session.destroy from the eval lane, including timeout and budget stops.
     core.queueCommand("runner.shutdown", {}, undefined, true);
     let exited: RunnerProcessResult;
     try {
@@ -2010,64 +2565,196 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
         "runner_exit_failure",
         `runnerd exited ${String(exited.code)}: ${exited.stderr}`,
         false,
-        { ...evalLifecycleDiagnostics(core, handle, runnerStateDirectory), stderr: exited.stderr.slice(-16_384) },
+        {
+          ...evalLifecycleDiagnostics(core, handle, runnerStateDirectory),
+          stderr: exited.stderr.slice(-16_384),
+        },
       );
     }
-    const records = core.store.state.committedEvents.map((committed) => committed.envelope.payload as Record<string, unknown>);
-    const evidence: Array<Record<string, unknown>> = [{
-      id: "exposure-1", kind: "tool_exposure", at: new Date().toISOString(), turnId: null,
-      data: { operationIds: exposedOperations.map((operation) => operation.operationId) },
-    }];
+    if (providerTerminalFailure !== null) {
+      throw new DurableEvalInfrastructureError(
+        providerTerminalFailure.failureClass,
+        providerTerminalFailure.message,
+        providerTerminalFailure.retryable,
+        evalLifecycleDiagnostics(core, handle, runnerStateDirectory),
+      );
+    }
+    const records = core.store.state.committedEvents.map(
+      (committed) => committed.envelope.payload as Record<string, unknown>,
+    );
+    const evidence: Array<Record<string, unknown>> = [
+      {
+        id: "exposure-1",
+        kind: "tool_exposure",
+        at: new Date().toISOString(),
+        turnId: null,
+        data: {
+          operationIds: exposedOperations.map(
+            (operation) => operation.operationId,
+          ),
+        },
+      },
+    ];
     for (const data of discoveryEvidence) {
-      evidence.push({ id: `discovery-${evidence.length + 1}`, kind: "tool_discovery", at: new Date().toISOString(), turnId: identity.turnId, data });
+      evidence.push({
+        id: `discovery-${evidence.length + 1}`,
+        kind: "tool_discovery",
+        at: new Date().toISOString(),
+        turnId: identity.turnId,
+        data,
+      });
     }
     let evidenceIndex = 1;
     let assistantText = "";
     let semanticResult: Record<string, unknown> | null = null;
-    let usage: Record<string, number> = {};
+    let usage: Record<string, number> = {
+      providerCalls: 1,
+      providerRequests: providerKind === "claude_managed" ? 0 : 1,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      providerCostNanodollars: 0,
+    };
     let providerSessionId: string | null = null;
+    let providerPid: number | null = null;
+    let sidecarPid: number | null = null;
+    let agentPid: number | null = null;
+    let providerDriver: string | null = null;
+    let providerVersion: string | null = null;
+    let agentServerVersion: string | null = null;
+    let agentRuntimeVersion: string | null = null;
+    let acpProtocolVersion: number | null = null;
+    let acpxRecordId: string | null = null;
+    let providerExecutionKind: string | null = null;
+    let providerService: string | null = null;
     const projectedCalls = new Map<string, string>();
     for (const record of records) {
       const payload = record.payload as Record<string, unknown> | undefined;
       if (record.eventType === "harness.ready") {
-        const descriptor = payload?.providerDescriptor as Record<string, unknown> | undefined;
-        if (typeof descriptor?.providerSessionId === "string") providerSessionId = descriptor.providerSessionId;
+        const descriptor = payload?.providerDescriptor as
+          Record<string, unknown> | undefined;
+        if (typeof descriptor?.providerSessionId === "string")
+          providerSessionId = descriptor.providerSessionId;
+        if (typeof descriptor?.processId === "number") {
+          providerPid = descriptor.processId;
+          if (descriptor.driver === "acpx_runtime")
+            sidecarPid = descriptor.processId;
+        }
+        if (typeof descriptor?.driver === "string")
+          providerDriver = descriptor.driver;
+        if (typeof descriptor?.providerVersion === "string")
+          providerVersion = descriptor.providerVersion;
+        if (typeof descriptor?.agentServerVersion === "string")
+          agentServerVersion = descriptor.agentServerVersion;
+        if (typeof descriptor?.agentRuntimeVersion === "string")
+          agentRuntimeVersion = descriptor.agentRuntimeVersion;
+        if (typeof descriptor?.acpProtocolVersion === "number")
+          acpProtocolVersion = descriptor.acpProtocolVersion;
+        if (typeof descriptor?.agentProcessId === "number")
+          agentPid = descriptor.agentProcessId;
+        if (typeof descriptor?.acpxRecordId === "string")
+          acpxRecordId = descriptor.acpxRecordId;
+        if (typeof descriptor?.executionKind === "string")
+          providerExecutionKind = descriptor.executionKind;
+        if (typeof descriptor?.service === "string")
+          providerService = descriptor.service;
       }
-      if (record.eventType === "run.result.proposed" && payload && semanticResult === null) {
+      if (record.eventType === "harness.diagnostic") {
+        if (
+          payload?.providerMethod === "acpx/process" &&
+          payload.role === "acp_agent" &&
+          typeof payload.pid === "number"
+        ) {
+          agentPid = payload.pid;
+        }
+      }
+      if (
+        record.eventType === "run.result.proposed" &&
+        payload &&
+        semanticResult === null
+      ) {
         semanticResult = structuredClone(payload);
       }
-      const semantic = payload?.semantic_tool as Record<string, unknown> | undefined;
+      const semantic = payload?.semantic_tool as
+        Record<string, unknown> | undefined;
       if (semantic?.phase === "input" || semantic?.phase === "result") {
-        const wrapperInput = semantic.input as Record<string, unknown> | undefined;
-        const projectedOperationId = semantic.operationId === "invoke_discovered_capability"
-          ? (typeof wrapperInput?.operationId === "string" ? wrapperInput.operationId : projectedCalls.get(String(semantic.callId)) ?? semantic.operationId)
-          : semantic.operationId;
-        const projectedInput = semantic.operationId === "invoke_discovered_capability" ? wrapperInput?.input : semantic.input;
-        if (semantic.phase === "input") projectedCalls.set(String(semantic.callId), String(projectedOperationId));
+        const wrapperInput = semantic.input as
+          Record<string, unknown> | undefined;
+        const projectedOperationId =
+          semantic.operationId === "invoke_discovered_capability"
+            ? typeof wrapperInput?.operationId === "string"
+              ? wrapperInput.operationId
+              : (projectedCalls.get(String(semantic.callId)) ??
+                semantic.operationId)
+            : semantic.operationId;
+        const projectedInput =
+          semantic.operationId === "invoke_discovered_capability"
+            ? wrapperInput?.input
+            : semantic.input;
+        if (semantic.phase === "input")
+          projectedCalls.set(
+            String(semantic.callId),
+            String(projectedOperationId),
+          );
         evidenceIndex += 1;
         evidence.push({
-          id: `evidence-${evidenceIndex}`, kind: semantic.phase === "input" ? "tool_call" : "tool_result",
-          at: new Date().toISOString(), turnId: identity.turnId,
-          data: semantic.phase === "input"
-            ? { callId: semantic.callId, operationId: projectedOperationId, input: projectedInput }
-            : { callId: semantic.callId, operationId: projectedOperationId, result: projectedSemanticResult(semantic.operationId, semantic.result) },
+          id: `evidence-${evidenceIndex}`,
+          kind: semantic.phase === "input" ? "tool_call" : "tool_result",
+          at: new Date().toISOString(),
+          turnId: identity.turnId,
+          data:
+            semantic.phase === "input"
+              ? {
+                  callId: semantic.callId,
+                  operationId: projectedOperationId,
+                  input: projectedInput,
+                }
+              : {
+                  callId: semantic.callId,
+                  operationId: projectedOperationId,
+                  result: projectedSemanticResult(
+                    semantic.operationId,
+                    semantic.result,
+                  ),
+                },
         });
       }
       if (record.eventType === "provider.event") {
         const method = payload?.method;
         const params = payload?.params as Record<string, unknown> | undefined;
-        if (typeof params?.delta === "string" && String(method).includes("agentMessage")) assistantText += params.delta;
+        if (
+          typeof params?.delta === "string" &&
+          String(method).includes("agentMessage")
+        )
+          assistantText += params.delta;
         const item = params?.item as Record<string, unknown> | undefined;
         // Codex reports the completed assistant item through `item/completed`; the
         // item type, rather than the notification method, identifies its role.
-        if (!assistantText && item?.type === "agentMessage" && typeof item.text === "string") assistantText = item.text;
-        if (!assistantText && String(method).includes("agentMessage") && typeof params?.text === "string") assistantText = params.text;
-        if (method === "thread/tokenUsage/updated" && typeof params?.tokenUsage === "object" && params.tokenUsage) {
+        if (
+          !assistantText &&
+          item?.type === "agentMessage" &&
+          typeof item.text === "string"
+        )
+          assistantText = item.text;
+        if (
+          !assistantText &&
+          String(method).includes("agentMessage") &&
+          typeof params?.text === "string"
+        )
+          assistantText = params.text;
+        if (
+          method === "thread/tokenUsage/updated" &&
+          typeof params?.tokenUsage === "object" &&
+          params.tokenUsage
+        ) {
           const tokenUsage = params.tokenUsage as Record<string, unknown>;
-          const total = typeof tokenUsage.total === "object" && tokenUsage.total !== null
-            ? tokenUsage.total as Record<string, number>
-            : tokenUsage as Record<string, number>;
+          const total =
+            typeof tokenUsage.total === "object" && tokenUsage.total !== null
+              ? (tokenUsage.total as Record<string, number>)
+              : (tokenUsage as Record<string, number>);
           usage = {
+            ...usage,
             inputTokens: total.inputTokens ?? 0,
             outputTokens: total.outputTokens ?? 0,
             cachedInputTokens: total.cachedInputTokens ?? 0,
@@ -2081,16 +2768,27 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       }
       if (record.eventType === "item.completed") {
         const item = payload?.item as Record<string, unknown> | undefined;
-        if (item?.type === "agentMessage" && typeof item.text === "string") assistantText = item.text;
+        if (item?.type === "agentMessage" && typeof item.text === "string")
+          assistantText = item.text;
       }
       if (record.eventType === "usage.reported") {
-        const runDelta = payload?.runDelta as Record<string, number> | undefined;
+        const runDelta = payload?.runDelta as
+          Record<string, number> | undefined;
         if (runDelta) {
           usage = {
+            ...usage,
+            providerRequests:
+              runDelta.requests ??
+              runDelta.providerRequests ??
+              usage.providerRequests,
             inputTokens: runDelta.inputTokens ?? 0,
             outputTokens: runDelta.outputTokens ?? 0,
             cachedInputTokens: runDelta.cacheReadTokens ?? 0,
             reasoningTokens: runDelta.reasoningTokens ?? 0,
+            providerCostNanodollars:
+              typeof runDelta.providerCostUsd === "number"
+                ? Math.round(runDelta.providerCostUsd * 1_000_000_000)
+                : usage.providerCostNanodollars,
           };
         }
       }
@@ -2102,69 +2800,216 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
           const item = candidate as Record<string, unknown>;
           return item.type === "agentMessage" && typeof item.text === "string";
         }) as Record<string, unknown> | undefined;
-        if (typeof finalMessage?.text === "string") assistantText = finalMessage.text;
+        if (typeof finalMessage?.text === "string")
+          assistantText = finalMessage.text;
       }
     }
     for (const command of core.store.state.commands) {
-      if (command.type !== "semantic_tool.result" || command.status !== "completed") continue;
+      if (
+        command.type !== "semantic_tool.result" ||
+        command.status !== "completed"
+      )
+        continue;
       const payload = command.payload as Record<string, unknown>;
       const wrapperInput = payload.input as Record<string, unknown> | undefined;
-      const projectedOperationId = payload.operationId === "invoke_discovered_capability"
-        ? (typeof wrapperInput?.operationId === "string" ? wrapperInput.operationId : projectedCalls.get(String(payload.callId)) ?? payload.operationId)
-        : payload.operationId;
-      if (evidence.some((entry) => entry.kind === "tool_result" && (entry.data as Record<string, unknown>).callId === payload.callId)) continue;
+      const projectedOperationId =
+        payload.operationId === "invoke_discovered_capability"
+          ? typeof wrapperInput?.operationId === "string"
+            ? wrapperInput.operationId
+            : (projectedCalls.get(String(payload.callId)) ??
+              payload.operationId)
+          : payload.operationId;
+      if (
+        evidence.some(
+          (entry) =>
+            entry.kind === "tool_result" &&
+            (entry.data as Record<string, unknown>).callId === payload.callId,
+        )
+      )
+        continue;
       evidenceIndex += 1;
       evidence.push({
-        id: `evidence-${evidenceIndex}`, kind: "tool_result", at: new Date().toISOString(), turnId: identity.turnId,
-        data: { callId: payload.callId, operationId: projectedOperationId, result: projectedSemanticResult(payload.operationId, payload.result) },
+        id: `evidence-${evidenceIndex}`,
+        kind: "tool_result",
+        at: new Date().toISOString(),
+        turnId: identity.turnId,
+        data: {
+          callId: payload.callId,
+          operationId: projectedOperationId,
+          result: projectedSemanticResult(payload.operationId, payload.result),
+        },
       });
     }
-    if (!assistantText) assistantText = "Provider completed the requested Paperclip operation.";
+    if (!assistantText)
+      assistantText = "Provider completed the requested Paperclip operation.";
     const finalState = JSON.stringify(authority.snapshot());
     const now = new Date().toISOString();
     return {
       turn: { turnId: identity.turnId, status: "completed", assistantText },
       snapshot: {
-        schema: "paperclip.capability.live-session.v1", revision: authority.snapshot().revision,
-        sessionId: identity.normalizedSessionId, providerThreadId: "withheld", providerSessionId,
+        schema: "paperclip.capability.live-session.v1",
+        revision: authority.snapshot().revision,
+        sessionId: identity.normalizedSessionId,
+        providerThreadId: "withheld",
+        providerSessionId,
         providerModel: {
           id: input.model,
-          provider: providerKind === "opencode"
-            ? input.model.split("/", 1)[0]
-            : providerKind === "aws_agentcore"
-              ? "amazon-bedrock"
-              : providerKind === "acpx"
-                ? acpxProfile!.agent === "pi" ? "openrouter" : acpxProfile!.agent === "claude" ? "anthropic" : "openai"
-                : "openai",
+          provider:
+            providerKind === "opencode"
+              ? input.model.split("/", 1)[0]
+              : providerKind === "claude_managed"
+                ? "anthropic"
+                : providerKind === "aws_agentcore"
+                  ? "amazon-bedrock"
+                  : providerKind === "acpx"
+                    ? acpxProfile!.agent === "pi"
+                      ? "openrouter"
+                      : acpxProfile!.agent === "claude"
+                        ? "anthropic"
+                        : "openai"
+                    : "openai",
         },
-        modelHistory: [{
-          requestedModel: input.model,
-          effectiveModel: input.model,
-          at: now,
-          source: "provider_verified",
-        }],
-        status: "idle", activeTurnId: null,
+        modelHistory: [
+          {
+            requestedModel: input.model,
+            effectiveModel: input.model,
+            at: now,
+            source: "provider_verified",
+          },
+        ],
+        status: "idle",
+        activeTurnId: null,
         semanticResult,
-        createdAt: now, updatedAt: now,
-        authority: { active: true, runId: identity.runId, companyId, actorId: input.actorId, taskId: input.taskId, sessionId: identity.normalizedSessionId, scenarioId: input.attemptId, capabilities: input.capabilities, explicitClaims: input.explicitClaims },
-        config: { workingDirectory: providerKind === "aws_agentcore" ? null : tmpdir(), requestedModel: input.model, provider: providerKind, driver: providerKind === "opencode" ? "opencode_server" : providerKind === "aws_agentcore" ? "aws_agentcore_harness_api" : providerKind === "acpx" ? "acpx_runtime" : "codex_app_server", providerVersion: providerKind === "opencode" ? input.opencodeVersion ?? "1.18.17" : providerKind === "aws_agentcore" ? input.agentCoreProfile?.harnessVersion ?? null : providerKind === "acpx" ? acpxProfile!.acpxVersion : null, ...(acpxProfile === null ? {} : { acpxAgent: acpxProfile.agent, acpxProfile }), scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
+        createdAt: now,
+        updatedAt: now,
+        authority: {
+          active: true,
+          runId: identity.runId,
+          companyId,
+          actorId: input.actorId,
+          taskId: input.taskId,
+          sessionId: identity.normalizedSessionId,
+          scenarioId: input.attemptId,
+          capabilities: input.capabilities,
+          explicitClaims: input.explicitClaims,
+        },
+        config: {
+          workingDirectory:
+            providerKind === "claude_managed" ||
+            providerKind === "aws_agentcore"
+              ? null
+              : tmpdir(),
+          requestedModel: input.model,
+          provider: providerKind,
+          driver:
+            providerKind === "opencode"
+              ? "opencode_server"
+              : providerKind === "claude_managed"
+                ? "claude_managed_agents_api"
+                : providerKind === "aws_agentcore"
+                  ? "aws_agentcore_harness_api"
+                  : providerKind === "acpx"
+                    ? "acpx_runtime"
+                    : "codex_app_server",
+          providerVersion:
+            providerKind === "opencode"
+              ? (input.opencodeVersion ?? "1.18.17")
+              : providerKind === "claude_managed"
+                ? (input.managedProfile?.agentVersion ?? null)
+                : providerKind === "aws_agentcore"
+                  ? (input.agentCoreProfile?.harnessVersion ?? null)
+                  : providerKind === "acpx"
+                    ? acpxProfile!.acpxVersion
+                    : null,
+          ...(providerKind === "claude_managed"
+            ? { managedProfile: input.managedProfile }
+            : {}),
+          ...(acpxProfile === null
+            ? {}
+            : { acpxAgent: acpxProfile.agent, acpxProfile }),
+          scenario: { id: input.attemptId, claims: input.capabilities },
+          capabilities: input.capabilities,
+          explicitClaims: input.explicitClaims,
+          seedState: initialState,
+          turnTimeoutMs: input.turnTimeoutMs,
+        },
         mockState: finalState,
         transcript: [
-          { id: "transcript-user", role: "user", text: input.prompt, turnId: identity.turnId, at: now },
-          { id: "transcript-assistant", role: "assistant", text: assistantText, turnId: identity.turnId, at: now },
+          {
+            id: "transcript-user",
+            role: "user",
+            text: input.prompt,
+            turnId: identity.turnId,
+            at: now,
+          },
+          {
+            id: "transcript-assistant",
+            role: "assistant",
+            text: assistantText,
+            turnId: identity.turnId,
+            at: now,
+          },
         ],
-        evidence, authorizationRecords: dispatcher.authorizationRecords(),
-        process: { runnerPid: handle.child.pid ?? null, codexPid: null, runnerExited: true, runnerExitCode: exited.code, runnerSignal: exited.signal, childEnvironmentKeys: [], diagnostics: [] },
-        networkEvidence: { realPaperclipRequests: 0, childPaperclipEnvironmentKeys: [] },
-        terminalTurns: [{ turnId: identity.turnId, status: "completed", reconciledByAttemptId: input.attemptId, observedAt: now }],
-        usageLedger: [{ receiptId: `usage-${input.attemptId}`, attemptId: input.attemptId, providerResponseId: null, turnId: identity.turnId, providerCalls: 1, providerRequests: 1, inputTokens: usage.inputTokens ?? 0, outputTokens: usage.outputTokens ?? 0, cachedInputTokens: usage.cachedInputTokens ?? 0, reasoningTokens: usage.reasoningTokens ?? 0, costNanodollars: 0, observedAt: now }],
+        evidence,
+        authorizationRecords: dispatcher.authorizationRecords(),
+        process: {
+          runnerPid: handle.child.pid ?? null,
+          runnerProcessGroupId: handle.child.pid ?? null,
+          providerPid,
+          codexPid: providerKind === "codex" ? providerPid : null,
+          sidecarPid,
+          agentPid,
+          providerDriver,
+          providerVersion,
+          acpxAgent: acpxProfile?.agent ?? null,
+          agentServerVersion,
+          agentRuntimeVersion,
+          acpProtocolVersion,
+          acpxRecordId,
+          providerExecutionKind,
+          providerService,
+          runnerExited: true,
+          runnerExitCode: exited.code,
+          runnerSignal: exited.signal,
+          childEnvironmentKeys: [],
+          diagnostics: [],
+        },
+        networkEvidence: {
+          realPaperclipRequests: 0,
+          childPaperclipEnvironmentKeys: [],
+        },
+        terminalTurns: [
+          {
+            turnId: identity.turnId,
+            status: "completed",
+            reconciledByAttemptId: input.attemptId,
+            observedAt: now,
+          },
+        ],
+        usageLedger: [
+          {
+            receiptId: `usage-${input.attemptId}`,
+            attemptId: input.attemptId,
+            providerResponseId: providerSessionId,
+            turnId: identity.turnId,
+            providerCalls: usage.providerCalls ?? 1,
+            providerRequests: usage.providerRequests ?? 0,
+            inputTokens: usage.inputTokens ?? 0,
+            outputTokens: usage.outputTokens ?? 0,
+            cachedInputTokens: usage.cachedInputTokens ?? 0,
+            reasoningTokens: usage.reasoningTokens ?? 0,
+            costNanodollars: usage.providerCostNanodollars ?? 0,
+            observedAt: now,
+          },
+        ],
       },
     };
   } finally {
     handle.child.kill("SIGKILL");
     await core.stop();
     await authority.stop();
-    if (process.env.PAPERCLIP_KEEP_EVAL_STATE !== "1") rmSync(root, { recursive: true, force: true });
+    if (process.env.PAPERCLIP_KEEP_EVAL_STATE !== "1")
+      rmSync(root, { recursive: true, force: true });
   }
 }
 
@@ -2179,7 +3024,9 @@ export async function runDurableRecoveryRecovery(
     tmpdir();
   const root =
     options.stateDirectory ??
-    mkdtempSync(resolve(scratchRoot, `paperclip-runner-durable-recovery-${fault}-`));
+    mkdtempSync(
+      resolve(scratchRoot, `paperclip-runner-durable-recovery-${fault}-`),
+    );
   const runnerStateDirectory = resolve(root, "runner");
   const coreStateDirectory = resolve(root, "mock-core");
   mkdirSync(runnerStateDirectory, { recursive: true, mode: 0o700 });
@@ -2220,7 +3067,9 @@ export async function runDurableRecoveryRecovery(
     } else if (fault === "lease-expiry") {
       const expired = await waitForProcess(handle);
       if (expired.code === 0) {
-        throw new Error("Lease-expiry injection did not produce a recoverable restart boundary.");
+        throw new Error(
+          "Lease-expiry injection did not produce a recoverable restart boundary.",
+        );
       }
       runnerRestarts += 1;
       handle = launch();
@@ -2256,10 +3105,10 @@ export async function runDurableRecoveryRecovery(
     [runnerStatePath, core.store.path],
     [...tickets, "must-not-persist"],
   );
-  const bootstrapTicketPersisted = persistedCapabilityShape(
-    runnerStatePath,
-    ["bootstrapTicket", "bootstrap_ticket"],
-  );
+  const bootstrapTicketPersisted = persistedCapabilityShape(runnerStatePath, [
+    "bootstrapTicket",
+    "bootstrap_ticket",
+  ]);
   const connectionLeaseTokenPersisted = persistedCapabilityShape(
     runnerStatePath,
     ["connectionLeaseToken", "connection_lease_token"],
@@ -2267,7 +3116,9 @@ export async function runDurableRecoveryRecovery(
   const committedEvents = coreState.committedEvents.toSorted(
     (left, right) => left.sourceSeq - right.sourceSeq,
   );
-  const p0Committed = committedEvents.filter((event) => event.priority === 0).length;
+  const p0Committed = committedEvents.filter(
+    (event) => event.priority === 0,
+  ).length;
   const completedCommands = coreState.commands.filter(
     (command) => command.status === "completed",
   );
@@ -2282,10 +3133,9 @@ export async function runDurableRecoveryRecovery(
         : 0),
     0,
   );
-  const duplicateDeliveries = Object.values(coreState.commandDeliveryCounts).reduce(
-    (sum, count) => sum + Math.max(0, count - 1),
-    0,
-  );
+  const duplicateDeliveries = Object.values(
+    coreState.commandDeliveryCounts,
+  ).reduce((sum, count) => sum + Math.max(0, count - 1), 0);
   const outcome: DurableRecoveryDiagnostics["recovery"]["outcome"] =
     fault === "drain"
       ? "drained"
@@ -2318,7 +3168,10 @@ export async function runDurableRecoveryRecovery(
       maxBytes: maxOutboxBytes,
       backpressure: runnerState.backpressure,
       p0Committed,
-      p0Lost: runnerState.ackedSourceSeq === coreState.ackedSourceSeq ? 0 : p0Committed,
+      p0Lost:
+        runnerState.ackedSourceSeq === coreState.ackedSourceSeq
+          ? 0
+          : p0Committed,
     },
     commands: {
       issued: coreState.commands.length,
@@ -2398,4 +3251,7 @@ export const durableRecoveryInternals = {
   canonicalJson,
   durableRecoveryIdentity,
   projectedSemanticResult,
+  claudeManagedEvalProviderConfiguration,
+  managedProviderBudgetReached,
+  durableEvalConnectionLeaseTtlMs,
 };

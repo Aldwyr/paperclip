@@ -89,8 +89,15 @@ interface EmbeddedEvalReport {
   run: {
     model: string;
     provider: string;
+    driver: string;
+    providerVersion: string | null;
+    runnerProvider: string;
     configuration: string;
     sessionId: string;
+    providerSessionId: string | null;
+    agentVersion: string | null;
+    retainedSession: boolean | null;
+    retainedSessionStatus: string | null;
     fixtureDigest: string;
     runnerPackageDigest: string;
     runnerdDigest: string;
@@ -107,6 +114,7 @@ interface EmbeddedEvalReport {
       outputTokens: number;
       cachedInputTokens: number;
       reasoningTokens: number;
+      providerReportedCostNanodollars?: number;
       estimatedCostNanodollars: number;
       pricingVersion: string;
     } | null;
@@ -411,7 +419,21 @@ export function App() {
           if (cancelled) return;
           rememberSession(response.sessionId, "cleanroom");
           setIdentity(response.identity ?? null);
-          setActiveHarness(response.configuration ?? initialHarnessRef.current);
+          const configuration = response.configuration ?? initialHarnessRef.current;
+          setActiveHarness(configuration);
+          // The server-returned immutable session configuration is authoritative
+          // for both the active status and the options initially shown for the
+          // next chat. Without this, a restored remote session could say Claude
+          // or AgentCore in the header while leaving Codex-only fields in the
+          // options form.
+          setHarness(configuration);
+          setManagedBudgetInput(String(
+            configuration.provider === "aws_agentcore"
+              ? configuration.maxEstimatedSessionCostUsd ?? 1
+              : configuration.provider === "claude_managed"
+                ? configuration.maxSessionListCostUsd ?? 1
+                : 1,
+          ));
           setProviderRuntime(response.runtime);
           setHistoricSessionId(null);
           setSnapshot(response.view);
@@ -758,11 +780,14 @@ export function App() {
   const adoptCleanRoom = useCallback((next: Awaited<ReturnType<typeof capabilityLiveClient.newCleanRoom>>) => {
     rememberSession(next.sessionId, "cleanroom");
     setIdentity(next.identity ?? null);
-    setActiveHarness(next.configuration ?? harness);
+    const configuration = next.configuration ?? harness;
+    setActiveHarness(configuration);
+    setHarness(configuration);
     setProviderRuntime(next.runtime);
     setHistoricSessionId(null);
     setSnapshot(next.view);
     setDevtools(null);
+    setError(null);
     setActionError(null);
     setAnnouncement(
       `New clean-room chat started on ${next.view.issue.identifier}. The previous session was closed.`,
@@ -870,6 +895,7 @@ export function App() {
       setSnapshot(live.snapshot);
       setIdentity(live.identity);
       setActiveHarness(live.configuration ?? null);
+      if (live.configuration !== undefined) setHarness(live.configuration);
       setProviderRuntime(live.runtime);
       setDevtools(null);
       setHistoricSessionId(null);
@@ -886,6 +912,7 @@ export function App() {
         setSnapshot(restored.view);
         setIdentity(restored.identity ?? archived.identity);
         setActiveHarness(restored.configuration ?? configuration);
+        setHarness(restored.configuration ?? configuration);
         setProviderRuntime(restored.runtime);
         setDevtools(null);
         setHistoricSessionId(null);
@@ -1020,10 +1047,141 @@ export function App() {
               : error}
           </p>
           {chat ? (
-            <p className="pit-muted">
-              The clean room only runs against the selected real provider through real runnerd, so it does not fall
-              back to a fixture or a recording.
-            </p>
+            <>
+              <p className="pit-muted">
+                The clean room only runs against the selected real provider through real runnerd, so it does not fall
+                back to a fixture or a recording.
+              </p>
+              <section className="pit-harness-picker" aria-label="Chat provider recovery options">
+                <label>
+                  <span>Provider</span>
+                  <select
+                    data-testid="chat-provider"
+                    value={harness.provider}
+                    onChange={(event) => {
+                      const provider = event.target.value as CapabilityHarnessConfiguration["provider"];
+                      setHarness((current) => ({
+                        ...defaultHarness(provider),
+                        lifecyclePolicy: current.lifecyclePolicy,
+                      }));
+                    }}
+                  >
+                    <option value="codex">Codex</option>
+                    <option value="opencode">OpenCode</option>
+                    <option value="claude_managed">Claude Agent</option>
+                    <option value="aws_agentcore">AWS AgentCore</option>
+                    <option value="acpx">ACPX</option>
+                  </select>
+                </label>
+                {harness.provider === "acpx" ? (
+                  <label>
+                    <span>ACP agent</span>
+                    <select
+                      data-testid="chat-acpx-agent"
+                      value={harness.acpxAgent ?? "pi"}
+                      onChange={(event) => {
+                        const acpxAgent = event.target.value as NonNullable<CapabilityHarnessConfiguration["acpxAgent"]>;
+                        setHarness((current) => ({
+                          ...current,
+                          acpxAgent,
+                          model: ACPX_AGENT_MODELS[acpxAgent],
+                        }));
+                      }}
+                    >
+                      <option value="pi">Pi</option>
+                      <option value="claude">Claude</option>
+                      <option value="codex">Codex (control)</option>
+                    </select>
+                  </label>
+                ) : null}
+                <label>
+                  <span>Execution</span>
+                  <select
+                    data-testid="chat-lifecycle-mode"
+                    value={harness.lifecyclePolicy.mode}
+                    onChange={(event) => setHarness((current) => ({
+                      ...current,
+                      lifecyclePolicy: event.target.value === "per_turn"
+                        ? { mode: "per_turn", idleTimeoutMs: null }
+                        : { mode: "warm", idleTimeoutMs: 300_000 },
+                    }))}
+                  >
+                    <option value="warm">Warm session</option>
+                    <option value="per_turn">Turn by turn</option>
+                  </select>
+                </label>
+                {harness.lifecyclePolicy.mode === "warm" ? (
+                  <label>
+                    <span>Idle timeout (seconds)</span>
+                    <input
+                      data-testid="chat-idle-timeout"
+                      type="number"
+                      min={1}
+                      value={Math.round((harness.lifecyclePolicy.idleTimeoutMs ?? 300_000) / 1_000)}
+                      onChange={(event) => setHarness((current) => ({
+                        ...current,
+                        lifecyclePolicy: {
+                          mode: "warm",
+                          idleTimeoutMs: Math.max(1, Number(event.target.value)) * 1_000,
+                        },
+                      }))}
+                    />
+                  </label>
+                ) : null}
+                {harness.provider === "aws_agentcore" ? (
+                  <>
+                    <label>
+                      <span>AgentCore profile</span>
+                      <input
+                        data-testid="chat-agentcore-profile"
+                        value={harness.agentCoreProfileId ?? ""}
+                        placeholder="qualified profile ID"
+                        onChange={(event) => setHarness((current) => ({
+                          ...current,
+                          agentCoreProfileId: event.target.value,
+                        }))}
+                      />
+                    </label>
+                    <label>
+                      <span>Estimated ceiling (USD)</span>
+                      <input
+                        data-testid="chat-agentcore-spend-cap"
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        value={harness.maxEstimatedSessionCostUsd ?? 1}
+                        onChange={(event) => setHarness((current) => ({
+                          ...current,
+                          maxEstimatedSessionCostUsd: Number(event.target.value),
+                        }))}
+                      />
+                    </label>
+                  </>
+                ) : null}
+                <label className="pit-harness-model">
+                  <span>Model</span>
+                  <input
+                    data-testid="chat-model"
+                    list={`chat-recovery-models-${harness.provider}`}
+                    value={harness.model ?? ""}
+                    placeholder={harness.provider === "opencode" || (harness.provider === "acpx" && harness.acpxAgent === "pi") ? "provider/model" : "model name"}
+                    onChange={(event) => setHarness((current) => ({ ...current, model: event.target.value }))}
+                  />
+                  <datalist id={`chat-recovery-models-${harness.provider}`}>
+                    {MODEL_PRESETS[harness.provider].map((model) => <option key={model} value={model} />)}
+                  </datalist>
+                </label>
+                <button
+                  type="button"
+                  className="pit-button"
+                  data-variant="primary"
+                  data-testid="chat-apply-harness"
+                  onClick={newChat}
+                >
+                  Start new chat
+                </button>
+              </section>
+            </>
           ) : null}
           <button
             type="button"
@@ -1319,12 +1477,12 @@ export function App() {
               </button>
             </div>
           ) : null}
-          {harness.provider === "claude_managed" ? (
+          {activeHarness?.provider === "claude_managed" ? (
             <p className="pit-harness-notice" role="note" data-testid="chat-managed-retention-notice">
               Managed Agent sessions are retained by Anthropic and are not eligible for ZDR or HIPAA modes. Paperclip tools still execute only in runnerd.
             </p>
           ) : null}
-          {harness.provider === "aws_agentcore" ? (
+          {activeHarness?.provider === "aws_agentcore" ? (
             <p className="pit-harness-notice" role="note" data-testid="chat-agentcore-retention-notice">
               AgentCore Memory retains this chat for 90 days. Cost is a Paperclip estimate; model tokens, Runtime active time, and Memory are billed by AWS. Paperclip tools execute only in runnerd.
             </p>

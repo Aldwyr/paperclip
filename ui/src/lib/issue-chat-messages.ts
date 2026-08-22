@@ -35,6 +35,10 @@ export interface IssueChatComment extends IssueComment {
   queueTargetRunId?: string | null;
   queueReason?: "hold" | "active_run" | "other";
   followUpRequested?: boolean;
+  /** Causal conversation slot: the run that actually consumed this input. */
+  consumedByRunId?: string | null;
+  conversationAnchorAt?: Date | string | null;
+  conversationAnchorSequence?: number;
 }
 
 export interface IssueChatLinkedRun {

@@ -6,6 +6,27 @@ import { providerDescriptorSchema } from "./generated/schema-bundle.js";
 const validate = new Ajv2020({ allErrors: true, strict: false }).compile(providerDescriptorSchema);
 
 describe("provider runtime descriptor", () => {
+  it("accepts ACPX sidecar and child process identities separately", () => {
+    expect(validate({
+      provider: "acpx",
+      driver: "acpx_runtime",
+      agent: "pi",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
+      executionKind: "local_process",
+      providerVersion: "0.13.1",
+      providerSessionId: "pi-session-1",
+      processId: 41001,
+      agentProcessId: 41002,
+      acpProtocolVersion: 1,
+      agentServerPackage: "pi-acp",
+      agentServerVersion: "0.0.33",
+      agentRuntimePackage: "@earendil-works/pi-coding-agent",
+      agentRuntimeVersion: "0.84.2",
+      acpxRecordId: "acpx-record-1",
+    })).toBe(true);
+  });
+
   it("accepts the closed AWS AgentCore remote identity", () => {
     expect(validate({
       provider: "aws_agentcore",

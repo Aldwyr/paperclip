@@ -234,15 +234,13 @@ function parseItemEvent(
   if (type === "reasoning") {
     const value = itemText(item, payload);
     if (phase === "completed") state.itemChannels.delete(id);
-    if (value && !state.reasoningDeltaItemIds.has(id)) return [{
+    return [{
       kind: "thinking",
       ts,
-      text: value,
+      text: value && !state.reasoningDeltaItemIds.has(id) ? value : "",
+      lifecycle: phase,
       channel: resolvedChannel === "detail" ? "detail" : resolvedChannel === "summary" ? "summary" : "unknown",
     }];
-    return phase === "started"
-      ? [{ kind: "system", ts, text: "Reasoning started" }]
-      : [];
   }
   if (type === "commandexecution") {
     const entries = commandEntries(event, item, phase, ts);

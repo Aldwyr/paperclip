@@ -42,6 +42,7 @@ import {
   type CodexRpcNotification,
   type CodexRpcServerRequest,
   type CodexServerRequestHandler,
+  type CodexTraceInterpretation,
 } from "./app-server-transport.js";
 
 class TestQueue<T> implements AsyncIterable<T> {
@@ -57,7 +58,8 @@ class TestQueue<T> implements AsyncIterable<T> {
 
   close(): void {
     this.closed = true;
-    for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true });
+    for (const waiter of this.waiters.splice(0))
+      waiter({ value: undefined, done: true });
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
@@ -73,8 +75,13 @@ class TestQueue<T> implements AsyncIterable<T> {
 }
 
 class FakeCodexTransport implements CodexAppServerTransport {
-  readonly calls: Array<{ method: string; params: Record<string, unknown> }> = [];
-  readonly sentNotifications: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  readonly calls: Array<{ method: string; params: Record<string, unknown> }> =
+    [];
+  readonly sentNotifications: Array<{
+    method: string;
+    params?: Record<string, unknown>;
+  }> = [];
+  readonly traceInterpretations: CodexTraceInterpretation[] = [];
   readonly queue = new TestQueue<CodexRpcNotification>();
   handler: CodexServerRequestHandler = async () => ({});
   rejectMethods = new Map<string, Error>();
@@ -88,20 +95,38 @@ class FakeCodexTransport implements CodexAppServerTransport {
     readonly providerSessionId = "provider-session-1",
   ) {}
 
-  async request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async request(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     this.calls.push({ method, params: structuredClone(params) });
     const rejection = this.rejectMethods.get(method);
     if (rejection) throw rejection;
     if (method === "initialize") {
-      return { userAgent: "codex-cli/0.132.0", codexHome: "/isolated/codex", platformFamily: "unix", platformOs: "linux" };
+      return {
+        userAgent: "codex-cli/0.132.0",
+        codexHome: "/isolated/codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      };
     }
     if (method === "collaborationMode/list") {
       return this.confirmCollaborationMode
-        ? { data: [{ name: "Plan", mode: "plan", model: "gpt-test", reasoning_effort: "high" }] }
+        ? {
+            data: [
+              {
+                name: "Plan",
+                mode: "plan",
+                model: "gpt-test",
+                reasoning_effort: "high",
+              },
+            ],
+          }
         : { data: [{ name: "Default", mode: "default", model: "gpt-test" }] };
     }
     if (method === "thread/start" || method === "thread/resume") {
-      const planMode = params.permissions === "paperclip-runner-workspace-read-only";
+      const planMode =
+        params.permissions === "paperclip-runner-workspace-read-only";
       return {
         thread: {
           id: this.threadId,
@@ -109,7 +134,11 @@ class FakeCodexTransport implements CodexAppServerTransport {
           modelProvider: "openai",
           cwd: "/workspace",
           turns: [],
-          activePermissionProfile: { id: planMode ? "paperclip-runner-workspace-read-only" : "paperclip-runner-workspace-only" },
+          activePermissionProfile: {
+            id: planMode
+              ? "paperclip-runner-workspace-read-only"
+              : "paperclip-runner-workspace-only",
+          },
         },
         model: "gpt-test",
         modelProvider: "openai",
@@ -120,15 +149,22 @@ class FakeCodexTransport implements CodexAppServerTransport {
       };
     }
     if (method === "turn/start") {
-      return this.turnStartResponse ?? { turn: { id: "turn-1", status: "inProgress", items: [] } };
+      return (
+        this.turnStartResponse ?? {
+          turn: { id: "turn-1", status: "inProgress", items: [] },
+        }
+      );
     }
     if (method === "thread/goal/get") return { goal: this.goalState };
     if (method === "thread/goal/set") {
       this.goalState = {
         threadId: this.threadId,
-        objective: typeof params.objective === "string"
-          ? params.objective
-          : String(this.goalState?.objective ?? "Ship the Live console tracer"),
+        objective:
+          typeof params.objective === "string"
+            ? params.objective
+            : String(
+                this.goalState?.objective ?? "Ship the Live console tracer",
+              ),
         status: params.status ?? this.goalState?.status ?? "active",
         tokenBudget: params.tokenBudget ?? this.goalState?.tokenBudget ?? null,
         tokensUsed: 0,
@@ -143,13 +179,24 @@ class FakeCodexTransport implements CodexAppServerTransport {
       return {};
     }
     if (method === "thread/read") {
-      return this.readResponse ?? { thread: { id: this.threadId, sessionId: this.providerSessionId, cwd: "/workspace", turns: [{ id: "turn-1", status: "inProgress", items: [] }] } };
+      return (
+        this.readResponse ?? {
+          thread: {
+            id: this.threadId,
+            sessionId: this.providerSessionId,
+            cwd: "/workspace",
+            turns: [{ id: "turn-1", status: "inProgress", items: [] }],
+          },
+        }
+      );
     }
     return {};
   }
 
   notify(method: string, params?: Record<string, unknown>): void {
-    this.sentNotifications.push(params === undefined ? { method } : { method, params });
+    this.sentNotifications.push(
+      params === undefined ? { method } : { method, params },
+    );
   }
 
   notifications(): AsyncIterable<CodexRpcNotification> {
@@ -160,12 +207,29 @@ class FakeCodexTransport implements CodexAppServerTransport {
     this.handler = handler;
   }
 
+  recordTraceInterpretation(input: CodexTraceInterpretation): void {
+    this.traceInterpretations.push(structuredClone(input));
+  }
+
   async close(): Promise<void> {
     this.queue.close();
   }
 
   push(method: string, params: Record<string, unknown>): void {
     this.queue.push({ method, params });
+  }
+
+  pushTraced(
+    method: string,
+    params: Record<string, unknown>,
+    sourceEventId: string,
+    sourceEventType: string,
+  ): void {
+    this.queue.push({
+      method,
+      params,
+      paperclipTrace: { sourceEventId, sourceEventType },
+    });
   }
 
   invoke(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
@@ -178,10 +242,12 @@ const envelope = createCodexTaskEnvelope({
   criteria: [{ id: "file", requirement: "hello.txt contains hello" }],
 });
 
-const liveConsoleFixturePath = fileURLToPath(new URL(
-  "../../../protocol/fixtures/codex-driver/driver-conformance.json",
-  import.meta.url,
-));
+const liveConsoleFixturePath = fileURLToPath(
+  new URL(
+    "../../../protocol/fixtures/codex-driver/driver-conformance.json",
+    import.meta.url,
+  ),
+);
 
 const result: PrpStructuredRunResult = {
   schema: "paperclip.run_result.v1",
@@ -190,7 +256,9 @@ const result: PrpStructuredRunResult = {
   completionClaim: {
     contractRevision: "codex-demo-v1",
     objectiveSatisfied: true,
-    criteria: [{ criterionId: "file", status: "satisfied", evidenceRefs: ["hello.txt"] }],
+    criteria: [
+      { criterionId: "file", status: "satisfied", evidenceRefs: ["hello.txt"] },
+    ],
     remainingWork: [],
   },
   evidence: [{ ref: "hello.txt" }],
@@ -199,7 +267,10 @@ const result: PrpStructuredRunResult = {
   artifacts: [{ kind: "file", ref: "hello.txt" }],
 };
 
-function makeDriver(transports: FakeCodexTransport[], options: Record<string, unknown> = {}) {
+function makeDriver(
+  transports: FakeCodexTransport[],
+  options: Record<string, unknown> = {},
+) {
   let index = 0;
   return new CodexAppServerDriver({
     taskEnvelope: envelope,
@@ -217,11 +288,21 @@ function makeDriver(transports: FakeCodexTransport[], options: Record<string, un
   });
 }
 
-async function collectUntilTerminal(events: AsyncIterable<PrpEvent>): Promise<PrpEvent[]> {
+async function collectUntilTerminal(
+  events: AsyncIterable<PrpEvent>,
+): Promise<PrpEvent[]> {
   const collected: PrpEvent[] = [];
   for await (const event of events) {
     collected.push(event);
-    if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) break;
+    if (
+      [
+        "turn.completed",
+        "turn.failed",
+        "turn.interrupted",
+        "turn.cancelled",
+      ].includes(event.eventType)
+    )
+      break;
   }
   return collected;
 }
@@ -247,7 +328,9 @@ async function traceCompletedProposal(
   } = {},
 ) {
   const transport = new FakeCodexTransport();
-  const driver = makeDriver([transport], { capabilities: options.capabilities });
+  const driver = makeDriver([transport], {
+    capabilities: options.capabilities,
+  });
   const traced = runCodexCodexTracer({
     driver,
     taskEnvelope: envelope,
@@ -268,7 +351,11 @@ async function traceCompletedProposal(
     transport.push("item/completed", {
       threadId: "thread-1",
       turnId: "turn-1",
-      item: { id: "answer-1", type: "agentMessage", text: JSON.stringify(proposal) },
+      item: {
+        id: "answer-1",
+        type: "agentMessage",
+        text: JSON.stringify(proposal),
+      },
     });
   }
   transport.push("turn/completed", {
@@ -325,12 +412,18 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
 
-    const threadStart = transport.calls.find((call) => call.method === "thread/start");
+    const threadStart = transport.calls.find(
+      (call) => call.method === "thread/start",
+    );
     expect(threadStart?.params).not.toHaveProperty("baseInstructions");
     expect(threadStart?.params.dynamicTools).toEqual([]);
 
-    const first = await session.startTurn({ message: { role: "user", text: "Hello Codex" } });
-    const firstStart = transport.calls.find((call) => call.method === "turn/start");
+    const first = await session.startTurn({
+      message: { role: "user", text: "Hello Codex" },
+    });
+    const firstStart = transport.calls.find(
+      (call) => call.method === "turn/start",
+    );
     expect(firstStart?.params).not.toHaveProperty("outputSchema");
     expect(firstStart?.params.input).toEqual([
       { type: "text", text: "Hello Codex", text_elements: [] },
@@ -360,18 +453,56 @@ describe("Codex app-server Codex driver", () => {
     const transport = new FakeCodexTransport();
     const driver = makeDriver([transport]);
     const descriptor = await driver.descriptor();
-    const session = await driver.openSession({ runId: "run-1", normalizedSessionId: "normalized-1", workingDirectory: "/workspace" });
-    const turn = await session.startTurn({ message: { role: "user", text: "Do the safe task." } });
+    const session = await driver.openSession({
+      runId: "run-1",
+      normalizedSessionId: "normalized-1",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Do the safe task." },
+    });
 
-    transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
-    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "cmd-1", type: "commandExecution", command: "printf hello" } });
-    transport.push("item/commandExecution/outputDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "cmd-1", delta: "hello" });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "file-1", type: "fileChange", changes: [{ path: "hello.txt" }] } });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reference-1", type: "agentMessage", text: "Open [hello.txt](hello.txt)." } });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("item/started", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: { id: "cmd-1", type: "commandExecution", command: "printf hello" },
+    });
+    transport.push("item/commandExecution/outputDelta", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "cmd-1",
+      delta: "hello",
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "file-1",
+        type: "fileChange",
+        changes: [{ path: "hello.txt" }],
+      },
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "reference-1",
+        type: "agentMessage",
+        text: "Open [hello.txt](hello.txt).",
+      },
+    });
     const requestResolution = transport.invoke({
       id: "request-1",
       method: "item/tool/requestUserInput",
-      params: { threadId: "thread-1", turnId: turn.turnId, itemId: "question-1" },
+      params: {
+        threadId: "thread-1",
+        turnId: turn.turnId,
+        itemId: "question-1",
+      },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(session.pendingRuntimeRequests?.()).toHaveLength(1);
@@ -381,25 +512,73 @@ describe("Codex app-server Codex driver", () => {
       resolution: { action: "cancel" },
     });
     expect(await requestResolution).toEqual({ answers: {} });
-    transport.push("thread/tokenUsage/updated", { threadId: "thread-1", turnId: turn.turnId, tokenUsage: { total: { inputTokens: 10, outputTokens: 4 }, modelContextWindow: 128000 } });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "answer-1", type: "agentMessage", text: JSON.stringify(result) } });
-    transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+    transport.push("thread/tokenUsage/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      tokenUsage: {
+        total: { inputTokens: 10, outputTokens: 4 },
+        modelContextWindow: 128000,
+      },
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "answer-1",
+        type: "agentMessage",
+        text: JSON.stringify(result),
+      },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "completed", items: [] },
+    });
 
     const events = await collectUntilTerminal(session.events());
     expect(events.every((event) => validatePrpEvent(event).ok)).toBe(true);
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "run.terminal")).toHaveLength(0);
-    expect(events.find((event) => event.eventType === "workspace.change.updated")?.payload)
-      .toMatchObject({ schema: "paperclip.workspace.diff.v1", complete: true, totals: { files: 1 } });
-    expect(events.find((event) => event.eventType === "workspace.diff.recorded")?.payload)
-      .toMatchObject({ schema: "paperclip.workspace.diff.v1", complete: true });
-    expect(events.find((event) => event.eventType === "workspace.file.referenced")?.payload)
-      .toMatchObject({ schema: "paperclip.workspace.file_reference.v1", path: "hello.txt" });
-    expect(events.map((event) => event.eventType)).toEqual(expect.arrayContaining([
-      "session.started", "turn.started", "item.started", "item.delta", "item.completed", "run.result.proposed", "turn.completed",
-      "runtime_request.created", "runtime_request.resolved", "workspace.change.updated", "workspace.diff.recorded",
-    ]));
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "turn.completed"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "run.terminal"),
+    ).toHaveLength(0);
+    expect(
+      events.find((event) => event.eventType === "workspace.change.updated")
+        ?.payload,
+    ).toMatchObject({
+      schema: "paperclip.workspace.diff.v1",
+      complete: true,
+      totals: { files: 1 },
+    });
+    expect(
+      events.find((event) => event.eventType === "workspace.diff.recorded")
+        ?.payload,
+    ).toMatchObject({ schema: "paperclip.workspace.diff.v1", complete: true });
+    expect(
+      events.find((event) => event.eventType === "workspace.file.referenced")
+        ?.payload,
+    ).toMatchObject({
+      schema: "paperclip.workspace.file_reference.v1",
+      path: "hello.txt",
+    });
+    expect(events.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining([
+        "session.started",
+        "turn.started",
+        "item.started",
+        "item.delta",
+        "item.completed",
+        "run.result.proposed",
+        "turn.completed",
+        "runtime_request.created",
+        "runtime_request.resolved",
+        "workspace.change.updated",
+        "workspace.diff.recorded",
+      ]),
+    );
 
     const capabilities: PrpCapabilities = {
       schema: "paperclip.prp.capabilities.v1",
@@ -414,14 +593,86 @@ describe("Codex app-server Codex driver", () => {
     };
     const metadata = {
       fixtureName: "codex-conformance",
-      identity: { schema: "paperclip.prp.identity.v1" as const, companyId: "company-1", issueId: "issue-1", runId: "run-1", environmentLeaseId: "lease-1", runnerInstanceId: "runner-codex", normalizedSessionId: "normalized-1" },
+      identity: {
+        schema: "paperclip.prp.identity.v1" as const,
+        companyId: "company-1",
+        issueId: "issue-1",
+        runId: "run-1",
+        environmentLeaseId: "lease-1",
+        runnerInstanceId: "runner-codex",
+        normalizedSessionId: "normalized-1",
+      },
       capabilities,
     };
-    const live = events.reduce(applyPrpEvent, createSessionSnapshotFromMetadata(metadata));
-    const replay = events.reduce(applyPrpEvent, createSessionSnapshotFromMetadata(metadata));
+    const live = events.reduce(
+      applyPrpEvent,
+      createSessionSnapshotFromMetadata(metadata),
+    );
+    const replay = events.reduce(
+      applyPrpEvent,
+      createSessionSnapshotFromMetadata(metadata),
+    );
     expect(live).toEqual(replay);
     expect(live.integrity).toBe("complete");
-    expect(await session.usage?.()).toMatchObject({ modelContextWindow: 128000 });
+    expect(await session.usage?.()).toMatchObject({
+      modelContextWindow: 128000,
+    });
+  });
+
+  it("correlates rehydrated notifications with the final canonical PRP event ids", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-traced",
+      normalizedSessionId: "normalized-traced",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Trace the response." },
+    });
+
+    transport.pushTraced(
+      "turn/started",
+      {
+        threadId: "thread-1",
+        turn: { id: turn.turnId, status: "inProgress" },
+      },
+      "event_runner_000001",
+      "turn.started",
+    );
+    transport.pushTraced(
+      "item/started",
+      {
+        threadId: "thread-1",
+        turnId: turn.turnId,
+        item: { id: "answer-1", type: "agentMessage", phase: "final_answer" },
+      },
+      "event_runner_000002",
+      "item.started",
+    );
+    transport.pushTraced(
+      "turn/completed",
+      {
+        threadId: "thread-1",
+        turn: { id: turn.turnId, status: "completed", items: [] },
+      },
+      "event_runner_000003",
+      "turn.completed",
+    );
+
+    const events = await collectUntilTerminal(session.events());
+    const itemMapping = transport.traceInterpretations.find(
+      (entry) => entry.providerMethod === "item/started",
+    );
+    expect(itemMapping).toMatchObject({
+      sourceEventId: "event_runner_000002",
+      sourceEventType: "item.started",
+      disposition: "mapped",
+    });
+    expect(itemMapping?.emittedEventIds.length).toBeGreaterThan(0);
+    expect(events.map((event) => event.sourceEventId)).toEqual(
+      expect.arrayContaining(itemMapping?.emittedEventIds ?? []),
+    );
+    expect(JSON.stringify(events)).not.toContain("paperclipTrace");
   });
 
   it("accepts a thread usage snapshot replayed before a resumed turn starts", async () => {
@@ -437,7 +688,9 @@ describe("Codex app-server Codex driver", () => {
       turnId: "prior-turn",
       tokenUsage: { total: { inputTokens: 10, outputTokens: 4 } },
     });
-    const turn = await session.startTurn({ message: { role: "user", text: "Continue." } });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Continue." },
+    });
     transport.push("turn/started", {
       threadId: "thread-1",
       turn: { id: turn.turnId, status: "inProgress" },
@@ -448,8 +701,12 @@ describe("Codex app-server Codex driver", () => {
     });
 
     const events = await collectUntilTerminal(session.events());
-    expect(events.some((event) => event.eventType === "session.failed")).toBe(false);
-    expect(await session.usage()).toMatchObject({ total: { inputTokens: 10, outputTokens: 4 } });
+    expect(events.some((event) => event.eventType === "session.failed")).toBe(
+      false,
+    );
+    expect(await session.usage()).toMatchObject({
+      total: { inputTokens: 10, outputTokens: 4 },
+    });
   });
 
   it("normalizes provider message and reasoning phases onto every streamed item event", async () => {
@@ -459,39 +716,146 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-stream-channels",
       workingDirectory: "/workspace",
     });
-    const turn = await session.startTurn({ message: { role: "user", text: "Stream progress." } });
-    transport.push("turn/started", { threadId: "thread-1", turn: { id: turn.turnId, status: "inProgress" } });
-    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "progress-1", type: "agentMessage", phase: "commentary", text: "" } });
-    transport.push("item/agentMessage/delta", { threadId: "thread-1", turnId: turn.turnId, itemId: "progress-1", delta: "Running it now." });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "progress-1", type: "agentMessage", phase: "commentary", text: "Running it now." } });
-    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reason-1", type: "reasoning", summary: [] } });
-    transport.push("item/reasoning/summaryTextDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "reason-1", delta: "Summary" });
-    transport.push("item/reasoning/textDelta", { threadId: "thread-1", turnId: turn.turnId, itemId: "reason-1", delta: "Detail" });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "reason-1", type: "reasoning", summary: [{ text: "Summary" }] } });
-    transport.push("item/started", { threadId: "thread-1", turnId: turn.turnId, item: { id: "final-1", type: "agentMessage", phase: "final_answer", text: "" } });
-    transport.push("item/agentMessage/delta", { threadId: "thread-1", turnId: turn.turnId, itemId: "final-1", delta: JSON.stringify(result) });
-    transport.push("item/completed", { threadId: "thread-1", turnId: turn.turnId, item: { id: "final-1", type: "agentMessage", phase: "final_answer", text: JSON.stringify(result) } });
-    transport.push("turn/completed", { threadId: "thread-1", turn: { id: turn.turnId, status: "completed", items: [] } });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Stream progress." },
+    });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("item/started", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "progress-1",
+        type: "agentMessage",
+        phase: "commentary",
+        text: "",
+      },
+    });
+    transport.push("item/agentMessage/delta", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "progress-1",
+      delta: "Running it now.",
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "progress-1",
+        type: "agentMessage",
+        phase: "commentary",
+        text: "Running it now.",
+      },
+    });
+    transport.push("item/started", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: { id: "reason-1", type: "reasoning", summary: [] },
+    });
+    transport.push("item/reasoning/summaryTextDelta", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "reason-1",
+      delta: "Summary",
+    });
+    transport.push("item/reasoning/textDelta", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "reason-1",
+      delta: "Detail",
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "reason-1",
+        type: "reasoning",
+        summary: [{ text: "Summary" }],
+      },
+    });
+    transport.push("item/started", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "final-1",
+        type: "agentMessage",
+        phase: "final_answer",
+        text: "",
+      },
+    });
+    transport.push("item/agentMessage/delta", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "final-1",
+      delta: JSON.stringify(result),
+    });
+    transport.push("item/completed", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      item: {
+        id: "final-1",
+        type: "agentMessage",
+        phase: "final_answer",
+        text: JSON.stringify(result),
+      },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "completed", items: [] },
+    });
 
     const events = await collectUntilTerminal(session.events());
-    const pick = (kind: string, channel: string) => events.find((event) =>
-      event.payload.kind === kind && event.payload.channel === channel);
-    expect(pick("agentMessage", "progress")?.payload).toMatchObject({ providerPhase: "commentary" });
-    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "progress")?.payload)
-      .toMatchObject({ providerMethod: "item/agentMessage/delta", text: "Running it now." });
-    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "summary")?.payload)
-      .toMatchObject({ providerMethod: "item/reasoning/summaryTextDelta" });
-    expect(events.find((event) => event.eventType === "item.delta" && event.payload.channel === "detail")?.payload)
-      .toMatchObject({ providerMethod: "item/reasoning/textDelta" });
-    expect(pick("agentMessage", "final")?.payload).toMatchObject({ providerPhase: "final_answer" });
+    const pick = (kind: string, channel: string) =>
+      events.find(
+        (event) =>
+          event.payload.kind === kind && event.payload.channel === channel,
+      );
+    expect(pick("agentMessage", "progress")?.payload).toMatchObject({
+      providerPhase: "commentary",
+    });
+    expect(
+      events.find(
+        (event) =>
+          event.eventType === "item.delta" &&
+          event.payload.channel === "progress",
+      )?.payload,
+    ).toMatchObject({
+      providerMethod: "item/agentMessage/delta",
+      text: "Running it now.",
+    });
+    expect(
+      events.find(
+        (event) =>
+          event.eventType === "item.delta" &&
+          event.payload.channel === "summary",
+      )?.payload,
+    ).toMatchObject({ providerMethod: "item/reasoning/summaryTextDelta" });
+    expect(
+      events.find(
+        (event) =>
+          event.eventType === "item.delta" &&
+          event.payload.channel === "detail",
+      )?.payload,
+    ).toMatchObject({ providerMethod: "item/reasoning/textDelta" });
+    expect(pick("agentMessage", "final")?.payload).toMatchObject({
+      providerPhase: "final_answer",
+    });
   });
 
   it("captures an exact skillless model/environment snapshot with credentials absent", async () => {
     const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({ runId: "run-context", normalizedSessionId: "normalized-context", workingDirectory: "/workspace" });
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-context",
+      normalizedSessionId: "normalized-context",
+      workingDirectory: "/workspace",
+    });
     const iterator = session.events()[Symbol.asyncIterator]();
     const first = await iterator.next();
-    const context = first.value?.payload.context as Parameters<typeof isSkilllessCodexContext>[0];
+    const context = first.value?.payload.context as Parameters<
+      typeof isSkilllessCodexContext
+    >[0];
     expect(context).toMatchObject({
       codexVersion: "codex-cli/0.132.0",
       model: "gpt-test",
@@ -502,7 +866,7 @@ describe("Codex app-server Codex driver", () => {
       instructionPolicy: {
         skillInstructions: false,
         appInstructions: false,
-        collaborationInstructions: false,
+        collaborationInstructions: true,
       },
       environmentKeys: ["LANG", "PATH"],
       envelope,
@@ -510,20 +874,23 @@ describe("Codex app-server Codex driver", () => {
     expect(isSkilllessCodexContext(context)).toBe(true);
     expect(JSON.stringify(context)).not.toContain("must-not-pass");
     expect(JSON.stringify(transport.calls)).not.toContain("RANDOM_SKILL_PATH");
-    expect(transport.calls.find((call) => call.method === "thread/start")?.params).toMatchObject({
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params,
+    ).toMatchObject({
       approvalPolicy: "never",
       config: {
         "skills.include_instructions": false,
         include_apps_instructions: false,
-        include_collaboration_mode_instructions: false,
+        include_collaboration_mode_instructions: true,
         "features.image_generation": false,
       },
       permissions: "paperclip-runner-workspace-only",
       runtimeWorkspaceRoots: ["/workspace"],
       dynamicTools: [{ name: "paperclip_finish" }, { name: "paperclip_block" }],
     });
-    const commandPolicy = transport.calls.find((call) => call.method === "thread/start")
-      ?.params.config as Record<string, unknown>;
+    const commandPolicy = transport.calls.find(
+      (call) => call.method === "thread/start",
+    )?.params.config as Record<string, unknown>;
     expect(JSON.stringify(commandPolicy)).not.toContain("/isolated/home");
     expect(JSON.stringify(commandPolicy)).not.toContain("/isolated/codex");
     expect(JSON.stringify(commandPolicy)).not.toContain("CODEX_HOME");
@@ -533,48 +900,94 @@ describe("Codex app-server Codex driver", () => {
       HOME: "/isolated/home",
       CODEX_HOME: "/isolated/codex",
     });
-    expect(appServerArgs).toEqual(expect.arrayContaining([
-      expect.stringContaining('default_permissions="paperclip-runner-workspace-only"'),
-      expect.stringContaining('permissions.paperclip-runner-workspace-only.filesystem='),
-      "permissions.paperclip-runner-workspace-only.network.enabled=false",
-      'shell_environment_policy.inherit="none"',
-      expect.stringContaining('shell_environment_policy.set={PATH="/bin",LANG="C.UTF-8"}'),
-      "--disable",
-      "image_generation",
-    ]));
-    expect(appServerArgs.find((arg) => arg.startsWith("permissions."))).toContain(
-      '"/isolated/home"="none"',
+    expect(appServerArgs).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          'default_permissions="paperclip-runner-workspace-only"',
+        ),
+        expect.stringContaining(
+          "permissions.paperclip-runner-workspace-only.filesystem=",
+        ),
+        "permissions.paperclip-runner-workspace-only.network.enabled=false",
+        'shell_environment_policy.inherit="none"',
+        expect.stringContaining(
+          'shell_environment_policy.set={PATH="/bin",LANG="C.UTF-8"}',
+        ),
+        "--disable",
+        "image_generation",
+      ]),
     );
-    expect(appServerArgs.find((arg) => arg.startsWith("permissions."))).toContain(
-      '"/isolated/codex"="none"',
-    );
+    expect(
+      appServerArgs.find((arg) => arg.startsWith("permissions.")),
+    ).toContain('"/isolated/home"="none"');
+    expect(
+      appServerArgs.find((arg) => arg.startsWith("permissions.")),
+    ).toContain('"/isolated/codex"="none"');
     expect(JSON.stringify(appServerArgs)).not.toContain("HOME=");
     expect(CODEX_RESULT_OUTPUT_SCHEMA.properties.schema).toEqual({
       type: "string",
       const: "paperclip.run_result.v1",
     });
-    expect(CODEX_BLOCK_RESULT_OUTPUT_SCHEMA.properties.reportedWorkDisposition).toEqual({
+    expect(
+      CODEX_BLOCK_RESULT_OUTPUT_SCHEMA.properties.reportedWorkDisposition,
+    ).toEqual({
       type: "string",
       const: "blocked",
     });
   });
 
+  it("allows eval fixtures to opt out of Codex collaboration instructions", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport], {
+      includeCollaborationModeInstructions: false,
+    }).openSession({
+      runId: "run-no-collaboration-instructions",
+      normalizedSessionId: "session-no-collaboration-instructions",
+      workingDirectory: "/workspace",
+    });
+    const first = await session.events()[Symbol.asyncIterator]().next();
+
+    expect(first.value?.payload.context).toMatchObject({
+      instructionPolicy: { collaborationInstructions: false },
+    });
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params,
+    ).toMatchObject({
+      config: { include_collaboration_mode_instructions: false },
+    });
+  });
+
   it("negotiates genuine plan mode with collaboration instructions and read-only workspace access", async () => {
     const transport = new FakeCodexTransport();
-    const driver = makeDriver([transport], { requestedCollaborationMode: "plan" });
-    const session = await driver.openSession({ runId: "run-plan", normalizedSessionId: "session-plan", workingDirectory: "/workspace" });
-    expect(transport.calls.find((call) => call.method === "thread/start")?.params).toMatchObject({
+    const driver = makeDriver([transport], {
+      requestedCollaborationMode: "plan",
+    });
+    const session = await driver.openSession({
+      runId: "run-plan",
+      normalizedSessionId: "session-plan",
+      workingDirectory: "/workspace",
+    });
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params,
+    ).toMatchObject({
       permissions: "paperclip-runner-workspace-read-only",
       config: { include_collaboration_mode_instructions: true },
     });
-    expect(transport.calls.find((call) => call.method === "thread/start")?.params)
-      .not.toHaveProperty("collaborationMode");
-    expect(transport.calls.some((call) => call.method === "collaborationMode/list")).toBe(true);
-    await expect(session.startTurn({
-      message: { role: "user", text: "Author a plan." },
-      requestedCollaborationMode: "plan",
-    })).resolves.toMatchObject({ effectiveCollaborationMode: "plan" });
-    expect(transport.calls.find((call) => call.method === "turn/start")?.params).toMatchObject({
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params,
+    ).not.toHaveProperty("collaborationMode");
+    expect(
+      transport.calls.some((call) => call.method === "collaborationMode/list"),
+    ).toBe(true);
+    await expect(
+      session.startTurn({
+        message: { role: "user", text: "Author a plan." },
+        requestedCollaborationMode: "plan",
+      }),
+    ).resolves.toMatchObject({ effectiveCollaborationMode: "plan" });
+    expect(
+      transport.calls.find((call) => call.method === "turn/start")?.params,
+    ).toMatchObject({
       collaborationMode: {
         mode: "plan",
         settings: {
@@ -590,46 +1003,78 @@ describe("Codex app-server Codex driver", () => {
   it("fails closed when the installed app-server does not confirm plan mode", async () => {
     const transport = new FakeCodexTransport();
     transport.confirmCollaborationMode = false;
-    await expect(makeDriver([transport], { requestedCollaborationMode: "plan" }).openSession({
-      runId: "run-plan-unsupported",
-      normalizedSessionId: "session-plan-unsupported",
-      workingDirectory: "/workspace",
-    })).rejects.toThrow("planning_mode_unsupported");
+    await expect(
+      makeDriver([transport], {
+        requestedCollaborationMode: "plan",
+      }).openSession({
+        runId: "run-plan-unsupported",
+        normalizedSessionId: "session-plan-unsupported",
+        workingDirectory: "/workspace",
+      }),
+    ).rejects.toThrow("planning_mode_unsupported");
   });
 
   it("refuses to turn host credential roots into model-writable workspaces", async () => {
-    await expect(makeDriver([]).openSession({
-      runId: "run-codex-home",
-      normalizedSessionId: "normalized-codex-home",
-      workingDirectory: "/isolated/codex",
-    })).rejects.toThrow("cannot overlap host CODEX_HOME");
-    await expect(makeDriver([]).openSession({
-      runId: "run-host-home",
-      normalizedSessionId: "normalized-host-home",
-      workingDirectory: "/isolated",
-    })).rejects.toThrow("cannot contain the host HOME");
-    await expect(makeDriver([]).openSession({
-      runId: "run-root",
-      normalizedSessionId: "normalized-root",
-      workingDirectory: "/",
-    })).rejects.toThrow("cannot be a filesystem root");
+    await expect(
+      makeDriver([]).openSession({
+        runId: "run-codex-home",
+        normalizedSessionId: "normalized-codex-home",
+        workingDirectory: "/isolated/codex",
+      }),
+    ).rejects.toThrow("cannot overlap host CODEX_HOME");
+    await expect(
+      makeDriver([]).openSession({
+        runId: "run-host-home",
+        normalizedSessionId: "normalized-host-home",
+        workingDirectory: "/isolated",
+      }),
+    ).rejects.toThrow("cannot contain the host HOME");
+    await expect(
+      makeDriver([]).openSession({
+        runId: "run-root",
+        normalizedSessionId: "normalized-root",
+        workingDirectory: "/",
+      }),
+    ).rejects.toThrow("cannot be a filesystem root");
   });
 
   it("steers and interrupts an active turn without replacing the session", async () => {
     const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({ runId: "run-controls", normalizedSessionId: "normalized-controls", workingDirectory: "/workspace" });
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
-    await session.steer?.({ turnId, message: { role: "user", text: "Use a shorter answer." } });
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-controls",
+      normalizedSessionId: "normalized-controls",
+      workingDirectory: "/workspace",
+    });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Start." },
+    });
+    await session.steer?.({
+      turnId,
+      message: { role: "user", text: "Use a shorter answer." },
+    });
     await session.interrupt?.({ turnId, reason: "operator requested" });
     expect(transport.calls.map((call) => call.method)).toEqual([
-      "initialize", "thread/start", "thread/goal/get", "turn/start", "turn/steer", "turn/interrupt",
+      "initialize",
+      "thread/start",
+      "thread/goal/get",
+      "turn/start",
+      "turn/steer",
+      "turn/interrupt",
     ]);
-    expect(session.ids()).toEqual({ driverSessionId: "thread-1", providerSessionId: "provider-session-1", displayId: "thread-1" });
+    expect(session.ids()).toEqual({
+      driverSessionId: "thread-1",
+      providerSessionId: "provider-session-1",
+      displayId: "thread-1",
+    });
   });
 
   it("loads the deterministic Live console wire fixture", async () => {
-    const fixture = await loadLiveConsoleConformanceFixture(liveConsoleFixturePath);
-    expect(fixture.runtimeRequests.map(({ requestKind }) => requestKind)).toEqual([
+    const fixture = await loadLiveConsoleConformanceFixture(
+      liveConsoleFixturePath,
+    );
+    expect(
+      fixture.runtimeRequests.map(({ requestKind }) => requestKind),
+    ).toEqual([
       "command_approval",
       "file_approval",
       "permission_approval",
@@ -637,12 +1082,18 @@ describe("Codex app-server Codex driver", () => {
       "elicitation",
     ]);
     expect(fixture.goals.map(({ action }) => action)).toEqual([
-      "get", "set", "pause", "resume", "clear",
+      "get",
+      "set",
+      "pause",
+      "resume",
+      "clear",
     ]);
   });
 
   it("holds browser-resolved upstream requests and returns the exact fixture responses", async () => {
-    const fixture = await loadLiveConsoleConformanceFixture(liveConsoleFixturePath);
+    const fixture = await loadLiveConsoleConformanceFixture(
+      liveConsoleFixturePath,
+    );
     for (const scenario of fixture.runtimeRequests) {
       const transport = new FakeCodexTransport();
       const session = await makeDriver([transport]).openSession({
@@ -650,7 +1101,9 @@ describe("Codex app-server Codex driver", () => {
         normalizedSessionId: `normalized-${scenario.id}`,
         workingDirectory: "/workspace",
       });
-      const { turnId } = await session.startTurn({ message: { role: "user", text: "Exercise request." } });
+      const { turnId } = await session.startTurn({
+        message: { role: "user", text: "Exercise request." },
+      });
       const response = transport.invoke({
         id: scenario.id,
         method: scenario.method,
@@ -670,11 +1123,15 @@ describe("Codex app-server Codex driver", () => {
           turnId,
         }),
       ]);
-      await expect(session.resolveRuntimeRequest?.({
-        requestId: scenario.id,
-        turnId,
-        resolution: { action: "forged" } as unknown as HarnessRuntimeRequestResolution,
-      })).rejects.toThrow("unsupported action");
+      await expect(
+        session.resolveRuntimeRequest?.({
+          requestId: scenario.id,
+          turnId,
+          resolution: {
+            action: "forged",
+          } as unknown as HarnessRuntimeRequestResolution,
+        }),
+      ).rejects.toThrow("unsupported action");
       expect(session.pendingRuntimeRequests?.()).toHaveLength(1);
       await session.resolveRuntimeRequest?.({
         requestId: scenario.id,
@@ -683,70 +1140,96 @@ describe("Codex app-server Codex driver", () => {
       });
       expect(await response).toEqual(scenario.expectedResponse);
       expect(session.pendingRuntimeRequests?.()).toEqual([]);
-      await expect(session.resolveRuntimeRequest?.({
-        requestId: scenario.id,
-        turnId,
-        resolution: { action: "cancel" },
-      })).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
+      await expect(
+        session.resolveRuntimeRequest?.({
+          requestId: scenario.id,
+          turnId,
+          resolution: { action: "cancel" },
+        }),
+      ).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
       await session.close({ reason: "fixture complete" });
     }
   });
 
   it("acknowledges same-turn steering and rejects stale or child steering", async () => {
-    const fixture = await loadLiveConsoleConformanceFixture(liveConsoleFixturePath);
+    const fixture = await loadLiveConsoleConformanceFixture(
+      liveConsoleFixturePath,
+    );
     const transport = new FakeCodexTransport("thread-root");
     const session = await makeDriver([transport]).openSession({
       runId: "run-live-console-controls",
       normalizedSessionId: "normalized-live-console-controls",
       workingDirectory: "/workspace",
     });
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
-    await session.steer?.({
-      turnId,
-      message: { role: "user", text: "Stay concise." },
-      correlationId: "queued-comment-1",
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Start." },
     });
     await session.steer?.({
       turnId,
       message: { role: "user", text: "Stay concise." },
       correlationId: "queued-comment-1",
     });
-    expect(transport.calls.find((call) => call.method === "turn/steer")?.params)
-      .toMatchObject({ correlationId: "queued-comment-1" });
-    expect(transport.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
-    transport.rejectMethods.set("turn/steer", new Error("provider rejected steering"));
-    const rejectedSteering = await session.steer?.({
+    await session.steer?.({
       turnId,
-      message: { role: "user", text: "Try this again later." },
-      correlationId: "queued-comment-2",
-    }).then(
-      () => null,
-      (error: unknown) => error,
+      message: { role: "user", text: "Stay concise." },
+      correlationId: "queued-comment-1",
+    });
+    expect(
+      transport.calls.find((call) => call.method === "turn/steer")?.params,
+    ).toMatchObject({ correlationId: "queued-comment-1" });
+    expect(
+      transport.calls.filter((call) => call.method === "turn/steer"),
+    ).toHaveLength(1);
+    transport.rejectMethods.set(
+      "turn/steer",
+      new Error("provider rejected steering"),
     );
+    const rejectedSteering = await session
+      .steer?.({
+        turnId,
+        message: { role: "user", text: "Try this again later." },
+        correlationId: "queued-comment-2",
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
     expect(rejectedSteering).toBeInstanceOf(Error);
-    expect(rejectedSteering).not.toBeInstanceOf(HarnessCapabilityUnavailableError);
+    expect(rejectedSteering).not.toBeInstanceOf(
+      HarnessCapabilityUnavailableError,
+    );
     expect(String(rejectedSteering)).toContain("provider rejected steering");
     transport.rejectMethods.delete("turn/steer");
-    await expect(session.steer?.({
-      turnId: fixture.controls.staleTurnSteer.turnId!,
-      message: { role: "user", text: "Stale." },
-    })).rejects.toBeInstanceOf(HarnessStaleTurnError);
+    await expect(
+      session.steer?.({
+        turnId: fixture.controls.staleTurnSteer.turnId!,
+        message: { role: "user", text: "Stale." },
+      }),
+    ).rejects.toBeInstanceOf(HarnessStaleTurnError);
     transport.push("thread/started", { thread: fixture.lineage.childThread });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(session.lineage?.()).toEqual(expect.arrayContaining([
-      expect.objectContaining({ threadId: "thread-root", parentThreadId: null, depth: 0 }),
-      expect.objectContaining({
-        threadId: "thread-child",
-        parentThreadId: "thread-root",
-        depth: 1,
-        nickname: "Scout",
-        role: "researcher",
+    expect(session.lineage?.()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          threadId: "thread-root",
+          parentThreadId: null,
+          depth: 0,
+        }),
+        expect.objectContaining({
+          threadId: "thread-child",
+          parentThreadId: "thread-root",
+          depth: 1,
+          nickname: "Scout",
+          role: "researcher",
+        }),
+      ]),
+    );
+    await expect(
+      session.steer?.({
+        turnId: "thread-child",
+        message: { role: "user", text: "Do not emulate child steering." },
       }),
-    ]));
-    await expect(session.steer?.({
-      turnId: "thread-child",
-      message: { role: "user", text: "Do not emulate child steering." },
-    })).rejects.toBeInstanceOf(HarnessStaleTurnError);
+    ).rejects.toBeInstanceOf(HarnessStaleTurnError);
     const events = session.events()[Symbol.asyncIterator]();
     const observed: PrpEvent[] = [];
     for (let index = 0; index < 9; index += 1) {
@@ -754,34 +1237,43 @@ describe("Codex app-server Codex driver", () => {
       if (next.done) break;
       observed.push(next.value);
     }
-    expect(observed).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        eventType: "item.completed",
-        itemId: `${turnId}:steer:queued-comment-1`,
-        payload: expect.objectContaining({ kind: "steering_acknowledgement", status: "acknowledged" }),
-      }),
-      expect.objectContaining({
-        eventType: "harness.diagnostic",
-        payload: expect.objectContaining({ code: "stale_turn_rejected" }),
-      }),
-      expect.objectContaining({
-        eventType: "item.started",
-        payload: expect.objectContaining({ kind: "thread_lineage" }),
-      }),
-    ]));
+    expect(observed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "item.completed",
+          itemId: `${turnId}:steer:queued-comment-1`,
+          payload: expect.objectContaining({
+            kind: "steering_acknowledgement",
+            status: "acknowledged",
+          }),
+        }),
+        expect.objectContaining({
+          eventType: "harness.diagnostic",
+          payload: expect.objectContaining({ code: "stale_turn_rejected" }),
+        }),
+        expect.objectContaining({
+          eventType: "item.started",
+          payload: expect.objectContaining({ kind: "thread_lineage" }),
+        }),
+      ]),
+    );
     await session.close({ reason: "fixture complete" });
   });
 
   it("queues an interrupt before turn identity and reports a terminal race precisely", async () => {
     const transport = new FakeCodexTransport();
     let releaseStart!: (value: Record<string, unknown>) => void;
-    transport.turnStartResponse = new Promise((resolve) => { releaseStart = resolve; });
+    transport.turnStartResponse = new Promise((resolve) => {
+      releaseStart = resolve;
+    });
     const session = await makeDriver([transport]).openSession({
       runId: "run-interrupt-races",
       normalizedSessionId: "normalized-interrupt-races",
       workingDirectory: "/workspace",
     });
-    const starting = session.startTurn({ message: { role: "user", text: "Start slowly." } });
+    const starting = session.startTurn({
+      message: { role: "user", text: "Start slowly." },
+    });
     await new Promise((resolve) => setTimeout(resolve, 0));
     await session.interrupt?.({ reason: "operator" });
     releaseStart({ turn: { id: "turn-1", status: "inProgress", items: [] } });
@@ -789,21 +1281,24 @@ describe("Codex app-server Codex driver", () => {
       turnId: "turn-1",
       effectiveCollaborationMode: "default",
     });
-    expect(transport.calls.map(({ method }) => method)).toEqual(expect.arrayContaining([
-      "turn/start", "turn/interrupt",
-    ]));
+    expect(transport.calls.map(({ method }) => method)).toEqual(
+      expect.arrayContaining(["turn/start", "turn/interrupt"]),
+    );
     transport.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "interrupted", items: [] },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    await expect(session.interrupt?.({ turnId: "turn-1" }))
-      .rejects.toBeInstanceOf(HarnessOperationAlreadyTerminalError);
+    await expect(
+      session.interrupt?.({ turnId: "turn-1" }),
+    ).rejects.toBeInstanceOf(HarnessOperationAlreadyTerminalError);
     await session.close({ reason: "fixture complete" });
   });
 
   it("maps all goal operations and advertises an exact unsupported state", async () => {
-    const fixture = await loadLiveConsoleConformanceFixture(liveConsoleFixturePath);
+    const fixture = await loadLiveConsoleConformanceFixture(
+      liveConsoleFixturePath,
+    );
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({
       runId: "run-goals",
@@ -811,23 +1306,37 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await session.goal?.({ action: "get" });
-    await session.goal?.({ action: "set", objective: "Ship the Live console tracer", tokenBudget: 4096 });
+    await session.goal?.({
+      action: "set",
+      objective: "Ship the Live console tracer",
+      tokenBudget: 4096,
+    });
     await session.goal?.({ action: "pause" });
     await session.goal?.({ action: "resume" });
     await session.goal?.({ action: "clear" });
-    const goalCalls = transport.calls.filter(({ method }) => method.startsWith("thread/goal/"));
-    expect(goalCalls.slice(1).map(({ method, params }) => ({
-      method,
-      params: Object.fromEntries(Object.entries(params).filter(([key]) => key !== "threadId")),
-    }))).toEqual(fixture.goals.map(({ method, params }) => ({ method, params })));
+    const goalCalls = transport.calls.filter(({ method }) =>
+      method.startsWith("thread/goal/"),
+    );
+    expect(
+      goalCalls.slice(1).map(({ method, params }) => ({
+        method,
+        params: Object.fromEntries(
+          Object.entries(params).filter(([key]) => key !== "threadId"),
+        ),
+      })),
+    ).toEqual(fixture.goals.map(({ method, params }) => ({ method, params })));
 
-    expect((await makeDriver([new FakeCodexTransport()]).descriptor()).capabilities)
-      .toMatchObject({ goals: true });
+    expect(
+      (await makeDriver([new FakeCodexTransport()]).descriptor()).capabilities,
+    ).toMatchObject({ goals: true });
 
     // Both denials a real app-server sends: the method is absent, and the
     // build has the feature switched off.
     for (const denial of [
-      new CodexRpcError('{"code":-32601,"message":"method not found"}', CODEX_METHOD_NOT_FOUND),
+      new CodexRpcError(
+        '{"code":-32601,"message":"method not found"}',
+        CODEX_METHOD_NOT_FOUND,
+      ),
       new CodexRpcError(
         '{"code":-32600,"message":"goals feature is disabled"}',
         CODEX_INVALID_REQUEST,
@@ -841,9 +1350,12 @@ describe("Codex app-server Codex driver", () => {
         normalizedSessionId: "normalized-goals-unsupported",
         workingDirectory: "/workspace",
       });
-      expect((await unsupportedDriver.descriptor()).capabilities).toMatchObject({ goals: false });
-      await expect(unsupported.goal?.({ action: "get" }))
-        .rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
+      expect((await unsupportedDriver.descriptor()).capabilities).toMatchObject(
+        { goals: false },
+      );
+      await expect(
+        unsupported.goal?.({ action: "get" }),
+      ).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
       await unsupported.close({ reason: "fixture complete" });
     }
     await session.close({ reason: "fixture complete" });
@@ -865,12 +1377,16 @@ describe("Codex app-server Codex driver", () => {
         workingDirectory: "/workspace",
       });
 
-      expect((await driver.descriptor()).capabilities).toMatchObject({ goals: true });
+      expect((await driver.descriptor()).capabilities).toMatchObject({
+        goals: true,
+      });
       // The capability survives, so the operation is still offered and the
       // next call reaches the provider instead of failing closed locally.
       transport.rejectMethods.delete("thread/goal/get");
       await expect(session.goal?.({ action: "get" })).resolves.toBeNull();
-      expect(transport.calls.filter(({ method }) => method === "thread/goal/get")).toHaveLength(2);
+      expect(
+        transport.calls.filter(({ method }) => method === "thread/goal/get"),
+      ).toHaveLength(2);
       await session.close({ reason: "fixture complete" });
     }
   });
@@ -882,15 +1398,25 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-resolution-shapes",
       workingDirectory: "/workspace",
     });
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Ask me things." } });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask me things." },
+    });
 
     // Not `async`: an async function would flatten and await the pending
     // provider response, which only settles once the request is resolved.
-    function open(id: string, method: string): Promise<Record<string, unknown>> {
+    function open(
+      id: string,
+      method: string,
+    ): Promise<Record<string, unknown>> {
       return transport.invoke({
         id,
         method,
-        params: { threadId: "thread-1", turnId, itemId: `item-${id}`, reason: `fixture ${id}` },
+        params: {
+          threadId: "thread-1",
+          turnId,
+          itemId: `item-${id}`,
+          reason: `fixture ${id}`,
+        },
       });
     }
     const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -905,22 +1431,32 @@ describe("Codex app-server Codex driver", () => {
       { action: "submit", content: { answer: "wrong shape" } },
       { action: "accept" },
     ]) {
-      await expect(session.resolveRuntimeRequest?.({
-        requestId: "ask-input",
-        turnId,
-        resolution: resolution as unknown as HarnessRuntimeRequestResolution,
-      })).rejects.toThrow(/user_input rejected its resolution/);
+      await expect(
+        session.resolveRuntimeRequest?.({
+          requestId: "ask-input",
+          turnId,
+          resolution: resolution as unknown as HarnessRuntimeRequestResolution,
+        }),
+      ).rejects.toThrow(/user_input rejected its resolution/);
       // A rejected resolution must leave the request answerable.
       expect(session.pendingRuntimeRequests?.()).toHaveLength(1);
     }
     await session.resolveRuntimeRequest?.({
       requestId: "ask-input",
       turnId,
-      resolution: { action: "submit", answers: { field: { answers: ["staging"] } } },
+      resolution: {
+        action: "submit",
+        answers: { field: { answers: ["staging"] } },
+      },
     });
-    expect(await userInput).toEqual({ answers: { field: { answers: ["staging"] } } });
+    expect(await userInput).toEqual({
+      answers: { field: { answers: ["staging"] } },
+    });
 
-    const elicitation = open("ask-elicitation", "mcpServer/elicitation/request");
+    const elicitation = open(
+      "ask-elicitation",
+      "mcpServer/elicitation/request",
+    );
     await settled();
     for (const resolution of [
       { action: "submit" },
@@ -928,11 +1464,13 @@ describe("Codex app-server Codex driver", () => {
       { action: "submit", answers: { field: { answers: ["wrong shape"] } } },
       { action: "accept_for_session" },
     ]) {
-      await expect(session.resolveRuntimeRequest?.({
-        requestId: "ask-elicitation",
-        turnId,
-        resolution: resolution as unknown as HarnessRuntimeRequestResolution,
-      })).rejects.toThrow(/elicitation rejected its resolution/);
+      await expect(
+        session.resolveRuntimeRequest?.({
+          requestId: "ask-elicitation",
+          turnId,
+          resolution: resolution as unknown as HarnessRuntimeRequestResolution,
+        }),
+      ).rejects.toThrow(/elicitation rejected its resolution/);
       expect(session.pendingRuntimeRequests?.()).toHaveLength(1);
     }
     await session.resolveRuntimeRequest?.({
@@ -946,16 +1484,21 @@ describe("Codex app-server Codex driver", () => {
       _meta: null,
     });
 
-    const approval = open("ask-approval", "item/commandExecution/requestApproval");
+    const approval = open(
+      "ask-approval",
+      "item/commandExecution/requestApproval",
+    );
     await settled();
-    await expect(session.resolveRuntimeRequest?.({
-      requestId: "ask-approval",
-      turnId,
-      resolution: {
-        action: "submit",
-        answers: { field: { answers: ["nope"] } },
-      } as unknown as HarnessRuntimeRequestResolution,
-    })).rejects.toThrow(/command_approval rejected its resolution/);
+    await expect(
+      session.resolveRuntimeRequest?.({
+        requestId: "ask-approval",
+        turnId,
+        resolution: {
+          action: "submit",
+          answers: { field: { answers: ["nope"] } },
+        } as unknown as HarnessRuntimeRequestResolution,
+      }),
+    ).rejects.toThrow(/command_approval rejected its resolution/);
     await session.resolveRuntimeRequest?.({
       requestId: "ask-approval",
       turnId,
@@ -976,16 +1519,28 @@ describe("Codex app-server Codex driver", () => {
     void (async () => {
       for await (const event of session.events()) events.push(event);
     })();
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Approve this." } });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Approve this." },
+    });
     const resolved = transport.invoke({
       id: "outcome-resolved",
       method: "item/commandExecution/requestApproval",
-      params: { threadId: "thread-1", turnId, itemId: "item-resolved", reason: "approve" },
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "item-resolved",
+        reason: "approve",
+      },
     });
     const cancelled = transport.invoke({
       id: "outcome-cancelled",
       method: "item/commandExecution/requestApproval",
-      params: { threadId: "thread-1", turnId, itemId: "item-cancelled", reason: "approve" },
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "item-cancelled",
+        reason: "approve",
+      },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     await session.resolveRuntimeRequest?.({
@@ -998,14 +1553,19 @@ describe("Codex app-server Codex driver", () => {
     await cancelled;
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const terminal = events.filter(({ eventType }) =>
-      eventType === "runtime_request.resolved" || eventType === "runtime_request.cancelled");
-    expect(terminal.map(({ eventType, turnId, itemId, payload }) => ({
-      eventType,
-      turnId,
-      itemId,
-      payload,
-    }))).toEqual([
+    const terminal = events.filter(
+      ({ eventType }) =>
+        eventType === "runtime_request.resolved" ||
+        eventType === "runtime_request.cancelled",
+    );
+    expect(
+      terminal.map(({ eventType, turnId, itemId, payload }) => ({
+        eventType,
+        turnId,
+        itemId,
+        payload,
+      })),
+    ).toEqual([
       {
         eventType: "runtime_request.resolved",
         turnId,
@@ -1035,14 +1595,18 @@ describe("Codex app-server Codex driver", () => {
   });
 
   it("redacts browser-visible request details and diagnostics from the fixture markers", async () => {
-    const fixture = await loadLiveConsoleConformanceFixture(liveConsoleFixturePath);
+    const fixture = await loadLiveConsoleConformanceFixture(
+      liveConsoleFixturePath,
+    );
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({
       runId: "run-redaction",
       normalizedSessionId: "normalized-redaction",
       workingDirectory: "/workspace",
     });
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Request input." } });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Request input." },
+    });
     const pending = transport.invoke({
       id: "redacted-request",
       method: "item/tool/requestUserInput",
@@ -1056,7 +1620,8 @@ describe("Codex app-server Codex driver", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     const serialized = JSON.stringify(session.pendingRuntimeRequests?.());
-    for (const marker of fixture.redactionMarkers) expect(serialized).not.toContain(marker);
+    for (const marker of fixture.redactionMarkers)
+      expect(serialized).not.toContain(marker);
     expect(serialized).toContain("[REDACTED]");
     await session.resolveRuntimeRequest?.({
       requestId: "redacted-request",
@@ -1069,41 +1634,94 @@ describe("Codex app-server Codex driver", () => {
 
   it("makes duplicate semantic completion idempotent and rejects changed payloads", async () => {
     const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({ runId: "run-result", normalizedSessionId: "normalized-result", workingDirectory: "/workspace" });
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-result",
+      normalizedSessionId: "normalized-result",
+      workingDirectory: "/workspace",
+    });
     await session.startTurn({ message: { role: "user", text: "Complete." } });
-    const request = { id: 1, method: "item/tool/call", params: { threadId: "thread-1", turnId: "turn-1", callId: "call-1", tool: "paperclip_finish", arguments: result } };
+    const request = {
+      id: 1,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-1",
+        tool: "paperclip_finish",
+        arguments: result,
+      },
+    };
     expect(await transport.invoke(request)).toMatchObject({ success: true });
-    expect(await transport.invoke({
-      ...request,
-      id: 2,
-      params: { ...request.params, callId: "call-2", arguments: reverseObjectKeys(result) },
-    })).toMatchObject({ success: true });
+    expect(
+      await transport.invoke({
+        ...request,
+        id: 2,
+        params: {
+          ...request.params,
+          callId: "call-2",
+          arguments: reverseObjectKeys(result),
+        },
+      }),
+    ).toMatchObject({ success: true });
     expect((await session.snapshot()).semanticResult?.callId).toBe("call-1");
     const changed = structuredClone(result);
     changed.summary = "Changed after commit.";
-    expect(await transport.invoke({ ...request, id: 3, params: { ...request.params, arguments: changed } })).toMatchObject({ success: false });
-    transport.push("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed", items: [] } });
-    transport.push("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed", items: [] } });
+    expect(
+      await transport.invoke({
+        ...request,
+        id: 3,
+        params: { ...request.params, arguments: changed },
+      }),
+    ).toMatchObject({ success: false });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
     const events = await collectUntilTerminal(session.events());
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "turn.completed"),
+    ).toHaveLength(1);
   });
 
   it("advertises and dispatches run-authorized control-plane tools", async () => {
     const transport = new FakeCodexTransport();
-    const handler = vi.fn(async (call) => ({ task: { id: "issue-1" }, callId: call.callId }));
+    const handler = vi.fn(async (call) => ({
+      task: { id: "issue-1" },
+      callId: call.callId,
+    }));
     const session = await makeDriver([transport], {
-      dynamicTools: [{
-        name: "get_task_context",
-        description: "Read the assigned task.",
-        inputSchema: { type: "object", additionalProperties: false },
-      }],
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the assigned task.",
+          inputSchema: { type: "object", additionalProperties: false },
+        },
+      ],
       dynamicToolHandler: handler,
-    }).openSession({ runId: "run-tools", normalizedSessionId: "normalized-tools", workingDirectory: "/workspace" });
-    await session.startTurn({ message: { role: "user", text: "Inspect the task." } });
+    }).openSession({
+      runId: "run-tools",
+      normalizedSessionId: "normalized-tools",
+      workingDirectory: "/workspace",
+    });
+    await session.startTurn({
+      message: { role: "user", text: "Inspect the task." },
+    });
 
-    expect(transport.calls.find((call) => call.method === "thread/start")?.params.dynamicTools)
-      .toEqual(expect.arrayContaining([expect.objectContaining({ name: "get_task_context" })]));
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params
+        .dynamicTools,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "get_task_context" }),
+      ]),
+    );
     const response = await transport.invoke({
       id: "rpc-tool",
       method: "item/tool/call",
@@ -1116,13 +1734,20 @@ describe("Codex app-server Codex driver", () => {
       },
     });
     expect(response).toMatchObject({ success: true });
-    expect(JSON.parse(String((response.contentItems as Array<Record<string, unknown>>)[0]?.text)))
-      .toEqual({ task: { id: "issue-1" }, callId: "call-context" });
-    expect(handler).toHaveBeenCalledWith(expect.objectContaining({
-      tool: "get_task_context",
-      callId: "call-context",
-      arguments: {},
-    }));
+    expect(
+      JSON.parse(
+        String(
+          (response.contentItems as Array<Record<string, unknown>>)[0]?.text,
+        ),
+      ),
+    ).toEqual({ task: { id: "issue-1" }, callId: "call-context" });
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tool: "get_task_context",
+        callId: "call-context",
+        arguments: {},
+      }),
+    );
   });
 
   it("fails closed when an agent message changes a tool-committed result", async () => {
@@ -1133,30 +1758,42 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await session.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await transport.invoke({
-      id: "tool-result",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "tool-result",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await transport.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     const changed = structuredClone(result);
     changed.summary = "Conflicting agent-message result.";
     transport.push("item/completed", {
       threadId: "thread-1",
       turnId: "turn-1",
-      item: { id: "message-result", type: "agentMessage", text: JSON.stringify(changed) },
+      item: {
+        id: "message-result",
+        type: "agentMessage",
+        text: JSON.stringify(changed),
+      },
     });
 
     const events: PrpEvent[] = [];
     for await (const event of session.events()) events.push(event);
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "conflicting_semantic_result", recoverable: false });
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.find((event) => event.eventType === "session.failed")?.payload,
+    ).toMatchObject({
+      code: "conflicting_semantic_result",
+      recoverable: false,
+    });
     expect((await session.snapshot()).semanticResult?.result).toEqual(result);
   });
 
@@ -1171,30 +1808,40 @@ describe("Codex app-server Codex driver", () => {
     transport.push("item/completed", {
       threadId: "thread-1",
       turnId: "turn-1",
-      item: { id: "message-result", type: "agentMessage", text: JSON.stringify(result) },
+      item: {
+        id: "message-result",
+        type: "agentMessage",
+        text: JSON.stringify(result),
+      },
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     const changed = structuredClone(result);
     changed.summary = "Conflicting tool result.";
-    expect(await transport.invoke({
-      id: "tool-result",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "tool-result",
-        tool: "paperclip_finish",
-        arguments: changed,
-      },
-    })).toMatchObject({ success: false });
+    expect(
+      await transport.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: changed,
+        },
+      }),
+    ).toMatchObject({ success: false });
     transport.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
     });
 
     const events = await collectUntilTerminal(session.events());
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.some((event) => event.eventType === "session.failed")).toBe(false);
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(events.some((event) => event.eventType === "session.failed")).toBe(
+      false,
+    );
     expect((await session.snapshot()).semanticResult).toMatchObject({
       callId: "message-result",
       result,
@@ -1209,17 +1856,19 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await session.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await transport.invoke({
-      id: "tool-result",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "tool-result",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await transport.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     transport.push("item/completed", {
       threadId: "thread-1",
       turnId: "turn-1",
@@ -1235,8 +1884,12 @@ describe("Codex app-server Codex driver", () => {
     });
 
     const events = await collectUntilTerminal(session.events());
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect((await session.snapshot()).semanticResult?.callId).toBe("tool-result");
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect((await session.snapshot()).semanticResult?.callId).toBe(
+      "tool-result",
+    );
   });
 
   it("fails closed when a live terminal embeds a changed semantic result", async () => {
@@ -1247,17 +1900,19 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await session.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await transport.invoke({
-      id: "tool-result",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "tool-result",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await transport.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     const changed = structuredClone(result);
     changed.summary = "Conflicting terminal result.";
     transport.push("turn/completed", {
@@ -1265,40 +1920,68 @@ describe("Codex app-server Codex driver", () => {
       turn: {
         id: "turn-1",
         status: "completed",
-        items: [{ id: "terminal-result", type: "agentMessage", text: JSON.stringify(changed) }],
+        items: [
+          {
+            id: "terminal-result",
+            type: "agentMessage",
+            text: JSON.stringify(changed),
+          },
+        ],
       },
     });
 
     const events: PrpEvent[] = [];
     for await (const event of session.events()) events.push(event);
-    expect(events.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "conflicting_semantic_result", recoverable: false });
-    expect(events.some((event) => event.eventType === "turn.completed")).toBe(false);
+    expect(
+      events.find((event) => event.eventType === "session.failed")?.payload,
+    ).toMatchObject({
+      code: "conflicting_semantic_result",
+      recoverable: false,
+    });
+    expect(events.some((event) => event.eventType === "turn.completed")).toBe(
+      false,
+    );
     expect((await session.snapshot()).semanticResult?.result).toEqual(result);
   });
 
   it.each([
     { threadId: "other-thread", turnId: "turn-1", label: "another thread" },
     { threadId: "thread-1", turnId: "other-turn", label: "another turn" },
-  ])("rejects a semantic result for $label without committing it", async ({ threadId, turnId }) => {
-    const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({
-      runId: "run-hostile-tool",
-      normalizedSessionId: "normalized-hostile-tool",
-      workingDirectory: "/workspace",
-    });
-    await session.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await transport.invoke({
-      id: "hostile-call",
-      method: "item/tool/call",
-      params: { threadId, turnId, callId: "hostile-call", tool: "paperclip_finish", arguments: result },
-    })).toMatchObject({ success: false });
-    const events = await collectUntilTerminal(session.events());
-    expect(events.some((event) => event.eventType === "run.result.proposed")).toBe(false);
-    expect(events.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "tool_binding_mismatch", recoverable: false });
-    expect(events.find((event) => event.eventType === "turn.failed")?.turnId).toBe("turn-1");
-  });
+  ])(
+    "rejects a semantic result for $label without committing it",
+    async ({ threadId, turnId }) => {
+      const transport = new FakeCodexTransport();
+      const session = await makeDriver([transport]).openSession({
+        runId: "run-hostile-tool",
+        normalizedSessionId: "normalized-hostile-tool",
+        workingDirectory: "/workspace",
+      });
+      await session.startTurn({ message: { role: "user", text: "Complete." } });
+      expect(
+        await transport.invoke({
+          id: "hostile-call",
+          method: "item/tool/call",
+          params: {
+            threadId,
+            turnId,
+            callId: "hostile-call",
+            tool: "paperclip_finish",
+            arguments: result,
+          },
+        }),
+      ).toMatchObject({ success: false });
+      const events = await collectUntilTerminal(session.events());
+      expect(
+        events.some((event) => event.eventType === "run.result.proposed"),
+      ).toBe(false);
+      expect(
+        events.find((event) => event.eventType === "session.failed")?.payload,
+      ).toMatchObject({ code: "tool_binding_mismatch", recoverable: false });
+      expect(
+        events.find((event) => event.eventType === "turn.failed")?.turnId,
+      ).toBe("turn-1");
+    },
+  );
 
   it("rejects pre-turn, cross-thread, and post-terminal notifications", async () => {
     const preTurnTransport = new FakeCodexTransport();
@@ -1310,13 +1993,21 @@ describe("Codex app-server Codex driver", () => {
     preTurnTransport.push("item/completed", {
       threadId: "thread-1",
       turnId: "turn-1",
-      item: { id: "answer-pre", type: "agentMessage", text: JSON.stringify(result) },
+      item: {
+        id: "answer-pre",
+        type: "agentMessage",
+        text: JSON.stringify(result),
+      },
     });
     const preTurnEvents: PrpEvent[] = [];
     for await (const event of preTurn.events()) preTurnEvents.push(event);
-    expect(preTurnEvents.some((event) => event.eventType === "run.result.proposed")).toBe(false);
-    expect(preTurnEvents.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "turn_binding_mismatch" });
+    expect(
+      preTurnEvents.some((event) => event.eventType === "run.result.proposed"),
+    ).toBe(false);
+    expect(
+      preTurnEvents.find((event) => event.eventType === "session.failed")
+        ?.payload,
+    ).toMatchObject({ code: "turn_binding_mismatch" });
 
     const crossThreadTransport = new FakeCodexTransport();
     const crossThread = await makeDriver([crossThreadTransport]).openSession({
@@ -1324,16 +2015,28 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-cross-thread",
       workingDirectory: "/workspace",
     });
-    await crossThread.startTurn({ message: { role: "user", text: "Complete." } });
+    await crossThread.startTurn({
+      message: { role: "user", text: "Complete." },
+    });
     crossThreadTransport.push("item/completed", {
       threadId: "other-thread",
       turnId: "turn-1",
-      item: { id: "answer-other", type: "agentMessage", text: JSON.stringify(result) },
+      item: {
+        id: "answer-other",
+        type: "agentMessage",
+        text: JSON.stringify(result),
+      },
     });
     const crossThreadEvents = await collectUntilTerminal(crossThread.events());
-    expect(crossThreadEvents.some((event) => event.eventType === "run.result.proposed")).toBe(false);
-    expect(crossThreadEvents.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "thread_binding_mismatch" });
+    expect(
+      crossThreadEvents.some(
+        (event) => event.eventType === "run.result.proposed",
+      ),
+    ).toBe(false);
+    expect(
+      crossThreadEvents.find((event) => event.eventType === "session.failed")
+        ?.payload,
+    ).toMatchObject({ code: "thread_binding_mismatch" });
 
     const postTerminalTransport = new FakeCodexTransport();
     const postTerminal = await makeDriver([postTerminalTransport]).openSession({
@@ -1341,23 +2044,27 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-post-terminal",
       workingDirectory: "/workspace",
     });
-    await postTerminal.startTurn({ message: { role: "user", text: "Complete." } });
+    await postTerminal.startTurn({
+      message: { role: "user", text: "Complete." },
+    });
     postTerminalTransport.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
     });
     await collectUntilTerminal(postTerminal.events());
-    expect(await postTerminalTransport.invoke({
-      id: "late-call",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "late-call",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: false });
+    expect(
+      await postTerminalTransport.invoke({
+        id: "late-call",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "late-call",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: false });
   });
 
   it("rejects duplicate and conflicting terminal facts", async () => {
@@ -1374,14 +2081,24 @@ describe("Codex app-server Codex driver", () => {
     });
     transport.push("turn/completed", {
       threadId: "thread-1",
-      turn: { id: "turn-1", status: "failed", error: { message: "changed" }, items: [] },
+      turn: {
+        id: "turn-1",
+        status: "failed",
+        error: { message: "changed" },
+        items: [],
+      },
     });
     const events: PrpEvent[] = [];
     for await (const event of session.events()) events.push(event);
-    expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "turn.failed")).toHaveLength(0);
-    expect(events.find((event) => event.eventType === "session.failed")?.payload)
-      .toMatchObject({ code: "conflicting_turn_terminal", recoverable: false });
+    expect(
+      events.filter((event) => event.eventType === "turn.completed"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "turn.failed"),
+    ).toHaveLength(0);
+    expect(
+      events.find((event) => event.eventType === "session.failed")?.payload,
+    ).toMatchObject({ code: "conflicting_turn_terminal", recoverable: false });
   });
 
   it("rejects oversized semantic results without retaining provider payloads", async () => {
@@ -1392,33 +2109,50 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await session.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await transport.invoke({
-      id: "large-call",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "large-call",
-        tool: "paperclip_finish",
-        arguments: { ...result, summary: "x".repeat(70 * 1024) },
-      },
-    })).toEqual({
+    expect(
+      await transport.invoke({
+        id: "large-call",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "large-call",
+          tool: "paperclip_finish",
+          arguments: { ...result, summary: "x".repeat(70 * 1024) },
+        },
+      }),
+    ).toEqual({
       success: false,
-      contentItems: [{ type: "inputText", text: "Semantic result exceeded the retained payload limit." }],
+      contentItems: [
+        {
+          type: "inputText",
+          text: "Semantic result exceeded the retained payload limit.",
+        },
+      ],
     });
     transport.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
     });
     const events = await collectUntilTerminal(session.events());
-    expect(events.some((event) => JSON.stringify(event).includes("x".repeat(1024)))).toBe(false);
-    expect(events.some((event) => event.eventType === "run.result.proposed")).toBe(false);
+    expect(
+      events.some((event) => JSON.stringify(event).includes("x".repeat(1024))),
+    ).toBe(false);
+    expect(
+      events.some((event) => event.eventType === "run.result.proposed"),
+    ).toBe(false);
   });
 
   it("normalizes finish and block tools into one canonical result contract", async () => {
     const transport = new FakeCodexTransport();
-    const session = await makeDriver([transport]).openSession({ runId: "run-tools", normalizedSessionId: "normalized-tools", workingDirectory: "/workspace" });
-    await session.startTurn({ message: { role: "user", text: "Complete or block." } });
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-tools",
+      normalizedSessionId: "normalized-tools",
+      workingDirectory: "/workspace",
+    });
+    await session.startTurn({
+      message: { role: "user", text: "Complete or block." },
+    });
     const blocked: PrpStructuredRunResult = {
       ...structuredClone(result),
       reportedWorkDisposition: "blocked",
@@ -1426,8 +2160,15 @@ describe("Codex app-server Codex driver", () => {
       completionClaim: {
         ...structuredClone(result.completionClaim),
         objectiveSatisfied: false,
-        criteria: [{ criterionId: "file", status: "not_satisfied", evidenceRefs: [] }],
-        remainingWork: [{ description: "Fixture owner must provide input.", blocksCompletion: true }],
+        criteria: [
+          { criterionId: "file", status: "not_satisfied", evidenceRefs: [] },
+        ],
+        remainingWork: [
+          {
+            description: "Fixture owner must provide input.",
+            blocksCompletion: true,
+          },
+        ],
       },
       blocker: {
         reasonCode: "fixture_input_missing",
@@ -1448,34 +2189,55 @@ describe("Codex app-server Codex driver", () => {
         arguments: blocked,
       },
     };
-    expect(await transport.invoke({
-      ...request,
-      id: 9,
-      params: { ...request.params, tool: "paperclip_finish" },
-    })).toMatchObject({ success: false });
+    expect(
+      await transport.invoke({
+        ...request,
+        id: 9,
+        params: { ...request.params, tool: "paperclip_finish" },
+      }),
+    ).toMatchObject({ success: false });
     expect(await transport.invoke(request)).toMatchObject({ success: true });
-    expect(await transport.invoke({ ...request, id: 11 })).toMatchObject({ success: true });
-    transport.push("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed", items: [] } });
+    expect(await transport.invoke({ ...request, id: 11 })).toMatchObject({
+      success: true,
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
     const events = await collectUntilTerminal(session.events());
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.find((event) => event.eventType === "run.result.proposed")?.payload)
-      .toMatchObject({ reportedWorkDisposition: "blocked" });
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.find((event) => event.eventType === "run.result.proposed")
+        ?.payload,
+    ).toMatchObject({ reportedWorkDisposition: "blocked" });
   });
 
   it("resumes and reconciles the exact provider thread after transport loss", async () => {
     const first = new FakeCodexTransport();
     const second = new FakeCodexTransport();
     const driver = makeDriver([first, second]);
-    const original = await driver.openSession({ runId: "run-recover", normalizedSessionId: "normalized-recover", workingDirectory: "/workspace" });
+    const original = await driver.openSession({
+      runId: "run-recover",
+      normalizedSessionId: "normalized-recover",
+      workingDirectory: "/workspace",
+    });
     await original.startTurn({ message: { role: "user", text: "Work." } });
     const snapshot = await original.snapshot();
     await original.close({ reason: "transport lost" });
     const recovery = await driver.recoverSession?.(snapshot);
     expect(recovery).toMatchObject({ recovered: true });
     expect(recovery?.session?.ids()).toEqual(original.ids());
-    expect(await recovery?.session?.reconcile?.()).toMatchObject({ thread: { id: "thread-1" } });
+    expect(await recovery?.session?.reconcile?.()).toMatchObject({
+      thread: { id: "thread-1" },
+    });
     expect(second.calls.map((call) => call.method)).toEqual([
-      "initialize", "thread/read", "thread/resume", "thread/goal/get", "thread/read",
+      "initialize",
+      "thread/read",
+      "thread/resume",
+      "thread/goal/get",
+      "thread/read",
     ]);
     expect((await recovery?.session?.snapshot())?.activeTurnId).toBe("turn-1");
   });
@@ -1500,7 +2262,9 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-history",
       workingDirectory: "/workspace",
     });
-    await original.startTurn({ message: { role: "user", text: "Keep working." } });
+    await original.startTurn({
+      message: { role: "user", text: "Keep working." },
+    });
     const snapshot = await original.snapshot();
     await original.close({ reason: "transport lost" });
 
@@ -1508,11 +2272,15 @@ describe("Codex app-server Codex driver", () => {
     const recovered = recovery?.session;
     expect(recovered).toBeDefined();
     await recovered!.reconcile?.();
-    expect(await recovered!.snapshot()).toMatchObject({ activeTurnId: "turn-1" });
+    expect(await recovered!.snapshot()).toMatchObject({
+      activeTurnId: "turn-1",
+    });
     await recovered!.close({ reason: "test complete" });
     const events: PrpEvent[] = [];
     for await (const event of recovered!.events()) events.push(event);
-    expect(events.some((event) => event.eventType === "turn.completed")).toBe(false);
+    expect(events.some((event) => event.eventType === "turn.completed")).toBe(
+      false,
+    );
   });
 
   it("preserves proposal idempotency and rejects a changed result after transport loss", async () => {
@@ -1525,17 +2293,19 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await original.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await first.invoke({
-      id: "call-before-loss",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-before-loss",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await first.invoke({
+        id: "call-before-loss",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-before-loss",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     const snapshot = await original.snapshot();
     expect(snapshot.semanticResult).toMatchObject({
       callId: "call-before-loss",
@@ -1545,44 +2315,56 @@ describe("Codex app-server Codex driver", () => {
     await original.close({ reason: "transport lost after proposal" });
     const originalEvents: PrpEvent[] = [];
     for await (const event of original.events()) originalEvents.push(event);
-    expect(originalEvents.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
+    expect(
+      originalEvents.filter(
+        (event) => event.eventType === "run.result.proposed",
+      ),
+    ).toHaveLength(1);
 
     const recovery = await driver.recoverSession?.(snapshot);
     const recovered = recovery?.session;
     expect(recovered).toBeDefined();
     const collecting = collectUntilTerminal(recovered!.events());
     await recovered!.reconcile?.();
-    expect(await second.invoke({
-      id: "call-after-loss",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-after-loss",
-        tool: "paperclip_finish",
-        arguments: reverseObjectKeys(result),
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await second.invoke({
+        id: "call-after-loss",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "call-after-loss",
+          tool: "paperclip_finish",
+          arguments: reverseObjectKeys(result),
+        },
+      }),
+    ).toMatchObject({ success: true });
     const changed = structuredClone(result);
     changed.summary = "Changed after transport loss.";
-    expect(await second.invoke({
-      id: "changed-after-loss",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "changed-after-loss",
-        tool: "paperclip_finish",
-        arguments: changed,
-      },
-    })).toMatchObject({ success: false });
+    expect(
+      await second.invoke({
+        id: "changed-after-loss",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "changed-after-loss",
+          tool: "paperclip_finish",
+          arguments: changed,
+        },
+      }),
+    ).toMatchObject({ success: false });
     second.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
     });
     const events = await collecting;
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(0);
-    expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(0);
+    expect(
+      events.filter((event) => event.eventType === "turn.completed"),
+    ).toHaveLength(1);
   });
 
   it("rejects changed terminal result content discovered during recovery", async () => {
@@ -1595,11 +2377,19 @@ describe("Codex app-server Codex driver", () => {
         id: "thread-1",
         sessionId: "provider-session-1",
         cwd: "/workspace",
-        turns: [{
-          id: "turn-1",
-          status: "completed",
-          items: [{ id: "terminal-result", type: "agentMessage", text: JSON.stringify(changed) }],
-        }],
+        turns: [
+          {
+            id: "turn-1",
+            status: "completed",
+            items: [
+              {
+                id: "terminal-result",
+                type: "agentMessage",
+                text: JSON.stringify(changed),
+              },
+            ],
+          },
+        ],
       },
     };
     const driver = makeDriver([first, second]);
@@ -1609,17 +2399,19 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await original.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await first.invoke({
-      id: "tool-result",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "tool-result",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await first.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     first.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
@@ -1631,13 +2423,18 @@ describe("Codex app-server Codex driver", () => {
 
     const recovery = await driver.recoverSession?.(snapshot);
     expect(recovery).toMatchObject({ recovered: true });
-    await expect(recovery!.session!.reconcile!())
-      .rejects.toMatchObject<HarnessReconciliationError>({
-        name: "HarnessReconciliationError",
-        recoverable: true,
-        message: expect.stringContaining("contains a conflicting semantic result"),
-      });
-    expect((await recovery!.session!.snapshot()).semanticResult?.result).toEqual(result);
+    await expect(
+      recovery!.session!.reconcile!(),
+    ).rejects.toMatchObject<HarnessReconciliationError>({
+      name: "HarnessReconciliationError",
+      recoverable: true,
+      message: expect.stringContaining(
+        "contains a conflicting semantic result",
+      ),
+    });
+    expect(
+      (await recovery!.session!.snapshot()).semanticResult?.result,
+    ).toEqual(result);
     await recovery!.session!.close({ reason: "test complete" });
   });
 
@@ -1659,17 +2456,19 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     await original.startTurn({ message: { role: "user", text: "Complete." } });
-    expect(await first.invoke({
-      id: "terminal-call",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "terminal-call",
-        tool: "paperclip_finish",
-        arguments: result,
-      },
-    })).toMatchObject({ success: true });
+    expect(
+      await first.invoke({
+        id: "terminal-call",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "terminal-call",
+          tool: "paperclip_finish",
+          arguments: result,
+        },
+      }),
+    ).toMatchObject({ success: true });
     first.push("turn/completed", {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed", items: [] },
@@ -1686,8 +2485,12 @@ describe("Codex app-server Codex driver", () => {
     await recovered!.close({ reason: "test complete" });
     const events: PrpEvent[] = [];
     for await (const event of recovered!.events()) events.push(event);
-    expect(events.some((event) => event.eventType.startsWith("turn."))).toBe(false);
-    expect(events.some((event) => event.eventType === "run.result.proposed")).toBe(false);
+    expect(events.some((event) => event.eventType.startsWith("turn."))).toBe(
+      false,
+    );
+    expect(
+      events.some((event) => event.eventType === "run.result.proposed"),
+    ).toBe(false);
   });
 
   it("fails recovery explicitly when the persisted active turn is missing or replaced", async () => {
@@ -1724,30 +2527,45 @@ describe("Codex app-server Codex driver", () => {
       await original.close({ reason: "transport lost" });
       const recovery = await driver.recoverSession?.(snapshot);
       expect(recovery?.session).toBeDefined();
-      await expect(recovery!.session!.reconcile!())
-        .rejects.toMatchObject<HarnessReconciliationError>({
-          name: "HarnessReconciliationError",
-          recoverable: true,
-          message: expect.stringContaining(testCase.message),
-        });
+      await expect(
+        recovery!.session!.reconcile!(),
+      ).rejects.toMatchObject<HarnessReconciliationError>({
+        name: "HarnessReconciliationError",
+        recoverable: true,
+        message: expect.stringContaining(testCase.message),
+      });
       await recovery!.session!.close({ reason: "test complete" });
     }
   });
 
   it("reconciles a turn completed during transport loss without replacing either session identity", async () => {
-    const first = new FakeCodexTransport("driver-thread-loss", "provider-session-loss");
-    const second = new FakeCodexTransport("driver-thread-loss", "provider-session-loss");
+    const first = new FakeCodexTransport(
+      "driver-thread-loss",
+      "provider-session-loss",
+    );
+    const second = new FakeCodexTransport(
+      "driver-thread-loss",
+      "provider-session-loss",
+    );
     second.readResponse = {
       thread: {
         id: "driver-thread-loss",
         sessionId: "provider-session-loss",
         cwd: "/workspace",
         tokenUsage: { total: { inputTokens: 21, outputTokens: 8 } },
-        turns: [{
-          id: "turn-1",
-          status: "completed",
-          items: [{ id: "answer-loss", type: "agentMessage", text: JSON.stringify(result) }],
-        }],
+        turns: [
+          {
+            id: "turn-1",
+            status: "completed",
+            items: [
+              {
+                id: "answer-loss",
+                type: "agentMessage",
+                text: JSON.stringify(result),
+              },
+            ],
+          },
+        ],
       },
     };
     const driver = makeDriver([first, second]);
@@ -1756,7 +2574,9 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "controller-session-loss",
       workingDirectory: "/workspace",
     });
-    await original.startTurn({ message: { role: "user", text: "Work through loss." } });
+    await original.startTurn({
+      message: { role: "user", text: "Work through loss." },
+    });
     const snapshot = await original.snapshot();
     await original.close({ reason: "transport lost before terminal delivery" });
 
@@ -1779,10 +2599,21 @@ describe("Codex app-server Codex driver", () => {
       driverSessionId: "driver-thread-loss",
       providerSessionId: "provider-session-loss",
     });
-    expect(events.filter((event) => event.eventType === "turn.completed")).toHaveLength(1);
-    expect(events.filter((event) => event.eventType === "run.result.proposed")).toHaveLength(1);
-    expect(events.every((event, index) => event.sourceSeq === snapshot.lastSourceSequence! + index + 1)).toBe(true);
-    expect(await recovered!.usage?.()).toEqual({ total: { inputTokens: 21, outputTokens: 8 } });
+    expect(
+      events.filter((event) => event.eventType === "turn.completed"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.every(
+        (event, index) =>
+          event.sourceSeq === snapshot.lastSourceSequence! + index + 1,
+      ),
+    ).toBe(true);
+    expect(await recovered!.usage?.()).toEqual({
+      total: { inputTokens: 21, outputTokens: 8 },
+    });
   });
 
   it("degrades unsupported operations with explicit redacted diagnostics", async () => {
@@ -1791,17 +2622,30 @@ describe("Codex app-server Codex driver", () => {
       "turn/steer",
       new Error("method not found Bearer super-secret api_key=also-secret"),
     );
-    const session = await makeDriver([transport]).openSession({ runId: "run-degrade", normalizedSessionId: "normalized-degrade", workingDirectory: "/workspace" });
-    const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
-    await expect(session.steer?.({ turnId, message: { role: "user", text: "Steer." } })).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-degrade",
+      normalizedSessionId: "normalized-degrade",
+      workingDirectory: "/workspace",
+    });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Start." },
+    });
+    await expect(
+      session.steer?.({ turnId, message: { role: "user", text: "Steer." } }),
+    ).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
     const iterator = session.events()[Symbol.asyncIterator]();
     const events: PrpEvent[] = [];
     for (let index = 0; index < 6; index += 1) {
       const next = await iterator.next();
       if (next.value) events.push(next.value);
     }
-    const diagnostic = events.find((event) => event.eventType === "harness.diagnostic");
-    expect(diagnostic?.payload).toMatchObject({ code: "unsupported_operation", operation: "steering" });
+    const diagnostic = events.find(
+      (event) => event.eventType === "harness.diagnostic",
+    );
+    expect(diagnostic?.payload).toMatchObject({
+      code: "unsupported_operation",
+      operation: "steering",
+    });
     expect(JSON.stringify(diagnostic)).not.toContain("super-secret");
     expect(JSON.stringify(diagnostic)).not.toContain("also-secret");
   });
@@ -1815,12 +2659,17 @@ describe("Codex app-server Codex driver", () => {
     });
 
     const unknownCriterion = structuredClone(result);
-    unknownCriterion.completionClaim.criteria = [{
-      criterionId: "not-in-envelope",
-      status: "satisfied",
-      evidenceRefs: [],
-    }];
-    const criterionDecision = validateCodexResultProposal(unknownCriterion, envelope);
+    unknownCriterion.completionClaim.criteria = [
+      {
+        criterionId: "not-in-envelope",
+        status: "satisfied",
+        evidenceRefs: [],
+      },
+    ];
+    const criterionDecision = validateCodexResultProposal(
+      unknownCriterion,
+      envelope,
+    );
     expect(criterionDecision).toMatchObject({ status: "rejected" });
     if (criterionDecision.status === "rejected") {
       expect(criterionDecision.issues.map((issue) => issue.code)).toEqual(
@@ -1839,38 +2688,54 @@ describe("Codex app-server Codex driver", () => {
   it.each(["needs_review", "blocked"] as const)(
     "keeps a completed runtime successful for an accepted %s advisory proposal",
     async (disposition) => {
-      const proposal: PrpStructuredRunResult = disposition === "needs_review"
-        ? {
-            ...structuredClone(result),
-            reportedWorkDisposition: "needs_review",
-            attentionRequests: [{ kind: "review", summary: "Review the completed artifact." }],
-          }
-        : {
-            ...structuredClone(result),
-            reportedWorkDisposition: "blocked",
-            summary: "Waiting on fixture input.",
-            completionClaim: {
-              ...structuredClone(result.completionClaim),
-              objectiveSatisfied: false,
-              criteria: [{ criterionId: "file", status: "not_satisfied", evidenceRefs: [] }],
-              remainingWork: [{ description: "Provide fixture input.", blocksCompletion: true }],
-            },
-            blocker: {
-              reasonCode: "fixture_input_missing",
-              owner: { kind: "external", name: "fixture owner" },
-              unblockAction: "Provide fixture input.",
-              scope: "task_wide",
-            },
-            artifacts: [],
-          };
+      const proposal: PrpStructuredRunResult =
+        disposition === "needs_review"
+          ? {
+              ...structuredClone(result),
+              reportedWorkDisposition: "needs_review",
+              attentionRequests: [
+                { kind: "review", summary: "Review the completed artifact." },
+              ],
+            }
+          : {
+              ...structuredClone(result),
+              reportedWorkDisposition: "blocked",
+              summary: "Waiting on fixture input.",
+              completionClaim: {
+                ...structuredClone(result.completionClaim),
+                objectiveSatisfied: false,
+                criteria: [
+                  {
+                    criterionId: "file",
+                    status: "not_satisfied",
+                    evidenceRefs: [],
+                  },
+                ],
+                remainingWork: [
+                  {
+                    description: "Provide fixture input.",
+                    blocksCompletion: true,
+                  },
+                ],
+              },
+              blocker: {
+                reasonCode: "fixture_input_missing",
+                owner: { kind: "external", name: "fixture owner" },
+                unblockAction: "Provide fixture input.",
+                scope: "task_wide",
+              },
+              artifacts: [],
+            };
       const { trace } = await traceCompletedProposal(proposal);
       expect(trace.resultDecision.status).toBe("accepted");
-      expect(trace.events.find((event) => event.eventType === "run.terminal")?.payload)
-        .toMatchObject({
-          turnTerminalState: "completed",
-          runTerminalState: "succeeded",
-          reportedWorkDisposition: disposition,
-        });
+      expect(
+        trace.events.find((event) => event.eventType === "run.terminal")
+          ?.payload,
+      ).toMatchObject({
+        turnTerminalState: "completed",
+        runTerminalState: "succeeded",
+        reportedWorkDisposition: disposition,
+      });
     },
   );
 
@@ -1879,18 +2744,31 @@ describe("Codex app-server Codex driver", () => {
     wrongRevision.completionClaim.contractRevision = "wrong-revision";
     const rejected = await traceCompletedProposal(wrongRevision);
     expect(rejected.trace.result).toBeNull();
-    expect(rejected.trace.proposedResult).toMatchObject({ reportedWorkDisposition: "done" });
-    expect(rejected.trace.events.find((event) => event.eventType === "run.result.rejected")?.payload)
-      .toMatchObject({ recovery: { required: true, recoverable: true } });
-    expect(rejected.trace.events.find((event) => event.eventType === "run.terminal")?.payload)
-      .toMatchObject({ runTerminalState: "succeeded", reportedWorkDisposition: "yielded" });
+    expect(rejected.trace.proposedResult).toMatchObject({
+      reportedWorkDisposition: "done",
+    });
+    expect(
+      rejected.trace.events.find(
+        (event) => event.eventType === "run.result.rejected",
+      )?.payload,
+    ).toMatchObject({ recovery: { required: true, recoverable: true } });
+    expect(
+      rejected.trace.events.find((event) => event.eventType === "run.terminal")
+        ?.payload,
+    ).toMatchObject({
+      runTerminalState: "succeeded",
+      reportedWorkDisposition: "yielded",
+    });
 
     const missing = await traceCompletedProposal(null);
     expect(missing.trace.resultDecision).toMatchObject({ status: "rejected" });
-    expect(missing.trace.events.some((event) =>
-      event.eventType === "run.result.proposed" &&
-      event.payload.reportedWorkDisposition === "needs_review"
-    )).toBe(false);
+    expect(
+      missing.trace.events.some(
+        (event) =>
+          event.eventType === "run.result.proposed" &&
+          event.payload.reportedWorkDisposition === "needs_review",
+      ),
+    ).toBe(false);
   });
 
   it("preserves four independent stable identities under controller ownership", async () => {
@@ -1905,10 +2783,13 @@ describe("Codex app-server Codex driver", () => {
       driverSessionId: "thread-1",
       providerSessionId: "provider-session-1",
     });
-    expect(trace.events.every((event) =>
-      event.runId === "runtime-run-identity" &&
-      event.normalizedSessionId === "controller-session-identity"
-    )).toBe(true);
+    expect(
+      trace.events.every(
+        (event) =>
+          event.runId === "runtime-run-identity" &&
+          event.normalizedSessionId === "controller-session-identity",
+      ),
+    ).toBe(true);
   });
 
   it("validates persisted identity, uniqueness, terminals, and line bounds before replay", async () => {
@@ -1916,29 +2797,48 @@ describe("Codex app-server Codex driver", () => {
       runId: "runtime-run-persisted",
       normalizedSessionId: "controller-session-persisted",
     });
-    const serialize = (events: PrpEvent[]) => `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
-    expect(replayPersistedCodexEvents(serialize(trace.events), trace.metadata))
-      .toEqual(trace.replaySnapshot);
+    const serialize = (events: PrpEvent[]) =>
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`;
+    expect(
+      replayPersistedCodexEvents(serialize(trace.events), trace.metadata),
+    ).toEqual(trace.replaySnapshot);
 
     const mismatched = structuredClone(trace.events);
     mismatched[0]!.normalizedSessionId = "another-session";
-    expect(() => replayPersistedCodexEvents(serialize(mismatched), trace.metadata))
-      .toThrow("identity did not match");
+    expect(() =>
+      replayPersistedCodexEvents(serialize(mismatched), trace.metadata),
+    ).toThrow("identity did not match");
 
-    const terminalIndex = trace.events.findIndex((event) => event.eventType === "run.terminal");
-    const duplicated = trace.events.toSpliced(terminalIndex, 0, structuredClone(trace.events[0]!));
-    expect(() => replayPersistedCodexEvents(serialize(duplicated), trace.metadata))
-      .toThrow("event id was duplicated");
+    const terminalIndex = trace.events.findIndex(
+      (event) => event.eventType === "run.terminal",
+    );
+    const duplicated = trace.events.toSpliced(
+      terminalIndex,
+      0,
+      structuredClone(trace.events[0]!),
+    );
+    expect(() =>
+      replayPersistedCodexEvents(serialize(duplicated), trace.metadata),
+    ).toThrow("event id was duplicated");
 
     const terminal = structuredClone(trace.events[terminalIndex]!);
     terminal.sourceEventId = `${terminal.sourceEventId}:conflict`;
     terminal.sourceSeq += 1;
-    expect(() => replayPersistedCodexEvents(serialize([...trace.events, terminal]), trace.metadata))
-      .toThrow("after the run terminal");
-    expect(() => replayPersistedCodexEvents(`{\"payload\":\"${"x".repeat(300 * 1024)}\"}\n`, trace.metadata))
-      .toThrow("line was empty or oversized");
-    expect(() => replayPersistedCodexEvents("{not-json}\n", trace.metadata))
-      .toThrow("malformed JSON");
+    expect(() =>
+      replayPersistedCodexEvents(
+        serialize([...trace.events, terminal]),
+        trace.metadata,
+      ),
+    ).toThrow("after the run terminal");
+    expect(() =>
+      replayPersistedCodexEvents(
+        `{\"payload\":\"${"x".repeat(300 * 1024)}\"}\n`,
+        trace.metadata,
+      ),
+    ).toThrow("line was empty or oversized");
+    expect(() =>
+      replayPersistedCodexEvents("{not-json}\n", trace.metadata),
+    ).toThrow("malformed JSON");
   });
 
   it("degrades declared unsupported capabilities without Codex-specific core branches", async () => {
@@ -1958,15 +2858,19 @@ describe("Codex app-server Codex driver", () => {
     });
     expect(trace.resultDecision.status).toBe("accepted");
     expect(trace.assertions.contextIsSkillless).toBe(true);
-    expect(trace.diagnostics).toEqual(expect.arrayContaining([
-      expect.stringContaining("steering is unavailable"),
-      expect.stringContaining("interruption is unavailable"),
-    ]));
+    expect(trace.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("steering is unavailable"),
+        expect.stringContaining("interruption is unavailable"),
+      ]),
+    );
     expect(transport.calls.map((call) => call.method)).not.toEqual(
       expect.arrayContaining(["turn/steer", "turn/interrupt", "thread/read"]),
     );
-    expect(transport.calls.find((call) => call.method === "thread/start")?.params.dynamicTools)
-      .toEqual([]);
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params
+        .dynamicTools,
+    ).toEqual([]);
 
     const directTransport = new FakeCodexTransport();
     const driver = makeDriver([directTransport], { capabilities });
@@ -1975,8 +2879,12 @@ describe("Codex app-server Codex driver", () => {
       normalizedSessionId: "normalized-no-capabilities",
       workingDirectory: "/workspace",
     });
-    await expect(session.read?.()).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
-    await expect(session.usage?.()).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);
+    await expect(session.read?.()).rejects.toBeInstanceOf(
+      HarnessCapabilityUnavailableError,
+    );
+    await expect(session.usage?.()).rejects.toBeInstanceOf(
+      HarnessCapabilityUnavailableError,
+    );
     const snapshot = await session.snapshot();
     expect(await driver.recoverSession?.(snapshot)).toMatchObject({
       recovered: false,

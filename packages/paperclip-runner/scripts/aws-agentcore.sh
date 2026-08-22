@@ -15,6 +15,8 @@ DEPLOYMENT_MODE="development"
 STACK_NAME="paperclip-agentcore-development"
 ENDPOINT_NAME="paperclip"
 MODEL_ID="global.anthropic.claude-sonnet-4-6"
+MARKETPLACE_PRODUCT_ID="prod-ffvjxvh4ltq64"
+MARKETPLACE_PRODUCT_ID_EXPLICIT=false
 TRUSTED_PRINCIPAL=""
 DRY_RUN=false
 FORCE=false
@@ -28,6 +30,7 @@ usage() {
     "  --mode MODE          development or private" \
     "  --stack-name NAME    CloudFormation stack name" \
     "  --model MODEL_ID     Bedrock-native model ID" \
+    "  --marketplace-product-id ID  exact AWS Marketplace product ID for the model" \
     "  --principal ARN      stable IAM role/user trusted to assume runner role" \
     "  --dry-run            validate and print changes without deployment" \
     "  --yes                confirm destructive teardown" \
@@ -42,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --mode) DEPLOYMENT_MODE="$2"; shift 2 ;;
     --stack-name) STACK_NAME="$2"; shift 2 ;;
     --model) MODEL_ID="$2"; shift 2 ;;
+    --marketplace-product-id) MARKETPLACE_PRODUCT_ID="$2"; MARKETPLACE_PRODUCT_ID_EXPLICIT=true; shift 2 ;;
     --principal) TRUSTED_PRINCIPAL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --force) FORCE=true; shift ;;
@@ -65,6 +69,14 @@ if [[ ! "$AWS_PROFILE_NAME" =~ ^[A-Za-z0-9_.@+-]+$ ]]; then
 fi
 if [[ ! "$AWS_REGION_NAME" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$ || "$AWS_REGION_NAME" == cn-* || "$AWS_REGION_NAME" == us-gov-* ]]; then
   printf 'This proof of concept currently supports commercial AWS regions only.\n' >&2
+  exit 2
+fi
+if [[ "$MODEL_ID" != "global.anthropic.claude-sonnet-4-6" && "$MARKETPLACE_PRODUCT_ID_EXPLICIT" != true ]]; then
+  printf 'A custom --model requires its exact --marketplace-product-id so subscription authority remains model-scoped.\n' >&2
+  exit 2
+fi
+if [[ ! "$MARKETPLACE_PRODUCT_ID" =~ ^prod-[a-z0-9]+$ ]]; then
+  printf 'Marketplace product ID must use the AWS prod-* form.\n' >&2
   exit 2
 fi
 
@@ -93,7 +105,7 @@ stack_output() {
 wait_for_harness_status() {
   local harness_id="$1" harness_version="$2" status=""
   for _ in {1..60}; do
-    status="$(aws_cli bedrock-agentcore-control get-harness --harness-id "$harness_id" --harness-version "$harness_version" --query status --output text 2>/dev/null || true)"
+    status="$(aws_cli bedrock-agentcore-control get-harness --harness-id "$harness_id" --harness-version "$harness_version" --query harness.status --output text 2>/dev/null || true)"
     if [[ "$status" == "READY" ]]; then return 0; fi
     if [[ "$status" == "FAILED" || "$status" == "CREATE_FAILED" || "$status" == "UPDATE_FAILED" ]]; then
       printf 'Harness %s entered terminal status %s.\n' "$harness_id" "$status" >&2
@@ -108,7 +120,7 @@ wait_for_harness_status() {
 wait_for_memory_status() {
   local memory_id="$1" status=""
   for _ in {1..60}; do
-    status="$(aws_cli bedrock-agentcore-control get-memory --memory-id "$memory_id" --query status --output text 2>/dev/null || true)"
+    status="$(aws_cli bedrock-agentcore-control get-memory --memory-id "$memory_id" --query memory.status --output text 2>/dev/null || true)"
     [[ "$status" == "ACTIVE" ]] && return 0
     [[ "$status" == "FAILED" ]] && { printf 'Memory %s entered FAILED.\n' "$memory_id" >&2; return 1; }
     sleep 5
@@ -120,7 +132,7 @@ wait_for_memory_status() {
 wait_for_endpoint_status() {
   local harness_id="$1" endpoint_name="$2" status=""
   for _ in {1..60}; do
-    status="$(aws_cli bedrock-agentcore-control get-harness-endpoint --harness-id "$harness_id" --endpoint-name "$endpoint_name" --query status --output text 2>/dev/null || true)"
+    status="$(aws_cli bedrock-agentcore-control get-harness-endpoint --harness-id "$harness_id" --endpoint-name "$endpoint_name" --query endpoint.status --output text 2>/dev/null || true)"
     [[ "$status" == "READY" ]] && return 0
     [[ "$status" == "FAILED" ]] && { printf 'Harness endpoint %s entered FAILED.\n' "$endpoint_name" >&2; return 1; }
     sleep 5
@@ -184,12 +196,21 @@ assume_runner_role() {
 
 probe() {
   load_local_env
-  local profile_save="$AWS_PROFILE_NAME"
+  local profile_save="$AWS_PROFILE_NAME" harness_json
   assume_runner_role "$PAPERCLIP_AWS_AGENTCORE_INVOCATION_ROLE_ARN"
   AWS_PROFILE_NAME=""
-  aws --region "$AWS_REGION_NAME" --no-cli-pager bedrock-agentcore-control get-harness \
+  harness_json="$(aws --region "$AWS_REGION_NAME" --no-cli-pager bedrock-agentcore-control get-harness \
     --harness-id "$PAPERCLIP_AWS_AGENTCORE_HARNESS_ID" \
-    --harness-version "$PAPERCLIP_AWS_AGENTCORE_HARNESS_VERSION" >/dev/null
+    --harness-version "$PAPERCLIP_AWS_AGENTCORE_HARNESS_VERSION" --output json)"
+  printf '%s' "$harness_json" | node -e '
+    const fs = require("fs");
+    const h = JSON.parse(fs.readFileSync(0, "utf8")).harness;
+    const expectedModel = process.env.PAPERCLIP_AWS_AGENTCORE_MODEL;
+    if (!h || h.model?.bedrockModelConfig?.modelId !== expectedModel) throw new Error("AgentCore model drift");
+    if (JSON.stringify(h.allowedTools) !== JSON.stringify(["@*/pc_*"])) throw new Error("AgentCore tool allowlist drift");
+    if (!Array.isArray(h.tools) || h.tools.length !== 0) throw new Error("AgentCore persistent tool drift");
+    if (!Array.isArray(h.skills) || h.skills.length !== 0) throw new Error("AgentCore skill drift");
+  '
   aws --region "$AWS_REGION_NAME" --no-cli-pager bedrock-agentcore-control get-harness-endpoint \
     --harness-id "$PAPERCLIP_AWS_AGENTCORE_HARNESS_ID" \
     --endpoint-name "$PAPERCLIP_AWS_AGENTCORE_ENDPOINT_QUALIFIER" >/dev/null
@@ -245,9 +266,11 @@ provision() {
     --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides \
       "EnvironmentName=development" "DeploymentMode=$DEPLOYMENT_MODE" \
+      "HarnessEndpointName=$ENDPOINT_NAME" \
       "TrustedRunnerPrincipalArn=$TRUSTED_PRINCIPAL" "BedrockModelId=$MODEL_ID" \
       "BedrockModelResourceArn=$model_resource_arn" \
       "BedrockFoundationModelResourceArn=$foundation_model_resource_arn" \
+      "BedrockMarketplaceProductId=$MARKETPLACE_PRODUCT_ID" \
     --tags paperclip:owned=true paperclip:environment=development paperclip:cost-center=runner-lab
   local harness_id harness_arn harness_version runtime_arn memory_id memory_arn role_arn
   harness_id="$(stack_output HarnessId)"
@@ -272,7 +295,7 @@ provision() {
   wait_for_endpoint_status "$harness_id" "$ENDPOINT_NAME"
   local endpoint_json endpoint_arn
   endpoint_json="$(aws_cli bedrock-agentcore-control get-harness-endpoint --harness-id "$harness_id" --endpoint-name "$ENDPOINT_NAME" --output json)"
-  endpoint_arn="$(printf '%s' "$endpoint_json" | node -e 'const fs=require("fs");const o=JSON.parse(fs.readFileSync(0,"utf8"));process.stdout.write(o.harnessEndpointArn||o.endpointArn||o.arn||"")')"
+  endpoint_arn="$(printf '%s' "$endpoint_json" | node -e 'const fs=require("fs");const o=JSON.parse(fs.readFileSync(0,"utf8"));process.stdout.write(o.endpoint?.arn||o.harnessEndpointArn||o.endpointArn||o.arn||"")')"
   [[ -n "$endpoint_arn" ]] || endpoint_arn="$harness_arn/endpoint/$ENDPOINT_NAME"
   mkdir -p "$LOCAL_DIR"
   umask 077
@@ -296,6 +319,9 @@ provision() {
     "PAPERCLIP_AWS_AGENTCORE_MODEL=$MODEL_ID" \
     "PAPERCLIP_AWS_AGENTCORE_QUALIFICATION_REVISION=aws-agentcore-harness-v1" \
     "PAPERCLIP_AWS_AGENTCORE_EVENT_EXPIRY_DAYS=90" >"$tmp"
+  if [[ -n "${AWS_CONFIG_FILE:-}" ]]; then
+    printf 'AWS_CONFIG_FILE=%s\n' "$AWS_CONFIG_FILE" >>"$tmp"
+  fi
   chmod 600 "$tmp"
   mv "$tmp" "$ENV_FILE"
   probe

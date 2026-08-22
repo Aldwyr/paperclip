@@ -1,4 +1,4 @@
-import { ChevronRight, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import type { TranscriptEntry } from "../../adapters";
 import { cn } from "@/lib/utils";
 import { useSecondTick } from "@/hooks/useSecondTick";
@@ -47,9 +47,6 @@ export function TaskChatLiveRunPill({
   startedAtMs,
   finishedAtMs,
   toolSummary,
-  runnerStyle = false,
-  expanded,
-  onToggle,
 }: {
   status: string;
   /** Run start (startedAt, falling back to createdAt) in ms, or null if unknown. */
@@ -57,10 +54,6 @@ export function TaskChatLiveRunPill({
   /** Run finish in ms once terminal; drives the settled elapsed readout. */
   finishedAtMs?: number | null;
   toolSummary: string | null;
-  /** Codex-style new-runner header: no spinner, whole-second compact duration. */
-  runnerStyle?: boolean;
-  expanded?: boolean;
-  onToggle?: () => void;
 }) {
   const active = !isTerminalRunStatus(status);
   // One shared page-wide ticker drives the live elapsed readout, matching the
@@ -70,42 +63,10 @@ export function TaskChatLiveRunPill({
   const elapsedMs =
     startedAtMs == null ? null : (active ? Date.now() : finishedAtMs ?? Date.now()) - startedAtMs;
   const elapsed = elapsedMs != null
-    ? runnerStyle
-      ? `${Math.max(0, Math.floor(elapsedMs / 1000))}s`
-      : formatDurationWords(elapsedMs)
+    ? formatDurationWords(elapsedMs)
     : null;
   const verb = active ? "Working" : "Worked";
   const suffix = elapsed ? `for ${elapsed}` : null;
-
-  if (runnerStyle) {
-    const content = (
-      <>
-        <span className="text-sm font-medium text-foreground/80">{verb}</span>
-        {suffix ? <span className="text-sm text-muted-foreground">{suffix}</span> : null}
-        {!active ? (
-          <ChevronRight
-            className={cn("ml-auto h-3.5 w-3.5 text-muted-foreground transition-transform", expanded && "rotate-90")}
-            aria-hidden
-          />
-        ) : null}
-      </>
-    );
-    return onToggle && !active ? (
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        className="flex w-full min-w-0 items-center gap-1.5 border-b border-border/70 px-1 py-2 text-left transition-colors hover:text-foreground"
-        data-testid="task-chat-live-run-pill"
-      >
-        {content}
-      </button>
-    ) : (
-      <div className="flex min-w-0 items-center gap-1.5 border-b border-border/70 px-1 py-2" data-testid="task-chat-live-run-pill">
-        {content}
-      </div>
-    );
-  }
 
   return (
     <div

@@ -13,6 +13,7 @@
     "service": { "enum": ["anthropic_managed_agents", "aws_bedrock_agentcore_harness"] },
     "providerSessionId": { "type": ["string", "null"], "maxLength": 240 },
     "processId": { "type": ["integer", "null"], "minimum": 1 },
+    "agentProcessId": { "type": ["integer", "null"], "minimum": 1 },
     "endpointArn": { "type": "string", "minLength": 1, "maxLength": 2048 },
     "endpointQualifier": { "type": "string", "minLength": 1, "maxLength": 240 },
     "memoryId": { "type": "string", "minLength": 1, "maxLength": 240 },
@@ -52,7 +53,7 @@
     {
       "if": { "properties": { "provider": { "const": "acpx" } }, "required": ["provider"] },
       "then": {
-        "required": ["agent", "requestedModel", "acpProtocolVersion", "agentServerPackage", "agentServerVersion", "acpxRecordId"]
+        "required": ["agent", "requestedModel", "acpProtocolVersion", "agentServerPackage", "agentServerVersion", "acpxRecordId", "agentProcessId"]
       }
     }
   ],

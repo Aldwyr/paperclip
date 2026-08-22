@@ -137,6 +137,8 @@ export interface TaskChatThinkingItem {
   summaryLabel?: string;
   /** Provider-emitted reasoning surface; never synthesized by the UI. */
   channel?: "summary" | "detail" | "unknown";
+  /** A real provider reasoning lifecycle with no provider-authored text. */
+  lifecycleOnly?: boolean;
 }
 
 /** A tool invocation row (ACP tool_call / tool_call_update). */

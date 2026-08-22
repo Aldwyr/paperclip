@@ -1,25 +1,232 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::local_runner::LocalRunnerError;
-use crate::process_supervisor::SupervisedProcess;
+use crate::process_supervisor::{ProcessOutput, SupervisedProcess};
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_PROVIDER_TRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+struct ProviderTraceSink {
+    sender: Option<mpsc::SyncSender<String>>,
+    writer: Option<thread::JoinHandle<()>>,
+    writer_error: Arc<Mutex<Option<String>>>,
+    provider: String,
+    next_frame_id: u64,
+    next_debug_sequence: u64,
+    captured_bytes: usize,
+    max_bytes: usize,
+    truncated: bool,
+    incomplete_reason: Option<String>,
+}
+
+impl ProviderTraceSink {
+    fn from_environment(provider: ProviderKind) -> Option<Self> {
+        let trace_path = std::env::var_os("PAPERCLIP_PROVIDER_TRACE_PATH")?;
+        let max_bytes = std::env::var("PAPERCLIP_PROVIDER_TRACE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PROVIDER_TRACE_MAX_BYTES);
+        Some(Self::at_path(trace_path.into(), max_bytes, provider))
+    }
+
+    fn at_path(trace_path: PathBuf, max_bytes: usize, provider: ProviderKind) -> Self {
+        // Debug delivery is deliberately bounded and lossy: a slow trace disk
+        // may mark the trace incomplete, but it can never backpressure PRP.
+        let (sender, receiver) = mpsc::sync_channel::<String>(1_024);
+        let writer_error = Arc::new(Mutex::new(None));
+        let thread_error = Arc::clone(&writer_error);
+        let writer = thread::spawn(move || {
+            let result = (|| -> std::io::Result<()> {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&trace_path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_mode(0o600);
+                    fs::set_permissions(&trace_path, permissions)?;
+                }
+                for line in receiver {
+                    file.write_all(line.as_bytes())?;
+                    file.write_all(b"\n")?;
+                }
+                file.flush()
+            })();
+            if let Err(error) = result {
+                if let Ok(mut slot) = thread_error.lock() {
+                    *slot = Some(format!("trace_sidecar_write_failed:{error}"));
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            writer: Some(writer),
+            writer_error,
+            provider: match provider {
+                ProviderKind::Codex => "codex",
+                ProviderKind::Opencode => "opencode",
+                ProviderKind::ClaudeManaged => "claude_managed",
+                ProviderKind::AwsAgentcore => "aws_agentcore",
+                ProviderKind::Acpx => "acpx",
+            }
+            .to_owned(),
+            next_frame_id: 1,
+            next_debug_sequence: 1,
+            captured_bytes: 0,
+            max_bytes,
+            truncated: false,
+            incomplete_reason: None,
+        }
+    }
+
+    fn send_record(&mut self, mut value: Value) {
+        let Some(sender) = self.sender.as_ref().cloned() else {
+            return;
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert("debugChannel".to_owned(), json!("rust_native"));
+            object.insert("debugSequence".to_owned(), json!(self.next_debug_sequence));
+            self.next_debug_sequence += 1;
+        }
+        match sender.try_send(value.to_string()) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.incomplete_reason = Some("trace_sidecar_spool_full".to_owned());
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.incomplete_reason = Some("trace_sidecar_channel_closed".to_owned());
+                self.sender = None;
+            }
+        }
+    }
+
+    fn frame(&mut self, direction: &str, raw: &[u8]) -> Option<u64> {
+        if self.captured_bytes.saturating_add(raw.len()) > self.max_bytes {
+            self.truncated = true;
+            return None;
+        }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id += 1;
+        self.captured_bytes += raw.len();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        self.send_record(json!({
+            "kind": "frame",
+            "schema": "paperclip.provider_trace_frame.v1",
+            "frameId": frame_id,
+            "timestamp": timestamp,
+            "direction": direction,
+            "transport": "stdio_jsonl",
+            "provider": self.provider,
+            "byteLength": raw.len(),
+            "digest": format!("sha256:{:x}", Sha256::digest(raw)),
+            "rawBase64": base64::engine::general_purpose::STANDARD.encode(raw),
+        }));
+        Some(frame_id)
+    }
+
+    fn interpretation(
+        &mut self,
+        frame_id: u64,
+        stage: &str,
+        rule_id: &str,
+        disposition: &str,
+        emitted_event_ids: Vec<String>,
+        dropped_fields: Vec<String>,
+        reason: &str,
+    ) {
+        let field_mappings = dropped_fields
+            .iter()
+            .map(|path| {
+                json!({
+                    "inputPath": path,
+                    "action": "dropped",
+                    "reason": reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.send_record(json!({
+            "kind": "interpretation",
+            "schema": "paperclip.provider_trace_interpretation.v1",
+            "frameId": frame_id,
+            "stage": stage,
+            "ruleId": rule_id,
+            "disposition": disposition,
+            "emittedEventIds": emitted_event_ids,
+            "droppedFields": dropped_fields,
+            "fieldMappings": field_mappings,
+            "reason": reason,
+        }));
+    }
+
+    fn finish(&mut self) {
+        if self.sender.is_none() && self.writer.is_none() {
+            return;
+        }
+        let writer_reason = self
+            .writer_error
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        let reason = self.incomplete_reason.clone().or(writer_reason);
+        let status = if reason.is_some() {
+            "incomplete"
+        } else if self.truncated {
+            "truncated"
+        } else {
+            "complete"
+        };
+        let acknowledged_debug_sequence = self.next_debug_sequence.saturating_sub(1);
+        self.send_record(json!({
+            "kind": "trace_status",
+            "status": status,
+            "acknowledgedDebugSequence": acknowledged_debug_sequence,
+            "reason": reason.or_else(|| self.truncated.then(|| "provider_trace_max_bytes_exceeded".to_owned())),
+        }));
+        self.sender.take();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
+}
+
+impl Drop for ProviderTraceSink {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 fn default_collaboration_mode() -> String {
     "default".to_owned()
 }
 
-fn skillless_thread_config(collaboration_mode: &str) -> Value {
+fn default_collaboration_mode_instructions() -> bool {
+    true
+}
+
+fn skillless_thread_config(include_collaboration_mode_instructions: bool) -> Value {
     json!({
         "skills.include_instructions": false,
         "include_apps_instructions": false,
-        "include_collaboration_mode_instructions": collaboration_mode == "plan",
+        "include_collaboration_mode_instructions": include_collaboration_mode_instructions,
         "features.apps": false,
         "features.plugins": false,
         "features.multi_agent": false,
@@ -52,6 +259,8 @@ pub struct LocalProviderConfig {
     pub instructions: String,
     #[serde(default = "default_collaboration_mode")]
     pub collaboration_mode: String,
+    #[serde(default = "default_collaboration_mode_instructions")]
+    pub include_collaboration_mode_instructions: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -250,10 +459,13 @@ pub enum ProviderSessionIdentity {
 
 pub trait Provider {
     fn kind(&self) -> ProviderKind;
+    fn runtime_identity(&self) -> ProviderRuntimeIdentity;
+    /// PID of a provider-owned child below the primary runtime process, when
+    /// the provider has a stable child identity to report. This is metadata,
+    /// never an ownership or authorization boundary.
     fn agent_process_id(&self) -> Option<u32> {
         None
     }
-    fn runtime_identity(&self) -> ProviderRuntimeIdentity;
     fn session_identity(&self) -> &str;
     fn provider_session_id(&self) -> Option<&str>;
     fn durable_session_identity(&self) -> Option<ProviderSessionIdentity> {
@@ -261,6 +473,20 @@ pub trait Provider {
     }
     fn durable_event_cursor(&self) -> Option<&str> {
         None
+    }
+    fn take_provider_trace_frame_id(&mut self) -> Option<u64> {
+        None
+    }
+    fn record_provider_trace_interpretation(
+        &mut self,
+        _frame_id: u64,
+        _stage: &str,
+        _rule_id: &str,
+        _disposition: &str,
+        _emitted_event_ids: Vec<String>,
+        _dropped_fields: Vec<String>,
+        _reason: &str,
+    ) {
     }
     fn configure_tools(&mut self, _tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
         Ok(())
@@ -341,10 +567,12 @@ pub struct CodexProvider {
     thread_id: String,
     session_id: Option<String>,
     active_provider_turn_id: Option<String>,
-    pending_messages: VecDeque<Value>,
+    pending_messages: VecDeque<(Value, Option<u64>)>,
     pending_tool_requests: BTreeMap<String, Value>,
     collaboration_mode: String,
     collaboration_mode_payload: Option<Value>,
+    trace: Option<ProviderTraceSink>,
+    last_trace_frame_id: Option<u64>,
 }
 
 impl CodexProvider {
@@ -373,12 +601,14 @@ impl CodexProvider {
             pending_tool_requests: BTreeMap::new(),
             collaboration_mode: config.collaboration_mode.clone(),
             collaboration_mode_payload: None,
+            trace: ProviderTraceSink::from_environment(config.kind),
+            last_trace_frame_id: None,
         };
         let initialized = provider.request("initialize", json!({
             "clientInfo": { "name": "paperclip-runnerd", "title": "Paperclip Runner", "version": "1" },
             "capabilities": { "experimentalApi": true, "requestAttestation": false }
         }))?;
-        provider.process.send(&json!({"method": "initialized"}))?;
+        provider.send_frame(&json!({"method": "initialized"}))?;
         let dynamic_tools = tools
             .map(|tool| {
                 json!({
@@ -408,7 +638,7 @@ impl CodexProvider {
                     "approvalPolicy": "never",
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(&config.collaboration_mode),
+                    "config": skillless_thread_config(config.include_collaboration_mode_instructions),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -424,7 +654,7 @@ impl CodexProvider {
                     "approvalPolicy": "never",
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(&config.collaboration_mode),
+                    "config": skillless_thread_config(config.include_collaboration_mode_instructions),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -567,20 +797,63 @@ impl CodexProvider {
     }
 
     pub fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
-        let message = if let Some(message) = self.pending_messages.pop_front() {
+        let (message, frame_id) = if let Some(message) = self.pending_messages.pop_front() {
             message
         } else {
-            let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+            let Some(line) = self.receive_stdout_line(Duration::from_millis(1))? else {
                 return if self.process.try_wait()?.is_some() {
                     Ok(Some(ProviderEvent::Exited))
                 } else {
                     Ok(None)
                 };
             };
-            serde_json::from_str(&line).map_err(|error| {
+            let frame_id = self.trace_inbound(&line);
+            let message = serde_json::from_str(&line).map_err(|error| {
+                if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
+                    trace.interpretation(
+                        frame_id,
+                        "rust_jsonrpc_parse",
+                        "codex.jsonrpc.invalid",
+                        "rejected",
+                        Vec::new(),
+                        Vec::new(),
+                        "Provider frame was not valid JSON-RPC",
+                    );
+                }
                 LocalRunnerError::invalid(format!("Codex emitted invalid JSON-RPC: {error}"))
-            })?
+            })?;
+            (message, frame_id)
         };
+        self.last_trace_frame_id = frame_id;
+        if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
+            let method = message.get("method").and_then(Value::as_str);
+            let disposition = if method.is_some() {
+                "mapped"
+            } else {
+                "ignored"
+            };
+            trace.interpretation(
+                frame_id,
+                "rust_jsonrpc_parse",
+                method
+                    .map(|value| {
+                        if value == "item/tool/call" {
+                            "codex.tool_call"
+                        } else {
+                            "codex.notification"
+                        }
+                    })
+                    .unwrap_or("codex.unroutable"),
+                disposition,
+                Vec::new(),
+                Vec::new(),
+                if method.is_some() {
+                    "JSON-RPC frame parsed and routed to provider normalization"
+                } else {
+                    "JSON-RPC frame had no routable method"
+                },
+            );
+        }
         if message.get("id").is_some()
             && message.get("method").and_then(Value::as_str) == Some("item/tool/call")
         {
@@ -638,7 +911,7 @@ impl CodexProvider {
             .ok_or_else(|| {
                 LocalRunnerError::invalid("Codex tool result has no pending JSON-RPC request")
             })?;
-        self.process.send(&json!({
+        self.send_frame(&json!({
             "id": request_id,
             "result": {
                 "success": !result.is_error,
@@ -654,25 +927,114 @@ impl CodexProvider {
     /// `Drop` remains the last-resort cleanup path, but runner shutdown must not
     /// depend on an implicit destructor firing after the durable transport loop.
     pub fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
-        self.process.terminate_group().map(|_| ())
+        let result = self.process.terminate_group().map(|_| ());
+        if let Some(trace) = self.trace.as_mut() {
+            trace.finish();
+        }
+        result
+    }
+
+    fn send_frame(&mut self, value: &Value) -> Result<(), LocalRunnerError> {
+        if let Some(trace) = self.trace.as_mut() {
+            let raw = serde_json::to_vec(value).unwrap_or_default();
+            if let Some(frame_id) = trace.frame("client_to_provider", &raw) {
+                trace.interpretation(
+                    frame_id,
+                    "rust_native_transport",
+                    "codex.jsonrpc.outbound",
+                    "operator_only",
+                    Vec::new(),
+                    Vec::new(),
+                    "Outbound provider command does not enter the canonical PRP outbox",
+                );
+            }
+        }
+        self.process.send(value)
+    }
+
+    fn trace_inbound(&mut self, line: &str) -> Option<u64> {
+        self.trace
+            .as_mut()
+            .and_then(|trace| trace.frame("provider_to_client", line.as_bytes()))
+    }
+
+    fn receive_stdout_line(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<String>, LocalRunnerError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match self.process.recv_timeout(remaining) {
+                Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
+                Ok(ProcessOutput::Stderr(line)) => {
+                    if let Some(trace) = self.trace.as_mut() {
+                        if let Some(frame_id) = trace.frame("provider_stderr", line.as_bytes()) {
+                            trace.interpretation(
+                                frame_id,
+                                "rust_native_transport",
+                                "provider.stderr",
+                                "operator_only",
+                                Vec::new(),
+                                Vec::new(),
+                                "Provider stderr is retained only in the restricted trace sidecar",
+                            );
+                        }
+                    }
+                }
+                Ok(ProcessOutput::StdoutError(message)) => {
+                    return Err(LocalRunnerError::invalid(message))
+                }
+                Ok(ProcessOutput::StdoutClosed) => return Ok(None),
+                Ok(ProcessOutput::StderrClosed) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(LocalRunnerError::invalid("process output channel closed"))
+                }
+            }
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LocalRunnerError> {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.process
-            .send(&json!({"id": id, "method": method, "params": params}))?;
+        self.send_frame(&json!({"id": id, "method": method, "params": params}))?;
         loop {
             let line = self
-                .process
                 .receive_stdout_line(Duration::from_secs(30))?
                 .ok_or_else(|| {
                     LocalRunnerError::invalid(format!("Codex {method} response timed out"))
                 })?;
+            let frame_id = self.trace_inbound(&line);
             let message: Value = serde_json::from_str(&line).map_err(|error| {
+                if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
+                    trace.interpretation(
+                        frame_id,
+                        "rust_jsonrpc_parse",
+                        "codex.jsonrpc.invalid",
+                        "rejected",
+                        Vec::new(),
+                        Vec::new(),
+                        "Provider frame was not valid JSON-RPC",
+                    );
+                }
                 LocalRunnerError::invalid(format!("Codex emitted invalid JSON-RPC: {error}"))
             })?;
             if message.get("id").and_then(Value::as_u64) == Some(id) {
+                if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
+                    trace.interpretation(
+                        frame_id,
+                        "rust_jsonrpc_parse",
+                        "codex.jsonrpc.response",
+                        "operator_only",
+                        Vec::new(),
+                        Vec::new(),
+                        "Matched synchronous app-server response",
+                    );
+                }
                 if let Some(error) = message.get("error") {
                     return Err(LocalRunnerError::invalid(format!(
                         "Codex {method} failed: {error}"
@@ -680,7 +1042,7 @@ impl CodexProvider {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
-            self.pending_messages.push_back(message);
+            self.pending_messages.push_back((message, frame_id));
         }
     }
 }
@@ -701,6 +1063,31 @@ impl Provider for CodexProvider {
     fn provider_session_id(&self) -> Option<&str> {
         self.session_id()
     }
+    fn take_provider_trace_frame_id(&mut self) -> Option<u64> {
+        self.last_trace_frame_id.take()
+    }
+    fn record_provider_trace_interpretation(
+        &mut self,
+        frame_id: u64,
+        stage: &str,
+        rule_id: &str,
+        disposition: &str,
+        emitted_event_ids: Vec<String>,
+        dropped_fields: Vec<String>,
+        reason: &str,
+    ) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.interpretation(
+                frame_id,
+                stage,
+                rule_id,
+                disposition,
+                emitted_event_ids,
+                dropped_fields,
+                reason,
+            );
+        }
+    }
     fn start_turn(
         &mut self,
         message: &str,
@@ -709,11 +1096,11 @@ impl Provider for CodexProvider {
     ) -> Result<Value, LocalRunnerError> {
         CodexProvider::start_turn(self, message, cwd)
     }
-    fn steer_turn(&mut self, turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
-        CodexProvider::steer_turn(self, turn_id, message)
-    }
     fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
         CodexProvider::interrupt_turn(self, turn_id)
+    }
+    fn steer_turn(&mut self, turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
+        CodexProvider::steer_turn(self, turn_id, message)
     }
     fn read(&mut self) -> Result<Value, LocalRunnerError> {
         self.read_thread()
@@ -726,5 +1113,132 @@ impl Provider for CodexProvider {
     }
     fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
         CodexProvider::shutdown(self)
+    }
+}
+
+#[cfg(test)]
+mod provider_trace_tests {
+    use super::*;
+
+    #[test]
+    fn collaboration_instructions_default_on_and_allow_explicit_opt_out() {
+        let default_config: LocalProviderConfig = serde_json::from_value(json!({
+            "kind": "codex",
+            "command": "codex",
+            "args": [],
+            "cwd": "/workspace",
+            "model": null,
+            "instructions": "Run the task.",
+            "collaborationMode": "default"
+        }))
+        .unwrap();
+        assert!(default_config.include_collaboration_mode_instructions);
+        assert_eq!(
+            skillless_thread_config(default_config.include_collaboration_mode_instructions)
+                ["include_collaboration_mode_instructions"],
+            json!(true)
+        );
+
+        let opt_out_config: LocalProviderConfig = serde_json::from_value(json!({
+            "kind": "codex",
+            "command": "codex",
+            "args": [],
+            "cwd": "/workspace",
+            "model": null,
+            "instructions": "Run the eval fixture.",
+            "collaborationMode": "default",
+            "includeCollaborationModeInstructions": false
+        }))
+        .unwrap();
+        assert!(!opt_out_config.include_collaboration_mode_instructions);
+        assert_eq!(
+            skillless_thread_config(opt_out_config.include_collaboration_mode_instructions)
+                ["include_collaboration_mode_instructions"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn provider_trace_preserves_exact_bytes_order_digest_and_interpretation() {
+        let trace_path = std::env::temp_dir().join(format!(
+            "paperclip-provider-trace-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let first = br#"{"id":1,"method":"thread/start"}"#;
+        let second = br#"{"method":"item/completed","params":{"item":{"type":"agentMessage"}}}"#;
+        let mut trace = ProviderTraceSink::at_path(
+            trace_path.clone(),
+            DEFAULT_PROVIDER_TRACE_MAX_BYTES,
+            ProviderKind::Codex,
+        );
+
+        let first_id = trace.frame("client_to_provider", first).unwrap();
+        let second_id = trace.frame("provider_to_client", second).unwrap();
+        trace.interpretation(
+            second_id,
+            "rust_jsonrpc_parse",
+            "codex.notification",
+            "mapped",
+            vec!["event_runner_000001".to_owned()],
+            Vec::new(),
+            "mapped for test",
+        );
+        trace.finish();
+
+        let entries = fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let frames = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "frame")
+            .collect::<Vec<_>>();
+        assert_eq!((first_id, second_id), (1, 2));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(frames[0]["rawBase64"].as_str().unwrap())
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(frames[1]["rawBase64"].as_str().unwrap())
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            frames[1]["digest"],
+            format!("sha256:{:x}", Sha256::digest(second))
+        );
+        assert_eq!(entries[0]["debugSequence"], 1);
+        assert_eq!(entries[1]["debugSequence"], 2);
+        assert_eq!(entries[2]["debugSequence"], 3);
+        assert_eq!(entries[2]["emittedEventIds"][0], "event_runner_000001");
+        assert_eq!(entries.last().unwrap()["status"], "complete");
+        assert_eq!(
+            entries.last().unwrap()["acknowledgedDebugSequence"],
+            entries.len() - 1
+        );
+
+        let _ = fs::remove_file(trace_path);
+    }
+
+    #[test]
+    fn provider_trace_truncation_does_not_accept_bytes_past_the_cap() {
+        let trace_path = std::env::temp_dir().join(format!(
+            "paperclip-provider-trace-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let mut trace = ProviderTraceSink::at_path(trace_path.clone(), 4, ProviderKind::Codex);
+        assert!(trace.frame("provider_to_client", b"12345").is_none());
+        trace.finish();
+
+        let content = fs::read_to_string(&trace_path).unwrap();
+        assert!(!content.contains("rawBase64"));
+        assert!(content.contains("\"status\":\"truncated\""));
+        assert!(content.contains("provider_trace_max_bytes_exceeded"));
+
+        let _ = fs::remove_file(trace_path);
     }
 }

@@ -95,6 +95,10 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import {
+  LEGACY_WITHHELD_RUN_COMMENT,
+  projectHistoricalHeartbeatRunComment,
+} from "./heartbeat-run-summary.js";
 import { DEFAULT_INSERT_CHUNK_ROWS, insertRowsInChunks } from "./batch-insert.js";
 import type {
   ImportIssueRow,
@@ -4427,6 +4431,37 @@ export function issueService(db: Db) {
     return enriched;
   }
 
+  async function projectHistoricalRunComments<
+    T extends { body: string; createdByRunId: string | null },
+  >(comments: T[]): Promise<T[]> {
+    const runIds = [
+      ...new Set(
+        comments.flatMap((comment) =>
+          comment.createdByRunId &&
+          comment.body === LEGACY_WITHHELD_RUN_COMMENT
+            ? [comment.createdByRunId]
+            : [],
+        ),
+      ),
+    ];
+    if (runIds.length === 0) return comments;
+    const runResults = await db
+      .select({ id: heartbeatRuns.id, resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, runIds));
+    const resultByRunId = new Map(
+      runResults.map((run) => [run.id, parseObject(run.resultJson)]),
+    );
+    return comments.map((comment) => {
+      if (!comment.createdByRunId) return comment;
+      const body = projectHistoricalHeartbeatRunComment(
+        comment.body,
+        resultByRunId.get(comment.createdByRunId),
+      );
+      return body === comment.body ? comment : { ...comment, body };
+    });
+  }
+
   async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {
     const row = await db
       .select({
@@ -8578,7 +8613,8 @@ export function issueService(db: Db) {
 
       const comments = limit ? await query.limit(limit) : await query;
       const { censorUsernameInLogs } = await instanceSettings.getGeneral();
-      const enrichedComments = await enrichCommentsWithDerivedAgentAttribution(comments);
+      const projectedComments = await projectHistoricalRunComments(comments);
+      const enrichedComments = await enrichCommentsWithDerivedAgentAttribution(projectedComments);
       return enrichedComments.map((comment) => redactIssueComment(comment, censorUsernameInLogs));
     },
 
@@ -8618,8 +8654,14 @@ export function issueService(db: Db) {
         .where(eq(issueComments.id, commentId))
         .then((rows) => rows[0] ?? null);
       if (!comment) return null;
-      const [enrichedComment] = await enrichCommentsWithDerivedAgentAttribution([comment]);
-      return redactIssueComment(enrichedComment ?? comment, censorUsernameInLogs);
+      const [projectedComment] = await projectHistoricalRunComments([comment]);
+      const [enrichedComment] = await enrichCommentsWithDerivedAgentAttribution([
+        projectedComment ?? comment,
+      ]);
+      return redactIssueComment(
+        enrichedComment ?? projectedComment ?? comment,
+        censorUsernameInLogs,
+      );
     },
 
     removeComment: async (commentId: string) => {

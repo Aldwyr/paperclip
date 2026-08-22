@@ -30,6 +30,10 @@ const runnerPackage = JSON.parse(
 );
 const acpxRuntimePatch = await readFile(new URL("../patches/acpx@0.13.1.patch", import.meta.url), "utf8");
 const piAcpPatch = await readFile(new URL("../patches/pi-acp@0.0.33.patch", import.meta.url), "utf8");
+const claudeAcpPatch = await readFile(
+  new URL("../patches/@agentclientprotocol__claude-agent-acp@0.70.0.patch", import.meta.url),
+  "utf8",
+);
 const dbPackage = JSON.parse(
   await readFile(new URL("../packages/db/package.json", import.meta.url), "utf8"),
 );
@@ -51,6 +55,10 @@ test("published packages preserve the patched ACPX runtime", () => {
 test("Paperclip Runner pins the qualified ACPX host and Pi isolation callbacks", () => {
   assert.equal(rootPackage.pnpm.patchedDependencies["acpx@0.13.1"], "patches/acpx@0.13.1.patch");
   assert.equal(rootPackage.pnpm.patchedDependencies["pi-acp@0.0.33"], "patches/pi-acp@0.0.33.patch");
+  assert.equal(
+    rootPackage.pnpm.patchedDependencies["@agentclientprotocol/claude-agent-acp@0.70.0"],
+    "patches/@agentclientprotocol__claude-agent-acp@0.70.0.patch",
+  );
   assert.equal(runnerPackage.dependencies.acpx, "0.13.1");
   assert.equal(runnerPackage.dependencies["pi-acp"], "0.0.33");
   assert.equal(runnerPackage.dependencies["@earendil-works/pi-coding-agent"], "0.84.2");
@@ -61,7 +69,9 @@ test("Paperclip Runner pins the qualified ACPX host and Pi isolation callbacks",
     "onSessionNotification", "onClientOperation",
   ]) assert.match(acpxRuntimePatch, new RegExp(callback));
   assert.match(piAcpPatch, /PI_ACP_PI_ARGS_JSON/);
-  assert.match(piAcpPatch, /sessionUpdate: "usage_update"/);
+  assert.match(piAcpPatch, /\[paperclip-pi-usage-v1\]/);
+  assert.match(claudeAcpPatch, /usage: \{/);
+  assert.match(claudeAcpPatch, /cache_creation_input_tokens/);
 });
 
 test("published packages preserve the patched embedded-postgres runtime", () => {

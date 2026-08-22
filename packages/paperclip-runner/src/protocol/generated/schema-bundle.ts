@@ -399,6 +399,13 @@ export const providerDescriptorSchema = {
       ],
       "minimum": 1
     },
+    "agentProcessId": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
     "endpointArn": {
       "type": "string",
       "minLength": 1,
@@ -564,7 +571,8 @@ export const providerDescriptorSchema = {
           "acpProtocolVersion",
           "agentServerPackage",
           "agentServerVersion",
-          "acpxRecordId"
+          "acpxRecordId",
+          "agentProcessId"
         ]
       }
     }

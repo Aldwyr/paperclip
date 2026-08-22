@@ -4,8 +4,15 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
+import { MemoryRouter } from "@/lib/router";
 import { TaskChatRunnerTurn } from "./TaskChatRunnerTurn";
-import type { TaskChatItem, TaskChatRuntimeRequestDecision, TaskChatRuntimeRequestItem } from "./task-chat-model";
+import type {
+  TaskChatItem,
+  TaskChatProviderActivityFamily,
+  TaskChatProviderActivityItem,
+  TaskChatRuntimeRequestDecision,
+  TaskChatRuntimeRequestItem,
+} from "./task-chat-model";
 
 describe("TaskChatRunnerTurn", () => {
   let container: HTMLDivElement;
@@ -28,16 +35,21 @@ describe("TaskChatRunnerTurn", () => {
     runId = "run-1",
     onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void,
   ) => act(() => root.render(
-    <ThemeProvider>
-      <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} onRuntimeRequestDecision={onRuntimeRequestDecision} />
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} onRuntimeRequestDecision={onRuntimeRequestDecision} />
+      </ThemeProvider>
+    </MemoryRouter>,
   ));
 
   it("shows immediate Thinking before the first runner event", () => {
     render([], "queued");
     expect(container.textContent).toContain("Thinking");
     expect(container.textContent).toContain("Runner");
-    expect(container.querySelector('[data-testid="task-chat-current-activity"] svg')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-runner-disclosure-caret"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-current-activity-icon"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Thinking");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.tagName).toBe("DIV");
     expect(container.textContent).not.toContain("Working");
     expect(container.textContent).not.toContain("Waiting for transcript");
     const identity = container.querySelector('[data-testid="task-chat-agent-identity"]');
@@ -59,14 +71,141 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-runner-identity-row"]')?.classList.contains("pt-2")).toBe(true);
   });
 
-  it("streams the final response in its durable slot and hides current activity", () => {
+  it("shows canonical web research as the current Codex-style activity", () => {
+    render([{
+      id: "research-1",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "research",
+      eventType: "research.started",
+      status: "running",
+      title: "Research",
+      summary: "site:openai.com model guide GPT-5.4",
+      details: [{ label: "Query", value: "site:openai.com model guide GPT-5.4" }],
+      steps: [],
+      links: [],
+      children: [],
+    }]);
+
+    const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
+    expect(activity?.textContent).toContain("Searching the web");
+    expect(activity?.textContent).toContain("site:openai.com model guide GPT-5.4");
+    expect(activity?.getAttribute("data-activity-family")).toBe("research");
+  });
+
+  it("has a purpose-built current-activity presentation for every provider family", () => {
+    const cases: Array<{
+      family: TaskChatProviderActivityFamily;
+      eventType: string;
+      status: TaskChatProviderActivityItem["status"];
+      expected: string;
+      details?: TaskChatProviderActivityItem["details"];
+    }> = [
+      { family: "plan", eventType: "plan.updated", status: "running", expected: "Updating the plan" },
+      { family: "tool_execution", eventType: "tool.execution.started", status: "running", expected: "Running a tool" },
+      { family: "research", eventType: "research.started", status: "running", expected: "Searching the web", details: [{ label: "Action", value: "search" }] },
+      { family: "delegation", eventType: "delegation.started", status: "running", expected: "Starting a subagent", details: [{ label: "Action", value: "spawn" }] },
+      { family: "model_identity", eventType: "model.route.changed", status: "informational", expected: "Switched models" },
+      { family: "context", eventType: "context.compacted", status: "completed", expected: "Compacted context" },
+      { family: "artifact", eventType: "artifact.generated", status: "running", expected: "Generating an artifact" },
+      { family: "review", eventType: "review.mode.changed", status: "informational", expected: "Entered review mode", details: [{ label: "State", value: "entered" }] },
+      { family: "hook", eventType: "hook.started", status: "running", expected: "Running a hook" },
+      { family: "memory", eventType: "memory.citation.referenced", status: "informational", expected: "Referenced memory" },
+      { family: "safety", eventType: "safety.review.started", status: "running", expected: "Reviewing safety" },
+      { family: "terminal", eventType: "terminal.input.sent", status: "informational", expected: "Sent terminal input" },
+      { family: "wait", eventType: "wait.started", status: "running", expected: "Waiting" },
+      { family: "provider_notice", eventType: "provider.notice.recorded", status: "informational", expected: "Provider notice" },
+    ];
+
+    expect(cases.map((entry) => entry.family)).toEqual([
+      "plan", "tool_execution", "research", "delegation", "model_identity", "context", "artifact",
+      "review", "hook", "memory", "safety", "terminal", "wait", "provider_notice",
+    ] satisfies TaskChatProviderActivityFamily[]);
+
+    for (const entry of cases) {
+      render([{
+        id: `provider-${entry.family}`,
+        kind: "protocol",
+        surface: "provider_activity",
+        family: entry.family,
+        eventType: entry.eventType,
+        status: entry.status,
+        title: entry.family,
+        details: entry.details ?? [],
+        steps: [],
+        links: [],
+        children: [],
+      }]);
+      const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
+      expect(activity?.getAttribute("data-activity-family"), entry.family).toBe(entry.family);
+      expect(activity?.textContent, entry.family).toContain(entry.expected);
+    }
+  });
+
+  it("shows provider failures and interruptions instead of a successful past-tense label", () => {
+    const provider = (status: "failed" | "interrupted"): TaskChatProviderActivityItem => ({
+      id: `research-${status}`,
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "research",
+      eventType: "research.completed",
+      status,
+      title: "Research",
+      details: [],
+      steps: [],
+      links: [],
+      children: [],
+    });
+    render([provider("failed")]);
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Web search failed");
+    render([provider("interrupted")]);
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Web search stopped");
+  });
+
+  it("surfaces workspace changes and file references as current activity", () => {
+    render([{
+      id: "workspace-change",
+      kind: "protocol",
+      surface: "workspace_change",
+      changeSetId: "change-1",
+      revision: 1,
+      source: "harness_reported",
+      complete: false,
+      files: [],
+      totals: { files: 2, additions: 3, deletions: 1 },
+      patchArtifactRef: null,
+    }]);
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Editing files");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("2 files");
+
+    render([{
+      id: "workspace-file",
+      kind: "protocol",
+      surface: "workspace_file",
+      referenceId: "file-1",
+      source: "runner_verified",
+      path: "ui/src/App.tsx",
+      displayName: "App.tsx",
+      mediaType: "text/typescript",
+      presentation: "code",
+      line: 42,
+      preview: null,
+      previewTruncated: false,
+    }]);
+    const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
+    expect(activity?.textContent).toContain("Referenced a file");
+    expect(activity?.textContent).toContain("ui/src/App.tsx:42");
+  });
+
+  it("streams the final response in its durable slot and settles the disclosure", () => {
     render([
       { id: "p1", kind: "message", author: "agent", text: "Checking.", interstitial: true, channel: "progress" },
       { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "Completed successfully.", channel: "final", streaming: true },
-    ]);
+    ], "succeeded");
     expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain("Completed successfully.");
     expect(container.querySelectorAll('[data-testid="task-chat-agent-avatar"]')).toHaveLength(1);
-    expect(container.querySelector('[data-testid="task-chat-current-activity"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Worked for");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("keeps final text mounted through a transient replay gap", () => {
@@ -101,7 +240,7 @@ describe("TaskChatRunnerTurn", () => {
       { id: "complete", kind: "marker", variant: "turn_boundary", label: "Turn completed" },
     ]);
 
-    expect(container.textContent).toContain("Paperclip_finish");
+    expect(container.textContent).not.toContain("Paperclip_finish");
     expect(container.textContent).toContain("Interrupted");
     expect(container.textContent).not.toContain("Session started");
     expect(container.textContent).not.toContain("Turn started");
@@ -132,5 +271,63 @@ describe("TaskChatRunnerTurn", () => {
     const button = Array.from(visibleCard!.querySelectorAll("button")).find((candidate) => candidate.textContent === "Allow once");
     await act(async () => button?.click());
     expect(onDecision).toHaveBeenCalledWith(expect.objectContaining({ requestId: "request-1" }), { action: "accept" });
+  });
+
+  it("expands live semantic activity from the current activity row", () => {
+    render([
+      { id: "thinking-empty", kind: "thinking", lines: [], streaming: false, lifecycleOnly: true },
+      { id: "commentary", kind: "message", author: "agent", text: "Checking the current implementation.", interstitial: true, channel: "progress" },
+      { id: "tool", kind: "tool", name: "Read", rawName: "read_file", target: "ui/src/App.tsx", status: "completed", detail: "export function App() {}" },
+    ]);
+
+    const disclosure = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]');
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[data-testid="task-chat-runner-disclosure-caret"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="task-chat-thinking"]')).toHaveLength(0);
+
+    act(() => disclosure?.click());
+
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector('[data-testid="task-chat-runner-activity-list"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-progress-update"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-activity-commentary"]')?.textContent).toContain("Checking the current implementation.");
+    expect(container.textContent).toContain("ui/src/App.tsx");
+  });
+
+  it("collapses an open activity list when the run becomes terminal", () => {
+    const items: TaskChatItem[] = [{ id: "tool", kind: "tool", name: "Search", rawName: "web_search", target: "smoked pork shoulder", status: "in_progress" }];
+    render(items);
+    const disclosure = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]');
+    act(() => disclosure?.click());
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+
+    render([{ ...items[0], kind: "tool", status: "completed" } as TaskChatItem], "succeeded");
+
+    const settled = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]');
+    expect(settled?.getAttribute("aria-expanded")).toBe("false");
+    expect(settled?.textContent).toContain("Worked for");
+    expect(container.querySelector(".tc-turn-fold")?.getAttribute("data-folded")).toBe("true");
+  });
+
+  it("resets the disclosure choice when a different run takes over", () => {
+    const items: TaskChatItem[] = [{ id: "tool", kind: "tool", name: "Read", rawName: "read_file", target: "ui/src/App.tsx", status: "completed" }];
+    render(items, "running", "run-1");
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]')?.click());
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.getAttribute("aria-expanded")).toBe("true");
+
+    render(items, "running", "run-2");
+
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".tc-turn-fold")?.getAttribute("data-folded")).toBe("true");
+  });
+
+  it("renders a failed terminal disclosure without treating prose as status authority", () => {
+    render([
+      { id: "final", kind: "message", author: "agent", text: "I finished the draft.", channel: "final" },
+      { id: "tool", kind: "tool", name: "Command", rawName: "bash", target: "pnpm test", status: "failed" },
+    ], "failed");
+
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Stopped after");
+    expect(container.querySelector('[data-testid="task-chat-final-response"]')?.textContent).toContain("I finished the draft.");
   });
 });

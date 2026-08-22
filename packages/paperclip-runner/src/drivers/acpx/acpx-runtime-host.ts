@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,6 +41,16 @@ export interface AcpxRuntimeProcessIdentity {
   pid: number;
   processGroupId: number | null;
   startedAt: string;
+}
+
+export interface AcpxRuntimeUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  thoughtTokens?: number;
+  totalTokens?: number;
+  cost?: { amount: number; currency: "USD" };
 }
 
 export interface AcpxRuntimePermissionContext {
@@ -83,7 +94,10 @@ export interface AcpxRuntimeHostOptions {
     context: AcpxRuntimePermissionContext,
   ) => Promise<AcpPermissionDecision | undefined>;
   onSpawn?: (meta: AcpxRuntimeProcessIdentity) => Promise<void>;
+  onUsage?: (usage: AcpxRuntimeUsage) => void;
   onDiagnostic?: (message: string) => void;
+  /** Host-only source paths; neither paths nor contents enter ACPX records. */
+  managedCredentialSources?: { codexAuthPath?: string };
 }
 
 export interface AcpxRuntimeIdentity {
@@ -122,6 +136,8 @@ export class AcpxRuntimeHost {
   readonly #bridge: RunnerToolBridge;
   readonly #identity: AcpxRuntimeIdentity;
   readonly #root: string;
+  readonly #ephemeralCredentialFiles: string[];
+  readonly #agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
   #activeTurn: AcpRuntimeTurn | null = null;
   #closed = false;
 
@@ -131,12 +147,16 @@ export class AcpxRuntimeHost {
     bridge: RunnerToolBridge;
     identity: AcpxRuntimeIdentity;
     root: string;
+    ephemeralCredentialFiles: string[];
+    agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
   }) {
     this.#runtime = input.runtime;
     this.#handle = input.handle;
     this.#bridge = input.bridge;
     this.#identity = input.identity;
     this.#root = input.root;
+    this.#ephemeralCredentialFiles = input.ephemeralCredentialFiles;
+    this.#agentProcessIdentity = input.agentProcessIdentity;
   }
 
   static async open(options: AcpxRuntimeHostOptions): Promise<AcpxRuntimeHost> {
@@ -164,6 +184,9 @@ export class AcpxRuntimeHost {
         enableInstallTelemetry: false,
       })}\n`, { mode: 0o600 });
     }
+    const ephemeralCredentialFiles = options.agent === "codex"
+      ? await stageManagedCodexCredential(agentHome, options)
+      : [];
 
     const command = await resolveAndVerifyCommand(profile);
     const piCommand = options.agent === "pi" ? await resolvePiRuntimeCommand(profile) : null;
@@ -210,6 +233,7 @@ export class AcpxRuntimeHost {
         PAPERCLIP_RUNTIME_ROOT: root,
       } : {}),
       ...(options.agent === "claude" ? { CLAUDE_CONFIG_DIR: agentHome } : {}),
+      ...(options.agent === "codex" ? { CODEX_HOME: agentHome } : {}),
       PAPERCLIP_ACPX_PROFILE: options.agent,
     }, options.agent);
     const safeSessionEnvironment = withoutCredentials(agentEnvironment);
@@ -219,6 +243,12 @@ export class AcpxRuntimeHost {
       url: bridge.url,
       headers: [{ name: "Authorization", value: `Bearer ${bridge.secret}` }],
     }];
+    const routeAgentStderr = createAgentStderrRouter(
+      agentEnvironment,
+      options.onUsage,
+      options.onDiagnostic,
+    );
+    let agentProcessIdentity: AcpxRuntimeProcessIdentity | null = null;
     const runtimeOptions: SecureAcpRuntimeOptions = {
       cwd,
       spawnCwd: cwd,
@@ -235,16 +265,27 @@ export class AcpxRuntimeHost {
         defaultAction: "escalate",
       },
       elicitationModes: ["form", "url"],
-      onPermissionRequest: options.onPermissionRequest
-        ? (request, context) => options.onPermissionRequest!({ request, signal: context.signal })
-        : async () => ({ outcome: "reject_once" }),
+      onPermissionRequest: async (request, context) => {
+        // Claude Code asks its ACP client to authorize every MCP invocation,
+        // including calls to Paperclip's own authenticated semantic bridge.
+        // Those calls must reach PRP, whose attached run catalog and schema
+        // checks are the authority. Treating this duplicate provider prompt as
+        // a human approval prevents even read-only semantic tools from running.
+        // Built-in filesystem/process calls do not have this closed namespace
+        // and continue through the durable interactive permission flow.
+        if (options.agent === "claude" && isRunnerOwnedSemanticPermission(request)) {
+          return { outcome: "allow_once" };
+        }
+        return options.onPermissionRequest
+          ? options.onPermissionRequest({ request, signal: context.signal })
+          : { outcome: "reject_once" };
+      },
       spawnEnvironment: () => ({ ...agentEnvironment }),
-      onAgentStderr: (chunk) => options.onDiagnostic?.(redactDiagnostic(chunk, agentEnvironment)),
-      onAgentSpawn: async (meta) => options.onSpawn?.({
-        pid: meta.pid,
-        processGroupId: null,
-        startedAt: meta.startedAt,
-      }),
+      onAgentStderr: routeAgentStderr,
+      onAgentSpawn: async (meta) => {
+        agentProcessIdentity = { pid: meta.pid, processGroupId: null, startedAt: meta.startedAt };
+        await options.onSpawn?.(agentProcessIdentity);
+      },
     };
     const runtimeFactory = options.runtimeFactory ?? ((input) => createAcpRuntime(input));
     const runtime = runtimeFactory(runtimeOptions);
@@ -261,7 +302,7 @@ export class AcpxRuntimeHost {
           env: safeSessionEnvironment,
         },
       });
-      const status = await requireVerifiedModel(runtime, handle, options.model);
+      const status = await requireVerifiedModel(runtime, handle, profile);
       const backendSessionId = requiredIdentity(status.backendSessionId ?? handle.backendSessionId, "backend session");
       const identity: AcpxRuntimeIdentity = {
         acpxRecordId: requiredIdentity(status.acpxRecordId ?? handle.acpxRecordId, "ACPX record"),
@@ -285,12 +326,21 @@ export class AcpxRuntimeHost {
         effectiveModel: identity.effectiveModel,
         profileDigest: profile.commandDigest,
       }, null, 2)}\n`, { mode: 0o600 });
-      return new AcpxRuntimeHost({ runtime, handle, bridge, identity, root });
+      return new AcpxRuntimeHost({
+        runtime,
+        handle,
+        bridge,
+        identity,
+        root,
+        ephemeralCredentialFiles,
+        agentProcessIdentity,
+      });
     } catch (error) {
       if (handle) {
         await runtime.close({ handle, reason: "ACPX startup failed", discardPersistentState: false }).catch(() => {});
       }
       await bridge.close().catch(() => {});
+      await removeEphemeralCredentialFiles(ephemeralCredentialFiles);
       throw error;
     }
   }
@@ -300,9 +350,11 @@ export class AcpxRuntimeHost {
   }
 
   async status(): Promise<AcpRuntimeStatus> {
-    return this.#runtime.getStatus
-      ? this.#runtime.getStatus({ handle: this.#handle })
-      : {};
+    if (!this.#runtime.getStatus) return {};
+    return normalizeQualifiedModelStatus(
+      await this.#runtime.getStatus({ handle: this.#handle }),
+      this.#identity.profile,
+    );
   }
 
   startTurn(input: { requestId: string; text: string; signal?: AbortSignal }): AcpRuntimeTurn {
@@ -332,17 +384,102 @@ export class AcpxRuntimeHost {
     if (this.#closed) return;
     this.#closed = true;
     await this.#activeTurn?.cancel({ reason: input.reason }).catch(() => {});
-    await this.#runtime.close({
-      handle: this.#handle,
-      reason: input.reason,
-      discardPersistentState: input.discardPersistentState ?? false,
-    }).finally(() => this.#bridge.close()).catch(async (error) => {
+    try {
+      const discardPersistentState = input.discardPersistentState ?? false;
+      try {
+        await this.#runtime.close({
+          handle: this.#handle,
+          reason: input.reason,
+          discardPersistentState,
+        });
+      } catch (error) {
+        // Some qualified ACP agents (currently Pi) do not implement the
+        // optional session/close control required for remote destruction.
+        // Still close the live owner and descendants, but retain the provider
+        // record rather than leaking a process or pretending it was deleted.
+        if (!discardPersistentState || runtimeErrorCode(error) !== "ACP_BACKEND_UNSUPPORTED_CONTROL") {
+          throw error;
+        }
+        await this.#runtime.close({
+          handle: this.#handle,
+          reason: `${input.reason} (retaining unsupported backend record)`,
+          discardPersistentState: false,
+        });
+      }
+    } finally {
       await this.#bridge.close().catch(() => {});
-      throw error;
-    });
+      await removeEphemeralCredentialFiles(this.#ephemeralCredentialFiles);
+    }
   }
 
   runtimeRoot(): string { return this.#root; }
+
+  processIdentity(): AcpxRuntimeProcessIdentity | null {
+    return this.#agentProcessIdentity === null ? null : { ...this.#agentProcessIdentity };
+  }
+}
+
+function runtimeErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object" || Array.isArray(error)) return null;
+  return typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : null;
+}
+
+function isRunnerOwnedSemanticPermission(request: AcpPermissionRequest): boolean {
+  const raw = request.raw as unknown as Record<string, unknown>;
+  const toolCall = raw.toolCall;
+  if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) return false;
+  const call = toolCall as Record<string, unknown>;
+  const meta = call._meta;
+  const claudeCode = meta && typeof meta === "object" && !Array.isArray(meta)
+    ? (meta as Record<string, unknown>).claudeCode
+    : null;
+  const metadataToolName = claudeCode && typeof claudeCode === "object" && !Array.isArray(claudeCode)
+    ? (claudeCode as Record<string, unknown>).toolName
+    : null;
+  return [call.name, call.title, metadataToolName].some((value) => (
+    typeof value === "string" && value.startsWith("mcp__paperclip__")
+  ));
+}
+
+async function stageManagedCodexCredential(
+  agentHome: string,
+  options: AcpxRuntimeHostOptions,
+): Promise<string[]> {
+  if (options.environment?.OPENAI_API_KEY || options.environment?.CODEX_API_KEY) return [];
+  const source = options.managedCredentialSources?.codexAuthPath ?? join(homedir(), ".codex", "auth.json");
+  let metadata;
+  try {
+    metadata = await stat(source);
+  } catch {
+    return [];
+  }
+  if (!metadata.isFile() || metadata.size <= 0 || metadata.size > 256 * 1024) {
+    throw new Error("Managed Codex credential source is not a bounded regular file");
+  }
+  const credential = await readFile(source);
+  try {
+    const parsed = JSON.parse(credential.toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("invalid credential document");
+    }
+  } catch {
+    credential.fill(0);
+    throw new Error("Managed Codex credential source is malformed");
+  }
+  const destination = join(agentHome, "auth.json");
+  try {
+    await writeFile(destination, credential, { mode: 0o600 });
+    await chmod(destination, 0o600);
+  } finally {
+    credential.fill(0);
+  }
+  return [destination];
+}
+
+async function removeEphemeralCredentialFiles(paths: readonly string[]): Promise<void> {
+  await Promise.all(paths.map((path) => rm(path, { force: true }).catch(() => {})));
 }
 
 async function verifyExpectedIdentity(
@@ -379,20 +516,49 @@ async function verifyExpectedIdentity(
 async function requireVerifiedModel(
   runtime: AcpRuntime,
   handle: AcpRuntimeHandle,
-  requestedModel: string,
+  profile: QualifiedAcpxProfile,
 ): Promise<AcpRuntimeStatus> {
   if (!runtime.getStatus) throw new Error("ACPX agent cannot verify its effective model");
+  const requestedModel = profile.qualificationModel;
   let status = await runtime.getStatus({ handle });
-  if (status.models?.currentModelId !== requestedModel && runtime.setConfigOption) {
+
+  // A distinct reported selector is an explicit part of a pinned profile, not
+  // a fuzzy alias. Re-apply the user's exact canonical model through ACP so a
+  // stale/default session cannot be mistaken for the qualified model merely
+  // because it currently reports the same selector.
+  if (profile.reportedModelId !== requestedModel) {
+    if (!runtime.setConfigOption) {
+      throw new Error("ACPX agent cannot verify its canonical model through ACP config options");
+    }
+    await runtime.setConfigOption({ handle, key: "model", value: requestedModel });
+    status = await runtime.getStatus({ handle });
+  } else if (status.models?.currentModelId !== requestedModel && runtime.setConfigOption) {
     await runtime.setConfigOption({ handle, key: "model", value: requestedModel });
     status = await runtime.getStatus({ handle });
   }
-  if (status.models?.currentModelId !== requestedModel) {
+  if (status.models?.currentModelId !== profile.reportedModelId) {
     throw new Error(
-      `ACPX effective model mismatch: requested ${requestedModel}, received ${status.models?.currentModelId ?? "unverified"}`,
+      `ACPX effective model mismatch: requested ${requestedModel}, expected ACP selector ${profile.reportedModelId}, received ${status.models?.currentModelId ?? "unverified"}`,
     );
   }
-  return status;
+  return normalizeQualifiedModelStatus(status, profile);
+}
+
+function normalizeQualifiedModelStatus(
+  status: AcpRuntimeStatus,
+  profile: QualifiedAcpxProfile,
+): AcpRuntimeStatus {
+  if (status.models?.currentModelId !== profile.reportedModelId) return status;
+  return {
+    ...status,
+    models: {
+      ...status.models,
+      currentModelId: profile.qualificationModel,
+      availableModelIds: status.models.availableModelIds.map((modelId) => (
+        modelId === profile.reportedModelId ? profile.qualificationModel : modelId
+      )),
+    },
+  };
 }
 
 async function resolveAndVerifyCommand(profile: QualifiedAcpxProfile): Promise<{ path: string; digest: string }> {
@@ -532,10 +698,13 @@ function withoutCredentials(environment: Record<string, string>): Record<string,
   return safe;
 }
 
-function redactDiagnostic(value: string, environment: Record<string, string>): string {
+function redactDiagnostic(
+  value: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): string {
   let redacted = value;
   for (const [key, secret] of Object.entries(environment)) {
-    if (!/(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION)$/i.test(key) || secret.length < 4) continue;
+    if (!secret || !/(?:KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION)$/i.test(key) || secret.length < 4) continue;
     redacted = redacted.split(secret).join("[REDACTED]");
   }
   return redacted.replace(/(key|token|secret|password|authorization)\s*[:=]\s*[^\s,}\]]+/gi, "$1=[REDACTED]").slice(-8_192);
@@ -569,6 +738,7 @@ function profileSessionKey(
       cwd,
       agent: profile.agent,
       model,
+      reportedModelId: profile.reportedModelId,
       commandDigest: profile.commandDigest,
       driverKind: profile.driverKind,
       protocolVersion: profile.protocolVersion,
@@ -580,6 +750,59 @@ function profileSessionKey(
 function requiredIdentity(value: string | undefined, label: string): string {
   if (!value?.trim()) throw new Error(`${label} identity is missing`);
   return value;
+}
+
+const PI_USAGE_PREFIX = "[paperclip-pi-usage-v1]";
+
+function createAgentStderrRouter(
+  environment: NodeJS.ProcessEnv,
+  onUsage?: (usage: AcpxRuntimeUsage) => void,
+  onDiagnostic?: (message: string) => void,
+): (chunk: string) => void {
+  let pending = "";
+  return (chunk) => {
+    pending = `${pending}${chunk}`.slice(-128 * 1024);
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.startsWith(PI_USAGE_PREFIX)) {
+        const usage = parsePiUsage(line.slice(PI_USAGE_PREFIX.length));
+        if (usage) onUsage?.(usage);
+        else onDiagnostic?.("Pi emitted a malformed bounded usage notification.");
+        continue;
+      }
+      if (line) onDiagnostic?.(redactDiagnostic(line, environment));
+    }
+  };
+}
+
+function parsePiUsage(serialized: string): AcpxRuntimeUsage | null {
+  if (Buffer.byteLength(serialized) > 8 * 1024) return null;
+  try {
+    const value = JSON.parse(serialized) as Record<string, unknown>;
+    const usage: AcpxRuntimeUsage = {};
+    for (const key of [
+      "inputTokens",
+      "outputTokens",
+      "cachedReadTokens",
+      "cachedWriteTokens",
+      "thoughtTokens",
+      "totalTokens",
+    ] as const) {
+      const amount = value[key];
+      if (typeof amount === "number" && Number.isFinite(amount) && amount >= 0) usage[key] = amount;
+    }
+    const cost = value.cost;
+    if (typeof cost === "object" && cost !== null && !Array.isArray(cost)) {
+      const amount = (cost as Record<string, unknown>).amount;
+      if (typeof amount === "number" && Number.isFinite(amount) && amount >= 0) {
+        usage.cost = { amount, currency: "USD" };
+      }
+    }
+    return Object.keys(usage).length > 0 ? usage : null;
+  } catch {
+    return null;
+  }
 }
 
 function paperclipAcpSystemPrompt(): string {

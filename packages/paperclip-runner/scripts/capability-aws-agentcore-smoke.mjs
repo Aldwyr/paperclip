@@ -106,7 +106,15 @@ async function main() {
     assert(read.toolResult && typeof read.toolResult === "object", "the mock Paperclip read operation succeeded");
 
     const serialized = JSON.stringify({ opened, first, second, read });
-    for (const pattern of [/AWS_ACCESS_KEY_ID/i, /AWS_SECRET_ACCESS_KEY/i, /AWS_SESSION_TOKEN/i, /X-Amz-Signature/i, /Authorization/i]) {
+    for (const pattern of [
+      /AWS_ACCESS_KEY_ID/i,
+      /AWS_SECRET_ACCESS_KEY/i,
+      /AWS_SESSION_TOKEN/i,
+      /X-Amz-Signature/i,
+      /AWS4-HMAC-SHA256/i,
+      /"Authorization"\s*:/,
+      /"Proxy-Authorization"\s*:/,
+    ]) {
       assert(!pattern.test(serialized), `browser payload excludes ${pattern}`);
     }
     process.stdout.write(`${JSON.stringify({

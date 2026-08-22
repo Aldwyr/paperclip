@@ -1,0 +1,126 @@
+// @vitest-environment jsdom
+
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ThemeProvider } from "@/context/ThemeContext";
+import { MemoryRouter } from "@/lib/router";
+import type { TaskChatProtocolItem, TaskChatProviderActivityItem } from "./task-chat-model";
+import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
+
+describe("TaskChatProtocolActivityRow", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  function render(item: TaskChatProtocolItem) {
+    act(() => root.render(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TaskChatProtocolActivityRow item={item} />
+        </ThemeProvider>
+      </MemoryRouter>,
+    ));
+  }
+
+  it("renders research as one compact line with expandable sources", () => {
+    const item: TaskChatProviderActivityItem = {
+      id: "research",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "research",
+      eventType: "research.completed",
+      status: "completed",
+      title: "Research",
+      summary: "smoked pork shoulder",
+      details: [{ label: "Query", value: "smoked pork shoulder", mono: true }],
+      steps: [],
+      links: [{ label: "Smoking guide", href: "https://example.com/smoking", description: "Temperature targets" }],
+      children: [],
+    };
+    render(item);
+
+    const row = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-protocol-activity-row"] button');
+    expect(container.querySelector("article")).toBeNull();
+    expect(row?.textContent).toContain("Searched the web");
+    expect(row?.textContent).toContain("smoked pork shoulder");
+    expect(row?.getAttribute("aria-expanded")).toBe("false");
+    expect(row?.getAttribute("aria-controls")).toMatch(/^task-chat-protocol-activity-/);
+
+    act(() => row?.click());
+
+    expect(row?.getAttribute("aria-expanded")).toBe("true");
+    const detail = container.querySelector('[data-testid="task-chat-protocol-activity-detail"]');
+    expect(detail?.id).toBe(row?.getAttribute("aria-controls"));
+    expect(detail?.textContent).toContain("Smoking guide");
+  });
+
+  it("keeps workspace files and diffs inside the row detail", () => {
+    render({
+      id: "workspace",
+      kind: "protocol",
+      surface: "workspace_change",
+      changeSetId: "change-1",
+      revision: 1,
+      source: "runner_verified",
+      complete: true,
+      files: [{ path: "ui/src/App.tsx", operation: "modify", previousPath: null, additions: 1, deletions: 1, binary: false, diff: "-old\n+new" }],
+      totals: { files: 1, additions: 1, deletions: 1 },
+      patchArtifactRef: null,
+    });
+
+    const row = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-protocol-activity-row"] button');
+    expect(row?.textContent).toContain("Edited files");
+    act(() => row?.click());
+    expect(container.textContent).toContain("ui/src/App.tsx");
+    expect(container.textContent).toContain("+new");
+  });
+
+  it("renders durable resources as direct compact links", () => {
+    render({
+      id: "resource",
+      kind: "protocol",
+      surface: "resource",
+      resourceKind: "document",
+      title: "Implementation notes",
+      subtitle: "markdown · ready",
+      href: "/documents/notes",
+    });
+
+    const link = container.querySelector<HTMLAnchorElement>('[data-testid="task-chat-protocol-activity-row"]');
+    expect(link?.getAttribute("href")).toBe("/documents/notes");
+    expect(link?.textContent).toContain("Added a document");
+    expect(link?.textContent).toContain("Implementation notes");
+  });
+
+  it("does not make an informational row focusable when it has no details", () => {
+    render({
+      id: "notice",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "provider_notice",
+      eventType: "provider.notice.recorded",
+      status: "informational",
+      title: "Provider notice",
+      summary: "Retrying automatically",
+      details: [],
+      steps: [],
+      links: [],
+      children: [],
+    });
+
+    const row = container.querySelector('[data-testid="task-chat-protocol-activity-row"]');
+    expect(row?.querySelector("button")).toBeNull();
+    expect(row?.querySelector('[aria-expanded]')).toBeNull();
+  });
+});

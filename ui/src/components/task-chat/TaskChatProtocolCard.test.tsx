@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
-import type { TaskChatProtocolItem, TaskChatRuntimeRequestDecision } from "./task-chat-model";
+import type { TaskChatProtocolItem, TaskChatProviderActivityFamily, TaskChatRuntimeRequestDecision } from "./task-chat-model";
 
 function renderCard(root: Root, item: TaskChatProtocolItem, onDecision?: (decision: TaskChatRuntimeRequestDecision) => void | Promise<void>) {
   flushSync(() => root.render(
@@ -52,6 +52,31 @@ describe("TaskChatProtocolCard", () => {
     expect(container.querySelector('[data-testid="task-chat-provider-plan"]')).not.toBeNull();
     expect(container.textContent).toContain("Inventory events");
     expect(container.textContent).toContain("Render widgets");
+  });
+
+  it("renders a structured history card for every provider family", () => {
+    const families = [
+      "plan", "tool_execution", "research", "delegation", "model_identity", "context", "artifact",
+      "review", "hook", "memory", "safety", "terminal", "wait", "provider_notice",
+    ] satisfies TaskChatProviderActivityFamily[];
+    for (const family of families) {
+      renderCard(root, {
+        id: `provider-${family}`,
+        kind: "protocol",
+        surface: "provider_activity",
+        family,
+        eventType: `${family}.fixture`,
+        status: "completed",
+        title: `Visible ${family}`,
+        summary: `Summary ${family}`,
+        details: [{ label: "Reference", value: `${family}-1` }],
+        links: [],
+        children: [],
+        steps: [],
+      });
+      expect(container.querySelector(`[data-testid="task-chat-provider-${family}"]`), family).not.toBeNull();
+      expect(container.textContent, family).toContain(`Visible ${family}`);
+    }
   });
 
   it("opens a workspace diff review dialog", async () => {

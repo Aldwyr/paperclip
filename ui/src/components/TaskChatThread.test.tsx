@@ -6,8 +6,8 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
-import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { TaskChatThread } from "./TaskChatThread";
+import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({ transcriptByRun: new Map() }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
@@ -114,6 +114,49 @@ describe("TaskChatThread draft pass-through", () => {
 
     expect(container.querySelector('[data-testid="mock-editor"]')?.textContent)
       .toBe("half-written thought");
+  });
+});
+
+describe("TaskChatThread causal comment ordering", () => {
+  it("places a queued input where its consuming run starts", () => {
+    const comment = (
+      id: string,
+      body: string,
+      createdAt: string,
+      authorType: "user" | "agent",
+      extra: Record<string, unknown> = {},
+    ) => ({
+      id,
+      companyId: "company-1",
+      issueId: "issue-1",
+      authorType,
+      authorAgentId: authorType === "agent" ? "agent-1" : null,
+      authorUserId: authorType === "user" ? "user-1" : null,
+      body,
+      presentation: null,
+      metadata: null,
+      createdAt: new Date(createdAt),
+      updatedAt: new Date(createdAt),
+      ...extra,
+    });
+    render(<TaskChatThread
+      comments={[
+        comment("initial", "Initial recipe request", "2026-08-22T12:00:00.000Z", "user"),
+        comment("queued", "What about BBQ sauce?", "2026-08-22T12:01:00.000Z", "user", {
+          consumedByRunId: "run-2",
+          conversationAnchorAt: "2026-08-22T12:03:00.000Z",
+          conversationAnchorSequence: 0,
+        }),
+        comment("reply-1", "Pork shoulder recipe", "2026-08-22T12:02:00.000Z", "agent", { runId: "run-1" }),
+        comment("reply-2", "BBQ sauce recipe", "2026-08-22T12:04:00.000Z", "agent", { runId: "run-2" }),
+      ]}
+      onAdd={async () => {}}
+    />);
+
+    const text = container.textContent ?? "";
+    expect(text.indexOf("Initial recipe request")).toBeLessThan(text.indexOf("Pork shoulder recipe"));
+    expect(text.indexOf("Pork shoulder recipe")).toBeLessThan(text.indexOf("What about BBQ sauce?"));
+    expect(text.indexOf("What about BBQ sauce?")).toBeLessThan(text.indexOf("BBQ sauce recipe"));
   });
 });
 

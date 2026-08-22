@@ -135,6 +135,47 @@ pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, V
             _ => "other",
         };
         let url = text(action.get("url"));
+        let sources: Vec<Value> = if complete {
+            item.get("results")
+                .and_then(Value::as_array)
+                .map(|results| {
+                    results
+                        .iter()
+                        .take(64)
+                        .enumerate()
+                        .filter_map(|(index, result)| {
+                            let source_url = text(result.get("url"));
+                            if (!source_url.starts_with("http://")
+                                && !source_url.starts_with("https://"))
+                                || source_url.len() > 8192
+                            {
+                                return None;
+                            }
+                            let fallback_id = format!("{item_id}:source:{}", index + 1);
+                            let source_id = id(
+                                text(result.get("ref_id").or_else(|| result.get("refId"))),
+                                &fallback_id,
+                            );
+                            let title = redact_text(text(result.get("title")));
+                            let title: String = if title.is_empty() {
+                                source_url.chars().take(4000).collect()
+                            } else {
+                                title.chars().take(4000).collect()
+                            };
+                            let snippet = redact_text(text(result.get("snippet")));
+                            Some(json!({
+                                "sourceId": source_id,
+                                "title": title,
+                                "url": source_url,
+                                "snippet": if snippet.is_empty() { Value::Null } else { Value::String(snippet.chars().take(4000).collect()) },
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         push(
             &mut result,
             if complete {
@@ -142,7 +183,7 @@ pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, V
             } else {
                 "research.started"
             },
-            json!({"schema":"paperclip.research.v1","researchId":item_id,"action":action_kind,"status":if complete {"completed"} else {"running"},"query":item.get("query").or_else(|| action.get("query")).and_then(Value::as_str),"url":if url.starts_with("http://") || url.starts_with("https://") {Value::String(url.to_owned())} else {Value::Null},"pattern":action.get("pattern").and_then(Value::as_str),"sources":[]}),
+            json!({"schema":"paperclip.research.v1","researchId":item_id,"action":action_kind,"status":if complete {"completed"} else {"running"},"query":item.get("query").or_else(|| action.get("query")).and_then(Value::as_str),"url":if url.starts_with("http://") || url.starts_with("https://") {Value::String(url.to_owned())} else {Value::Null},"pattern":action.get("pattern").and_then(Value::as_str),"sources":sources}),
             &item_id,
         );
     } else if (method == "item/started" || complete)
@@ -331,5 +372,20 @@ mod tests {
         assert_eq!(events[0].0, "memory.citation.referenced");
         assert_eq!(events[0].1["available"], false);
         assert!(!events[0].1.to_string().contains("native-secret"));
+    }
+
+    #[test]
+    fn maps_bounded_safe_web_search_sources() {
+        let events = canonical_provider_events(
+            "item/completed",
+            &json!({"item":{"id":"web-1","type":"webSearch","results":[
+                {"ref_id":"source-1","title":"Protocol notes","url":"https://example.com/prp","snippet":"Canonical event details"},
+                {"ref_id":"unsafe","title":"Unsafe","url":"file:///etc/passwd"}
+            ]}}),
+        );
+        assert_eq!(events[0].0, "research.completed");
+        assert_eq!(events[0].1["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(events[0].1["sources"][0]["sourceId"], "source-1");
+        assert_eq!(events[0].1["sources"][0]["url"], "https://example.com/prp");
     }
 }

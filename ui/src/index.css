@@ -683,6 +683,11 @@
 .tc-turn-fold[data-folded="true"] { grid-template-rows: 0fr; opacity: 0; }
 .tc-turn-fold > * { overflow: hidden; min-height: 0; }
 
+/* Hover-revealed activity carets remain discoverable on touch-only devices. */
+@media (hover: none) {
+  .tc-hover-disclosure-caret { opacity: 1; }
+}
+
 /* Properties-pane maximize/restore glide (left animates between docked and
    sidebar-flush while the pane is position:fixed). */
 .tc-pane-glide { transition: left var(--motion-pane-glide) var(--motion-ease-standard); }
@@ -2112,6 +2117,8 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --sz-52vh: 52vh;
   --sz-40rem: 40rem;
   --sz-44rem: 44rem;
+  --sz-36rem: 36rem;
+  --sz-neg-1_25rem: -1.25rem;
   --sz-30pct: 30%;
   --sz-24pct: 24%;
   --sz-18pct: 18%;
@@ -2345,6 +2352,12 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   --gtc-63: 280px 1fr;
   --gtc-64: minmax(0,20rem) 1fr;
   --gtc-65: minmax(8rem,0.38fr) minmax(0,0.62fr) auto;
+  --gtc-runner-inspector-stage: 1.25rem minmax(0,1fr);
+  --gtc-runner-inspector-filters: minmax(14rem,1fr) repeat(5,minmax(8rem,auto));
+  --gtc-runner-inspector-pipeline: 21rem minmax(0,1fr);
+  --gtc-runner-inspector-fields: 8rem 1fr;
+  --gtc-runner-inspector-presentation: minmax(18rem,0.8fr) minmax(20rem,1.2fr);
+  --gtc-runner-inspector-trace: 20rem minmax(0,1fr);
   --gtr-1: auto auto; /* Extracted from ui/src/components/ui/card.tsx (grid-rows-[auto_auto]). */
   --gtr-2: 1fr; /* Extracted from ui/src/pages/CompanySkills.tsx (grid-rows-[1fr]). */
   --gtr-3: 0fr; /* Extracted from ui/src/pages/CompanySkills.tsx (grid-rows-[0fr]). */

@@ -25,10 +25,17 @@ test("AgentCore template has closed development/private resources and explicit c
   assert.match(source, /MaxIterations: 8/);
   assert.match(source, /MaxTokens: 4096/);
   assert.match(source, /TimeoutSeconds: 300/);
+  assert.match(source, /AllowedTools:\s+- "@\*\/pc_\*"/);
   assert.match(source, /Tools: \[\]/);
   assert.match(source, /Skills: \[\]/);
   assert.doesNotMatch(source, /BedrockModelResourceArn:\s+[\s\S]{0,100}Default: "\*"/);
   assert.match(source, /BedrockFoundationModelResourceArn/);
+  assert.match(source, /HarnessEndpointName/);
+  assert.match(source, /\$\{AgentHarness\.Arn\}\/harness-endpoint\/\$\{HarnessEndpointName\}/);
+  assert.match(source, /\$\{AgentHarness\.Arn\}\/runtime-endpoint\/\$\{HarnessEndpointName\}/);
+  assert.match(source, /BedrockMarketplaceProductId/);
+  assert.match(source, /Sid: ViewMarketplaceSubscriptionsForModelAccess[\s\S]*Action: aws-marketplace:ViewSubscriptions[\s\S]*Sid: SubscribePinnedMarketplaceModel[\s\S]*Action: aws-marketplace:Subscribe[\s\S]*aws-marketplace:ProductId: !Ref BedrockMarketplaceProductId/);
+  assert.doesNotMatch(source, /aws-marketplace:Unsubscribe/);
 });
 
 test("AgentCore wrapper is valid shell and writes only nonsecret profile metadata", async () => {
@@ -38,6 +45,7 @@ test("AgentCore wrapper is valid shell and writes only nonsecret profile metadat
   assert.ok(generatedBlock.length > 0);
   assert.doesNotMatch(generatedBlock, /AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|Authorization|X-Amz-Signature/);
   assert.match(source, /chmod 600 "\$tmp"/);
+  assert.match(source, /printf 'AWS_CONFIG_FILE=%s\\n'/);
   assert.match(source, /cloudformation deploy/);
   assert.match(source, /CAPABILITY_NAMED_IAM/);
   assert.match(source, /--\) shift ;;/);
@@ -45,5 +53,12 @@ test("AgentCore wrapper is valid shell and writes only nonsecret profile metadat
   assert.doesNotMatch(source, /printf 'arn:%s:iam::%s:role\/%s/);
   assert.match(source, /existing_status.*ROLLBACK_COMPLETE/s);
   assert.match(source, /cloudformation wait stack-delete-complete/);
-  assert.ok(source.indexOf("delete-harness-endpoint") < source.indexOf("cloudformation delete-stack"));
+  assert.match(source, /--query harness\.status/);
+  assert.match(source, /AgentCore tool allowlist drift/);
+  assert.match(source, /--query memory\.status/);
+  assert.match(source, /--query endpoint\.status/);
+  assert.match(source, /o\.endpoint\?\.arn/);
+  assert.match(source, /--marketplace-product-id/);
+  assert.match(source, /BedrockMarketplaceProductId=\$MARKETPLACE_PRODUCT_ID/);
+  assert.ok(source.indexOf("delete-harness-endpoint") < source.lastIndexOf("cloudformation delete-stack"));
 });

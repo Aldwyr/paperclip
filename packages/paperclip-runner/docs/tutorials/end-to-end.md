@@ -101,7 +101,9 @@ pnpm --filter @paperclipai/paperclip-runner verify:rootless
   tokens.
 - the Codex child receives an allowlisted environment without Paperclip or
   OpenAI bearer credentials;
-- automatic skill, app, and collaboration instruction blocks are disabled;
+- automatic skill and app instruction blocks are disabled, while Codex's
+  built-in collaboration instructions are enabled by default and remain
+  explicitly removable for controlled eval baselines;
 - direct app-server create, resume, read, turn, steer, interrupt, usage, and
   reconciliation operations preserve stable identities;
 - provider events normalize to canonical lifecycle, model, tool, file,

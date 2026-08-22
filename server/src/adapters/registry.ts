@@ -30,6 +30,7 @@ import {
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
   getQuotaWindows as claudeGetQuotaWindows,
+  readClaudeAuthStatus,
   getConfigSchema as getClaudeConfigSchema,
   CLAUDE_SETUP_TOKEN_COMMAND,
   parseSetupTokenPrompt,
@@ -47,6 +48,7 @@ import {
   testEnvironment as codexTestEnvironment,
   sessionCodec as codexSessionCodec,
   getQuotaWindows as codexGetQuotaWindows,
+  readCodexAuthInfo,
   getConfigSchema as getCodexConfigSchema,
   CODEX_DEVICE_LOGIN_COMMAND,
   parseDeviceLoginPrompt,
@@ -244,11 +246,17 @@ async function testPaperclipRunnerAcpxEnvironment(
     : {};
   const environment = { ...process.env };
   for (const [key, value] of Object.entries(configuredEnv)) if (typeof value === "string") environment[key] = value;
+  const managedClaudeAuth = agent === "claude" && !environment.ANTHROPIC_API_KEY && !environment.CLAUDE_CODE_OAUTH_TOKEN
+    ? await readClaudeAuthStatus()
+    : null;
+  const managedCodexAuth = agent === "codex" && !environment.OPENAI_API_KEY && !environment.CODEX_API_KEY
+    ? await readCodexAuthInfo()
+    : null;
   const credentialReady = agent === "pi"
     ? Boolean(environment.OPENROUTER_API_KEY)
     : agent === "claude"
-      ? Boolean(environment.ANTHROPIC_API_KEY || environment.CLAUDE_CODE_OAUTH_TOKEN)
-      : Boolean(environment.OPENAI_API_KEY || environment.CODEX_API_KEY);
+      ? Boolean(environment.ANTHROPIC_API_KEY || environment.CLAUDE_CODE_OAUTH_TOKEN || managedClaudeAuth?.loggedIn)
+      : Boolean(environment.OPENAI_API_KEY || environment.CODEX_API_KEY || managedCodexAuth);
   if (!credentialReady) {
     const required = agent === "pi"
       ? "OPENROUTER_API_KEY"

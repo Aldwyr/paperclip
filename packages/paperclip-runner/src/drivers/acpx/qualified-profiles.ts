@@ -16,6 +16,15 @@ export interface QualifiedAcpxProfile {
   agentRuntimeVersion: string | null;
   commandDigest: string;
   qualificationModel: string;
+  /**
+   * Model identifier the pinned ACP server reports after accepting the exact
+   * qualification model. Most agents echo the requested model. Claude's ACP
+   * server deliberately exposes its stable SDK selector (`sonnet`) while the
+   * SDK resolves that selector to the canonical wire model
+   * (`claude-sonnet-5`). Paperclip verifies the exact request was accepted
+   * before treating this identifier as the qualified effective model.
+   */
+  reportedModelId: string;
   permissionPolicy: "interactive";
 }
 
@@ -35,8 +44,9 @@ export const QUALIFIED_ACPX_PROFILES: Readonly<Record<QualifiedAcpxAgent, Qualif
     agentServerVersion: "0.0.33",
     agentRuntimePackage: "@earendil-works/pi-coding-agent",
     agentRuntimeVersion: "0.84.2",
-    commandDigest: "sha256:5d06b5cfe819b1acd75e8d9dea4766e76a40a64b82549eda08c3835f18bdac24",
+    commandDigest: "sha256:e806321f458baaf23aa5580324d8f90a59082066105eda69de35b1ef0c8418eb",
     qualificationModel: "openrouter/deepseek/deepseek-v4-flash-0731",
+    reportedModelId: "openrouter/deepseek/deepseek-v4-flash-0731",
     permissionPolicy: "interactive",
   },
   claude: {
@@ -51,6 +61,7 @@ export const QUALIFIED_ACPX_PROFILES: Readonly<Record<QualifiedAcpxAgent, Qualif
     agentRuntimeVersion: null,
     commandDigest: "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
     qualificationModel: "claude-sonnet-5",
+    reportedModelId: "sonnet",
     permissionPolicy: "interactive",
   },
   codex: {
@@ -65,6 +76,7 @@ export const QUALIFIED_ACPX_PROFILES: Readonly<Record<QualifiedAcpxAgent, Qualif
     agentRuntimeVersion: null,
     commandDigest: "sha256:8c7fc8af156596668a95ce23d52309f70ad576e75bac6dc209d30378bdbb8ebe",
     qualificationModel: "gpt-5.6-sol",
+    reportedModelId: "gpt-5.6-sol",
     permissionPolicy: "interactive",
   },
 };

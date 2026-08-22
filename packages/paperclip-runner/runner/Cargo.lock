@@ -1785,6 +1785,7 @@ dependencies = [
  "aws-sdk-sts",
  "aws-smithy-types",
  "aws-types",
+ "base64",
  "hmac 0.12.1",
  "jsonschema",
  "reqwest",

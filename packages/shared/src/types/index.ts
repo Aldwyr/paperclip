@@ -341,7 +341,15 @@ export type {
   DocumentTextRange,
   UpdateDocumentAnnotationThreadRequest,
 } from "./document-annotation.js";
-export type { Project, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
+export type {
+  Project,
+  ProjectBudgetSummary,
+  ProjectCodebase,
+  ProjectCodebaseOrigin,
+  ProjectGoalRef,
+  ProjectManagedByPlugin,
+  ProjectWorkspace,
+} from "./project.js";
 export type {
   CompanySearchCountType,
   CompanySearchExtractIssueResult,
@@ -832,8 +840,23 @@ export type {
   RoutineExecutionIssueOrigin,
   RoutineListItem,
 } from "./routine.js";
-export type { CostEvent, CostSummary, IssueCostSummary, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
-export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
+export type {
+  CostEvent,
+  CostSummary,
+  IssueCostSummary,
+  CostByAgent,
+  CostByProviderModel,
+  CostByBiller,
+  CostByAgentModel,
+  CostWindowSpendRow,
+  CostByProject,
+} from "./cost.js";
+export type {
+  FinanceEvent,
+  FinanceSummary,
+  FinanceByBiller,
+  FinanceByKind,
+} from "./finance.js";
 export type {
   AgentWakeupResponse,
   AgentWakeupSkipped,
@@ -843,6 +866,17 @@ export type {
   HeartbeatRun,
   HeartbeatRunEvent,
   HeartbeatRunStatusPhase,
+  ProviderTraceDebugRequest,
+  ProviderTraceDirection,
+  ProviderTraceDisposition,
+  ProviderTraceFieldMapping,
+  ProviderTraceFieldMappingAction,
+  ProviderTraceFrame,
+  ProviderTraceInterpretation,
+  ProviderTraceMetadata,
+  ProviderTraceStatus,
+  RunPresentationDecision,
+  RunPresentationSource,
   AgentRuntimeState,
   AgentTaskSession,
   AgentWakeupRequest,

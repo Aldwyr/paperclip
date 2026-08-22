@@ -83,6 +83,35 @@ describe("paperclip runner transcript projection", () => {
       .toEqual([{ kind: "thinking", ts: expect.any(String), text: "Detailed trace", delta: true, channel: "detail" }]);
   });
 
+  it("preserves empty reasoning lifecycle events as real thinking activity", () => {
+    const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
+    const event = (eventType: string) => parse(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: {
+        eventType,
+        itemId: "reason-empty",
+        payload: {
+          kind: "reasoning",
+          channel: "summary",
+          item: { id: "reason-empty", type: "reasoning", text: "" },
+        },
+      },
+    }), "2026-08-21T12:00:00.000Z");
+
+    expect(event("item.started")).toEqual([expect.objectContaining({
+      kind: "thinking",
+      text: "",
+      lifecycle: "started",
+      channel: "summary",
+    })]);
+    expect(event("item.completed")).toEqual([expect.objectContaining({
+      kind: "thinking",
+      text: "",
+      lifecycle: "completed",
+      channel: "summary",
+    })]);
+  });
+
   it("never exposes the structured task result envelope as final-response prose", () => {
     const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
     const event = (eventType: string, payload: Record<string, unknown>, itemId = "result-1") => parse(JSON.stringify({
@@ -99,13 +128,36 @@ describe("paperclip runner transcript projection", () => {
       ]);
   });
 
-  it("projects canonical provider events as structured activity instead of JSON prose", () => {
-    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
-      type: "paperclip.prp.event",
-      event: { eventType: "plan.updated", payload: { schema: "paperclip.plan.updated.v1", planId: "plan-1", revision: 1, complete: true, explanation: "Ship safely", steps: [{ stepId: "s1", body: "Validate", status: "completed" }] } },
-    }), "2026-08-21T12:00:00.000Z");
-    expect(entries).toEqual([expect.objectContaining({ kind: "provider_activity", family: "plan", eventType: "plan.updated", title: "Plan" })]);
-    expect(entries).not.toEqual([expect.objectContaining({ kind: "assistant" })]);
+  it("projects every canonical provider family as structured activity instead of JSON prose", () => {
+    const cases = [
+      ["plan.updated", "plan", { complete: true, explanation: "Ship safely" }],
+      ["tool.execution.completed", "tool_execution", { status: "completed", name: "tests" }],
+      ["research.completed", "research", { status: "completed", query: "PRP" }],
+      ["delegation.completed", "delegation", { status: "completed", action: "spawn" }],
+      ["model.route.changed", "model_identity", { provider: "claude", requestedModel: "claude", effectiveModel: "Claude Sonnet" }],
+      ["context.compacted", "context", { reason: "window" }],
+      ["artifact.generated", "artifact", { status: "completed", reference: "image.png" }],
+      ["review.mode.changed", "review", { state: "entered" }],
+      ["hook.completed", "hook", { status: "completed", event: "post-tool" }],
+      ["memory.citation.referenced", "memory", { label: "Decision" }],
+      ["safety.review.completed", "safety", { status: "completed", decision: "allowed" }],
+      ["terminal.input.sent", "terminal", { byteCount: 1 }],
+      ["wait.completed", "wait", { status: "completed", reason: "timer" }],
+      ["provider.notice.recorded", "provider_notice", { summary: "Provider warning" }],
+    ] as const;
+
+    for (const [eventType, family, payload] of cases) {
+      const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+        type: "paperclip.prp.event",
+        event: { eventType, payload },
+      }), "2026-08-21T12:00:00.000Z");
+      expect(entries, eventType).toEqual([expect.objectContaining({
+        kind: "provider_activity",
+        family,
+        eventType,
+      })]);
+      expect(entries, eventType).not.toEqual([expect.objectContaining({ kind: "assistant" })]);
+    }
 
     const modelRoute = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
       type: "paperclip.prp.event",

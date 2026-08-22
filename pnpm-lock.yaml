@@ -20,6 +20,9 @@ overrides:
   '@lexical/utils': 0.49.0
 
 patchedDependencies:
+  '@agentclientprotocol/claude-agent-acp@0.70.0':
+    hash: 3uuiqvasvwjam3tge5jo3jbw7a
+    path: patches/@agentclientprotocol__claude-agent-acp@0.70.0.patch
   acpx@0.13.1:
     hash: c5ivrcgwkvhn7lv7slpppkd7sy
     path: patches/acpx@0.13.1.patch
@@ -27,7 +30,7 @@ patchedDependencies:
     hash: 55uhvnotpqyiy37rn3pqpukhei
     path: patches/embedded-postgres@18.1.0-beta.16.patch
   pi-acp@0.0.33:
-    hash: nwy4ztc7fl2g2mu436sxq5sba4
+    hash: v6qgcxfo3rn3zt3m56ysulht2y
     path: patches/pi-acp@0.0.33.patch
 
 importers:
@@ -446,7 +449,7 @@ importers:
     dependencies:
       '@agentclientprotocol/claude-agent-acp':
         specifier: 0.70.0
-        version: 0.70.0(@anthropic-ai/sdk@0.91.1(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))
+        version: 0.70.0(patch_hash=3uuiqvasvwjam3tge5jo3jbw7a)(@anthropic-ai/sdk@0.91.1(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))
       '@agentclientprotocol/codex-acp':
         specifier: 1.6.2
         version: 1.6.2
@@ -461,7 +464,7 @@ importers:
         version: 8.20.0
       pi-acp:
         specifier: 0.0.33
-        version: 0.0.33(patch_hash=nwy4ztc7fl2g2mu436sxq5sba4)
+        version: 0.0.33(patch_hash=v6qgcxfo3rn3zt3m56ysulht2y)
     devDependencies:
       '@playwright/test':
         specifier: ^1.61.1
@@ -9340,7 +9343,7 @@ snapshots:
       - '@anthropic-ai/sdk'
       - '@modelcontextprotocol/sdk'
 
-  '@agentclientprotocol/claude-agent-acp@0.70.0(@anthropic-ai/sdk@0.91.1(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))':
+  '@agentclientprotocol/claude-agent-acp@0.70.0(patch_hash=3uuiqvasvwjam3tge5jo3jbw7a)(@anthropic-ai/sdk@0.91.1(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))':
     dependencies:
       '@agentclientprotocol/sdk': 1.3.0(zod@3.25.76)
       '@anthropic-ai/claude-agent-sdk': 0.3.232(@anthropic-ai/sdk@0.91.1(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))(zod@3.25.76)
@@ -16781,7 +16784,7 @@ snapshots:
     dependencies:
       split2: 4.2.0
 
-  pi-acp@0.0.33(patch_hash=nwy4ztc7fl2g2mu436sxq5sba4):
+  pi-acp@0.0.33(patch_hash=v6qgcxfo3rn3zt3m56ysulht2y):
     dependencies:
       '@agentclientprotocol/sdk': 0.26.0(zod@3.25.76)
       zod: 3.25.76

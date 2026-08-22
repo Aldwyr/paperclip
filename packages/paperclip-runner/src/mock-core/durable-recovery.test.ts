@@ -884,16 +884,69 @@ describe.sequential("Durable transport and recovery", () => {
   it("passes only the bootstrap capability and platform basics to the runner", () => {
     const environment = durableRecoveryInternals.runnerEnvironment("opaque-ticket", {
       PATH: "/usr/bin",
+      HOME: "/Users/tester",
+      AWS_PROFILE: "paperclip-dev",
+      AWS_REGION: "us-east-1",
+      AWS_ACCESS_KEY_ID: "must-not-cross-runner-boundary",
+      AWS_SESSION_TOKEN: "must-not-cross-runner-boundary",
       ANTHROPIC_API_KEY: "sk-ant-live-only",
       UNRELATED_SERVER_SECRET: "must-not-cross-runner-boundary",
     });
 
     expect(environment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET).toBe("opaque-ticket");
     expect(environment.ANTHROPIC_API_KEY).toBe("sk-ant-live-only");
+    expect(environment.HOME).toBe("/Users/tester");
+    expect(environment.AWS_PROFILE).toBe("paperclip-dev");
+    expect(environment.AWS_REGION).toBe("us-east-1");
+    expect(environment.AWS_ACCESS_KEY_ID).toBeUndefined();
+    expect(environment.AWS_SESSION_TOKEN).toBeUndefined();
     expect(environment.UNRELATED_SERVER_SECRET).toBeUndefined();
     expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
     expect(environment.OPENAI_API_KEY).toBeUndefined();
     expect(environment.EMAIL_AGENTMAIL_GENERAL_API_KEY).toBeUndefined();
+  });
+
+  it("keeps the eval connection lease independent from the provider turn deadline", () => {
+    expect(durableRecoveryInternals.durableEvalConnectionLeaseTtlMs(180_000))
+      .toBe(60 * 60 * 1_000);
+    expect(durableRecoveryInternals.durableEvalConnectionLeaseTtlMs(90 * 60 * 1_000))
+      .toBe(91 * 60 * 1_000);
+  });
+
+  it("builds the pinned remote Claude Managed eval provider without local capabilities", () => {
+    const provider = durableRecoveryInternals.claudeManagedEvalProviderConfiguration(
+      "claude-sonnet-5",
+      {
+        profileId: "profile-qualified",
+        anthropicAgentId: "agent-qualified",
+        agentVersion: "17",
+        environmentId: "environment-qualified",
+        betaVersion: "managed-agents-2026-04-01",
+        maxSessionListCostUsd: 0.5,
+      },
+    );
+    expect(provider).toEqual({
+      kind: "claude_managed",
+      model: "claude-sonnet-5",
+      profileId: "profile-qualified",
+      anthropicAgentId: "agent-qualified",
+      agentVersion: "17",
+      environmentId: "environment-qualified",
+      betaVersion: "managed-agents-2026-04-01",
+      maxSessionListCostUsd: 0.5,
+    });
+    expect(provider).not.toHaveProperty("cwd");
+    expect(provider).not.toHaveProperty("command");
+    expect(provider).not.toHaveProperty("mcpServers");
+  });
+
+  it("recognizes a managed provider budget stop before the generic turn timeout", () => {
+    expect(durableRecoveryInternals.managedProviderBudgetReached([{
+      envelope: { payload: { eventType: "session.updated", payload: { status: "budget_reached" } } },
+    }])).toBe(true);
+    expect(durableRecoveryInternals.managedProviderBudgetReached([{
+      envelope: { payload: { eventType: "session.updated", payload: { status: "budget_increased" } } },
+    }])).toBe(false);
   });
 
   it("projects the authenticated result inside a discovered-capability gateway", () => {

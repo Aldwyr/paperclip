@@ -159,6 +159,22 @@ function planPayload(params: Record<string, unknown>, item: Record<string, unkno
   };
 }
 
+function researchSources(item: Record<string, unknown>, researchId: string): Array<Record<string, unknown>> {
+  if (!Array.isArray(item.results)) return [];
+  return item.results.slice(0, 64).flatMap((value, index) => {
+    const result = record(value);
+    const url = text(result.url).slice(0, 8192);
+    if (!url.startsWith("http://") && !url.startsWith("https://")) return [];
+    const fallbackId = `${researchId}:source:${index + 1}`;
+    return [{
+      sourceId: safeId(text(result.ref_id, text(result.refId, fallbackId)), fallbackId),
+      title: text(result.title, url).slice(0, 4000),
+      url,
+      snippet: text(result.snippet).slice(0, 4000) || null,
+    }];
+  });
+}
+
 /** Maps qualified Codex app-server notifications to bounded canonical PRP events. */
 export function canonicalProviderEventsFromCodex(method: string, paramsValue: unknown): CanonicalProviderEvent[] {
   const params = record(paramsValue);
@@ -183,7 +199,7 @@ export function canonicalProviderEventsFromCodex(method: string, paramsValue: un
     const action = record(item.action);
     const actionType = text(action.type, "other").replace("openPage", "open_page").replace("findInPage", "find_in_page");
     const url = text(action.url) || null;
-    return [{ eventType: completed ? "research.completed" : "research.started", payload: { schema: "paperclip.research.v1", researchId: itemId, action: actionType, status: completed ? "completed" : "running", query: text(item.query, text(action.query)) || null, url: url?.startsWith("http://") || url?.startsWith("https://") ? url : null, pattern: text(action.pattern) || null, sources: [] }, itemId }];
+    return [{ eventType: completed ? "research.completed" : "research.started", payload: { schema: "paperclip.research.v1", researchId: itemId, action: actionType, status: completed ? "completed" : "running", query: text(item.query, text(action.query)) || null, url: url?.startsWith("http://") || url?.startsWith("https://") ? url : null, pattern: text(action.pattern) || null, sources: completed ? researchSources(item, itemId) : [] }, itemId }];
   }
   if ((method === "item/started" || completed) && (type === "collabAgentToolCall" || type === "subAgentActivity")) {
     return [{ eventType: completed ? "delegation.completed" : "delegation.started", payload: { schema: "paperclip.delegation.v1", delegationId: itemId, action: text(item.tool, "spawnAgent").replace("spawnAgent", "spawn").replace("sendInput", "message").replace("resumeAgent", "resume").replace("closeAgent", "close"), status: completed ? "completed" : "running", children: [] }, itemId }];

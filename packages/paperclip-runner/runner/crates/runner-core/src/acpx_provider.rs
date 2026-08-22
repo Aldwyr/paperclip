@@ -41,6 +41,7 @@ pub struct AcpxProvider {
     last_sequence: u64,
     assistant_text: String,
     provider_requests: u64,
+    agent_process_id: Option<u32>,
 }
 
 impl AcpxProvider {
@@ -71,6 +72,7 @@ impl AcpxProvider {
             last_sequence: 0,
             assistant_text: String::new(),
             provider_requests: 0,
+            agent_process_id: None,
         };
         provider.request(
             GeneratedAcpxSidecarCommand::Initialize,
@@ -97,6 +99,22 @@ impl AcpxProvider {
             return Err(LocalRunnerError::invalid(
                 "ACPX sidecar did not verify the configured effective model",
             ));
+        }
+        if let Some(agent_process) = opened.get("agentProcess").filter(|value| value.is_object()) {
+            provider.agent_process_id = agent_process
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0);
+            provider.inbox.push_back(ProviderEvent::Notification {
+                method: "acpx/process".to_owned(),
+                params: json!({
+                    "role": "acp_agent",
+                    "pid": agent_process.get("pid").and_then(Value::as_u64),
+                    "processGroupId": agent_process.get("processGroupId").and_then(Value::as_u64),
+                    "startedAt": agent_process.get("startedAt").and_then(Value::as_str),
+                }),
+            });
         }
         provider.request(
             GeneratedAcpxSidecarCommand::RunAttach,
@@ -322,6 +340,10 @@ impl Provider for AcpxProvider {
         }
     }
 
+    fn agent_process_id(&self) -> Option<u32> {
+        self.agent_process_id
+    }
+
     fn session_identity(&self) -> &str {
         &self.acpx_record_id
     }
@@ -517,7 +539,7 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
                 Some("@earendil-works/pi-coding-agent"),
                 Some("0.84.2"),
                 "openrouter/deepseek/deepseek-v4-flash-0731",
-                "sha256:5d06b5cfe819b1acd75e8d9dea4766e76a40a64b82549eda08c3835f18bdac24",
+                "sha256:e806321f458baaf23aa5580324d8f90a59082066105eda69de35b1ef0c8418eb",
             ),
             "claude" => (
                 "@agentclientprotocol/claude-agent-acp",
@@ -615,6 +637,13 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
         "thinking" => ProviderEvent::Notification {
             method: "item/started".to_owned(),
             params: json!({ "item": { "type": "reasoning", "status": "inProgress" } }),
+        },
+        "semantic_result" => ProviderEvent::SemanticResult {
+            result: payload.get("result").cloned().unwrap_or(Value::Null),
+            item_id: payload
+                .get("callId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         },
         "status" if payload.get("tag").and_then(Value::as_str) == Some("usage_update") => {
             let breakdown = payload
@@ -720,6 +749,25 @@ mod tests {
                 assert!(!params.to_string().contains("secret"))
             }
             _ => panic!("expected notification"),
+        }
+    }
+
+    #[test]
+    fn maps_runner_owned_terminal_result_without_control_plane_tool_authority() {
+        let result = json!({
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done"
+        });
+        let event = map_runtime_event(
+            json!({ "type": "semantic_result", "callId": "finish-1", "result": result }),
+            1,
+        );
+        match event {
+            ProviderEvent::SemanticResult { result, item_id } => {
+                assert_eq!(result["reportedWorkDisposition"], "done");
+                assert_eq!(item_id.as_deref(), Some("finish-1"));
+            }
+            _ => panic!("expected semantic result"),
         }
     }
 }
