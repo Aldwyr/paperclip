@@ -14,7 +14,10 @@ export function TaskChatActivityPhase({
   const shouldAutoOpen =
     item.active || item.items.some((child) =>
       (child.kind === "thinking" && child.streaming) ||
-      (child.kind === "tool" && child.status === "in_progress"));
+      (child.kind === "tool" && child.status === "in_progress") ||
+      (child.kind === "protocol" && child.surface === "provider_activity" && child.status === "running") ||
+      (child.kind === "protocol" && child.surface === "workspace_change" && !child.complete) ||
+      (child.kind === "protocol" && child.surface === "runtime_request" && child.status === "pending"));
   const [open, setOpen] = useState(shouldAutoOpen);
   useEffect(() => {
     if (shouldAutoOpen) setOpen(true);

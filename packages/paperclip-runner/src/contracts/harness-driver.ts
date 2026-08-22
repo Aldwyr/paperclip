@@ -300,6 +300,20 @@ export interface PersistedHarnessTurnTerminal {
   fingerprint: string;
 }
 
+export interface AcpxSessionIdentity {
+  kind: "acpx";
+  normalizedSessionId: string;
+  acpxRecordId: string;
+  backendSessionId: string;
+  agentSessionId: string;
+  profileDigest: string;
+  workspaceDigest: string;
+  requestedModel: string;
+  effectiveModel: string;
+}
+
+export type PersistedHarnessProviderIdentity = AcpxSessionIdentity;
+
 export interface PersistedHarnessSession {
   driverKind: string;
   driverSessionId: string;
@@ -313,6 +327,8 @@ export interface PersistedHarnessSession {
   goal?: HarnessThreadGoal | null;
   lineage?: HarnessThreadLineageEntry[];
   lastSourceSequence?: number;
+  /** Tagged provider identity used to reject cross-profile recovery. */
+  providerIdentity?: PersistedHarnessProviderIdentity;
 }
 
 export interface HarnessSessionRecoveryResult {
@@ -329,7 +345,10 @@ export interface HarnessSession {
   };
   events(): AsyncIterable<PrpEvent>;
   attachRun?(input: { runId: string }): Promise<void> | void;
-  startTurn(input: { message: NativeUserMessage }): Promise<{ turnId: string }>;
+  startTurn(input: {
+    message: NativeUserMessage;
+    requestedCollaborationMode?: "default" | "plan";
+  }): Promise<{ turnId: string; effectiveCollaborationMode?: "default" | "plan" }>;
   steer?(input: { turnId: string; message: NativeUserMessage }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;
   pendingRuntimeRequests?(): HarnessRuntimeRequest[];

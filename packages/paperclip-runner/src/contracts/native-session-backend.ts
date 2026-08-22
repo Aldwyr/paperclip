@@ -28,6 +28,7 @@ export interface OpenNativeSessionInput {
 
 export interface PersistedNativeSession {
   backendKind: NativeSessionBackendDescriptor["kind"];
+  driverKind?: string | null;
   sessionId: string;
   identity: NativeRunIdentity;
   providerSessionId?: string | null;
@@ -51,7 +52,10 @@ export interface NativeSession {
   capabilities(): Promise<NativeSessionCapabilities>;
   attachRun?(input: { identity: NativeRunIdentity }): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;
-  startTurn(input: { message: NativeUserMessage }): Promise<{ turnId: string }>;
+  startTurn(input: {
+    message: NativeUserMessage;
+    requestedCollaborationMode?: "default" | "plan";
+  }): Promise<{ turnId: string; effectiveCollaborationMode?: "default" | "plan" }>;
   steer?(input: { turnId: string; message: NativeUserMessage }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;
   cancel?(input: { reason: string }): Promise<void>;

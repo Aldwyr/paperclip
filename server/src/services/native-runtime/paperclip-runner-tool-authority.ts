@@ -21,6 +21,7 @@ type Binding = {
   issueId: string;
   runId: string;
   agentId: string;
+  workMode?: "standard" | "planning";
 };
 
 type ToolReceipt = {
@@ -48,8 +49,12 @@ export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
+    const workMode = this.binding.workMode ?? "standard";
     return CAPABILITY_SEMANTIC_TOOL_CATALOG
-      .filter((descriptor) => IMPLEMENTED_OPERATIONS.has(descriptor.operationId))
+      .filter((descriptor) =>
+        IMPLEMENTED_OPERATIONS.has(descriptor.operationId)
+        && descriptor.allowedModes.includes(workMode)
+      )
       .map((descriptor) => ({
         name: descriptor.operationId,
         description: descriptor.description,
@@ -60,6 +65,10 @@ export class PaperclipRunnerToolAuthority {
   async execute(call: { tool: string; callId: string; arguments: unknown }): Promise<unknown> {
     if (!IMPLEMENTED_OPERATIONS.has(call.tool)) throw new Error("paperclip_runner_tool_not_advertised");
     const context = await this.#boundContext();
+    const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find((candidate) => candidate.operationId === call.tool);
+    if (!descriptor?.allowedModes.includes(context.issue.workMode as "standard" | "planning")) {
+      throw new Error("paperclip_runner_tool_mode_denied");
+    }
     const input = record(call.arguments);
     switch (call.tool) {
       case "get_task_context": return {

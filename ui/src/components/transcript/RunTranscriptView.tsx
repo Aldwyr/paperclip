@@ -599,6 +599,38 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
       continue;
     }
 
+    if (entry.kind === "workspace_change") {
+      blocks.push({
+        type: "event",
+        ts: entry.ts,
+        label: entry.complete ? "workspace diff" : "workspace changes",
+        tone: "info",
+        text: `${entry.totals.files} changed ${entry.totals.files === 1 ? "file" : "files"}`,
+        detail: entry.source === "runner_verified" ? "Verified from workspace" : "Reported by harness",
+      });
+      continue;
+    }
+
+    if (entry.kind === "workspace_file_reference") {
+      blocks.push({ type: "event", ts: entry.ts, label: "file reference", tone: "info", text: entry.displayName, detail: entry.path });
+      continue;
+    }
+
+    if (entry.kind === "runtime_request") {
+      blocks.push({ type: "event", ts: entry.ts, label: `runtime ${entry.requestType}`, tone: entry.status === "pending" ? "warn" : "info", text: entry.prompt, detail: entry.status });
+      continue;
+    }
+
+    if (entry.kind === "run_result") {
+      blocks.push({ type: "event", ts: entry.ts, label: `result · ${entry.disposition}`, tone: entry.disposition === "blocked" ? "warn" : "info", text: entry.summary });
+      continue;
+    }
+
+    if (entry.kind === "run_terminal") {
+      blocks.push({ type: "event", ts: entry.ts, label: "terminal", tone: entry.runState === "failed" ? "error" : "info", text: `${entry.runState} · ${entry.disposition}`, detail: entry.stopReason });
+      continue;
+    }
+
     if (entry.kind === "tool_call") {
       const toolUseId = entry.toolUseId ?? extractToolUseId(entry.input);
       // Streaming runtimes (e.g. ACPX) re-emit the same tool call as its
@@ -1720,6 +1752,11 @@ function rawEntryContent(entry: TranscriptEntry): string {
   if (entry.kind === "init") {
     return `model=${entry.model}${entry.sessionId ? ` session=${entry.sessionId}` : ""}`;
   }
+  if (entry.kind === "workspace_change") return `${entry.totals.files} files · ${entry.source} · revision ${entry.revision}`;
+  if (entry.kind === "workspace_file_reference") return `${entry.displayName}\n${entry.path}`;
+  if (entry.kind === "runtime_request") return `${entry.requestType} · ${entry.status}\n${entry.prompt}`;
+  if (entry.kind === "run_result") return `${entry.disposition}\n${entry.summary}`;
+  if (entry.kind === "run_terminal") return `${entry.runState} · ${entry.turnState} · ${entry.disposition}${entry.stopReason ? `\n${entry.stopReason}` : ""}`;
   return entry.text;
 }
 

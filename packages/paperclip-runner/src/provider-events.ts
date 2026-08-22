@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { AcpRuntimeEvent } from "acpx/runtime";
 
 export const PROVIDER_EVENT_FAMILIES = [
   "plan", "tool_execution", "research", "delegation", "model_identity",
@@ -268,6 +269,130 @@ export function canonicalProviderEventsFromOpenCodePart(partValue: unknown): Can
     return [{ eventType: "context.compacted", payload: { schema: "paperclip.context.compacted.v1", compactionId: itemId, reason: "provider", preTokens: null, postTokens: null, sameSession: true }, itemId }];
   }
   return [];
+}
+
+/** Maps ACPX's bounded public runtime events; raw ACP JSON-RPC never enters PRP. */
+export function canonicalProviderEventsFromAcpxRuntimeEvent(
+  event: AcpRuntimeEvent,
+  fallbackItemId: string,
+): CanonicalProviderEvent[] {
+  const runtimeType = text(record(event).type);
+  if (!["text_delta", "status", "tool_call", "error", "done"].includes(runtimeType)) {
+    return [{
+      eventType: "provider.notice.recorded",
+      payload: {
+        schema: "paperclip.provider.notice.v1",
+        noticeId: safeId(`${fallbackItemId}:${runtimeType || "unknown"}`, "acpx-unclassified-update"),
+        severity: "warning",
+        category: `unclassified_acp_${runtimeType || "unknown"}`.slice(0, 160),
+        scope: "turn",
+        recoverable: true,
+        userActionable: false,
+        summary: "The qualified ACP agent emitted an unclassified runtime update.",
+      },
+      itemId: fallbackItemId,
+    }];
+  }
+  const itemId = safeId(
+    event.type === "tool_call" ? text(event.toolCallId, fallbackItemId) : fallbackItemId,
+    "acpx-item",
+  );
+  if (event.type === "tool_call") {
+    const kind = text(event.kind).toLowerCase();
+    const status = canonicalStatus(event.status, "running");
+    const output = typeof event.rawOutput === "string"
+      ? event.rawOutput
+      : event.rawOutput === undefined
+        ? ""
+        : JSON.stringify(event.rawOutput);
+    const operation = /read/.test(kind) ? "read"
+      : /search/.test(kind) ? "search"
+        : /list/.test(kind) ? "list"
+          : /edit|write|delete|move/.test(kind) ? "edit"
+            : /execute|terminal/.test(kind) ? "execute"
+              : "unknown";
+    const payload = {
+      schema: "paperclip.tool.execution.v1",
+      executionId: itemId,
+      transport: "built_in",
+      operation,
+      name: text(event.title) || null,
+      target: safeAcpLocation(event.locations?.[0]),
+      namespace: null,
+      readOnly: ["read", "search", "list"].includes(operation),
+      status,
+      durationMs: null,
+      exitCode: null,
+      progress: status === "running" ? event.text.slice(0, 4000) || null : null,
+      ...boundedOutput(output),
+    };
+    const terminal = status !== "running";
+    return [{
+      eventType: terminal ? "tool.execution.completed" : event.tag === "tool_call" ? "tool.execution.started" : "tool.execution.progressed",
+      payload,
+      itemId,
+    }];
+  }
+  if (event.type === "status" && event.tag === "plan") {
+    const steps = event.text.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 256)
+      .map((body, index) => ({ stepId: `step-${index + 1}`, body: body.slice(0, 4000), status: "pending" }));
+    return [{
+      eventType: "plan.updated",
+      payload: {
+        schema: "paperclip.plan.updated.v1",
+        planId: itemId,
+        revision: 1,
+        explanation: null,
+        steps,
+        complete: true,
+        syncStatus: "pending",
+        documentRevision: null,
+      },
+      itemId,
+    }];
+  }
+  if (event.type === "status" && event.tag === "current_mode_update") {
+    const state = /review|plan/i.test(event.text) ? "entered" : "exited";
+    return [{
+      eventType: "review.mode.changed",
+      payload: {
+        schema: "paperclip.review.mode_changed.v1",
+        reviewId: itemId,
+        state,
+        scope: event.text.slice(0, 4000) || null,
+      },
+      itemId,
+    }];
+  }
+  if (event.type === "status" && event.tag && ![
+    "usage_update",
+    "available_commands_update",
+    "config_option_update",
+    "session_info_update",
+  ].includes(event.tag)) {
+    return [{
+      eventType: "provider.notice.recorded",
+      payload: {
+        schema: "paperclip.provider.notice.v1",
+        noticeId: itemId,
+        severity: "info",
+        category: `acp_${event.tag}`.slice(0, 160),
+        scope: "turn",
+        recoverable: true,
+        userActionable: false,
+        summary: event.text.slice(0, 4000) || "ACP provider update",
+      },
+      itemId,
+    }];
+  }
+  return [];
+}
+
+function safeAcpLocation(value: unknown): string | null {
+  const location = record(value);
+  const raw = text(location.path, text(location.uri)).replaceAll("\\", "/");
+  if (!raw || raw.startsWith("/") || raw.split("/").includes("..") || /^[a-z]+:\/\//i.test(raw)) return null;
+  return raw.slice(0, 4000);
 }
 
 export function providerFamilyCapabilities(

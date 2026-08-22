@@ -347,14 +347,18 @@ export const providerDescriptorSchema = {
       "enum": [
         "codex",
         "opencode",
-        "claude_managed"
+        "claude_managed",
+        "aws_agentcore",
+        "acpx"
       ]
     },
     "driver": {
       "enum": [
         "codex_app_server",
         "opencode_server",
-        "claude_managed_agents_api"
+        "claude_managed_agents_api",
+        "aws_agentcore_harness_api",
+        "acpx_runtime"
       ]
     },
     "model": {
@@ -377,7 +381,8 @@ export const providerDescriptorSchema = {
     },
     "service": {
       "enum": [
-        "anthropic_managed_agents"
+        "anthropic_managed_agents",
+        "aws_bedrock_agentcore_harness"
       ]
     },
     "providerSessionId": {
@@ -393,6 +398,70 @@ export const providerDescriptorSchema = {
         "null"
       ],
       "minimum": 1
+    },
+    "endpointArn": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "endpointQualifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "memoryId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "eventExpiryDays": {
+      "const": 90
+    },
+    "agent": {
+      "enum": [
+        "pi",
+        "claude",
+        "codex"
+      ]
+    },
+    "requestedModel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "acpProtocolVersion": {
+      "const": 1
+    },
+    "agentServerPackage": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "agentServerVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "agentRuntimePackage": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "agentRuntimeVersion": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 120
+    },
+    "acpxRecordId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
     }
   },
   "allOf": [
@@ -427,6 +496,76 @@ export const providerDescriptorSchema = {
         "properties": {
           "service": false
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "claude_managed"
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "properties": {
+          "service": {
+            "const": "anthropic_managed_agents"
+          }
+        },
+        "required": [
+          "service"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "aws_agentcore"
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "properties": {
+          "service": {
+            "const": "aws_bedrock_agentcore_harness"
+          }
+        },
+        "required": [
+          "service",
+          "endpointArn",
+          "endpointQualifier",
+          "memoryId",
+          "eventExpiryDays"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "const": "acpx"
+          }
+        },
+        "required": [
+          "provider"
+        ]
+      },
+      "then": {
+        "required": [
+          "agent",
+          "requestedModel",
+          "acpProtocolVersion",
+          "agentServerPackage",
+          "agentServerVersion",
+          "acpxRecordId"
+        ]
       }
     }
   ],

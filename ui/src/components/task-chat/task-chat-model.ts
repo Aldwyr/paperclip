@@ -13,6 +13,24 @@
  * CSS motion tokens in ui/src/index.css.
  */
 import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
+import type { IssueAttachment, IssueDocumentSummary, IssueWorkProduct } from "@paperclipai/shared";
+
+export type TaskChatProviderActivityFamily =
+  | "plan" | "tool_execution" | "research" | "delegation" | "model_identity"
+  | "context" | "artifact" | "review" | "hook" | "memory" | "safety"
+  | "terminal" | "wait" | "provider_notice";
+
+export type TaskChatProviderActivityStatus = "running" | "completed" | "failed" | "interrupted" | "informational";
+
+export interface TaskChatWorkspaceChangeFile {
+  path: string;
+  operation: "create" | "modify" | "delete" | "rename" | "mode_change";
+  previousPath: string | null;
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+  diff: string | null;
+}
 import type { IssueThreadInteraction } from "@/lib/issue-thread-interactions";
 
 /** Who authored a thread row — the primary legibility signal. */
@@ -202,7 +220,7 @@ export interface TaskChatActivityPhaseItem {
   /** Historical assistant update that introduced this phase. */
   interstitial?: TaskChatMessageItem;
   /** Chronological tool/usage rows owned exclusively by this phase. */
-  items: Array<TaskChatToolItem | TaskChatUsageItem | TaskChatThinkingItem | TaskChatMarkerItem>;
+  items: Array<TaskChatToolItem | TaskChatUsageItem | TaskChatThinkingItem | TaskChatMarkerItem | TaskChatProtocolItem>;
   /** Deterministic, taxonomy-based summary (for example "Read 3 files, ran 1 command"). */
   summary: string;
   /** The tail phase of an in-flight run stays foregrounded. */
@@ -233,6 +251,142 @@ export interface TaskChatInteractionItem {
   interaction: IssueThreadInteraction;
 }
 
+export interface TaskChatProtocolDetail {
+  label: string;
+  value: string;
+  mono?: boolean;
+}
+
+export interface TaskChatProtocolStep {
+  id: string;
+  label: string;
+  status: "pending" | "in_progress" | "completed" | "blocked" | "failed";
+}
+
+export interface TaskChatProtocolLink {
+  label: string;
+  href: string;
+  description?: string;
+}
+
+export interface TaskChatProtocolChild {
+  id: string;
+  title: string;
+  status: string;
+  metadata?: string;
+  summary?: string;
+}
+
+export interface TaskChatProviderActivityItem {
+  id: string;
+  kind: "protocol";
+  surface: "provider_activity";
+  family: TaskChatProviderActivityFamily;
+  eventType: string;
+  status: TaskChatProviderActivityStatus;
+  title: string;
+  summary?: string;
+  details: TaskChatProtocolDetail[];
+  steps: TaskChatProtocolStep[];
+  links: TaskChatProtocolLink[];
+  children: TaskChatProtocolChild[];
+  output?: string;
+  outputTruncated?: boolean;
+}
+
+export interface TaskChatWorkspaceChangeItem {
+  id: string;
+  kind: "protocol";
+  surface: "workspace_change";
+  changeSetId: string;
+  revision: number;
+  source: "harness_reported" | "runner_verified";
+  complete: boolean;
+  files: TaskChatWorkspaceChangeFile[];
+  totals: { files: number; additions: number | null; deletions: number | null };
+  patchArtifactRef: string | null;
+}
+
+export interface TaskChatWorkspaceFileItem {
+  id: string;
+  kind: "protocol";
+  surface: "workspace_file";
+  referenceId: string;
+  source: "harness_reported" | "runner_verified";
+  path: string;
+  displayName: string;
+  mediaType: string | null;
+  presentation: "document" | "code" | "image" | "generic";
+  line: number | null;
+  preview: string | null;
+  previewTruncated: boolean;
+}
+
+export interface TaskChatRuntimeRequestItem {
+  id: string;
+  kind: "protocol";
+  surface: "runtime_request";
+  runId: string;
+  requestId: string;
+  requestKind: "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null;
+  turnId: string | null;
+  requestType: "permission" | "input";
+  status: "pending" | "resolved" | "expired" | "cancelled";
+  prompt: string;
+  choices: Array<{ key: string; label: string }>;
+  fields: Array<{ name: string; label: string; placeholder: string | null }>;
+}
+
+export type TaskChatRuntimeRequestDecision =
+  | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
+  | { action: "submit"; values: Record<string, string> };
+
+export interface TaskChatRunResultItem {
+  id: string;
+  kind: "protocol";
+  surface: "run_result";
+  disposition: "done" | "blocked" | "needs_review" | "yielded";
+  summary: string;
+  objectiveSatisfied: boolean | null;
+  verification: Array<{ commandOrCheck: string; status: "passed" | "failed" | "not_run"; detail?: string; artifactRef?: string }>;
+  remainingWork: Array<{ description: string; blocksCompletion: boolean }>;
+  blocker: { reasonCode: string; unblockAction: string; scope: "current_track" | "task_wide" } | null;
+  artifacts: Array<{ kind: string; ref: string; title?: string }>;
+}
+
+export interface TaskChatRunTerminalItem {
+  id: string;
+  kind: "protocol";
+  surface: "run_terminal";
+  turnState: "completed" | "failed" | "interrupted" | "cancelled";
+  runState: "succeeded" | "failed" | "cancelled";
+  disposition: "done" | "blocked" | "needs_review" | "yielded";
+  stopReason?: string;
+}
+
+export interface TaskChatMaterializedResourceItem {
+  id: string;
+  kind: "protocol";
+  surface: "resource";
+  resourceKind: "document" | "deliverable" | "attachment";
+  title: string;
+  subtitle: string;
+  href: string | null;
+  timestamp?: string;
+  document?: IssueDocumentSummary;
+  workProduct?: IssueWorkProduct;
+  attachment?: IssueAttachment;
+}
+
+export type TaskChatProtocolItem =
+  | TaskChatProviderActivityItem
+  | TaskChatWorkspaceChangeItem
+  | TaskChatWorkspaceFileItem
+  | TaskChatRuntimeRequestItem
+  | TaskChatRunResultItem
+  | TaskChatRunTerminalItem
+  | TaskChatMaterializedResourceItem;
+
 /** Items a turn can group — everything except another turn. */
 export type TaskChatTurnChildItem =
   | TaskChatMessageItem
@@ -241,7 +395,8 @@ export type TaskChatTurnChildItem =
   | TaskChatStatusItem
   | TaskChatMarkerItem
   | TaskChatUsageItem
-  | TaskChatActivityPhaseItem;
+  | TaskChatActivityPhaseItem
+  | TaskChatProtocolItem;
 
 /**
  * One agent turn's activity (thinking/tools/diffs) grouped so a finished turn
@@ -290,7 +445,8 @@ export type TaskChatItem =
   | TaskChatActivityPhaseItem
   | TaskChatInteractionItem
   | TaskChatTurnItem
-  | TaskChatBriefItem;
+  | TaskChatBriefItem
+  | TaskChatProtocolItem;
 
 /** A structured plan entry (ACP PlanEntry) for the Plans tab. */
 export interface TaskChatPlanEntry {

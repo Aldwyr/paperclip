@@ -4449,6 +4449,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/heartbeat-runs/{runId}/runtime-requests/{requestId}/resolve",
+  tags: ["runs"],
+  summary: "Resolve a pending Paperclip runner runtime request",
+  request: {
+    params: z.object({ runId: z.string(), requestId: z.string() }),
+    body: jsonBody(z.object({
+      turnId: z.string().min(1).max(160),
+      requestKind: z.enum(["command_approval", "file_approval", "permission_approval", "user_input", "elicitation"]),
+      resolution: z.union([
+        z.object({ action: z.enum(["accept", "accept_for_session", "decline", "cancel"]) }),
+        z.object({ action: z.literal("submit"), answers: z.record(z.string(), z.object({ answers: z.array(z.string()) })) }),
+        z.object({ action: z.literal("submit"), content: z.record(z.string(), z.unknown()) }),
+      ]),
+    })),
+  },
+  responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/heartbeat-runs/{runId}/watchdog-decisions",
   tags: ["runs"],
   summary: "Submit watchdog decisions for a run",

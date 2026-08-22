@@ -25,6 +25,11 @@ const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.
 const adapterUtilsPackage = JSON.parse(
   await readFile(new URL("../packages/adapter-utils/package.json", import.meta.url), "utf8"),
 );
+const runnerPackage = JSON.parse(
+  await readFile(new URL("../packages/paperclip-runner/package.json", import.meta.url), "utf8"),
+);
+const acpxRuntimePatch = await readFile(new URL("../patches/acpx@0.13.1.patch", import.meta.url), "utf8");
+const piAcpPatch = await readFile(new URL("../patches/pi-acp@0.0.33.patch", import.meta.url), "utf8");
 const dbPackage = JSON.parse(
   await readFile(new URL("../packages/db/package.json", import.meta.url), "utf8"),
 );
@@ -34,13 +39,29 @@ const buildNpmScript = await readFile(new URL("./build-npm.sh", import.meta.url)
 
 test("published packages preserve the patched ACPX runtime", () => {
   assert.equal(
-    rootPackage.pnpm.patchedDependencies["acpx@0.12.0"],
-    "patches/acpx@0.12.0.patch",
+    rootPackage.pnpm.patchedDependencies["acpx@0.13.1"],
+    "patches/acpx@0.13.1.patch",
   );
-  assert.equal(adapterUtilsPackage.dependencies.acpx, "0.12.0");
+  assert.equal(adapterUtilsPackage.dependencies.acpx, "0.13.1");
   assert.deepEqual(adapterUtilsPackage.bundleDependencies, ["acpx"]);
   assert.equal(bundledCliNpmDependencies.has("acpx"), true);
   assert.equal(cliEsbuildConfig.external.includes("acpx"), false);
+});
+
+test("Paperclip Runner pins the qualified ACPX host and Pi isolation callbacks", () => {
+  assert.equal(rootPackage.pnpm.patchedDependencies["acpx@0.13.1"], "patches/acpx@0.13.1.patch");
+  assert.equal(rootPackage.pnpm.patchedDependencies["pi-acp@0.0.33"], "patches/pi-acp@0.0.33.patch");
+  assert.equal(runnerPackage.dependencies.acpx, "0.13.1");
+  assert.equal(runnerPackage.dependencies["pi-acp"], "0.0.33");
+  assert.equal(runnerPackage.dependencies["@earendil-works/pi-coding-agent"], "0.84.2");
+  assert.equal(runnerPackage.dependencies["@agentclientprotocol/claude-agent-acp"], "0.70.0");
+  assert.equal(runnerPackage.dependencies["@agentclientprotocol/codex-acp"], "1.6.2");
+  for (const callback of [
+    "spawnEnvironment", "spawnCwd", "onAgentSpawn", "onAgentStderr", "onAgentExit",
+    "onSessionNotification", "onClientOperation",
+  ]) assert.match(acpxRuntimePatch, new RegExp(callback));
+  assert.match(piAcpPatch, /PI_ACP_PI_ARGS_JSON/);
+  assert.match(piAcpPatch, /sessionUpdate: "usage_update"/);
 });
 
 test("published packages preserve the patched embedded-postgres runtime", () => {

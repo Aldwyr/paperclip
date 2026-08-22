@@ -518,6 +518,52 @@ export interface ServerAdapterModule {
 // UI types (moved from ui/src/adapters/types.ts)
 // ---------------------------------------------------------------------------
 
+export type ProviderActivityFamily =
+  | "plan"
+  | "tool_execution"
+  | "research"
+  | "delegation"
+  | "model_identity"
+  | "context"
+  | "artifact"
+  | "review"
+  | "hook"
+  | "memory"
+  | "safety"
+  | "terminal"
+  | "wait"
+  | "provider_notice";
+
+export type ProviderActivityStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "informational";
+
+export interface TranscriptWorkspaceChangeFile {
+  path: string;
+  operation: "create" | "modify" | "delete" | "rename" | "mode_change";
+  previousPath: string | null;
+  additions: number | null;
+  deletions: number | null;
+  binary: boolean;
+  diff: string | null;
+}
+
+export interface TranscriptRunVerification {
+  commandOrCheck: string;
+  status: "passed" | "failed" | "not_run";
+  detail?: string;
+  artifactRef?: string;
+}
+
+export interface TranscriptRunArtifact {
+  kind: string;
+  ref: string;
+  title?: string;
+}
+
 export type TranscriptEntry =
   | { kind: "assistant"; ts: string; text: string; delta?: boolean; channel?: "progress" | "final" | "unknown" }
   | { kind: "thinking"; ts: string; text: string; delta?: boolean; channel?: "summary" | "detail" | "unknown" }
@@ -530,7 +576,12 @@ export type TranscriptEntry =
   | { kind: "system"; ts: string; text: string }
   | { kind: "stdout"; ts: string; text: string }
   | { kind: "diff"; ts: string; changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation"; text: string }
-  | { kind: "provider_activity"; ts: string; family: "plan" | "tool_execution" | "research" | "delegation" | "model_identity" | "context" | "artifact" | "review" | "hook" | "memory" | "safety" | "terminal" | "wait" | "provider_notice"; eventType: string; status: "running" | "completed" | "failed" | "interrupted" | "informational"; title: string; summary: string; payload: Record<string, unknown> };
+  | { kind: "provider_activity"; ts: string; family: ProviderActivityFamily; eventType: string; status: ProviderActivityStatus; title: string; summary: string; payload: Record<string, unknown> }
+  | { kind: "workspace_change"; ts: string; changeSetId: string; revision: number; source: "harness_reported" | "runner_verified"; complete: boolean; files: TranscriptWorkspaceChangeFile[]; totals: { files: number; additions: number | null; deletions: number | null }; patchArtifactRef: string | null }
+  | { kind: "workspace_file_reference"; ts: string; referenceId: string; source: "harness_reported" | "runner_verified"; path: string; displayName: string; mediaType: string | null; presentation: "document" | "code" | "image" | "generic"; line: number | null; preview: string | null; previewTruncated: boolean; contentDigest: string | null }
+  | { kind: "runtime_request"; ts: string; requestId: string; requestKind: "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null; turnId: string | null; requestType: "permission" | "input"; status: "pending" | "resolved" | "expired" | "cancelled"; prompt: string; choices: Array<{ key: string; label: string }>; fields: Array<{ name: string; label: string; placeholder: string | null }> }
+  | { kind: "run_result"; ts: string; disposition: "done" | "blocked" | "needs_review" | "yielded"; summary: string; objectiveSatisfied: boolean | null; verification: TranscriptRunVerification[]; remainingWork: Array<{ description: string; blocksCompletion: boolean }>; blocker: { reasonCode: string; unblockAction: string; scope: "current_track" | "task_wide" } | null; artifacts: TranscriptRunArtifact[] }
+  | { kind: "run_terminal"; ts: string; turnState: "completed" | "failed" | "interrupted" | "cancelled"; runState: "succeeded" | "failed" | "cancelled"; disposition: "done" | "blocked" | "needs_review" | "yielded"; stopReason?: string };
 
 export type StdoutLineParser = (line: string, ts: string) => TranscriptEntry[];
 

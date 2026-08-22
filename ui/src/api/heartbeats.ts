@@ -80,6 +80,18 @@ export interface WatchdogDecisionInput {
   snoozedUntil?: string | null;
 }
 
+export type RuntimeRequestKind =
+  | "command_approval"
+  | "file_approval"
+  | "permission_approval"
+  | "user_input"
+  | "elicitation";
+
+export type RuntimeRequestResolution =
+  | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
+  | { action: "submit"; answers: Record<string, { answers: string[] }> }
+  | { action: "submit"; content: Record<string, unknown> };
+
 export interface HeartbeatRunListOptions {
   summary?: boolean;
 }
@@ -109,6 +121,20 @@ export const heartbeatsApi = {
       `/workspace-operations/${operationId}/log?offset=${encodeURIComponent(String(offset))}&limitBytes=${encodeURIComponent(String(limitBytes))}`,
     ),
   cancel: (runId: string) => api.post<void>(`/heartbeat-runs/${runId}/cancel`, {}),
+  resolveRuntimeRequest: (input: {
+    runId: string;
+    requestId: string;
+    turnId: string;
+    requestKind: RuntimeRequestKind;
+    resolution: RuntimeRequestResolution;
+  }) => api.post<{ accepted: true; commandId: string }>(
+    `/heartbeat-runs/${input.runId}/runtime-requests/${encodeURIComponent(input.requestId)}/resolve`,
+    {
+      turnId: input.turnId,
+      requestKind: input.requestKind,
+      resolution: input.resolution,
+    },
+  ),
   recordWatchdogDecision: (input: WatchdogDecisionInput) =>
     api.post(`/heartbeat-runs/${input.runId}/watchdog-decisions`, {
       decision: input.decision,

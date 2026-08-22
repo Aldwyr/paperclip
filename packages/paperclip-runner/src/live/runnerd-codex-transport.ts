@@ -12,7 +12,10 @@ import type {
   CodexTransportProcessInfo,
 } from "../drivers/codex/app-server-transport.js";
 import { createSanitizedCodexEnvironment } from "../drivers/codex/app-server-transport.js";
-import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
+import {
+  codexSemanticToolSpecs,
+  createIsolatedCodexAppServerArgs,
+} from "../drivers/codex/codex-app-server-driver.js";
 import type { DurableRecoveryIdentity } from "../contracts/durable-recovery.js";
 import {
   DurablePrpControlPlane,
@@ -21,6 +24,8 @@ import {
   waitForProcess,
   type RunnerProcessHandle,
 } from "../control-plane/durable-prp-control-plane.js";
+import { resolveQualifiedAcpxProfile, type QualifiedAcpxAgent } from "../drivers/acpx/qualified-profiles.js";
+import { createSanitizedAcpxEnvironment } from "../drivers/acpx/environment.js";
 
 const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
@@ -46,9 +51,18 @@ function recoveredControlPlaneIdentity(
 export interface CapabilityRunnerdProcessEvidence {
   runnerPid: number | null;
   runnerProcessGroupId: number | null;
+  providerPid: number | null;
   codexPid: number | null;
+  sidecarPid: number | null;
+  agentPid: number | null;
+  providerDriver: string | null;
+  providerVersion: string | null;
+  acpxAgent: QualifiedAcpxAgent | null;
+  agentServerVersion: string | null;
+  agentRuntimeVersion: string | null;
+  acpProtocolVersion: number | null;
   providerExecutionKind: "local_process" | "remote_service" | null;
-  providerService: "anthropic_managed_agents" | null;
+  providerService: "anthropic_managed_agents" | "aws_bedrock_agentcore_harness" | null;
   runnerExited: boolean;
   runnerExitCode: number | null;
   runnerSignal: NodeJS.Signals | null;
@@ -57,7 +71,10 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions {
-  provider?: "codex" | "opencode" | "claude_managed";
+  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  acpxAgent?: QualifiedAcpxAgent;
+  acpxSidecarPath?: string;
+  acpxRuntimeDirectory?: string;
   managedProfile?: {
     profileId: string;
     anthropicAgentId: string;
@@ -65,6 +82,26 @@ export interface CapabilityRunnerdCodexTransportOptions {
     environmentId: string;
     betaVersion: "managed-agents-2026-04-01";
     maxSessionListCostUsd: number;
+    model: string;
+  };
+  agentCoreProfile?: {
+    profileId: string;
+    region: string;
+    accountId: string;
+    harnessArn: string;
+    harnessVersion: string;
+    endpointArn: string;
+    endpointQualifier: string;
+    agentRuntimeArn: string;
+    memoryArn: string;
+    memoryId: string;
+    invocationRoleArn: string;
+    qualificationRevision: string;
+    eventExpiryDays: 90;
+    maxEstimatedSessionCostUsd: number;
+    maxIterations: number;
+    maxOutputTokens: number;
+    timeoutSeconds: number;
     model: string;
   };
   runnerBinary?: string;
@@ -240,6 +277,21 @@ function createSanitizedClaudeManagedEnvironment(environment: NodeJS.ProcessEnv 
   return result;
 }
 
+export function createSanitizedAwsAgentCoreEnvironment(environment: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
+  const source = environment ?? process.env;
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "RUST_BACKTRACE", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  ]) {
+    if (typeof source[key] === "string") result[key] = source[key];
+  }
+  return result;
+}
+
 function unwrapToolResponse(response: Record<string, unknown>): Record<string, unknown> {
   const items = Array.isArray(response.contentItems) ? response.contentItems : [];
   const value = record(items[0]).text;
@@ -282,13 +334,25 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#ownsRoot = options.stateDirectory === undefined;
     this.#root = options.stateDirectory ?? mkdtempSync(resolve(tmpdir(), "paperclip-runner-lab-prp-"));
     if (options.resumeDynamicTools !== undefined) {
-      this.#authorizedTools = authorizedToolSet(options.resumeDynamicTools);
+      this.#authorizedTools = authorizedToolSet([
+        ...options.resumeDynamicTools,
+        ...codexSemanticToolSpecs(),
+      ]);
     }
     mkdirSync(this.#root, { recursive: true, mode: 0o700 });
     this.#evidence = {
       runnerPid: null,
       runnerProcessGroupId: null,
+      providerPid: null,
       codexPid: null,
+      sidecarPid: null,
+      agentPid: null,
+      providerDriver: null,
+      providerVersion: null,
+      acpxAgent: null,
+      agentServerVersion: null,
+      agentRuntimeVersion: null,
+      acpProtocolVersion: null,
       providerExecutionKind: null,
       providerService: null,
       runnerExited: false,
@@ -297,6 +361,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       childEnvironmentKeys: Object.keys(
         options.provider === "claude_managed"
           ? createSanitizedClaudeManagedEnvironment(options.environment)
+          : options.provider === "aws_agentcore"
+            ? createSanitizedAwsAgentCoreEnvironment(options.environment)
+          : options.provider === "acpx"
+            ? createSanitizedAcpxEnvironment(options.environment, options.acpxAgent ?? "pi")
           : createSanitizedCodexEnvironment(options.environment),
       ).sort(),
       diagnostics: ["lab transport selected authenticated durable PRP"],
@@ -312,6 +380,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#throwIfFailed();
     if (method === "initialize") return { user: {} };
     if (method === "thread/start") return this.#start(params);
+    if (method === "collaborationMode/list") {
+      // runnerd already negotiated the real preset with the provider during
+      // session.open. This transport-level mask confirms that closed boundary;
+      // turn/start remains runner-managed and never forwards this sentinel.
+      return this.options.provider === undefined || this.options.provider === "codex"
+        ? { data: [{ name: "Plan", mode: "plan", model: "runner-managed", reasoning_effort: null }] }
+        : { data: [] };
+    }
     if (method === "turn/start") return this.#startTurn(params);
     if (method === "turn/interrupt") {
       await this.#command("turn.interrupt", params);
@@ -319,7 +395,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     if (method === "thread/read") {
       if (this.#core === null) await this.#resume();
-      return this.#commandResult("provider.thread.read", {});
+      const result = await this.#commandResult("provider.thread.read", {});
+      if (this.options.provider !== "claude_managed" && this.options.provider !== "aws_agentcore") return result;
+      const session = record(result.session);
+      return {
+        ...result,
+        thread: {
+          id: this.#threadId,
+          sessionId: this.#sessionId,
+          turns: [],
+          ...(session.usage === undefined ? {} : { tokenUsage: session.usage }),
+        },
+      };
     }
     if (method === "session/budget/increase") {
       await this.#command("session.budget.increase", params);
@@ -362,6 +449,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       itemId: input.itemId,
       ...(this.#authorizedTools === null ? {} : { authorizedTools: this.#authorizedTools }),
     });
+    await this.#waitForAttachment(input.runId);
+    this.#turnId = input.turnId;
+  }
+
+  async #waitForAttachment(runId: string): Promise<void> {
     const core = this.#core;
     const attachDeadline = Date.now() + 10_000;
     let attachmentDrained = false;
@@ -369,7 +461,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const durable = record(JSON.parse(readFileSync(resolve(this.#root, "runner", "runner-state.json"), "utf8")));
       const attached = core.store.state.committedEvents.find((event) =>
         event.eventType === "run.attached"
-        && record(record(event.envelope.payload).payload).runId === input.runId
+        && record(record(event.envelope.payload).payload).runId === runId
       );
       if (attached && Number(durable.ackedSourceSeq ?? 0) >= attached.sourceSeq) {
         attachmentDrained = true;
@@ -379,14 +471,23 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
     if (!attachmentDrained) throw new Error("runnerd did not durably acknowledge the run attachment");
-    this.#turnId = input.turnId;
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#core !== null && this.#handle !== null) {
-      this.#core.queueCommand("runner.suspend", {}, undefined, true);
+      const perTurnAlreadySuspending = this.options.lifecyclePolicy?.mode === "per_turn"
+        && this.#core.store.state.committedEvents.some((event) =>
+          event.eventType === "runner.suspending"
+          || event.eventType === "turn.completed"
+          || event.eventType === "turn.failed"
+          || event.eventType === "turn.interrupted"
+          || event.eventType === "turn.cancelled"
+        );
+      if (!perTurnAlreadySuspending) {
+        this.#core.queueCommand("runner.suspend", {}, undefined, true);
+      }
       try {
         const result = await waitForProcess(this.#handle, this.options.closeGraceMs ?? 10_000);
         this.#evidence.runnerExited = true;
@@ -441,11 +542,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const provider = this.options.provider ?? "codex";
     const opencodeProxyPath = this.options.opencodeProxyPath
       ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
+    const acpxSidecarPath = this.options.acpxSidecarPath
+      ?? fileURLToPath(new URL("../cli/acpx-runtime-sidecar.js", import.meta.url));
     this.#authorizedTools = authorizedToolSet(dynamicTools);
     const managed = this.options.managedProfile;
+    const agentCore = this.options.agentCoreProfile;
     if (provider === "claude_managed" && managed === undefined) {
       throw new Error("Claude Agent runner transport requires a managed profile snapshot");
     }
+    if (provider === "aws_agentcore" && agentCore === undefined) {
+      throw new Error("AWS AgentCore runner transport requires a qualified profile snapshot");
+    }
+    const acpxAgent = provider === "acpx" ? this.options.acpxAgent ?? "pi" : null;
+    const requestedModel = typeof params.model === "string" ? params.model : "";
+    const acpxProfile = provider === "acpx"
+      ? resolveQualifiedAcpxProfile(acpxAgent!, requestedModel)
+      : null;
     core.queueCommand("run.prepare", {
       authorizedTools: this.#authorizedTools,
       provider: provider === "claude_managed" ? {
@@ -457,6 +569,44 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         environmentId: managed!.environmentId,
         betaVersion: managed!.betaVersion,
         maxSessionListCostUsd: managed!.maxSessionListCostUsd,
+      } : provider === "aws_agentcore" ? {
+        kind: "aws_agentcore",
+        model: agentCore!.model,
+        profileId: agentCore!.profileId,
+        region: agentCore!.region,
+        accountId: agentCore!.accountId,
+        harnessArn: agentCore!.harnessArn,
+        harnessVersion: agentCore!.harnessVersion,
+        endpointArn: agentCore!.endpointArn,
+        endpointQualifier: agentCore!.endpointQualifier,
+        agentRuntimeArn: agentCore!.agentRuntimeArn,
+        memoryArn: agentCore!.memoryArn,
+        memoryId: agentCore!.memoryId,
+        invocationRoleArn: agentCore!.invocationRoleArn,
+        qualificationRevision: agentCore!.qualificationRevision,
+        eventExpiryDays: agentCore!.eventExpiryDays,
+        maxEstimatedSessionCostUsd: agentCore!.maxEstimatedSessionCostUsd,
+        maxIterations: agentCore!.maxIterations,
+        maxOutputTokens: agentCore!.maxOutputTokens,
+        timeoutSeconds: agentCore!.timeoutSeconds,
+      } : provider === "acpx" ? {
+        kind: "acpx",
+        agent: acpxProfile!.agent,
+        model: requestedModel,
+        acpxVersion: acpxProfile!.acpxVersion,
+        agentServerPackage: acpxProfile!.agentServerPackage,
+        agentServerVersion: acpxProfile!.agentServerVersion,
+        agentRuntimePackage: acpxProfile!.agentRuntimePackage,
+        agentRuntimeVersion: acpxProfile!.agentRuntimeVersion,
+        commandDigest: acpxProfile!.commandDigest,
+        sidecarCommand: process.execPath,
+        sidecarArgs: [acpxSidecarPath],
+        runtimeDirectory: this.options.acpxRuntimeDirectory ?? resolve(this.#root, "acpx"),
+        normalizedSessionId: identity.normalizedSessionId,
+        runId: identity.runId,
+        cwd: String(params.cwd ?? tmpdir()),
+        instructions: String(params.baseInstructions ?? "You are a Paperclip agent."),
+        permissionPolicy: "interactive",
       } : {
         kind: provider,
         command: provider === "opencode" ? process.execPath : this.options.codexCommand ?? "codex",
@@ -464,6 +614,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         cwd: String(params.cwd ?? tmpdir()),
         model: typeof params.model === "string" ? params.model : null,
         instructions: String(params.baseInstructions ?? "You are a Paperclip agent."),
+        collaborationMode: params.permissions === "paperclip-runner-workspace-read-only"
+          ? "plan"
+          : "default",
       },
     });
     core.queueCommand("session.open", { reuse: "same_session" });
@@ -492,8 +645,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             PAPERCLIP_RUN_ID: identity.runId,
             PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
           }
+        : provider === "acpx"
+          ? {
+              ...createSanitizedAcpxEnvironment(this.options.environment, acpxAgent!),
+              PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+              PAPERCLIP_RUN_ID: identity.runId,
+              PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+            }
         : provider === "claude_managed"
           ? createSanitizedClaudeManagedEnvironment(this.options.environment)
+          : provider === "aws_agentcore"
+            ? createSanitizedAwsAgentCoreEnvironment(this.options.environment)
           : this.options.environment,
     });
     this.#handle = handle;
@@ -513,8 +675,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         model: params.model,
         modelProvider: provider === "claude_managed"
           ? "anthropic"
+          : provider === "aws_agentcore"
+          ? "amazon-bedrock"
           : provider === "opencode" && typeof params.model === "string"
           ? params.model.split("/", 1)[0]
+          : provider === "acpx"
+          ? acpxAgent === "pi" ? "openrouter" : acpxAgent === "claude" ? "anthropic" : "openai"
           : "openai",
       },
     };
@@ -527,6 +693,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     const controlPlaneDirectory = resolve(this.#root, "control-plane");
     const identity = recoveredControlPlaneIdentity(controlPlaneDirectory, desiredIdentity);
+    const attachingNewRun = identity.runId !== desiredIdentity.runId;
     const core = new DurablePrpControlPlane({
       stateDirectory: controlPlaneDirectory,
       identity,
@@ -562,6 +729,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerBinaryPath: this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
       environment: this.options.provider === "claude_managed"
         ? createSanitizedClaudeManagedEnvironment(this.options.environment)
+        : this.options.provider === "aws_agentcore"
+          ? createSanitizedAwsAgentCoreEnvironment(this.options.environment)
+        : this.options.provider === "acpx"
+          ? createSanitizedAcpxEnvironment(this.options.environment, this.options.acpxAgent ?? "pi")
         : this.options.environment,
     });
     this.#handle = handle;
@@ -572,7 +743,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     await this.#waitForProviderIdentity();
     if (
-      identity.runId !== desiredIdentity.runId
+      attachingNewRun
       || identity.turnId !== desiredIdentity.turnId
       || identity.itemId !== desiredIdentity.itemId
     ) {
@@ -653,7 +824,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#pumpEvents();
       if (
         this.#threadId.length > 0
-        && (this.#evidence.providerExecutionKind === "remote_service" || this.#evidence.codexPid !== null)
+        && (this.#evidence.providerExecutionKind === "remote_service" || this.#evidence.providerPid !== null)
       ) return;
       if (this.#handle?.child.exitCode !== null) throw new Error("runnerd exited before provider startup");
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
@@ -692,18 +863,35 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         const threadId = started.threadId;
         const sessionId = started.sessionId;
         if (typeof pid === "number") {
-          this.#evidence.codexPid = pid;
+          this.#evidence.providerPid = pid;
+          if (descriptor.driver === "acpx_runtime") this.#evidence.sidecarPid = pid;
+          else this.#evidence.codexPid = pid;
         }
+        if (typeof descriptor.driver === "string") this.#evidence.providerDriver = descriptor.driver;
+        if (typeof descriptor.providerVersion === "string") this.#evidence.providerVersion = descriptor.providerVersion;
+        if (descriptor.agent === "pi" || descriptor.agent === "claude" || descriptor.agent === "codex") this.#evidence.acpxAgent = descriptor.agent;
+        if (typeof descriptor.agentServerVersion === "string") this.#evidence.agentServerVersion = descriptor.agentServerVersion;
+        if (typeof descriptor.agentRuntimeVersion === "string") this.#evidence.agentRuntimeVersion = descriptor.agentRuntimeVersion;
+        if (typeof descriptor.acpProtocolVersion === "number") this.#evidence.acpProtocolVersion = descriptor.acpProtocolVersion;
         if (runtimeIdentity.executionKind === "local_process" || runtimeIdentity.executionKind === "remote_service") {
           this.#evidence.providerExecutionKind = runtimeIdentity.executionKind;
         }
         if (runtimeIdentity.service === "anthropic_managed_agents") {
           this.#evidence.providerService = "anthropic_managed_agents";
+        } else if (runtimeIdentity.service === "aws_bedrock_agentcore_harness") {
+          this.#evidence.providerService = "aws_bedrock_agentcore_harness";
         }
         if (typeof threadId === "string") this.#threadId = threadId;
         if (typeof sessionId === "string") this.#sessionId = sessionId;
         this.#publish();
         continue;
+      }
+      if (event.eventType === "harness.diagnostic") {
+        const diagnostic = record(record(event.envelope.payload).payload);
+        if (diagnostic.providerMethod === "acpx/process" && diagnostic.role === "acp_agent" && typeof diagnostic.pid === "number") {
+          this.#evidence.agentPid = diagnostic.pid;
+          this.#publish();
+        }
       }
       const eventPayload = record(event.envelope.payload).payload;
       const sessionUpdatePayload = record(eventPayload);

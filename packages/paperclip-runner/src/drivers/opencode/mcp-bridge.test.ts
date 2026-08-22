@@ -44,6 +44,24 @@ describe("OpenCode MCP bridge", () => {
     });
   });
 
+  it("admits runner-private extension operations without advertising them to the model", async () => {
+    const handler = vi.fn(async ({ tool }) => ({ decision: tool === "__paperclip_permission" ? "accept" : "decline" }));
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "documents.read", inputSchema: { type: "object" } }],
+      privateTools: [{ name: "__paperclip_permission", inputSchema: { type: "object" } }],
+      handler,
+    });
+    bridges.push(bridge);
+    const listed = await (await rpc(bridge, { id: 1, method: "tools/list" })).json() as { result: { tools: Array<{ name: string }> } };
+    expect(listed.result.tools.map((tool) => tool.name)).not.toContain("__paperclip_permission");
+    expect(await (await rpc(bridge, {
+      id: "permission-1",
+      method: "tools/call",
+      params: { name: "__paperclip_permission", arguments: {} },
+    })).json()).toMatchObject({ result: { content: [{ text: "{\"decision\":\"accept\"}" }] } });
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ tool: "__paperclip_permission" }));
+  });
+
   it("maps prefixed names and replays identical duplicate calls exactly once", async () => {
     const handler = vi.fn(async () => ({ value: 7 }));
     const bridge = await startOpenCodeMcpBridge({

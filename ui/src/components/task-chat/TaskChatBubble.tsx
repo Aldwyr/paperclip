@@ -157,7 +157,6 @@ export function TaskChatBubble({
             isHuman
               ? "max-w-(--pct-85) rounded-2xl rounded-br-sm bg-(--liveness-blue) px-3.5 text-white"
               : "w-full bg-transparent px-1 text-foreground",
-            item.optimistic ? "opacity-80" : null,
           )}
         >
           <MarkdownBody
@@ -185,7 +184,7 @@ export function TaskChatBubble({
             const kind = fileKindForName(ref.name);
             const KindIcon = kind.icon;
             return (
-              <Attachment key={ref.url} size="sm" className={cn(item.optimistic && "opacity-80")}>
+              <Attachment key={ref.url} size="sm">
                 <AttachmentMedia>
                   <KindIcon aria-hidden />
                 </AttachmentMedia>

@@ -1,0 +1,725 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::codex_provider::{
+    AcpxProviderConfig, Provider, ProviderEvent, ProviderKind, ProviderRuntimeIdentity,
+    ProviderSessionIdentity,
+};
+use crate::generated_acpx_sidecar_contract::{
+    GeneratedAcpxSidecarCommand, GeneratedAcpxSidecarEventType,
+    GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+};
+use crate::local_runner::LocalRunnerError;
+use crate::process_supervisor::SupervisedProcess;
+use crate::provider_bridge::{AuthorizedTool, ToolResult};
+
+const ACPX_SIDECAR_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct PendingTool {
+    operation_id: String,
+    input: Value,
+    turn_id: String,
+}
+
+pub struct AcpxProvider {
+    process: SupervisedProcess,
+    next_request_id: u64,
+    inbox: VecDeque<ProviderEvent>,
+    pending_tools: BTreeMap<String, PendingTool>,
+    config: AcpxProviderConfig,
+    tools: Vec<AuthorizedTool>,
+    catalog_revision: u64,
+    acpx_record_id: String,
+    backend_session_id: String,
+    agent_session_id: String,
+    active_turn_id: Option<String>,
+    last_sequence: u64,
+    assistant_text: String,
+    provider_requests: u64,
+}
+
+impl AcpxProvider {
+    pub fn start(
+        config: &AcpxProviderConfig,
+        tools: Vec<AuthorizedTool>,
+        expected_identity: Option<&ProviderSessionIdentity>,
+    ) -> Result<Self, LocalRunnerError> {
+        validate_config(config)?;
+        let process = SupervisedProcess::spawn(
+            Path::new(&config.sidecar_command),
+            &config.sidecar_args,
+            Duration::from_secs(3),
+            ACPX_SIDECAR_MAX_FRAME_BYTES,
+        )?;
+        let mut provider = Self {
+            process,
+            next_request_id: 1,
+            inbox: VecDeque::new(),
+            pending_tools: BTreeMap::new(),
+            config: config.clone(),
+            tools,
+            catalog_revision: 1,
+            acpx_record_id: String::new(),
+            backend_session_id: String::new(),
+            agent_session_id: String::new(),
+            active_turn_id: None,
+            last_sequence: 0,
+            assistant_text: String::new(),
+            provider_requests: 0,
+        };
+        provider.request(
+            GeneratedAcpxSidecarCommand::Initialize,
+            json!({ "agent": config.agent, "model": config.model }),
+        )?;
+        let opened = provider.request(
+            GeneratedAcpxSidecarCommand::SessionOpen,
+            json!({
+                "runtimeDirectory": config.runtime_directory,
+                "normalizedSessionId": config.normalized_session_id,
+                "workingDirectory": config.cwd,
+                "agent": config.agent,
+                "model": config.model,
+                "tools": provider.tools,
+                "expectedIdentity": expected_identity,
+            }),
+        )?;
+        let identity = opened.get("identity").unwrap_or(&Value::Null);
+        provider.acpx_record_id = required_text(identity, "acpxRecordId", "ACPX record")?;
+        provider.backend_session_id =
+            required_text(identity, "backendSessionId", "backend session")?;
+        provider.agent_session_id = required_text(identity, "agentSessionId", "agent session")?;
+        if identity.get("effectiveModel").and_then(Value::as_str) != Some(config.model.as_str()) {
+            return Err(LocalRunnerError::invalid(
+                "ACPX sidecar did not verify the configured effective model",
+            ));
+        }
+        provider.request(
+            GeneratedAcpxSidecarCommand::RunAttach,
+            json!({
+                "runId": config.run_id,
+                "catalogRevision": provider.catalog_revision,
+                "tools": provider.tools,
+            }),
+        )?;
+        Ok(provider)
+    }
+
+    fn request(
+        &mut self,
+        command: GeneratedAcpxSidecarCommand,
+        params: Value,
+    ) -> Result<Value, LocalRunnerError> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.process.send(&json!({
+            "protocolVersion": GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
+            "id": id,
+            "command": command.as_str(),
+            "params": params,
+        }))?;
+        loop {
+            let line = self
+                .process
+                .receive_stdout_line(Duration::from_secs(30))?
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid(format!(
+                        "ACPX sidecar {} response timed out",
+                        command.as_str()
+                    ))
+                })?;
+            let message = parse_frame(&line)?;
+            if message.get("id").and_then(Value::as_u64) == Some(id) {
+                if message.get("ok").and_then(Value::as_bool) != Some(true) {
+                    return Err(LocalRunnerError::invalid(format!(
+                        "ACPX sidecar {} failed: {}",
+                        command.as_str(),
+                        message
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                    )));
+                }
+                return Ok(message.get("result").cloned().unwrap_or_else(|| json!({})));
+            }
+            if let Some(event) = self.map_frame(&message)? {
+                self.inbox.push_back(event);
+            }
+        }
+    }
+
+    fn map_frame(&mut self, message: &Value) -> Result<Option<ProviderEvent>, LocalRunnerError> {
+        let Some(event_type_text) = message.get("eventType").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let event_type: GeneratedAcpxSidecarEventType =
+            serde_json::from_value(Value::String(event_type_text.to_owned())).map_err(|_| {
+                LocalRunnerError::invalid("ACPX sidecar emitted an unclassified event type")
+            })?;
+        let sequence = message
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| LocalRunnerError::invalid("ACPX sidecar event omitted its sequence"))?;
+        if sequence <= self.last_sequence {
+            return Ok(None);
+        }
+        if sequence != self.last_sequence + 1 {
+            return Err(LocalRunnerError::invalid(
+                "ACPX sidecar event sequence has a gap",
+            ));
+        }
+        self.last_sequence = sequence;
+        let event_run_id = message.get("runId").and_then(Value::as_str);
+        if let Some(event_run_id) = event_run_id {
+            if event_run_id != self.config.run_id {
+                return Err(LocalRunnerError::invalid(
+                    "ACPX sidecar event named a stale run",
+                ));
+            }
+        } else if !matches!(
+            event_type,
+            GeneratedAcpxSidecarEventType::RuntimeProcess
+                | GeneratedAcpxSidecarEventType::RuntimeDiagnostic
+        ) {
+            return Err(LocalRunnerError::invalid(
+                "ACPX sidecar event omitted its run binding",
+            ));
+        }
+        if matches!(
+            event_type,
+            GeneratedAcpxSidecarEventType::RuntimeToolCalled
+                | GeneratedAcpxSidecarEventType::RuntimePermissionRequested
+                | GeneratedAcpxSidecarEventType::RuntimeTurnTerminal
+                | GeneratedAcpxSidecarEventType::RuntimeEvent
+        ) {
+            let event_turn_id = message
+                .get("turnId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid("ACPX sidecar event omitted its turn binding")
+                })?;
+            if self.active_turn_id.as_deref() != Some(event_turn_id) {
+                return Err(LocalRunnerError::invalid(
+                    "ACPX sidecar event named a stale turn",
+                ));
+            }
+        }
+        let payload = message.get("payload").cloned().unwrap_or_else(|| json!({}));
+        match event_type {
+            GeneratedAcpxSidecarEventType::RuntimeToolCalled => {
+                let call_id = required_text(&payload, "callId", "tool call")?;
+                let operation_id = required_text(&payload, "operationId", "tool operation")?;
+                let input = payload.get("input").cloned().unwrap_or(Value::Null);
+                let turn_id = message
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if self
+                    .pending_tools
+                    .insert(
+                        call_id.clone(),
+                        PendingTool {
+                            operation_id: operation_id.clone(),
+                            input: input.clone(),
+                            turn_id,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "ACPX reused a pending tool call id",
+                    ));
+                }
+                Ok(Some(ProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    input,
+                }))
+            }
+            GeneratedAcpxSidecarEventType::RuntimePermissionRequested => {
+                Ok(Some(ProviderEvent::RuntimeRequest {
+                    request_id: required_text(&payload, "requestId", "permission request")?,
+                    request_kind: permission_kind(payload.get("kind").and_then(Value::as_str)),
+                    title: payload
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ACP permission request")
+                        .to_owned(),
+                    details: payload,
+                }))
+            }
+            GeneratedAcpxSidecarEventType::RuntimeTurnTerminal => {
+                let turn_id = message
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if self.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                    self.active_turn_id = None;
+                }
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed");
+                let terminal = ProviderEvent::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({ "turn": { "id": turn_id, "status": status }, "acpx": payload }),
+                };
+                if self.assistant_text.is_empty() {
+                    Ok(Some(terminal))
+                } else {
+                    let text = std::mem::take(&mut self.assistant_text);
+                    self.inbox.push_back(terminal);
+                    Ok(Some(ProviderEvent::Notification {
+                        method: "item/completed".to_owned(),
+                        params: json!({ "item": { "id": format!("acpx-message-{turn_id}"), "type": "agentMessage", "text": text } }),
+                    }))
+                }
+            }
+            GeneratedAcpxSidecarEventType::RuntimeEvent => {
+                if payload.get("type").and_then(Value::as_str) == Some("text_delta") {
+                    self.assistant_text.push_str(
+                        payload
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                }
+                Ok(Some(map_runtime_event(payload, self.provider_requests)))
+            }
+            GeneratedAcpxSidecarEventType::RuntimeProcess => {
+                Ok(Some(ProviderEvent::Notification {
+                    method: "acpx/process".to_owned(),
+                    params: payload,
+                }))
+            }
+            GeneratedAcpxSidecarEventType::RuntimeDiagnostic => {
+                Ok(Some(ProviderEvent::Notification {
+                    method: "acpx/diagnostic".to_owned(),
+                    params: payload,
+                }))
+            }
+        }
+    }
+}
+
+impl Provider for AcpxProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Acpx
+    }
+
+    fn runtime_identity(&self) -> ProviderRuntimeIdentity {
+        ProviderRuntimeIdentity::LocalProcess {
+            process_id: self.process.id(),
+            provider_session_id: self.agent_session_id.clone(),
+        }
+    }
+
+    fn session_identity(&self) -> &str {
+        &self.acpx_record_id
+    }
+
+    fn provider_session_id(&self) -> Option<&str> {
+        Some(&self.agent_session_id)
+    }
+
+    fn durable_session_identity(&self) -> Option<ProviderSessionIdentity> {
+        Some(ProviderSessionIdentity::Acpx {
+            normalized_session_id: self.config.normalized_session_id.clone(),
+            acpx_record_id: self.acpx_record_id.clone(),
+            backend_session_id: self.backend_session_id.clone(),
+            agent_session_id: self.agent_session_id.clone(),
+            profile_digest: self.config.command_digest.clone(),
+            workspace_digest: format!("sha256:{:x}", Sha256::digest(self.config.cwd.as_bytes())),
+            requested_model: self.config.model.clone(),
+            effective_model: self.config.model.clone(),
+        })
+    }
+
+    fn attach_run(
+        &mut self,
+        run_id: &str,
+        tools: Vec<AuthorizedTool>,
+    ) -> Result<(), LocalRunnerError> {
+        if self.active_turn_id.is_some() || !self.pending_tools.is_empty() {
+            return Err(LocalRunnerError::invalid(
+                "cannot attach an ACPX run while work is active",
+            ));
+        }
+        self.catalog_revision += 1;
+        self.tools = tools;
+        let previous_run_id = std::mem::replace(&mut self.config.run_id, run_id.to_owned());
+        let attached = self.request(
+            GeneratedAcpxSidecarCommand::RunAttach,
+            json!({
+                "runId": run_id,
+                "catalogRevision": self.catalog_revision,
+                "tools": self.tools,
+            }),
+        );
+        if let Err(error) = attached {
+            self.config.run_id = previous_run_id;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn configure_tools(&mut self, tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
+        let run_id = self.config.run_id.clone();
+        self.attach_run(&run_id, tools)
+    }
+
+    fn start_turn(
+        &mut self,
+        message: &str,
+        cwd: &str,
+        turn_id: &str,
+    ) -> Result<Value, LocalRunnerError> {
+        if cwd != self.config.cwd {
+            return Err(LocalRunnerError::invalid(
+                "ACPX turn cwd differs from its immutable workspace",
+            ));
+        }
+        if self.active_turn_id.is_some() {
+            return Err(LocalRunnerError::invalid("ACPX already has an active turn"));
+        }
+        self.active_turn_id = Some(turn_id.to_owned());
+        self.assistant_text.clear();
+        self.provider_requests += 1;
+        match self.request(
+            GeneratedAcpxSidecarCommand::TurnStart,
+            json!({ "turnId": turn_id, "message": message }),
+        ) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                if self.active_turn_id.as_deref() == Some(turn_id) {
+                    self.active_turn_id = None;
+                }
+                self.provider_requests = self.provider_requests.saturating_sub(1);
+                Err(error)
+            }
+        }
+    }
+
+    fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
+        self.request(
+            GeneratedAcpxSidecarCommand::TurnCancel,
+            json!({ "turnId": turn_id, "reason": "Paperclip interruption" }),
+        )
+    }
+
+    fn read(&mut self) -> Result<Value, LocalRunnerError> {
+        self.request(GeneratedAcpxSidecarCommand::SessionRead, json!({}))
+    }
+
+    fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
+        if let Some(event) = self.inbox.pop_front() {
+            return Ok(Some(event));
+        }
+        let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+            return if self.process.try_wait()?.is_some() {
+                Ok(Some(ProviderEvent::Exited))
+            } else {
+                Ok(None)
+            };
+        };
+        let frame = parse_frame(&line)?;
+        self.map_frame(&frame)
+    }
+
+    fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
+        let pending = self
+            .pending_tools
+            .get(&result.call_id)
+            .cloned()
+            .ok_or_else(|| {
+                LocalRunnerError::invalid("ACPX tool result has no pending sidecar call")
+            })?;
+        if pending.operation_id != result.operation_id {
+            return Err(LocalRunnerError::invalid(
+                "ACPX tool result operation mismatch",
+            ));
+        }
+        self.request(GeneratedAcpxSidecarCommand::ToolResolve, json!({
+            "callId": result.call_id,
+            "turnId": pending.turn_id,
+            "result": result.result,
+            "error": if result.is_error { json!({"message":"Paperclip semantic operation failed"}) } else { Value::Null },
+        }))?;
+        self.pending_tools.remove(&result.call_id);
+        if !result.is_error
+            && ["paperclip_finish", "paperclip_block"].contains(&result.operation_id.as_str())
+        {
+            self.inbox.push_back(ProviderEvent::SemanticResult {
+                result: pending.input,
+                item_id: Some(result.call_id.clone()),
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_runtime_request(
+        &mut self,
+        request_id: &str,
+        turn_id: &str,
+        resolution: &Value,
+    ) -> Result<(), LocalRunnerError> {
+        let action = resolution
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("cancel");
+        let outcome = match action {
+            "accept" => "allow_once",
+            "accept_for_session" => "allow_always",
+            "decline" => "reject_once",
+            "cancel" => "cancel",
+            _ => {
+                return Err(LocalRunnerError::invalid(
+                    "unsupported ACPX permission resolution",
+                ))
+            }
+        };
+        self.request(
+            GeneratedAcpxSidecarCommand::PermissionResolve,
+            json!({
+                "requestId": request_id,
+                "turnId": turn_id,
+                "decision": { "outcome": outcome },
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+        if self.active_turn_id.is_none() {
+            let _ = self.request(
+                GeneratedAcpxSidecarCommand::SessionSuspend,
+                json!({ "reason": "Paperclip runner suspension" }),
+            );
+        }
+        self.process.terminate_group().map(|_| ())
+    }
+}
+
+fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> {
+    let (server_package, server_version, runtime_package, runtime_version, model, command_digest) =
+        match config.agent.as_str() {
+            "pi" => (
+                "pi-acp",
+                "0.0.33",
+                Some("@earendil-works/pi-coding-agent"),
+                Some("0.84.2"),
+                "openrouter/deepseek/deepseek-v4-flash-0731",
+                "sha256:896d0f734998529087bc2af0854112b2064c83047c4bc59359420510abd14791",
+            ),
+            "claude" => (
+                "@agentclientprotocol/claude-agent-acp",
+                "0.70.0",
+                None,
+                None,
+                "claude-sonnet-5",
+                "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
+            ),
+            "codex" => (
+                "@agentclientprotocol/codex-acp",
+                "1.6.2",
+                None,
+                None,
+                "gpt-5.6-sol",
+                "sha256:8c7fc8af156596668a95ce23d52309f70ad576e75bac6dc209d30378bdbb8ebe",
+            ),
+            _ => {
+                return Err(LocalRunnerError::invalid(
+                    "ACPX agent must be pi, claude, or codex",
+                ))
+            }
+        };
+    if config.acpx_version != "0.13.1"
+        || config.agent_server_package != server_package
+        || config.agent_server_version != server_version
+        || config.agent_runtime_package.as_deref() != runtime_package
+        || config.agent_runtime_version.as_deref() != runtime_version
+        || config.model != model
+        || config.permission_policy != "interactive"
+        || config.command_digest != command_digest
+        || config.normalized_session_id.is_empty()
+        || config.run_id.is_empty()
+        || config.cwd.is_empty()
+    {
+        return Err(LocalRunnerError::invalid(
+            "ACPX config does not match a qualified profile",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_frame(line: &str) -> Result<Value, LocalRunnerError> {
+    let value: Value = serde_json::from_str(line).map_err(|error| {
+        LocalRunnerError::invalid(format!("ACPX sidecar emitted invalid JSON: {error}"))
+    })?;
+    if value.get("protocolVersion").and_then(Value::as_u64)
+        != Some(GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION)
+    {
+        return Err(LocalRunnerError::invalid(
+            "ACPX sidecar protocol version mismatch",
+        ));
+    }
+    Ok(value)
+}
+
+fn required_text(value: &Value, key: &str, label: &str) -> Result<String, LocalRunnerError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| LocalRunnerError::invalid(format!("ACPX sidecar omitted {label} identity")))
+}
+
+fn permission_kind(value: Option<&str>) -> String {
+    let kind = value.unwrap_or_default().to_ascii_lowercase();
+    if kind.contains("write")
+        || kind.contains("edit")
+        || kind.contains("delete")
+        || kind.contains("move")
+    {
+        "file_approval".to_owned()
+    } else if kind.contains("execute") || kind.contains("terminal") {
+        "command_approval".to_owned()
+    } else {
+        "permission_approval".to_owned()
+    }
+}
+
+fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
+    match payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "text_delta" => ProviderEvent::Notification {
+            method: "item/delta".to_owned(),
+            params: json!({
+                "itemId": payload.get("messageId").and_then(Value::as_str).unwrap_or("acpx-agent-message"),
+                "delta": payload.get("text").and_then(Value::as_str).unwrap_or_default(),
+                "authoritative": true,
+            }),
+        },
+        "thinking" => ProviderEvent::Notification {
+            method: "item/started".to_owned(),
+            params: json!({ "item": { "type": "reasoning", "status": "inProgress" } }),
+        },
+        "status" if payload.get("tag").and_then(Value::as_str) == Some("usage_update") => {
+            let breakdown = payload
+                .get("breakdown")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let provider_cost_usd = payload
+                .pointer("/cost/amount")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            ProviderEvent::Notification {
+                method: "thread/tokenUsage/updated".to_owned(),
+                params: json!({
+                    "tokenUsage": { "total": {
+                        "inputTokens": breakdown.get("inputTokens"),
+                        "outputTokens": breakdown.get("outputTokens"),
+                        "cacheReadTokens": breakdown.get("cachedReadTokens"),
+                        "cacheWriteTokens": breakdown.get("cachedWriteTokens"),
+                        "reasoningTokens": breakdown.get("thoughtTokens"),
+                        "providerCostUsd": provider_cost_usd,
+                        "requests": provider_requests,
+                    }},
+                }),
+            }
+        }
+        "tool_call" => {
+            let completed = matches!(
+                payload.get("status").and_then(Value::as_str),
+                Some("completed" | "failed" | "cancelled" | "canceled")
+            );
+            ProviderEvent::Notification {
+                method: if completed {
+                    "item/completed"
+                } else {
+                    "item/started"
+                }
+                .to_owned(),
+                params: json!({ "item": {
+                    "id": payload.get("toolCallId"),
+                    "type": "commandExecution",
+                    "command": payload.get("title"),
+                    "status": payload.get("status"),
+                    "locations": payload.get("locations"),
+                    "aggregatedOutput": payload.get("output"),
+                    "outputBytes": payload.get("outputBytes"),
+                    "outputTruncated": payload.get("outputTruncated"),
+                    "outputDigest": payload.get("outputDigest"),
+                }}),
+            }
+        }
+        "provider_notice" => ProviderEvent::Notification {
+            method: "warning".to_owned(),
+            params: json!({
+                "code": payload.get("category").and_then(Value::as_str).unwrap_or("unclassified_acp_update"),
+                "message": payload.get("summary").and_then(Value::as_str).unwrap_or("The qualified ACP agent emitted an unclassified runtime update."),
+            }),
+        },
+        _ => ProviderEvent::Notification {
+            method: "warning".to_owned(),
+            params: json!({
+                "code": "unclassified_acp_runtime_event",
+                "message": "The ACPX sidecar emitted an unclassified bounded runtime event.",
+            }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unqualified_profiles() {
+        let config = AcpxProviderConfig {
+            agent: "pi".to_owned(),
+            model: "fallback".to_owned(),
+            acpx_version: "0.13.1".to_owned(),
+            agent_server_package: "pi-acp".to_owned(),
+            agent_server_version: "0.0.33".to_owned(),
+            agent_runtime_package: Some("@earendil-works/pi-coding-agent".to_owned()),
+            agent_runtime_version: Some("0.84.2".to_owned()),
+            command_digest: "sha256:test".to_owned(),
+            sidecar_command: "node".into(),
+            sidecar_args: vec![],
+            runtime_directory: "/tmp/acpx".to_owned(),
+            normalized_session_id: "session".to_owned(),
+            run_id: "run".to_owned(),
+            cwd: "/tmp/workspace".to_owned(),
+            instructions: "safe".to_owned(),
+            permission_policy: "interactive".to_owned(),
+        };
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn maps_thought_without_retaining_hidden_text() {
+        let event = map_runtime_event(
+            json!({ "type": "thinking", "text": "secret chain of thought" }),
+            1,
+        );
+        match event {
+            ProviderEvent::Notification { params, .. } => {
+                assert!(!params.to_string().contains("secret"))
+            }
+            _ => panic!("expected notification"),
+        }
+    }
+}

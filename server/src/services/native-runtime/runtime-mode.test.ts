@@ -35,7 +35,7 @@ describe("resolveNativeRuntimeMode", () => {
       runtimeConfig: {},
       adapterConfig: { provider: "claude" },
       agent: { ...eligible.agent, adapterType: "paperclip_runner" },
-    })).toThrow(/provider must be codex, opencode, or claude_managed/);
+    })).toThrow(/provider must be codex, opencode, claude_managed, aws_agentcore, or acpx/);
   });
 
   it("selects OpenCode only with a provider/model value", () => {
@@ -124,5 +124,19 @@ describe("resolveNativeRuntimeMode", () => {
       runtimeConfig: {},
       adapterConfig: { provider: "codex" },
     })).toEqual(expect.objectContaining({ kind: "native" }));
+  });
+
+  it("admits planning only through paperclip_runner", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      issue: { id: "plan-issue", workMode: "planning" },
+      runtimeConfig: {},
+      adapterConfig: { provider: "codex" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toMatchObject({ kind: "native", profile: { backend: "codex_app_server" } });
+    expect(() => resolveNativeRuntimeMode({
+      ...eligible,
+      issue: { id: "plan-issue", workMode: "planning" },
+    })).toThrow("planning requires the paperclip_runner adapter");
   });
 });

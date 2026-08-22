@@ -24,6 +24,8 @@ export interface OpenCodeMcpCall {
 
 export interface OpenCodeMcpBridgeOptions {
   tools?: readonly Readonly<Record<string, unknown>>[];
+  /** Runner-owned operations callable only by a trusted harness extension and never advertised to the model. */
+  privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler: (call: OpenCodeMcpCall) => Promise<unknown>;
   timeoutMs?: number;
   maxBodyBytes?: number;
@@ -53,13 +55,16 @@ export async function startOpenCodeMcpBridge(
 ): Promise<OpenCodeMcpBridge> {
   const secret = options.secret ?? randomBytes(32).toString("base64url");
   const tools = normalizeTools(options.tools ?? []);
-  const validators = compileValidators(tools);
+  const privateTools = normalizeTools(options.privateTools ?? [], false);
+  const admittedTools = [...tools, ...privateTools.filter((candidate) => !tools.some((tool) => tool.name === candidate.name))];
+  const validators = compileValidators(admittedTools);
   const calls = new Map<string, { fingerprint: string; promise: Promise<unknown> }>();
   const controllers = new Map<string, AbortController>();
   const server = createServer((request, response) => {
     void handleRequest(request, response, {
       secret,
       tools,
+      admittedTools,
       validators,
       calls,
       controllers,
@@ -90,7 +95,10 @@ export async function startOpenCodeMcpBridge(
   };
 }
 
-function normalizeTools(input: readonly Readonly<Record<string, unknown>>[]): OpenCodeMcpToolDefinition[] {
+function normalizeTools(
+  input: readonly Readonly<Record<string, unknown>>[],
+  includeTerminalTools = true,
+): OpenCodeMcpToolDefinition[] {
   const tools: OpenCodeMcpToolDefinition[] = [];
   const seen = new Set<string>();
   for (const raw of input) {
@@ -104,7 +112,7 @@ function normalizeTools(input: readonly Readonly<Record<string, unknown>>[]): Op
     });
     seen.add(name);
   }
-  for (const terminal of [
+  if (includeTerminalTools) for (const terminal of [
     { name: CODEX_COMPLETION_TOOL_NAME, description: "Return the semantic completion result.", inputSchema: CODEX_RESULT_OUTPUT_SCHEMA },
     { name: CODEX_BLOCK_TOOL_NAME, description: "Return the semantic blocked result.", inputSchema: CODEX_BLOCK_RESULT_OUTPUT_SCHEMA },
   ]) {
@@ -124,6 +132,7 @@ async function handleRequest(
   context: {
     secret: string;
     tools: OpenCodeMcpToolDefinition[];
+    admittedTools: OpenCodeMcpToolDefinition[];
     validators: Map<string, ValidateFunction>;
     calls: Map<string, { fingerprint: string; promise: Promise<unknown> }>;
     controllers: Map<string, AbortController>;
@@ -202,7 +211,7 @@ async function handleRequest(
   const params = isRecord(message.params) ? message.params : {};
   const rawName = typeof params.name === "string" ? params.name : "";
   const tool = canonicalOpenCodeMcpToolName(rawName);
-  if (!context.tools.some((entry) => entry.name === tool)) {
+  if (!context.admittedTools.some((entry) => entry.name === tool)) {
     writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Unsupported tool." }] });
     return;
   }

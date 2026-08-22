@@ -54,7 +54,10 @@ describe("paperclip runner transcript projection", () => {
     }), "2026-08-21T12:00:00.000Z");
 
     expect(line("run.result.proposed", { summary: "Finished the task" }))
-      .toEqual([{ kind: "assistant", ts: expect.any(String), text: "Finished the task", channel: "final" }]);
+      .toEqual([
+        expect.objectContaining({ kind: "run_result", disposition: "done", summary: "Finished the task" }),
+        { kind: "assistant", ts: expect.any(String), text: "Finished the task", channel: "final" },
+      ]);
     expect(line("run.result.accepted", { result: { summary: "Finished the task" } }))
       .toEqual([]);
   });
@@ -90,7 +93,10 @@ describe("paperclip runner transcript projection", () => {
     expect(event("item.delta", { kind: "agentMessage", channel: "final", text: "{\"schema\":" })).toEqual([]);
     expect(event("item.delta", { kind: "agentMessage", channel: "final", text: "\"paperclip.run_result.v1\"}" })).toEqual([]);
     expect(event("run.result.proposed", { summary: "Human-readable completion." }))
-      .toEqual([{ kind: "assistant", ts: expect.any(String), text: "Human-readable completion.", channel: "final" }]);
+      .toEqual([
+        expect.objectContaining({ kind: "run_result", summary: "Human-readable completion." }),
+        { kind: "assistant", ts: expect.any(String), text: "Human-readable completion.", channel: "final" },
+      ]);
   });
 
   it("projects canonical provider events as structured activity instead of JSON prose", () => {
@@ -100,5 +106,92 @@ describe("paperclip runner transcript projection", () => {
     }), "2026-08-21T12:00:00.000Z");
     expect(entries).toEqual([expect.objectContaining({ kind: "provider_activity", family: "plan", eventType: "plan.updated", title: "Plan" })]);
     expect(entries).not.toEqual([expect.objectContaining({ kind: "assistant" })]);
+
+    const modelRoute = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType: "model.route.changed", payload: { provider: "claude", requestedModel: "claude", effectiveModel: "Claude Sonnet" } },
+    }), "2026-08-21T12:00:01.000Z");
+    expect(modelRoute).toEqual([expect.objectContaining({ kind: "provider_activity", family: "model_identity", summary: "Claude Sonnet" })]);
+  });
+
+  it("projects workspace changes and verified file references as bounded structured entries", () => {
+    const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
+    const event = (eventType: string, payload: Record<string, unknown>) => parse(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType, payload },
+    }), "2026-08-21T12:00:00.000Z");
+
+    expect(event("workspace.diff.recorded", {
+      changeSetId: "changes-1",
+      revision: 2,
+      source: "runner_verified",
+      complete: true,
+      files: [{ path: "ui/src/App.tsx", operation: "modify", previousPath: null, additions: 3, deletions: 1, binary: false, diff: "+hello" }],
+      totals: { files: 1, additions: 3, deletions: 1 },
+      patchArtifactRef: null,
+    })).toEqual([expect.objectContaining({ kind: "workspace_change", complete: true, source: "runner_verified" })]);
+
+    expect(event("workspace.file.referenced", {
+      referenceId: "file-1",
+      source: "runner_verified",
+      path: "doc/protocol.md",
+      displayName: "protocol.md",
+      mediaType: "text/markdown",
+      presentation: "document",
+      line: 12,
+      preview: "# Protocol",
+      previewTruncated: false,
+      contentDigest: null,
+    })).toEqual([expect.objectContaining({ kind: "workspace_file_reference", path: "doc/protocol.md", line: 12 })]);
+
+    expect(event("workspace.file.referenced", {
+      referenceId: "unsafe",
+      path: "../secrets.env",
+    })).toEqual([expect.objectContaining({ kind: "system", text: expect.stringContaining("unsafe") })]);
+  });
+
+  it("coalesces runtime request lifecycle data and emits terminal state", () => {
+    const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
+    const event = (eventType: string, payload: Record<string, unknown>, turnId = "turn-1") => parse(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType, turnId, payload },
+    }), "2026-08-21T12:00:00.000Z");
+    expect(event("runtime_request.created", { request: { requestId: "request-1", requestKind: "command_approval", type: "item/commandExecution/requestApproval", status: "pending", prompt: "Allow command?" } }))
+      .toEqual([expect.objectContaining({
+        kind: "runtime_request",
+        requestKind: "command_approval",
+        turnId: "turn-1",
+        status: "pending",
+        choices: [
+          { key: "accept", label: "Allow once" },
+          { key: "accept_for_session", label: "Allow for session" },
+          { key: "decline", label: "Deny" },
+          { key: "cancel", label: "Cancel" },
+        ],
+      })]);
+    expect(event("runtime_request.resolved", { requestId: "request-1" }))
+      .toEqual([expect.objectContaining({ kind: "runtime_request", status: "resolved", prompt: "Allow command?", requestKind: "command_approval", turnId: "turn-1" })]);
+    expect(event("run.terminal", { turnTerminalState: "interrupted", runTerminalState: "cancelled", reportedWorkDisposition: "yielded", stopReason: { code: "user_stop" } }))
+      .toEqual([expect.objectContaining({ kind: "run_terminal", turnState: "interrupted", runState: "cancelled", disposition: "yielded", stopReason: "user_stop" })]);
+  });
+
+  it("normalizes MCP semantic tools, canonical usage, and actionable failures", () => {
+    const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
+    const event = (eventType: string, payload: Record<string, unknown>) => parse(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType, payload },
+    }), "2026-08-21T12:00:00.000Z");
+
+    expect(event("mcp_app.tool_input", {
+      semantic_tool: { callId: "mcp-1", operationId: "paperclip.tasks.create", content: { references: [{ kind: "issue", id: "PAP-2" }] } },
+    })).toEqual([expect.objectContaining({ kind: "tool_call", toolUseId: "mcp-1", name: "paperclip.tasks.create" })]);
+    expect(event("mcp_app.tool_result", {
+      semantic_tool: { callId: "mcp-1", operationId: "paperclip.tasks.create", outcome: "denied", code: "audience_denied" },
+    })).toEqual([expect.objectContaining({ kind: "tool_result", toolUseId: "mcp-1", isError: true })]);
+    expect(event("usage.reported", {
+      runDelta: { inputTokens: 240, outputTokens: 60, cacheReadTokens: 120 },
+    })).toEqual([expect.objectContaining({ kind: "result", inputTokens: 240, outputTokens: 60, cachedTokens: 120 })]);
+    expect(event("mcp_app.failed", { code: "host_unavailable", message: "Artifact host unavailable" }))
+      .toEqual([expect.objectContaining({ kind: "system", text: "Runner: Artifact host unavailable" })]);
   });
 });

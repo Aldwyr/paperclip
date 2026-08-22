@@ -38,6 +38,7 @@ export interface CodexModelContextSnapshot {
   model: string;
   modelProvider: string;
   workingDirectory: string;
+  collaborationMode: "default" | "plan";
   sandbox: unknown;
   approvalPolicy: unknown;
   baseInstructions: string;
@@ -45,7 +46,7 @@ export interface CodexModelContextSnapshot {
   instructionPolicy: {
     skillInstructions: false;
     appInstructions: false;
-    collaborationInstructions: false;
+    collaborationInstructions: boolean;
   };
   environmentKeys: string[];
   dynamicToolNames: string[];
@@ -316,7 +317,6 @@ export function isSkilllessCodexContext(
     ) &&
     context.instructionPolicy.skillInstructions === false &&
     context.instructionPolicy.appInstructions === false &&
-    context.instructionPolicy.collaborationInstructions === false &&
     !serialized.includes("paperclip_api_key") &&
     !serialized.includes("authorization: bearer") &&
     !serialized.includes("/api/issues/") &&

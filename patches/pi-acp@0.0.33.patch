@@ -1,0 +1,56 @@
+diff --git a/dist/index.js b/dist/index.js
+index ead9809cabc9f3b203f1769db3cabb8327dd758a..113b166120711705edcabaca2d63ae40f46c7819 100755
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -68,6 +68,15 @@ function shouldUseShellForPiCommand(cmd) {
+   const normalized = cmd.trim().toLowerCase();
+   return normalized.endsWith(".cmd") || normalized.endsWith(".bat");
+ }
++function paperclipPiArgs() {
++  const raw = process.env.PI_ACP_PI_ARGS_JSON;
++  if (!raw) return [];
++  const parsed = JSON.parse(raw);
++  if (!Array.isArray(parsed) || parsed.length > 32 || parsed.some((value) => typeof value !== "string" || value.length > 4096)) {
++    throw new Error("PI_ACP_PI_ARGS_JSON must be a bounded JSON string array");
++  }
++  return parsed;
++}
+ 
+ // src/pi-rpc/process.ts
+ var PiRpcSpawnError = class extends Error {
+@@ -132,7 +141,7 @@ var PiRpcProcess = class _PiRpcProcess {
+   }
+   static async spawn(params) {
+     const cmd = getPiCommand(params.piCommand);
+-    const args = ["--mode", "rpc", "--no-themes"];
++    const args = ["--mode", "rpc", "--no-themes", ...paperclipPiArgs()];
+     if (params.sessionPath) args.push("--session", params.sessionPath);
+     const child = spawn(cmd, args, {
+       cwd: params.cwd,
+@@ -949,6 +958,26 @@ var PiAcpSession = class {
+     switch (type) {
+       case "message_update": {
+         const ame = ev.assistantMessageEvent;
++        if (ev.usage && typeof ev.usage === "object") {
++          const usage = ev.usage;
++          const fingerprint = JSON.stringify(usage);
++          if (fingerprint !== this.paperclipUsageFingerprint && (usage.totalTokens ?? 0) > 0) {
++            this.paperclipUsageFingerprint = fingerprint;
++          this.emit({
++            sessionUpdate: "usage_update",
++            used: typeof usage.totalTokens === "number" ? usage.totalTokens : void 0,
++            cost: typeof usage.cost?.total === "number" ? { amount: usage.cost.total, currency: "USD" } : void 0,
++            _meta: { usage: {
++              inputTokens: typeof usage.input === "number" ? usage.input : void 0,
++              outputTokens: typeof usage.output === "number" ? usage.output : void 0,
++              cachedReadTokens: typeof usage.cacheRead === "number" ? usage.cacheRead : void 0,
++              cachedWriteTokens: typeof usage.cacheWrite === "number" ? usage.cacheWrite : void 0,
++              thoughtTokens: typeof usage.reasoning === "number" ? usage.reasoning : void 0,
++              totalTokens: typeof usage.totalTokens === "number" ? usage.totalTokens : void 0
++            } }
++          });
++          }
++        }
+         if (ame?.type === "text_delta" && typeof ame.delta === "string") {
+           this.emit({
+             sessionUpdate: "agent_message_chunk",

@@ -197,3 +197,8 @@ export {
   CLAUDE_MANAGED_BETA_VERSION,
   type ManagedAgentProfileInput,
 } from "./managed-agent-profiles.js";
+export {
+  remoteAgentProfileService,
+  type RemoteAgentProfileInput,
+  type RemoteAgentService,
+} from "./remote-agent-profiles.js";

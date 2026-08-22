@@ -56,6 +56,7 @@ interface FakeProviderState {
   lastToolResult: string;
   transports: FakeCapabilityCodexTransport[];
   turns: Map<string, string>;
+  attachments: Array<{ runId: string; turnId: string; itemId: string }>;
   holdAfterTool: boolean;
   onTurnStart?: () => Promise<void>;
 }
@@ -140,6 +141,10 @@ class FakeCapabilityCodexTransport implements CodexAppServerTransport {
 
   setServerRequestHandler(handler: CodexServerRequestHandler): void {
     this.#handler = handler;
+  }
+
+  async attachRun(input: { runId: string; turnId: string; itemId: string }): Promise<void> {
+    this.state.attachments.push(structuredClone(input));
   }
 
   invokeServerRequest(request: CodexRpcServerRequest): Promise<Record<string, unknown>> {
@@ -287,6 +292,7 @@ function providerState(): FakeProviderState {
     lastToolResult: "nothing yet",
     transports: [],
     turns: new Map(),
+    attachments: [],
     holdAfterTool: false,
   };
 }
@@ -431,6 +437,8 @@ describe("Capability live runnerd and Codex session", () => {
     expect(first.assistantText).toContain("stateRevision");
     expect(second.assistantText).toContain("stateRevision");
     expect(first.snapshot.providerThreadId).toBe(second.snapshot.providerThreadId);
+    expect(state.attachments).toHaveLength(1);
+    expect(second.snapshot.providerRunBinding).toEqual(state.attachments[0]);
     expect(second.snapshot.usageLedger.slice(-2)).toMatchObject([
       { providerRequests: 1, inputTokens: 100, outputTokens: 10 },
       { providerRequests: 1, inputTokens: 100, outputTokens: 10 },

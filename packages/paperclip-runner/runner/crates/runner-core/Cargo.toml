@@ -13,6 +13,13 @@ serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 jsonschema.workspace = true
+aws-config.workspace = true
+aws-sdk-bedrockagentcore.workspace = true
+aws-sdk-sts.workspace = true
+aws-smithy-types.workspace = true
+aws-types.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 
 [[bin]]
 name = "conformance-tracer"

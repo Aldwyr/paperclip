@@ -156,6 +156,15 @@ pub struct ProcessedCommand {
     pub result: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingProviderRuntimeRequest {
+    pub request_id: String,
+    pub turn_id: String,
+    pub request_kind: String,
+    pub created_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableRunnerState {
@@ -202,6 +211,8 @@ pub struct DurableRunnerState {
     #[serde(default, alias = "codexProviderThreadId")]
     pub provider_session_id: Option<String>,
     #[serde(default)]
+    pub provider_session_identity: Option<crate::codex_provider::ProviderSessionIdentity>,
+    #[serde(default)]
     pub provider_event_cursor: Option<String>,
     #[serde(default)]
     pub provider_usage_cumulative: Option<Value>,
@@ -209,6 +220,8 @@ pub struct DurableRunnerState {
     pub provider_usage_run_baseline: Option<Value>,
     #[serde(default)]
     pub provider_budget_ceiling_usd: Option<f64>,
+    #[serde(default)]
+    pub pending_provider_runtime_requests: BTreeMap<String, PendingProviderRuntimeRequest>,
 }
 
 impl DurableRunnerState {
@@ -246,10 +259,12 @@ impl DurableRunnerState {
             provider_tool_bridge: ProviderToolBridge::default(),
             provider_config: None,
             provider_session_id: None,
+            provider_session_identity: None,
             provider_event_cursor: None,
             provider_usage_cumulative: None,
             provider_usage_run_baseline: None,
             provider_budget_ceiling_usd: None,
+            pending_provider_runtime_requests: BTreeMap::new(),
         }
     }
 
@@ -1224,6 +1239,8 @@ fn execute_command_effect(
                 if state.provider_budget_ceiling_usd.is_none() {
                     if let ProviderConfig::ClaudeManaged(managed) = &provider {
                         state.provider_budget_ceiling_usd = Some(managed.max_session_list_cost_usd);
+                    } else if let ProviderConfig::AwsAgentcore(agentcore) = &provider {
+                        state.provider_budget_ceiling_usd = Some(agentcore.max_estimated_session_cost_usd);
                     }
                 }
                 state.provider_config = Some(provider);
@@ -1276,6 +1293,7 @@ fn execute_command_effect(
             state.run_id = run_id;
             state.turn_id = turn_id;
             state.item_id = item_id;
+            state.stop_after_flush = false;
             state.lifecycle = "ready".to_owned();
             enqueue_event(
                 state,

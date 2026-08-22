@@ -756,8 +756,12 @@ export function projectCapabilityIssueThread(
   const agentLabel = mode === "live"
     ? snapshot.config.provider === "claude_managed" || snapshot.config.driver === "claude_managed_agents_api"
       ? "Claude Agent"
+      : snapshot.config.provider === "aws_agentcore" || snapshot.config.driver === "aws_agentcore_harness_api"
+        ? "Real AWS AgentCore"
       : snapshot.config.provider === "opencode" || snapshot.config.driver === "opencode_server"
         ? "Real OpenCode"
+      : snapshot.config.provider === "acpx" || snapshot.config.driver === "acpx_runtime"
+        ? `Real ${snapshot.config.acpxAgent === "claude" ? "Claude" : snapshot.config.acpxAgent === "codex" ? "Codex" : "Pi"} via ACPX`
         : "Real Codex"
     : mode === "replay" ? "Replay" : "Fake agent";
   const connection = input.connection ?? { state: "connected", attempt: 0 };

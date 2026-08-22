@@ -1,6 +1,9 @@
 import type { IncomingMessage, Server } from "node:http";
 import type { Duplex } from "node:stream";
-import type { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
+import type {
+  DurablePrpControlPlane,
+  HarnessRuntimeRequestResolution,
+} from "../vendor/paperclip-runner/index.js";
 import { logger } from "../middleware/logger.js";
 
 const CONNECT_PATH_PREFIX = "/api/runner/v1/connect/";
@@ -8,6 +11,7 @@ const CONNECT_PATH_PREFIX = "/api/runner/v1/connect/";
 type Registration = {
   authority: DurablePrpControlPlane;
   generation: symbol;
+  runtimeRequestResolutions: Map<string, { fingerprint: string; commandId: string }>;
 };
 
 const registrations = new Map<string, Registration>();
@@ -56,13 +60,62 @@ export async function registerRunnerPrpAuthority(input: {
   if (loopbackOrigin === null) throw new Error("runner_prp_websocket_server_not_configured");
   if (registrations.has(input.runId)) throw new Error("runner_prp_authority_already_registered");
   const generation = Symbol(input.runId);
-  registrations.set(input.runId, { authority: input.authority, generation });
+  registrations.set(input.runId, {
+    authority: input.authority,
+    generation,
+    runtimeRequestResolutions: new Map(),
+  });
   return {
     connectUrl: `${loopbackOrigin}${CONNECT_PATH_PREFIX}${input.runId}`,
     release: async () => {
       if (registrations.get(input.runId)?.generation === generation) registrations.delete(input.runId);
     },
   };
+}
+
+export class RunnerPrpRuntimeRequestResolutionError extends Error {
+  constructor(
+    readonly code: "runner_prp_authority_not_active" | "runtime_request_resolution_conflict",
+  ) {
+    super(code);
+    this.name = "RunnerPrpRuntimeRequestResolutionError";
+  }
+}
+
+/**
+ * Queues one turn-bound runtime response on the active durable PRP authority.
+ * Replayed identical browser submissions return the original command instead
+ * of answering the provider twice; a different answer for the same request
+ * fails closed.
+ */
+export function queueRunnerPrpRuntimeRequestResolution(input: {
+  runId: string;
+  requestId: string;
+  turnId: string;
+  resolution: HarnessRuntimeRequestResolution;
+}): { commandId: string } {
+  const registration = registrations.get(input.runId);
+  if (!registration) {
+    throw new RunnerPrpRuntimeRequestResolutionError("runner_prp_authority_not_active");
+  }
+  const fingerprint = JSON.stringify({ turnId: input.turnId, resolution: input.resolution });
+  const previous = registration.runtimeRequestResolutions.get(input.requestId);
+  if (previous) {
+    if (previous.fingerprint !== fingerprint) {
+      throw new RunnerPrpRuntimeRequestResolutionError("runtime_request_resolution_conflict");
+    }
+    return { commandId: previous.commandId };
+  }
+  const command = registration.authority.queueCommand("request.resolve", {
+    requestId: input.requestId,
+    turnId: input.turnId,
+    resolution: input.resolution,
+  }, undefined, true);
+  registration.runtimeRequestResolutions.set(input.requestId, {
+    fingerprint,
+    commandId: command.commandId,
+  });
+  return { commandId: command.commandId };
 }
 
 export const runnerPrpWebSocketInternals = {

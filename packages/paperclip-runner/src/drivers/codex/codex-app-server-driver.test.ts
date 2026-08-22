@@ -81,6 +81,7 @@ class FakeCodexTransport implements CodexAppServerTransport {
   readResponse: Record<string, unknown> | null = null;
   turnStartResponse: Promise<Record<string, unknown>> | null = null;
   goalState: Record<string, unknown> | null = null;
+  confirmCollaborationMode = true;
 
   constructor(
     readonly threadId = "thread-1",
@@ -94,7 +95,13 @@ class FakeCodexTransport implements CodexAppServerTransport {
     if (method === "initialize") {
       return { userAgent: "codex-cli/0.132.0", codexHome: "/isolated/codex", platformFamily: "unix", platformOs: "linux" };
     }
+    if (method === "collaborationMode/list") {
+      return this.confirmCollaborationMode
+        ? { data: [{ name: "Plan", mode: "plan", model: "gpt-test", reasoning_effort: "high" }] }
+        : { data: [{ name: "Default", mode: "default", model: "gpt-test" }] };
+    }
     if (method === "thread/start" || method === "thread/resume") {
+      const planMode = params.permissions === "paperclip-runner-workspace-read-only";
       return {
         thread: {
           id: this.threadId,
@@ -102,7 +109,7 @@ class FakeCodexTransport implements CodexAppServerTransport {
           modelProvider: "openai",
           cwd: "/workspace",
           turns: [],
-          activePermissionProfile: { id: "paperclip-runner-workspace-only" },
+          activePermissionProfile: { id: planMode ? "paperclip-runner-workspace-read-only" : "paperclip-runner-workspace-only" },
         },
         model: "gpt-test",
         modelProvider: "openai",
@@ -343,7 +350,10 @@ describe("Codex app-server Codex driver", () => {
     });
     await expect(
       session.startTurn({ message: { role: "user", text: "And a follow-up" } }),
-    ).resolves.toEqual({ turnId: "turn-2" });
+    ).resolves.toEqual({
+      turnId: "turn-2",
+      effectiveCollaborationMode: "default",
+    });
   });
 
   it("passes the common typed-event contract and reports one provider turn terminal", async () => {
@@ -412,6 +422,34 @@ describe("Codex app-server Codex driver", () => {
     expect(live).toEqual(replay);
     expect(live.integrity).toBe("complete");
     expect(await session.usage?.()).toMatchObject({ modelContextWindow: 128000 });
+  });
+
+  it("accepts a thread usage snapshot replayed before a resumed turn starts", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-usage-replay",
+      normalizedSessionId: "normalized-usage-replay",
+      workingDirectory: "/workspace",
+    });
+
+    transport.push("thread/tokenUsage/updated", {
+      threadId: "thread-1",
+      turnId: "prior-turn",
+      tokenUsage: { total: { inputTokens: 10, outputTokens: 4 } },
+    });
+    const turn = await session.startTurn({ message: { role: "user", text: "Continue." } });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "completed", items: [] },
+    });
+
+    const events = await collectUntilTerminal(session.events());
+    expect(events.some((event) => event.eventType === "session.failed")).toBe(false);
+    expect(await session.usage()).toMatchObject({ total: { inputTokens: 10, outputTokens: 4 } });
   });
 
   it("normalizes provider message and reasoning phases onto every streamed item event", async () => {
@@ -519,6 +557,44 @@ describe("Codex app-server Codex driver", () => {
       type: "string",
       const: "blocked",
     });
+  });
+
+  it("negotiates genuine plan mode with collaboration instructions and read-only workspace access", async () => {
+    const transport = new FakeCodexTransport();
+    const driver = makeDriver([transport], { requestedCollaborationMode: "plan" });
+    const session = await driver.openSession({ runId: "run-plan", normalizedSessionId: "session-plan", workingDirectory: "/workspace" });
+    expect(transport.calls.find((call) => call.method === "thread/start")?.params).toMatchObject({
+      permissions: "paperclip-runner-workspace-read-only",
+      config: { include_collaboration_mode_instructions: true },
+    });
+    expect(transport.calls.find((call) => call.method === "thread/start")?.params)
+      .not.toHaveProperty("collaborationMode");
+    expect(transport.calls.some((call) => call.method === "collaborationMode/list")).toBe(true);
+    await expect(session.startTurn({
+      message: { role: "user", text: "Author a plan." },
+      requestedCollaborationMode: "plan",
+    })).resolves.toMatchObject({ effectiveCollaborationMode: "plan" });
+    expect(transport.calls.find((call) => call.method === "turn/start")?.params).toMatchObject({
+      collaborationMode: {
+        mode: "plan",
+        settings: {
+          model: "gpt-test",
+          reasoning_effort: "high",
+          developer_instructions: null,
+        },
+      },
+      permissions: "paperclip-runner-workspace-read-only",
+    });
+  });
+
+  it("fails closed when the installed app-server does not confirm plan mode", async () => {
+    const transport = new FakeCodexTransport();
+    transport.confirmCollaborationMode = false;
+    await expect(makeDriver([transport], { requestedCollaborationMode: "plan" }).openSession({
+      runId: "run-plan-unsupported",
+      normalizedSessionId: "session-plan-unsupported",
+      workingDirectory: "/workspace",
+    })).rejects.toThrow("planning_mode_unsupported");
   });
 
   it("refuses to turn host credential roots into model-writable workspaces", async () => {
@@ -683,7 +759,10 @@ describe("Codex app-server Codex driver", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await session.interrupt?.({ reason: "operator" });
     releaseStart({ turn: { id: "turn-1", status: "inProgress", items: [] } });
-    await expect(starting).resolves.toEqual({ turnId: "turn-1" });
+    await expect(starting).resolves.toEqual({
+      turnId: "turn-1",
+      effectiveCollaborationMode: "default",
+    });
     expect(transport.calls.map(({ method }) => method)).toEqual(expect.arrayContaining([
       "turn/start", "turn/interrupt",
     ]));

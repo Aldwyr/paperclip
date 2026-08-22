@@ -94,6 +94,16 @@ import {
 } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
+import {
+  HarnessRuntimeRequestResolutionError,
+  parseHarnessRuntimeRequestResolution,
+  type HarnessRuntimeRequestKind,
+  type HarnessRuntimeRequestResolution,
+} from "../vendor/paperclip-runner/index.js";
+import {
+  queueRunnerPrpRuntimeRequestResolution,
+  RunnerPrpRuntimeRequestResolutionError,
+} from "../realtime/runner-prp-ws.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import {
   instanceSettingsService,
@@ -5013,6 +5023,70 @@ export function agentRoutes(
     }
 
     res.json(run);
+  });
+
+  router.post("/heartbeat-runs/:runId/runtime-requests/:requestId/resolve", async (req, res) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const requestId = req.params.requestId as string;
+    const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!existing) return;
+    if (existing.runtimeMode !== "native" || existing.status !== "running") {
+      throw conflict("This runner session is no longer accepting runtime responses.");
+    }
+    const turnId = typeof req.body?.turnId === "string" ? req.body.turnId.trim() : "";
+    const rawRequestKind = typeof req.body?.requestKind === "string" ? req.body.requestKind : "";
+    const runtimeRequestKinds: readonly HarnessRuntimeRequestKind[] = [
+      "command_approval",
+      "file_approval",
+      "permission_approval",
+      "user_input",
+      "elicitation",
+    ];
+    if (!requestId || requestId.length > 160 || !turnId || turnId.length > 160) {
+      throw badRequest("Runtime request and turn identifiers are required.");
+    }
+    if (!runtimeRequestKinds.includes(rawRequestKind as HarnessRuntimeRequestKind)) {
+      throw badRequest("Unsupported runtime request kind.");
+    }
+    let resolution: HarnessRuntimeRequestResolution;
+    try {
+      resolution = parseHarnessRuntimeRequestResolution(
+        rawRequestKind as HarnessRuntimeRequestKind,
+        req.body?.resolution,
+      );
+    } catch (error) {
+      if (error instanceof HarnessRuntimeRequestResolutionError) {
+        throw badRequest("Invalid runtime request response.");
+      }
+      throw error;
+    }
+
+    try {
+      const queued = queueRunnerPrpRuntimeRequestResolution({
+        runId,
+        requestId,
+        turnId,
+        resolution,
+      });
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "heartbeat.runtime_request_resolution_queued",
+        entityType: "heartbeat_run",
+        entityId: existing.id,
+        details: { requestId, action: resolution.action },
+      });
+      res.status(202).json({ accepted: true, commandId: queued.commandId });
+    } catch (error) {
+      if (error instanceof RunnerPrpRuntimeRequestResolutionError) {
+        throw conflict(error.code === "runtime_request_resolution_conflict"
+          ? "A different response was already submitted for this runtime request."
+          : "The runner session is no longer accepting runtime responses.");
+      }
+      throw error;
+    }
   });
 
   router.post("/heartbeat-runs/:runId/watchdog-decisions", async (req, res) => {

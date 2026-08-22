@@ -97,7 +97,7 @@ function publicCompanyState(serialized: string): CapabilityJsonValue {
 
 function boundary(kind: string): string {
   if (kind === "tool_call" || kind === "tool_result" || kind === "tool_discovery") return "semantic tool";
-  if (kind === "provider_event") return "Codex app-server";
+  if (kind === "provider_event") return "provider harness";
   if (kind === "process") return "runnerd process";
   if (kind === "interaction") return "mock control plane";
   return "live session";
@@ -142,6 +142,7 @@ export function projectCapabilityDevtools(snapshot: CapabilityLiveSessionSnapsho
     runtime: safe({
       status: snapshot.status,
       activeTurnId: snapshot.activeTurnId,
+      providerSessionId: snapshot.providerSessionId,
       providerModel: snapshot.providerModel ?? null,
       process: snapshot.process === null ? null : {
         runnerPid: snapshot.process.runnerPid,

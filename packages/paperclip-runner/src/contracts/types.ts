@@ -37,6 +37,7 @@ export interface NativeSessionCapabilities {
   runtimeRequestResolution?: boolean;
   goals?: boolean;
   threadLineage?: boolean;
+  collaborationModes?: Array<"default" | "plan">;
   unsupported?: string[];
 }
 

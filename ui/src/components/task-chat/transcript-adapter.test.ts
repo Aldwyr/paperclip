@@ -163,6 +163,45 @@ describe("transcriptToTaskChatItems tool_call updates", () => {
   });
 });
 
+describe("transcriptToTaskChatItems protocol surfaces", () => {
+  const opts = { runId: "run-protocol", running: false };
+
+  it("retains and updates provider activity instead of dropping it", () => {
+    const items = transcriptToTaskChatItems([
+      { kind: "provider_activity", ts: TS, family: "plan", eventType: "plan.updated", status: "running", title: "Plan", summary: "Drafting", payload: { planId: "plan-1", revision: 1, steps: [{ stepId: "one", body: "Inventory", status: "in_progress" }] } },
+      { kind: "provider_activity", ts: TS, family: "plan", eventType: "plan.updated", status: "completed", title: "Plan", summary: "Ready", payload: { planId: "plan-1", revision: 2, steps: [{ stepId: "one", body: "Inventory", status: "completed" }] } },
+    ], opts);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "protocol", surface: "provider_activity", family: "plan", status: "completed", summary: "Ready" });
+  });
+
+  it("coalesces workspace revisions and runtime request lifecycle states", () => {
+    const items = transcriptToTaskChatItems([
+      { kind: "workspace_change", ts: TS, changeSetId: "change-1", revision: 1, source: "harness_reported", complete: false, files: [], totals: { files: 0, additions: null, deletions: null }, patchArtifactRef: null },
+      { kind: "workspace_change", ts: TS, changeSetId: "change-1", revision: 2, source: "runner_verified", complete: true, files: [{ path: "ui/src/App.tsx", operation: "modify", previousPath: null, additions: 1, deletions: 0, binary: false, diff: "+ok" }], totals: { files: 1, additions: 1, deletions: 0 }, patchArtifactRef: null },
+      { kind: "runtime_request", ts: TS, requestId: "request-1", requestKind: "command_approval", turnId: "turn-1", requestType: "permission", status: "pending", prompt: "Allow?", choices: [], fields: [] },
+      { kind: "runtime_request", ts: TS, requestId: "request-1", requestKind: "command_approval", turnId: "turn-1", requestType: "permission", status: "resolved", prompt: "Allow?", choices: [], fields: [] },
+    ], opts);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ kind: "protocol", surface: "workspace_change", revision: 2, complete: true });
+    expect(items[1]).toMatchObject({ kind: "protocol", surface: "runtime_request", runId: "run-protocol", turnId: "turn-1", requestKind: "command_approval", status: "resolved" });
+  });
+
+  it("bounds provider output and workspace previews to 8 KiB", () => {
+    const oversized = "x".repeat(9 * 1024);
+    const items = transcriptToTaskChatItems([
+      { kind: "provider_activity", ts: TS, family: "tool_execution", eventType: "tool.execution.completed", status: "completed", title: "Tool execution", summary: "Done", payload: { executionId: "exec-1", output: oversized } },
+      { kind: "workspace_file_reference", ts: TS, referenceId: "file-1", source: "runner_verified", path: "ui/src/App.tsx", displayName: "App.tsx", mediaType: "text/typescript", presentation: "code", line: null, preview: oversized, previewTruncated: false, contentDigest: null },
+    ], opts);
+    const provider = items.find((item) => item.kind === "protocol" && item.surface === "provider_activity");
+    const file = items.find((item) => item.kind === "protocol" && item.surface === "workspace_file");
+    expect(provider && provider.surface === "provider_activity" ? provider.output?.length : 0).toBe(8 * 1024);
+    expect(provider && provider.surface === "provider_activity" ? provider.outputTruncated : false).toBe(true);
+    expect(file && file.surface === "workspace_file" ? file.preview?.length : 0).toBe(8 * 1024);
+    expect(file && file.surface === "workspace_file" ? file.previewTruncated : false).toBe(true);
+  });
+});
+
 describe("buildTurnSummary tool counting", () => {
   function statusEntry(toolUseId: string | undefined, status: string): TranscriptEntry {
     return {

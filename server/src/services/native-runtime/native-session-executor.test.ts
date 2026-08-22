@@ -34,6 +34,7 @@ import {
   nativeSessionFailureDisposition,
   nativeSessionFailureSourceCode,
   providerPlanMarkdown,
+  semanticProviderPlanMarkdown,
 } from "./native-session-executor.js";
 
 describe("native provider bootstrap environment", () => {
@@ -77,6 +78,23 @@ const execution = {
 } as NativeExecutionInputV1;
 
 describe("provider plan synchronization", () => {
+  it("prefers the provider's completed Markdown when it is available", () => {
+    expect(providerPlanMarkdown({
+      markdown: "# Release plan\n\n1. Prepare\n2. Deploy",
+      explanation: "This fallback must not replace the completed plan.",
+      steps: [{ body: "Fallback", status: "pending" }],
+    })).toBe("# Release plan\n\n1. Prepare\n2. Deploy");
+  });
+
+  it("extracts a completed plan from the semantic result artifact", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "<proposed_plan>\n# Health check\n\n1. Add endpoint\n2. Verify it\n</proposed_plan>",
+      }],
+    })).toBe("# Health check\n\n1. Add endpoint\n2. Verify it");
+  });
+
   it("renders a bounded Markdown checklist without embedding provenance", () => {
     const markdown = providerPlanMarkdown({
       explanation: "Release safely",
@@ -257,6 +275,9 @@ describe("native session bounded recovery", () => {
     expect(nativeSessionFailureSourceCode(new Error(
       "provider_transport_failed: invalid JSON-RPC",
     ))).toBe("provider_transport_failed");
+    expect(nativeSessionFailureSourceCode(new Error(
+      "planning_mode_unsupported: installed Codex app-server did not confirm plan mode",
+    ))).toBe("planning_mode_unsupported");
   });
 
   it("retries the same run twice and stops at the third failed attempt", () => {

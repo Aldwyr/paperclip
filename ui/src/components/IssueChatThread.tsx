@@ -36,12 +36,14 @@ import type {
   FeedbackVote,
   FeedbackVoteValue,
   IssueAttachment,
+  IssueDocumentSummary,
   IssueBlockerAttention,
   IssueRecoveryAction,
   IssueRelationIssueSummary,
   IssueScheduledRetry,
   SuccessfulRunHandoffState,
   IssueWorkMode,
+  IssueWorkProduct,
 } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
@@ -433,6 +435,10 @@ interface IssueChatComposerProps {
 interface IssueChatThreadProps {
   comments: IssueChatComment[];
   interactions?: IssueThreadInteraction[];
+  /** App-authoritative resources interleaved by the default task thread. */
+  documents?: IssueDocumentSummary[];
+  workProducts?: IssueWorkProduct[];
+  attachments?: IssueAttachment[];
   feedbackVotes?: FeedbackVote[];
   feedbackDataSharingPreference?: FeedbackDataSharingPreference;
   feedbackTermsUrl?: string | null;

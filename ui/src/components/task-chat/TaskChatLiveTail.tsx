@@ -1,11 +1,12 @@
 import type { ReactElement } from "react";
 import { MarkdownBody } from "@/components/MarkdownBody";
-import type { TaskChatItem } from "./task-chat-model";
+import type { TaskChatItem, TaskChatRuntimeRequestDecision, TaskChatRuntimeRequestItem } from "./task-chat-model";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatMarker } from "./TaskChatMarker";
+import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { buildActivityPhases } from "./transcript-adapter";
 
 /**
@@ -30,18 +31,23 @@ export function TaskChatLiveTail({
   items,
   emptyMessage,
   excludeFinal = false,
+  onRuntimeRequestDecision,
 }: {
   items: readonly TaskChatItem[];
   /** Shown when nothing renderable has streamed yet (queued / pre-first-token). */
   emptyMessage?: string;
   /** New-runner turn renders final-answer messages in its dedicated response slot. */
   excludeFinal?: boolean;
+  onRuntimeRequestDecision?: (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => void | Promise<void>;
 }) {
   const visibleItems = excludeFinal
     ? items.filter((item) => item.kind !== "message" || item.interstitial)
     : items;
   const rows = buildActivityPhases(visibleItems, true)
-    .map((item) => renderTailRow(item))
+    .map((item) => renderTailRow(item, onRuntimeRequestDecision))
     .filter((row): row is ReactElement => row != null);
 
   if (rows.length === 0) {
@@ -53,7 +59,13 @@ export function TaskChatLiveTail({
   return <div className="flex flex-col gap-2">{rows}</div>;
 }
 
-function renderTailRow(item: TaskChatItem): ReactElement | null {
+function renderTailRow(
+  item: TaskChatItem,
+  onRuntimeRequestDecision?: (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => void | Promise<void>,
+): ReactElement | null {
   switch (item.kind) {
     case "message": {
       // Streamed reply text (always interstitial from the transcript adapter).
@@ -98,9 +110,13 @@ function renderTailRow(item: TaskChatItem): ReactElement | null {
               ? <TaskChatThinking item={child} />
               : child.kind === "marker"
                 ? <TaskChatMarker item={child} />
-              : <TaskChatUsageReadout item={child} />}
+                : child.kind === "protocol"
+                  ? <TaskChatProtocolCard item={child} onRuntimeRequestDecision={onRuntimeRequestDecision} />
+                  : <TaskChatUsageReadout item={child} />}
         />
       );
+    case "protocol":
+      return <TaskChatProtocolCard key={item.id} item={item} onRuntimeRequestDecision={onRuntimeRequestDecision} />;
     // Markers, interactions, briefs, statuses, turns, and dropped debug kinds
     // cannot appear as direct live-tail rows.
     default:

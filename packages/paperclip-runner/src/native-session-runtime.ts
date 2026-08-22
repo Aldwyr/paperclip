@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
-import type { NativeExecutionInputV1, NativeSessionExecutionResult } from "./contracts/native-execution.js";
+import type { NativeExecutionInput, NativeSessionExecutionResult } from "./contracts/native-execution.js";
 import { buildNativeModelEnvelope, parseNativeExecutionInput } from "./contracts/native-execution.js";
 import type { NativeSession, NativeSessionBackend } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
 import type { PrpEvent, PrpTerminalState } from "./protocol/replay-contract.js";
 
 export interface ExecuteNativeSessionOptions {
-  input: NativeExecutionInputV1;
+  input: NativeExecutionInput;
   backend: NativeSessionBackend;
   controlPlane: ControlPlanePort;
   runnerInstanceId: string;
@@ -151,10 +151,17 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
       : null;
     if (!completed) {
       const consuming = consumeTurn(session, options.controlPlane, options.timeoutMs ?? 900_000);
+      // Event consumption must begin before startTurn so an eager provider cannot
+      // outrun us. Observe its rejection immediately, though: if startTurn or
+      // checkpointing fails first, the outer finally closes the session and the
+      // abandoned consumer will reject when its stream closes. Without a handler
+      // that later rejection becomes process-fatal under Node's strict policy.
+      void consuming.catch(() => undefined);
       const recoveredActiveTurnId = recoveredSnapshot.activeTurnId ?? persistedSession?.activeTurnId ?? null;
       if (!recovered || !recoveredActiveTurnId) {
         await session.startTurn({
           message: { role: "user", text: JSON.stringify(buildNativeModelEnvelope(input)) },
+          requestedCollaborationMode: "executionMode" in input ? input.executionMode : "default",
         });
         await checkpoint();
       }

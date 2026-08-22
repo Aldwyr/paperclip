@@ -737,6 +737,44 @@ test.describe("Capability clean-room chat", () => {
     await expect(page.locator("body")).not.toContainText("Codex is thinking");
   });
 
+  test("AWS AgentCore options are exclusive and expose remote-runtime retention controls", async ({ page }) => {
+    await page.addInitScript(() => window.localStorage.clear());
+    await page.route(CLEAN_ROOM_API, async (route) => {
+      const payload = cleanRoomPayload("MCK-1402");
+      payload.view.identity = {
+        ...payload.view.identity,
+        agentLabel: "Real AWS AgentCore",
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...payload,
+          configuration: {
+            provider: "aws_agentcore",
+            model: "global.anthropic.claude-sonnet-4-6",
+            agentCoreProfileId: "qualified-agentcore",
+            maxEstimatedSessionCostUsd: 1,
+            lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
+          },
+        }),
+      });
+    });
+    await page.goto("/#/chat");
+    await expect(page.locator('[data-thread-state="settled"]')).toBeVisible();
+
+    await expect(page.getByTestId("agent-chip")).toHaveText("Real AWS AgentCore");
+    await expect(page.getByTestId("chat-active-harness")).toContainText("AWS cloud · no provider PID");
+    await expect(page.getByTestId("chat-agentcore-profile")).toHaveValue("qualified-agentcore");
+    await expect(page.getByTestId("chat-agentcore-spend-cap")).toHaveValue("1");
+    await expect(page.getByTestId("chat-managed-profile")).toHaveCount(0);
+    await expect(page.getByTestId("chat-managed-spend-cap")).toHaveCount(0);
+    await expect(page.getByTestId("chat-agentcore-delete-session")).toBeVisible();
+    await expect(page.getByTestId("chat-agentcore-retention-notice")).toContainText("90 days");
+    await expect(page.getByTestId("chat-agentcore-retention-notice")).toContainText("Paperclip estimate");
+    await expect(page.locator("body")).not.toContainText("Codex is thinking");
+  });
+
   test("evidence stays collapsed until it is asked for", async ({ page }) => {
     await openCleanRoom(page);
 

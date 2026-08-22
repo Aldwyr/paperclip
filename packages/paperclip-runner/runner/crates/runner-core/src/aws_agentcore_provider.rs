@@ -1,0 +1,1348 @@
+//! Amazon Bedrock AgentCore Harness provider.
+//!
+//! The Harness owns the remote model loop. Paperclip supplies only caller-side
+//! inline functions, then executes those functions through the durable PRP
+//! bridge. No Paperclip credential or callback address enters AgentCore.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use aws_config::sts::AssumeRoleProvider;
+use aws_sdk_bedrockagentcore::types::{
+    HarnessBedrockApiFormat, HarnessBedrockModelConfig, HarnessContentBlock,
+    HarnessContentBlockDelta, HarnessContentBlockStart, HarnessConversationRole,
+    HarnessInlineFunctionConfig, HarnessMessage, HarnessModelConfiguration, HarnessTool,
+    HarnessToolConfiguration, HarnessToolResultBlock, HarnessToolResultContentBlock,
+    HarnessToolType, HarnessToolUseBlock, HarnessToolUseStatus, HarnessToolUseType,
+    InvokeHarnessStreamOutput,
+};
+use aws_smithy_types::{Document, Number};
+use aws_types::region::Region;
+use jsonschema::validator_for;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::codex_provider::{
+    AwsAgentCoreProviderConfig, Provider, ProviderEvent, ProviderKind, ProviderRuntimeIdentity,
+};
+use crate::local_runner::LocalRunnerError;
+use crate::provider_bridge::{AuthorizedTool, ToolResult};
+
+const MAX_AGENTCORE_TOOLS: usize = 64;
+#[derive(Clone, Debug)]
+struct RemoteToolUse {
+    remote_name: String,
+    operation_id: String,
+    input: Value,
+}
+
+#[derive(Clone, Debug)]
+enum NetworkEvent {
+    TextDelta(String),
+    ReasoningProgress,
+    ToolUse {
+        call_id: String,
+        remote_name: String,
+        input: Value,
+    },
+    Usage {
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_input_tokens: i64,
+        cache_write_input_tokens: i64,
+        latency_ms: i64,
+    },
+    Stop(String),
+    MemoryCursor(String),
+    Failure(String),
+}
+
+enum NetworkCommand {
+    Invoke {
+        messages: Vec<HarnessMessage>,
+        tools: Vec<HarnessTool>,
+        allowed_tools: Vec<String>,
+        invocation_id: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    StopRuntime {
+        token: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    DeleteMemory {
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    Shutdown,
+}
+
+struct NetworkWorker {
+    commands: SyncSender<NetworkCommand>,
+    events: Receiver<NetworkEvent>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl NetworkWorker {
+    fn start(
+        config: AwsAgentCoreProviderConfig,
+        session_id: String,
+        actor_id: String,
+    ) -> Result<Self, LocalRunnerError> {
+        let (command_tx, command_rx) = mpsc::sync_channel(32);
+        let (event_tx, event_rx) = mpsc::sync_channel(256);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("paperclip-aws-agentcore-network".to_owned())
+            .spawn(move || {
+                network_loop(config, session_id, actor_id, command_rx, event_tx, ready_tx)
+            })
+            .map_err(|error| {
+                LocalRunnerError::invalid(format!(
+                    "failed to start AgentCore network worker: {error}"
+                ))
+            })?;
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| LocalRunnerError::invalid("AgentCore credential setup timed out"))?
+            .map_err(LocalRunnerError::invalid)?;
+        Ok(Self {
+            commands: command_tx,
+            events: event_rx,
+            join: Some(join),
+        })
+    }
+
+    fn invoke(
+        &self,
+        messages: Vec<HarnessMessage>,
+        tools: Vec<HarnessTool>,
+        allowed_tools: Vec<String>,
+        invocation_id: String,
+    ) -> Result<(), LocalRunnerError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.commands
+            .send(NetworkCommand::Invoke {
+                messages,
+                tools,
+                allowed_tools,
+                invocation_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| LocalRunnerError::invalid("AgentCore network worker stopped"))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(45))
+            .map_err(|_| {
+                LocalRunnerError::invalid(
+                    "AgentCore invocation delivery is ambiguous and requires Memory reconciliation",
+                )
+            })?
+            .map_err(LocalRunnerError::invalid)
+    }
+
+    fn stop_runtime(&self, token: String) -> Result<(), LocalRunnerError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.commands
+            .send(NetworkCommand::StopRuntime {
+                token,
+                reply: reply_tx,
+            })
+            .map_err(|_| LocalRunnerError::invalid("AgentCore network worker stopped"))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(45))
+            .map_err(|_| LocalRunnerError::invalid("AgentCore runtime stop timed out"))?
+            .map_err(LocalRunnerError::invalid)
+    }
+
+    fn delete_memory(&self) -> Result<(), LocalRunnerError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.commands
+            .send(NetworkCommand::DeleteMemory { reply: reply_tx })
+            .map_err(|_| LocalRunnerError::invalid("AgentCore network worker stopped"))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(60))
+            .map_err(|_| LocalRunnerError::invalid("AgentCore Memory purge timed out"))?
+            .map_err(LocalRunnerError::invalid)
+    }
+
+    fn try_event(&self) -> Option<NetworkEvent> {
+        self.events.try_recv().ok()
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.commands.send(NetworkCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for NetworkWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn network_loop(
+    config: AwsAgentCoreProviderConfig,
+    session_id: String,
+    actor_id: String,
+    commands: Receiver<NetworkCommand>,
+    events: SyncSender<NetworkEvent>,
+    ready: mpsc::Sender<Result<(), String>>,
+) {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = ready.send(Err(format!(
+                "failed to create AgentCore async runtime: {error}"
+            )));
+            return;
+        }
+    };
+    let clients = runtime.block_on(async {
+        let region = Region::new(config.region.clone());
+        let base = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region.clone())
+            .load()
+            .await;
+        let assumed = AssumeRoleProvider::builder(config.invocation_role_arn.clone())
+            .session_name(format!(
+                "paperclip-{}",
+                &session_id[session_id.len().saturating_sub(24)..]
+            ))
+            .configure(&base)
+            .build()
+            .await;
+        let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region)
+            .credentials_provider(assumed)
+            .load()
+            .await;
+        (aws_sdk_bedrockagentcore::Client::new(&shared), config)
+    });
+    let _ = ready.send(Ok(()));
+    let (client, config) = clients;
+    while let Ok(command) = commands.recv() {
+        match command {
+            NetworkCommand::Invoke {
+                messages,
+                tools,
+                allowed_tools,
+                invocation_id,
+                reply,
+            } => {
+                let client = client.clone();
+                let config = config.clone();
+                let session_id = session_id.clone();
+                let actor_id = actor_id.clone();
+                let events = events.clone();
+                runtime.spawn(async move {
+                    let model = HarnessBedrockModelConfig::builder()
+                        .model_id(config.model.clone())
+                        .max_tokens(config.max_output_tokens as i32)
+                        .api_format(HarnessBedrockApiFormat::ConverseStream)
+                        .build();
+                    let Ok(model) = model else {
+                        let _ = events.send(NetworkEvent::Failure(
+                            "invalid AgentCore model configuration".to_owned(),
+                        ));
+                        return;
+                    };
+                    let response = client
+                        .invoke_harness()
+                        .harness_arn(config.harness_arn.clone())
+                        .qualifier(config.endpoint_qualifier.clone())
+                        .runtime_session_id(session_id.clone())
+                        .runtime_user_id(actor_id.clone())
+                        .actor_id(actor_id.clone())
+                        .set_messages(Some(messages))
+                        .model(HarnessModelConfiguration::BedrockModelConfig(model))
+                        .set_tools(Some(tools))
+                        .set_allowed_tools(Some(allowed_tools))
+                        .set_skills(Some(Vec::new()))
+                        .max_iterations(config.max_iterations as i32)
+                        .max_tokens(config.max_output_tokens as i32)
+                        .timeout_seconds(config.timeout_seconds as i32)
+                        .trace_parent(format!(
+                            "00-{}-{}-01",
+                            sha_hex(&invocation_id, 32),
+                            sha_hex(&(invocation_id.clone() + "span"), 16)
+                        ))
+                        .send()
+                        .await;
+                    let mut response = match response {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let detail = redact_aws_error(&error.to_string());
+                            let _ = reply.send(Err(detail.clone()));
+                            let _ = events.send(NetworkEvent::Failure(detail));
+                            return;
+                        }
+                    };
+                    let _ = reply.send(Ok(()));
+                    let mut tool_blocks: BTreeMap<i32, (String, String, String)> = BTreeMap::new();
+                    loop {
+                        match response.stream.recv().await {
+                            Ok(Some(event)) => {
+                                normalize_stream_event(event, &mut tool_blocks, &events)
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                let _ = events.send(NetworkEvent::Failure(redact_aws_error(
+                                    &error.to_string(),
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(Some(event_id)) =
+                        latest_memory_event_id(&client, &config, &session_id, &actor_id).await
+                    {
+                        let _ = events.send(NetworkEvent::MemoryCursor(event_id));
+                    }
+                });
+            }
+            NetworkCommand::StopRuntime { token, reply } => {
+                let result = runtime.block_on(async {
+                    match client
+                        .stop_runtime_session()
+                        .runtime_session_id(session_id.clone())
+                        .agent_runtime_arn(config.agent_runtime_arn.clone())
+                        .qualifier(config.endpoint_qualifier.clone())
+                        .client_token(token)
+                        .send()
+                        .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(error) if is_resource_not_found(&error.to_string()) => Ok(()),
+                        Err(error) => Err(redact_aws_error(&error.to_string())),
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            NetworkCommand::DeleteMemory { reply } => {
+                let result = runtime.block_on(delete_all_memory_events(
+                    &client,
+                    &config,
+                    &session_id,
+                    &actor_id,
+                ));
+                let _ = reply.send(result);
+            }
+            NetworkCommand::Shutdown => break,
+        }
+    }
+}
+
+fn normalize_stream_event(
+    event: InvokeHarnessStreamOutput,
+    tool_blocks: &mut BTreeMap<i32, (String, String, String)>,
+    events: &SyncSender<NetworkEvent>,
+) {
+    match event {
+        InvokeHarnessStreamOutput::ContentBlockStart(value) => {
+            if let Some(HarnessContentBlockStart::ToolUse(start)) = value.start() {
+                tool_blocks.insert(
+                    value.content_block_index(),
+                    (
+                        start.tool_use_id().to_owned(),
+                        start.name().to_owned(),
+                        String::new(),
+                    ),
+                );
+            }
+        }
+        InvokeHarnessStreamOutput::ContentBlockDelta(value) => match value.delta() {
+            Some(HarnessContentBlockDelta::Text(text)) => {
+                let _ = events.send(NetworkEvent::TextDelta(text.clone()));
+            }
+            Some(HarnessContentBlockDelta::ReasoningContent(_)) => {
+                let _ = events.send(NetworkEvent::ReasoningProgress);
+            }
+            Some(HarnessContentBlockDelta::ToolUse(delta)) => {
+                if let Some((_, _, input)) = tool_blocks.get_mut(&value.content_block_index()) {
+                    input.push_str(delta.input());
+                }
+            }
+            _ => {}
+        },
+        InvokeHarnessStreamOutput::ContentBlockStop(value) => {
+            if let Some((call_id, remote_name, input)) =
+                tool_blocks.remove(&value.content_block_index())
+            {
+                match serde_json::from_str::<Value>(&input) {
+                    Ok(input) => {
+                        let _ = events.send(NetworkEvent::ToolUse {
+                            call_id,
+                            remote_name,
+                            input,
+                        });
+                    }
+                    Err(_) => {
+                        let _ = events.send(NetworkEvent::Failure(
+                            "AgentCore emitted malformed inline-tool JSON".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        InvokeHarnessStreamOutput::Metadata(value) => {
+            let usage = value.usage();
+            let metrics = value.metrics();
+            let _ = events.send(NetworkEvent::Usage {
+                input_tokens: usage.map(|v| v.input_tokens() as i64).unwrap_or(0),
+                output_tokens: usage.map(|v| v.output_tokens() as i64).unwrap_or(0),
+                cache_read_input_tokens: usage
+                    .and_then(|v| v.cache_read_input_tokens())
+                    .unwrap_or(0) as i64,
+                cache_write_input_tokens: usage
+                    .and_then(|v| v.cache_write_input_tokens())
+                    .unwrap_or(0) as i64,
+                latency_ms: metrics.map(|v| v.latency_ms()).unwrap_or(0),
+            });
+        }
+        InvokeHarnessStreamOutput::MessageStop(value) => {
+            let _ = events.send(NetworkEvent::Stop(value.stop_reason().as_str().to_owned()));
+        }
+        InvokeHarnessStreamOutput::MessageStart(_) => {}
+        _ => {
+            let _ = events.send(NetworkEvent::Failure(
+                "AgentCore SDK did not recognize an EventStream record".to_owned(),
+            ));
+        }
+    }
+}
+
+async fn delete_all_memory_events(
+    client: &aws_sdk_bedrockagentcore::Client,
+    config: &AwsAgentCoreProviderConfig,
+    session_id: &str,
+    actor_id: &str,
+) -> Result<(), String> {
+    let mut next_token: Option<String> = None;
+    loop {
+        let page = client
+            .list_events()
+            .memory_id(config.memory_id.clone())
+            .session_id(session_id)
+            .actor_id(actor_id)
+            .max_results(100)
+            .set_next_token(next_token.take())
+            .send()
+            .await
+            .map_err(|error| redact_aws_error(&error.to_string()))?;
+        for event in page.events() {
+            let deleted = client
+                .delete_event()
+                .memory_id(config.memory_id.clone())
+                .session_id(session_id)
+                .actor_id(actor_id)
+                .event_id(event.event_id())
+                .send()
+                .await;
+            if let Err(error) = deleted {
+                if !is_resource_not_found(&error.to_string()) {
+                    return Err(redact_aws_error(&error.to_string()));
+                }
+            }
+        }
+        next_token = page.next_token().map(str::to_owned);
+        if next_token.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn latest_memory_event_id(
+    client: &aws_sdk_bedrockagentcore::Client,
+    config: &AwsAgentCoreProviderConfig,
+    session_id: &str,
+    actor_id: &str,
+) -> Result<Option<String>, String> {
+    let mut next_token: Option<String> = None;
+    let mut latest: Option<(i64, String)> = None;
+    loop {
+        let page = client
+            .list_events()
+            .memory_id(config.memory_id.clone())
+            .session_id(session_id)
+            .actor_id(actor_id)
+            .include_payloads(false)
+            .max_results(100)
+            .set_next_token(next_token.take())
+            .send()
+            .await
+            .map_err(|error| redact_aws_error(&error.to_string()))?;
+        for event in page.events() {
+            let candidate = (event.event_timestamp().secs(), event.event_id().to_owned());
+            if latest.as_ref().is_none_or(|current| candidate > *current) {
+                latest = Some(candidate);
+            }
+        }
+        next_token = page.next_token().map(str::to_owned);
+        if next_token.is_none() {
+            break;
+        }
+    }
+    Ok(latest.map(|(_, event_id)| event_id))
+}
+
+pub struct AwsAgentCoreHarnessProvider {
+    config: AwsAgentCoreProviderConfig,
+    session_id: String,
+    actor_id: String,
+    worker: NetworkWorker,
+    tools: Vec<HarnessTool>,
+    allowed_tools: Vec<String>,
+    remote_to_canonical: BTreeMap<String, String>,
+    input_schemas: BTreeMap<String, Value>,
+    pending: BTreeMap<String, RemoteToolUse>,
+    delivered_results: BTreeMap<String, ToolResult>,
+    queue: VecDeque<ProviderEvent>,
+    current_turn_id: Option<String>,
+    current_text: String,
+    invocation_counter: u64,
+    durable_cursor: Option<String>,
+    usage: Value,
+    interrupted: bool,
+    max_estimated_cost_usd: f64,
+}
+
+impl AwsAgentCoreHarnessProvider {
+    pub fn start(
+        config: &AwsAgentCoreProviderConfig,
+        tools: Vec<AuthorizedTool>,
+        resume_session_id: Option<&str>,
+        resume_event_cursor: Option<&str>,
+    ) -> Result<Self, LocalRunnerError> {
+        validate_config(config)?;
+        let session_id = resume_session_id
+            .map(str::to_owned)
+            .unwrap_or_else(new_runtime_session_id);
+        let actor_id = format!("paperclip-{}", sha_hex(&session_id, 32));
+        let worker = NetworkWorker::start(config.clone(), session_id.clone(), actor_id.clone())?;
+        let (encoded, allowed, reverse, schemas) = encode_tools(&tools)?;
+        Ok(Self {
+            config: config.clone(),
+            session_id,
+            actor_id,
+            worker,
+            tools: encoded,
+            allowed_tools: allowed,
+            remote_to_canonical: reverse,
+            input_schemas: schemas,
+            pending: BTreeMap::new(),
+            delivered_results: BTreeMap::new(),
+            queue: VecDeque::new(),
+            current_turn_id: None,
+            current_text: String::new(),
+            invocation_counter: 0,
+            durable_cursor: resume_event_cursor.map(str::to_owned),
+            usage: json!({ "inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "requestCount": 0, "estimatedCostUsd": 0.0, "costSource": "paperclip_estimate" }),
+            interrupted: false,
+            max_estimated_cost_usd: config.max_estimated_session_cost_usd,
+        })
+    }
+
+    fn invoke(&mut self, messages: Vec<HarnessMessage>) -> Result<Value, LocalRunnerError> {
+        if self
+            .usage
+            .get("estimatedCostUsd")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            >= self.max_estimated_cost_usd
+        {
+            return Err(LocalRunnerError::invalid("AgentCore estimated session spend ceiling reached; raise it explicitly before continuing"));
+        }
+        self.invocation_counter = self.invocation_counter.saturating_add(1);
+        let invocation_id = format!("{}-{}", self.session_id, self.invocation_counter);
+        self.durable_cursor = Some(invocation_id.clone());
+        self.worker.invoke(
+            messages,
+            self.tools.clone(),
+            self.allowed_tools.clone(),
+            invocation_id.clone(),
+        )?;
+        Ok(json!({ "runtimeSessionId": self.session_id, "invocationId": invocation_id }))
+    }
+}
+
+impl Provider for AwsAgentCoreHarnessProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::AwsAgentcore
+    }
+
+    fn runtime_identity(&self) -> ProviderRuntimeIdentity {
+        ProviderRuntimeIdentity::RemoteService {
+            service: "aws_bedrock_agentcore_harness".to_owned(),
+            provider_session_id: self.session_id.clone(),
+            process_id: None,
+        }
+    }
+
+    fn session_identity(&self) -> &str {
+        &self.session_id
+    }
+    fn provider_session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
+    }
+    fn durable_event_cursor(&self) -> Option<&str> {
+        self.durable_cursor.as_deref()
+    }
+
+    fn configure_tools(&mut self, tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
+        if self.current_turn_id.is_some() {
+            return Err(LocalRunnerError::invalid(
+                "cannot replace AgentCore tools while a turn is active",
+            ));
+        }
+        let (encoded, allowed, reverse, schemas) = encode_tools(&tools)?;
+        self.tools = encoded;
+        self.allowed_tools = allowed;
+        self.remote_to_canonical = reverse;
+        self.input_schemas = schemas;
+        Ok(())
+    }
+
+    fn increase_budget(&mut self, value: f64) -> Result<Value, LocalRunnerError> {
+        if !value.is_finite() || value <= self.max_estimated_cost_usd {
+            return Err(LocalRunnerError::invalid(
+                "AgentCore estimated spend ceiling may only be raised monotonically",
+            ));
+        }
+        self.max_estimated_cost_usd = value;
+        Ok(json!({ "maxEstimatedSessionCostUsd": value, "costSource": "paperclip_estimate" }))
+    }
+
+    fn destroy_session(&mut self) -> Result<(), LocalRunnerError> {
+        self.worker.stop_runtime(format!(
+            "paperclip-delete-{}",
+            sha_hex(&self.session_id, 32)
+        ))?;
+        self.worker.delete_memory()?;
+        self.worker.shutdown();
+        Ok(())
+    }
+
+    fn start_turn(
+        &mut self,
+        message: &str,
+        _cwd: &str,
+        turn_id: &str,
+    ) -> Result<Value, LocalRunnerError> {
+        if self.current_turn_id.is_some() {
+            return Err(LocalRunnerError::invalid("AgentCore turn already active"));
+        }
+        self.current_turn_id = Some(turn_id.to_owned());
+        self.current_text.clear();
+        self.interrupted = false;
+        self.queue.push_back(ProviderEvent::Notification {
+            method: "turn/started".to_owned(),
+            params: json!({ "turnId": turn_id, "turn": { "id": turn_id, "status": "inProgress" } }),
+        });
+        self.invoke(vec![user_text_message(message)?])
+    }
+
+    fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
+        if self.current_turn_id.as_deref() != Some(turn_id) {
+            return Err(LocalRunnerError::invalid(
+                "AgentCore interrupt does not match active turn",
+            ));
+        }
+        self.interrupted = true;
+        self.worker.stop_runtime(format!(
+            "paperclip-interrupt-{}",
+            sha_hex(&(self.session_id.clone() + turn_id), 32)
+        ))?;
+        Ok(json!({ "runtimeSessionId": self.session_id, "stopped": true }))
+    }
+
+    fn read(&mut self) -> Result<Value, LocalRunnerError> {
+        Ok(json!({
+            "runtimeSessionId": self.session_id,
+            "actorId": self.actor_id,
+            "harnessArn": self.config.harness_arn,
+            "harnessVersion": self.config.harness_version,
+            "endpointArn": self.config.endpoint_arn,
+            "usage": self.usage,
+        }))
+    }
+
+    fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
+        if let Some(event) = self.queue.pop_front() {
+            return Ok(Some(event));
+        }
+        let Some(event) = self.worker.try_event() else {
+            return Ok(None);
+        };
+        match event {
+            NetworkEvent::TextDelta(delta) => {
+                self.current_text.push_str(&delta);
+                Ok(Some(ProviderEvent::Notification {
+                    method: "item/delta".to_owned(),
+                    params: json!({ "turnId": self.current_turn_id, "itemId": format!("aws-message-{}", self.invocation_counter), "delta": delta, "authoritative": true }),
+                }))
+            }
+            NetworkEvent::ReasoningProgress => Ok(Some(ProviderEvent::Notification {
+                method: "item/started".to_owned(),
+                params: json!({ "turnId": self.current_turn_id, "item": { "id": format!("aws-progress-{}", self.invocation_counter), "type": "progress", "phase": "thinking" } }),
+            })),
+            NetworkEvent::ToolUse {
+                call_id,
+                remote_name,
+                input,
+            } => {
+                let operation_id = self
+                    .remote_to_canonical
+                    .get(&remote_name)
+                    .ok_or_else(|| {
+                        LocalRunnerError::invalid(
+                            "AgentCore requested an unauthorized inline function",
+                        )
+                    })?
+                    .clone();
+                let schema = self.input_schemas.get(&operation_id).ok_or_else(|| {
+                    LocalRunnerError::invalid("AgentCore tool has no durable input schema")
+                })?;
+                if !validator_for(schema)
+                    .map_err(|_| {
+                        LocalRunnerError::invalid(
+                            "authorized Paperclip tool has invalid JSON Schema",
+                        )
+                    })?
+                    .is_valid(&input)
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "AgentCore inline-function arguments failed schema validation",
+                    ));
+                }
+                if let Some(previous) = self.pending.get(&call_id) {
+                    if previous.operation_id != operation_id || previous.input != input {
+                        return Err(LocalRunnerError::invalid(
+                            "AgentCore reused a tool-use ID with conflicting content",
+                        ));
+                    }
+                    return Ok(None);
+                }
+                self.pending.insert(
+                    call_id.clone(),
+                    RemoteToolUse {
+                        remote_name,
+                        operation_id: operation_id.clone(),
+                        input: input.clone(),
+                    },
+                );
+                Ok(Some(ProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    input,
+                }))
+            }
+            NetworkEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                latency_ms,
+            } => {
+                let prior_input = self
+                    .usage
+                    .get("inputTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let prior_output = self
+                    .usage
+                    .get("outputTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let prior_cache_read = self
+                    .usage
+                    .get("cacheReadInputTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let prior_cache_write = self
+                    .usage
+                    .get("cacheWriteInputTokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let total_input = prior_input.saturating_add(input_tokens);
+                let total_output = prior_output.saturating_add(output_tokens);
+                let total_cache_read = prior_cache_read.saturating_add(cache_read_input_tokens);
+                let total_cache_write = prior_cache_write.saturating_add(cache_write_input_tokens);
+                let requests = self
+                    .usage
+                    .get("requestCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    + 1;
+                let estimate = estimate_model_token_cost_usd(
+                    &self.config.model,
+                    total_input,
+                    total_output,
+                    total_cache_read,
+                    total_cache_write,
+                );
+                self.usage = json!({
+                    "inputTokens": total_input,
+                    "outputTokens": total_output,
+                    "cacheReadInputTokens": total_cache_read,
+                    "cacheWriteInputTokens": total_cache_write,
+                    "requestCount": requests,
+                    "latencyMs": latency_ms,
+                    "estimatedCostUsd": estimate,
+                    "estimateScope": "bedrock_model_tokens_only",
+                    "costSource": "paperclip_estimate",
+                    "estimatedCeilingUsd": self.max_estimated_cost_usd,
+                });
+                if estimate.is_some_and(|value| value >= self.max_estimated_cost_usd) {
+                    self.queue.push_back(ProviderEvent::Notification {
+                        method: "provider/budgetReached".to_owned(),
+                        params: json!({ "turnId": self.current_turn_id, "status": "limit_reached", "stopReason": "estimated_session_cost", "estimatedCostUsd": estimate, "costSource": "paperclip_estimate" }),
+                    });
+                }
+                Ok(Some(ProviderEvent::Notification {
+                    method: "thread/tokenUsage/updated".to_owned(),
+                    params: self.usage.clone(),
+                }))
+            }
+            NetworkEvent::Stop(reason) => match reason.as_str() {
+                "tool_use" | "tool_result" | "partial_turn" => {
+                    Ok(Some(ProviderEvent::Notification {
+                        method: "provider/waitingForToolResult".to_owned(),
+                        params: json!({ "turnId": self.current_turn_id, "runtimeSessionId": self.session_id }),
+                    }))
+                }
+                "end_turn" | "stop_sequence" | "interrupted" => {
+                    let turn_id = self.current_turn_id.take();
+                    let status = if self.interrupted || reason == "interrupted" {
+                        "interrupted"
+                    } else {
+                        "completed"
+                    };
+                    if !self.current_text.is_empty() {
+                        self.queue.push_back(ProviderEvent::Notification {
+                            method: "item/completed".to_owned(),
+                            params: json!({ "turnId": turn_id, "item": { "id": format!("aws-message-{}", self.invocation_counter), "type": "agentMessage", "text": self.current_text, "authoritative": true } }),
+                        });
+                    }
+                    self.queue.push_back(ProviderEvent::Notification {
+                        method: "turn/completed".to_owned(),
+                        params: json!({ "turnId": turn_id, "turn": { "id": turn_id, "status": status }, "stopReason": reason }),
+                    });
+                    Ok(self.queue.pop_front())
+                }
+                "max_iterations_exceeded"
+                | "max_output_tokens_exceeded"
+                | "max_tokens"
+                | "timeout_exceeded"
+                | "model_context_window_exceeded" => Ok(Some(ProviderEvent::Notification {
+                    method: "provider/budgetReached".to_owned(),
+                    params: json!({ "turnId": self.current_turn_id, "status": "limit_reached", "stopReason": reason, "costSource": "paperclip_estimate" }),
+                })),
+                "content_filtered" => Err(LocalRunnerError::invalid(
+                    "AgentCore model output was filtered",
+                )),
+                "malformed_model_output" | "malformed_tool_use" => Err(LocalRunnerError::invalid(
+                    "AgentCore returned malformed model output",
+                )),
+                _ => Err(LocalRunnerError::invalid(
+                    "AgentCore returned an unknown stop reason",
+                )),
+            },
+            NetworkEvent::MemoryCursor(event_id) => {
+                self.durable_cursor = Some(event_id);
+                Ok(None)
+            }
+            NetworkEvent::Failure(detail) => Err(LocalRunnerError::invalid(format!(
+                "AgentCore transport failed: {detail}"
+            ))),
+        }
+    }
+
+    fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
+        let pending = self
+            .pending
+            .get(&result.call_id)
+            .ok_or_else(|| {
+                LocalRunnerError::invalid("AgentCore tool result does not match a pending tool use")
+            })?
+            .clone();
+        if pending.operation_id != result.operation_id {
+            return Err(LocalRunnerError::invalid(
+                "AgentCore tool result operation does not match pending tool use",
+            ));
+        }
+        if let Some(previous) = self.delivered_results.get(&result.call_id) {
+            if previous != result {
+                return Err(LocalRunnerError::invalid(
+                    "AgentCore received conflicting results for one tool-use ID",
+                ));
+            }
+            return Ok(());
+        }
+        self.delivered_results
+            .insert(result.call_id.clone(), result.clone());
+        if self.delivered_results.len() < self.pending.len() {
+            return Ok(());
+        }
+
+        // AgentCore requires every toolUse from the assistant message and all
+        // matching user toolResults in one continuation. This also guarantees
+        // that parallel governed mutations cannot advance separate model turns.
+        let mut assistant_builder =
+            HarnessMessage::builder().role(HarnessConversationRole::Assistant);
+        let mut user_builder = HarnessMessage::builder().role(HarnessConversationRole::User);
+        for (call_id, pending) in &self.pending {
+            let delivered = self.delivered_results.get(call_id).ok_or_else(|| {
+                LocalRunnerError::invalid("AgentCore tool-result batch is incomplete")
+            })?;
+            let tool_use = HarnessToolUseBlock::builder()
+                .name(pending.remote_name.clone())
+                .tool_use_id(call_id.clone())
+                .input(json_to_document(&pending.input)?)
+                .r#type(HarnessToolUseType::ToolUse)
+                .build()
+                .map_err(|_| {
+                    LocalRunnerError::invalid("failed to build AgentCore tool-use continuation")
+                })?;
+            let tool_result = HarnessToolResultBlock::builder()
+                .tool_use_id(call_id.clone())
+                .content(HarnessToolResultContentBlock::Json(json_to_document(
+                    &delivered.result,
+                )?))
+                .status(if delivered.is_error {
+                    HarnessToolUseStatus::Error
+                } else {
+                    HarnessToolUseStatus::Success
+                })
+                .r#type(HarnessToolUseType::ToolUse)
+                .build()
+                .map_err(|_| {
+                    LocalRunnerError::invalid("failed to build AgentCore tool-result continuation")
+                })?;
+            assistant_builder = assistant_builder.content(HarnessContentBlock::ToolUse(tool_use));
+            user_builder = user_builder.content(HarnessContentBlock::ToolResult(tool_result));
+        }
+        let assistant = assistant_builder.build().map_err(|_| {
+            LocalRunnerError::invalid("failed to build AgentCore assistant continuation")
+        })?;
+        let user = user_builder.build().map_err(|_| {
+            LocalRunnerError::invalid("failed to build AgentCore user continuation")
+        })?;
+        // The durable runner records ToolResult before calling this method. A
+        // transport ambiguity therefore never repeats the Paperclip mutation;
+        // it fails closed with the last authoritative Memory cursor preserved
+        // for the control plane's reconciliation workflow.
+        self.invoke(vec![assistant, user])?;
+        self.pending.clear();
+        self.delivered_results.clear();
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+        self.worker.stop_runtime(format!(
+            "paperclip-suspend-{}",
+            sha_hex(&self.session_id, 32)
+        ))?;
+        self.worker.shutdown();
+        Ok(())
+    }
+}
+
+fn user_text_message(message: &str) -> Result<HarnessMessage, LocalRunnerError> {
+    HarnessMessage::builder()
+        .role(HarnessConversationRole::User)
+        .content(HarnessContentBlock::Text(message.to_owned()))
+        .build()
+        .map_err(|_| LocalRunnerError::invalid("failed to build AgentCore user message"))
+}
+
+fn validate_config(config: &AwsAgentCoreProviderConfig) -> Result<(), LocalRunnerError> {
+    if [
+        config.model.as_str(),
+        config.profile_id.as_str(),
+        config.region.as_str(),
+        config.account_id.as_str(),
+        config.harness_arn.as_str(),
+        config.harness_version.as_str(),
+        config.endpoint_arn.as_str(),
+        config.endpoint_qualifier.as_str(),
+        config.agent_runtime_arn.as_str(),
+        config.memory_arn.as_str(),
+        config.memory_id.as_str(),
+        config.invocation_role_arn.as_str(),
+        config.qualification_revision.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore profile fields must be non-empty",
+        ));
+    }
+    if config.event_expiry_days != 90 {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore profile must use the qualified 90-day Memory expiry",
+        ));
+    }
+    if config.max_iterations == 0
+        || config.max_iterations > 8
+        || config.max_output_tokens == 0
+        || config.max_output_tokens > 4096
+        || config.timeout_seconds == 0
+        || config.timeout_seconds > 300
+    {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore invocation limits exceed the qualified profile",
+        ));
+    }
+    if !config.max_estimated_session_cost_usd.is_finite()
+        || config.max_estimated_session_cost_usd <= 0.0
+    {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore estimated spend ceiling must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_tools(
+    tools: &[AuthorizedTool],
+) -> Result<
+    (
+        Vec<HarnessTool>,
+        Vec<String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, Value>,
+    ),
+    LocalRunnerError,
+> {
+    if tools.len() > MAX_AGENTCORE_TOOLS {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore supports at most 64 inline functions",
+        ));
+    }
+    let mut encoded = Vec::with_capacity(tools.len());
+    let mut allowed = Vec::with_capacity(tools.len());
+    let mut reverse = BTreeMap::new();
+    let mut schemas = BTreeMap::new();
+    for tool in tools {
+        validator_for(&tool.input_schema).map_err(|_| {
+            LocalRunnerError::invalid("authorized Paperclip tool has invalid JSON Schema")
+        })?;
+        let remote_name = remote_tool_name(&tool.operation_id);
+        if reverse
+            .insert(remote_name.clone(), tool.operation_id.clone())
+            .is_some()
+        {
+            return Err(LocalRunnerError::invalid(
+                "AgentCore inline-function name collision",
+            ));
+        }
+        schemas.insert(tool.operation_id.clone(), tool.input_schema.clone());
+        let inline = HarnessInlineFunctionConfig::builder()
+            .description(tool.description.clone())
+            .input_schema(json_to_document(&tool.input_schema)?)
+            .build()
+            .map_err(|_| LocalRunnerError::invalid("failed to build AgentCore inline function"))?;
+        let harness_tool = HarnessTool::builder()
+            .r#type(HarnessToolType::InlineFunction)
+            .name(remote_name.clone())
+            .config(HarnessToolConfiguration::InlineFunction(inline))
+            .build()
+            .map_err(|_| LocalRunnerError::invalid("failed to build AgentCore tool"))?;
+        allowed.push(remote_name);
+        encoded.push(harness_tool);
+    }
+    Ok((encoded, allowed, reverse, schemas))
+}
+
+fn remote_tool_name(operation_id: &str) -> String {
+    let mut slug = operation_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("__") {
+        slug = slug.replace("__", "_");
+    }
+    slug = slug.trim_matches('_').to_owned();
+    if slug.is_empty() {
+        slug = "paperclip_tool".to_owned();
+    }
+    slug.truncate(48);
+    format!("pc_{}_{}", slug, sha_hex(operation_id, 12))
+}
+
+fn new_runtime_session_id() -> String {
+    format!("paperclip-{}-{}", Uuid::new_v4(), Uuid::new_v4())
+}
+
+fn estimate_model_token_cost_usd(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_input_tokens: i64,
+    cache_write_input_tokens: i64,
+) -> Option<f64> {
+    if model != "global.anthropic.claude-sonnet-4-6" {
+        return None;
+    }
+    // Qualified 2026-08-21 Bedrock global standard-tier rates per million
+    // tokens. Runtime, Memory, CloudWatch, network, and tax are deliberately
+    // excluded and the receipt names that scope explicitly.
+    let uncached_input = input_tokens
+        .saturating_sub(cache_read_input_tokens)
+        .saturating_sub(cache_write_input_tokens)
+        .max(0) as f64;
+    Some(
+        uncached_input * 3.00 / 1_000_000.0
+            + output_tokens.max(0) as f64 * 15.00 / 1_000_000.0
+            + cache_read_input_tokens.max(0) as f64 * 0.30 / 1_000_000.0
+            + cache_write_input_tokens.max(0) as f64 * 3.75 / 1_000_000.0,
+    )
+}
+
+fn sha_hex(value: &str, length: usize) -> String {
+    let digest = format!("{:x}", Sha256::digest(value.as_bytes()));
+    digest[..length.min(digest.len())].to_owned()
+}
+
+fn redact_aws_error(value: &str) -> String {
+    // Smithy errors can embed a serialized request and signed headers. Retain
+    // only a closed, useful classification; never attempt field-by-field
+    // scrubbing of an open-ended provider error object.
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("accessdenied")
+        || lower.contains("access denied")
+        || lower.contains("unauthorized")
+    {
+        "AWS AgentCore access denied".to_owned()
+    } else if lower.contains("resourcenotfound") || lower.contains("not found") {
+        "AWS AgentCore resource not found".to_owned()
+    } else if lower.contains("throttl") || lower.contains("too many requests") {
+        "AWS AgentCore request throttled".to_owned()
+    } else if lower.contains("conflict") {
+        "AWS AgentCore resource conflict".to_owned()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "AWS AgentCore request timed out".to_owned()
+    } else if lower.contains("validation") {
+        "AWS AgentCore request validation failed".to_owned()
+    } else {
+        "AWS AgentCore request failed".to_owned()
+    }
+}
+
+fn is_resource_not_found(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("resourcenotfound")
+        || lower.contains("not found")
+        || lower.contains("status code: 404")
+}
+
+fn json_to_document(value: &Value) -> Result<Document, LocalRunnerError> {
+    Ok(match value {
+        Value::Null => Document::Null,
+        Value::Bool(value) => Document::Bool(*value),
+        Value::String(value) => Document::String(value.clone()),
+        Value::Array(values) => Document::Array(
+            values
+                .iter()
+                .map(json_to_document)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Object(values) => Document::Object(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json_to_document(value)?)))
+                .collect::<Result<HashMap<_, _>, LocalRunnerError>>()?,
+        ),
+        Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                Document::Number(Number::PosInt(value))
+            } else if let Some(value) = value.as_i64() {
+                Document::Number(Number::NegInt(value))
+            } else if let Some(value) = value.as_f64() {
+                Document::Number(Number::Float(value))
+            } else {
+                return Err(LocalRunnerError::invalid(
+                    "JSON number cannot be represented in AgentCore",
+                ));
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_bedrockagentcore::types::{
+        HarnessContentBlockDeltaEvent, HarnessContentBlockStartEvent, HarnessContentBlockStopEvent,
+        HarnessToolUseBlockDelta, HarnessToolUseBlockStart,
+    };
+
+    #[test]
+    fn runtime_session_ids_are_valid_and_unique() {
+        let first = new_runtime_session_id();
+        let second = new_runtime_session_id();
+        assert!(first.len() >= 33);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tool_names_are_safe_stable_and_collision_resistant() {
+        let first = remote_tool_name("issues.comment:create");
+        let second = remote_tool_name("issues.comment/create");
+        assert!(first
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'));
+        assert_ne!(first, second);
+        assert_eq!(first, remote_tool_name("issues.comment:create"));
+    }
+
+    #[test]
+    fn rejects_more_than_sixty_four_tools() {
+        let tool = AuthorizedTool {
+            operation_id: "op".to_owned(),
+            version: 1,
+            description: "op".to_owned(),
+            input_schema: json!({"type":"object"}),
+            response_schema: json!({"type":"object"}),
+        };
+        assert!(encode_tools(&vec![tool; 65]).is_err());
+    }
+
+    #[test]
+    fn redacts_credential_markers_from_remote_errors() {
+        let value =
+            redact_aws_error("Authorization: AWS_SESSION_TOKEN X-Amz-Signature=secret-value");
+        assert!(!value.contains("Authorization"));
+        assert!(!value.contains("AWS_SESSION_TOKEN"));
+        assert!(!value.contains("secret-value"));
+        assert_eq!(
+            redact_aws_error("AccessDeniedException: signed request"),
+            "AWS AgentCore access denied"
+        );
+    }
+
+    #[test]
+    fn estimates_only_the_qualified_model_token_component() {
+        assert_eq!(
+            estimate_model_token_cost_usd("other-model", 1, 1, 0, 0),
+            None
+        );
+        let estimate = estimate_model_token_cost_usd(
+            "global.anthropic.claude-sonnet-4-6",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!((estimate - 18.0).abs() < f64::EPSILON);
+        let cached = estimate_model_token_cost_usd(
+            "global.anthropic.claude-sonnet-4-6",
+            2_000_000,
+            0,
+            1_000_000,
+            1_000_000,
+        )
+        .unwrap();
+        assert!((cached - 4.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn eventstream_text_delta_is_normalized_without_provider_objects() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut blocks = BTreeMap::new();
+        let event = HarnessContentBlockDeltaEvent::builder()
+            .content_block_index(0)
+            .delta(HarnessContentBlockDelta::Text("hello".to_owned()))
+            .build()
+            .unwrap();
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockDelta(event),
+            &mut blocks,
+            &sender,
+        );
+        match receiver.try_recv().unwrap() {
+            NetworkEvent::TextDelta(value) => assert_eq!(value, "hello"),
+            other => panic!("unexpected normalized event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eventstream_tool_json_is_buffered_until_the_block_is_complete() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut blocks = BTreeMap::new();
+        let start = HarnessToolUseBlockStart::builder()
+            .tool_use_id("tool-use-1")
+            .name("pc_get_task_abc123")
+            .r#type(HarnessToolUseType::ToolUse)
+            .build()
+            .unwrap();
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockStart(
+                HarnessContentBlockStartEvent::builder()
+                    .content_block_index(2)
+                    .start(HarnessContentBlockStart::ToolUse(start))
+                    .build()
+                    .unwrap(),
+            ),
+            &mut blocks,
+            &sender,
+        );
+        for chunk in ["{\"issue", "Id\":\"MCK-1\"}"] {
+            normalize_stream_event(
+                InvokeHarnessStreamOutput::ContentBlockDelta(
+                    HarnessContentBlockDeltaEvent::builder()
+                        .content_block_index(2)
+                        .delta(HarnessContentBlockDelta::ToolUse(
+                            HarnessToolUseBlockDelta::builder()
+                                .input(chunk)
+                                .build()
+                                .unwrap(),
+                        ))
+                        .build()
+                        .unwrap(),
+                ),
+                &mut blocks,
+                &sender,
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        normalize_stream_event(
+            InvokeHarnessStreamOutput::ContentBlockStop(
+                HarnessContentBlockStopEvent::builder()
+                    .content_block_index(2)
+                    .build()
+                    .unwrap(),
+            ),
+            &mut blocks,
+            &sender,
+        );
+        match receiver.try_recv().unwrap() {
+            NetworkEvent::ToolUse {
+                call_id,
+                remote_name,
+                input,
+            } => {
+                assert_eq!(call_id, "tool-use-1");
+                assert_eq!(remote_name, "pc_get_task_abc123");
+                assert_eq!(input, json!({"issueId":"MCK-1"}));
+            }
+            other => panic!("unexpected normalized event: {other:?}"),
+        }
+    }
+}

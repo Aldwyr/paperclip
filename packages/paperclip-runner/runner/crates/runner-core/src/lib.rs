@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+pub mod acpx_provider;
+pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;
 pub mod codex_provider;
 pub mod durable;
 pub mod fake_harness;
+pub mod generated_acpx_sidecar_contract;
 pub mod local_runner;
 pub mod process_supervisor;
 pub mod provider_bridge;

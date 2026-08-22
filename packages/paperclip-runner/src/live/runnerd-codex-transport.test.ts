@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -6,11 +6,34 @@ import { expect, it } from "vitest";
 
 import {
   createCapabilityRunnerdCodexTransport,
+  createSanitizedAwsAgentCoreEnvironment,
   defaultCapabilityRunnerdBinary,
   rehydrateRunnerdUsageNotification,
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
 } from "./runnerd-codex-transport.js";
+
+it("passes only workload-identity metadata to the AgentCore runner", () => {
+  const sanitized = createSanitizedAwsAgentCoreEnvironment({
+    PATH: "/bin",
+    AWS_PROFILE: "paperclip-dev",
+    AWS_REGION: "us-east-1",
+    AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
+    AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/workload",
+    AWS_ACCESS_KEY_ID: "AKIACANARY",
+    AWS_SECRET_ACCESS_KEY: "secret-canary",
+    AWS_SESSION_TOKEN: "token-canary",
+    PAPERCLIP_API_KEY: "paperclip-canary",
+    ANTHROPIC_API_KEY: "anthropic-canary",
+  });
+  expect(sanitized).toEqual({
+    PATH: "/bin",
+    AWS_PROFILE: "paperclip-dev",
+    AWS_REGION: "us-east-1",
+    AWS_WEB_IDENTITY_TOKEN_FILE: "/var/run/token",
+    AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/workload",
+  });
+});
 
 it("rehydrates normalized usage with the provider thread binding", () => {
   expect(rehydrateRunnerdUsageNotification({
@@ -166,7 +189,7 @@ it("cold-restores a suspended provider session under a new run binding", async (
     codexCommand: fakeCodex,
     codexArgs: [],
     stateDirectory,
-    lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
+    lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
   };
   const dynamicTools = [{
     name: "get_task_context",
@@ -187,6 +210,7 @@ it("cold-restores a suspended provider session under a new run binding", async (
 
   const restored = createCapabilityRunnerdCodexTransport({
     ...options,
+    resumeDynamicTools: dynamicTools,
     prpIdentity: {
       ...baseIdentity,
       runId: "run-cold-restored",
@@ -198,6 +222,15 @@ it("cold-restores a suspended provider session under a new run binding", async (
   try {
     const read = await restored.transport.request("thread/read", {});
     expect(read.thread).toMatchObject({ id: "fake-thread" });
+    const durable = JSON.parse(await readFile(
+      join(stateDirectory, "runner", "runner-state.json"),
+      "utf8",
+    )) as { providerToolBridge?: { authorized?: Record<string, unknown> } };
+    expect(Object.keys(durable.providerToolBridge?.authorized ?? {})).toEqual(expect.arrayContaining([
+      "get_task_context",
+      "paperclip_finish",
+      "paperclip_block",
+    ]));
     await restored.transport.request("turn/start", { input: [{ type: "text", text: "restored process" }] });
     for await (const event of restored.transport.notifications()) {
       if (event.method === "turn/completed") break;

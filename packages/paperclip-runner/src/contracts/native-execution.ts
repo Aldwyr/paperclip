@@ -1,7 +1,20 @@
 import type { PrpStructuredRunResult, PrpTerminalState } from "../protocol/replay-contract.js";
 
-export const NATIVE_EXECUTION_INPUT_SCHEMA = "paperclip.native-execution-input.v1" as const;
-export const NATIVE_MODEL_ENVELOPE_SCHEMA = "paperclip.native-model-envelope.v1" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V1 = "paperclip.native-execution-input.v1" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA = "paperclip.native-execution-input.v2" as const;
+export const NATIVE_MODEL_ENVELOPE_SCHEMA_V1 = "paperclip.native-model-envelope.v1" as const;
+export const NATIVE_MODEL_ENVELOPE_SCHEMA = "paperclip.native-model-envelope.v2" as const;
+
+export type NativeExecutionMode = "default" | "plan";
+
+export interface NativePlanningContext {
+  documentId: string | null;
+  baseRevisionId: string | null;
+  baseRevisionNumber: number;
+  markdown: string;
+  sha256: string;
+  reviewContext: Record<string, unknown>;
+}
 
 export interface StrictCompletionContractInput {
   revision: string;
@@ -35,6 +48,37 @@ export interface NativeManagedAgentProfileSnapshot {
   betaVersion: "managed-agents-2026-04-01";
 }
 
+export interface NativeAwsAgentCoreProfileSnapshot {
+  profileId: string;
+  region: string;
+  accountId: string;
+  harnessArn: string;
+  harnessVersion: string;
+  endpointArn: string;
+  endpointQualifier: string;
+  agentRuntimeArn: string;
+  memoryArn: string;
+  memoryId: string;
+  invocationRoleArn: string;
+  qualificationRevision: string;
+  eventExpiryDays: 90;
+}
+
+export type NativeAcpxAgent = "pi" | "claude" | "codex";
+
+export interface NativeAcpxProfileSnapshot {
+  driverKind: "acpx_runtime";
+  protocolVersion: 1;
+  acpxVersion: "0.13.1";
+  agent: NativeAcpxAgent;
+  agentProfileVersion: 1;
+  agentServerPackage: string;
+  agentServerVersion: string;
+  agentRuntimePackage: string | null;
+  agentRuntimeVersion: string | null;
+  commandDigest: string;
+}
+
 export type NativeProviderConfig =
   | { kind: "codex"; model: string | null }
   | { kind: "opencode"; model: string }
@@ -43,10 +87,28 @@ export type NativeProviderConfig =
       model: string;
       managedProfile: NativeManagedAgentProfileSnapshot;
       maxSessionListCostUsd: number;
+    }
+  | {
+      kind: "aws_agentcore";
+      model: string;
+      agentCoreProfile: NativeAwsAgentCoreProfileSnapshot;
+      maxEstimatedSessionCostUsd: number;
+      invocationLimits: {
+        maxIterations: number;
+        maxOutputTokens: number;
+        timeoutSeconds: number;
+      };
+    }
+  | {
+      kind: "acpx";
+      agent: NativeAcpxAgent;
+      model: string;
+      permissionPolicy: "interactive";
+      profile: NativeAcpxProfileSnapshot;
     };
 
 export interface NativeExecutionInputV1 {
-  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V1;
   binding: {
     companyId: string;
     runId: string;
@@ -70,7 +132,7 @@ export interface NativeExecutionInputV1 {
   };
   session: {
     normalizedSessionId: string | null;
-    driverKind: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
+    driverKind: "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
     protocolVersion: 1;
     lifecyclePolicy: NativeSessionLifecyclePolicy;
   };
@@ -85,12 +147,33 @@ export interface NativeExecutionInputV1 {
   credentialBindings: NativeCredentialBindingRef[];
 }
 
+export interface NativeExecutionInputV2 extends Omit<NativeExecutionInputV1, "schema" | "task"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
+  executionMode: NativeExecutionMode;
+  task: Omit<NativeExecutionInputV1["task"], "workMode"> & {
+    workMode: "standard" | "planning";
+  };
+  planningContext: NativePlanningContext | null;
+}
+
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2;
+
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
-  schema: typeof NATIVE_MODEL_ENVELOPE_SCHEMA;
+  schema: typeof NATIVE_MODEL_ENVELOPE_SCHEMA_V1;
   task: NativeExecutionInputV1["task"];
   /** Remote providers have no Paperclip workspace mounted in their service. */
   workspace: Pick<NativeExecutionInputV1["workspace"], "cwd"> | null;
+  completionContract: StrictCompletionContractInput;
+  interactionResponses: NativeInteractionResponseEnvelope[];
+}
+
+export interface NativeModelEnvelopeV2 {
+  schema: typeof NATIVE_MODEL_ENVELOPE_SCHEMA;
+  task: NativeExecutionInputV2["task"];
+  executionMode: NativeExecutionMode;
+  planningContext: NativePlanningContext | null;
+  workspace: Pick<NativeExecutionInputV2["workspace"], "cwd"> | null;
   completionContract: StrictCompletionContractInput;
   interactionResponses: NativeInteractionResponseEnvelope[];
 }
@@ -148,8 +231,9 @@ function nullableText(value: unknown, path: string): string | null {
  * intentionally not an extensible metadata bag: new fields require a contract
  * revision and an explicit security review.
  */
-export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV1 {
+export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
+  const isV2 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
   exactKeys(input, [
     "schema",
     "binding",
@@ -160,9 +244,12 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     "completionContract",
     "interactionResponses",
     "credentialBindings",
+    ...(isV2 ? ["executionMode", "planningContext"] : []),
   ], "input");
-  if (input.schema !== NATIVE_EXECUTION_INPUT_SCHEMA) {
-    throw new NativeExecutionInputError(`input.schema must be ${NATIVE_EXECUTION_INPUT_SCHEMA}`);
+  if (!isV2 && input.schema !== NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
+    throw new NativeExecutionInputError(
+      `input.schema must be ${NATIVE_EXECUTION_INPUT_SCHEMA_V1} or ${NATIVE_EXECUTION_INPUT_SCHEMA}`,
+    );
   }
 
   const binding = record(input.binding, "input.binding");
@@ -178,17 +265,57 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
   const contract = record(completionContract.contract, "input.completionContract.contract");
   exactKeys(contract, ["revision", "objective", "criteria"], "input.completionContract.contract");
 
-  if (task.workMode !== "standard") throw new NativeExecutionInputError("input.task.workMode must be standard");
+  if (task.workMode !== "standard" && (!isV2 || task.workMode !== "planning")) {
+    throw new NativeExecutionInputError("input.task.workMode must be standard or planning");
+  }
+  const executionMode: NativeExecutionMode = isV2 && input.executionMode === "plan" ? "plan" : "default";
+  if (isV2 && input.executionMode !== "default" && input.executionMode !== "plan") {
+    throw new NativeExecutionInputError("input.executionMode must be default or plan");
+  }
+  if (isV2 && task.workMode === "standard" && executionMode === "plan") {
+    throw new NativeExecutionInputError("plan execution mode requires planning work mode");
+  }
+  let planningContext: NativePlanningContext | null = null;
+  if (isV2 && input.planningContext !== null) {
+    const context = record(input.planningContext, "input.planningContext");
+    exactKeys(context, [
+      "documentId", "baseRevisionId", "baseRevisionNumber", "markdown", "sha256", "reviewContext",
+    ], "input.planningContext");
+    if (!Number.isSafeInteger(context.baseRevisionNumber) || Number(context.baseRevisionNumber) < 0) {
+      throw new NativeExecutionInputError("input.planningContext.baseRevisionNumber must be a non-negative integer");
+    }
+    planningContext = {
+      documentId: context.documentId === null ? null : text(context.documentId, "input.planningContext.documentId"),
+      baseRevisionId: context.baseRevisionId === null
+        ? null
+        : text(context.baseRevisionId, "input.planningContext.baseRevisionId"),
+      baseRevisionNumber: Number(context.baseRevisionNumber),
+      markdown: typeof context.markdown === "string"
+        ? context.markdown
+        : (() => { throw new NativeExecutionInputError("input.planningContext.markdown must be a string"); })(),
+      sha256: text(context.sha256, "input.planningContext.sha256"),
+      reviewContext: structuredClone(record(context.reviewContext, "input.planningContext.reviewContext")),
+    };
+  }
+  if (isV2 && executionMode === "plan" && planningContext === null) {
+    throw new NativeExecutionInputError("input.planningContext is required in plan execution mode");
+  }
+  if (isV2 && executionMode === "default" && input.planningContext !== null) {
+    throw new NativeExecutionInputError("input.planningContext is only valid in plan execution mode");
+  }
   if (
     (
       session.driverKind !== "codex_app_server"
       && session.driverKind !== "opencode_server"
       && session.driverKind !== "claude_managed_agents_api"
+      && session.driverKind !== "aws_agentcore_harness_api"
+      && session.driverKind !== "acpx_runtime"
     )
     || session.protocolVersion !== 1
   ) {
     throw new NativeExecutionInputError("input.session must select a supported protocol version 1 driver");
   }
+  const driverKind = session.driverKind as NativeExecutionInputV1["session"]["driverKind"];
   const lifecyclePolicyValue = session.lifecyclePolicy === undefined
     ? { mode: "per_turn", idleTimeoutMs: null }
     : record(session.lifecyclePolicy, "input.session.lifecyclePolicy");
@@ -210,13 +337,23 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
   const provider = input.provider === undefined
     ? { kind: "codex", model: null }
     : record(input.provider, "input.provider");
-  if (provider.kind !== "codex" && provider.kind !== "opencode" && provider.kind !== "claude_managed") {
-    throw new NativeExecutionInputError("input.provider.kind must be codex, opencode, or claude_managed");
+  if (
+    provider.kind !== "codex"
+    && provider.kind !== "opencode"
+    && provider.kind !== "claude_managed"
+    && provider.kind !== "aws_agentcore"
+    && provider.kind !== "acpx"
+  ) {
+    throw new NativeExecutionInputError("input.provider.kind must be codex, opencode, claude_managed, aws_agentcore, or acpx");
   }
   exactKeys(
     provider,
     provider.kind === "claude_managed"
       ? ["kind", "model", "managedProfile", "maxSessionListCostUsd"]
+      : provider.kind === "aws_agentcore"
+        ? ["kind", "model", "agentCoreProfile", "maxEstimatedSessionCostUsd", "invocationLimits"]
+      : provider.kind === "acpx"
+        ? ["kind", "agent", "model", "permissionPolicy", "profile"]
       : ["kind", "model"],
     "input.provider",
   );
@@ -224,6 +361,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     (provider.kind === "codex" && session.driverKind !== "codex_app_server")
     || (provider.kind === "opencode" && session.driverKind !== "opencode_server")
     || (provider.kind === "claude_managed" && session.driverKind !== "claude_managed_agents_api")
+    || (provider.kind === "aws_agentcore" && session.driverKind !== "aws_agentcore_harness_api")
+    || (provider.kind === "acpx" && session.driverKind !== "acpx_runtime")
   ) {
     throw new NativeExecutionInputError("input.provider.kind does not match input.session.driverKind");
   }
@@ -271,6 +410,116 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
       },
       maxSessionListCostUsd: provider.maxSessionListCostUsd,
     };
+  } else if (provider.kind === "aws_agentcore") {
+    if (providerModel === null) {
+      throw new NativeExecutionInputError("input.provider.model is required for aws_agentcore");
+    }
+    const profile = record(provider.agentCoreProfile, "input.provider.agentCoreProfile");
+    exactKeys(profile, [
+      "profileId", "region", "accountId", "harnessArn", "harnessVersion", "endpointArn",
+      "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn",
+      "qualificationRevision", "eventExpiryDays",
+    ], "input.provider.agentCoreProfile");
+    if (profile.eventExpiryDays !== 90) {
+      throw new NativeExecutionInputError("input.provider.agentCoreProfile.eventExpiryDays must be 90");
+    }
+    if (
+      typeof provider.maxEstimatedSessionCostUsd !== "number"
+      || !Number.isFinite(provider.maxEstimatedSessionCostUsd)
+      || provider.maxEstimatedSessionCostUsd <= 0
+    ) {
+      throw new NativeExecutionInputError("input.provider.maxEstimatedSessionCostUsd must be a positive finite number");
+    }
+    const limits = record(provider.invocationLimits, "input.provider.invocationLimits");
+    exactKeys(limits, ["maxIterations", "maxOutputTokens", "timeoutSeconds"], "input.provider.invocationLimits");
+    const positiveInteger = (value: unknown, path: string): number => {
+      if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+        throw new NativeExecutionInputError(`${path} must be a positive integer`);
+      }
+      return Number(value);
+    };
+    const maxIterations = positiveInteger(limits.maxIterations, "input.provider.invocationLimits.maxIterations");
+    const maxOutputTokens = positiveInteger(limits.maxOutputTokens, "input.provider.invocationLimits.maxOutputTokens");
+    const timeoutSeconds = positiveInteger(limits.timeoutSeconds, "input.provider.invocationLimits.timeoutSeconds");
+    if (maxIterations > 8) throw new NativeExecutionInputError("input.provider.invocationLimits.maxIterations exceeds 8");
+    if (maxOutputTokens > 4096) throw new NativeExecutionInputError("input.provider.invocationLimits.maxOutputTokens exceeds 4096");
+    if (timeoutSeconds > 300) throw new NativeExecutionInputError("input.provider.invocationLimits.timeoutSeconds exceeds 300");
+    parsedProvider = {
+      kind: "aws_agentcore",
+      model: providerModel,
+      agentCoreProfile: {
+        profileId: text(profile.profileId, "input.provider.agentCoreProfile.profileId"),
+        region: text(profile.region, "input.provider.agentCoreProfile.region"),
+        accountId: text(profile.accountId, "input.provider.agentCoreProfile.accountId"),
+        harnessArn: text(profile.harnessArn, "input.provider.agentCoreProfile.harnessArn"),
+        harnessVersion: text(profile.harnessVersion, "input.provider.agentCoreProfile.harnessVersion"),
+        endpointArn: text(profile.endpointArn, "input.provider.agentCoreProfile.endpointArn"),
+        endpointQualifier: text(profile.endpointQualifier, "input.provider.agentCoreProfile.endpointQualifier"),
+        agentRuntimeArn: text(profile.agentRuntimeArn, "input.provider.agentCoreProfile.agentRuntimeArn"),
+        memoryArn: text(profile.memoryArn, "input.provider.agentCoreProfile.memoryArn"),
+        memoryId: text(profile.memoryId, "input.provider.agentCoreProfile.memoryId"),
+        invocationRoleArn: text(profile.invocationRoleArn, "input.provider.agentCoreProfile.invocationRoleArn"),
+        qualificationRevision: text(profile.qualificationRevision, "input.provider.agentCoreProfile.qualificationRevision"),
+        eventExpiryDays: 90,
+      },
+      maxEstimatedSessionCostUsd: provider.maxEstimatedSessionCostUsd,
+      invocationLimits: { maxIterations, maxOutputTokens, timeoutSeconds },
+    };
+  } else if (provider.kind === "acpx") {
+    if (providerModel === null) {
+      throw new NativeExecutionInputError("input.provider.model is required for acpx");
+    }
+    if (provider.agent !== "pi" && provider.agent !== "claude" && provider.agent !== "codex") {
+      throw new NativeExecutionInputError("input.provider.agent must be pi, claude, or codex");
+    }
+    if (provider.permissionPolicy !== "interactive") {
+      throw new NativeExecutionInputError("input.provider.permissionPolicy must be interactive");
+    }
+    const profile = record(provider.profile, "input.provider.profile");
+    exactKeys(profile, [
+      "driverKind",
+      "protocolVersion",
+      "acpxVersion",
+      "agent",
+      "agentProfileVersion",
+      "agentServerPackage",
+      "agentServerVersion",
+      "agentRuntimePackage",
+      "agentRuntimeVersion",
+      "commandDigest",
+    ], "input.provider.profile");
+    if (
+      profile.driverKind !== "acpx_runtime"
+      || profile.protocolVersion !== 1
+      || profile.acpxVersion !== "0.13.1"
+      || profile.agent !== provider.agent
+      || profile.agentProfileVersion !== 1
+    ) {
+      throw new NativeExecutionInputError("input.provider.profile does not match the qualified ACPX v1 profile");
+    }
+    const runtimePackage = nullableText(profile.agentRuntimePackage, "input.provider.profile.agentRuntimePackage");
+    const runtimeVersion = nullableText(profile.agentRuntimeVersion, "input.provider.profile.agentRuntimeVersion");
+    if ((runtimePackage === null) !== (runtimeVersion === null)) {
+      throw new NativeExecutionInputError("input.provider.profile agent runtime package and version must both be present or null");
+    }
+    parsedProvider = {
+      kind: "acpx",
+      agent: provider.agent,
+      model: providerModel,
+      permissionPolicy: "interactive",
+      profile: {
+        driverKind: "acpx_runtime",
+        protocolVersion: 1,
+        acpxVersion: "0.13.1",
+        agent: provider.agent,
+        agentProfileVersion: 1,
+        agentServerPackage: text(profile.agentServerPackage, "input.provider.profile.agentServerPackage"),
+        agentServerVersion: text(profile.agentServerVersion, "input.provider.profile.agentServerVersion"),
+        agentRuntimePackage: runtimePackage,
+        agentRuntimeVersion: runtimeVersion,
+        commandDigest: text(profile.commandDigest, "input.provider.profile.commandDigest"),
+      },
+    };
   } else if (provider.kind === "opencode") {
     parsedProvider = { kind: "opencode", model: providerModel! };
   } else {
@@ -313,8 +562,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     };
   });
 
-  return {
-    schema: NATIVE_EXECUTION_INPUT_SCHEMA,
+  const common = {
     binding: {
       companyId: text(binding.companyId, "input.binding.companyId"),
       runId: text(binding.runId, "input.binding.runId"),
@@ -330,7 +578,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
       // Recovery must retain those runs, so derive the same bounded model
       // prompt from their task fields instead of making them unrecoverable.
       prompt: text(task.prompt ?? task.description ?? task.title, "input.task.prompt"),
-      workMode: "standard",
+      workMode: task.workMode as "standard" | "planning",
     },
     workspace: {
       cwd: text(workspace.cwd, "input.workspace.cwd"),
@@ -340,8 +588,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     },
     session: {
       normalizedSessionId: nullableText(session.normalizedSessionId, "input.session.normalizedSessionId"),
-      driverKind: session.driverKind,
-      protocolVersion: 1,
+      driverKind,
+      protocolVersion: 1 as const,
       lifecyclePolicy,
     },
     provider: parsedProvider,
@@ -358,13 +606,41 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInputV
     interactionResponses,
     credentialBindings,
   };
+  if (!isV2) {
+    return {
+      ...common,
+      schema: NATIVE_EXECUTION_INPUT_SCHEMA_V1,
+      task: { ...common.task, workMode: "standard" },
+    };
+  }
+  return {
+    ...common,
+    schema: NATIVE_EXECUTION_INPUT_SCHEMA,
+    executionMode,
+    planningContext,
+  };
 }
 
-export function buildNativeModelEnvelope(input: NativeExecutionInputV1): NativeModelEnvelopeV1 {
+export function buildNativeModelEnvelope(input: NativeExecutionInput): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 {
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
+    return {
+      schema: NATIVE_MODEL_ENVELOPE_SCHEMA_V1,
+      task: structuredClone(input.task),
+      workspace: input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore"
+        ? null
+        : { cwd: input.workspace.cwd },
+      completionContract: structuredClone(input.completionContract.contract),
+      interactionResponses: structuredClone(input.interactionResponses),
+    };
+  }
   return {
     schema: NATIVE_MODEL_ENVELOPE_SCHEMA,
     task: structuredClone(input.task),
-    workspace: input.provider.kind === "claude_managed" ? null : { cwd: input.workspace.cwd },
+    executionMode: input.executionMode,
+    planningContext: structuredClone(input.planningContext),
+    workspace: input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore"
+      ? null
+      : { cwd: input.workspace.cwd },
     completionContract: structuredClone(input.completionContract.contract),
     interactionResponses: structuredClone(input.interactionResponses),
   };

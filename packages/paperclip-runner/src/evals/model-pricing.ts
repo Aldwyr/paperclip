@@ -16,6 +16,10 @@ const RATES: Readonly<Record<string, TokenRatesUsdPerMillion>> = Object.freeze({
   "gpt-5.6-luna": { input: 0.2, cachedInput: 0.02, output: 1.2 },
   // OpenRouter routed list price published for DeepSeek V4 Flash 0731.
   "openrouter/deepseek/deepseek-v4-flash-0731": { input: 0.065, cachedInput: 0.02, output: 0.18 },
+  // Qualified Anthropic direct profile. Actual invoice discounts are intentionally excluded.
+  "claude-sonnet-5": { input: 3, cachedInput: 0.3, output: 15 },
+  // Amazon Bedrock global cross-region list price for Claude Sonnet 4.6.
+  "global.anthropic.claude-sonnet-4-6": { input: 3, cachedInput: 0.3, output: 15 },
 });
 
 export interface EstimatedModelCost {

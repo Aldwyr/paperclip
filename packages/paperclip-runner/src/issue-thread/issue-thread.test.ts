@@ -63,8 +63,8 @@ function credentialLike(value: unknown): string[] {
 
 describe("Capability issue-thread fixtures", () => {
   it("exposes every screenshot slug exactly once", () => {
-    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(44);
-    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(44);
+    expect(CAPABILITY_UI_SHOT_SLUGS).toHaveLength(64);
+    expect(new Set(CAPABILITY_UI_SHOT_SLUGS).size).toBe(64);
   });
 
   it("builds a schema-valid snapshot for every slug", () => {

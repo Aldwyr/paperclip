@@ -15,15 +15,39 @@ import {
   reconcileCapabilityLiveUsage,
   type CreateCapabilityLiveSessionInput,
 } from "../live/live-session.js";
+import {
+  resolveQualifiedAcpxProfile,
+  type QualifiedAcpxAgent,
+} from "../drivers/acpx/qualified-profiles.js";
 
 interface EvalSessionRequest {
   schema: "paperclip-runner/eval-session-request/v1";
   attemptId: string;
   prompt: string;
   model: string;
-  provider?: "codex" | "opencode";
-  driver?: "codex_app_server" | "opencode_server";
+  provider?: "codex" | "opencode" | "aws_agentcore" | "acpx";
+  driver?: "codex_app_server" | "opencode_server" | "aws_agentcore_harness_api" | "acpx_runtime";
   opencodeVersion?: string;
+  acpxAgent?: QualifiedAcpxAgent;
+  agentCoreProfile?: {
+    profileId: string;
+    region: string;
+    accountId: string;
+    harnessArn: string;
+    harnessVersion: string;
+    endpointArn: string;
+    endpointQualifier: string;
+    agentRuntimeArn: string;
+    memoryArn: string;
+    memoryId: string;
+    invocationRoleArn: string;
+    qualificationRevision: string;
+    eventExpiryDays: 90;
+    maxEstimatedSessionCostUsd: number;
+    maxIterations: number;
+    maxOutputTokens: number;
+    timeoutSeconds: number;
+  };
   runnerd: { path: string; sha256: string };
   limits: { turnTimeoutMs: number; maxAgentTurns: number; maxEstimatedCostNanodollars: number };
   session: CreateCapabilityLiveSessionInput;
@@ -43,6 +67,9 @@ async function sha256(path: string): Promise<string> {
 const requestPath = argument("--request");
 const outputPath = argument("--output");
 const request = JSON.parse(await readFile(requestPath, "utf8")) as EvalSessionRequest;
+const acpxProfile = request.provider === "acpx"
+  ? resolveQualifiedAcpxProfile(request.acpxAgent ?? "pi", request.model)
+  : null;
 const evalStartedAt = new Date().toISOString();
 const evalStartedAtMs = Date.now();
 if (request.schema !== "paperclip-runner/eval-session-request/v1") throw new Error("unsupported request schema");
@@ -65,7 +92,9 @@ try {
     prompt: request.prompt,
     model: request.model,
     provider: request.provider ?? "codex",
+    acpxAgent: request.acpxAgent,
     opencodeVersion: request.opencodeVersion,
+    agentCoreProfile: request.agentCoreProfile,
     runnerBinaryPath: runnerdPath,
     seed: request.session.seed ?? {},
     actorId: request.session.actorId ?? "",
@@ -98,8 +127,9 @@ try {
     runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
     requestedModel: request.model,
     provider: request.provider ?? "codex",
-    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : "codex_app_server"),
-    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : null,
+    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : request.provider === "aws_agentcore" ? "aws_agentcore_harness_api" : request.provider === "acpx" ? "acpx_runtime" : "codex_app_server"),
+    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : request.provider === "aws_agentcore" ? request.agentCoreProfile?.harnessVersion ?? null : request.provider === "acpx" ? acpxProfile!.acpxVersion : null,
+    ...(acpxProfile === null ? {} : { acpxAgent: acpxProfile.agent, acpxProfile }),
     turn,
     snapshot,
     devtools: projectCapabilityDevtools(snapshot),
@@ -130,8 +160,9 @@ try {
     runnerd: { path: "[withheld]", sha256: `sha256:${actualDigest}` },
     requestedModel: request.model,
     provider: request.provider ?? "codex",
-    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : "codex_app_server"),
-    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : null,
+    driver: request.driver ?? (request.provider === "opencode" ? "opencode_server" : request.provider === "aws_agentcore" ? "aws_agentcore_harness_api" : request.provider === "acpx" ? "acpx_runtime" : "codex_app_server"),
+    providerVersion: request.provider === "opencode" ? request.opencodeVersion ?? "1.18.17" : request.provider === "aws_agentcore" ? request.agentCoreProfile?.harnessVersion ?? null : request.provider === "acpx" ? acpxProfile!.acpxVersion : null,
+    ...(acpxProfile === null ? {} : { acpxAgent: acpxProfile.agent, acpxProfile }),
     timing: { startedAt: evalStartedAt, finishedAt: new Date().toISOString(), durationMs: Date.now() - evalStartedAtMs },
   }, null, 2)}\n`);
   process.exitCode = 2;

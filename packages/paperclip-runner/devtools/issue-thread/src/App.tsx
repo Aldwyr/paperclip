@@ -48,14 +48,27 @@ const REPLAY_STEP_MS = 800;
 const PENDING_ANNOUNCEMENT = "A request is waiting for your answer.";
 const ANSWERED_ANNOUNCEMENT = "Your answer was recorded.";
 const SETTLED_ANNOUNCEMENT = "The pending request is resolved.";
-const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts", "wc-workspace-changes", "fr-file-reference", "pe-structured-plan", "te-command-execution", "mp-mcp-progress", "rs-web-research", "da-subagent-delegation", "mr-model-routing", "cc-context-compaction", "ag-generated-artifact", "rv-review-mode", "hk-hook-lifecycle", "mc-memory-citations", "sr-safety-review", "ti-terminal-input", "wt-intentional-wait", "pn-provider-notices", "cm-stream-reconcile", "cm-session-continuity", "cm-tool-read", "cm-tool-mutation", "cm-completion-control", "cm-tool-denied", "cm-tool-duplicate-delivery", "cm-sse-recovery", "cm-interrupt", "cm-warm-restore", "cm-budget", "cm-terminated-deleted", "cm-provisioning-auth", "cm-redacted-failure", "cm-provider-labels"];
+const SCENARIOS = ["hb-baseline", "dp-documents", "ix-interactions", "ar-artifacts", "wc-workspace-changes", "fr-file-reference", "pe-structured-plan", "te-command-execution", "mp-mcp-progress", "rs-web-research", "da-subagent-delegation", "mr-model-routing", "cc-context-compaction", "ag-generated-artifact", "rv-review-mode", "hk-hook-lifecycle", "mc-memory-citations", "sr-safety-review", "ti-terminal-input", "wt-intentional-wait", "pn-provider-notices", "ax-acpx-lifecycle", "ax-acpx-permissions", "ax-acpx-tools", "ax-acpx-events", "ax-acpx-failures", "cm-stream-reconcile", "cm-session-continuity", "cm-tool-read", "cm-tool-mutation", "cm-completion-control", "cm-tool-denied", "cm-tool-duplicate-delivery", "cm-sse-recovery", "cm-interrupt", "cm-warm-restore", "cm-budget", "cm-terminated-deleted", "cm-provisioning-auth", "cm-redacted-failure", "cm-provider-labels", "ac-streaming", "ac-session-continuity", "ac-tool-read", "ac-tool-mutation", "ac-completion-control", "ac-tool-denied", "ac-tool-duplicate", "ac-eventstream-recovery", "ac-memory-reconciliation", "ac-interrupt", "ac-warm-restore", "ac-limits", "ac-session-delete", "ac-iam-profile", "ac-redacted-failure"];
 const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
 const CHAT_HARNESS_KEY = "paperclip-runner.capability.chat.harness.v1";
 const MODEL_PRESETS = {
   codex: ["gpt-5.4-mini", "gpt-5.4"],
   opencode: ["openrouter/deepseek/deepseek-v4-flash-0731"],
   claude_managed: ["claude-sonnet-5"],
+  aws_agentcore: ["global.anthropic.claude-sonnet-4-6"],
+  acpx: ["openrouter/deepseek/deepseek-v4-flash-0731", "claude-sonnet-5", "gpt-5.6-sol"],
 } as const;
+const ACPX_AGENT_MODELS = {
+  pi: "openrouter/deepseek/deepseek-v4-flash-0731",
+  claude: "claude-sonnet-5",
+  codex: "gpt-5.6-sol",
+} as const;
+
+function acpxLabel(configuration: CapabilityHarnessConfiguration | null | undefined): string {
+  if (configuration?.provider !== "acpx") return configuration?.provider ?? "starting";
+  const agent = configuration.acpxAgent ?? "pi";
+  return `Real ${agent === "pi" ? "Pi" : agent === "claude" ? "Claude" : "Codex"} via ACPX`;
+}
 
 interface EmbeddedEvalCheck {
   id: string;
@@ -113,14 +126,18 @@ interface StoredChatSession {
   identity: CapabilityCleanRoomIdentity | null;
   updatedAt: string;
   configuration?: CapabilityHarnessConfiguration;
+  runtime?: Awaited<ReturnType<typeof capabilityLiveClient.newCleanRoom>>["runtime"];
 }
 
 function defaultHarness(provider: CapabilityHarnessConfiguration["provider"] = "codex"): CapabilityHarnessConfiguration {
   return {
     provider,
     model: MODEL_PRESETS[provider][0],
+    ...(provider === "acpx" ? { acpxAgent: "pi" as const } : {}),
     ...(provider === "claude_managed"
       ? { managedProfileId: "default", maxSessionListCostUsd: 1 }
+      : provider === "aws_agentcore"
+        ? { agentCoreProfileId: "default", maxEstimatedSessionCostUsd: 1 }
       : {}),
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
   };
@@ -129,7 +146,7 @@ function defaultHarness(provider: CapabilityHarnessConfiguration["provider"] = "
 function readHarnessConfiguration(): CapabilityHarnessConfiguration {
   try {
     const value = JSON.parse(window.localStorage.getItem(CHAT_HARNESS_KEY) ?? "null") as Partial<CapabilityHarnessConfiguration> | null;
-    if (value && (value.provider === "codex" || value.provider === "opencode" || value.provider === "claude_managed") && typeof value.model === "string") {
+    if (value && (value.provider === "codex" || value.provider === "opencode" || value.provider === "claude_managed" || value.provider === "aws_agentcore" || value.provider === "acpx") && typeof value.model === "string") {
       const lifecyclePolicy = value.lifecyclePolicy?.mode === "per_turn"
         ? { mode: "per_turn" as const, idleTimeoutMs: null }
         : value.lifecyclePolicy?.mode === "warm" && Number.isSafeInteger(value.lifecyclePolicy.idleTimeoutMs) && Number(value.lifecyclePolicy.idleTimeoutMs) > 0
@@ -138,12 +155,22 @@ function readHarnessConfiguration(): CapabilityHarnessConfiguration {
       return {
         provider: value.provider,
         model: value.model,
+        ...(value.provider === "acpx" ? {
+          acpxAgent: value.acpxAgent === "claude" || value.acpxAgent === "codex" ? value.acpxAgent : "pi",
+        } : {}),
         ...(value.provider === "claude_managed" ? {
           managedProfileId: typeof value.managedProfileId === "string" && value.managedProfileId.trim()
             ? value.managedProfileId.trim()
             : "default",
           maxSessionListCostUsd: typeof value.maxSessionListCostUsd === "number" && value.maxSessionListCostUsd > 0
             ? value.maxSessionListCostUsd
+            : 1,
+        } : value.provider === "aws_agentcore" ? {
+          agentCoreProfileId: typeof value.agentCoreProfileId === "string" && value.agentCoreProfileId.trim()
+            ? value.agentCoreProfileId.trim()
+            : "default",
+          maxEstimatedSessionCostUsd: typeof value.maxEstimatedSessionCostUsd === "number" && value.maxEstimatedSessionCostUsd > 0
+            ? value.maxEstimatedSessionCostUsd
             : 1,
         } : {}),
         lifecyclePolicy,
@@ -302,6 +329,7 @@ export function App() {
   const initialHarnessRef = useRef<CapabilityHarnessConfiguration>(readHarnessConfiguration());
   const [harness, setHarness] = useState<CapabilityHarnessConfiguration>(initialHarnessRef.current);
   const [activeHarness, setActiveHarness] = useState<CapabilityHarnessConfiguration | null>(null);
+  const [providerRuntime, setProviderRuntime] = useState<Awaited<ReturnType<typeof capabilityLiveClient.newCleanRoom>>["runtime"]>(undefined);
   const [chatHistory, setChatHistory] = useState<StoredChatSession[]>(readChatHistory);
   const [historicSessionId, setHistoricSessionId] = useState<string | null>(null);
   const liveRoomRef = useRef<StoredChatSession | null>(null);
@@ -384,6 +412,7 @@ export function App() {
           rememberSession(response.sessionId, "cleanroom");
           setIdentity(response.identity ?? null);
           setActiveHarness(response.configuration ?? initialHarnessRef.current);
+          setProviderRuntime(response.runtime);
           setHistoricSessionId(null);
           setSnapshot(response.view);
           setSnapshotSurface("chat");
@@ -500,6 +529,7 @@ export function App() {
       identity,
       updatedAt: snapshot.renderedAt,
       ...(activeHarness === null ? {} : { configuration: activeHarness }),
+      ...(providerRuntime === undefined ? {} : { runtime: providerRuntime }),
     };
     liveRoomRef.current = record;
     setChatHistory((current) => {
@@ -507,7 +537,7 @@ export function App() {
       persistChatHistory(next);
       return next;
     });
-  }, [activeHarness, chat, historicSessionId, identity, snapshot?.renderedAt, snapshot?.sessionId]);
+  }, [activeHarness, chat, historicSessionId, identity, providerRuntime, snapshot?.renderedAt, snapshot?.sessionId]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -670,7 +700,10 @@ export function App() {
           },
         })
         .then((next) => {
-          if (turnGenerationRef.current === generation) setSnapshot(next.view);
+          if (turnGenerationRef.current === generation) {
+            setSnapshot(next.view);
+            setProviderRuntime(next.runtime);
+          }
         })
         .catch((cause) => {
           if (turnGenerationRef.current !== generation || controller.signal.aborted) return;
@@ -726,6 +759,7 @@ export function App() {
     rememberSession(next.sessionId, "cleanroom");
     setIdentity(next.identity ?? null);
     setActiveHarness(next.configuration ?? harness);
+    setProviderRuntime(next.runtime);
     setHistoricSessionId(null);
     setSnapshot(next.view);
     setDevtools(null);
@@ -745,6 +779,13 @@ export function App() {
       setActionError("OpenCode models must use provider/model form.");
       return;
     }
+    if (harness.provider === "acpx") {
+      const agent = harness.acpxAgent ?? "pi";
+      if (model !== ACPX_AGENT_MODELS[agent]) {
+        setActionError(`The qualified ACPX ${agent} profile requires exact model ${ACPX_AGENT_MODELS[agent]}.`);
+        return;
+      }
+    }
     if (harness.provider === "claude_managed") {
       if (!harness.managedProfileId?.trim()) {
         setActionError("Choose a qualified Managed Agent profile before starting a Claude Agent chat.");
@@ -752,6 +793,16 @@ export function App() {
       }
       if (!(typeof harness.maxSessionListCostUsd === "number" && harness.maxSessionListCostUsd > 0)) {
         setActionError("Claude Agent chats require a positive session spend ceiling.");
+        return;
+      }
+    }
+    if (harness.provider === "aws_agentcore") {
+      if (!harness.agentCoreProfileId?.trim()) {
+        setActionError("Choose a qualified AWS AgentCore profile before starting a chat.");
+        return;
+      }
+      if (!(typeof harness.maxEstimatedSessionCostUsd === "number" && harness.maxEstimatedSessionCostUsd > 0)) {
+        setActionError("AWS AgentCore chats require a positive estimated session ceiling.");
         return;
       }
     }
@@ -769,9 +820,11 @@ export function App() {
   }, [abandonTurn, adoptCleanRoom, harness, snapshot]);
 
   const increaseManagedBudget = useCallback(() => {
-    if (snapshot === null || activeHarness?.provider !== "claude_managed") return;
+    if (snapshot === null || (activeHarness?.provider !== "claude_managed" && activeHarness?.provider !== "aws_agentcore")) return;
     const nextCap = Number(managedBudgetInput);
-    const currentCap = activeHarness.maxSessionListCostUsd ?? 0;
+    const currentCap = activeHarness.provider === "aws_agentcore"
+      ? activeHarness.maxEstimatedSessionCostUsd ?? 0
+      : activeHarness.maxSessionListCostUsd ?? 0;
     if (!Number.isFinite(nextCap) || nextCap <= currentCap) {
       setActionError(`Enter a spend ceiling greater than the current $${currentCap.toFixed(2)} cap.`);
       return;
@@ -781,17 +834,20 @@ export function App() {
         setSnapshot(next.view);
         setActiveHarness((current) => current === null ? current : {
           ...current,
-          maxSessionListCostUsd: nextCap,
+          ...(current.provider === "aws_agentcore"
+            ? { maxEstimatedSessionCostUsd: nextCap }
+            : { maxSessionListCostUsd: nextCap }),
         });
         setActionError(null);
-        setAnnouncement(`Claude Agent session spend ceiling raised to $${nextCap.toFixed(2)}.`);
+        setAnnouncement(`${activeHarness.provider === "aws_agentcore" ? "AWS AgentCore estimated" : "Claude Agent"} session ceiling raised to $${nextCap.toFixed(2)}.`);
       })
       .catch((cause) => setActionError(describe(cause)));
   }, [activeHarness, managedBudgetInput, snapshot]);
 
   const deleteManagedSession = useCallback(() => {
-    if (snapshot === null || activeHarness?.provider !== "claude_managed") return;
-    if (!window.confirm("Permanently delete this Anthropic Managed Agent session? It cannot be resumed.")) return;
+    if (snapshot === null || (activeHarness?.provider !== "claude_managed" && activeHarness?.provider !== "aws_agentcore")) return;
+    const providerLabel = activeHarness.provider === "aws_agentcore" ? "AWS AgentCore" : "Anthropic Managed Agent";
+    if (!window.confirm(`Permanently delete this ${providerLabel} session and its remote memory? It cannot be resumed.`)) return;
     abandonTurn();
     const deletedSessionId = snapshot.sessionId;
     void capabilityLiveClient.deleteManagedSession(deletedSessionId)
@@ -803,7 +859,7 @@ export function App() {
           return retained;
         });
         adoptCleanRoom(next);
-        setAnnouncement("Remote Claude Agent session deleted. A new clean room is ready.");
+        setAnnouncement(`Remote ${providerLabel} session deleted. A new clean room is ready.`);
       })
       .catch((cause) => setActionError(describe(cause)));
   }, [abandonTurn, activeHarness, adoptCleanRoom, harness, snapshot]);
@@ -814,6 +870,7 @@ export function App() {
       setSnapshot(live.snapshot);
       setIdentity(live.identity);
       setActiveHarness(live.configuration ?? null);
+      setProviderRuntime(live.runtime);
       setDevtools(null);
       setHistoricSessionId(null);
       setActionError(null);
@@ -829,6 +886,7 @@ export function App() {
         setSnapshot(restored.view);
         setIdentity(restored.identity ?? archived.identity);
         setActiveHarness(restored.configuration ?? configuration);
+        setProviderRuntime(restored.runtime);
         setDevtools(null);
         setHistoricSessionId(null);
         setActionError(null);
@@ -1065,8 +1123,32 @@ export function App() {
               <option value="codex">Codex</option>
               <option value="opencode">OpenCode</option>
               <option value="claude_managed">Claude Agent</option>
+              <option value="aws_agentcore">AWS AgentCore</option>
+              <option value="acpx">ACPX</option>
             </select>
           </label>
+          {harness.provider === "acpx" ? (
+            <label>
+              <span>ACP agent</span>
+              <select
+                data-testid="chat-acpx-agent"
+                value={harness.acpxAgent ?? "pi"}
+                disabled={streamingTurn}
+                onChange={(event) => {
+                  const acpxAgent = event.target.value as NonNullable<CapabilityHarnessConfiguration["acpxAgent"]>;
+                  setHarness((current) => ({
+                    ...current,
+                    acpxAgent,
+                    model: ACPX_AGENT_MODELS[acpxAgent],
+                  }));
+                }}
+              >
+                <option value="pi">Pi</option>
+                <option value="claude">Claude</option>
+                <option value="codex">Codex (control)</option>
+              </select>
+            </label>
+          ) : null}
           <label>
             <span>Execution</span>
             <select
@@ -1104,7 +1186,7 @@ export function App() {
               />
             </label>
           ) : null}
-          {harness.provider === "claude_managed" || activeHarness?.provider === "claude_managed" ? (
+          {harness.provider === "claude_managed" ? (
             <>
               <label>
                 <span>Managed profile</span>
@@ -1136,6 +1218,32 @@ export function App() {
               </label>
             </>
           ) : null}
+          {harness.provider === "aws_agentcore" ? (
+            <>
+              <label>
+                <span>AgentCore profile</span>
+                <input
+                  data-testid="chat-agentcore-profile"
+                  value={harness.agentCoreProfileId ?? ""}
+                  disabled={streamingTurn}
+                  placeholder="qualified profile ID"
+                  onChange={(event) => setHarness((current) => ({ ...current, agentCoreProfileId: event.target.value }))}
+                />
+              </label>
+              <label>
+                <span>Estimated ceiling (USD)</span>
+                <input
+                  data-testid="chat-agentcore-spend-cap"
+                  type="number"
+                  min="0.01"
+                  step="0.01"
+                  value={harness.maxEstimatedSessionCostUsd ?? 1}
+                  disabled={streamingTurn}
+                  onChange={(event) => setHarness((current) => ({ ...current, maxEstimatedSessionCostUsd: Number(event.target.value) }))}
+                />
+              </label>
+            </>
+          ) : null}
           <label className="pit-harness-model">
             <span>Model</span>
             <input
@@ -1143,7 +1251,7 @@ export function App() {
               list={`chat-models-${harness.provider}`}
               value={harness.model ?? ""}
               disabled={streamingTurn}
-              placeholder={harness.provider === "opencode" ? "provider/model" : "model name"}
+              placeholder={harness.provider === "opencode" || (harness.provider === "acpx" && harness.acpxAgent === "pi") ? "provider/model" : "model name"}
               onChange={(event) => setHarness((current) => ({ ...current, model: event.target.value }))}
             />
             <datalist id={`chat-models-${harness.provider}`}>
@@ -1161,19 +1269,29 @@ export function App() {
             Start new chat
           </button>
           <span className="pit-harness-active" data-testid="chat-active-harness">
-            Active: {activeHarness?.provider === "claude_managed" ? "Claude Agent" : activeHarness?.provider ?? "starting"}
+            Active: {activeHarness?.provider === "claude_managed" ? "Claude Agent" : activeHarness?.provider === "aws_agentcore" ? "AWS AgentCore" : acpxLabel(activeHarness)}
             {activeHarness?.model ? ` · ${activeHarness.model}` : ""}
             {activeHarness?.provider === "claude_managed" ? " · Anthropic cloud · no provider PID" : ""}
+            {activeHarness?.provider === "aws_agentcore" ? " · AWS cloud · no provider PID" : ""}
             {activeHarness ? ` · ${activeHarness.lifecyclePolicy.mode === "warm" ? `warm ${Math.round(activeHarness.lifecyclePolicy.idleTimeoutMs / 1_000)}s` : "turn by turn"}` : ""}
+            {providerRuntime?.runnerPid ? ` · runner PID ${providerRuntime.runnerPid}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.sidecarPid ? ` · sidecar PID ${providerRuntime.sidecarPid}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.agentPid ? ` · agent PID ${providerRuntime.agentPid}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.driverSessionId ? ` · ACPX record ${providerRuntime.driverSessionId}` : ""}
+            {providerRuntime?.providerSessionId ? ` · session ${providerRuntime.providerSessionId}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.providerVersion ? ` · ACPX ${providerRuntime.providerVersion}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.agentServerVersion ? ` · agent ${providerRuntime.agentServerVersion}` : ""}
+            {activeHarness?.provider === "acpx" && providerRuntime?.acpProtocolVersion ? ` · ACP ${providerRuntime.acpProtocolVersion}` : ""}
+            {providerRuntime?.status ? ` · ${providerRuntime.status}` : ""}
           </span>
-          {activeHarness?.provider === "claude_managed" && snapshot !== null && historicSessionId === null ? (
-            <div className="pit-managed-session-actions" aria-label="Active Claude Agent session controls">
+          {(activeHarness?.provider === "claude_managed" || activeHarness?.provider === "aws_agentcore") && snapshot !== null && historicSessionId === null ? (
+            <div className="pit-managed-session-actions" aria-label={`Active ${activeHarness.provider === "aws_agentcore" ? "AWS AgentCore" : "Claude Agent"} session controls`}>
               <label>
                 <span>Raise active cap (USD)</span>
                 <input
                   data-testid="chat-managed-active-spend-cap"
                   type="number"
-                  min={(activeHarness.maxSessionListCostUsd ?? 1) + 0.01}
+                  min={(activeHarness.provider === "aws_agentcore" ? activeHarness.maxEstimatedSessionCostUsd ?? 1 : activeHarness.maxSessionListCostUsd ?? 1) + 0.01}
                   step="0.01"
                   value={managedBudgetInput}
                   disabled={streamingTurn}
@@ -1193,17 +1311,22 @@ export function App() {
                 type="button"
                 className="pit-button"
                 data-variant="danger"
-                data-testid="chat-managed-delete-session"
+                data-testid={activeHarness.provider === "aws_agentcore" ? "chat-agentcore-delete-session" : "chat-managed-delete-session"}
                 disabled={streamingTurn}
                 onClick={deleteManagedSession}
               >
-                Delete remote session
+                Delete {activeHarness.provider === "aws_agentcore" ? "AWS session" : "remote session"}
               </button>
             </div>
           ) : null}
-          {harness.provider === "claude_managed" || activeHarness?.provider === "claude_managed" ? (
+          {harness.provider === "claude_managed" ? (
             <p className="pit-harness-notice" role="note" data-testid="chat-managed-retention-notice">
               Managed Agent sessions are retained by Anthropic and are not eligible for ZDR or HIPAA modes. Paperclip tools still execute only in runnerd.
+            </p>
+          ) : null}
+          {harness.provider === "aws_agentcore" ? (
+            <p className="pit-harness-notice" role="note" data-testid="chat-agentcore-retention-notice">
+              AgentCore Memory retains this chat for 90 days. Cost is a Paperclip estimate; model tokens, Runtime active time, and Memory are billed by AWS. Paperclip tools execute only in runnerd.
             </p>
           ) : null}
         </section>

@@ -9,7 +9,9 @@ import {
   type DurablePrpControlPlane,
 } from "../vendor/paperclip-runner/index.js";
 import {
+  queueRunnerPrpRuntimeRequestResolution,
   registerRunnerPrpAuthority,
+  RunnerPrpRuntimeRequestResolutionError,
   runnerPrpWebSocketInternals,
   setupRunnerPrpWebSocketServer,
 } from "./runner-prp-ws.js";
@@ -54,6 +56,42 @@ describe("runner PRP websocket route", () => {
       headers: {},
     }, socket, Buffer.alloc(0));
     expect(Buffer.concat(writes).toString("utf8")).toContain("404 Not Found");
+    server.close();
+  });
+
+  it("queues one idempotent, turn-bound runtime request resolution", async () => {
+    const server = createServer();
+    setupRunnerPrpWebSocketServer(server, { port: 3212 });
+    const queueCommand = vi.fn(() => ({ commandId: "command-resolution-1" }));
+    const runId = "00000000-0000-4000-8000-000000000780";
+    const registration = await registerRunnerPrpAuthority({
+      runId,
+      authority: { queueCommand } as unknown as DurablePrpControlPlane,
+    });
+    const input = {
+      runId,
+      requestId: "request-1",
+      turnId: "turn-1",
+      resolution: { action: "accept" as const },
+    };
+
+    expect(queueRunnerPrpRuntimeRequestResolution(input)).toEqual({ commandId: "command-resolution-1" });
+    expect(queueRunnerPrpRuntimeRequestResolution(input)).toEqual({ commandId: "command-resolution-1" });
+    expect(queueCommand).toHaveBeenCalledTimes(1);
+    expect(queueCommand).toHaveBeenCalledWith("request.resolve", {
+      requestId: "request-1",
+      turnId: "turn-1",
+      resolution: { action: "accept" },
+    }, undefined, true);
+    expect(() => queueRunnerPrpRuntimeRequestResolution({
+      ...input,
+      resolution: { action: "decline" },
+    })).toThrowError(RunnerPrpRuntimeRequestResolutionError);
+
+    await registration.release();
+    expect(() => queueRunnerPrpRuntimeRequestResolution(input)).toThrowError(
+      "runner_prp_authority_not_active",
+    );
     server.close();
   });
 

@@ -231,6 +231,7 @@ pub fn run_durable_runner(
         }
 
         let mut revoke_deadline: Option<Instant> = None;
+        let mut revoke_control_drained = false;
         let disconnected = loop {
             poll_provider(&mut provider, &mut state, &store, &config)?;
             if started.elapsed() >= config.max_runtime && !state.active_turn {
@@ -254,7 +255,10 @@ pub fn run_durable_runner(
             if provider.is_some() {
                 send_outbox(&mut client, &state, &mut sent_source_seq)?;
             }
-            if (state.stop_after_flush || state.lifecycle == "revoked") && state.outbox.is_empty() {
+            if (state.stop_after_flush || state.lifecycle == "revoked")
+                && state.outbox.is_empty()
+                && (state.lifecycle != "revoked" || revoke_control_drained || revoke_deadline.is_none())
+            {
                 if let Some(mut runtime) = provider.take() {
                     runtime.shutdown().map_err(|error| {
                         DurableRunnerError::invalid(format!(
@@ -275,6 +279,10 @@ pub fn run_durable_runner(
                 return Ok(());
             }
             if revoke_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if state.outbox.is_empty() {
+                    revoke_control_drained = true;
+                    continue;
+                }
                 state.record_diagnostic(
                     "revocation flush deadline elapsed; unacked durable events remain preserved",
                 );
@@ -362,6 +370,10 @@ pub fn run_durable_runner(
                                         store.save(&state)?;
                                         break true;
                                     }
+                                    // A revoked connection remains open until the bounded drain
+                                    // deadline even after the final command result is written. A
+                                    // successful socket write is not a peer acknowledgement, and
+                                    // exiting here can race the controller's durable commit.
                                 }
                                 Err(error) => {
                                     state.record_diagnostic(error.to_string());
@@ -500,8 +512,49 @@ fn start_configured_provider(
                 })?
             },
         ),
+        crate::codex_provider::ProviderConfig::AwsAgentcore(mut agentcore) => Box::new({
+            if let Some(value) = state.provider_budget_ceiling_usd {
+                agentcore.max_estimated_session_cost_usd = value;
+            }
+            crate::aws_agentcore_provider::AwsAgentCoreHarnessProvider::start(
+                &agentcore,
+                tools,
+                resume_thread_id.as_deref(),
+                state.provider_event_cursor.as_deref(),
+            )
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to start AWS AgentCore provider: {error}"
+                ))
+            })?
+        }),
+        crate::codex_provider::ProviderConfig::Acpx(acpx) => Box::new(
+            crate::acpx_provider::AcpxProvider::start(
+                &acpx,
+                tools,
+                state.provider_session_identity.as_ref(),
+            ).map_err(|error| {
+                DurableRunnerError::invalid(format!("failed to start ACPX provider: {error}"))
+            })?,
+        ),
     };
+    if let Some(expected) = state.provider_session_id.as_deref() {
+        if expected != runtime.session_identity() {
+            return Err(DurableRunnerError::invalid(
+                "provider recovery returned a different durable session identity",
+            ));
+        }
+    }
+    let durable_identity = runtime.durable_session_identity();
+    if let Some(expected) = state.provider_session_identity.as_ref() {
+        if Some(expected) != durable_identity.as_ref() {
+            return Err(DurableRunnerError::invalid(
+                "provider recovery returned a different tagged session identity",
+            ));
+        }
+    }
     state.provider_session_id = Some(runtime.session_identity().to_owned());
+    state.provider_session_identity = durable_identity;
     Ok(Some(runtime))
 }
 
@@ -510,6 +563,8 @@ fn provider_kind_name(kind: crate::codex_provider::ProviderKind) -> &'static str
         crate::codex_provider::ProviderKind::Codex => "codex",
         crate::codex_provider::ProviderKind::Opencode => "opencode",
         crate::codex_provider::ProviderKind::ClaudeManaged => "claude_managed",
+        crate::codex_provider::ProviderKind::AwsAgentcore => "aws_agentcore",
+        crate::codex_provider::ProviderKind::Acpx => "acpx",
     }
 }
 
@@ -528,6 +583,40 @@ fn provider_descriptor(
             "service": "anthropic_managed_agents",
             "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
             "processId": Value::Null,
+        }),
+        Some(crate::codex_provider::ProviderConfig::AwsAgentcore(value)) => json!({
+            "provider": "aws_agentcore",
+            "driver": "aws_agentcore_harness_api",
+            "model": value.model,
+            "executionKind": "remote_service",
+            "providerVersion": value.harness_version,
+            "service": "aws_bedrock_agentcore_harness",
+            "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
+            "processId": Value::Null,
+            "endpointArn": value.endpoint_arn,
+            "endpointQualifier": value.endpoint_qualifier,
+            "memoryId": value.memory_id,
+            "eventExpiryDays": value.event_expiry_days,
+        }),
+        Some(crate::codex_provider::ProviderConfig::Acpx(value)) => json!({
+            "provider": "acpx",
+            "driver": "acpx_runtime",
+            "agent": value.agent,
+            "model": value.model,
+            "requestedModel": value.model,
+            "executionKind": "local_process",
+            "providerVersion": value.acpx_version,
+            "acpProtocolVersion": 1,
+            "agentServerPackage": value.agent_server_package,
+            "agentServerVersion": value.agent_server_version,
+            "agentRuntimePackage": value.agent_runtime_package,
+            "agentRuntimeVersion": value.agent_runtime_version,
+            "providerSessionId": runtime.and_then(|item| item.provider_session_id()),
+            "acpxRecordId": runtime.map(|item| item.session_identity()),
+            "processId": match runtime_identity {
+                Some(crate::codex_provider::ProviderRuntimeIdentity::LocalProcess { process_id, .. }) => Some(process_id),
+                _ => None,
+            },
         }),
         Some(crate::codex_provider::ProviderConfig::Local(value)) => json!({
             "provider": provider_kind_name(value.kind),
@@ -571,12 +660,16 @@ fn process_command_and_provider(
         if !fresh
             && processed.status == "completed"
             && command.get("type").and_then(Value::as_str) == Some("semantic_tool.result")
-            && provider.as_ref().is_some_and(|runtime| runtime.kind() == crate::codex_provider::ProviderKind::ClaudeManaged)
+            && provider.as_ref().is_some_and(|runtime| matches!(
+                runtime.kind(),
+                crate::codex_provider::ProviderKind::ClaudeManaged
+                    | crate::codex_provider::ProviderKind::AwsAgentcore
+            ))
         {
             let result: crate::provider_bridge::ToolResult = serde_json::from_value(command["payload"].clone())
                 .map_err(|error| DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}")))?;
             provider.as_mut().expect("checked above").deliver_tool_result(&result)
-                .map_err(|error| DurableRunnerError::invalid(format!("failed to reconcile Claude Agent tool result: {error}")))?;
+                .map_err(|error| DurableRunnerError::invalid(format!("failed to reconcile remote provider tool result: {error}")))?;
         }
         return Ok(processed);
     }
@@ -654,9 +747,15 @@ fn process_command_and_provider(
             })?;
         }
         Some("run.attach") => {
+            if !state.pending_provider_runtime_requests.is_empty() {
+                return Err(DurableRunnerError::invalid(
+                    "cannot attach a run while a provider runtime request is pending",
+                ));
+            }
             if let Some(runtime) = provider.as_mut() {
                 runtime
-                    .configure_tools(
+                    .attach_run(
+                        &state.run_id.clone(),
                         state
                             .provider_tool_bridge
                             .authorized_tools()
@@ -669,6 +768,63 @@ fn process_command_and_provider(
                         DurableRunnerError::invalid(format!("failed to replace provider tools: {error}"))
                     })?;
             }
+        }
+        Some("request.resolve") => {
+            let request_id = command
+                .pointer("/payload/requestId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("request.resolve payload.requestId is required")
+                })?;
+            let turn_id = command
+                .pointer("/payload/turnId")
+                .and_then(Value::as_str)
+                .unwrap_or(state.turn_id.as_str());
+            let resolution = command
+                .pointer("/payload/resolution")
+                .unwrap_or(&command["payload"]);
+            if matches!(
+                state.provider_config,
+                Some(crate::codex_provider::ProviderConfig::Acpx(_))
+            ) {
+                let pending = state
+                    .pending_provider_runtime_requests
+                    .get(request_id)
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid(
+                            "request.resolve named a stale or expired ACPX permission request",
+                        )
+                    })?;
+                if pending.turn_id != turn_id {
+                    return Err(DurableRunnerError::invalid(
+                        "request.resolve named a stale ACPX permission turn",
+                    ));
+                }
+            }
+            provider
+                .as_mut()
+                .ok_or_else(|| DurableRunnerError::invalid("request.resolve requires a provider"))?
+                .resolve_runtime_request(request_id, turn_id, resolution)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to resolve provider runtime request: {error}"
+                    ))
+                })?;
+            state.pending_provider_runtime_requests.remove(request_id);
+            state.lifecycle = "active".to_owned();
+            enqueue_event(
+                state,
+                config,
+                "runtime_request.resolved",
+                0,
+                json!({
+                    "requestId": request_id,
+                    "turnId": turn_id,
+                    "action": resolution.get("action"),
+                }),
+                Some(&state.item_id.clone()),
+            )?;
+            store.save(state)?;
         }
         Some("semantic_tool.result") => {
             let result: crate::provider_bridge::ToolResult =
@@ -808,6 +964,7 @@ fn poll_provider(
             Ok(None) => break,
             Err(error) => {
                 let detail = error.to_string();
+                expire_acpx_permission_requests_after_provider_loss(state, config)?;
                 persist_provider_failure(state, store, &detail)?;
                 return Err(DurableRunnerError::invalid(format!(
                     "provider failed: {detail}"
@@ -897,6 +1054,14 @@ fn poll_provider(
                         "cumulative": cumulative,
                         "runDelta": run_delta,
                     })
+                } else if method == "acpx/process" {
+                    json!({
+                        "providerMethod": method,
+                        "role": params.get("role").and_then(Value::as_str),
+                        "pid": params.get("pid").and_then(Value::as_u64),
+                        "processGroupId": params.get("processGroupId").and_then(Value::as_u64),
+                        "startedAt": params.get("startedAt").and_then(Value::as_str),
+                    })
                 } else if matches!(method.as_str(), "turn/started" | "item/started" | "item/delta" | "item/completed" | "turn/completed" | "provider/budgetReached") {
                     params.clone()
                 } else {
@@ -907,6 +1072,11 @@ fn poll_provider(
                     state.lifecycle = "waiting_input".to_owned();
                 }
                 if method == "turn/completed" {
+                    cancel_pending_runtime_requests_on_terminal(
+                        state,
+                        config,
+                        "provider_turn_became_terminal",
+                    )?;
                     state.active_turn = false;
                     if state.lifecycle_mode == "warm" {
                         state.lifecycle = "warm_idle".to_owned();
@@ -937,7 +1107,51 @@ fn poll_provider(
                 )?;
                 store.save(state)?;
             }
+            crate::codex_provider::ProviderEvent::RuntimeRequest {
+                request_id,
+                request_kind,
+                title,
+                details,
+            } => {
+                state.last_activity_at_unix_ms = current_unix_ms()?;
+                if state.pending_provider_runtime_requests.contains_key(&request_id) {
+                    return Err(DurableRunnerError::invalid(
+                        "provider reused a pending runtime request id",
+                    ));
+                }
+                state.pending_provider_runtime_requests.insert(
+                    request_id.clone(),
+                    PendingProviderRuntimeRequest {
+                        request_id: request_id.clone(),
+                        turn_id: state.turn_id.clone(),
+                        request_kind: request_kind.clone(),
+                        created_at_unix_ms: state.last_activity_at_unix_ms,
+                    },
+                );
+                state.lifecycle = "waiting_input".to_owned();
+                enqueue_event(
+                    state,
+                    config,
+                    "runtime_request.created",
+                    0,
+                    json!({
+                        "request": {
+                            "schema": "paperclip.runtime_request.v1",
+                            "requestKind": request_kind,
+                            "requestId": request_id,
+                            "type": "permission",
+                            "status": "pending",
+                            "prompt": title,
+                            "turnId": state.turn_id,
+                            "details": details,
+                        }
+                    }),
+                    Some(&state.item_id.clone()),
+                )?;
+                store.save(state)?;
+            }
             crate::codex_provider::ProviderEvent::Exited => {
+                expire_acpx_permission_requests_after_provider_loss(state, config)?;
                 persist_provider_failure(state, store, "local provider exited unexpectedly")?;
                 return Err(DurableRunnerError::invalid(
                     "native_runner_process_exited: local provider exited unexpectedly",
@@ -956,6 +1170,8 @@ fn provider_model(config: &crate::codex_provider::ProviderConfig) -> Option<&str
     match config {
         crate::codex_provider::ProviderConfig::Local(value) => value.model.as_deref(),
         crate::codex_provider::ProviderConfig::ClaudeManaged(value) => Some(value.model.as_str()),
+        crate::codex_provider::ProviderConfig::AwsAgentcore(value) => Some(value.model.as_str()),
+        crate::codex_provider::ProviderConfig::Acpx(value) => Some(value.model.as_str()),
     }
 }
 
@@ -1038,10 +1254,89 @@ fn should_suspend_for_idle_at(
     {
         return Ok(false);
     }
+    if state.lifecycle == "waiting_input"
+        && matches!(
+            state.provider_config,
+            Some(crate::codex_provider::ProviderConfig::Acpx(_))
+        )
+    {
+        return Ok(false);
+    }
     let Some(timeout_ms) = state.idle_timeout_ms else {
         return Ok(false);
     };
     Ok(now_unix_ms.saturating_sub(state.last_activity_at_unix_ms) >= timeout_ms)
+}
+
+fn expire_acpx_permission_requests_after_provider_loss(
+    state: &mut DurableRunnerState,
+    config: &DurableRunnerConfig,
+) -> Result<(), DurableRunnerError> {
+    if !matches!(
+        state.provider_config,
+        Some(crate::codex_provider::ProviderConfig::Acpx(_))
+    ) || state.pending_provider_runtime_requests.is_empty()
+    {
+        return Ok(());
+    }
+    let pending = std::mem::take(&mut state.pending_provider_runtime_requests);
+    for request in pending.into_values() {
+        enqueue_event(
+            state,
+            config,
+            "runtime_request.expired",
+            0,
+            json!({
+                "requestId": request.request_id,
+                "turnId": request.turn_id,
+                "requestKind": request.request_kind,
+                "reason": "acpx_provider_process_lost",
+                "replayAllowed": false,
+            }),
+            Some(&state.item_id.clone()),
+        )?;
+    }
+    state.active_turn = false;
+    enqueue_event(
+        state,
+        config,
+        "turn.failed",
+        0,
+        json!({
+            "turn": { "id": state.turn_id, "status": "failed" },
+            "error": {
+                "code": "acpx_permission_transport_lost",
+                "message": "The ACP process exited while permission was pending; the prompt and approval will not be replayed.",
+                "recoverable": true,
+            }
+        }),
+        Some(&state.item_id.clone()),
+    )?;
+    Ok(())
+}
+
+fn cancel_pending_runtime_requests_on_terminal(
+    state: &mut DurableRunnerState,
+    config: &DurableRunnerConfig,
+    reason: &str,
+) -> Result<(), DurableRunnerError> {
+    let pending = std::mem::take(&mut state.pending_provider_runtime_requests);
+    for request in pending.into_values() {
+        enqueue_event(
+            state,
+            config,
+            "runtime_request.cancelled",
+            0,
+            json!({
+                "requestId": request.request_id,
+                "turnId": request.turn_id,
+                "requestKind": request.request_kind,
+                "reason": reason,
+            }),
+            Some(&state.item_id.clone()),
+        )?;
+    }
+    Ok(())
 }
 
 fn begin_automatic_suspend(
@@ -1251,6 +1546,29 @@ mod tests {
             assert!(!should_suspend_for_idle_at(&state, 1_299_999).unwrap());
             assert!(should_suspend_for_idle_at(&state, 1_300_000).unwrap());
         }
+        state.provider_config = Some(crate::codex_provider::ProviderConfig::Acpx(
+            crate::codex_provider::AcpxProviderConfig {
+                agent: "pi".to_owned(),
+                model: "openrouter/deepseek/deepseek-v4-flash-0731".to_owned(),
+                acpx_version: "0.13.1".to_owned(),
+                agent_server_package: "pi-acp".to_owned(),
+                agent_server_version: "0.0.33".to_owned(),
+                agent_runtime_package: Some("@earendil-works/pi-coding-agent".to_owned()),
+                agent_runtime_version: Some("0.84.2".to_owned()),
+                command_digest: "sha256:qualified".to_owned(),
+                sidecar_command: PathBuf::from("node"),
+                sidecar_args: Vec::new(),
+                runtime_directory: "/tmp/acpx".to_owned(),
+                normalized_session_id: "session".to_owned(),
+                run_id: "run".to_owned(),
+                cwd: "/tmp/workspace".to_owned(),
+                instructions: "safe".to_owned(),
+                permission_policy: "interactive".to_owned(),
+            },
+        ));
+        state.lifecycle = "waiting_input".to_owned();
+        assert!(!should_suspend_for_idle_at(&state, 86_400_000).unwrap());
+        state.provider_config = None;
         for lifecycle in ["active", "ready", "suspending", "suspended"] {
             state.lifecycle = lifecycle.to_owned();
             assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
@@ -1258,6 +1576,60 @@ mod tests {
             state.lifecycle = "active".to_owned();
         state.stop_after_flush = true;
         assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acpx_process_loss_expires_pending_permission_without_replay() {
+        let root = temporary_root("acpx-permission-loss");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        state.provider_config = Some(crate::codex_provider::ProviderConfig::Acpx(
+            crate::codex_provider::AcpxProviderConfig {
+                agent: "pi".to_owned(),
+                model: "openrouter/deepseek/deepseek-v4-flash-0731".to_owned(),
+                acpx_version: "0.13.1".to_owned(),
+                agent_server_package: "pi-acp".to_owned(),
+                agent_server_version: "0.0.33".to_owned(),
+                agent_runtime_package: Some("@earendil-works/pi-coding-agent".to_owned()),
+                agent_runtime_version: Some("0.84.2".to_owned()),
+                command_digest: "sha256:qualified".to_owned(),
+                sidecar_command: PathBuf::from("node"),
+                sidecar_args: Vec::new(),
+                runtime_directory: "/tmp/acpx".to_owned(),
+                normalized_session_id: "session".to_owned(),
+                run_id: "run".to_owned(),
+                cwd: "/tmp/workspace".to_owned(),
+                instructions: "safe".to_owned(),
+                permission_policy: "interactive".to_owned(),
+            },
+        ));
+        state.active_turn = true;
+        state.lifecycle = "waiting_input".to_owned();
+        state.pending_provider_runtime_requests.insert(
+            "permission-1".to_owned(),
+            PendingProviderRuntimeRequest {
+                request_id: "permission-1".to_owned(),
+                turn_id: state.turn_id.clone(),
+                request_kind: "file_approval".to_owned(),
+                created_at_unix_ms: 1,
+            },
+        );
+
+        expire_acpx_permission_requests_after_provider_loss(&mut state, &runner_config).unwrap();
+
+        assert!(state.pending_provider_runtime_requests.is_empty());
+        assert!(!state.active_turn);
+        assert!(state.outbox.iter().any(|event| {
+            event.envelope["payload"]["eventType"] == "runtime_request.expired"
+                && event.envelope["payload"]["payload"]["replayAllowed"] == false
+        }));
+        assert!(state.outbox.iter().any(|event| {
+            event.envelope["payload"]["eventType"] == "turn.failed"
+                && event.envelope["payload"]["payload"]["error"]["code"]
+                    == "acpx_permission_transport_lost"
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

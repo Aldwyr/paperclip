@@ -83,6 +83,7 @@ import {
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
+import { documentService } from "./documents.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import {
   buildNativeProviderEnvironment,
@@ -92,13 +93,15 @@ import {
   ensureNativeCompletionContract,
   executePaperclipNativeSession,
   finalizeNativeRun,
+  isNativeSessionId,
   materializeNativeInteractionResponses,
+  rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
   resolveHeartbeatNativeRuntimeMode,
 } from "./native-runtime/index.js";
 import {
   parseNativeExecutionInput,
-  type NativeExecutionInputV1,
+  type NativeExecutionInput,
   type NativeSessionBackend,
 } from "../vendor/paperclip-runner/index.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
@@ -305,6 +308,7 @@ import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { managedAgentProfileService } from "./managed-agent-profiles.js";
+import { remoteAgentProfileService } from "./remote-agent-profiles.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
@@ -6677,7 +6681,7 @@ export interface HeartbeatServiceOptions {
    * the seam here exercises the production reaper, claim, execution, package
    * session loop, persistence port, and finalizer without spawning a provider.
    */
-  nativeSessionBackendFactory?: (execution: NativeExecutionInputV1) => NativeSessionBackend;
+  nativeSessionBackendFactory?: (execution: NativeExecutionInput) => NativeSessionBackend;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -13607,9 +13611,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
-      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+      const nativeLocalChild = run.runtimeMode === "native";
+      const tracksLocalChild = nativeLocalChild || isTrackedLocalChildProcessAdapter(adapterType);
+      let processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      let processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+      if (nativeLocalChild && (processPidAlive || processGroupAlive)) {
+        // A native runner's reconnect URL is bound to the old run authority.
+        // If startup resumption did not adopt it above, leaving it alive makes
+        // the next run fight an orphan for the same provider thread writer.
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+        processPidAlive = false;
+        processGroupAlive = false;
+      }
       if (
         (processPidAlive || processGroupAlive) &&
         readHotRestartAdoptionMetadata(parseObject(run.resultJson))
@@ -15876,7 +15892,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         target: executionTarget,
         workspaceId: persistedExecutionWorkspace?.id ?? null,
       });
-      let nativeExecution: ReturnType<typeof buildNativeExecutionInput> | null = null;
+      let nativeExecution: NativeExecutionInput | null = null;
       let nativeRunnerInstanceId: string | null = null;
       if (nativeRuntimeResolution.kind === "native") {
         if (!issueRef) {
@@ -15902,8 +15918,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               actorId: agent.id,
               immediateRequest: safeWakeCommentContext?.body ?? null,
             });
-        nativeRunnerInstanceId = run.runnerInstanceId ?? randomUUID();
-        const nativeSessionId = run.nativeSessionId ?? randomUUID();
+        const taskNativeSessionId = readNonEmptyString(taskSessionDecodedParams?.sessionId);
+        const resumableTaskSessionId =
+          taskSessionForRun?.lastRunId
+          && taskSessionForRun.lastRunId !== run.id
+          && isNativeSessionId(taskNativeSessionId)
+            ? taskNativeSessionId
+            : null;
+        const previousNativeRun = resumableTaskSessionId && taskSessionForRun?.lastRunId
+          ? await db.select({
+              id: heartbeatRuns.id,
+              companyId: heartbeatRuns.companyId,
+              agentId: heartbeatRuns.agentId,
+              runnerInstanceId: heartbeatRuns.runnerInstanceId,
+              nativeSessionId: heartbeatRuns.nativeSessionId,
+              runnerProfileJson: heartbeatRuns.runnerProfileJson,
+            }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, taskSessionForRun.lastRunId),
+              eq(heartbeatRuns.companyId, agent.companyId),
+              eq(heartbeatRuns.agentId, agent.id),
+              eq(heartbeatRuns.nativeSessionId, resumableTaskSessionId),
+            )).limit(1).then((rows) => rows[0] ?? null)
+          : null;
+        nativeRunnerInstanceId =
+          previousNativeRun?.runnerInstanceId
+          && previousNativeRun.nativeSessionId === (run.nativeSessionId ?? resumableTaskSessionId)
+            ? previousNativeRun.runnerInstanceId
+            : run.runnerInstanceId ?? randomUUID();
+        let nativeSessionId = run.nativeSessionId ?? resumableTaskSessionId ?? randomUUID();
+        let nativeResumeCheckpoint: ReturnType<typeof rebindNativeSessionCheckpoint> = null;
         const persistedProfile = persistedRunnerProfile;
         if (persistedNativeExecutionInput) {
           nativeExecution = persistedNativeExecutionInput;
@@ -15932,6 +15975,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 readNonEmptyString(parseObject(runtimeConfig).managedProfileId) ?? "",
               )
             : null;
+          const agentCoreProfile = nativeRuntimeResolution.profile.backend === "aws_agentcore_harness_api"
+            ? await remoteAgentProfileService(db).requireQualified(
+                agent.companyId,
+                readNonEmptyString(parseObject(agent.adapterConfig).agentCoreProfileId) ?? "",
+                "aws_bedrock_agentcore_harness",
+              )
+            : null;
+          const agentCoreConfig = parseObject(agentCoreProfile?.configuration);
           if (managedProfile) {
             const rawApiKeyBinding = parseObject(parseObject(agent.adapterConfig).env).ANTHROPIC_API_KEY;
             const boundSecretId = typeof rawApiKeyBinding === "object" && rawApiKeyBinding !== null
@@ -15952,6 +16003,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
             }
           }
+          const executionMode = issueRef.workMode === "planning" && !acceptedPlanContinuationWake
+            ? "plan" as const
+            : "default" as const;
+          const pinnedPlan = executionMode === "plan"
+            ? await documentService(db).getIssueDocumentByKey(issueRef.id, "plan")
+            : null;
+          const pinnedReviewContext = executionMode === "plan"
+            ? await buildPlanReviewContext({
+                db,
+                companyId: agent.companyId,
+                issueId: issueRef.id,
+                issueWorkMode: issueRef.workMode,
+                interactionId: readNonEmptyString(context.interactionId),
+              })
+            : null;
+          const pinnedPlanMarkdown = pinnedPlan?.body ?? "";
           nativeExecution = buildNativeExecutionInput({
             companyId: agent.companyId,
             runId: run.id,
@@ -15970,14 +16037,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               branchName: executionWorkspace.branchName,
             },
             normalizedSessionId: nativeSessionId,
+            executionMode,
+            planningContext: executionMode === "plan" ? {
+              documentId: pinnedPlan?.id ?? null,
+              baseRevisionId: pinnedPlan?.latestRevisionId ?? null,
+              baseRevisionNumber: pinnedPlan?.latestRevisionNumber ?? 0,
+              markdown: pinnedPlanMarkdown,
+              sha256: createHash("sha256").update(pinnedPlanMarkdown).digest("hex"),
+              reviewContext: pinnedReviewContext
+                ? structuredClone(pinnedReviewContext) as unknown as Record<string, unknown>
+                : {},
+            } : null,
             provider: nativeRuntimeResolution.profile.backend === "opencode_server"
               ? "opencode"
               : nativeRuntimeResolution.profile.backend === "claude_managed_agents_api"
                 ? "claude_managed"
+                : nativeRuntimeResolution.profile.backend === "aws_agentcore_harness_api"
+                  ? "aws_agentcore"
+                : nativeRuntimeResolution.profile.backend === "acpx_runtime"
+                  ? "acpx"
                 : "codex",
-            model: typeof parseObject(runtimeConfig).model === "string"
-              ? String(parseObject(runtimeConfig).model)
-              : managedProfile?.defaultModel ?? null,
+            ...(nativeRuntimeResolution.profile.backend === "acpx_runtime" ? {
+              acpxAgent: parseObject(runtimeConfig).acpxAgent as "pi" | "claude" | "codex",
+            } : {}),
+            model: typeof parseObject(agent.adapterConfig).model === "string"
+              ? String(parseObject(agent.adapterConfig).model)
+              : managedProfile?.defaultModel ?? readNonEmptyString(agentCoreConfig.defaultModel) ?? null,
             ...(nativeRuntimeResolution.profile.backend === "claude_managed_agents_api" ? {
               managedProfile: {
                 profileId: managedProfile!.id,
@@ -15991,7 +16076,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   ?? managedProfile!.defaultMaxListCostCents / 100,
               ),
             } : {}),
-            lifecyclePolicy: parseObject(runtimeConfig).lifecycleMode === "warm"
+            ...(nativeRuntimeResolution.profile.backend === "aws_agentcore_harness_api" ? {
+              agentCoreProfile: {
+                profileId: agentCoreProfile!.id,
+                region: readNonEmptyString(agentCoreConfig.region) ?? "",
+                accountId: readNonEmptyString(agentCoreConfig.accountId) ?? "",
+                harnessArn: readNonEmptyString(agentCoreConfig.harnessArn) ?? "",
+                harnessVersion: readNonEmptyString(agentCoreConfig.harnessVersion) ?? "",
+                endpointArn: readNonEmptyString(agentCoreConfig.endpointArn) ?? "",
+                endpointQualifier: readNonEmptyString(agentCoreConfig.endpointQualifier) ?? "",
+                agentRuntimeArn: readNonEmptyString(agentCoreConfig.agentRuntimeArn) ?? "",
+                memoryArn: readNonEmptyString(agentCoreConfig.memoryArn) ?? "",
+                memoryId: readNonEmptyString(agentCoreConfig.memoryId) ?? "",
+                invocationRoleArn: readNonEmptyString(agentCoreConfig.invocationRoleArn) ?? "",
+                qualificationRevision: readNonEmptyString(agentCoreConfig.qualificationRevision) ?? "aws-agentcore-harness-v1",
+                eventExpiryDays: 90 as const,
+              },
+              maxEstimatedSessionCostUsd: Number(parseObject(agent.adapterConfig).maxEstimatedSessionCostUsd ?? agentCoreConfig.defaultMaxEstimatedSessionCostUsd ?? 1),
+              invocationLimits: {
+                maxIterations: Math.min(8, Number(parseObject(agent.adapterConfig).maxIterations ?? 8)),
+                maxOutputTokens: Math.min(4096, Number(parseObject(agent.adapterConfig).maxOutputTokens ?? 4096)),
+                timeoutSeconds: Math.min(300, Number(parseObject(agent.adapterConfig).timeoutSeconds ?? 300)),
+              },
+            } : {}),
+            lifecyclePolicy: parseObject(agent.adapterConfig).lifecycleMode === "warm"
               ? {
                   mode: "warm",
                   idleTimeoutMs: Number.isSafeInteger(parseObject(agent.adapterConfig).idleTimeoutMs)
@@ -16008,6 +16116,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               contract: completionContract.contract,
             },
           });
+          if (previousNativeRun && nativeSessionId === resumableTaskSessionId) {
+            nativeResumeCheckpoint = rebindNativeSessionCheckpoint({
+              previousRun: previousNativeRun,
+              currentExecution: nativeExecution,
+            });
+            if (!nativeResumeCheckpoint) {
+              nativeSessionId = randomUUID();
+              nativeExecution = parseNativeExecutionInput({
+                ...nativeExecution,
+                session: {
+                  ...nativeExecution.session,
+                  normalizedSessionId: nativeSessionId,
+                },
+              });
+            }
+          }
         }
         await db.transaction(async (tx) => {
           const lockedRun = await tx.select().from(heartbeatRuns)
@@ -16017,6 +16141,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (lockedRun.runtimeModeResolvedAt && lockedRun.runtimeMode !== "native") {
             throw new Error("native_runtime_mode_conflict");
           }
+          const lockedProfile = parseObject(lockedRun.runnerProfileJson);
           await tx.update(heartbeatRuns).set({
             runtimeMode: "native",
             runtimeModeResolverVersion: lockedRun.runtimeModeResolverVersion ?? nativeRuntimeResolution.resolverVersion,
@@ -16024,10 +16149,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             runtimeModeResolvedAt: lockedRun.runtimeModeResolvedAt ?? new Date(),
             runnerProfileJson: {
               ...nativeRuntimeResolution.profile,
-              ...parseObject(lockedRun.runnerProfileJson),
-              nativeExecutionInput: parseObject(lockedRun.runnerProfileJson).nativeExecutionInput ?? nativeExecution,
+              ...lockedProfile,
+              nativeExecutionInput: lockedProfile.nativeExecutionInput ?? nativeExecution,
+              ...(lockedProfile.sessionCheckpoint !== undefined
+                ? { sessionCheckpoint: lockedProfile.sessionCheckpoint }
+                : nativeResumeCheckpoint
+                  ? { sessionCheckpoint: nativeResumeCheckpoint as unknown as Record<string, unknown> }
+                  : {}),
             },
-            runnerInstanceId: lockedRun.runnerInstanceId ?? nativeRunnerInstanceId,
+            runnerInstanceId:
+              previousNativeRun?.runnerInstanceId
+              && lockedRun.nativeSessionId !== null
+              && lockedRun.nativeSessionId === previousNativeRun.nativeSessionId
+                ? previousNativeRun.runnerInstanceId
+                : lockedRun.runnerInstanceId ?? nativeRunnerInstanceId,
             nativeSessionId: lockedRun.nativeSessionId ?? nativeSessionId,
             driverKind: lockedRun.driverKind ?? nativeExecution?.session.driverKind ?? "codex_app_server",
             driverVersion: lockedRun.driverVersion ?? "phase6-v1",

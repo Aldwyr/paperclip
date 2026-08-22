@@ -26,6 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         linger_after_turn_start: args.iter().any(|arg| arg == "--linger-after-turn-start"),
     };
     let mut turn_count = 0_u64;
+    let mut planning_thread = false;
     let mut pending_tool_turns = BTreeMap::<String, String>::new();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -41,6 +42,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "initialize" => {
                 send(json!({"id": id, "result": {"user": {"sessionId": "fake-session"}}}))?
             }
+            "collaborationMode/list" => send(json!({
+                "id": id,
+                "result": {"data": [{"name": "Plan", "mode": "plan", "model": "gpt-test", "reasoning_effort": "high"}]}
+            }))?,
             "thread/start" | "thread/resume" => {
                 let tools = request
                     .pointer("/params/dynamicTools")
@@ -53,10 +58,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("authorized tool was not registered".into());
                 }
                 let config = request.pointer("/params/config").and_then(Value::as_object);
+                planning_thread = config
+                    .and_then(|value| value.get("include_collaboration_mode_instructions"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
                 for key in [
                     "skills.include_instructions",
                     "include_apps_instructions",
-                    "include_collaboration_mode_instructions",
                     "features.apps",
                     "features.plugins",
                     "features.multi_agent",
@@ -89,6 +97,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
             "turn/start" => {
+                if planning_thread {
+                    let collaboration_mode = request.pointer("/params/collaborationMode");
+                    if collaboration_mode
+                        .and_then(|value| value.get("mode"))
+                        .and_then(Value::as_str)
+                        != Some("plan")
+                        || collaboration_mode
+                            .and_then(|value| value.pointer("/settings/model"))
+                            .and_then(Value::as_str)
+                            != Some("gpt-test")
+                        || !collaboration_mode
+                            .and_then(|value| value.pointer("/settings/developer_instructions"))
+                            .is_some_and(Value::is_null)
+                    {
+                        return Err(
+                            "planning turn omitted the qualified collaboration mode payload".into(),
+                        );
+                    }
+                }
                 turn_count += 1;
                 let turn_id = if turn_count == 1 {
                     "fake-turn".to_owned()

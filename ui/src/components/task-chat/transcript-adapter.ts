@@ -13,6 +13,10 @@ import type {
   TaskChatToolItem,
   TaskChatTurnChildItem,
   TaskChatTurnItem,
+  TaskChatProviderActivityItem,
+  TaskChatProtocolDetail,
+  TaskChatProtocolItem,
+  TaskChatProtocolStep,
 } from "./task-chat-model";
 import { isGenericToolName, mcpToolSegment, toolTaxonomy } from "./tool-taxonomy";
 
@@ -37,7 +41,7 @@ export function isTerminalRunStatus(status: string | undefined | null): boolean 
  * interaction cards stay in the thread outside.
  */
 export function isNestableLiveChild(item: TaskChatItem): item is TaskChatTurnChildItem {
-  return item.kind === "tool" || item.kind === "thinking" || item.kind === "usage" || item.kind === "activity_phase";
+  return item.kind === "tool" || item.kind === "thinking" || item.kind === "usage" || item.kind === "activity_phase" || item.kind === "protocol";
 }
 
 /**
@@ -137,6 +141,146 @@ function thoughtDurationLabel(startTs: string | undefined, endTs: string): strin
 }
 
 const DETAIL_MAX = 600;
+const PROTOCOL_OUTPUT_MAX = 8 * 1024;
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function scalarValue(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return undefined;
+}
+
+function titleCaseKey(value: string): string {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function safeHttpHref(value: unknown): string | null {
+  const href = stringValue(value);
+  if (!href) return null;
+  try {
+    const url = new URL(href);
+    return url.protocol === "http:" || url.protocol === "https:" ? href : null;
+  } catch {
+    return null;
+  }
+}
+
+const PROVIDER_DETAIL_KEYS: Record<TaskChatProviderActivityItem["family"], readonly string[]> = {
+  plan: ["revision", "syncStatus", "documentRevision", "complete"],
+  tool_execution: ["transport", "operation", "name", "target", "progress", "durationMs", "exitCode", "outputBytes"],
+  research: ["action", "query", "pattern", "url"],
+  delegation: ["action"],
+  model_identity: ["provider", "requestedModel", "fromModel", "effectiveModel", "reason", "status", "buffering", "summary"],
+  context: ["reason", "preTokens", "postTokens", "sameSession"],
+  artifact: ["status", "reference", "mediaType", "title", "registered", "transparentBackground", "failure"],
+  review: ["state", "scope"],
+  hook: ["event", "scope", "status", "blocking", "durationMs", "summary"],
+  memory: ["label", "available", "reference"],
+  safety: ["status", "decision", "summary"],
+  terminal: ["origin", "inputClass", "byteCount"],
+  wait: ["reason", "status", "plannedDurationMs", "elapsedDurationMs"],
+  provider_notice: ["level", "code", "message", "action"],
+};
+
+function providerActivityKey(entry: Extract<TranscriptEntry, { kind: "provider_activity" }>): string {
+  const idKeys = [
+    "planId", "executionId", "researchId", "delegationId", "routeId", "verificationId",
+    "compactionId", "artifactId", "reviewId", "hookId", "citationId", "waitId", "noticeId",
+  ];
+  for (const key of idKeys) {
+    const value = stringValue(entry.payload[key]);
+    if (value) return `${entry.family}:${value}`;
+  }
+  return `${entry.family}:${entry.eventType}:${entry.ts}`;
+}
+
+function providerActivityItem(
+  entry: Extract<TranscriptEntry, { kind: "provider_activity" }>,
+  runId: string,
+  index: number,
+): TaskChatProviderActivityItem {
+  const details: TaskChatProtocolDetail[] = [];
+  for (const key of PROVIDER_DETAIL_KEYS[entry.family]) {
+    const value = scalarValue(entry.payload[key]);
+    if (!value) continue;
+    details.push({
+      label: titleCaseKey(key),
+      value: clip(value, key === "message" || key === "summary" || key === "reason" ? 320 : 160),
+      mono: /(?:id|model|target|reference|url|code|bytes)$/i.test(key),
+    });
+  }
+
+  const steps = entry.family === "plan" && Array.isArray(entry.payload.steps)
+    ? entry.payload.steps.map(objectRecord).slice(0, 256).map((step, stepIndex) => {
+        const rawStatus = stringValue(step.status);
+        const status: TaskChatProtocolStep["status"] = rawStatus === "in_progress" || rawStatus === "completed" || rawStatus === "blocked"
+          ? rawStatus
+          : "pending";
+        return {
+          id: stringValue(step.stepId) ?? `${runId}:plan-step:${stepIndex}`,
+          label: stringValue(step.body) ?? "Plan step",
+          status,
+        };
+      })
+    : [];
+
+  const links = entry.family === "research" && Array.isArray(entry.payload.sources)
+    ? entry.payload.sources.map(objectRecord).slice(0, 64).flatMap((source) => {
+        const href = safeHttpHref(source.url);
+        return href ? [{
+          label: stringValue(source.title) ?? href,
+          href,
+          description: stringValue(source.snippet),
+        }] : [];
+      })
+    : [];
+
+  const children = entry.family === "delegation" && Array.isArray(entry.payload.children)
+    ? entry.payload.children.map(objectRecord).slice(0, 64).map((child, childIndex) => ({
+        id: stringValue(child.childId) ?? `${runId}:delegation:${childIndex}`,
+        title: stringValue(child.role) ?? "Subagent",
+        status: stringValue(child.status) ?? "unknown",
+        metadata: [stringValue(child.model), stringValue(child.activitySummary)].filter(Boolean).join(" · ") || undefined,
+        summary: stringValue(child.summary),
+      }))
+    : [];
+
+  const rawOutput = entry.family === "tool_execution" ? stringValue(entry.payload.output) : undefined;
+  const outputTruncated = entry.payload.outputTruncated === true || Boolean(rawOutput && rawOutput.length > PROTOCOL_OUTPUT_MAX);
+  const summary = entry.summary && entry.summary !== entry.eventType
+    ? entry.summary
+    : stringValue(entry.payload.explanation)
+      ?? stringValue(entry.payload.progress)
+      ?? stringValue(entry.payload.message)
+      ?? stringValue(entry.payload.summary);
+
+  return {
+    id: `${runId}:provider:${providerActivityKey(entry)}:${index}`,
+    kind: "protocol",
+    surface: "provider_activity",
+    family: entry.family,
+    eventType: entry.eventType,
+    status: entry.status,
+    title: entry.title,
+    summary,
+    details,
+    steps,
+    links,
+    children,
+    output: rawOutput ? rawOutput.slice(0, PROTOCOL_OUTPUT_MAX) : undefined,
+    outputTruncated,
+  };
+}
 
 /** Result content → the expandable mono detail block (clipped, trimmed). */
 function formatToolResultDetail(content: unknown): string | undefined {
@@ -165,6 +309,7 @@ export function transcriptToTaskChatItems(
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
   const toolIndexById = new Map<string, number>();
+  const protocolIndexByKey = new Map<string, number>();
   const thinkingStartTs = new Map<number, string>();
   let lastToolIndex = -1;
   let thinkingIndex = -1;
@@ -330,6 +475,135 @@ export function transcriptToTaskChatItems(
         resetInline();
         break;
       }
+      case "provider_activity": {
+        const key = `provider:${providerActivityKey(entry)}`;
+        const item = providerActivityItem(entry, runId, i);
+        const existingIndex = protocolIndexByKey.get(key);
+        if (existingIndex == null) {
+          items.push(item);
+          protocolIndexByKey.set(key, items.length - 1);
+        } else {
+          items[existingIndex] = { ...item, id: items[existingIndex].id };
+        }
+        resetInline();
+        break;
+      }
+      case "workspace_change": {
+        const key = `workspace:${entry.changeSetId}`;
+        const item: TaskChatProtocolItem = {
+          id: `${runId}:workspace:${entry.changeSetId}`,
+          kind: "protocol",
+          surface: "workspace_change",
+          changeSetId: entry.changeSetId,
+          revision: entry.revision,
+          source: entry.source,
+          complete: entry.complete,
+          files: entry.files.map((file) => ({
+            ...file,
+            diff: file.diff == null ? null : file.diff.slice(0, PROTOCOL_OUTPUT_MAX),
+          })),
+          totals: entry.totals,
+          patchArtifactRef: entry.patchArtifactRef,
+        };
+        const existingIndex = protocolIndexByKey.get(key);
+        if (existingIndex == null) {
+          items.push(item);
+          protocolIndexByKey.set(key, items.length - 1);
+        } else {
+          items[existingIndex] = { ...item, id: items[existingIndex].id };
+        }
+        resetInline();
+        break;
+      }
+      case "workspace_file_reference": {
+        const key = `workspace-file:${entry.referenceId}`;
+        const item: TaskChatProtocolItem = {
+          id: `${runId}:workspace-file:${entry.referenceId}`,
+          kind: "protocol",
+          surface: "workspace_file",
+          referenceId: entry.referenceId,
+          source: entry.source,
+          path: entry.path,
+          displayName: entry.displayName,
+          mediaType: entry.mediaType,
+          presentation: entry.presentation,
+          line: entry.line,
+          preview: entry.preview == null ? null : entry.preview.slice(0, PROTOCOL_OUTPUT_MAX),
+          previewTruncated: entry.previewTruncated || Boolean(entry.preview && entry.preview.length > PROTOCOL_OUTPUT_MAX),
+        };
+        const existingIndex = protocolIndexByKey.get(key);
+        if (existingIndex == null) {
+          items.push(item);
+          protocolIndexByKey.set(key, items.length - 1);
+        } else {
+          items[existingIndex] = { ...item, id: items[existingIndex].id };
+        }
+        resetInline();
+        break;
+      }
+      case "runtime_request": {
+        const key = `runtime-request:${entry.requestId}`;
+        const item: TaskChatProtocolItem = {
+          id: `${runId}:runtime-request:${entry.requestId}`,
+          kind: "protocol",
+          surface: "runtime_request",
+          runId,
+          requestId: entry.requestId,
+          requestKind: entry.requestKind,
+          turnId: entry.turnId,
+          requestType: entry.requestType,
+          status: entry.status,
+          prompt: entry.prompt,
+          choices: entry.choices,
+          fields: entry.fields,
+        };
+        const existingIndex = protocolIndexByKey.get(key);
+        if (existingIndex == null) {
+          items.push(item);
+          protocolIndexByKey.set(key, items.length - 1);
+        } else {
+          items[existingIndex] = { ...item, id: items[existingIndex].id };
+        }
+        resetInline();
+        break;
+      }
+      case "run_result": {
+        items.push({
+          id: `${runId}:result:${i}`,
+          kind: "protocol",
+          surface: "run_result",
+          disposition: entry.disposition,
+          summary: entry.summary,
+          objectiveSatisfied: entry.objectiveSatisfied,
+          verification: entry.verification,
+          remainingWork: entry.remainingWork,
+          blocker: entry.blocker,
+          artifacts: entry.artifacts,
+        });
+        resetInline();
+        break;
+      }
+      case "run_terminal": {
+        const key = "run-terminal";
+        const item: TaskChatProtocolItem = {
+          id: `${runId}:terminal`,
+          kind: "protocol",
+          surface: "run_terminal",
+          turnState: entry.turnState,
+          runState: entry.runState,
+          disposition: entry.disposition,
+          stopReason: entry.stopReason,
+        };
+        const existingIndex = protocolIndexByKey.get(key);
+        if (existingIndex == null) {
+          items.push(item);
+          protocolIndexByKey.set(key, items.length - 1);
+        } else {
+          items[existingIndex] = item;
+        }
+        resetInline();
+        break;
+      }
       case "system": {
         if (entry.text.startsWith("Paperclip session ")) {
           const [label, ...detail] = entry.text.split(" · ");
@@ -420,7 +694,7 @@ export function paperclipRunnerHistoryItems(parsed: readonly TaskChatItem[]): Ta
   });
 }
 
-function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { kind: "thinking" } | { kind: "marker" })[]): string {
+function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { kind: "thinking" } | { kind: "marker" } | TaskChatProtocolItem)[]): string {
   const counts = new Map<string, number>();
   let generic = 0;
   for (const item of items) {
@@ -446,6 +720,8 @@ function phaseSummary(items: readonly (TaskChatToolItem | { kind: "usage" } | { 
   const other = [...counts].reduce((n, [family, count]) => n + (known.has(family) ? 0 : count), 0) + generic;
   if (other) phrases.push(`Called ${other} ${other === 1 ? "tool" : "tools"}`);
   if (phrases.length > 0) return phrases.join(", ");
+  const protocolCount = items.filter((item) => item.kind === "protocol").length;
+  if (protocolCount > 0) return protocolCount === 1 ? "Runner activity" : `${protocolCount} runner updates`;
   if (items.some((item) => item.kind === "thinking")) return "Reasoning";
   return items.some((item) => item.kind === "marker") ? "Turn activity" : "No tool activity";
 }
@@ -482,7 +758,7 @@ export function buildActivityPhases(
         active: false,
       };
       phases.push(current);
-    } else if (item.kind === "tool" || item.kind === "usage" || item.kind === "thinking" || item.kind === "marker") {
+    } else if (item.kind === "tool" || item.kind === "usage" || item.kind === "thinking" || item.kind === "marker" || item.kind === "protocol") {
       ensureOpening(item.id).items.push(item);
     }
   }

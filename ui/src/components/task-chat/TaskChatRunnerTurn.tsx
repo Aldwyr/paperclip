@@ -1,10 +1,11 @@
 import { useRef, useState } from "react";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { cn } from "@/lib/utils";
-import type { TaskChatItem, TaskChatMessageItem, TaskChatThinkingItem, TaskChatToolItem } from "./task-chat-model";
+import type { TaskChatItem, TaskChatMessageItem, TaskChatRuntimeRequestDecision, TaskChatRuntimeRequestItem, TaskChatThinkingItem, TaskChatToolItem } from "./task-chat-model";
 import { TaskChatAgentIdentity } from "./TaskChatBubble";
 import { TaskChatLiveRunPill } from "./TaskChatLiveRunPill";
 import { TaskChatLiveTail } from "./TaskChatLiveTail";
+import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { paperclipRunnerHistoryItems } from "./transcript-adapter";
 import { toolTaxonomy } from "./tool-taxonomy";
 
@@ -49,6 +50,7 @@ export function TaskChatRunnerTurn({
   startedAtMs,
   finishedAtMs,
   toolSummary,
+  onRuntimeRequestDecision,
 }: {
   /** Stable identity used to clear replay-latched final text for the next turn. */
   runId?: string | null;
@@ -59,9 +61,19 @@ export function TaskChatRunnerTurn({
   startedAtMs: number | null;
   finishedAtMs?: number | null;
   toolSummary: string | null;
+  onRuntimeRequestDecision?: (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => void | Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   const historyItems = paperclipRunnerHistoryItems(items);
+  const pendingRuntimeRequest = lastOf<TaskChatRuntimeRequestItem>(
+    historyItems,
+    (item): item is TaskChatRuntimeRequestItem => item.kind === "protocol"
+      && item.surface === "runtime_request"
+      && item.status === "pending",
+  );
   const progress = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && Boolean(item.interstitial));
   const observedFinal = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
   // A reconnect/replay can briefly rebuild the transcript without the final
@@ -104,7 +116,11 @@ export function TaskChatRunnerTurn({
       <div className="tc-turn-fold" data-folded={open ? "false" : "true"} aria-hidden={!open}>
         <div>
           <div className="flex flex-col gap-2 py-2">
-            <TaskChatLiveTail items={historyItems} excludeFinal />
+            <TaskChatLiveTail
+              items={historyItems}
+              excludeFinal
+              onRuntimeRequestDecision={onRuntimeRequestDecision}
+            />
           </div>
         </div>
       </div>
@@ -115,7 +131,12 @@ export function TaskChatRunnerTurn({
               <MarkdownBody softBreaks linkIssueReferences>{progress.text}</MarkdownBody>
             </div>
           ) : null}
-          {!final ? <CurrentActivity items={items} /> : null}
+          {pendingRuntimeRequest ? (
+            <TaskChatProtocolCard
+              item={pendingRuntimeRequest}
+              onRuntimeRequestDecision={onRuntimeRequestDecision}
+            />
+          ) : !final ? <CurrentActivity items={items} /> : null}
         </div>
       ) : null}
       {final ? (

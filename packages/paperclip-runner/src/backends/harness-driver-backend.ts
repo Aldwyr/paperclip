@@ -51,7 +51,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       return { recovered: false, reason: "driver does not support recovery" };
     }
     const persisted: PersistedHarnessSession = {
-      driverKind: snapshot.backendKind,
+      driverKind: snapshot.driverKind ?? snapshot.backendKind,
       driverSessionId: snapshot.sessionId,
       providerSessionId: snapshot.providerSessionId,
       runId: snapshot.identity.runId,
@@ -188,6 +188,7 @@ class HarnessNativeSession implements NativeSession {
     const snapshot = await this.#session.snapshot();
     return {
       backendKind: "runner",
+      driverKind: snapshot.driverKind,
       sessionId: snapshot.driverSessionId,
       identity: structuredClone(this.#input.identity),
       providerSessionId: snapshot.providerSessionId,

@@ -97,6 +97,48 @@ Live console provider-backed routes are loopback-only and reject wildcard/LAN
 binds. Browser mutations require same-origin Fetch Metadata, matching Origin,
 and JSON content; see the protocol-server tutorial for direct `curl` examples.
 
+## AWS AgentCore Harness proof of concept
+
+The AWS remote-provider path uses the same runnerd, PRP tool bridge, durable
+state, and Runner Lab UI as the local and Claude Agent providers. AWS runs the
+agent loop; Paperclip executes only the exact caller-side inline-tool catalog
+authorized for the attached run. The Harness is never given Paperclip
+credentials, MCP servers, shell, filesystem, browser, skills, or Gateway tools.
+
+Provision the development stack with an AWS CLI v2 profile, then launch the
+existing Runner Lab:
+
+```sh
+pnpm --filter @paperclipai/paperclip-runner aws-agentcore:provision -- \
+  --aws-profile <profile> \
+  --region <region> \
+  --mode development
+pnpm --filter @paperclipai/paperclip-runner aws-agentcore:probe
+pnpm --filter @paperclipai/paperclip-runner aws-agentcore:lab
+```
+
+Open `http://127.0.0.1:4184/#/chat`, select **AWS AgentCore**, and start a new
+chat. Provisioning writes only profile and nonsecret resource metadata to the
+ignored `.paperclip-local/aws-agentcore.env` file with mode `0600`; it never
+writes AWS access keys or session tokens. The default Harness model is
+`global.anthropic.claude-sonnet-4-6`, Memory retention is 90 days, and the UI's
+dollar ceiling is an estimate rather than an AWS-enforced currency limit.
+
+Use `--mode private` to provision the isolated two-subnet VPC variant. Inspect
+changes without applying them with `aws-agentcore:provision -- --dry-run ...`.
+The teardown command is intentionally interactive and deletes the named
+endpoint before the CloudFormation stack:
+
+```sh
+pnpm --filter @paperclipai/paperclip-runner aws-agentcore:destroy
+```
+
+After provisioning, the live two-turn route-level check is:
+
+```sh
+pnpm --filter @paperclipai/paperclip-runner smoke:capability:aws-agentcore
+```
+
 ## Package-owned commands
 
 | Command | Purpose |
@@ -135,6 +177,11 @@ and JSON content; see the protocol-server tutorial for direct `curl` examples.
 | `trace:live-runner` | Run the real runnerd/Codex semantic loop against the mock control plane. |
 | `demo:scenarios` | Start the Capability scenario explorer over the mock control plane on `127.0.0.1:4183`. |
 | `console:issue-thread` | Start the Paperclip-style issue thread on `127.0.0.1:4184`. |
+| `aws-agentcore:provision` | Deploy or update the AgentCore Harness proof-of-concept stack and write ignored local metadata. |
+| `aws-agentcore:probe` | Read-only qualification probe for the configured Harness, endpoint, Memory, model, and invocation role. |
+| `aws-agentcore:lab` | Source the ignored AgentCore metadata and start the existing Runner Lab on `127.0.0.1:4184`. |
+| `aws-agentcore:destroy` | Confirm, delete the pinned Harness endpoint, and tear down the proof-of-concept stack. |
+| `smoke:capability:aws-agentcore` | Send two real messages through Runner Lab routes, assert session continuity, and exercise one governed read tool. |
 | `test:scenarios` | Run the scenario index, run-artifact, parity, explorer component, and route tests. |
 | `test:browser:scenarios` | Exercise both the scenario explorer and issue-thread browser contracts. |
 | `record:capability` | Record the twelve-route screenshot acceptance set at both viewports. |

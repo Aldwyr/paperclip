@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
 import type { NativeFinalizationResult } from "@paperclipai/shared";
 import type {
-  NativeExecutionInputV1,
+  NativeExecutionInput,
   NativeSession,
   NativeSessionBackend,
   PersistedNativeSession,
@@ -26,6 +26,8 @@ import { persistActivity, publishActivity } from "../activity-log.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { documentService } from "../documents.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { issueService } from "../issues.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -90,12 +92,17 @@ type PlanSynchronization = {
   eventId: string;
   planId: string;
   providerRevision: number;
-  status: "synchronized" | "already_synchronized" | "conflict" | "invalid";
+  status: "synchronized" | "already_synchronized" | "conflict" | "invalid" | "approval_failed";
+  baseRevisionId: string | null;
+  digest: string;
   documentRevision: number | null;
   currentRevisionId: string | null;
+  confirmationId: string | null;
 };
 
 export function providerPlanMarkdown(payload: Record<string, unknown>): string {
+  const completedMarkdown = typeof payload.markdown === "string" ? payload.markdown.trim() : "";
+  if (completedMarkdown) return completedMarkdown.slice(0, 256_000);
   const explanation = typeof payload.explanation === "string" ? payload.explanation.trim() : "";
   const steps = Array.isArray(payload.steps) ? payload.steps : [];
   const lines = steps.slice(0, 256).flatMap((value) => {
@@ -110,46 +117,126 @@ export function providerPlanMarkdown(payload: Record<string, unknown>): string {
   return [explanation, lines.join("\n")].filter(Boolean).join("\n\n").slice(0, 256_000);
 }
 
-async function synchronizeCompletedProviderPlan(input: {
+export function semanticProviderPlanMarkdown(result: Record<string, unknown>): string | null {
+  const artifacts = Array.isArray(result.artifacts) ? result.artifacts : [];
+  for (const value of artifacts) {
+    const artifact = record(value);
+    if (artifact.kind !== "native_provider_plan" || typeof artifact.ref !== "string") continue;
+    const match = artifact.ref.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
+    const markdown = (match?.[1] ?? artifact.ref).trim();
+    if (markdown) return markdown.slice(0, 256_000);
+  }
+  return null;
+}
+
+export async function synchronizeCompletedProviderPlan(input: {
   db: Db;
-  execution: NativeExecutionInputV1;
+  execution: NativeExecutionInput;
   event: { sourceEventId: string; turnId?: string; eventType: string; payload: Record<string, unknown> };
 }): Promise<PlanSynchronization | null> {
   if (input.event.eventType !== "plan.updated" || input.event.payload.complete !== true) return null;
+  if (!("executionMode" in input.execution) || input.execution.executionMode !== "plan") return null;
+  const planningContext = input.execution.planningContext;
+  if (!planningContext) return null;
   const planId = typeof input.event.payload.planId === "string" ? input.event.payload.planId : "";
   const providerRevision = Number.isSafeInteger(input.event.payload.revision) ? Number(input.event.payload.revision) : 0;
   const body = providerPlanMarkdown(input.event.payload);
+  const digest = createHash("sha256").update(body).digest("hex");
   if (!planId || providerRevision < 1 || !body) {
-    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "invalid", documentRevision: null, currentRevisionId: null };
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "invalid", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: null, currentRevisionId: null, confirmationId: null };
   }
-  const provenance = `runner-plan-sync:v1 run=${input.execution.binding.runId} turn=${input.event.turnId ?? "unknown"} provider=${input.execution.provider.kind} plan=${planId} revision=${providerRevision}`;
+  const provenance = `runner-plan-sync:v2 run=${input.execution.binding.runId} turn=${input.event.turnId ?? "unknown"} provider=${input.execution.provider.kind} plan=${planId} revision=${providerRevision} digest=${digest}`;
   const existingRevision = await input.db.select({ revisionNumber: documentRevisions.revisionNumber, id: documentRevisions.id })
     .from(documentRevisions)
     .innerJoin(issueDocuments, eq(issueDocuments.documentId, documentRevisions.documentId))
     .where(and(eq(issueDocuments.issueId, input.execution.binding.issueId), eq(issueDocuments.key, "plan"), eq(documentRevisions.changeSummary, provenance)))
     .orderBy(desc(documentRevisions.revisionNumber)).limit(1).then((rows) => rows[0] ?? null);
-  if (existingRevision) {
-    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "already_synchronized", documentRevision: existingRevision.revisionNumber, currentRevisionId: existingRevision.id };
-  }
   const documents = documentService(input.db);
-  const current = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
+  let revision = existingRevision;
+  let status: PlanSynchronization["status"] = existingRevision ? "already_synchronized" : "synchronized";
+  if (!revision) {
+    const latest = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
+    if (latest?.latestRevisionId && latest.body === body) {
+      const sameRunRevision = await input.db.select({
+        id: documentRevisions.id,
+        revisionNumber: documentRevisions.revisionNumber,
+        createdByRunId: documentRevisions.createdByRunId,
+      }).from(documentRevisions)
+        .where(eq(documentRevisions.id, latest.latestRevisionId))
+        .limit(1).then((rows) => rows[0] ?? null);
+      if (sameRunRevision?.createdByRunId === input.execution.binding.runId) {
+        revision = sameRunRevision;
+        status = "already_synchronized";
+      }
+    }
+  }
   try {
-    const write = await documents.upsertIssueDocument({
-      issueId: input.execution.binding.issueId,
-      key: "plan",
-      title: "Plan",
-      format: "markdown",
-      body,
-      baseRevisionId: current?.latestRevisionId ?? null,
-      changeSummary: provenance,
-      createdByAgentId: input.execution.binding.agentId,
-      createdByRunId: input.execution.binding.runId,
-    });
-    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "synchronized", documentRevision: write.document.latestRevisionNumber, currentRevisionId: write.document.latestRevisionId };
+    if (!revision) {
+      const write = await documents.upsertIssueDocument({
+        issueId: input.execution.binding.issueId,
+        key: "plan",
+        title: "Plan",
+        format: "markdown",
+        body,
+        baseRevisionId: planningContext.baseRevisionId,
+        changeSummary: provenance,
+        createdByAgentId: input.execution.binding.agentId,
+        createdByRunId: input.execution.binding.runId,
+      });
+      revision = { revisionNumber: write.document.latestRevisionNumber, id: write.document.latestRevisionId! };
+    }
   } catch (error) {
     if (!(error instanceof HttpError) || error.status !== 409) throw error;
     const latest = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
-    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "conflict", documentRevision: latest?.latestRevisionNumber ?? null, currentRevisionId: latest?.latestRevisionId ?? null };
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "conflict", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: latest?.latestRevisionNumber ?? null, currentRevisionId: latest?.latestRevisionId ?? null, confirmationId: null };
+  }
+  const current = await documents.getIssueDocumentByKey(input.execution.binding.issueId, "plan");
+  if (!current || !revision?.id || current.latestRevisionId !== revision.id) {
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "conflict", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: current?.latestRevisionNumber ?? null, currentRevisionId: current?.latestRevisionId ?? null, confirmationId: null };
+  }
+  try {
+    const confirmation = await issueThreadInteractionService(input.db).create(
+      { id: input.execution.binding.issueId, companyId: input.execution.binding.companyId },
+      {
+        kind: "request_confirmation",
+        idempotencyKey: `runner-plan-approval:v1:${input.execution.binding.runId}:${planId}:${providerRevision}:${digest}`,
+        sourceRunId: input.execution.binding.runId,
+        title: `Review plan revision ${revision.revisionNumber}`,
+        summary: "Review the synchronized Paperclip plan.",
+        continuationPolicy: "wake_assignee_on_accept",
+        payload: {
+          version: 1,
+          prompt: `Approve plan revision ${revision.revisionNumber}?`,
+          detailsMarkdown: "The completed provider plan has been synchronized to the canonical Plan document.",
+          acceptLabel: "Approve plan",
+          rejectLabel: "Request changes",
+          rejectRequiresReason: true,
+          supersedeOnUserComment: false,
+          target: {
+            type: "issue_document",
+            issueId: input.execution.binding.issueId,
+            documentId: current.id,
+            key: "plan",
+            revisionId: revision.id,
+            revisionNumber: revision.revisionNumber,
+            label: `Plan v${revision.revisionNumber}`,
+          },
+        },
+      } as never,
+      { agentId: input.execution.binding.agentId, runId: input.execution.binding.runId },
+    );
+    const currentIssue = await input.db.select({ status: issues.status }).from(issues)
+      .where(eq(issues.id, input.execution.binding.issueId))
+      .limit(1).then((rows) => rows[0] ?? null);
+    if (currentIssue && currentIssue.status !== "review") {
+      await issueService(input.db).update(input.execution.binding.issueId, {
+        status: "review",
+        actorAgentId: input.execution.binding.agentId,
+      });
+    }
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status, baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId: confirmation.id };
+  } catch {
+    return { eventId: input.event.sourceEventId, planId, providerRevision, status: "approval_failed", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId: null };
   }
 }
 
@@ -175,12 +262,41 @@ class SessionToolAuthorityRouter {
 
 const sessionToolRouters = new Map<string, SessionToolAuthorityRouter>();
 
-function nativeSessionKey(execution: NativeExecutionInputV1): string {
+function nativeSessionKey(execution: NativeExecutionInput): string {
   return execution.session.normalizedSessionId ?? `session-${execution.binding.runId}`;
 }
 
-function nativeSessionConfigDigest(execution: NativeExecutionInputV1): string {
-  const executionLocation = execution.provider.kind === "claude_managed"
+function runnerdStateRoot(execution: NativeExecutionInput): string {
+  return resolve(
+    process.env.PAPERCLIP_RUNNER_STATE_DIR ?? resolve(tmpdir(), "paperclip-runner"),
+    createHash("sha256").update(nativeSessionKey(execution)).digest("hex"),
+  );
+}
+
+function loadRunnerdDurableBinding(execution: NativeExecutionInput): {
+  runnerInstanceId: string;
+  environmentLeaseId: string;
+} | null {
+  const statePath = resolve(runnerdStateRoot(execution), "control-plane", "mock-core-state.json");
+  if (!existsSync(statePath)) return null;
+  try {
+    const identity = record(record(JSON.parse(readFileSync(statePath, "utf8"))).identity);
+    if (
+      identity.normalizedSessionId !== nativeSessionKey(execution)
+      || typeof identity.runnerInstanceId !== "string"
+      || typeof identity.environmentLeaseId !== "string"
+    ) return null;
+    return {
+      runnerInstanceId: identity.runnerInstanceId,
+      environmentLeaseId: identity.environmentLeaseId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function nativeSessionConfigDigest(execution: NativeExecutionInput): string {
+  const executionLocation = execution.provider.kind === "claude_managed" || execution.provider.kind === "aws_agentcore"
     ? { executionKind: "remote_service", workspace: null }
     : {
         executionKind: "local_process",
@@ -194,6 +310,7 @@ function nativeSessionConfigDigest(execution: NativeExecutionInputV1): string {
     provider: execution.provider,
     driverKind: execution.session.driverKind,
     lifecyclePolicy: execution.session.lifecyclePolicy,
+    executionMode: "executionMode" in execution ? execution.executionMode : "default",
   })).digest("hex")}`;
 }
 
@@ -222,7 +339,7 @@ function persistWarmNativeCheckpoint(
 }
 
 function loadWarmNativeCheckpoint(
-  execution: NativeExecutionInputV1,
+  execution: NativeExecutionInput,
   configDigest: string,
 ): PersistedNativeSession | null {
   const path = nativeSessionCheckpointPath(nativeSessionKey(execution));
@@ -289,6 +406,7 @@ export function nativeSessionFailureSourceCode(error: unknown):
   | "provider_frame_too_large"
   | "provider_transport_failed"
   | "native_runner_process_exited"
+  | "planning_mode_unsupported"
   | "native_session_interrupted" {
   const message = error instanceof Error ? error.message : String(error);
   if (/provider_frame_too_large|stdout frame exceeded/i.test(message)) {
@@ -299,6 +417,9 @@ export function nativeSessionFailureSourceCode(error: unknown):
   }
   if (/native_runner_process_exited|runnerd exited|runner process failed/i.test(message)) {
     return "native_runner_process_exited";
+  }
+  if (/planning_mode_unsupported/i.test(message)) {
+    return "planning_mode_unsupported";
   }
   return "native_session_interrupted";
 }
@@ -495,7 +616,7 @@ export function resolveNativeCancellationStatus(input: {
 
 export async function executePaperclipNativeSession(input: {
   db: Db;
-  execution: NativeExecutionInputV1;
+  execution: NativeExecutionInput;
   runnerInstanceId: string;
   leaseOwner?: string;
   onSpawn?: (meta: {
@@ -510,7 +631,19 @@ export async function executePaperclipNativeSession(input: {
   /** Resolved adapter env; the runner transport applies a provider allowlist before spawn. */
   runnerEnvironment?: NodeJS.ProcessEnv;
 }): Promise<AdapterExecutionResult> {
-  const leaseOwner = input.leaseOwner ?? `${input.runnerInstanceId}:${randomUUID()}`;
+  const durableRunnerBinding = input.useRunnerd ? loadRunnerdDurableBinding(input.execution) : null;
+  const effectiveRunnerInstanceId = durableRunnerBinding?.runnerInstanceId ?? input.runnerInstanceId;
+  if (effectiveRunnerInstanceId !== input.runnerInstanceId) {
+    await input.db.update(heartbeatRuns).set({
+      runnerInstanceId: effectiveRunnerInstanceId,
+      updatedAt: new Date(),
+    }).where(and(
+      eq(heartbeatRuns.id, input.execution.binding.runId),
+      eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+      eq(heartbeatRuns.agentId, input.execution.binding.agentId),
+    ));
+  }
+  const leaseOwner = input.leaseOwner ?? `${effectiveRunnerInstanceId}:${randomUUID()}`;
   const leaseNow = new Date();
   const leaseExpiresAt = new Date(leaseNow.getTime() + 20 * 60_000);
   const attempt = await input.db.transaction(async (tx) => {
@@ -545,8 +678,36 @@ export async function executePaperclipNativeSession(input: {
     }).where(eq(heartbeatRuns.id, coordinator.runId));
     return coordinator.attempt + 1;
   });
-  const controlPlaneInstanceId = `${input.runnerInstanceId}:control`;
+  const controlPlaneInstanceId = `${effectiveRunnerInstanceId}:control`;
   const planSynchronizations: PlanSynchronization[] = [];
+  const recordPlanSynchronization = async (event: {
+    sourceEventId: string;
+    turnId?: string;
+    eventType: string;
+    payload: Record<string, unknown>;
+  }) => {
+    const synchronization = await synchronizeCompletedProviderPlan({
+      db: input.db,
+      execution: input.execution,
+      event,
+    });
+    if (!synchronization) return;
+    planSynchronizations.push(synchronization);
+    const activity = await persistActivity(input.db, {
+      companyId: input.execution.binding.companyId,
+      actorType: "agent",
+      actorId: input.execution.binding.agentId,
+      agentId: input.execution.binding.agentId,
+      runId: input.execution.binding.runId,
+      issueId: input.execution.binding.issueId,
+      action: "issue.document_updated",
+      entityType: "issue",
+      entityId: input.execution.binding.issueId,
+      details: { key: "plan", source: "native_plan_synchronization", synchronization },
+    });
+    publishActivity(activity.publication);
+    if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.plan.synchronization", synchronization })}\n`);
+  };
   const controlPlane = new PaperclipControlPlanePort(input.db, {
     companyId: input.execution.binding.companyId,
     issueId: input.execution.binding.issueId,
@@ -554,20 +715,17 @@ export async function executePaperclipNativeSession(input: {
     agentId: input.execution.binding.agentId,
     completionContractId: input.execution.completionContract.id,
     completionContractSha256: input.execution.completionContract.sha256,
-    sourceInstanceId: input.runnerInstanceId,
+    sourceInstanceId: effectiveRunnerInstanceId,
     controlPlaneSourceInstanceId: controlPlaneInstanceId,
   }, {
     onCommittedEvent: async (event) => {
       if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`);
-      const synchronization = await synchronizeCompletedProviderPlan({
-        db: input.db,
-        execution: input.execution,
-        event: event as { sourceEventId: string; turnId?: string; eventType: string; payload: Record<string, unknown> },
+      await recordPlanSynchronization(event as {
+        sourceEventId: string;
+        turnId?: string;
+        eventType: string;
+        payload: Record<string, unknown>;
       });
-      if (synchronization) {
-        planSynchronizations.push(synchronization);
-        if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.plan.synchronization", synchronization })}\n`);
-      }
     },
   });
   let native: Awaited<ReturnType<typeof executeNativeSession>>;
@@ -592,7 +750,11 @@ export async function executePaperclipNativeSession(input: {
   }
   try {
     const runnerdBackend = input.useRunnerd && input.backend === undefined
-      ? createRunnerdBackend(input)
+      ? createRunnerdBackend({
+          ...input,
+          runnerInstanceId: effectiveRunnerInstanceId,
+          durableEnvironmentLeaseId: durableRunnerBinding?.environmentLeaseId,
+        })
       : null;
     native = await executeNativeSession({
       input: input.execution,
@@ -603,9 +765,10 @@ export async function executePaperclipNativeSession(input: {
           onSpawn: input.onSpawn,
           environment: input.runnerEnvironment ?? process.env,
           opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
+          acpxRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "acpx"),
         }),
       controlPlane,
-      runnerInstanceId: input.runnerInstanceId,
+      runnerInstanceId: effectiveRunnerInstanceId,
       controlPlaneInstanceId,
       existingSession: existingWarmSession,
       persistedSession: persistedWarmSession,
@@ -698,6 +861,29 @@ export async function executePaperclipNativeSession(input: {
     });
     throw error;
   }
+  if (
+    planSynchronizations.length === 0
+    && "executionMode" in input.execution
+    && input.execution.executionMode === "plan"
+  ) {
+    const markdown = semanticProviderPlanMarkdown(native.result as unknown as Record<string, unknown>);
+    if (markdown) {
+      const digest = createHash("sha256").update(markdown).digest("hex");
+      await recordPlanSynchronization({
+        sourceEventId: `semantic-plan:${input.execution.binding.runId}:${digest}`,
+        ...(native.turnId ? { turnId: native.turnId } : {}),
+        eventType: "plan.updated",
+        payload: {
+          schema: "paperclip.plan.updated.v1",
+          planId: `semantic:${native.turnId ?? input.execution.binding.runId}`,
+          revision: 1,
+          complete: true,
+          markdown,
+          source: "semantic_result_artifact",
+        },
+      });
+    }
+  }
   await input.db.update(nativeRunFinalizations).set({
     leaseOwner: null,
     leaseExpiresAt: null,
@@ -715,7 +901,7 @@ export async function executePaperclipNativeSession(input: {
     result: native.result as unknown as Record<string, unknown>,
     terminal: native.terminal,
     turnId: native.turnId,
-    sourceInstanceId: input.runnerInstanceId,
+    sourceInstanceId: effectiveRunnerInstanceId,
     normalizedSessionId: native.normalizedSessionId,
     providerSessionId: native.providerSessionId,
     driverKind: native.driverKind,
@@ -746,8 +932,16 @@ export async function executePaperclipNativeSession(input: {
     sessionDisplayId: native.providerSessionId ?? native.normalizedSessionId,
     provider: input.execution.provider.kind === "claude_managed"
       ? "anthropic"
+      : input.execution.provider.kind === "aws_agentcore"
+      ? "amazon-bedrock"
       : input.execution.provider.kind === "opencode"
       ? input.execution.provider.model?.split("/", 1)[0] ?? "opencode"
+      : input.execution.provider.kind === "acpx"
+      ? input.execution.provider.agent === "pi"
+        ? "openrouter"
+        : input.execution.provider.agent === "claude"
+          ? "anthropic"
+          : "openai"
       : "openai",
     model: input.execution.provider.model,
     usage: normalizeNativeUsage(native.usage),
@@ -783,8 +977,9 @@ function normalizeNativeUsage(usage: Record<string, unknown> | null) {
 
 function createRunnerdBackend(input: {
   db: Db;
-  execution: NativeExecutionInputV1;
+  execution: NativeExecutionInput;
   runnerInstanceId: string;
+  durableEnvironmentLeaseId?: string;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   runnerEnvironment?: NodeJS.ProcessEnv;
 }): NativeSessionBackend {
@@ -793,16 +988,14 @@ function createRunnerdBackend(input: {
     issueId: input.execution.binding.issueId,
     runId: input.execution.binding.runId,
     agentId: input.execution.binding.agentId,
+    workMode: input.execution.task.workMode,
   });
   const sessionId = nativeSessionKey(input.execution);
   const existingRouter = sessionToolRouters.get(sessionId);
   const authorityRouter = existingRouter ?? new SessionToolAuthorityRouter(authority);
   authorityRouter.bind(authority);
   sessionToolRouters.set(sessionId, authorityRouter);
-  const root = resolve(
-    process.env.PAPERCLIP_RUNNER_STATE_DIR ?? resolve(tmpdir(), "paperclip-runner"),
-    createHash("sha256").update(sessionId).digest("hex"),
-  );
+  const root = runnerdStateRoot(input.execution);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   return createNativeSessionBackend(input.execution, {
     runnerInstanceId: input.runnerInstanceId,
@@ -812,11 +1005,35 @@ function createRunnerdBackend(input: {
     environment: input.runnerEnvironment ?? process.env,
     opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
     codexTransportFactory: () => createRunnerdCodexTransport({
-      provider: input.execution.provider.kind,
+      provider: input.execution.provider.kind === "codex"
+        ? "codex"
+        : input.execution.provider.kind === "opencode"
+          ? "opencode"
+          : input.execution.provider.kind === "claude_managed"
+            ? "claude_managed"
+            : input.execution.provider.kind === "aws_agentcore"
+              ? "aws_agentcore"
+              : input.execution.provider.kind === "acpx"
+                ? "acpx"
+                : undefined,
+      ...(input.execution.provider.kind === "acpx" ? {
+        acpxAgent: input.execution.provider.agent,
+        acpxRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "acpx"),
+      } : {}),
       ...(input.execution.provider.kind === "claude_managed" ? {
         managedProfile: {
           ...input.execution.provider.managedProfile,
           maxSessionListCostUsd: input.execution.provider.maxSessionListCostUsd,
+          model: input.execution.provider.model,
+        },
+      } : {}),
+      ...(input.execution.provider.kind === "aws_agentcore" ? {
+        agentCoreProfile: {
+          ...input.execution.provider.agentCoreProfile,
+          maxEstimatedSessionCostUsd: input.execution.provider.maxEstimatedSessionCostUsd,
+          maxIterations: input.execution.provider.invocationLimits.maxIterations,
+          maxOutputTokens: input.execution.provider.invocationLimits.maxOutputTokens,
+          timeoutSeconds: input.execution.provider.invocationLimits.timeoutSeconds,
           model: input.execution.provider.model,
         },
       } : {}),
@@ -826,7 +1043,7 @@ function createRunnerdBackend(input: {
       resumeDynamicTools: authorityRouter.definitions(),
       prpIdentity: {
         runnerInstanceId: input.runnerInstanceId,
-        environmentLeaseId: input.execution.binding.executionWorkspaceId,
+        environmentLeaseId: input.durableEnvironmentLeaseId ?? input.execution.binding.executionWorkspaceId,
         runId: input.execution.binding.runId,
         normalizedSessionId: input.execution.session.normalizedSessionId ?? `session-${input.execution.binding.runId}`,
         turnId: `turn-${input.execution.binding.runId}`,

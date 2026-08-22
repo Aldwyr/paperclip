@@ -4,7 +4,16 @@ import type {
   ServerAdapterModule,
 } from "./types.js";
 import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
+import {
+  AcpxRuntimeHost,
+  inspectQualifiedAcpxInstallation,
+  resolveQualifiedAcpxProfile,
+  type QualifiedAcpxAgent,
+} from "../vendor/paperclip-runner/index.js";
 import { parseAdapterModelsEnv } from "../services/adapter-models-env.js";
 import { stampClaudeAgentIdHeader } from "./claude-agent-id-header.js";
 import {
@@ -188,6 +197,113 @@ async function testPaperclipRunnerOpenCodeEnvironment(
   }
 }
 
+async function testPaperclipRunnerAcpxEnvironment(
+  context: Parameters<typeof codexTestEnvironment>[0],
+) {
+  const testedAt = new Date().toISOString();
+  const agent = context.config.acpxAgent;
+  const model = typeof context.config.model === "string" ? context.config.model.trim() : "";
+  if (context.config.permissionPolicy !== undefined && context.config.permissionPolicy !== "interactive") {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_permission_policy_invalid", level: "error" as const, message: "ACPX v1 requires permissionPolicy=interactive." }],
+    };
+  }
+  if (agent !== "pi" && agent !== "claude" && agent !== "codex") {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_agent_invalid", level: "error" as const, message: "ACPX agent must be Pi, Claude, or Codex." }],
+    };
+  }
+  let profile;
+  try {
+    profile = resolveQualifiedAcpxProfile(agent, model);
+  } catch (error) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_model_unqualified", level: "error" as const, message: error instanceof Error ? error.message : "ACPX model is not qualified." }],
+    };
+  }
+  const nodeParts = process.versions.node.split(".").map(Number);
+  if ((nodeParts[0] ?? 0) < 22 || ((nodeParts[0] ?? 0) === 22 && (nodeParts[1] ?? 0) < 13)) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_node_too_old", level: "error" as const, message: `ACPX 0.13.1 requires Node 22.13 or newer; found ${process.versions.node}.` }],
+    };
+  }
+  const configuredEnv = context.config.env && typeof context.config.env === "object"
+    ? context.config.env as Record<string, unknown>
+    : {};
+  const environment = { ...process.env };
+  for (const [key, value] of Object.entries(configuredEnv)) if (typeof value === "string") environment[key] = value;
+  const credentialReady = agent === "pi"
+    ? Boolean(environment.OPENROUTER_API_KEY)
+    : agent === "claude"
+      ? Boolean(environment.ANTHROPIC_API_KEY || environment.CLAUDE_CODE_OAUTH_TOKEN)
+      : Boolean(environment.OPENAI_API_KEY || environment.CODEX_API_KEY);
+  if (!credentialReady) {
+    const required = agent === "pi"
+      ? "OPENROUTER_API_KEY"
+      : agent === "claude"
+        ? "ANTHROPIC_API_KEY or the managed Claude credential"
+        : "the managed Codex credential or OPENAI_API_KEY";
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_auth_missing", level: "error" as const, message: `ACPX ${agent} requires ${required}.` }],
+    };
+  }
+  let probeRoot: string | null = null;
+  try {
+    const installation = await inspectQualifiedAcpxInstallation(agent as QualifiedAcpxAgent, model);
+    probeRoot = await mkdtemp(join(tmpdir(), "paperclip-acpx-probe-"));
+    const host = await AcpxRuntimeHost.open({
+      runtimeDirectory: probeRoot,
+      normalizedSessionId: "environment-probe",
+      workingDirectory: probeRoot,
+      agent: agent as QualifiedAcpxAgent,
+      model,
+      environment,
+      dynamicTools: [],
+      dynamicToolHandler: async () => { throw new Error("environment probe exposes no semantic tools"); },
+    });
+    const identity = host.identity();
+    await host.close({ reason: "environment probe complete", discardPersistentState: true });
+    return {
+      adapterType: "paperclip_runner",
+      status: "pass" as const,
+      testedAt,
+      checks: [{
+        code: "acpx_profile_qualified",
+        level: "info" as const,
+        message: `Verified ACPX ${profile.acpxVersion}, ${profile.agentServerPackage}@${profile.agentServerVersion}, exact model ${identity.effectiveModel}, semantic bridge startup, and clean shutdown (digest ${installation.commandDigest}).`,
+      }, {
+        code: "acpx_auth_ready",
+        level: "info" as const,
+        message: `Credential readiness was verified for ACPX ${agent}; no credential value was retained.`,
+      }],
+    };
+  } catch (error) {
+    return {
+      adapterType: "paperclip_runner",
+      status: "fail" as const,
+      testedAt,
+      checks: [{ code: "acpx_handshake_failed", level: "error" as const, message: error instanceof Error ? error.message : "ACPX handshake failed." }],
+    };
+  } finally {
+    if (probeRoot) await rm(probeRoot, { recursive: true, force: true });
+  }
+}
+
 async function testPaperclipRunnerClaudeManagedEnvironment(
   context: Parameters<typeof codexTestEnvironment>[0],
 ) {
@@ -334,6 +450,68 @@ async function testPaperclipRunnerClaudeManagedEnvironment(
     };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function testPaperclipRunnerAwsAgentCoreEnvironment(
+  context: Parameters<typeof codexTestEnvironment>[0],
+) {
+  const testedAt = new Date().toISOString();
+  const required = [
+    ["agentCoreProfileId", "AgentCore profile ID"], ["awsRegion", "AWS region"],
+    ["harnessId", "Harness ID"], ["harnessVersion", "Harness version"],
+    ["endpointQualifier", "endpoint qualifier"], ["memoryId", "Memory ID"],
+    ["invocationRoleArn", "invocation role ARN"], ["model", "Bedrock model"],
+  ] as const;
+  const missing = required.filter(([key]) => typeof context.config[key] !== "string" || String(context.config[key]).trim().length === 0);
+  if (missing.length > 0 || context.config.agentCoreRetentionAcknowledged !== true) {
+    return {
+      adapterType: "paperclip_runner", status: "fail" as const, testedAt,
+      checks: [{ code: "aws_agentcore_profile_incomplete", level: "error" as const,
+        message: missing.length > 0
+          ? `AWS AgentCore profile is missing: ${missing.map(([, label]) => label).join(", ")}.`
+          : "AWS AgentCore requires an administrator acknowledgement of 90-day Memory retention." }],
+    };
+  }
+  const cap = Number(context.config.maxEstimatedSessionCostUsd);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    return { adapterType: "paperclip_runner", status: "fail" as const, testedAt,
+      checks: [{ code: "aws_agentcore_estimated_cap_invalid", level: "error" as const, message: "AWS AgentCore requires a positive estimated session ceiling." }] };
+  }
+  const sourceEnvironment = context.config.env && typeof context.config.env === "object"
+    ? { ...process.env, ...(context.config.env as Record<string, string>) }
+    : process.env;
+  const region = String(context.config.awsRegion);
+  try {
+    const version = await execFileAsync("aws", ["--version"], { timeout: 5_000, env: sourceEnvironment });
+    if (!`${version.stdout}${version.stderr}`.includes("aws-cli/2.")) throw new Error("AWS CLI v2 is required");
+    const assumed = await execFileAsync("aws", ["--region", region, "sts", "assume-role", "--role-arn", String(context.config.invocationRoleArn), "--role-session-name", "paperclip-environment-probe", "--duration-seconds", "900", "--output", "json"], { timeout: 15_000, env: sourceEnvironment });
+    const credentials = (JSON.parse(assumed.stdout) as { Credentials?: { AccessKeyId?: string; SecretAccessKey?: string; SessionToken?: string } }).Credentials;
+    if (!credentials?.AccessKeyId || !credentials.SecretAccessKey || !credentials.SessionToken) throw new Error("STS omitted temporary credentials");
+    const env = {
+      ...sourceEnvironment,
+      AWS_ACCESS_KEY_ID: credentials.AccessKeyId,
+      AWS_SECRET_ACCESS_KEY: credentials.SecretAccessKey,
+      AWS_SESSION_TOKEN: credentials.SessionToken,
+      AWS_REGION: region,
+      AWS_DEFAULT_REGION: region,
+      AWS_PROFILE: undefined,
+    };
+    await Promise.all([
+      execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-harness", "--harness-id", String(context.config.harnessId), "--harness-version", String(context.config.harnessVersion)], { timeout: 15_000, env }),
+      execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-harness-endpoint", "--harness-id", String(context.config.harnessId), "--endpoint-name", String(context.config.endpointQualifier)], { timeout: 15_000, env }),
+      execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-memory", "--memory-id", String(context.config.memoryId), "--view", "full"], { timeout: 15_000, env }),
+    ]);
+    return {
+      adapterType: "paperclip_runner", status: "warn" as const, testedAt,
+      checks: [
+        { code: "aws_agentcore_profile_qualified", level: "info" as const, message: `Verified pinned Harness ${String(context.config.harnessId)} version ${String(context.config.harnessVersion)} and Memory ${String(context.config.memoryId)} without creating a paid session.` },
+        { code: "aws_agentcore_retention_notice", level: "warn" as const, message: "AgentCore Memory retains short-term events for 90 days; the session cost shown by Paperclip is an estimate, not an AWS currency hard stop." },
+      ],
+    };
+  } catch {
+    return { adapterType: "paperclip_runner", status: "fail" as const, testedAt,
+      checks: [{ code: "aws_agentcore_probe_failed", level: "error" as const, message: "AWS AgentCore read-only qualification failed. Verify AWS CLI v2, the source profile, sts:AssumeRole, region, Harness endpoint, and Memory identifiers." }] };
   }
 }
 
@@ -553,18 +731,32 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       timedOut: false,
       errorMessage: message,
       errorCode: "paperclip_runner_coordinator_required",
-      provider: "codex",
+      provider: ctx.config.provider === "acpx"
+        ? "acpx"
+        : ctx.config.provider === "opencode"
+          ? "opencode"
+          : ctx.config.provider === "claude_managed"
+            ? "anthropic"
+            : ctx.config.provider === "aws_agentcore"
+              ? "amazon-bedrock"
+              : "codex",
       summary: message,
     };
   },
   async testEnvironment(context) {
     const provider = context.config.provider === "opencode"
       ? "opencode"
-      : context.config.provider === "claude_managed" ? "claude_managed" : "codex";
+      : context.config.provider === "claude_managed" ? "claude_managed"
+      : context.config.provider === "aws_agentcore" ? "aws_agentcore"
+      : context.config.provider === "acpx" ? "acpx" : "codex";
     const result = provider === "claude_managed"
       ? await testPaperclipRunnerClaudeManagedEnvironment(context)
+      : provider === "aws_agentcore"
+      ? await testPaperclipRunnerAwsAgentCoreEnvironment(context)
       : provider === "opencode"
       ? await testPaperclipRunnerOpenCodeEnvironment(context)
+      : provider === "acpx"
+      ? await testPaperclipRunnerAcpxEnvironment(context)
       : await codexTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
   },
@@ -575,6 +767,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
     ...codexModels,
     { id: "openrouter/deepseek/deepseek-v4-flash-0731", label: "OpenRouter · DeepSeek V4 Flash 0731" },
     { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+    { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   modelProfiles: codexModelProfiles,
   listModels: listCodexModels,
@@ -583,12 +776,12 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
-  getRuntimeCommandSpec: (config) => config.provider === "claude_managed"
+  getRuntimeCommandSpec: (config) => config.provider === "claude_managed" || config.provider === "aws_agentcore" || config.provider === "acpx"
     ? { command: "paperclip-runnerd", detectCommand: null, installCommand: null }
     : config.provider === "opencode"
     ? buildNpmRuntimeCommandSpec(config, "opencode", "opencode-ai@1.18.17")
-    : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex"),
-  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns Codex, OpenCode, or a remote Claude Agent through the native Paperclip runner and authenticated PRP control-plane connection. Claude Agent credentials remain in runnerd; Anthropic never receives a Paperclip credential or endpoint.\n`,
+    : buildNpmRuntimeCommandSpec(config, "codex", "@openai/codex@0.148.0"),
+  agentConfigurationDoc: `# Paperclip Runner\n\nAdapter: paperclip_runner\n\nRuns native Codex, OpenCode, Claude Managed, AWS AgentCore, or a qualified Pi/Claude/Codex ACP agent through ACPX 0.13.1 and authenticated PRP. Provider processes never receive a Paperclip credential or unrestricted server environment.\n`,
   getConfigSchema: () => ({
     fields: [{
       key: "provider",
@@ -599,8 +792,29 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         { value: "codex", label: "Codex" },
         { value: "opencode", label: "OpenCode 1.18.17" },
         { value: "claude_managed", label: "Claude Agent" },
+        { value: "aws_agentcore", label: "AWS AgentCore" },
+        { value: "acpx", label: "ACPX" },
       ],
-      hint: "Select a local harness or an Anthropic cloud-managed Claude Agent.",
+      hint: "Select a local harness, ACPX agent, Anthropic Claude Agent, or AWS AgentCore Harness.",
+    }, {
+      key: "acpxAgent",
+      label: "ACP agent",
+      type: "select",
+      default: "pi",
+      options: [
+        { value: "pi", label: "Pi via ACPX" },
+        { value: "claude", label: "Claude via ACPX" },
+        { value: "codex", label: "Codex via ACPX (control)" },
+      ],
+      hint: "Qualified ACP server profile. Configuration is immutable after session creation.",
+      meta: { provider: "acpx" },
+    }, {
+      key: "permissionPolicy",
+      label: "Permission policy",
+      type: "text",
+      default: "interactive",
+      hint: "ACPX v1 supports the interactive policy only.",
+      meta: { provider: "acpx", readOnly: true },
     }, {
       key: "lifecycleMode",
       label: "Runner lifecycle",
@@ -649,6 +863,51 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
     }, {
       key: "managedAgentsRetentionAcknowledged", label: "Acknowledge beta retention", type: "toggle", default: false,
       hint: "Managed Agents is stateful and is not eligible for ZDR or HIPAA modes.", meta: { provider: "claude_managed" },
+    }, {
+      key: "agentCoreProfileId", label: "AgentCore profile", type: "text", required: true,
+      hint: "Company-scoped provisioned profile identifier.", meta: { provider: "aws_agentcore" },
+    }, {
+      key: "awsRegion", label: "AWS region", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "awsAccountId", label: "AWS account ID", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "harnessArn", label: "Harness ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "harnessId", label: "Harness ID", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "harnessVersion", label: "Pinned Harness version", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "endpointQualifier", label: "Harness endpoint", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "endpointArn", label: "Harness endpoint ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "agentRuntimeArn", label: "Underlying Runtime ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "memoryId", label: "AgentCore Memory ID", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "memoryArn", label: "AgentCore Memory ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "invocationRoleArn", label: "Invocation role ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "maxEstimatedSessionCostUsd", label: "Estimated session ceiling (USD)", type: "number", default: 1,
+      hint: "Paperclip estimate; AWS has no per-session currency hard stop.", meta: { provider: "aws_agentcore" },
+    }, {
+      key: "qualificationRevision", label: "Qualification revision", type: "text", default: "aws-agentcore-harness-v1",
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "agentCoreRetentionAcknowledged", label: "Acknowledge 90-day Memory retention", type: "toggle", default: false,
+      hint: "AgentCore short-term Memory retains events for 90 days.", meta: { provider: "aws_agentcore" },
     }],
   }),
   loginCapability: codexLoginCapability,

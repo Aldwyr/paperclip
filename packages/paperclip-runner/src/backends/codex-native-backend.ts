@@ -1,5 +1,5 @@
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
-import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
+import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
@@ -10,7 +10,7 @@ import { HarnessDriverBackend } from "./harness-driver-backend.js";
  * closed native input; construction of the concrete Codex driver stays here.
  */
 export function createCodexNativeSessionBackend(
-  input: NativeExecutionInputV1,
+  input: NativeExecutionInput,
   options: {
     runnerInstanceId?: string;
     onSpawn?: (meta: {
@@ -30,12 +30,19 @@ export function createCodexNativeSessionBackend(
   } = {},
 ): NativeSessionBackend {
   return new HarnessDriverBackend(new CodexAppServerDriver({
+    requestedCollaborationMode: "executionMode" in input ? input.executionMode : "default",
     taskEnvelope: createCodexTaskEnvelope({
       objective: input.completionContract.contract.objective,
       contractRevision: input.completionContract.contract.revision,
       criteria: input.completionContract.contract.criteria,
       constraints: [
         "Work only inside the supplied working directory.",
+        ...("executionMode" in input && input.executionMode === "plan" ? [
+          "Use native plan collaboration mode and do not modify workspace files.",
+          "Treat the supplied Paperclip planning context as the canonical pinned base revision.",
+          "Complete one structured provider plan item; Paperclip will synchronize it after completion.",
+          "Keep the final response to a short synchronization summary instead of repeating the full plan.",
+        ] : []),
         "Do not discover or invoke skills.",
         "Do not call a control-plane API.",
         "Return one semantic completion result.",

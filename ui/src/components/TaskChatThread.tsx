@@ -28,6 +28,8 @@ import type {
   TaskChatInteractionItem,
   TaskChatItem,
   TaskChatMessageItem,
+  TaskChatRuntimeRequestDecision,
+  TaskChatRuntimeRequestItem,
   TaskChatTurnItem,
 } from "@/components/task-chat/task-chat-model";
 import { TaskChatInteractionCard } from "@/components/task-chat/TaskChatInteractionCard";
@@ -53,6 +55,13 @@ import {
   TaskChatBlockerLinks,
   TaskChatLiveWorkLinks,
 } from "@/components/task-chat/TaskChatBlockerLinks";
+import { buildDocumentAnnotationHash } from "@/lib/document-annotation-hash";
+import {
+  documentDisplayTitle,
+  selectAgentArtifactAttachments,
+  workProductHref,
+} from "@/lib/issue-artifacts";
+import { heartbeatsApi, type RuntimeRequestResolution } from "@/api/heartbeats";
 
 function toMs(value: Date | string | null | undefined): number {
   if (!value) return 0;
@@ -62,6 +71,23 @@ function toMs(value: Date | string | null | undefined): number {
 
 function normalizedMessageText(value: string | null | undefined): string {
   return (value ?? "").trim().replace(/\s+/g, " ");
+}
+
+function safeResourceHref(value: string | null | undefined): string | null {
+  if (!value) return null;
+  if (value.startsWith("/") || value.startsWith("#")) return value;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatResourceBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function isRunnerResponseComment(params: {
@@ -114,6 +140,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const {
     comments,
     interactions,
+    documents = [],
+    workProducts = [],
+    attachments = [],
     timelineEvents,
     issueId = null,
     agentMap,
@@ -392,6 +421,65 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         item: { id, kind: "interaction", interaction },
       });
     }
+    for (const document of documents) {
+      if (document.key === "plan") continue;
+      const id = `resource:document:${document.id}`;
+      entries.push({
+        ms: toMs(document.updatedAt),
+        order: 3,
+        id,
+        item: {
+          id,
+          kind: "protocol",
+          surface: "resource",
+          resourceKind: "document",
+          title: documentDisplayTitle(document),
+          subtitle: `Document · rev ${document.latestRevisionNumber}`,
+          href: buildDocumentAnnotationHash({ documentKey: document.key, threadId: null, commentId: null }),
+          timestamp: new Date(document.updatedAt).toISOString(),
+          document,
+        },
+      });
+    }
+    for (const workProduct of workProducts) {
+      const id = `resource:deliverable:${workProduct.id}`;
+      const href = workProductHref(workProduct);
+      entries.push({
+        ms: toMs(workProduct.createdAt),
+        order: 3,
+        id,
+        item: {
+          id,
+          kind: "protocol",
+          surface: "resource",
+          resourceKind: "deliverable",
+          title: workProduct.title,
+          subtitle: [workProduct.type.replaceAll("_", " "), workProduct.status, workProduct.reviewState !== "none" ? workProduct.reviewState : null].filter(Boolean).join(" · "),
+          href: safeResourceHref(href),
+          timestamp: new Date(workProduct.createdAt).toISOString(),
+          workProduct,
+        },
+      });
+    }
+    for (const attachment of selectAgentArtifactAttachments(attachments, workProducts)) {
+      const id = `resource:attachment:${attachment.id}`;
+      entries.push({
+        ms: toMs(attachment.createdAt),
+        order: 3,
+        id,
+        item: {
+          id,
+          kind: "protocol",
+          surface: "resource",
+          resourceKind: "attachment",
+          title: attachment.originalFilename ?? "Agent attachment",
+          subtitle: `${attachment.contentType} · ${formatResourceBytes(attachment.byteSize)}`,
+          href: safeResourceHref(attachment.openPath ?? attachment.contentPath),
+          timestamp: new Date(attachment.createdAt).toISOString(),
+          attachment,
+        },
+      });
+    }
     if (planDocument) {
       const revision = planDocument.latestRevisionNumber ?? 1;
       const id = `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`;
@@ -411,7 +499,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
-  }, [comments, commentItems, interactions, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText]);
+  }, [comments, commentItems, interactions, documents, workProducts, attachments, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText]);
 
   // Boolean gate (stable across the host's per-render brief objects) so the
   // heavy assembly memo doesn't recompute on every parent render.
@@ -655,6 +743,45 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tailRunId, tailContentKey, tailStreaming, tailAgentName],
   );
+  const pendingRuntimeRequest = tailItems.find(
+    (item): item is TaskChatRuntimeRequestItem => item.kind === "protocol"
+      && item.surface === "runtime_request"
+      && item.status === "pending",
+  ) ?? null;
+  const handleRuntimeRequestDecision = useCallback(async (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => {
+    if (!paperclipRunnerTail || item.runId !== tailRunId || !item.turnId || !item.requestKind) {
+      throw new Error("This runtime request is no longer attached to the active Paperclip runner turn.");
+    }
+    let resolution: RuntimeRequestResolution;
+    if (decision.action !== "submit") {
+      resolution = decision;
+    } else if (item.requestKind === "user_input") {
+      resolution = {
+        action: "submit",
+        answers: Object.fromEntries(
+          Object.entries(decision.values).map(([field, value]) => [field, { answers: [value] }]),
+        ),
+      };
+    } else if (item.requestKind === "elicitation") {
+      resolution = { action: "submit", content: decision.values };
+    } else {
+      throw new Error("This runtime permission does not accept submitted form data.");
+    }
+    await heartbeatsApi.resolveRuntimeRequest({
+      runId: item.runId,
+      requestId: item.requestId,
+      turnId: item.turnId,
+      requestKind: item.requestKind,
+      resolution,
+    });
+  }, [paperclipRunnerTail, tailRunId]);
+  const runtimeComposerDisabledReason = composerDisabledReason
+    ?? (paperclipRunnerTail && pendingRuntimeRequest
+      ? "Resolve the runtime request before sending another message."
+      : undefined);
   const assigneeUsesPaperclipRunner = Boolean(
     issueAssigneeAgentId && agentMap?.get(issueAssigneeAgentId)?.adapterType === "paperclip_runner",
   );
@@ -808,6 +935,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           <TaskChatThreadView
             items={items}
             header={threadHeaderWithBlockers}
+            onRuntimeRequestDecision={handleRuntimeRequestDecision}
             renderInteraction={renderInteraction}
             renderBrief={issueBrief ? () => <TaskChatDescriptionBubble brief={issueBrief} /> : undefined}
             renderMessageActions={renderMessageActions}
@@ -826,6 +954,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         startedAtMs={tailStartedAtMs}
                         finishedAtMs={tailFinishedAtMs}
                         toolSummary={tailToolSummary}
+                        onRuntimeRequestDecision={handleRuntimeRequestDecision}
                       />
                     ) : (
                       <>
@@ -882,8 +1011,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             onAdd={handleThreadAdd}
             workMode={issueWorkMode}
             onWorkModeChange={onWorkModeChange}
-            disabled={Boolean(composerDisabledReason)}
-            disabledReason={composerDisabledReason}
+            disabled={Boolean(runtimeComposerDisabledReason)}
+            disabledReason={runtimeComposerDisabledReason}
             onAttachImage={onAttachImage}
             onImageUpload={imageUploadHandler}
             mentions={mentions}

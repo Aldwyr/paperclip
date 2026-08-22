@@ -86,6 +86,31 @@ describe("HarnessDriverBackend", () => {
     for await (const event of session.events()) events.push(event);
     expect(events).toHaveLength(2);
     await expect(session.result()).resolves.toMatchObject({ result, turnId: "turn-1", terminal: { runTerminalState: "succeeded" } });
-    await expect(session.snapshot()).resolves.toMatchObject({ sessionId: "driver-1", providerSessionId: "provider-1" });
+    await expect(session.snapshot()).resolves.toMatchObject({
+      driverKind: "fake",
+      sessionId: "driver-1",
+      providerSessionId: "provider-1",
+    });
+  });
+
+  it("passes the persisted harness driver kind through recovery", async () => {
+    let recoveredDriverKind: string | null = null;
+    const recoveryDriver: HarnessDriver = {
+      ...driver,
+      async recoverSession(snapshot) {
+        recoveredDriverKind = snapshot.driverKind;
+        return { recovered: true, session: new FakeHarnessSession() };
+      },
+    };
+    const backend = new HarnessDriverBackend(recoveryDriver);
+    const recovery = await backend.recoverSession({
+      backendKind: "runner",
+      driverKind: "fake",
+      sessionId: "driver-1",
+      providerSessionId: "provider-1",
+      identity: { runId: "run-2", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+    });
+    expect(recovery.recovered).toBe(true);
+    expect(recoveredDriverKind).toBe("fake");
   });
 });

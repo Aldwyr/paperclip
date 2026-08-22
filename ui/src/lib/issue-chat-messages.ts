@@ -67,7 +67,12 @@ export interface IssueChatTranscriptEntry {
     | "system"
     | "stdout"
     | "diff"
-    | "provider_activity";
+    | "provider_activity"
+    | "workspace_change"
+    | "workspace_file_reference"
+    | "runtime_request"
+    | "run_result"
+    | "run_terminal";
   ts: string;
   text?: string;
   delta?: boolean;
@@ -88,7 +93,7 @@ export interface IssueChatTranscriptEntry {
   changeType?: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
   family?: "plan" | "tool_execution" | "research" | "delegation" | "model_identity" | "context" | "artifact" | "review" | "hook" | "memory" | "safety" | "terminal" | "wait" | "provider_notice";
   eventType?: string;
-  status?: "running" | "completed" | "failed" | "interrupted" | "informational";
+  status?: "running" | "completed" | "failed" | "interrupted" | "informational" | "pending" | "resolved" | "expired" | "cancelled";
   title?: string;
   summary?: string;
   payload?: Record<string, unknown>;
@@ -394,7 +399,15 @@ function isIssueChatRenderableTranscriptEntry(entry: IssueChatTranscriptEntry) {
   return entry.kind !== "init"
     && entry.kind !== "stderr"
     && entry.kind !== "stdout"
-    && entry.kind !== "system";
+    && entry.kind !== "system"
+    // The classic task interface intentionally remains unchanged. Structured
+    // PRP surfaces are rendered by TaskChatThread and remain available in run
+    // details when the classic interface is enabled.
+    && entry.kind !== "workspace_change"
+    && entry.kind !== "workspace_file_reference"
+    && entry.kind !== "runtime_request"
+    && entry.kind !== "run_result"
+    && entry.kind !== "run_terminal";
 }
 
 function compactIssueChatTranscript(

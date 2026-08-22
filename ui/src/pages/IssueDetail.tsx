@@ -221,6 +221,7 @@ import {
   type IssueRecoveryAction,
   type IssueAttachment,
   type IssueComment,
+  type IssueDocumentSummary,
   type IssueWorkProduct,
   type IssueWorkMode,
   type IssueThreadInteraction,
@@ -979,6 +980,9 @@ type IssueDetailChatTabProps = {
   commentsInitialLoading?: boolean;
   locallyQueuedCommentRunIds: ReadonlyMap<string, string>;
   interactions: IssueThreadInteraction[];
+  documents: IssueDocumentSummary[];
+  workProducts: IssueWorkProduct[];
+  attachments: IssueAttachment[];
   hasOlderComments: boolean;
   commentsLoadingOlder: boolean;
   onLoadOlderComments: () => void;
@@ -1081,6 +1085,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   commentsInitialLoading = false,
   locallyQueuedCommentRunIds,
   interactions,
+  documents,
+  workProducts,
+  attachments,
   hasOlderComments,
   commentsLoadingOlder,
   onLoadOlderComments,
@@ -1326,6 +1333,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         issueBrief={issueBrief}
         comments={commentsWithRunMeta}
         interactions={interactions}
+        documents={documents}
+        workProducts={workProducts}
+        attachments={attachments}
         feedbackVotes={feedbackVotes}
         feedbackDataSharingPreference={feedbackDataSharingPreference}
         feedbackTermsUrl={feedbackTermsUrl}
@@ -2779,13 +2789,11 @@ export function IssueDetail() {
       };
     },
     onSuccess: async (comment, _variables, context) => {
-      if (context?.optimisticCommentId) {
+      if (context?.optimisticCommentId && cancelledQueuedOptimisticCommentIdsRef.current.has(context.optimisticCommentId)) {
+        cancelledQueuedOptimisticCommentIdsRef.current.delete(context.optimisticCommentId);
         setOptimisticComments((current) =>
           current.filter((entry) => entry.clientId !== context.optimisticCommentId),
         );
-      }
-      if (context?.optimisticCommentId && cancelledQueuedOptimisticCommentIdsRef.current.has(context.optimisticCommentId)) {
-        cancelledQueuedOptimisticCommentIdsRef.current.delete(context.optimisticCommentId);
         try {
           await issuesApi.cancelComment(issueId!, comment.id);
           invalidateIssueDetail();
@@ -2817,6 +2825,11 @@ export function IssueDetail() {
           pages: upsertIssueCommentInPages(undefined, comment),
         },
       );
+      if (context?.optimisticCommentId) {
+        setOptimisticComments((current) =>
+          current.filter((entry) => entry.clientId !== context.optimisticCommentId),
+        );
+      }
     },
     onError: (err, _variables, context) => {
       if (context?.optimisticCommentId) {
@@ -3004,8 +3017,11 @@ export function IssueDetail() {
         ...(interrupt ? { interrupt } : {}),
       }),
     onMutate: async ({ body, reopen, reassignment, interrupt }) => {
-      await queryClient.cancelQueries({ queryKey: queryKeys.issues.comments(issueId!) });
-      await queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
+      // Cache cancellation can wait on an active request for several seconds.
+      // Start it now, but paint the optimistic echo before awaiting it so a
+      // reassignment never clears the composer into an empty thread.
+      const cancelComments = queryClient.cancelQueries({ queryKey: queryKeys.issues.comments(issueId!) });
+      const cancelIssue = queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
 
       const previousIssue = queryClient.getQueryData<Issue>(queryKeys.issues.detail(issueId!));
       const queuedComment = !interrupt
@@ -3032,6 +3048,8 @@ export function IssueDetail() {
         );
       }
 
+      await Promise.all([cancelComments, cancelIssue]);
+
       return {
         optimisticCommentId: optimisticComment?.clientId ?? null,
         queuedCommentTargetRunId: queuedComment?.id ?? null,
@@ -3039,16 +3057,13 @@ export function IssueDetail() {
       };
     },
     onSuccess: async (result, _variables, context) => {
-      if (context?.optimisticCommentId) {
-        setOptimisticComments((current) =>
-          current.filter((entry) => entry.clientId !== context.optimisticCommentId),
-        );
-      }
-
       const { comment, ...nextIssue } = result;
       queryClient.setQueryData(queryKeys.issues.detail(issueId!), nextIssue);
       if (comment && context?.optimisticCommentId && cancelledQueuedOptimisticCommentIdsRef.current.has(context.optimisticCommentId)) {
         cancelledQueuedOptimisticCommentIdsRef.current.delete(context.optimisticCommentId);
+        setOptimisticComments((current) =>
+          current.filter((entry) => entry.clientId !== context.optimisticCommentId),
+        );
         try {
           await issuesApi.cancelComment(issueId!, comment.id);
           invalidateIssueDetail();
@@ -3080,6 +3095,11 @@ export function IssueDetail() {
             pageParams: [null],
             pages: upsertIssueCommentInPages(undefined, comment),
           },
+        );
+      }
+      if (context?.optimisticCommentId) {
+        setOptimisticComments((current) =>
+          current.filter((entry) => entry.clientId !== context.optimisticCommentId),
         );
       }
     },
@@ -5305,6 +5325,9 @@ export function IssueDetail() {
               commentsInitialLoading={commentsLoading}
               locallyQueuedCommentRunIds={locallyQueuedCommentRunIds}
               interactions={interactions}
+              documents={issue.documentSummaries ?? []}
+              workProducts={workProducts ?? []}
+              attachments={attachments ?? []}
               hasOlderComments={hasOlderComments}
               commentsLoadingOlder={commentsLoadingOlder}
               onLoadOlderComments={loadOlderComments}

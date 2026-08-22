@@ -4,6 +4,8 @@ import type {
   TaskChatInteractionItem,
   TaskChatItem,
   TaskChatMessageItem,
+  TaskChatRuntimeRequestDecision,
+  TaskChatRuntimeRequestItem,
 } from "./task-chat-model";
 import { TaskChatTurn } from "./TaskChatTurn";
 import { TaskChatBubble } from "./TaskChatBubble";
@@ -14,6 +16,7 @@ import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskMessageScroller } from "./TaskMessageScroller";
+import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 
 interface TaskChatThreadViewProps {
   items: TaskChatItem[];
@@ -24,6 +27,7 @@ interface TaskChatThreadViewProps {
    */
   header?: ReactNode;
   onApprovalDecision?: (statusItemId: string, optionId: string) => void;
+  onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void | Promise<void>;
   /**
    * Renders an interleaved issue-thread interaction (the live thread supplies
    * TaskChatInteractionCard bound to its accept/reject handlers). Interaction
@@ -60,6 +64,7 @@ function renderItem(
   renderBrief?: () => ReactNode,
   renderMessageActions?: (item: TaskChatMessageItem) => ReactNode,
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode,
+  onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void | Promise<void>,
 ) {
   switch (item.kind) {
     case "message": {
@@ -74,13 +79,17 @@ function renderItem(
           item={item.attachedTurn}
           timestampPrefix={item.attachedTurn.standaloneHeader ? undefined : item.timestamp}
           leading={item.attachedTurn.standaloneHeader ? undefined : actions}
-          renderChild={(child) => renderItem(child, onApprovalDecision)}
+          renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)}
         />
       ) : undefined;
       return (
         <TaskChatBubble
           item={item}
-          animateEntry={!item.attachedTurn?.standaloneHeader}
+          // Human messages are inserted optimistically and later replaced by
+          // their canonical server IDs. Animating either mount makes the same
+          // text visibly fade twice during that handoff; user sends should
+          // paint immediately and remain visually stable.
+          animateEntry={item.author !== "human" && !item.attachedTurn?.standaloneHeader}
           actions={item.attachedTurn?.standaloneHeader ? actions : item.attachedTurn ? undefined : actions}
           queuedAction={renderQueuedAction?.(item)}
           beforeTurn={item.attachedTurn?.standaloneHeader ? turn : undefined}
@@ -104,7 +113,7 @@ function renderItem(
     case "usage":
       return <TaskChatUsageReadout item={item} />;
     case "activity_phase":
-      return <TaskChatActivityPhase item={item} renderChild={(child) => renderItem(child, onApprovalDecision)} />;
+      return <TaskChatActivityPhase item={item} renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)} />;
     case "interaction":
       return renderInteraction ? renderInteraction(item) : null;
     case "brief":
@@ -113,9 +122,11 @@ function renderItem(
       return (
         <TaskChatTurn
           item={item}
-          renderChild={(child) => renderItem(child, onApprovalDecision)}
+          renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)}
         />
       );
+    case "protocol":
+      return <TaskChatProtocolCard item={item} onRuntimeRequestDecision={onRuntimeRequestDecision} />;
     default: {
       // Exhaustiveness guard: a new item kind must add a branch above.
       const _never: never = item;
@@ -134,6 +145,7 @@ export function TaskChatThreadView({
   items,
   header,
   onApprovalDecision,
+  onRuntimeRequestDecision,
   renderInteraction,
   renderBrief,
   renderMessageActions,
@@ -159,6 +171,7 @@ export function TaskChatThreadView({
             renderBrief,
             renderMessageActions,
             renderQueuedAction,
+            onRuntimeRequestDecision,
           )}
         </div>
       ))}

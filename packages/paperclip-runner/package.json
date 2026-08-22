@@ -6,7 +6,8 @@
   "type": "module",
   "bin": {
     "paperclip-runner-eval-session": "./dist/cli/eval-session.js",
-    "paperclip-runner-opencode-proxy": "./dist/cli/opencode-app-server-proxy.js"
+    "paperclip-runner-opencode-proxy": "./dist/cli/opencode-app-server-proxy.js",
+    "paperclip-runner-acpx-sidecar": "./dist/cli/acpx-runtime-sidecar.js"
   },
   "exports": {
     ".": {
@@ -67,7 +68,7 @@
     "typecheck:typescript": "pnpm run check:protocol-types && tsc -p tsconfig.json --noEmit",
     "typecheck:rust": "cargo check --manifest-path runner/Cargo.toml --locked --workspace",
     "typecheck:browser": "tsc -p tsconfig.browser.json --noEmit",
-    "test": "pnpm run build:runner-binaries && pnpm run test:typescript && pnpm run test:rust && node --test scripts/check-forbidden-imports.test.mjs scripts/check-numbered-milestones.test.mjs scripts/check-tracked-imports.test.mjs scripts/record-codex-evidence.test.mjs scripts/validate-doc-links.test.mjs test/capability-contract.test.mjs",
+    "test": "pnpm run build:runner-binaries && pnpm run test:typescript && pnpm run test:rust && node --test scripts/aws-agentcore-provisioning.test.mjs scripts/check-forbidden-imports.test.mjs scripts/check-numbered-milestones.test.mjs scripts/check-tracked-imports.test.mjs scripts/record-codex-evidence.test.mjs scripts/validate-doc-links.test.mjs test/capability-contract.test.mjs",
     "test:typescript": "vitest run",
     "test:rust": "cargo test --manifest-path runner/Cargo.toml --locked --workspace",
     "test:browser": "pnpm run build:typescript && pnpm run build:runner-binaries && pnpm run build:browser && playwright test --config devtools/browser/playwright.config.ts",
@@ -78,8 +79,8 @@
     "test:browser:issue-thread": "pnpm run build:typescript && pnpm run build:issue-thread && playwright test --config devtools/issue-thread/playwright.config.ts",
     "record:sdk:codex": "pnpm run build:typescript && playwright test --config examples/playwright.real.config.ts",
     "build:runner-binaries": "cargo build --manifest-path runner/Cargo.toml --locked --workspace --bins",
-    "generate:protocol-types": "node scripts/generate-protocol-schema-module.mjs",
-    "check:protocol-types": "node scripts/generate-protocol-schema-module.mjs --check",
+    "generate:protocol-types": "node scripts/generate-protocol-schema-module.mjs && node scripts/generate-acpx-sidecar-contract.mjs",
+    "check:protocol-types": "node scripts/generate-protocol-schema-module.mjs --check && node scripts/generate-acpx-sidecar-contract.mjs --check",
     "generate:replay-goldens": "pnpm run build:typescript && node scripts/generate-replay-goldens.mjs",
     "check:replay-goldens": "node scripts/generate-replay-goldens.mjs --check",
     "check:browser-tokens": "node scripts/check-browser-tokens.mjs",
@@ -113,6 +114,11 @@
     "demo:standalone": "pnpm run build:typescript && vite --config vite.standalone.config.ts --host 127.0.0.1 --port 4182",
     "demo:scenarios": "pnpm run build:typescript && vite --config vite.scenarios.config.ts --host 127.0.0.1 --port 4183",
     "console:issue-thread": "pnpm run build:typescript && vite --config vite.issue-thread.config.ts --host 127.0.0.1 --port 4184",
+    "aws-agentcore:provision": "bash scripts/aws-agentcore.sh provision",
+    "aws-agentcore:probe": "bash scripts/aws-agentcore.sh probe",
+    "aws-agentcore:lab": "bash scripts/aws-agentcore.sh lab",
+    "aws-agentcore:destroy": "bash scripts/aws-agentcore.sh destroy",
+    "smoke:capability:aws-agentcore": "pnpm run build:typescript && cargo build --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd && node scripts/capability-aws-agentcore-smoke.mjs",
     "demo:live-console": "pnpm run build:typescript && node scripts/live-console-demo-server.mjs",
     "record:live-console": "pnpm run build:typescript && node scripts/record-live-console-evidence.mjs",
     "record:codex": "pnpm run build:typescript && node scripts/record-codex-evidence.mjs",
@@ -135,7 +141,12 @@
     "verify:rootless": "bash scripts/verify-rootless-linux.sh"
   },
   "dependencies": {
-    "ajv": "^8.20.0"
+    "@agentclientprotocol/claude-agent-acp": "0.70.0",
+    "@agentclientprotocol/codex-acp": "1.6.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "acpx": "0.13.1",
+    "ajv": "^8.20.0",
+    "pi-acp": "0.0.33"
   },
   "peerDependencies": {
     "react": ">=18",

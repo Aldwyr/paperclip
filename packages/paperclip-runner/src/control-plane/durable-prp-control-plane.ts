@@ -36,6 +36,11 @@ import type { CapabilityFixtureSeed } from "../mock-core/capability-control-plan
 import { capabilitySemanticToolDescriptor } from "../semantic-tools/catalog.js";
 import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
 import { CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS } from "../semantic-tools/discovery.js";
+import {
+  resolveQualifiedAcpxProfile,
+  type QualifiedAcpxAgent,
+} from "../drivers/acpx/qualified-profiles.js";
+import { createSanitizedAcpxEnvironment } from "../drivers/acpx/environment.js";
 
 import {
   DURABLE_RECOVERY_FAULTS,
@@ -1252,6 +1257,12 @@ export class DurablePrpControlPlane {
     command.result = structuredClone(result);
     if (command.status === "completed" && command.type === "run.attach") {
       this.#applyRunAttachment(command.payload);
+      this.store.save();
+      // The existing channel authenticated the previous immutable run
+      // binding. Force the runner to reconnect using the rotated ticket/lease
+      // identity before accepting any attached-run events or commands.
+      this.disconnectActiveRunner();
+      return;
     }
     this.store.save();
     this.#sendNextCommand(connection);
@@ -1698,10 +1709,31 @@ export interface DurableEvalSessionInput {
   explicitClaims: string[];
   turnTimeoutMs: number;
   toolExposure?: "eager" | "lazy";
-  provider?: "codex" | "opencode";
+  provider?: "codex" | "opencode" | "aws_agentcore" | "acpx";
+  acpxAgent?: QualifiedAcpxAgent;
+  acpxSidecarPath?: string;
   opencodeVersion?: string;
   opencodeCommand?: string;
   opencodeProxyPath?: string;
+  agentCoreProfile?: {
+    profileId: string;
+    region: string;
+    accountId: string;
+    harnessArn: string;
+    harnessVersion: string;
+    endpointArn: string;
+    endpointQualifier: string;
+    agentRuntimeArn: string;
+    memoryArn: string;
+    memoryId: string;
+    invocationRoleArn: string;
+    qualificationRevision: string;
+    eventExpiryDays: 90;
+    maxEstimatedSessionCostUsd: number;
+    maxIterations: number;
+    maxOutputTokens: number;
+    timeoutSeconds: number;
+  };
 }
 
 export type DurableEvalInfrastructureFailureClass =
@@ -1778,6 +1810,20 @@ function projectedSemanticResult(operationId: unknown, result: unknown): unknown
     } catch {
       // Preserve the bounded gateway response when its content is not JSON.
     }
+  }
+  return result;
+}
+
+function sanitizedAwsEvalEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of [
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+    "RUST_BACKTRACE", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  ]) {
+    if (typeof source[key] === "string") result[key] = source[key];
   }
   return result;
 }
@@ -1864,15 +1910,45 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
     "app-server",
   ];
   const providerKind = input.provider ?? "codex";
+  if (providerKind === "aws_agentcore" && input.agentCoreProfile === undefined) {
+    throw new Error("AWS AgentCore eval requires an immutable qualified profile snapshot");
+  }
   const opencodeProxyPath = input.opencodeProxyPath
     ?? fileURLToPath(new URL("../cli/opencode-app-server-proxy.js", import.meta.url));
+  const acpxSidecarPath = input.acpxSidecarPath
+    ?? fileURLToPath(new URL("../cli/acpx-runtime-sidecar.js", import.meta.url));
+  const acpxProfile = providerKind === "acpx"
+    ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", input.model)
+    : null;
   core.queueCommand("run.prepare", {
     authorizedTools: {
       schema: "paperclip.runner.authorized-tools.v1", schemaVersion: 1,
       catalogDigest: `sha256:${createHash("sha256").update(canonicalJson(operations)).digest("hex")}`,
       operations: exposedOperations,
     },
-    provider: {
+    provider: providerKind === "aws_agentcore" ? {
+      kind: "aws_agentcore",
+      model: input.model,
+      ...input.agentCoreProfile,
+    } : providerKind === "acpx" ? {
+      kind: "acpx",
+      agent: acpxProfile!.agent,
+      model: input.model,
+      acpxVersion: acpxProfile!.acpxVersion,
+      agentServerPackage: acpxProfile!.agentServerPackage,
+      agentServerVersion: acpxProfile!.agentServerVersion,
+      agentRuntimePackage: acpxProfile!.agentRuntimePackage,
+      agentRuntimeVersion: acpxProfile!.agentRuntimeVersion,
+      commandDigest: acpxProfile!.commandDigest,
+      sidecarCommand: process.execPath,
+      sidecarArgs: [acpxSidecarPath],
+      runtimeDirectory: resolve(root, "acpx"),
+      normalizedSessionId: identity.normalizedSessionId,
+      runId: identity.runId,
+      cwd: tmpdir(),
+      instructions: "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
+      permissionPolicy: "interactive",
+    } : {
       kind: providerKind,
       command: providerKind === "opencode" ? process.execPath : process.env.PAPERCLIP_CODEX_COMMAND ?? "codex",
       args: providerKind === "opencode" ? [opencodeProxyPath] : providerArgs,
@@ -1897,7 +1973,11 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
           PAPERCLIP_RUN_ID: identity.runId,
           PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
         }
-      : process.env,
+      : providerKind === "aws_agentcore"
+        ? sanitizedAwsEvalEnvironment(process.env)
+        : providerKind === "acpx"
+          ? createSanitizedAcpxEnvironment(process.env, acpxProfile!.agent)
+        : process.env,
   });
   try {
     const deadline = Date.now() + input.turnTimeoutMs;
@@ -1945,9 +2025,14 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
     let assistantText = "";
     let semanticResult: Record<string, unknown> | null = null;
     let usage: Record<string, number> = {};
+    let providerSessionId: string | null = null;
     const projectedCalls = new Map<string, string>();
     for (const record of records) {
       const payload = record.payload as Record<string, unknown> | undefined;
+      if (record.eventType === "harness.ready") {
+        const descriptor = payload?.providerDescriptor as Record<string, unknown> | undefined;
+        if (typeof descriptor?.providerSessionId === "string") providerSessionId = descriptor.providerSessionId;
+      }
       if (record.eventType === "run.result.proposed" && payload && semanticResult === null) {
         semanticResult = structuredClone(payload);
       }
@@ -1989,6 +2074,14 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
             reasoningTokens: total.reasoningTokens ?? 0,
           };
         }
+      }
+      if (record.eventType === "item.delta") {
+        const delta = payload?.delta;
+        if (typeof delta === "string") assistantText += delta;
+      }
+      if (record.eventType === "item.completed") {
+        const item = payload?.item as Record<string, unknown> | undefined;
+        if (item?.type === "agentMessage" && typeof item.text === "string") assistantText = item.text;
       }
       if (record.eventType === "usage.reported") {
         const runDelta = payload?.runDelta as Record<string, number> | undefined;
@@ -2033,12 +2126,28 @@ export async function runDurableEvalSession(input: DurableEvalSessionInput): Pro
       turn: { turnId: identity.turnId, status: "completed", assistantText },
       snapshot: {
         schema: "paperclip.capability.live-session.v1", revision: authority.snapshot().revision,
-        sessionId: identity.normalizedSessionId, providerThreadId: "withheld", providerSessionId: null,
-        providerModel: { id: input.model, provider: providerKind === "opencode" ? input.model.split("/", 1)[0] : "openai" }, status: "idle", activeTurnId: null,
+        sessionId: identity.normalizedSessionId, providerThreadId: "withheld", providerSessionId,
+        providerModel: {
+          id: input.model,
+          provider: providerKind === "opencode"
+            ? input.model.split("/", 1)[0]
+            : providerKind === "aws_agentcore"
+              ? "amazon-bedrock"
+              : providerKind === "acpx"
+                ? acpxProfile!.agent === "pi" ? "openrouter" : acpxProfile!.agent === "claude" ? "anthropic" : "openai"
+                : "openai",
+        },
+        modelHistory: [{
+          requestedModel: input.model,
+          effectiveModel: input.model,
+          at: now,
+          source: "provider_verified",
+        }],
+        status: "idle", activeTurnId: null,
         semanticResult,
         createdAt: now, updatedAt: now,
         authority: { active: true, runId: identity.runId, companyId, actorId: input.actorId, taskId: input.taskId, sessionId: identity.normalizedSessionId, scenarioId: input.attemptId, capabilities: input.capabilities, explicitClaims: input.explicitClaims },
-        config: { workingDirectory: tmpdir(), requestedModel: input.model, provider: providerKind, driver: providerKind === "opencode" ? "opencode_server" : "codex_app_server", providerVersion: providerKind === "opencode" ? input.opencodeVersion ?? "1.18.17" : null, scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
+        config: { workingDirectory: providerKind === "aws_agentcore" ? null : tmpdir(), requestedModel: input.model, provider: providerKind, driver: providerKind === "opencode" ? "opencode_server" : providerKind === "aws_agentcore" ? "aws_agentcore_harness_api" : providerKind === "acpx" ? "acpx_runtime" : "codex_app_server", providerVersion: providerKind === "opencode" ? input.opencodeVersion ?? "1.18.17" : providerKind === "aws_agentcore" ? input.agentCoreProfile?.harnessVersion ?? null : providerKind === "acpx" ? acpxProfile!.acpxVersion : null, ...(acpxProfile === null ? {} : { acpxAgent: acpxProfile.agent, acpxProfile }), scenario: { id: input.attemptId, claims: input.capabilities }, capabilities: input.capabilities, explicitClaims: input.explicitClaims, seedState: initialState, turnTimeoutMs: input.turnTimeoutMs },
         mockState: finalState,
         transcript: [
           { id: "transcript-user", role: "user", text: input.prompt, turnId: identity.turnId, at: now },
@@ -2121,6 +2230,20 @@ export async function runDurableRecoveryRecovery(
       throw new Error(
         `Durable recovery runner exited with code ${String(result.code)}: ${result.stderr.trim()}`,
       );
+    }
+    if (fault === "revoke") {
+      // The runner can exit immediately after it sends the final rejection while
+      // the mock core is still committing that HTTP request. Wait for the
+      // durable command result before stopping the server and reading evidence.
+      const deadline = Date.now() + 1_000;
+      while (
+        core.store.state.commands.find(
+          (command) => command.commandId === "command_after_revoke",
+        )?.status === "pending" &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+      }
     }
   } finally {
     await core.stop();

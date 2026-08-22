@@ -1,8 +1,10 @@
-import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
+import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import type { CodexAppServerTransport } from "../drivers/codex/app-server-transport.js";
 import { createCodexNativeSessionBackend } from "./codex-native-backend.js";
 import { createOpenCodeNativeSessionBackend } from "./opencode-native-backend.js";
+import { createAcpxNativeSessionBackend } from "./acpx-native-backend.js";
+import type { AcpxRuntimeFactory } from "../drivers/acpx/acpx-runtime-host.js";
 
 export interface NativeBackendFactoryOptions {
   runnerInstanceId?: string;
@@ -19,10 +21,12 @@ export interface NativeBackendFactoryOptions {
   opencodeRuntimeDirectory?: string;
   environment?: NodeJS.ProcessEnv;
   opencodeCommand?: string;
+  acpxRuntimeDirectory?: string;
+  acpxRuntimeFactory?: AcpxRuntimeFactory;
 }
 
 export function createNativeSessionBackend(
-  input: NativeExecutionInputV1,
+  input: NativeExecutionInput,
   options: NativeBackendFactoryOptions = {},
 ): NativeSessionBackend {
   if (input.provider.kind === "codex") {
@@ -34,9 +38,9 @@ export function createNativeSessionBackend(
       transportFactory: options.codexTransportFactory,
     });
   }
-  if (input.provider.kind === "claude_managed") {
+  if (input.provider.kind === "claude_managed" || input.provider.kind === "aws_agentcore") {
     if (!options.codexTransportFactory) {
-      throw new Error("Claude Agent native backend requires the runnerd remote-provider transport");
+      throw new Error(`${input.provider.kind === "claude_managed" ? "Claude Agent" : "AWS AgentCore"} native backend requires the runnerd remote-provider transport`);
     }
     return createCodexNativeSessionBackend(input, {
       runnerInstanceId: options.runnerInstanceId,
@@ -44,6 +48,18 @@ export function createNativeSessionBackend(
       dynamicTools: options.dynamicTools,
       dynamicToolHandler: options.dynamicToolHandler,
       transportFactory: options.codexTransportFactory,
+    });
+  }
+  if (input.provider.kind === "acpx") {
+    if (!options.acpxRuntimeDirectory) throw new Error("ACPX native backend requires its own instance runtime directory");
+    return createAcpxNativeSessionBackend(input, {
+      runnerInstanceId: options.runnerInstanceId,
+      onSpawn: options.onSpawn,
+      runtimeDirectory: options.acpxRuntimeDirectory,
+      environment: options.environment,
+      dynamicTools: options.dynamicTools,
+      dynamicToolHandler: options.dynamicToolHandler,
+      runtimeFactory: options.acpxRuntimeFactory,
     });
   }
   if (!options.opencodeRuntimeDirectory) {

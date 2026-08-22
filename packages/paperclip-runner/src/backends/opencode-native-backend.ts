@@ -1,11 +1,11 @@
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
-import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
+import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import { OpenCodeServerDriver, type OpenCodeServerDriverOptions } from "../drivers/opencode/opencode-server-driver.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 
 export function createOpenCodeNativeSessionBackend(
-  input: NativeExecutionInputV1,
+  input: NativeExecutionInput,
   options: Omit<OpenCodeServerDriverOptions, "model" | "taskEnvelope">,
 ): NativeSessionBackend {
   if (input.provider.kind !== "opencode" || !input.provider.model) {

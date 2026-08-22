@@ -124,6 +124,88 @@ describe("NativeExecutionInputV1", () => {
     })).toThrow("betaVersion");
   });
 
+  it("accepts a closed AWS AgentCore Harness snapshot and rejects drift or unsafe limits", () => {
+    const awsAgentCore = {
+      ...input,
+      session: { ...input.session, driverKind: "aws_agentcore_harness_api" },
+      provider: {
+        kind: "aws_agentcore",
+        model: "global.anthropic.claude-sonnet-4-6",
+        agentCoreProfile: {
+          profileId: "agentcore-development",
+          region: "us-east-1",
+          accountId: "123456789012",
+          harnessArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/harness-1",
+          harnessVersion: "3",
+          endpointArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness-endpoint/harness-1/paperclip",
+          endpointQualifier: "paperclip",
+          agentRuntimeArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/runtime-1",
+          memoryArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/memory-1",
+          memoryId: "memory-1",
+          invocationRoleArn: "arn:aws:iam::123456789012:role/paperclip-agentcore-runner",
+          qualificationRevision: "aws-agentcore-harness-v1",
+          eventExpiryDays: 90,
+        },
+        maxEstimatedSessionCostUsd: 1,
+        invocationLimits: { maxIterations: 8, maxOutputTokens: 4096, timeoutSeconds: 300 },
+      },
+    } as const;
+    const parsed = parseNativeExecutionInput(awsAgentCore);
+    expect(parsed.provider).toEqual(awsAgentCore.provider);
+    expect(buildNativeModelEnvelope(parsed).workspace).toBeNull();
+    expect(JSON.stringify(parsed)).not.toContain("AWS_SECRET_ACCESS_KEY");
+    expect(() => parseNativeExecutionInput({
+      ...awsAgentCore,
+      session: { ...awsAgentCore.session, driverKind: "codex_app_server" },
+    })).toThrow("does not match");
+    expect(() => parseNativeExecutionInput({
+      ...awsAgentCore,
+      provider: { ...awsAgentCore.provider, invocationLimits: { ...awsAgentCore.provider.invocationLimits, maxIterations: 9 } },
+    })).toThrow("maxIterations");
+    expect(() => parseNativeExecutionInput({
+      ...awsAgentCore,
+      provider: { ...awsAgentCore.provider, agentCoreProfile: { ...awsAgentCore.provider.agentCoreProfile, eventExpiryDays: 30 } },
+    })).toThrow("eventExpiryDays");
+  });
+
+  it("accepts only a closed ACPX profile matching the driver and agent", () => {
+    const provider = {
+      kind: "acpx",
+      agent: "pi",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      permissionPolicy: "interactive",
+      profile: {
+        driverKind: "acpx_runtime",
+        protocolVersion: 1,
+        acpxVersion: "0.13.1",
+        agent: "pi",
+        agentProfileVersion: 1,
+        agentServerPackage: "pi-acp",
+        agentServerVersion: "0.0.33",
+        agentRuntimePackage: "@earendil-works/pi-coding-agent",
+        agentRuntimeVersion: "0.84.2",
+        commandDigest: "sha256:24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc",
+      },
+    } as const;
+    const parsed = parseNativeExecutionInput({
+      ...input,
+      session: { ...input.session, driverKind: "acpx_runtime" },
+      provider,
+    });
+    expect(parsed.provider).toEqual(provider);
+    expect(buildNativeModelEnvelope(parsed).workspace).toEqual({ cwd: "/safe/workspace" });
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      session: { ...input.session, driverKind: "acpx_runtime" },
+      provider: { ...provider, profile: { ...provider.profile, agent: "claude" } },
+    })).toThrow("qualified ACPX v1 profile");
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      session: { ...input.session, driverKind: "opencode_server" },
+      provider,
+    })).toThrow("does not match");
+  });
+
   it("defaults legacy lifecycle state to per-turn and validates warm timeouts", () => {
     const legacy = structuredClone(input) as Record<string, unknown>;
     delete (legacy.session as Record<string, unknown>).lifecyclePolicy;
@@ -145,5 +227,49 @@ describe("NativeExecutionInputV1", () => {
         lifecyclePolicy: { mode: "warm", idleTimeoutMs: 0 },
       },
     })).toThrow("positive integer");
+  });
+});
+
+describe("NativeExecutionInputV2 planning", () => {
+  const planning = {
+    ...input,
+    schema: "paperclip.native-execution-input.v2",
+    executionMode: "plan",
+    task: { ...input.task, workMode: "planning" },
+    planningContext: {
+      documentId: "document-1",
+      baseRevisionId: "revision-3",
+      baseRevisionNumber: 3,
+      markdown: "# Existing plan",
+      sha256: "plan-digest",
+      reviewContext: { threads: [{ id: "annotation-1" }] },
+    },
+  } as const;
+
+  it("round-trips native plan mode and its pinned canonical revision into model context", () => {
+    const parsed = parseNativeExecutionInput(planning);
+    expect(parsed).toMatchObject({ schema: "paperclip.native-execution-input.v2", executionMode: "plan" });
+    expect(buildNativeModelEnvelope(parsed)).toMatchObject({
+      schema: "paperclip.native-model-envelope.v2",
+      executionMode: "plan",
+      planningContext: { baseRevisionId: "revision-3", baseRevisionNumber: 3 },
+    });
+  });
+
+  it("fails closed when plan mode omits its pinned Paperclip context", () => {
+    expect(() => parseNativeExecutionInput({ ...planning, planningContext: null }))
+      .toThrow("planningContext is required");
+    expect(() => parseNativeExecutionInput({
+      ...planning,
+      task: { ...planning.task, workMode: "standard" },
+    })).toThrow("requires planning work mode");
+  });
+
+  it("allows an accepted planning issue to continue in fresh default execution mode", () => {
+    expect(parseNativeExecutionInput({
+      ...planning,
+      executionMode: "default",
+      planningContext: null,
+    })).toMatchObject({ task: { workMode: "planning" }, executionMode: "default" });
   });
 });

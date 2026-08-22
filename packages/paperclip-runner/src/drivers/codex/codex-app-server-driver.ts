@@ -61,6 +61,7 @@ import {
 const DRIVER_KIND = "codex_app_server";
 const DRIVER_VERSION = "codex-v2";
 const SKILLLESS_PERMISSION_PROFILE = "paperclip-runner-workspace-only";
+const PLANNING_PERMISSION_PROFILE = "paperclip-runner-workspace-read-only";
 const MAX_RETAINED_CODEX_PAYLOAD_BYTES = 64 * 1024;
 const MAX_RETAINED_CODEX_STRING_CHARS = 32 * 1024;
 
@@ -97,6 +98,7 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
   conversationMode?: "task" | "direct";
+  requestedCollaborationMode?: "default" | "plan";
   transportFactory?: () => CodexAppServerTransport;
   /** Additional control-plane tools exposed to the provider for this run. */
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
@@ -145,6 +147,7 @@ interface TerminalReplayConflict {
 interface OpenedCodexThread {
   threadId: string;
   providerSessionId: string | null;
+  collaborationMode: Record<string, unknown> | null;
   context: CodexModelContextSnapshot;
   lineage: HarnessThreadLineageEntry;
 }
@@ -234,6 +237,10 @@ function blockToolSpec(): Record<string, unknown> {
   };
 }
 
+export function codexSemanticToolSpecs(): readonly Readonly<Record<string, unknown>>[] {
+  return [finishToolSpec(), blockToolSpec()];
+}
+
 function dynamicToolResponse(value: unknown): Record<string, unknown> {
   return {
     success: true,
@@ -271,6 +278,13 @@ export function createSkilllessCodexThreadConfig(
   return { ...SKILLLESS_BASE_CONFIG };
 }
 
+function collaborationThreadConfig(mode: "default" | "plan") {
+  return {
+    ...SKILLLESS_BASE_CONFIG,
+    include_collaboration_mode_instructions: mode === "plan",
+  };
+}
+
 function tomlString(value: string): string {
   return JSON.stringify(value);
 }
@@ -288,6 +302,13 @@ export function createIsolatedCodexAppServerArgs(
     ...deniedHostRoots.map((path) => `${tomlString(path)}=\"none\"`),
     `\":workspace_roots\"={\".\"=\"write\"}`,
   ].join(",");
+  const planningFilesystemRules = [
+    `\":root\"=\"none\"`,
+    `\":minimal\"=\"read\"`,
+    `\":tmpdir\"=\"none\"`,
+    ...deniedHostRoots.map((path) => `${tomlString(path)}=\"none\"`),
+    `\":workspace_roots\"={\".\"=\"read\"}`,
+  ].join(",");
   const commandEnv = Object.entries(commandEnvironment(source))
     .map(([key, value]) => `${key}=${tomlString(value)}`)
     .join(",");
@@ -298,6 +319,10 @@ export function createIsolatedCodexAppServerArgs(
     `permissions.${SKILLLESS_PERMISSION_PROFILE}.filesystem={${filesystemRules}}`,
     "-c",
     `permissions.${SKILLLESS_PERMISSION_PROFILE}.network.enabled=false`,
+    "-c",
+    `permissions.${PLANNING_PERMISSION_PROFILE}.filesystem={${planningFilesystemRules}}`,
+    "-c",
+    `permissions.${PLANNING_PERMISSION_PROFILE}.network.enabled=false`,
     "-c",
     `shell_environment_policy.inherit=\"none\"`,
     "-c",
@@ -314,11 +339,13 @@ export function createIsolatedCodexAppServerArgs(
 function securedThreadParams(
   workingDirectory: string,
   source: NodeJS.ProcessEnv = process.env,
+  mode: "default" | "plan" = "default",
 ): Record<string, unknown> {
+  const permissionProfile = mode === "plan" ? PLANNING_PERMISSION_PROFILE : SKILLLESS_PERMISSION_PROFILE;
   return {
     cwd: workingDirectory,
-    config: createSkilllessCodexThreadConfig(workingDirectory, source),
-    permissions: SKILLLESS_PERMISSION_PROFILE,
+    config: collaborationThreadConfig(mode),
+    permissions: permissionProfile,
     runtimeWorkspaceRoots: [workingDirectory],
   };
 }
@@ -387,6 +414,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         runtimeRequestResolution: this.#caps.runtimeRequestResolution,
         goals: this.#caps.goals,
         threadLineage: this.#caps.threadLineage,
+        collaborationModes: ["default", "plan"],
         unsupported,
       },
     };
@@ -398,19 +426,25 @@ export class CodexAppServerDriver implements HarnessDriver {
     try {
       await this.#persistProcessOwnership(transport);
       const initialize = await this.#initialize(transport);
+      const requestedMode = this.#options.requestedCollaborationMode ?? "default";
       const response = await transport.request("thread/start", {
-        ...securedThreadParams(workingDirectory, this.#options.environment),
+        ...securedThreadParams(workingDirectory, this.#options.environment, requestedMode),
         approvalPolicy: "never",
         ...(this.#direct() ? {} : { baseInstructions: CODEX_SKILLLESS_BASE_INSTRUCTIONS }),
         dynamicTools: this.#direct()
           ? []
           : this.#caps.dynamicTools
-            ? [...(this.#options.dynamicTools ?? []), finishToolSpec(), blockToolSpec()]
+            ? [...(this.#options.dynamicTools ?? []), ...codexSemanticToolSpecs()]
             : [],
         experimentalRawEvents: false,
         persistExtendedHistory: false,
       });
-      const opened = this.#openedThread(response, initialize, workingDirectory);
+      const collaborationMode = await this.#negotiateCollaborationMode(
+        transport,
+        response,
+        requestedMode,
+      );
+      const opened = this.#openedThread(response, initialize, workingDirectory, collaborationMode);
       const goal = await this.#discoverGoal(transport, opened.threadId);
       if (opened.context.liveConsole) opened.context.liveConsole.goals = this.#caps.goals;
       return this.#session({
@@ -459,11 +493,20 @@ export class CodexAppServerDriver implements HarnessDriver {
       );
       const response = await transport.request("thread/resume", {
         threadId: snapshot.driverSessionId,
-        ...securedThreadParams(workingDirectory, this.#options.environment),
+        ...securedThreadParams(
+          workingDirectory,
+          this.#options.environment,
+          this.#options.requestedCollaborationMode ?? "default",
+        ),
         baseInstructions: this.#direct() ? "" : CODEX_SKILLLESS_BASE_INSTRUCTIONS,
         persistExtendedHistory: false,
       });
-      const opened = this.#openedThread(response, initialize, workingDirectory);
+      const collaborationMode = await this.#negotiateCollaborationMode(
+        transport,
+        response,
+        this.#options.requestedCollaborationMode ?? "default",
+      );
+      const opened = this.#openedThread(response, initialize, workingDirectory, collaborationMode);
       if (opened.threadId !== snapshot.driverSessionId) {
         await transport.close();
         return { recovered: false, reason: "provider resumed a different session" };
@@ -510,6 +553,40 @@ export class CodexAppServerDriver implements HarnessDriver {
         processGroup: true,
       })
     );
+  }
+
+  async #negotiateCollaborationMode(
+    transport: CodexAppServerTransport,
+    threadResponse: Record<string, unknown>,
+    requested: "default" | "plan",
+  ): Promise<Record<string, unknown> | null> {
+    if (requested !== "plan") return null;
+    try {
+      const response = await transport.request("collaborationMode/list", {});
+      const preset = Array.isArray(response.data)
+        ? response.data.map(record).find((candidate) => text(candidate.mode) === "plan")
+        : undefined;
+      if (!preset) throw new Error("plan preset is absent");
+      const model = text(
+        preset.model,
+        text(threadResponse.model, text(record(threadResponse.thread).model)),
+      );
+      if (model.length === 0) throw new Error("plan preset did not resolve a model");
+      return {
+        mode: "plan",
+        settings: {
+          model,
+          reasoning_effort: preset.reasoning_effort ?? null,
+          developer_instructions: null,
+        },
+      };
+    } catch (cause) {
+      const error = new Error(
+        `planning_mode_unsupported: installed Codex app-server did not expose a usable native plan collaboration mode (${redactCodexDiagnostic(String(cause))})`,
+      );
+      error.name = "PlanningModeUnsupportedError";
+      throw error;
+    }
   }
 
   async #persistProcessOwnership(transport: CodexAppServerTransport): Promise<void> {
@@ -564,21 +641,26 @@ export class CodexAppServerDriver implements HarnessDriver {
     response: Record<string, unknown>,
     initialize: Record<string, unknown>,
     workingDirectory: string,
+    collaborationMode: Record<string, unknown> | null,
   ): OpenedCodexThread {
     const thread = record(response.thread);
     const threadId = text(thread.id);
     if (threadId.length === 0) throw new Error("Codex thread response omitted thread.id");
     const activePermissionProfile = record(thread.activePermissionProfile);
     const permissionProfileId = text(activePermissionProfile.id);
+    const requestedMode = this.#options.requestedCollaborationMode ?? "default";
+    const requiredPermissionProfile = requestedMode === "plan"
+      ? PLANNING_PERMISSION_PROFILE
+      : SKILLLESS_PERMISSION_PROFILE;
     if (
       permissionProfileId.length > 0 &&
-      permissionProfileId !== SKILLLESS_PERMISSION_PROFILE
+      permissionProfileId !== requiredPermissionProfile
     ) {
       throw new Error("Codex thread did not activate the required filesystem permission profile");
     }
     const configuredPermissionProfile = {
       ...activePermissionProfile,
-      id: SKILLLESS_PERMISSION_PROFILE,
+      id: requiredPermissionProfile,
     };
     const returnedWorkingDirectory = text(response.cwd, workingDirectory);
     if (resolve(returnedWorkingDirectory) !== workingDirectory) {
@@ -587,6 +669,7 @@ export class CodexAppServerDriver implements HarnessDriver {
     return {
       threadId,
       providerSessionId: text(thread.sessionId) || null,
+      collaborationMode,
       context: {
         protocolVersion: CODEX_CODEX_PROTOCOL_VERSION,
         codexVersion: boundedText(initialize.userAgent),
@@ -598,12 +681,13 @@ export class CodexAppServerDriver implements HarnessDriver {
         model: boundedText(response.model),
         modelProvider: boundedText(response.modelProvider, boundedText(thread.modelProvider)),
         workingDirectory,
+        collaborationMode: collaborationMode === null ? "default" : "plan",
         sandbox: {
           permissionProfile: boundedCodexValue(configuredPermissionProfile),
           legacyPolicy: boundedCodexValue(response.sandbox ?? null),
           rootAccess: "none",
           minimalRuntimeAccess: "read",
-          workspaceAccess: "write",
+          workspaceAccess: requestedMode === "plan" ? "read" : "write",
           networkAccess: false,
         },
         approvalPolicy: boundedCodexValue(response.approvalPolicy ?? "never"),
@@ -617,7 +701,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         instructionPolicy: {
           skillInstructions: false,
           appInstructions: false,
-          collaborationInstructions: false,
+          collaborationInstructions: requestedMode === "plan",
         },
         environmentKeys: Object.keys(
           commandEnvironment(this.#options.environment),
@@ -833,7 +917,10 @@ class CodexHarnessSession implements HarnessSession {
     return this.#events;
   }
 
-  async startTurn(input: { message: NativeUserMessage }): Promise<{ turnId: string }> {
+  async startTurn(input: {
+    message: NativeUserMessage;
+    requestedCollaborationMode?: "default" | "plan";
+  }): Promise<{ turnId: string; effectiveCollaborationMode: "default" | "plan" }> {
     if (this.#terminal || this.#protocolFailed || this.#activeTurnId !== null || this.#turnStartPending) {
       throw this.#unsupported(
         "turn start",
@@ -845,21 +932,35 @@ class CodexHarnessSession implements HarnessSession {
     const taskText = this.#conversationMode === "direct"
       ? input.message.text
       : JSON.stringify({ task: this.#taskEnvelope, message: input.message.text });
+    const effectiveCollaborationMode = this.#opened.context.collaborationMode;
+    if (input.requestedCollaborationMode && input.requestedCollaborationMode !== effectiveCollaborationMode) {
+      throw new Error(
+        `collaboration_mode_mismatch: requested ${input.requestedCollaborationMode}, effective ${effectiveCollaborationMode}`,
+      );
+    }
     // The submitted text is part of the canonical record so a tracer can show
     // the operator's own message without keeping shadow state next to the
     // reducer.
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
       text: input.message.text,
+      requestedCollaborationMode: input.requestedCollaborationMode ?? effectiveCollaborationMode,
+      effectiveCollaborationMode,
     });
     this.#turnStartPending = true;
     let response: Record<string, unknown>;
+    const requestedMode = this.#opened.context.collaborationMode;
     try {
       response = await this.#transport.request("turn/start", {
         threadId: this.#opened.threadId,
         cwd: this.#opened.context.workingDirectory,
-        permissions: SKILLLESS_PERMISSION_PROFILE,
+        permissions: requestedMode === "plan"
+          ? PLANNING_PERMISSION_PROFILE
+          : SKILLLESS_PERMISSION_PROFILE,
         runtimeWorkspaceRoots: [this.#opened.context.workingDirectory],
+        ...(this.#opened.collaborationMode === null
+          ? {}
+          : { collaborationMode: this.#opened.collaborationMode }),
         input: [userInput({ role: "user", text: taskText })],
         ...(this.#conversationMode === "direct" ? {} : { outputSchema: CODEX_RESULT_OUTPUT_SCHEMA }),
       });
@@ -879,7 +980,10 @@ class CodexHarnessSession implements HarnessSession {
       this.#interruptQueued = false;
       await this.#sendInterrupt(turnId, "queued_before_start");
     }
-    return { turnId };
+    return {
+      turnId,
+      effectiveCollaborationMode,
+    };
   }
 
   async steer(input: { turnId: string; message: NativeUserMessage }): Promise<void> {
@@ -1383,8 +1487,11 @@ class CodexHarnessSession implements HarnessSession {
       return;
     }
     if (notification.method === "thread/tokenUsage/updated") {
-      if (!this.#notificationNamesActiveTurn(turnId, "usage update")) return;
       this.#usage = boundedPayload(record(params.tokenUsage));
+      // Codex can replay a thread-scoped usage snapshot while a resumed thread
+      // is being attached, before the next turn has started. Keep the snapshot,
+      // but do not turn that benign replay into a fatal turn-binding violation.
+      if (this.#activeTurnId === null || turnId !== this.#activeTurnId) return;
       this.#emit("item.completed", { kind: "usage", usage: this.#usage }, {
         turnId,
         itemId: `${turnId}:usage:${this.#sourceSequence + 1}`,

@@ -7,6 +7,36 @@ use paperclip_runner_core::codex_provider::{
 use paperclip_runner_core::provider_bridge::{AuthorizedTool, ToolResult};
 use serde_json::json;
 
+fn test_tool() -> AuthorizedTool {
+    AuthorizedTool {
+        operation_id: "get_task_context".to_owned(),
+        version: 1,
+        description: "Read task context.".to_owned(),
+        input_schema: json!({"type": "object"}),
+        response_schema: json!({"type": "object"}),
+    }
+}
+
+#[test]
+fn codex_plan_mode_is_qualified_and_selected_on_turn_start() {
+    let mut provider = CodexProvider::start(
+        &LocalProviderConfig {
+            kind: ProviderKind::Codex,
+            command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
+            args: Vec::new(),
+            cwd: "/tmp".to_owned(),
+            model: None,
+            instructions: "Author a plan without editing files.".to_owned(),
+            collaboration_mode: "plan".to_owned(),
+        },
+        vec![test_tool()].into_iter(),
+        None,
+    )
+    .unwrap();
+    provider.start_turn("Plan the work.", "/tmp").unwrap();
+    provider.shutdown().unwrap();
+}
+
 #[test]
 fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
     let mut provider = CodexProvider::start(
@@ -17,6 +47,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             cwd: "/tmp".to_owned(),
             model: None,
             instructions: "Use the authorized Paperclip tools.".to_owned(),
+            collaboration_mode: "default".to_owned(),
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -92,6 +123,7 @@ fn provider_contract_preserves_the_opencode_tag() {
             cwd: "/tmp".to_owned(),
             model: Some("openrouter/deepseek/deepseek-v4-flash-0731".to_owned()),
             instructions: "Use the authorized Paperclip tools.".to_owned(),
+            collaboration_mode: "default".to_owned(),
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -118,6 +150,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
             cwd: "/tmp".to_owned(),
             model: None,
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
+            collaboration_mode: "default".to_owned(),
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -176,6 +209,7 @@ fn codex_provider_rejects_an_event_above_the_four_megabyte_hard_limit() {
             cwd: "/tmp".to_owned(),
             model: None,
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
+            collaboration_mode: "default".to_owned(),
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),

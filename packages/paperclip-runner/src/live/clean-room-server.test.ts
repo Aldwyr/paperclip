@@ -162,6 +162,8 @@ class FakeCleanRoomTransport implements CodexAppServerTransport {
     this.#handler = handler;
   }
 
+  async attachRun(): Promise<void> {}
+
   async close(): Promise<void> {
     this.#closed = true;
     this.queue.close();

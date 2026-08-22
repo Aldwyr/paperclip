@@ -11,11 +11,15 @@ use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-fn skillless_thread_config() -> Value {
+fn default_collaboration_mode() -> String {
+    "default".to_owned()
+}
+
+fn skillless_thread_config(collaboration_mode: &str) -> Value {
     json!({
         "skills.include_instructions": false,
         "include_apps_instructions": false,
-        "include_collaboration_mode_instructions": false,
+        "include_collaboration_mode_instructions": collaboration_mode == "plan",
         "features.apps": false,
         "features.plugins": false,
         "features.multi_agent": false,
@@ -31,6 +35,8 @@ pub enum ProviderKind {
     Codex,
     Opencode,
     ClaudeManaged,
+    AwsAgentcore,
+    Acpx,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -44,6 +50,8 @@ pub struct LocalProviderConfig {
     pub cwd: String,
     pub model: Option<String>,
     pub instructions: String,
+    #[serde(default = "default_collaboration_mode")]
+    pub collaboration_mode: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -58,10 +66,57 @@ pub struct ClaudeManagedProviderConfig {
     pub max_session_list_cost_usd: f64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AwsAgentCoreProviderConfig {
+    pub model: String,
+    pub profile_id: String,
+    pub region: String,
+    pub account_id: String,
+    pub harness_arn: String,
+    pub harness_version: String,
+    pub endpoint_arn: String,
+    pub endpoint_qualifier: String,
+    pub agent_runtime_arn: String,
+    pub memory_arn: String,
+    pub memory_id: String,
+    pub invocation_role_arn: String,
+    pub qualification_revision: String,
+    pub event_expiry_days: u16,
+    pub max_estimated_session_cost_usd: f64,
+    pub max_iterations: u32,
+    pub max_output_tokens: u32,
+    pub timeout_seconds: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpxProviderConfig {
+    pub agent: String,
+    pub model: String,
+    pub acpx_version: String,
+    pub agent_server_package: String,
+    pub agent_server_version: String,
+    pub agent_runtime_package: Option<String>,
+    pub agent_runtime_version: Option<String>,
+    pub command_digest: String,
+    pub sidecar_command: PathBuf,
+    #[serde(default)]
+    pub sidecar_args: Vec<String>,
+    pub runtime_directory: String,
+    pub normalized_session_id: String,
+    pub run_id: String,
+    pub cwd: String,
+    pub instructions: String,
+    pub permission_policy: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProviderConfig {
     Local(LocalProviderConfig),
     ClaudeManaged(ClaudeManagedProviderConfig),
+    AwsAgentcore(AwsAgentCoreProviderConfig),
+    Acpx(AcpxProviderConfig),
 }
 
 impl ProviderConfig {
@@ -69,6 +124,8 @@ impl ProviderConfig {
         match self {
             Self::Local(config) => config.kind,
             Self::ClaudeManaged(_) => ProviderKind::ClaudeManaged,
+            Self::AwsAgentcore(_) => ProviderKind::AwsAgentcore,
+            Self::Acpx(_) => ProviderKind::Acpx,
         }
     }
 
@@ -76,6 +133,8 @@ impl ProviderConfig {
         match self {
             Self::Local(config) => Some(&config.cwd),
             Self::ClaudeManaged(_) => None,
+            Self::AwsAgentcore(_) => None,
+            Self::Acpx(config) => Some(&config.cwd),
         }
     }
 }
@@ -98,6 +157,22 @@ impl Serialize for ProviderConfig {
                     );
                 value.serialize(serializer)
             }
+            Self::AwsAgentcore(config) => {
+                let mut value = serde_json::to_value(config).map_err(serde::ser::Error::custom)?;
+                value
+                    .as_object_mut()
+                    .expect("AgentCore config serializes as an object")
+                    .insert("kind".to_owned(), Value::String("aws_agentcore".to_owned()));
+                value.serialize(serializer)
+            }
+            Self::Acpx(config) => {
+                let mut value = serde_json::to_value(config).map_err(serde::ser::Error::custom)?;
+                value
+                    .as_object_mut()
+                    .expect("ACPX config serializes as an object")
+                    .insert("kind".to_owned(), Value::String("acpx".to_owned()));
+                value.serialize(serializer)
+            }
         }
     }
 }
@@ -116,6 +191,22 @@ impl<'de> Deserialize<'de> for ProviderConfig {
                 .remove("kind");
             serde_json::from_value(value)
                 .map(Self::ClaudeManaged)
+                .map_err(serde::de::Error::custom)
+        } else if kind == "aws_agentcore" {
+            value
+                .as_object_mut()
+                .expect("provider config must be an object")
+                .remove("kind");
+            serde_json::from_value(value)
+                .map(Self::AwsAgentcore)
+                .map_err(serde::de::Error::custom)
+        } else if kind == "acpx" {
+            value
+                .as_object_mut()
+                .expect("provider config must be an object")
+                .remove("kind");
+            serde_json::from_value(value)
+                .map(Self::Acpx)
                 .map_err(serde::de::Error::custom)
         } else {
             serde_json::from_value(value)
@@ -141,16 +232,52 @@ pub enum ProviderRuntimeIdentity {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ProviderSessionIdentity {
+    #[serde(rename = "acpx")]
+    Acpx {
+        normalized_session_id: String,
+        acpx_record_id: String,
+        backend_session_id: String,
+        agent_session_id: String,
+        profile_digest: String,
+        workspace_digest: String,
+        requested_model: String,
+        effective_model: String,
+    },
+}
+
 pub trait Provider {
     fn kind(&self) -> ProviderKind;
     fn runtime_identity(&self) -> ProviderRuntimeIdentity;
     fn session_identity(&self) -> &str;
     fn provider_session_id(&self) -> Option<&str>;
+    fn durable_session_identity(&self) -> Option<ProviderSessionIdentity> {
+        None
+    }
     fn durable_event_cursor(&self) -> Option<&str> {
         None
     }
     fn configure_tools(&mut self, _tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
         Ok(())
+    }
+    fn attach_run(
+        &mut self,
+        _run_id: &str,
+        tools: Vec<AuthorizedTool>,
+    ) -> Result<(), LocalRunnerError> {
+        self.configure_tools(tools)
+    }
+    fn resolve_runtime_request(
+        &mut self,
+        _request_id: &str,
+        _turn_id: &str,
+        _resolution: &Value,
+    ) -> Result<(), LocalRunnerError> {
+        Err(LocalRunnerError::invalid(
+            "provider does not support runtime request resolution",
+        ))
     }
     fn increase_budget(&mut self, _max_list_cost_usd: f64) -> Result<Value, LocalRunnerError> {
         Err(LocalRunnerError::invalid(
@@ -190,6 +317,12 @@ pub enum ProviderEvent {
         result: Value,
         item_id: Option<String>,
     },
+    RuntimeRequest {
+        request_id: String,
+        request_kind: String,
+        title: String,
+        details: Value,
+    },
     Exited,
 }
 
@@ -200,6 +333,8 @@ pub struct CodexProvider {
     thread_id: String,
     session_id: Option<String>,
     pending_tool_requests: BTreeMap<String, Value>,
+    collaboration_mode: String,
+    collaboration_mode_payload: Option<Value>,
 }
 
 impl CodexProvider {
@@ -224,6 +359,8 @@ impl CodexProvider {
             thread_id: String::new(),
             session_id: None,
             pending_tool_requests: BTreeMap::new(),
+            collaboration_mode: config.collaboration_mode.clone(),
+            collaboration_mode_payload: None,
         };
         let initialized = provider.request("initialize", json!({
             "clientInfo": { "name": "paperclip-runnerd", "title": "Paperclip Runner", "version": "1" },
@@ -239,6 +376,16 @@ impl CodexProvider {
                 })
             })
             .collect::<Vec<_>>();
+        if config.collaboration_mode != "default" && config.collaboration_mode != "plan" {
+            return Err(LocalRunnerError::invalid(
+                "unsupported Codex collaboration mode",
+            ));
+        }
+        let permission_profile = if config.collaboration_mode == "plan" {
+            "paperclip-runner-workspace-read-only"
+        } else {
+            "paperclip-runner-workspace-only"
+        };
         let opened = if let Some(thread_id) = resume_thread_id {
             provider.request(
                 "thread/resume",
@@ -247,9 +394,9 @@ impl CodexProvider {
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": "never",
-                    "permissions": "paperclip-runner-workspace-only",
+                    "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(),
+                    "config": skillless_thread_config(&config.collaboration_mode),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -263,9 +410,9 @@ impl CodexProvider {
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": "never",
-                    "permissions": "paperclip-runner-workspace-only",
+                    "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(),
+                    "config": skillless_thread_config(&config.collaboration_mode),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -273,6 +420,43 @@ impl CodexProvider {
                 }),
             )?
         };
+        if config.collaboration_mode == "plan" {
+            let presets = provider
+                .request("collaborationMode/list", json!({}))
+                .map_err(|error| {
+                    LocalRunnerError::invalid(format!(
+                        "planning_mode_unsupported: Codex collaborationMode/list failed: {error}"
+                    ))
+                })?;
+            let preset = presets
+                .get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| {
+                    items.iter().find(|item| item.get("mode").and_then(Value::as_str) == Some("plan"))
+                })
+                .ok_or_else(|| LocalRunnerError::invalid(
+                    "planning_mode_unsupported: installed Codex app-server did not advertise a native plan preset",
+                ))?;
+            let model = preset
+                .get("model")
+                .and_then(Value::as_str)
+                .or_else(|| opened.get("model").and_then(Value::as_str))
+                .or(config.model.as_deref())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "planning_mode_unsupported: native plan preset did not resolve a model",
+                    )
+                })?;
+            provider.collaboration_mode_payload = Some(json!({
+                "mode": "plan",
+                "settings": {
+                    "model": model,
+                    "reasoning_effort": preset.get("reasoning_effort").cloned().unwrap_or(Value::Null),
+                    "developer_instructions": Value::Null,
+                }
+            }));
+        }
         provider.thread_id = opened
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -302,16 +486,25 @@ impl CodexProvider {
 
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         let thread_id = self.thread_id.clone();
-        self.request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "cwd": cwd,
-                "permissions": "paperclip-runner-workspace-only",
-                "runtimeWorkspaceRoots": [cwd],
-                "input": [{"type": "text", "text": message, "text_elements": []}],
-            }),
-        )
+        let permission_profile = if self.collaboration_mode == "plan" {
+            "paperclip-runner-workspace-read-only"
+        } else {
+            "paperclip-runner-workspace-only"
+        };
+        let mut params = json!({
+            "threadId": thread_id,
+            "cwd": cwd,
+            "permissions": permission_profile,
+            "runtimeWorkspaceRoots": [cwd],
+            "input": [{"type": "text", "text": message, "text_elements": []}],
+        });
+        if let Some(collaboration_mode) = self.collaboration_mode_payload.clone() {
+            params
+                .as_object_mut()
+                .expect("turn parameters are an object")
+                .insert("collaborationMode".to_owned(), collaboration_mode);
+        }
+        self.request("turn/start", params)
     }
 
     pub fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {

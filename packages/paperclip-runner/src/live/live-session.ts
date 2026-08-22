@@ -8,6 +8,11 @@ import type {
 } from "../drivers/codex/app-server-transport.js";
 import { redactCodexDiagnostic } from "../drivers/codex/app-server-transport.js";
 import { createSkilllessCodexThreadConfig } from "../drivers/codex/codex-app-server-driver.js";
+import {
+  resolveQualifiedAcpxProfile,
+  type QualifiedAcpxAgent,
+  type QualifiedAcpxProfile,
+} from "../drivers/acpx/qualified-profiles.js";
 import { canonicalProviderEventsFromCodex } from "../provider-events.js";
 import type {
   CapabilityFixtureInteraction,
@@ -110,9 +115,11 @@ export interface CapabilityLiveSessionConfigSnapshot {
   /** Exact model requested by the caller; omitted only for legacy interactive sessions. */
   requestedModel?: string;
   /** Safe harness identity used by server-side projections and eval metadata. */
-  provider?: "codex" | "opencode" | "claude_managed";
-  driver?: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
+  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  driver?: "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
   providerVersion?: string | null;
+  acpxAgent?: QualifiedAcpxAgent;
+  acpxProfile?: QualifiedAcpxProfile;
   managedProfile?: {
     profileId: string;
     anthropicAgentId: string;
@@ -120,6 +127,25 @@ export interface CapabilityLiveSessionConfigSnapshot {
     environmentId: string;
     betaVersion: "managed-agents-2026-04-01";
     maxSessionListCostUsd: number;
+  };
+  agentCoreProfile?: {
+    profileId: string;
+    region: string;
+    accountId: string;
+    harnessArn: string;
+    harnessVersion: string;
+    endpointArn: string;
+    endpointQualifier: string;
+    agentRuntimeArn: string;
+    memoryArn: string;
+    memoryId: string;
+    invocationRoleArn: string;
+    qualificationRevision: string;
+    eventExpiryDays: 90;
+    maxEstimatedSessionCostUsd: number;
+    maxIterations: number;
+    maxOutputTokens: number;
+    timeoutSeconds: number;
   };
   scenario: CapabilitySemanticScenarioPolicy;
   capabilities: string[];
@@ -210,6 +236,8 @@ export interface CapabilityLiveSessionSnapshot {
   semanticResult?: Record<string, CapabilityJsonValue> | null;
   status: CapabilityLiveSessionStatus;
   activeTurnId: string | null;
+  /** Latest immutable PRP attachment retained independently of the provider session. */
+  providerRunBinding?: { runId: string; turnId: string; itemId: string };
   createdAt: string;
   updatedAt: string;
   authority: CapabilityLiveAuthoritySnapshot;
@@ -242,9 +270,11 @@ export interface CapabilityLiveSessionSnapshot {
 export interface CreateCapabilityLiveSessionInput {
   seed?: CapabilityFixtureSeed | CapabilityFixtureState;
   workingDirectory?: string;
-  provider?: "codex" | "opencode" | "claude_managed";
+  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  acpxAgent?: QualifiedAcpxAgent;
   requestedModel?: string;
   managedProfile?: CapabilityLiveSessionConfigSnapshot["managedProfile"];
+  agentCoreProfile?: CapabilityLiveSessionConfigSnapshot["agentCoreProfile"];
   scenario?: CapabilitySemanticScenarioPolicy;
   capabilities?: string[];
   explicitClaims?: string[];
@@ -452,6 +482,14 @@ export function assertCapabilityLiveSessionSnapshot(
   if (authority.sessionId !== snapshot.sessionId) {
     throw new Error("capability_live_checkpoint_binding_mismatch");
   }
+  if (snapshot.providerRunBinding !== undefined) {
+    const binding = record(snapshot.providerRunBinding);
+    for (const name of ["runId", "turnId", "itemId"] as const) {
+      if (text(binding[name]).length === 0) {
+        throw new Error(`capability_live_checkpoint_corrupt: missing providerRunBinding.${name}`);
+      }
+    }
+  }
   const config = record(snapshot.config);
   const persistedProvider = config.provider;
   if (
@@ -459,13 +497,17 @@ export function assertCapabilityLiveSessionSnapshot(
     persistedProvider !== "codex" &&
     persistedProvider !== "opencode" &&
     persistedProvider !== "claude_managed"
+    && persistedProvider !== "aws_agentcore"
+    && persistedProvider !== "acpx"
   ) {
     throw new Error("capability_live_checkpoint_corrupt: invalid config.provider");
   }
   const provider = persistedProvider ?? "codex";
   const expectedDriver = provider === "opencode"
     ? "opencode_server"
-    : provider === "claude_managed" ? "claude_managed_agents_api" : "codex_app_server";
+    : provider === "claude_managed" ? "claude_managed_agents_api"
+    : provider === "aws_agentcore" ? "aws_agentcore_harness_api"
+    : provider === "acpx" ? "acpx_runtime" : "codex_app_server";
   if (config.driver !== undefined && config.driver !== expectedDriver) {
     throw new Error("capability_live_checkpoint_corrupt: provider/driver mismatch");
   }
@@ -480,8 +522,18 @@ export function assertCapabilityLiveSessionSnapshot(
     if (provider === "opencode" && !requestedModel.includes("/")) {
       throw new Error("capability_live_checkpoint_corrupt: invalid OpenCode model");
     }
-  } else if (provider === "opencode" || provider === "claude_managed") {
-    throw new Error(`capability_live_checkpoint_corrupt: missing ${provider === "opencode" ? "OpenCode" : "Claude Agent"} model`);
+  } else if (provider === "opencode" || provider === "claude_managed" || provider === "aws_agentcore" || provider === "acpx") {
+    throw new Error(`capability_live_checkpoint_corrupt: missing ${provider === "opencode" ? "OpenCode" : provider === "claude_managed" ? "Claude Agent" : provider === "aws_agentcore" ? "AWS AgentCore" : "ACPX"} model`);
+  }
+  if (provider === "acpx") {
+    const agent = config.acpxAgent;
+    if (agent !== "pi" && agent !== "claude" && agent !== "codex") {
+      throw new Error("capability_live_checkpoint_corrupt: invalid config.acpxAgent");
+    }
+    const expected = resolveQualifiedAcpxProfile(agent, text(config.requestedModel));
+    if (JSON.stringify(record(config.acpxProfile)) !== JSON.stringify(expected)) {
+      throw new Error("capability_live_checkpoint_corrupt: ACPX profile drift");
+    }
   }
   if (provider === "claude_managed") {
     const profile = record(config.managedProfile);
@@ -495,6 +547,20 @@ export function assertCapabilityLiveSessionSnapshot(
     }
     if (typeof profile.maxSessionListCostUsd !== "number" || profile.maxSessionListCostUsd <= 0) {
       throw new Error("capability_live_checkpoint_corrupt: invalid managed session spend ceiling");
+    }
+  }
+  if (provider === "aws_agentcore") {
+    const profile = record(config.agentCoreProfile);
+    for (const field of ["profileId", "region", "accountId", "harnessArn", "harnessVersion", "endpointArn", "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn", "qualificationRevision"] as const) {
+      if (text(profile[field]).trim().length === 0) {
+        throw new Error(`capability_live_checkpoint_corrupt: missing agentCoreProfile.${field}`);
+      }
+    }
+    if (profile.eventExpiryDays !== 90) throw new Error("capability_live_checkpoint_corrupt: invalid AgentCore Memory expiry");
+    for (const field of ["maxIterations", "maxOutputTokens", "timeoutSeconds"] as const) {
+      if (!Number.isSafeInteger(profile[field]) || Number(profile[field]) <= 0) {
+        throw new Error(`capability_live_checkpoint_corrupt: invalid agentCoreProfile.${field}`);
+      }
     }
   }
   if (
@@ -700,6 +766,9 @@ export class CapabilityLiveSessionService {
     const state = port.snapshot();
     const sessionId = input.sessionId ?? randomUUID();
     const runId = input.runId ?? randomUUID();
+    const acpxProfile = input.provider === "acpx"
+      ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", requireNonEmpty(input.requestedModel ?? "", "requested_model"))
+      : null;
     const capabilities = [...(input.capabilities ?? [])];
     const scenario = input.scenario ?? { id: "capability-live-default" };
     const authority: CapabilityLiveAuthoritySnapshot = {
@@ -733,11 +802,20 @@ export class CapabilityLiveSessionService {
         provider: input.provider ?? "codex",
         driver: input.provider === "opencode"
           ? "opencode_server"
-          : input.provider === "claude_managed" ? "claude_managed_agents_api" : "codex_app_server",
+          : input.provider === "claude_managed" ? "claude_managed_agents_api"
+          : input.provider === "aws_agentcore" ? "aws_agentcore_harness_api"
+          : input.provider === "acpx" ? "acpx_runtime" : "codex_app_server",
         providerVersion: input.provider === "opencode"
           ? "1.18.17"
-          : input.provider === "claude_managed" ? "managed-agents-2026-04-01" : null,
+          : input.provider === "claude_managed" ? "managed-agents-2026-04-01"
+          : input.provider === "aws_agentcore" ? input.agentCoreProfile?.harnessVersion ?? null
+          : input.provider === "acpx" ? acpxProfile!.acpxVersion : null,
+        ...(acpxProfile === null ? {} : {
+          acpxAgent: acpxProfile.agent,
+          acpxProfile: structuredClone(acpxProfile),
+        }),
         ...(input.managedProfile === undefined ? {} : { managedProfile: structuredClone(input.managedProfile) }),
+        ...(input.agentCoreProfile === undefined ? {} : { agentCoreProfile: structuredClone(input.agentCoreProfile) }),
         ...(input.requestedModel === undefined
           ? {}
           : { requestedModel: requireNonEmpty(input.requestedModel, "requested_model") }),
@@ -946,6 +1024,7 @@ export class CapabilityLiveSession {
   #providerModel: { id: string; provider: string } | undefined;
   #status: CapabilityLiveSessionStatus = "starting";
   #activeTurnId: string | null = null;
+  #providerRunBinding: { runId: string; turnId: string; itemId: string } | null;
   #revision = 0;
   #updatedAt: string;
   #entryCounter = 0;
@@ -955,7 +1034,14 @@ export class CapabilityLiveSession {
   readonly #listeners = new Set<CapabilityLiveTurnListener>();
   #eventSeq = 0;
   #turnEventCount = 0;
-  readonly #rawUsageByTurn = new Map<string, { providerRequests: number; inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningTokens: number }>();
+  readonly #rawUsageByTurn = new Map<string, {
+    providerRequests: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    reasoningTokens: number;
+    costNanodollars: number;
+  }>();
   #latestCumulativeUsage: Record<string, unknown> = {};
   #idleTimer: ReturnType<typeof setTimeout> | null = null;
   readonly #loadedOperationIds = new Set<string>();
@@ -1005,6 +1091,9 @@ export class CapabilityLiveSession {
       ? undefined
       : structuredClone(options.snapshot.providerModel);
     this.#activeTurnId = options.snapshot?.activeTurnId ?? null;
+    this.#providerRunBinding = options.snapshot?.providerRunBinding === undefined
+      ? null
+      : structuredClone(options.snapshot.providerRunBinding);
     this.#revision = options.snapshot?.revision ?? 0;
     this.#entryCounter = this.#transcript.length + this.#evidence.length;
   }
@@ -1149,6 +1238,9 @@ export class CapabilityLiveSession {
         : { providerModel: structuredClone(this.#providerModel) }),
       status: this.#status,
       activeTurnId: this.#activeTurnId,
+      ...(this.#providerRunBinding === null
+        ? {}
+        : { providerRunBinding: structuredClone(this.#providerRunBinding) }),
       createdAt: this.#createdAt,
       updatedAt: this.#updatedAt,
       authority: structuredClone(this.#authority),
@@ -1238,6 +1330,20 @@ export class CapabilityLiveSession {
     if (this.#activeTurnId !== null || this.#turnWaiter !== null) {
       throw new Error("Capability live session already has an active turn");
     }
+    if (this.#terminalTurns.length > 0) {
+      if (this.#transport.attachRun === undefined) {
+        throw new Error("capability_live_multi_run_attachment_unavailable");
+      }
+      const bindingId = randomUUID().replaceAll("-", "");
+      const binding = {
+        runId: `run_lab_${bindingId}`,
+        turnId: `turn_lab_${bindingId}`,
+        itemId: `item_lab_${bindingId}`,
+      };
+      await this.#transport.attachRun(binding);
+      this.#providerRunBinding = binding;
+      await this.#persist();
+    }
     this.#status = "running";
     this.#clearIdleTimer();
     this.#turnEventCount = 0;
@@ -1322,7 +1428,7 @@ export class CapabilityLiveSession {
         },
       });
     }
-    await this.#captureTurnUsage(result.turnId);
+    await this.#captureTurnUsage(result.turnId, result.status !== "completed");
     await this.#persist();
     await this.#afterTurnSettled();
     return { ...result, snapshot: this.snapshot() };
@@ -1356,7 +1462,7 @@ export class CapabilityLiveSession {
     }, timeoutMs);
   }
 
-  async #captureTurnUsage(turnId: string): Promise<void> {
+  async #captureTurnUsage(turnId: string, allowEmpty = false): Promise<void> {
     if (this.#transport === null) throw new Error("capability_live_usage_transport_missing");
     // Codex can emit rawResponse/completed immediately after turn/completed.
     // Give the notification pump a short bounded window before falling back to
@@ -1390,7 +1496,7 @@ export class CapabilityLiveSession {
       cachedInputTokens: integer("cachedInputTokens", "cached_input_tokens"),
       reasoningTokens: integer("reasoningOutputTokens", "reasoningTokens", "reasoning_output_tokens"),
     };
-    if (cumulative.inputTokens + cumulative.outputTokens === 0) {
+    if (cumulative.inputTokens + cumulative.outputTokens === 0 && captured === undefined && !allowEmpty) {
       throw new Error(`capability_live_usage_missing:${JSON.stringify({
         captured: captured !== undefined,
         readKeys: Object.keys(read).sort(),
@@ -1417,7 +1523,7 @@ export class CapabilityLiveSession {
       outputTokens: delta.outputTokens,
       cachedInputTokens: delta.cachedInputTokens,
       reasoningTokens: delta.reasoningTokens,
-      costNanodollars: 0,
+      costNanodollars: captured?.costNanodollars ?? 0,
     });
   }
 
@@ -1526,14 +1632,15 @@ export class CapabilityLiveSession {
   }
 
   async increaseManagedSessionBudget(maxSessionListCostUsd: number): Promise<CapabilityLiveSessionSnapshot> {
-    if (this.#config.provider !== "claude_managed" || this.#transport === null) {
-      throw new Error("managed session budget updates require a connected Claude Agent session");
+    if ((this.#config.provider !== "claude_managed" && this.#config.provider !== "aws_agentcore") || this.#transport === null) {
+      throw new Error("remote session budget updates require a connected remote provider session");
     }
     if (!Number.isFinite(maxSessionListCostUsd) || maxSessionListCostUsd <= 0) {
       throw new Error("managed session spend ceiling must be positive");
     }
     await this.#transport.request("session/budget/increase", { maxSessionListCostUsd });
     if (this.#config.managedProfile) this.#config.managedProfile.maxSessionListCostUsd = maxSessionListCostUsd;
+    if (this.#config.agentCoreProfile) this.#config.agentCoreProfile.maxEstimatedSessionCostUsd = maxSessionListCostUsd;
     this.#status = this.#activeTurnId === null ? "warm_idle" : "running";
     this.#appendEvidence("session", this.#activeTurnId, {
       action: "budget_increased",
@@ -1544,8 +1651,8 @@ export class CapabilityLiveSession {
   }
 
   async deleteManagedRemoteSession(): Promise<CapabilityLiveSessionSnapshot> {
-    if (this.#config.provider !== "claude_managed" || this.#transport === null) {
-      throw new Error("remote session deletion requires a connected Claude Agent session");
+    if ((this.#config.provider !== "claude_managed" && this.#config.provider !== "aws_agentcore") || this.#transport === null) {
+      throw new Error("remote session deletion requires a connected remote provider session");
     }
     if (this.#activeTurnId !== null) {
       throw new Error("interrupt the active turn before deleting the remote session");
@@ -1650,13 +1757,28 @@ export class CapabilityLiveSession {
   async #connect(resume: boolean): Promise<void> {
     this.#status = resume ? "restoring" : "starting";
     const identityDigest = createHash("sha256").update(this.id).digest("hex").slice(0, 20);
+    const providerRunBinding = this.#providerRunBinding ?? {
+      runId: this.#authority.runId,
+      turnId: `turn_lab_${identityDigest}`,
+      itemId: `item_lab_${identityDigest}`,
+    };
+    this.#providerRunBinding = providerRunBinding;
     const transportBundle = this.#transportFactory({
       ...this.#transportOptions,
       provider: this.#config.provider ?? this.#transportOptions.provider ?? "codex",
+      ...(this.#config.provider === "acpx" && this.#config.acpxAgent ? {
+        acpxAgent: this.#config.acpxAgent,
+      } : {}),
       ...(this.#config.provider === "claude_managed" && this.#config.managedProfile ? {
         managedProfile: {
           ...this.#config.managedProfile,
           model: this.#config.requestedModel ?? "claude-sonnet-5",
+        },
+      } : {}),
+      ...(this.#config.provider === "aws_agentcore" && this.#config.agentCoreProfile ? {
+        agentCoreProfile: {
+          ...this.#config.agentCoreProfile,
+          model: this.#config.requestedModel ?? "global.anthropic.claude-sonnet-4-6",
         },
       } : {}),
       lifecyclePolicy: this.#config.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
@@ -1664,10 +1786,10 @@ export class CapabilityLiveSession {
       prpIdentity: {
         runnerInstanceId: `runner_lab_${identityDigest}`,
         environmentLeaseId: `lease_lab_${identityDigest}`,
-        runId: this.#authority.runId,
+        runId: providerRunBinding.runId,
         normalizedSessionId: this.id,
-        turnId: `turn_lab_${identityDigest}`,
-        itemId: `item_lab_${identityDigest}`,
+        turnId: providerRunBinding.turnId,
+        itemId: providerRunBinding.itemId,
       },
       onDiagnostic: (message) => {
         this.#transportOptions.onDiagnostic?.(message);
@@ -1810,6 +1932,9 @@ export class CapabilityLiveSession {
       runnerExited: this.#processEvidence?.runnerExited ?? true,
       runnerPid: this.#processEvidence?.runnerPid ?? null,
       codexPid: this.#processEvidence?.codexPid ?? null,
+      providerPid: this.#processEvidence?.providerPid ?? null,
+      sidecarPid: this.#processEvidence?.sidecarPid ?? null,
+      agentPid: this.#processEvidence?.agentPid ?? null,
     });
   }
 
@@ -1990,6 +2115,29 @@ export class CapabilityLiveSession {
       this.#latestCumulativeUsage = record(
         tokenUsage.total ?? tokenUsage.totalTokenUsage ?? tokenUsage.total_token_usage ?? tokenUsage,
       );
+      const runDelta = record(tokenUsage.runDelta ?? params.runDelta);
+      if (turnId.length > 0 && Object.keys(runDelta).length > 0) {
+        const integer = (...names: string[]): number => {
+          for (const name of names) {
+            const value = runDelta[name];
+            if (Number.isSafeInteger(value) && Number(value) >= 0) return Number(value);
+          }
+          return 0;
+        };
+        const providerCostUsd = typeof runDelta.providerCostUsd === "number"
+          && Number.isFinite(runDelta.providerCostUsd)
+          && runDelta.providerCostUsd >= 0
+          ? runDelta.providerCostUsd
+          : 0;
+        this.#rawUsageByTurn.set(turnId, {
+          providerRequests: integer("requests", "providerRequests"),
+          inputTokens: integer("inputTokens", "input_tokens"),
+          outputTokens: integer("outputTokens", "output_tokens"),
+          cachedInputTokens: integer("cacheReadTokens", "cachedInputTokens", "cache_read_input_tokens"),
+          reasoningTokens: integer("reasoningTokens", "reasoning_tokens"),
+          costNanodollars: Math.round(providerCostUsd * 1_000_000_000),
+        });
+      }
     }
     this.#appendEvidence("provider_event", turnId || null, {
       method: notification.method,
@@ -2005,13 +2153,14 @@ export class CapabilityLiveSession {
         const previous = this.#rawUsageByTurn.get(usageTurnId);
         const value = (name: string): number => Number.isSafeInteger(rawUsage[name]) && Number(rawUsage[name]) >= 0 ? Number(rawUsage[name]) : 0;
         if (notification.method === "rawResponse/completed") {
-          const base = previous ?? { providerRequests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+          const base = previous ?? { providerRequests: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, costNanodollars: 0 };
           this.#rawUsageByTurn.set(usageTurnId, {
             providerRequests: base.providerRequests + 1,
             inputTokens: base.inputTokens + value("inputTokens"),
             outputTokens: base.outputTokens + value("outputTokens"),
             cachedInputTokens: base.cachedInputTokens + value("cachedInputTokens"),
             reasoningTokens: base.reasoningTokens + value("reasoningOutputTokens"),
+            costNanodollars: base.costNanodollars,
           });
         } else if (previous === undefined) {
           // Some provider versions publish only a terminal per-turn receipt.
@@ -2021,6 +2170,7 @@ export class CapabilityLiveSession {
             outputTokens: value("outputTokens"),
             cachedInputTokens: value("cachedInputTokens"),
             reasoningTokens: value("reasoningOutputTokens"),
+            costNanodollars: 0,
           });
         }
       }

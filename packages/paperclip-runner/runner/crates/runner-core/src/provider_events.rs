@@ -86,13 +86,35 @@ pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, V
             _ => "process",
         };
         let mut payload = json!({"schema":"paperclip.tool.execution.v1","executionId":item_id,"transport":transport,"operation":if kind == "commandExecution" {"execute"} else {"unknown"},"name":item.get("tool").or_else(|| item.get("command")).and_then(Value::as_str),"target":Value::Null,"namespace":item.get("server").and_then(Value::as_str),"readOnly":item.get("readOnlyHint").and_then(Value::as_bool),"status":status(text(item.get("status")), complete),"durationMs":item.get("durationMs").and_then(Value::as_u64),"exitCode":item.get("exitCode").and_then(Value::as_i64),"progress":Value::Null});
-        if let (Some(object), Value::Object(output)) = (
-            payload.as_object_mut(),
-            bounded_output(text(
+        if let Some(object) = payload.as_object_mut() {
+            if item.get("outputBytes").and_then(Value::as_u64).is_some()
+                && item
+                    .get("outputTruncated")
+                    .and_then(Value::as_bool)
+                    .is_some()
+                && item.get("outputDigest").and_then(Value::as_str).is_some()
+            {
+                object.insert(
+                    "output".to_owned(),
+                    item.get("aggregatedOutput").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "outputBytes".to_owned(),
+                    item.get("outputBytes").cloned().unwrap_or(json!(0)),
+                );
+                object.insert(
+                    "outputTruncated".to_owned(),
+                    item.get("outputTruncated").cloned().unwrap_or(json!(false)),
+                );
+                object.insert(
+                    "outputDigest".to_owned(),
+                    item.get("outputDigest").cloned().unwrap_or(Value::Null),
+                );
+            } else if let Value::Object(output) = bounded_output(text(
                 item.get("aggregatedOutput").or_else(|| item.get("output")),
-            )),
-        ) {
-            object.extend(output);
+            )) {
+                object.extend(output);
+            }
         }
         push(
             &mut result,

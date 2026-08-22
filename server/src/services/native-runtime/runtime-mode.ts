@@ -19,7 +19,7 @@ export type NativeRuntimeResolution =
       reason: "eligible_opt_in";
       profile: {
         mode: "native";
-        backend: "codex_app_server" | "opencode_server" | "claude_managed_agents_api";
+        backend: "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
         protocolVersion: 1;
       };
       authorityDecision: NativeStatusDecision;
@@ -51,8 +51,8 @@ export function resolveNativeRuntimeMode(input: {
   const nativeRunner = record(record(input.runtimeConfig).nativeRunner);
   const runnerAdapterSelected = input.agent.adapterType === "paperclip_runner";
   const runnerProvider = record(input.adapterConfig).provider ?? "codex";
-  if (runnerAdapterSelected && !["codex", "opencode", "claude_managed"].includes(String(runnerProvider))) {
-    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex, opencode, or claude_managed");
+  if (runnerAdapterSelected && !["codex", "opencode", "claude_managed", "aws_agentcore", "acpx"].includes(String(runnerProvider))) {
+    throw new NativeRuntimeEligibilityError("paperclip_runner provider must be codex, opencode, claude_managed, aws_agentcore, or acpx");
   }
   if (runnerAdapterSelected && runnerProvider === "opencode") {
     const model = record(input.adapterConfig).model;
@@ -73,6 +73,39 @@ export function resolveNativeRuntimeMode(input: {
     const cap = Number(config.maxSessionListCostUsd);
     if (!Number.isFinite(cap) || cap <= 0) {
       throw new NativeRuntimeEligibilityError("paperclip_runner Claude Agent provider requires a positive spend ceiling");
+    }
+  }
+  if (runnerAdapterSelected && runnerProvider === "aws_agentcore") {
+    const config = record(input.adapterConfig);
+    for (const key of ["agentCoreProfileId", "model"]) {
+      if (typeof config[key] !== "string" || String(config[key]).trim().length === 0) {
+        throw new NativeRuntimeEligibilityError(`paperclip_runner AWS AgentCore provider requires ${key}`);
+      }
+    }
+    if (config.agentCoreRetentionAcknowledged !== true) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner AWS AgentCore provider requires the 90-day retention acknowledgement");
+    }
+    const cap = Number(config.maxEstimatedSessionCostUsd);
+    if (!Number.isFinite(cap) || cap <= 0) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner AWS AgentCore provider requires a positive estimated spend ceiling");
+    }
+  }
+  if (runnerAdapterSelected && runnerProvider === "acpx") {
+    const config = record(input.adapterConfig);
+    const agent = config.acpxAgent;
+    if (agent !== "pi" && agent !== "claude" && agent !== "codex") {
+      throw new NativeRuntimeEligibilityError("paperclip_runner ACPX provider requires acpxAgent pi, claude, or codex");
+    }
+    if (typeof config.model !== "string" || config.model.trim().length === 0) {
+      throw new NativeRuntimeEligibilityError("paperclip_runner ACPX provider requires an exact model");
+    }
+    const qualifiedModel = agent === "pi"
+      ? "openrouter/deepseek/deepseek-v4-flash-0731"
+      : agent === "claude"
+        ? "claude-sonnet-5"
+        : "gpt-5.6-sol";
+    if (config.model !== qualifiedModel) {
+      throw new NativeRuntimeEligibilityError(`paperclip_runner ACPX ${agent} profile requires model ${qualifiedModel}`);
     }
   }
   const mode = runnerAdapterSelected ? "native" : nativeRunner.mode;
@@ -105,11 +138,14 @@ export function resolveNativeRuntimeMode(input: {
   ) {
     throw new NativeRuntimeEligibilityError("agent must be an active Codex-backed native agent");
   }
-  if (!input.issue || input.issue.workMode !== "standard") {
-    throw new NativeRuntimeEligibilityError("run must be bound to a standard issue");
+  if (!input.issue || !["standard", "planning"].includes(input.issue.workMode)) {
+    throw new NativeRuntimeEligibilityError("run must be bound to a standard or planning issue");
+  }
+  if (input.issue.workMode === "planning" && !runnerAdapterSelected) {
+    throw new NativeRuntimeEligibilityError("native planning requires the paperclip_runner adapter");
   }
   if (
-    (!input.workspaceId && !runnerAdapterSelected && runnerProvider !== "claude_managed")
+    (!input.workspaceId && !runnerAdapterSelected && runnerProvider !== "claude_managed" && runnerProvider !== "aws_agentcore")
     || input.target?.kind && input.target.kind !== "local"
   ) {
     throw new NativeRuntimeEligibilityError("a realized local workspace is required");
@@ -132,6 +168,10 @@ export function resolveNativeRuntimeMode(input: {
         ? "opencode_server"
         : runnerProvider === "claude_managed"
           ? "claude_managed_agents_api"
+          : runnerProvider === "aws_agentcore"
+            ? "aws_agentcore_harness_api"
+          : runnerProvider === "acpx"
+            ? "acpx_runtime"
           : "codex_app_server",
       protocolVersion: 1,
     },
@@ -171,6 +211,10 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
             ? "opencode_server"
             : input.persisted.driverKind === "claude_managed_agents_api"
               ? "claude_managed_agents_api"
+              : input.persisted.driverKind === "aws_agentcore_harness_api"
+                ? "aws_agentcore_harness_api"
+              : input.persisted.driverKind === "acpx_runtime"
+                ? "acpx_runtime"
               : "codex_app_server",
           protocolVersion: 1,
         },

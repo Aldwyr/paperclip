@@ -42,10 +42,13 @@ export interface CapabilityCleanRoomIdentity {
 }
 
 export interface CapabilityHarnessConfiguration {
-  provider: "codex" | "opencode" | "claude_managed";
+  provider: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   model: string | null;
+  acpxAgent?: "pi" | "claude" | "codex";
   managedProfileId?: string | null;
   maxSessionListCostUsd?: number | null;
+  agentCoreProfileId?: string | null;
+  maxEstimatedSessionCostUsd?: number | null;
   lifecyclePolicy:
     | { mode: "per_turn"; idleTimeoutMs: null }
     | { mode: "warm"; idleTimeoutMs: number };
@@ -60,6 +63,20 @@ export interface CapabilityLiveResponse {
   limits?: { maxTurns: number; maxMessageBytes: number };
   turns?: number;
   configuration?: CapabilityHarnessConfiguration;
+  runtime?: {
+    providerSessionId: string | null;
+    driverSessionId?: string | null;
+    runnerPid: number | null;
+    providerPid: number | null;
+    sidecarPid?: number | null;
+    agentPid?: number | null;
+    providerVersion?: string | null;
+    agentServerVersion?: string | null;
+    agentRuntimeVersion?: string | null;
+    acpProtocolVersion?: number | null;
+    executionKind: "local_process" | "remote_service";
+    status: string;
+  };
 }
 
 export interface CapabilityToolTestResponse extends CapabilityLiveResponse {
@@ -175,9 +192,14 @@ export const capabilityLiveClient = {
     const query = new URLSearchParams({ provider: configuration.provider });
     if (sessionId !== null) query.set("sessionId", sessionId);
     if (configuration.model !== null) query.set("model", configuration.model);
+    if (configuration.acpxAgent) query.set("acpxAgent", configuration.acpxAgent);
     if (configuration.managedProfileId) query.set("managedProfileId", configuration.managedProfileId);
     if (configuration.maxSessionListCostUsd !== null && configuration.maxSessionListCostUsd !== undefined) {
       query.set("maxSessionListCostUsd", String(configuration.maxSessionListCostUsd));
+    }
+    if (configuration.agentCoreProfileId) query.set("agentCoreProfileId", configuration.agentCoreProfileId);
+    if (configuration.maxEstimatedSessionCostUsd !== null && configuration.maxEstimatedSessionCostUsd !== undefined) {
+      query.set("maxEstimatedSessionCostUsd", String(configuration.maxEstimatedSessionCostUsd));
     }
     query.set("lifecycleMode", configuration.lifecyclePolicy.mode);
     if (configuration.lifecyclePolicy.mode === "warm") {

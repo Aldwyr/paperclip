@@ -9,6 +9,7 @@ export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
 export * from "./backends/codex-native-backend.js";
 export * from "./backends/opencode-native-backend.js";
+export * from "./backends/acpx-native-backend.js";
 export * from "./backends/native-backend-factory.js";
 export * from "./native-session-runtime.js";
 export * from "./provider-events.js";
@@ -20,6 +21,11 @@ export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
 export * from "./drivers/opencode/opencode-server-driver.js";
 export * from "./drivers/opencode/mcp-bridge.js";
+export * from "./drivers/acpx/qualified-profiles.js";
+export * from "./drivers/acpx/acpx-runtime-host.js";
+export * from "./drivers/acpx/acpx-runtime-driver.js";
+export * from "./drivers/acpx/sidecar-protocol.js";
+export * from "./drivers/runner-tool-bridge.js";
 export {
   createRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
