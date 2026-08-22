@@ -1,12 +1,17 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { RequestConfirmationInteraction } from "@/lib/issue-thread-interactions";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { IssueThreadInteraction, RequestConfirmationInteraction } from "@/lib/issue-thread-interactions";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { expiredSecretProposalInteraction } from "@/fixtures/issueThreadInteractionFixtures";
+import {
+  expiredSecretProposalInteraction,
+  pendingAskUserQuestionsInteraction,
+  pendingRequestItemVerdictsInteraction,
+} from "@/fixtures/issueThreadInteractionFixtures";
 import { TaskChatInteractionCard } from "./TaskChatInteractionCard";
 import { TaskChatThreadView } from "./TaskChatThreadView";
 import type { TaskChatInteractionItem } from "./task-chat-model";
@@ -46,7 +51,7 @@ function createRequestConfirmation(
 }
 
 function interactionItem(
-  interaction: RequestConfirmationInteraction,
+  interaction: IssueThreadInteraction,
 ): TaskChatInteractionItem {
   return { id: `interaction:${interaction.id}`, kind: "interaction", interaction };
 }
@@ -82,7 +87,7 @@ describe("TaskChatInteractionCard", () => {
     expect(container.textContent).toContain("Approve the plan");
   });
 
-  it("puts the primary CTA on the right via a reversed action row", () => {
+  it("puts the primary CTA at the right edge of the compact action row", () => {
     flushSync(() => {
       root.render(
         <TooltipProvider>
@@ -99,7 +104,77 @@ describe("TaskChatInteractionCard", () => {
     expect(reject).not.toBeUndefined();
     const row = approve?.parentElement;
     expect(row).toBe(reject?.parentElement);
-    expect(row?.className).toContain("flex-row-reverse");
+    expect(Array.from(row?.querySelectorAll("button") ?? []).at(-1)).toBe(approve);
+    expect(container.textContent).not.toContain("proposed by");
+    expect(container.textContent).not.toContain("Review and approve the latest plan.");
+  });
+
+  it("shows one question at a time and preserves answers across pages", async () => {
+    const submit = vi.fn();
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(pendingAskUserQuestionsInteraction)}
+              onSubmitInteractionAnswers={submit}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Question 1 of 2");
+    expect(container.textContent).toContain("How aggressive should");
+    expect(container.textContent).not.toContain("What should the answered-state card emphasize");
+
+    const firstAnswer = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Only collapse hidden descendants"));
+    await act(async () => firstAnswer?.click());
+    const next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Next");
+    await act(async () => next?.click());
+
+    expect(container.textContent).toContain("Question 2 of 2");
+    expect(container.textContent).toContain("What should the answered-state card emphasize");
+    expect(container.textContent).not.toContain("How aggressive should");
+
+    const secondAnswer = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Inline answer pills"));
+    await act(async () => secondAnswer?.click());
+    const send = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Send answers");
+    await act(async () => send?.click());
+
+    expect(submit).toHaveBeenCalledOnce();
+    expect(submit.mock.calls[0]?.[1]).toEqual([
+      { questionId: "collapse-depth", optionIds: ["visible-root"] },
+      { questionId: "post-submit-summary", optionIds: ["answers-inline"] },
+    ]);
+  });
+
+  it("paginates item verdicts instead of expanding the whole review set", async () => {
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(pendingRequestItemVerdictsInteraction)}
+              onSubmitInteractionVerdicts={() => undefined}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("Item 1 of 5");
+    expect(container.textContent).toContain("Spring launch recap");
+    expect(container.textContent).not.toContain("Monthly changelog digest");
+
+    const approve = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "approve");
+    await act(async () => approve?.click());
+    const next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Next");
+    await act(async () => next?.click());
+
+    expect(container.textContent).toContain("Item 2 of 5");
+    expect(container.textContent).toContain("Monthly changelog digest");
+    expect(container.textContent).not.toContain("Spring launch recap");
   });
 
   it("demotes an expired confirmation to a marker row", () => {

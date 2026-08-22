@@ -350,12 +350,17 @@ function RuntimeRequestCard({ item, onDecision }: { item: TaskChatRuntimeRequest
             <Button type="submit" size="sm" disabled={!onDecision || submitting || !canSubmitInput}>
               {submitting ? "Submitting…" : "Submit response"}
             </Button>
+            {item.choices.some((choice) => choice.key === "decline") ? (
+              <Button type="button" size="sm" variant="outline" disabled={!onDecision || submitting} onClick={() => void submit({ action: "decline" })}>
+                Deny
+              </Button>
+            ) : null}
             <Button type="button" size="sm" variant="outline" disabled={!onDecision || submitting} onClick={() => void submit({ action: "cancel" })}>
               Cancel
             </Button>
           </div>
         </form>
-      ) : item.choices.length > 0 ? (
+      ) : item.status === "pending" && item.choices.length > 0 ? (
         <div className="flex flex-wrap gap-2">
           {item.choices.map((choice) => (
             <Button

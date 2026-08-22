@@ -2,10 +2,10 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TaskChatRunnerTurn } from "./TaskChatRunnerTurn";
-import type { TaskChatItem } from "./task-chat-model";
+import type { TaskChatItem, TaskChatRuntimeRequestDecision, TaskChatRuntimeRequestItem } from "./task-chat-model";
 
 describe("TaskChatRunnerTurn", () => {
   let container: HTMLDivElement;
@@ -22,9 +22,14 @@ describe("TaskChatRunnerTurn", () => {
     container.remove();
   });
 
-  const render = (items: TaskChatItem[], status = "running", runId = "run-1") => act(() => root.render(
+  const render = (
+    items: TaskChatItem[],
+    status = "running",
+    runId = "run-1",
+    onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void,
+  ) => act(() => root.render(
     <ThemeProvider>
-      <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} />
+      <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} toolSummary={null} onRuntimeRequestDecision={onRuntimeRequestDecision} />
     </ThemeProvider>,
   ));
 
@@ -102,5 +107,30 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.textContent).not.toContain("Turn started");
     expect(container.textContent).not.toContain("Turn completed");
     expect(container.textContent).not.toContain("10,520");
+  });
+
+  it("keeps a pending runtime request actionable while the run history is folded", async () => {
+    const onDecision = vi.fn();
+    render([{
+      id: "request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-1",
+      requestKind: "command_approval",
+      turnId: "turn-1",
+      requestType: "permission",
+      status: "pending",
+      prompt: "Allow command?",
+      choices: [{ key: "accept", label: "Allow once" }],
+      fields: [],
+    }], "running", "run-1", onDecision);
+
+    const cards = Array.from(container.querySelectorAll('[data-testid="task-chat-runtime-request"]'));
+    const visibleCard = cards.find((card) => card.closest(".tc-turn-fold") === null);
+    expect(visibleCard).toBeDefined();
+    const button = Array.from(visibleCard!.querySelectorAll("button")).find((candidate) => candidate.textContent === "Allow once");
+    await act(async () => button?.click());
+    expect(onDecision).toHaveBeenCalledWith(expect.objectContaining({ requestId: "request-1" }), { action: "accept" });
   });
 });

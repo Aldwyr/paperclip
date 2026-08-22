@@ -74,6 +74,9 @@ export function TaskChatRunnerTurn({
       && item.surface === "runtime_request"
       && item.status === "pending",
   );
+  const visibleHistoryItems = pendingRuntimeRequest
+    ? historyItems.filter((item) => item.id !== pendingRuntimeRequest.id)
+    : historyItems;
   const progress = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && Boolean(item.interstitial));
   const observedFinal = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
   // A reconnect/replay can briefly rebuild the transcript without the final
@@ -117,28 +120,28 @@ export function TaskChatRunnerTurn({
         <div>
           <div className="flex flex-col gap-2 py-2">
             <TaskChatLiveTail
-              items={historyItems}
+              items={visibleHistoryItems}
               excludeFinal
               onRuntimeRequestDecision={onRuntimeRequestDecision}
             />
           </div>
         </div>
       </div>
-      {!open ? (
+      {!open && progress ? (
         <div className="flex min-w-0 flex-col py-1">
-          {progress ? (
-            <div className="tc-enter-cot-line min-w-0 px-1 py-1.5 text-sm text-foreground/90" data-testid="task-chat-progress-update">
-              <MarkdownBody softBreaks linkIssueReferences>{progress.text}</MarkdownBody>
-            </div>
-          ) : null}
-          {pendingRuntimeRequest ? (
-            <TaskChatProtocolCard
-              item={pendingRuntimeRequest}
-              onRuntimeRequestDecision={onRuntimeRequestDecision}
-            />
-          ) : !final ? <CurrentActivity items={items} /> : null}
+          <div className="tc-enter-cot-line min-w-0 px-1 py-1.5 text-sm text-foreground/90" data-testid="task-chat-progress-update">
+            <MarkdownBody softBreaks linkIssueReferences>{progress.text}</MarkdownBody>
+          </div>
         </div>
       ) : null}
+      {pendingRuntimeRequest ? (
+        <div className="py-1">
+          <TaskChatProtocolCard
+            item={pendingRuntimeRequest}
+            onRuntimeRequestDecision={onRuntimeRequestDecision}
+          />
+        </div>
+      ) : !open && !final ? <CurrentActivity items={items} /> : null}
       {final ? (
         <div className="tc-enter-bubble w-full" data-testid="task-chat-final-response">
           <div className="break-words px-1 py-2 text-sm text-foreground" data-testid="task-chat-agent-bubble">

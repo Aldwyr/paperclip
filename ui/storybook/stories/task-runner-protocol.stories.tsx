@@ -93,6 +93,19 @@ const resultEvents = [
   prp("run.terminal", { turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "needs_review" }),
 ];
 
+const runtimeInputEvent = prp("runtime_request.created", {
+  request: {
+    requestId: "request-input",
+    requestKind: "user_input",
+    turnId: "turn-1",
+    type: "item/tool/requestUserInput",
+    status: "pending",
+    prompt: "Which environment should the verification target?",
+    details: { fields: [{ name: "environment", label: "Environment", placeholder: "staging" }] },
+    actions: ["submit", "decline", "cancel"],
+  },
+});
+
 function TaskPageFrame({ children, composerDisabledReason }: { children: ReactNode; composerDisabledReason?: string }) {
   return (
     <main className="min-h-screen bg-background p-4 text-foreground">
@@ -125,6 +138,13 @@ function RuntimeRequestStory() {
   const [items, setItems] = useState(initial);
   const resolve = (request: TaskChatRuntimeRequestItem) => setItems((current) => current.map((item) => item.id === request.id && item.kind === "protocol" && item.surface === "runtime_request" ? { ...item, status: "resolved" } : item));
   return <TaskPageFrame composerDisabledReason="Waiting for a runtime decision"><TaskChatThreadView scroll={false} header={<TaskHeader />} items={items} onRuntimeRequestDecision={resolve} /></TaskPageFrame>;
+}
+
+function RuntimeInputStory() {
+  const initial = useMemo(() => protocolItems([runtimeInputEvent]), []);
+  const [items, setItems] = useState(initial);
+  const resolve = (request: TaskChatRuntimeRequestItem) => setItems((current) => current.map((item) => item.id === request.id && item.kind === "protocol" && item.surface === "runtime_request" ? { ...item, status: "resolved" } : item));
+  return <TaskPageFrame composerDisabledReason="Waiting for a runtime response"><TaskChatThreadView scroll={false} header={<TaskHeader />} items={items} onRuntimeRequestDecision={resolve} /></TaskPageFrame>;
 }
 
 function InteractionStory() {
@@ -190,6 +210,14 @@ export const RuntimeRequests: Story = {
     await expect(within(canvasElement).getByTestId("task-chat-runtime-request")).toHaveTextContent("resolved");
   },
 };
+export const RuntimeInput: Story = {
+  render: () => <RuntimeInputStory />,
+  play: async ({ canvasElement }) => {
+    await userEvent.type(within(canvasElement).getByLabelText("Environment"), "production");
+    await userEvent.click(within(canvasElement).getByRole("button", { name: "Submit response" }));
+    await expect(within(canvasElement).getByTestId("task-chat-runtime-request")).toHaveTextContent("resolved");
+  },
+};
 export const Interactions: Story = { render: () => <InteractionStory /> };
 export const ResultsAndTerminalStates: Story = { render: () => <ThreadStory items={protocolItems(resultEvents.slice(1))} /> };
 export const DesktopKitchenSink: Story = {
@@ -210,9 +238,13 @@ export const PendingQuestions: Story = {
   render: () => <InteractionStory />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByText("Only collapse hidden descendants"));
-    await userEvent.click(canvas.getByText("Inline answer pills"));
-    await userEvent.click(canvas.getByRole("button", { name: "Send answers" }));
+    const questionCard = canvas.getByText("Resolve open UX decisions before Phase 1").closest("article");
+    if (!questionCard) throw new Error("Question interaction card did not render");
+    const questions = within(questionCard);
+    await userEvent.click(questions.getByText("Only collapse hidden descendants"));
+    await userEvent.click(questions.getByRole("button", { name: "Next" }));
+    await userEvent.click(questions.getByText("Inline answer pills"));
+    await userEvent.click(questions.getByRole("button", { name: "Send answers" }));
     await waitFor(() => {
       expect(canvas.queryByRole("button", { name: "Send answers" })).not.toBeInTheDocument();
       expect(

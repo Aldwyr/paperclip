@@ -115,4 +115,32 @@ describe("TaskChatProtocolCard", () => {
     await act(async () => button?.click());
     expect(onDecision).toHaveBeenCalledWith({ action: "accept" });
   });
+
+  it("submits structured runtime input through the production card", async () => {
+    const onDecision = vi.fn().mockResolvedValue(undefined);
+    renderCard(root, {
+      id: "input-request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-input",
+      requestKind: "user_input",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "pending",
+      prompt: "Which environment should the run target?",
+      choices: [],
+      fields: [{ name: "environment", label: "Environment", placeholder: "staging" }],
+    }, onDecision);
+    const textarea = container.querySelector("textarea")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(textarea, "production");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const submit = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent === "Submit response");
+    await act(async () => submit?.click());
+    expect(onDecision).toHaveBeenCalledWith({ action: "submit", values: { environment: "production" } });
+    expect(container.textContent).toContain("Submitting…");
+  });
 });
