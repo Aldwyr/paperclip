@@ -517,7 +517,7 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
                 Some("@earendil-works/pi-coding-agent"),
                 Some("0.84.2"),
                 "openrouter/deepseek/deepseek-v4-flash-0731",
-                "sha256:896d0f734998529087bc2af0854112b2064c83047c4bc59359420510abd14791",
+                "sha256:5d06b5cfe819b1acd75e8d9dea4766e76a40a64b82549eda08c3835f18bdac24",
             ),
             "claude" => (
                 "@agentclientprotocol/claude-agent-acp",

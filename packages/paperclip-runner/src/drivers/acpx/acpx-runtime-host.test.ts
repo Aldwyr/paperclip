@@ -144,7 +144,7 @@ describe("AcpxRuntimeHost", () => {
       agentSessionId: "agent-1",
       requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
       effectiveModel: "openrouter/deepseek/deepseek-v4-flash-0731",
-      profileDigest: "sha256:896d0f734998529087bc2af0854112b2064c83047c4bc59359420510abd14791",
+      profileDigest: "sha256:5d06b5cfe819b1acd75e8d9dea4766e76a40a64b82549eda08c3835f18bdac24",
     }));
     let runtimeConstructed = false;
     await expect(AcpxRuntimeHost.open({
@@ -159,7 +159,7 @@ describe("AcpxRuntimeHost", () => {
         acpxRecordId: "record-stale",
         backendSessionId: "backend-1",
         agentSessionId: "agent-1",
-        profileDigest: "sha256:896d0f734998529087bc2af0854112b2064c83047c4bc59359420510abd14791",
+        profileDigest: "sha256:5d06b5cfe819b1acd75e8d9dea4766e76a40a64b82549eda08c3835f18bdac24",
         workspaceDigest: `sha256:${createHash("sha256").update(resolve(workspace)).digest("hex")}`,
         requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731",
         effectiveModel: "openrouter/deepseek/deepseek-v4-flash-0731",
