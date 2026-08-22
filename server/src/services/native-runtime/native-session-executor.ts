@@ -123,8 +123,76 @@ export function semanticProviderPlanMarkdown(result: Record<string, unknown>): s
     const artifact = record(value);
     if (artifact.kind !== "native_provider_plan" || typeof artifact.ref !== "string") continue;
     const match = artifact.ref.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
-    const markdown = (match?.[1] ?? artifact.ref).trim();
-    if (markdown) return markdown.slice(0, 256_000);
+    const completedMarkdown = match?.[1]?.trim();
+    if (completedMarkdown) return completedMarkdown.slice(0, 256_000);
+
+    const embedded = artifact.ref.match(/^native-provider-plan:([^\n]+)\n([\s\S]+)$/i);
+    if (embedded) {
+      const title = embedded[1]!
+        .replace(/^(?:DOT-\d+-)?/i, "")
+        .replace(/-v\d+$/i, "")
+        .replace(/-/g, " ")
+        .trim();
+      const body = embedded[2]!.trim();
+      if (title && body) {
+        return [`# ${title.charAt(0).toUpperCase()}${title.slice(1)}`, "", body]
+          .join("\n")
+          .slice(0, 256_000);
+      }
+    }
+
+    if (/^\s*1\.\s+/.test(artifact.ref)) {
+      const numberedPlan = artifact.ref
+        .split(/\s+\|\s+(?=\d+\.\s+)/)
+        .join("\n")
+        .trim();
+      if (numberedPlan) return `# Plan\n\n${numberedPlan}`.slice(0, 256_000);
+    }
+
+    // Some qualified Codex builds use the artifact reference itself as a
+    // compact, human-readable plan. Accept only an explicitly numbered form;
+    // arbitrary opaque artifact references must never become plan documents.
+    const inlineNumbered = artifact.ref.trim();
+    if (/\(1\)\s+.+\(2\)\s+/s.test(inlineNumbered)) {
+      const body = inlineNumbered
+        .replace(/^DOT-\d+\s+plan:\s*/i, "")
+        .replace(/^\(1\)\s*/, "1. ")
+        .replace(/;\s*\((\d+)\)\s*/g, "\n$1. ")
+        .trim();
+      if (body) return `# Plan\n\n${body}`.slice(0, 256_000);
+    }
+
+    const compact = artifact.ref.match(/^native-provider-plan:([^#]+)#(.+)$/i)
+      ?? artifact.ref.match(/^native-plan:\/\/[^/]+\/([^#]+)#(.+)$/i);
+    if (!compact) continue;
+    const humanize = (slug: string) => slug
+      .replace(/\b(GET|POST|PUT|PATCH|DELETE)-([a-z0-9][a-z0-9-]*)/gi, (_whole, method: string, path: string) => `${method.toUpperCase()} /${path}`)
+      .replace(/-/g, " ")
+      .replace(/\bjson\b/gi, "JSON")
+      .replace(/\bapi\b/gi, "API")
+      .replace(/\s+/g, " ")
+      .trim();
+    const title = humanize(compact[1]!.replace(/-v\d+$/i, ""));
+    const steps = compact[2]!.split(";").flatMap((encoded) => {
+      const parsed = encoded.match(/^\d+-(.+)$/);
+      const sentence = humanize(parsed?.[1] ?? encoded);
+      return sentence ? [sentence.charAt(0).toUpperCase() + sentence.slice(1)] : [];
+    });
+    if (!title || steps.length === 0) continue;
+    return [`# ${title.charAt(0).toUpperCase()}${title.slice(1)}`, "", ...steps.map((step, index) => `${index + 1}. ${step}`)]
+      .join("\n")
+      .slice(0, 256_000);
+
+  }
+  const hasNativePlanArtifact = artifacts.some((value) => record(value).kind === "native_provider_plan");
+  const summary = typeof result.summary === "string" ? result.summary.trim() : "";
+  const summaryPlan = hasNativePlanArtifact ? summary.match(/(?:^|:\s*)(1\)\s+[\s\S]+;\s*2\)\s+[\s\S]+;\s*3\)\s+[\s\S]+)$/) : null;
+  if (summaryPlan) {
+    const body = summaryPlan[1]!
+      .replace(/^1\)\s*/, "1. ")
+      .replace(/;\s*(\d+)\)\s*/g, "\n$1. ")
+      .trim();
+    if (body) return `# Plan\n\n${body}`.slice(0, 256_000);
   }
   return null;
 }
@@ -194,6 +262,7 @@ export async function synchronizeCompletedProviderPlan(input: {
   if (!current || !revision?.id || current.latestRevisionId !== revision.id) {
     return { eventId: input.event.sourceEventId, planId, providerRevision, status: "conflict", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: current?.latestRevisionNumber ?? null, currentRevisionId: current?.latestRevisionId ?? null, confirmationId: null };
   }
+  let confirmationId: string;
   try {
     const confirmation = await issueThreadInteractionService(input.db).create(
       { id: input.execution.binding.issueId, companyId: input.execution.binding.companyId },
@@ -203,7 +272,7 @@ export async function synchronizeCompletedProviderPlan(input: {
         sourceRunId: input.execution.binding.runId,
         title: `Review plan revision ${revision.revisionNumber}`,
         summary: "Review the synchronized Paperclip plan.",
-        continuationPolicy: "wake_assignee_on_accept",
+        continuationPolicy: "wake_assignee",
         payload: {
           version: 1,
           prompt: `Approve plan revision ${revision.revisionNumber}?`,
@@ -225,19 +294,29 @@ export async function synchronizeCompletedProviderPlan(input: {
       } as never,
       { agentId: input.execution.binding.agentId, runId: input.execution.binding.runId },
     );
-    const currentIssue = await input.db.select({ status: issues.status }).from(issues)
-      .where(eq(issues.id, input.execution.binding.issueId))
-      .limit(1).then((rows) => rows[0] ?? null);
-    if (currentIssue && currentIssue.status !== "review") {
-      await issueService(input.db).update(input.execution.binding.issueId, {
-        status: "review",
-        actorAgentId: input.execution.binding.agentId,
-      });
-    }
-    return { eventId: input.event.sourceEventId, planId, providerRevision, status, baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId: confirmation.id };
+    confirmationId = confirmation.id;
   } catch {
     return { eventId: input.event.sourceEventId, planId, providerRevision, status: "approval_failed", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId: null };
   }
+  try {
+    const currentIssue = await input.db.select({ status: issues.status }).from(issues)
+      .where(eq(issues.id, input.execution.binding.issueId))
+      .limit(1).then((rows) => rows[0] ?? null);
+    if (currentIssue && currentIssue.status !== "in_review") {
+      await issueService(input.db).update(input.execution.binding.issueId, {
+        status: "in_review",
+        actorAgentId: input.execution.binding.agentId,
+      });
+    }
+  } catch {
+    const settledIssue = await input.db.select({ status: issues.status }).from(issues)
+      .where(eq(issues.id, input.execution.binding.issueId))
+      .limit(1).then((rows) => rows[0] ?? null);
+    if (settledIssue?.status !== "in_review") {
+      return { eventId: input.event.sourceEventId, planId, providerRevision, status: "approval_failed", baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId };
+    }
+  }
+  return { eventId: input.event.sourceEventId, planId, providerRevision, status, baseRevisionId: planningContext.baseRevisionId, digest, documentRevision: revision.revisionNumber, currentRevisionId: revision.id, confirmationId };
 }
 
 class SessionToolAuthorityRouter {

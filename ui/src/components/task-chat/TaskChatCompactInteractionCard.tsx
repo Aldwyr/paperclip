@@ -14,11 +14,14 @@ import {
   Circle,
   CircleHelp,
   GitBranch,
+  Lightbulb,
   ListChecks,
   Loader2,
+  Maximize2,
   MessageSquareQuote,
   X,
 } from "lucide-react";
+import type { IssueDocument } from "@paperclipai/shared";
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { Button } from "@/components/ui/button";
@@ -53,6 +56,7 @@ type SharedInteractionProps = Omit<
 
 export interface TaskChatCompactInteractionCardProps extends SharedInteractionProps {
   interaction: IssueThreadInteraction;
+  planDocument?: IssueDocument | null;
 }
 
 const OTHER_ANSWER_ID = "__paperclip_other__";
@@ -180,6 +184,86 @@ function CompactTarget({ interaction }: { interaction: RequestConfirmationIntera
     return <a href={href} className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-foreground hover:bg-muted/60">{label}</a>;
   }
   return <span className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-muted-foreground">{label}</span>;
+}
+
+function planPreviewContent(markdown: string) {
+  const lines = markdown
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const headingIndex = lines.findIndex((line) => /^#\s+/.test(line));
+  const title = headingIndex >= 0
+    ? lines[headingIndex]!.replace(/^#\s+/, "").trim()
+    : "Plan";
+  const preview = lines
+    .filter((_, index) => index !== headingIndex)
+    .map((line) => line
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/^[-*+]\s+/, "")
+      .replace(/^\d+[.)]\s+/, "")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
+      .trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  return { title, preview };
+}
+
+function PlanReviewPreview({
+  interaction,
+  planDocument,
+}: {
+  interaction: RequestConfirmationInteraction;
+  planDocument?: IssueDocument | null;
+}) {
+  const target = interaction.payload.target;
+  if (target?.type !== "issue_document" || target.key !== "plan") return null;
+
+  const targetRevision = target.revisionNumber ?? null;
+  const documentMatchesTarget = Boolean(
+    planDocument
+    && (targetRevision == null || planDocument.latestRevisionNumber === targetRevision),
+  );
+  const content = documentMatchesTarget && planDocument
+    ? planPreviewContent(planDocument.body)
+    : { title: target.label ?? "Plan", preview: [] as string[] };
+  const revisionLabel = targetRevision == null ? null : `v${targetRevision}`;
+
+  return (
+    <a
+      href="#document-plan"
+      data-testid="plan-review-preview"
+      aria-label={`Open ${target.label ?? revisionLabel ?? "plan"}`}
+      className="group block overflow-hidden rounded-md border border-border bg-muted/25 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2.5 text-sm text-muted-foreground">
+        <Lightbulb aria-hidden className="h-4 w-4 shrink-0" />
+        <span className="font-medium">Plan</span>
+        {revisionLabel ? <span className="text-xs">{revisionLabel}</span> : null}
+        <Maximize2
+          aria-hidden
+          className="ml-auto h-4 w-4 transition-transform group-hover:scale-105 group-hover:text-foreground"
+        />
+      </div>
+      <div className="relative max-h-36 overflow-hidden px-4 py-3">
+        <h3 className="text-base font-semibold leading-6 text-foreground">{content.title}</h3>
+        {content.preview.length > 0 ? (
+          <ul className="mt-2 space-y-1.5 text-sm leading-5 text-muted-foreground">
+            {content.preview.map((line, index) => (
+              <li key={`${index}-${line}`} className="flex gap-2">
+                <span aria-hidden className="shrink-0 text-muted-foreground/60">•</span>
+                <span className="line-clamp-1">{line}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-sm text-muted-foreground">Open the synchronized plan to review it.</p>
+        )}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-linear-to-b from-transparent to-card/95" />
+      </div>
+    </a>
+  );
 }
 
 function ResolvedInteraction({ interaction }: { interaction: IssueThreadInteraction }) {
@@ -453,12 +537,14 @@ function AskUserQuestionsCard({
 
 function ConfirmationCard({
   interaction,
+  planDocument,
   onAcceptInteraction,
   onRejectInteraction,
   externalReferences,
   errorMessage,
 }: {
   interaction: RequestConfirmationInteraction;
+  planDocument?: IssueDocument | null;
   onAcceptInteraction?: SharedInteractionProps["onAcceptInteraction"];
   onRejectInteraction?: SharedInteractionProps["onRejectInteraction"];
   externalReferences?: SharedInteractionProps["externalReferences"];
@@ -473,6 +559,8 @@ function ConfirmationCard({
     || interaction.payload.allowDeclineReason
     || interaction.payload.declineReasonPlaceholder,
   );
+  const isPlanConfirmation = interaction.payload.target?.type === "issue_document"
+    && interaction.payload.target.key === "plan";
 
   async function resolve(action: "accept" | "reject") {
     if (action === "reject" && interaction.payload.rejectRequiresReason && !reason.trim()) return;
@@ -490,11 +578,15 @@ function ConfirmationCard({
 
   return (
     <div>
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <p className="min-w-0 flex-1 text-sm leading-5 text-foreground">{interaction.payload.prompt}</p>
-        <CompactTarget interaction={interaction} />
-      </div>
-      {interaction.payload.detailsMarkdown ? (
+      {isPlanConfirmation ? (
+        <PlanReviewPreview interaction={interaction} planDocument={planDocument} />
+      ) : (
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <p className="min-w-0 flex-1 text-sm leading-5 text-foreground">{interaction.payload.prompt}</p>
+          <CompactTarget interaction={interaction} />
+        </div>
+      )}
+      {!isPlanConfirmation && interaction.payload.detailsMarkdown ? (
         <Details><MarkdownBody externalReferences={externalReferences}>{interaction.payload.detailsMarkdown}</MarkdownBody></Details>
       ) : null}
       {rejecting ? (
@@ -887,6 +979,7 @@ function ItemVerdictsCard({
 
 export function TaskChatCompactInteractionCard({
   interaction,
+  planDocument,
   agentMap,
   currentUserId,
   userLabelMap,
@@ -914,7 +1007,7 @@ export function TaskChatCompactInteractionCard({
       ) : interaction.kind === "ask_user_questions" ? (
         <AskUserQuestionsCard interaction={interaction} onSubmitInteractionAnswers={onSubmitInteractionAnswers} onCancelInteraction={onCancelInteraction} errorMessage={errorMessage} />
       ) : interaction.kind === "request_confirmation" ? (
-        <ConfirmationCard interaction={interaction} onAcceptInteraction={onAcceptInteraction} onRejectInteraction={onRejectInteraction} externalReferences={externalReferences} errorMessage={errorMessage} />
+        <ConfirmationCard interaction={interaction} planDocument={planDocument} onAcceptInteraction={onAcceptInteraction} onRejectInteraction={onRejectInteraction} externalReferences={externalReferences} errorMessage={errorMessage} />
       ) : interaction.kind === "request_checkbox_confirmation" ? (
         <CheckboxConfirmationCard interaction={interaction} onAcceptInteraction={onAcceptInteraction} onRejectInteraction={onRejectInteraction} externalReferences={externalReferences} errorMessage={errorMessage} />
       ) : interaction.kind === "suggest_tasks" ? (

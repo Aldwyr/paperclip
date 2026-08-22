@@ -4,6 +4,7 @@ import { act } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { IssueDocument } from "@paperclipai/shared";
 import type { IssueThreadInteraction, RequestConfirmationInteraction } from "@/lib/issue-thread-interactions";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -85,6 +86,56 @@ describe("TaskChatInteractionCard", () => {
     expect(card).not.toBeNull();
     expect(card?.id).toBe("interaction-confirmation-1");
     expect(container.textContent).toContain("Approve the plan");
+  });
+
+  it("renders a plan confirmation as a linked document preview", () => {
+    const interaction = createRequestConfirmation({
+      title: "Review plan revision 3",
+      payload: {
+        version: 1,
+        prompt: "Approve plan revision 3?",
+        acceptLabel: "Approve plan",
+        target: {
+          type: "issue_document",
+          issueId: "issue-1",
+          documentId: "document-plan",
+          key: "plan",
+          revisionId: "revision-3",
+          revisionNumber: 3,
+          label: "Plan v3",
+        },
+      },
+    });
+    const planDocument = {
+      id: "document-plan",
+      issueId: "issue-1",
+      key: "plan",
+      title: "Plan",
+      body: "# Health-check endpoint\n1. Define the health response contract.\n2. Test readiness before and after startup.\n3. Document the verification request.",
+      latestRevisionId: "revision-3",
+      latestRevisionNumber: 3,
+    } as IssueDocument;
+
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(interaction)}
+              planDocument={planDocument}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    const preview = container.querySelector('[data-testid="plan-review-preview"]');
+    expect(preview?.getAttribute("href")).toBe("#document-plan");
+    expect(preview?.getAttribute("aria-label")).toBe("Open Plan v3");
+    expect(container.textContent).toContain("Health-check endpoint");
+    expect(container.textContent).toContain("Test readiness before and after startup.");
+    expect(container.textContent).not.toContain("Approve plan revision 3?");
+    expect(container.textContent).toContain("Approve plan");
   });
 
   it("puts the primary CTA at the right edge of the compact action row", () => {

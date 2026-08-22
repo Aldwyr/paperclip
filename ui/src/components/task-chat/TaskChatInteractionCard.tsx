@@ -1,4 +1,5 @@
 import type { ComponentProps } from "react";
+import type { IssueDocument } from "@paperclipai/shared";
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
 import { shouldHideInteractionCard } from "@/lib/issue-thread-interactions";
 import { TaskChatCompactInteractionCard } from "./TaskChatCompactInteractionCard";
@@ -9,6 +10,7 @@ type InteractionCardProps = Omit<ComponentProps<typeof IssueThreadInteractionCar
 
 export interface TaskChatInteractionCardProps extends InteractionCardProps {
   item: TaskChatInteractionItem;
+  planDocument?: IssueDocument | null;
 }
 
 /**
@@ -18,7 +20,7 @@ export interface TaskChatInteractionCardProps extends InteractionCardProps {
  * secret proposals deliberately retain the specialized shared renderer because
  * its risk, expiry, and safe-binding receipts are security-relevant.
  */
-export function TaskChatInteractionCard({ item, ...cardProps }: TaskChatInteractionCardProps) {
+export function TaskChatInteractionCard({ item, planDocument, ...cardProps }: TaskChatInteractionCardProps) {
   const interaction = item.interaction;
   if (shouldHideInteractionCard(interaction)) return null;
   if (
@@ -49,7 +51,11 @@ export function TaskChatInteractionCard({ item, ...cardProps }: TaskChatInteract
       {useSpecializedRenderer ? (
         <IssueThreadInteractionCard interaction={interaction} primaryActionOnRight {...cardProps} />
       ) : (
-        <TaskChatCompactInteractionCard interaction={interaction} {...cardProps} />
+        <TaskChatCompactInteractionCard
+          interaction={interaction}
+          planDocument={planDocument}
+          {...cardProps}
+        />
       )}
     </div>
   );

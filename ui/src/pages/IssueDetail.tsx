@@ -5605,9 +5605,19 @@ export function IssueDetail() {
 
       {/* Mobile properties drawer */}
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
-        <SheetContent side="bottom" className="max-h-(--sz-85dvh) pb-(--sz-safe-bottom)">
+        <SheetContent
+          side={documentDeepLink?.documentKey === "plan" ? "right" : "bottom"}
+          className={cn(
+            documentDeepLink?.documentKey === "plan"
+              ? "inset-0 h-dvh w-screen max-w-none gap-0 border-0 p-0 sm:max-w-none"
+              : "max-h-(--sz-85dvh) pb-(--sz-safe-bottom)",
+          )}
+          data-testid={documentDeepLink?.documentKey === "plan" ? "mobile-plan-panel" : undefined}
+        >
           <SheetHeader>
-            <SheetTitle className="text-sm">Properties</SheetTitle>
+            <SheetTitle className="text-sm">
+              {documentDeepLink?.documentKey === "plan" ? "Plan" : "Properties"}
+            </SheetTitle>
           </SheetHeader>
           <ScrollArea className="flex-1 overflow-y-auto">
             <div className="px-4 pb-4">

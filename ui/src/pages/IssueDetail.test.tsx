@@ -476,7 +476,20 @@ vi.mock("@/components/ui/dialog", () => ({
 
 vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children, open }: { children?: ReactNode; open?: boolean }) => (open ? <div>{children}</div> : null),
-  SheetContent: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  SheetContent: ({
+    children,
+    className,
+    "data-testid": testId,
+  }: {
+    children?: ReactNode;
+    className?: string;
+    "data-testid"?: string;
+  }) => (
+    <div className={className} data-testid={testId}>
+      {children}
+      <button type="button" data-slot="sheet-close">Close</button>
+    </div>
+  ),
   SheetHeader: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   SheetDescription: ({ children }: { children?: ReactNode }) => <p>{children}</p>,
   SheetTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
@@ -1300,6 +1313,37 @@ describe("IssueDetail", () => {
       }));
     });
     expect(mockSetPanelVisible).not.toHaveBeenCalled();
+  });
+
+  it("opens a plan deep link in a dismissible full-screen mobile panel", async () => {
+    mockSidebarState.isMobile = true;
+    mockLocation.hash = "#document-plan";
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(mockIssuePropertiesRender).toHaveBeenCalledWith(expect.objectContaining({
+        inline: true,
+        documentDeepLink: expect.objectContaining({
+          tab: "plans",
+          documentKey: "plan",
+        }),
+      }));
+    });
+
+    const panel = document.querySelector('[data-testid="mobile-plan-panel"]');
+    expect(panel).not.toBeNull();
+    expect(panel?.className).toContain("h-dvh");
+    expect(panel?.className).toContain("w-screen");
+    expect(panel?.textContent).toContain("Plan");
+    expect(panel?.querySelector('[data-slot="sheet-close"]')).not.toBeNull();
   });
 
   it("renders the full sub-task tree below the title in the chat center pane", async () => {

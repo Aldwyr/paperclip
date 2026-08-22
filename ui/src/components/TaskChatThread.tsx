@@ -874,6 +874,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     (item: TaskChatInteractionItem) => (
       <TaskChatInteractionCard
         item={item}
+        planDocument={planDocument}
         agentMap={agentMap}
         currentUserId={currentUserId}
         userLabelMap={userLabelMap}
@@ -897,6 +898,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       onSubmitInteractionVerdicts,
       imageUploadHandler,
       externalReferences,
+      planDocument,
     ],
   );
 

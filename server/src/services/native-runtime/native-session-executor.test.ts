@@ -95,6 +95,63 @@ describe("provider plan synchronization", () => {
     })).toBe("# Health check\n\n1. Add endpoint\n2. Verify it");
   });
 
+  it("decodes the native provider's compact plan reference into readable Markdown", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "native-provider-plan:health-check-endpoint-v1#1-register-GET-health-return-200-json-status-ok;2-add-API-tests",
+      }],
+    })).toBe([
+      "# Health check endpoint",
+      "",
+      "1. Register GET /health return 200 JSON status ok",
+      "2. Add API tests",
+    ].join("\n"));
+  });
+
+  it("decodes a task-scoped native plan URI", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "native-plan://DOT-13/health-check#1-add-GET-health;2-add-tests",
+      }],
+    })).toBe("# Health check\n\n1. Add GET /health\n2. Add tests");
+  });
+
+  it("retains readable Markdown embedded after a native provider plan reference", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "native-provider-plan:DOT-14-health-check-v1\n1. Add `GET /health`.\n2. Add tests.",
+      }],
+    })).toBe("# Health check\n\n1. Add `GET /health`.\n2. Add tests.");
+  });
+
+  it("normalizes a plain numbered native provider plan", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "1. Add GET /health. | 2. Add tests. | 3. Document it.",
+      }],
+    })).toBe("# Plan\n\n1. Add GET /health.\n2. Add tests.\n3. Document it.");
+  });
+
+  it("normalizes a task-labelled inline numbered plan", () => {
+    expect(semanticProviderPlanMarkdown({
+      artifacts: [{
+        kind: "native_provider_plan",
+        ref: "DOT-16 plan: (1) add GET /health; (2) add tests; (3) document it.",
+      }],
+    })).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
+  });
+
+  it("uses an explicitly numbered semantic summary when the artifact is opaque", () => {
+    expect(semanticProviderPlanMarkdown({
+      summary: "Native provider plan completed: 1) add GET /health; 2) add tests; 3) document it.",
+      artifacts: [{ kind: "native_provider_plan", ref: "native-provider-plan:DOT-18:health-check" }],
+    })).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
+  });
+
   it("renders a bounded Markdown checklist without embedding provenance", () => {
     const markdown = providerPlanMarkdown({
       explanation: "Release safely",

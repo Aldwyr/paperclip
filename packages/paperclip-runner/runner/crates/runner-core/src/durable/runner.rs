@@ -253,7 +253,25 @@ pub fn run_durable_runner(
                 )?;
             }
             if provider.is_some() {
-                send_outbox(&mut client, &state, &mut sent_source_seq)?;
+                if let Err(error) = send_outbox(&mut client, &state, &mut sent_source_seq) {
+                    // A run attachment deliberately rotates the immutable run binding and
+                    // makes the control plane close the old authenticated connection. The
+                    // command-result write can still succeed locally after the peer has
+                    // closed, so the first observable failure may be this subsequent outbox
+                    // flush. Treat every steady-state write failure like a receive-side
+                    // disconnect: preserve the durable suffix and reconnect under the
+                    // rotated lease identity instead of terminating runnerd.
+                    state.record_diagnostic(error.to_string());
+                    if state.lifecycle == "revoked" {
+                        store.save(&state)?;
+                        connection_lease_token.take();
+                        bootstrap_ticket.take();
+                        return Ok(());
+                    }
+                    state.reconnect_count += 1;
+                    store.save(&state)?;
+                    break true;
+                }
             }
             if (state.stop_after_flush || state.lifecycle == "revoked")
                 && state.outbox.is_empty()
@@ -617,6 +635,7 @@ fn provider_descriptor(
                 Some(crate::codex_provider::ProviderRuntimeIdentity::LocalProcess { process_id, .. }) => Some(process_id),
                 _ => None,
             },
+            "agentProcessId": runtime.and_then(|item| item.agent_process_id()),
         }),
         Some(crate::codex_provider::ProviderConfig::Local(value)) => json!({
             "provider": provider_kind_name(value.kind),

@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -24,6 +25,7 @@ describe("paperclip-runner real server vertical slice", () => {
   const agentId = "00000000-0000-4000-8000-000000000702";
   const issueId = "00000000-0000-4000-8000-000000000703";
   const runId = "00000000-0000-4000-8000-000000000704";
+  const resumedRunId = "00000000-0000-4000-8000-000000000705";
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-runner-real-server-");
@@ -73,10 +75,13 @@ describe("paperclip-runner real server vertical slice", () => {
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("Expected a TCP listener.");
     setupRunnerPrpWebSocketServer(server, { port: address.port });
+    const stateDirectory = await mkdtemp(resolve(tmpdir(), "paperclip-runner-real-resume-"));
     const bundle = createRunnerdCodexTransport({
       runnerBinary: defaultCapabilityRunnerdBinary(),
       codexCommand: resolve(import.meta.dirname, "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
       codexArgs: [],
+      stateDirectory,
+      lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
       prpIdentity: {
         runnerInstanceId: "runner-real-server",
         environmentLeaseId: "lease-real-server",
@@ -121,8 +126,77 @@ describe("paperclip-runner real server vertical slice", () => {
         run: { id: runId },
       });
       expect(bundle.evidence().diagnostics).toContain("runnerd authenticated to the durable PRP control plane");
+
+      await bundle.transport.close();
+      await db.insert(heartbeatRuns).values({
+        id: resumedRunId,
+        companyId,
+        agentId,
+        status: "running",
+        runtimeMode: "native",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        contextSnapshot: { issueId },
+      });
+      await db.update(issues).set({ executionRunId: resumedRunId }).where(eq(issues.id, issueId));
+      const resumedAuthority = new PaperclipRunnerToolAuthority(db, {
+        companyId,
+        agentId,
+        issueId,
+        runId: resumedRunId,
+      });
+      const restored = createRunnerdCodexTransport({
+        runnerBinary: defaultCapabilityRunnerdBinary(),
+        codexCommand: resolve(import.meta.dirname, "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
+        codexArgs: [],
+        stateDirectory,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+        resumeDynamicTools: resumedAuthority.definitions(),
+        prpIdentity: {
+          runnerInstanceId: "runner-real-server",
+          environmentLeaseId: "lease-real-server",
+          runId: resumedRunId,
+          normalizedSessionId: "session-real-server",
+          turnId: "turn-real-server-resumed",
+          itemId: "item-real-server-resumed",
+        },
+        controlPlaneRegistration: (prp) => registerRunnerPrpAuthority({ runId: resumedRunId, authority: prp }),
+      });
+      restored.transport.setServerRequestHandler(async (request) => {
+        const params = request.params as Record<string, unknown>;
+        const result = await resumedAuthority.execute({
+          tool: String(params.tool),
+          callId: String(params.callId),
+          arguments: params.arguments,
+        });
+        observedResults.push(result);
+        return {
+          success: true,
+          contentItems: [{ type: "inputText", text: JSON.stringify({ ok: true, result }) }],
+        };
+      });
+      try {
+        await restored.transport.request("thread/read", {});
+        await restored.transport.request("turn/start", {
+          input: [{ type: "text", text: "Read the same task in a resumed process." }],
+        });
+        for await (const notification of restored.transport.notifications()) {
+          if (notification.method === "turn/completed") break;
+        }
+        expect(observedResults).toHaveLength(2);
+        expect(observedResults[1]).toMatchObject({
+          activeTask: { id: issueId, identifier: "RRS-1" },
+          run: { id: resumedRunId },
+        });
+        expect(restored.evidence().diagnostics).toContain(
+          "runnerd restored its durable PRP session and provider thread",
+        );
+      } finally {
+        await restored.transport.close();
+      }
     } finally {
       await bundle.transport.close();
+      await rm(stateDirectory, { recursive: true, force: true });
       server.closeAllConnections();
       server.close();
     }
