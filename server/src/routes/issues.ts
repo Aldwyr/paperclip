@@ -6,6 +6,7 @@ import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companyMemberships,
@@ -92,6 +93,7 @@ import {
   type IssueReviewPolicy,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueCommentPresentation,
+  type IssueQueuedCommentQueue,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -248,10 +250,29 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
+import {
+  getNativeSessionSteeringState,
+  NativeSessionSteeringError,
+  steerNativeSession,
+} from "../services/native-runtime/native-session-executor.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+});
+const queuedCommentTargetSchema = z.object({
+  targetRunId: z.string().min(1),
+  revision: z.string().min(1),
+});
+const editQueuedCommentSchema = queuedCommentTargetSchema.extend({
+  body: z
+    .string()
+    .min(1)
+    .max(200_000)
+    .refine((value) => value.trim().length > 0, "Queued message cannot be empty"),
+});
+const reorderQueuedCommentsSchema = queuedCommentTargetSchema.extend({
+  orderedCommentIds: z.array(z.string().min(1)).max(MAX_ISSUE_COMMENT_LIMIT),
 });
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
@@ -5190,6 +5211,180 @@ export function issueRoutes(
     }
 
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
+  }
+
+  type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+  type DeferredIssueWake = typeof agentWakeupRequests.$inferSelect;
+  const QUEUE_CONTEXT_KEY = "_paperclipWakeContext";
+  const QUEUE_IDS_KEY = "wakeCommentIds";
+
+  function queuedCommentIdsFromWake(wake: DeferredIssueWake | null): string[] {
+    if (!wake) return [];
+    const context = readObject(readObject(wake.payload)[QUEUE_CONTEXT_KEY]);
+    const ids = Array.isArray(context[QUEUE_IDS_KEY]) ? context[QUEUE_IDS_KEY] : [];
+    const seen = new Set<string>();
+    return ids.flatMap((value) => {
+      if (typeof value !== "string" || !value || seen.has(value)) return [];
+      seen.add(value);
+      return [value];
+    });
+  }
+
+  function queueRevision(input: {
+    runId: string | null;
+    wake: DeferredIssueWake | null;
+    comments: Array<{ id: string; updatedAt: Date }>;
+  }): string {
+    return createHash("sha256")
+      .update(JSON.stringify({
+        runId: input.runId,
+        wakeId: input.wake?.id ?? null,
+        wakeUpdatedAt: input.wake?.updatedAt?.toISOString() ?? null,
+        comments: input.comments.map((comment) => [comment.id, comment.updatedAt.toISOString()]),
+      }))
+      .digest("hex")
+      .slice(0, 32);
+  }
+
+  async function findDeferredIssueWake(
+    executor: IssueQueueDb,
+    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+    lock = false,
+  ): Promise<DeferredIssueWake | null> {
+    if (!issue.assigneeAgentId) return null;
+    const query = executor
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ))
+      .orderBy(asc(agentWakeupRequests.requestedAt));
+    const rows = lock ? await query.for("update") : await query;
+    return rows.find((row) => readObject(row.payload).issueId === issue.id) ?? null;
+  }
+
+  async function queueCommentsForWake(executor: IssueQueueDb, issueId: string, wake: DeferredIssueWake | null) {
+    const ids = queuedCommentIdsFromWake(wake);
+    if (ids.length === 0) return [];
+    const rows = await executor
+      .select()
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), inArray(issueComments.id, ids)));
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row && !row.deletedAt ? [row] : [];
+    });
+  }
+
+  async function buildQueuedCommentQueue(input: {
+    executor: IssueQueueDb;
+    issue: { id: string; companyId: string; assigneeAgentId: string | null };
+    activeRun: Awaited<ReturnType<typeof resolveActiveIssueRun>>;
+    actor: ReturnType<typeof getActorInfo>;
+    wake?: DeferredIssueWake | null;
+    steeringDisposition?: IssueQueuedCommentQueue["steeringDisposition"];
+  }): Promise<IssueQueuedCommentQueue> {
+    const wake = input.wake === undefined
+      ? await findDeferredIssueWake(input.executor, input.issue)
+      : input.wake;
+    const comments = await queueCommentsForWake(input.executor, input.issue.id, wake);
+    const protocol = input.activeRun?.runtimeMode === "native"
+      ? "paperclip_runner_v1" as const
+      : "legacy" as const;
+    let steeringDisposition = input.steeringDisposition
+      ?? (protocol === "paperclip_runner_v1" && input.activeRun
+        ? await getNativeSessionSteeringState(input.activeRun.id)
+          .then((state) => state.disposition)
+          .catch(() => "temporarily_unavailable" as const)
+        : "unsupported" as const);
+    if (!input.activeRun || comments.length === 0) steeringDisposition = "temporarily_unavailable";
+    return {
+      issueId: input.issue.id,
+      targetRunId: input.activeRun?.id ?? null,
+      revision: queueRevision({ runId: input.activeRun?.id ?? null, wake, comments }),
+      protocol,
+      steeringDisposition,
+      entries: comments.map((comment, position) => ({
+        comment: comment as IssueQueuedCommentQueue["entries"][number]["comment"],
+        position,
+        canEdit: input.actor.actorType === "user" && comment.authorUserId === input.actor.actorId,
+        canDiscard: input.actor.actorType === "user" && comment.authorUserId === input.actor.actorId,
+      })),
+    };
+  }
+
+  function updateWakePayloadCommentIds(wake: DeferredIssueWake, ids: string[]) {
+    const payload = { ...readObject(wake.payload) };
+    const context = { ...readObject(payload[QUEUE_CONTEXT_KEY]) };
+    if (ids.length > 0) {
+      context[QUEUE_IDS_KEY] = ids;
+      context.wakeCommentId = ids[ids.length - 1];
+      context.commentId = ids[ids.length - 1];
+      payload.commentId = ids[ids.length - 1];
+    } else {
+      delete context[QUEUE_IDS_KEY];
+      delete context.wakeCommentId;
+      delete context.commentId;
+      delete payload.commentId;
+    }
+    payload[QUEUE_CONTEXT_KEY] = context;
+    return payload;
+  }
+
+  function assertQueueMutationTarget(input: {
+    queue: IssueQueuedCommentQueue;
+    targetRunId: string;
+    revision: string;
+  }) {
+    if (input.queue.targetRunId !== input.targetRunId) {
+      throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+    }
+    if (input.queue.revision !== input.revision) {
+      throw conflict("The queued messages changed in another session", { code: "queued_comment_revision_conflict" });
+    }
+  }
+
+  async function lockQueuedCommentState(input: {
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0];
+    issue: { id: string; companyId: string; assigneeAgentId: string | null };
+    actor: ReturnType<typeof getActorInfo>;
+    targetRunId: string;
+  }) {
+    await input.tx
+      .select({ id: issueRows.id })
+      .from(issueRows)
+      .where(and(eq(issueRows.id, input.issue.id), eq(issueRows.companyId, input.issue.companyId)))
+      .for("update");
+    const activeRun = await input.tx
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.targetRunId),
+        eq(heartbeatRuns.companyId, input.issue.companyId),
+        eq(heartbeatRuns.status, "running"),
+      ))
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const runContext = readObject(activeRun?.contextSnapshot);
+    if (!activeRun || (runContext.issueId !== input.issue.id && runContext.taskId !== input.issue.id)) {
+      throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+    }
+    const wake = await findDeferredIssueWake(input.tx, input.issue, true);
+    const queue = await buildQueuedCommentQueue({
+      executor: input.tx,
+      issue: input.issue,
+      activeRun,
+      actor: input.actor,
+      wake,
+      steeringDisposition: activeRun.runtimeMode === "native"
+        ? "temporarily_unavailable"
+        : "unsupported",
+    });
+    return { activeRun, wake, queue };
   }
 
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
@@ -10840,6 +11035,300 @@ export function issueRoutes(
     });
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, comments));
   });
+
+  router.get("/issues/:id/queued-comments", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const queue = await buildQueuedCommentQueue({
+      executor: db,
+      issue,
+      activeRun: await resolveActiveIssueRun(issue),
+      actor: getActorInfo(req),
+    });
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+  });
+
+  router.patch(
+    "/issues/:id/queued-comments/:commentId",
+    validate(editQueuedCommentSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const queue = await db.transaction(async (tx) => {
+        const locked = await lockQueuedCommentState({
+          tx,
+          issue,
+          actor,
+          targetRunId: req.body.targetRunId,
+        });
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          targetRunId: req.body.targetRunId,
+          revision: req.body.revision,
+        });
+        const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
+        if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        if (!entry.canEdit) throw forbidden("Only the queued message author can edit it");
+        const updatedAt = new Date();
+        const updated = await tx
+          .update(issueComments)
+          .set({ body: req.body.body, updatedAt })
+          .where(and(eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id)))
+          .returning({ id: issueComments.id })
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        await tx.update(issueRows).set({ updatedAt }).where(eq(issueRows.id, issue.id));
+        await issueReferencesSvc.syncComment(commentId, tx);
+        await externalObjectsSvc.syncCommentSafely(commentId, tx);
+        return buildQueuedCommentQueue({
+          executor: tx,
+          issue,
+          activeRun: locked.activeRun,
+          actor,
+          wake: locked.wake,
+        });
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.put(
+    "/issues/:id/queued-comments/order",
+    validate(reorderQueuedCommentsSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const queue = await db.transaction(async (tx) => {
+        const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          targetRunId: req.body.targetRunId,
+          revision: req.body.revision,
+        });
+        if (!locked.wake) throw conflict("The queued messages are no longer pending", { code: "queued_comment_not_pending" });
+        const currentIds = locked.queue.entries.map((entry) => entry.comment.id);
+        const orderedIds = req.body.orderedCommentIds as string[];
+        const orderedSet = new Set(orderedIds);
+        if (
+          orderedSet.size !== orderedIds.length
+          || orderedIds.length !== currentIds.length
+          || currentIds.some((commentId) => !orderedSet.has(commentId))
+        ) {
+          throw conflict("The queued message order does not match the current queue", {
+            code: "queued_comment_order_mismatch",
+          });
+        }
+        const updatedWake = await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: updateWakePayloadCommentIds(locked.wake, orderedIds),
+            updatedAt: new Date(),
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id))
+          .returning()
+          .then((rows) => rows[0] ?? locked.wake);
+        return buildQueuedCommentQueue({
+          executor: tx,
+          issue,
+          activeRun: locked.activeRun,
+          actor,
+          wake: updatedWake,
+        });
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.post(
+    "/issues/:id/queued-comments/:commentId/steer",
+    validate(queuedCommentTargetSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      let acknowledgedTurnId: string | null = null;
+      let duplicate = false;
+      let queue: IssueQueuedCommentQueue;
+      try {
+        queue = await db.transaction(async (tx) => {
+          const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
+          const runResult = readObject(locked.activeRun.resultJson);
+          const acknowledgements = readObject(runResult.queuedSteeringAcknowledgements);
+          const priorAcknowledgement = readObject(acknowledgements[commentId]);
+          if (priorAcknowledgement.status === "acknowledged") {
+            duplicate = true;
+            acknowledgedTurnId = typeof priorAcknowledgement.turnId === "string"
+              ? priorAcknowledgement.turnId
+              : null;
+            return buildQueuedCommentQueue({
+              executor: tx,
+              issue,
+              activeRun: locked.activeRun,
+              actor,
+              wake: locked.wake,
+            });
+          }
+          assertQueueMutationTarget({
+            queue: locked.queue,
+            targetRunId: req.body.targetRunId,
+            revision: req.body.revision,
+          });
+          if (locked.queue.protocol !== "paperclip_runner_v1") {
+            throw conflict("This runner does not support same-turn steering", { code: "steering_unsupported" });
+          }
+          if (!locked.wake) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+          const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
+          if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+
+          const acknowledgement = await steerNativeSession({
+            runId: locked.activeRun.id,
+            message: entry.comment.body,
+            correlationId: commentId,
+          });
+          acknowledgedTurnId = acknowledgement.turnId;
+          const remainingIds = locked.queue.entries
+            .map((candidate) => candidate.comment.id)
+            .filter((candidateId) => candidateId !== commentId);
+          const now = new Date();
+          const nextWake = remainingIds.length === 0
+            ? await tx
+              .update(agentWakeupRequests)
+              .set({ status: "cancelled", finishedAt: now, updatedAt: now })
+              .where(eq(agentWakeupRequests.id, locked.wake.id))
+              .returning()
+              .then(() => null)
+            : await tx
+              .update(agentWakeupRequests)
+              .set({ payload: updateWakePayloadCommentIds(locked.wake, remainingIds), updatedAt: now })
+              .where(eq(agentWakeupRequests.id, locked.wake.id))
+              .returning()
+              .then((rows) => rows[0] ?? locked.wake);
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              resultJson: {
+                ...runResult,
+                queuedSteeringAcknowledgements: {
+                  ...acknowledgements,
+                  [commentId]: {
+                    status: "acknowledged",
+                    turnId: acknowledgement.turnId,
+                    acknowledgedAt: now.toISOString(),
+                  },
+                },
+              },
+              updatedAt: now,
+            })
+            .where(eq(heartbeatRuns.id, locked.activeRun.id));
+          return buildQueuedCommentQueue({
+            executor: tx,
+            issue,
+            activeRun: { ...locked.activeRun, resultJson: runResult },
+            actor,
+            wake: nextWake,
+          });
+        });
+      } catch (error) {
+        if (error instanceof NativeSessionSteeringError) {
+          throw conflict(error.message, { code: error.code, retryable: true });
+        }
+        throw error;
+      }
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.queued_comment_steered",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId,
+          targetRunId: req.body.targetRunId,
+          turnId: acknowledgedTurnId,
+          duplicate,
+        },
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.delete(
+    "/issues/:id/queued-comments/:commentId",
+    validate(queuedCommentTargetSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const queue = await db.transaction(async (tx) => {
+        const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          targetRunId: req.body.targetRunId,
+          revision: req.body.revision,
+        });
+        if (!locked.wake) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
+        if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        if (!entry.canDiscard) throw forbidden("Only the queued message author can discard it");
+        const deleted = await tx
+          .delete(issueComments)
+          .where(and(eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id)))
+          .returning({ id: issueComments.id })
+          .then((rows) => rows[0] ?? null);
+        if (!deleted) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        await issueReferencesSvc.deleteCommentSource(commentId, tx);
+        await externalObjectsSvc.syncCommentSafely(commentId, tx);
+        const remainingIds = locked.queue.entries
+          .map((candidate) => candidate.comment.id)
+          .filter((candidateId) => candidateId !== commentId);
+        const now = new Date();
+        await tx.update(issueRows).set({ updatedAt: now }).where(eq(issueRows.id, issue.id));
+        const nextWake = remainingIds.length === 0
+          ? await tx
+            .update(agentWakeupRequests)
+            .set({ status: "cancelled", finishedAt: now, updatedAt: now })
+            .where(eq(agentWakeupRequests.id, locked.wake.id))
+            .returning()
+            .then(() => null)
+          : await tx
+            .update(agentWakeupRequests)
+            .set({ payload: updateWakePayloadCommentIds(locked.wake, remainingIds), updatedAt: now })
+            .where(eq(agentWakeupRequests.id, locked.wake.id))
+            .returning()
+            .then((rows) => rows[0] ?? locked.wake);
+        return buildQueuedCommentQueue({
+          executor: tx,
+          issue,
+          activeRun: locked.activeRun,
+          actor,
+          wake: nextWake,
+        });
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
 
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;

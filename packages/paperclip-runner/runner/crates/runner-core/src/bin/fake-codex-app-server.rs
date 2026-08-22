@@ -26,6 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         linger_after_turn_start: args.iter().any(|arg| arg == "--linger-after-turn-start"),
     };
     let mut turn_count = 0_u64;
+    let mut active_turn_id: Option<String> = None;
     let mut planning_thread = false;
     let mut pending_tool_turns = BTreeMap::<String, String>::new();
     let stdin = io::stdin();
@@ -122,6 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     format!("fake-turn-{turn_count}")
                 };
+                active_turn_id = Some(turn_id.clone());
                 let call_id = format!("call-{turn_count}");
                 let request_id = format!("rpc-tool-{turn_count}");
                 send(json!({"id": id, "result": {"turn": {"id": turn_id}}}))?;
@@ -153,6 +155,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "params": {"threadId": "fake-thread", "turnId": turn_id, "callId": call_id, "tool": "get_task_context", "arguments": {}}
                 }))?;
             }
+            "turn/steer" => {
+                let expected_turn_id = request
+                    .pointer("/params/expectedTurnId")
+                    .and_then(Value::as_str);
+                if expected_turn_id != active_turn_id.as_deref() {
+                    send(json!({
+                        "id": id,
+                        "error": {"code": -32000, "message": "stale active turn"}
+                    }))?;
+                } else {
+                    send(json!({"id": id, "result": {"acknowledged": true}}))?;
+                }
+            }
+            "turn/interrupt" => send(json!({"id": id, "result": {}}))?,
             _ => {}
         }
         let completed_turn = request

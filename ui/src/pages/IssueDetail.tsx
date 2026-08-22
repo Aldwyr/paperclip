@@ -29,6 +29,7 @@ import { buildCompanyUserInlineOptions, buildCompanyUserLabelMap, buildCompanyUs
 import { extractIssueTimelineEvents, extractIssueWorkModeChanges } from "../lib/issue-timeline-events";
 import { queryKeys } from "../lib/queryKeys";
 import { keepPreviousDataForSameQueryTail } from "../lib/query-placeholder-data";
+import { normalizeIssueQueuedCommentQueue } from "../lib/issue-queued-comment-queue";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
 import {
   hasLegacyIssueDetailQuery,
@@ -1142,6 +1143,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   // prop type, so no cast is needed.
   const { enabled: classicTaskInterfaceEnabled } = useClassicTaskInterfaceEnabled();
   const ThreadComponent = classicTaskInterfaceEnabled ? IssueChatThread : TaskChatThread;
+  const queryClient = useQueryClient();
   const { data: activity } = useQuery({
     queryKey: queryKeys.issues.activity(issueId),
     queryFn: () => activityApi.forIssue(issueId),
@@ -1166,6 +1168,27 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     () => resolveIssueActiveRun({ status: issueStatus, executionRunId }, activeRun),
     [activeRun, executionRunId, issueStatus],
   );
+  const paperclipQueueEnabled = !classicTaskInterfaceEnabled
+    && resolvedActiveRun?.adapterType === "paperclip_runner";
+  const { data: authoritativeQueuedCommentQueue } = useQuery({
+    queryKey: queryKeys.issues.queuedComments(issueId),
+    queryFn: async () => normalizeIssueQueuedCommentQueue(
+      await issuesApi.getQueuedComments(issueId),
+      issueId,
+    ),
+    enabled: paperclipQueueEnabled,
+    refetchInterval: paperclipQueueEnabled ? 1000 : false,
+  });
+  const [consumedQueuedCommentIds, setConsumedQueuedCommentIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [discardedQueuedCommentIds, setDiscardedQueuedCommentIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    setConsumedQueuedCommentIds(new Set());
+    setDiscardedQueuedCommentIds(new Set());
+  }, [resolvedActiveRun?.id]);
   const hasLiveRuns = liveRunCount > 0 || !!resolvedActiveRun;
   const { data: linkedRuns } = useQuery({
     queryKey: queryKeys.issues.runs(issueId),
@@ -1279,6 +1302,133 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     resolvedLinkedRuns,
     interruptibleIssueRun,
   ]);
+  const effectiveQueuedCommentQueue = useMemo(() => {
+    if (!paperclipQueueEnabled || !resolvedActiveRun) return null;
+    const base = authoritativeQueuedCommentQueue ?? {
+      issueId,
+      targetRunId: resolvedActiveRun.id,
+      revision: "pending-canonical-queue",
+      protocol: "paperclip_runner_v1" as const,
+      steeringDisposition: "temporarily_unavailable" as const,
+      entries: [],
+    };
+    const existingIds = new Set(base.entries.map((entry) => entry.comment.id));
+    const optimisticEntries = commentsWithRunMeta.flatMap((comment) => {
+      if (
+        existingIds.has(comment.id)
+        || consumedQueuedCommentIds.has(comment.id)
+        || discardedQueuedCommentIds.has(comment.id)
+        || comment.queueState !== "queued"
+        || comment.queueTargetRunId !== resolvedActiveRun.id
+      ) return [];
+      return [{
+        comment,
+        position: base.entries.length,
+        canEdit: comment.authorUserId === currentUserId,
+        canDiscard: comment.authorUserId === currentUserId,
+      }];
+    });
+    return {
+      ...base,
+      entries: [...base.entries, ...optimisticEntries]
+        .map((entry, position) => ({ ...entry, position })),
+    };
+  }, [
+    authoritativeQueuedCommentQueue,
+    commentsWithRunMeta,
+    consumedQueuedCommentIds,
+    currentUserId,
+    discardedQueuedCommentIds,
+    issueId,
+    paperclipQueueEnabled,
+    resolvedActiveRun,
+  ]);
+  const commentsForThread = useMemo(() => commentsWithRunMeta.flatMap((comment) => {
+    if (discardedQueuedCommentIds.has(comment.id)) return [];
+    if (!consumedQueuedCommentIds.has(comment.id)) return [comment];
+    return [{
+      ...comment,
+      queueState: undefined,
+      queueTargetRunId: null,
+      queueReason: undefined,
+    }];
+  }), [commentsWithRunMeta, consumedQueuedCommentIds, discardedQueuedCommentIds]);
+
+  const storeQueuedCommentQueue = useCallback((value: unknown) => {
+    const queue = normalizeIssueQueuedCommentQueue(value, issueId);
+    queryClient.setQueryData(queryKeys.issues.queuedComments(issueId), queue);
+    return queue;
+  }, [issueId, queryClient]);
+
+  const refreshQueueAfterConflict = useCallback(async (error: unknown) => {
+    if (error instanceof ApiError && error.status === 409) {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.queuedComments(issueId) });
+    }
+    throw error;
+  }, [issueId, queryClient]);
+
+  const editQueuedComment = useCallback(async (commentId: string, body: string, revision: string) => {
+    const targetRunId = effectiveQueuedCommentQueue?.targetRunId;
+    if (!targetRunId) throw new Error("The queued message no longer has an active run target.");
+    try {
+      storeQueuedCommentQueue(await issuesApi.editQueuedComment(issueId, commentId, {
+        body,
+        targetRunId,
+        revision,
+      }));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) });
+    } catch (error) {
+      await refreshQueueAfterConflict(error);
+    }
+  }, [effectiveQueuedCommentQueue?.targetRunId, issueId, queryClient, refreshQueueAfterConflict, storeQueuedCommentQueue]);
+
+  const reorderQueuedComments = useCallback(async (orderedCommentIds: string[], revision: string) => {
+    const targetRunId = effectiveQueuedCommentQueue?.targetRunId;
+    if (!targetRunId) throw new Error("The queued messages no longer have an active run target.");
+    try {
+      storeQueuedCommentQueue(await issuesApi.reorderQueuedComments(issueId, {
+        orderedCommentIds,
+        targetRunId,
+        revision,
+      }));
+    } catch (error) {
+      await refreshQueueAfterConflict(error);
+    }
+  }, [effectiveQueuedCommentQueue?.targetRunId, issueId, refreshQueueAfterConflict, storeQueuedCommentQueue]);
+
+  const steerQueuedComment = useCallback(async (commentId: string, revision: string) => {
+    const targetRunId = effectiveQueuedCommentQueue?.targetRunId;
+    if (!targetRunId) throw new Error("The queued message no longer has an active run target.");
+    try {
+      storeQueuedCommentQueue(await issuesApi.steerQueuedComment(issueId, commentId, {
+        targetRunId,
+        revision,
+      }));
+      setConsumedQueuedCommentIds((current) => new Set(current).add(commentId));
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(issueId) }),
+      ]);
+    } catch (error) {
+      await refreshQueueAfterConflict(error);
+    }
+  }, [effectiveQueuedCommentQueue?.targetRunId, issueId, queryClient, refreshQueueAfterConflict, storeQueuedCommentQueue]);
+
+  const discardQueuedComment = useCallback(async (commentId: string, revision: string) => {
+    const targetRunId = effectiveQueuedCommentQueue?.targetRunId;
+    if (!targetRunId) throw new Error("The queued message no longer has an active run target.");
+    try {
+      storeQueuedCommentQueue(await issuesApi.discardQueuedComment(issueId, commentId, {
+        targetRunId,
+        revision,
+      }));
+      setDiscardedQueuedCommentIds((current) => new Set(current).add(commentId));
+      await queryClient.invalidateQueries({ queryKey: queryKeys.issues.comments(issueId) });
+    } catch (error) {
+      await refreshQueueAfterConflict(error);
+    }
+  }, [effectiveQueuedCommentQueue?.targetRunId, issueId, queryClient, refreshQueueAfterConflict, storeQueuedCommentQueue]);
+
   const timelineEvents = useMemo(
     () => extractIssueTimelineEvents(resolvedActivity),
     [resolvedActivity],
@@ -1331,7 +1481,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           ) : undefined
         }
         issueBrief={issueBrief}
-        comments={commentsWithRunMeta}
+        comments={commentsForThread}
         interactions={interactions}
         documents={documents}
         workProducts={workProducts}
@@ -1383,6 +1533,11 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         imageUploadHandler={onImageUpload}
         onAttachImage={onAttachImage}
         onInterruptQueued={onInterruptQueued}
+        queuedCommentQueue={effectiveQueuedCommentQueue}
+        onEditQueuedComment={editQueuedComment}
+        onReorderQueuedComments={reorderQueuedComments}
+        onSteerQueuedComment={steerQueuedComment}
+        onDiscardQueuedComment={discardQueuedComment}
         onDeleteComment={onDeleteComment}
         onCancelQueued={onCancelQueued}
         interruptingQueuedRunId={interruptingQueuedRunId}

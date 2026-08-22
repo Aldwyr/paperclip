@@ -1518,6 +1518,11 @@ fn execute_command_effect(
             }
             Ok(("completed".to_owned(), 1, "turn completed".to_owned()))
         }
+        "turn.steer" => Ok((
+            "completed".to_owned(),
+            1,
+            "provider turn steering requested".to_owned(),
+        )),
         "turn.interrupt" => Ok((
             "completed".to_owned(),
             1,

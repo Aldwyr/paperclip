@@ -509,6 +509,101 @@ function record(value: unknown): Record<string, unknown> {
     : {};
 }
 
+export type NativeSessionSteeringState = {
+  disposition: "available" | "unsupported" | "temporarily_unavailable";
+  activeTurnId: string | null;
+};
+
+export class NativeSessionSteeringError extends Error {
+  constructor(
+    readonly code:
+      | "steering_unsupported"
+      | "steering_temporarily_unavailable"
+      | "steering_stale_turn"
+      | "steering_timeout"
+      | "steering_rejected",
+    message: string,
+  ) {
+    super(message);
+    this.name = "NativeSessionSteeringError";
+  }
+}
+
+export async function getNativeSessionSteeringState(runId: string): Promise<NativeSessionSteeringState> {
+  const active = activeNativeSessions.get(runId);
+  if (!active) return { disposition: "temporarily_unavailable", activeTurnId: null };
+  const capabilities = await active.session.capabilities();
+  if (!capabilities.steering || !active.session.steer) {
+    return { disposition: "unsupported", activeTurnId: null };
+  }
+  const snapshot = await active.session.snapshot();
+  return {
+    disposition: snapshot.activeTurnId ? "available" : "temporarily_unavailable",
+    activeTurnId: snapshot.activeTurnId ?? null,
+  };
+}
+
+/** Dispatches a true same-turn steering message and resolves only after ack. */
+export async function steerNativeSession(input: {
+  runId: string;
+  message: string;
+  correlationId: string;
+  timeoutMs?: number;
+}): Promise<{ turnId: string }> {
+  const active = activeNativeSessions.get(input.runId);
+  if (!active) {
+    throw new NativeSessionSteeringError(
+      "steering_temporarily_unavailable",
+      "The active native session is not attached.",
+    );
+  }
+  const capabilities = await active.session.capabilities();
+  if (!capabilities.steering || !active.session.steer) {
+    throw new NativeSessionSteeringError(
+      "steering_unsupported",
+      "This provider does not support same-turn steering.",
+    );
+  }
+  const snapshot = await active.session.snapshot();
+  const turnId = snapshot.activeTurnId ?? null;
+  if (!turnId) {
+    throw new NativeSessionSteeringError(
+      "steering_stale_turn",
+      "The target turn is no longer active.",
+    );
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      active.session.steer({
+        turnId,
+        message: { role: "user", text: input.message },
+        correlationId: input.correlationId,
+      }),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new NativeSessionSteeringError(
+          "steering_timeout",
+          "The provider did not acknowledge steering in time.",
+        )), input.timeoutMs ?? 10_000);
+      }),
+    ]);
+    return { turnId };
+  } catch (error) {
+    if (error instanceof NativeSessionSteeringError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (/stale|terminal|active turn/i.test(message)) {
+      throw new NativeSessionSteeringError("steering_stale_turn", "The target turn is no longer active.");
+    }
+    if (/unsupported|unavailable|capability/i.test(message)) {
+      throw new NativeSessionSteeringError("steering_unsupported", "This provider does not support same-turn steering.");
+    }
+    throw new NativeSessionSteeringError("steering_rejected", "The provider rejected the steering message.");
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export function cancelNativeSession(runId: string, reason: string): Promise<boolean>;
 export function cancelNativeSession(
   runId: string,

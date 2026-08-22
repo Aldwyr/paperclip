@@ -153,7 +153,7 @@ class HarnessNativeSession implements NativeSession {
     return this.#session.startTurn(input);
   }
 
-  steer(input: { turnId: string; message: { role: "user"; text: string } }) {
+  steer(input: { turnId: string; message: { role: "user"; text: string }; correlationId?: string }) {
     if (this.#session.steer === undefined) throw new Error("steering is unavailable");
     return this.#session.steer(input);
   }

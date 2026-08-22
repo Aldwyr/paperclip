@@ -125,6 +125,85 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
   expect(bundle.evidence()).toMatchObject({ runnerExited: true, runnerExitCode: 0 });
 }, 30_000);
 
+it("steers the active provider turn through the durable PRP command path", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: ["--linger-after-turn-start"],
+  });
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+        },
+      ],
+    });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "Work until I steer you." }],
+    });
+
+    await expect(
+      bundle.transport.request("turn/steer", {
+        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        correlationId: "queued-comment-1",
+      }),
+    ).resolves.toEqual({});
+    await expect(
+      bundle.transport.request("turn/steer", {
+        input: [{ type: "text", text: "Prioritize the mobile queue layout." }],
+        correlationId: "queued-comment-1",
+      }),
+    ).resolves.toEqual({});
+    await expect(
+      bundle.transport.request("turn/steer", {
+        expectedTurnId: "stale-logical-turn",
+        input: [{ type: "text", text: "This must not dispatch." }],
+      }),
+    ).rejects.toThrow("stale turn");
+
+    const notifications = bundle.transport
+      .notifications()
+      [Symbol.asyncIterator]();
+    const methods: string[] = [];
+    let acknowledged = false;
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !acknowledged) {
+      const next = await Promise.race([
+        notifications.next(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("steering notification timeout")),
+            1_000,
+          ),
+        ),
+      ]);
+      if (!next.value) break;
+      methods.push(next.value.method);
+      acknowledged =
+        next.value.method === "item/completed" &&
+        (next.value.params?.kind === "steering_acknowledgement" ||
+          next.value.params?.item?.kind === "steering_acknowledgement");
+    }
+    expect(methods).toContain("turn/started");
+    expect(acknowledged).toBe(true);
+  } finally {
+    await bundle.transport.close();
+  }
+}, 30_000);
+
 it("attaches a second governed run to one warm runner and provider process", async () => {
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),

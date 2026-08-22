@@ -701,7 +701,32 @@ describe("Codex app-server Codex driver", () => {
       workingDirectory: "/workspace",
     });
     const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
-    await session.steer?.({ turnId, message: { role: "user", text: "Stay concise." } });
+    await session.steer?.({
+      turnId,
+      message: { role: "user", text: "Stay concise." },
+      correlationId: "queued-comment-1",
+    });
+    await session.steer?.({
+      turnId,
+      message: { role: "user", text: "Stay concise." },
+      correlationId: "queued-comment-1",
+    });
+    expect(transport.calls.find((call) => call.method === "turn/steer")?.params)
+      .toMatchObject({ correlationId: "queued-comment-1" });
+    expect(transport.calls.filter((call) => call.method === "turn/steer")).toHaveLength(1);
+    transport.rejectMethods.set("turn/steer", new Error("provider rejected steering"));
+    const rejectedSteering = await session.steer?.({
+      turnId,
+      message: { role: "user", text: "Try this again later." },
+      correlationId: "queued-comment-2",
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(rejectedSteering).toBeInstanceOf(Error);
+    expect(rejectedSteering).not.toBeInstanceOf(HarnessCapabilityUnavailableError);
+    expect(String(rejectedSteering)).toContain("provider rejected steering");
+    transport.rejectMethods.delete("turn/steer");
     await expect(session.steer?.({
       turnId: fixture.controls.staleTurnSteer.turnId!,
       message: { role: "user", text: "Stale." },
@@ -732,6 +757,7 @@ describe("Codex app-server Codex driver", () => {
     expect(observed).toEqual(expect.arrayContaining([
       expect.objectContaining({
         eventType: "item.completed",
+        itemId: `${turnId}:steer:queued-comment-1`,
         payload: expect.objectContaining({ kind: "steering_acknowledgement", status: "acknowledged" }),
       }),
       expect.objectContaining({
@@ -1761,7 +1787,10 @@ describe("Codex app-server Codex driver", () => {
 
   it("degrades unsupported operations with explicit redacted diagnostics", async () => {
     const transport = new FakeCodexTransport();
-    transport.rejectMethods.set("turn/steer", new Error("Bearer super-secret api_key=also-secret"));
+    transport.rejectMethods.set(
+      "turn/steer",
+      new Error("method not found Bearer super-secret api_key=also-secret"),
+    );
     const session = await makeDriver([transport]).openSession({ runId: "run-degrade", normalizedSessionId: "normalized-degrade", workingDirectory: "/workspace" });
     const { turnId } = await session.startTurn({ message: { role: "user", text: "Start." } });
     await expect(session.steer?.({ turnId, message: { role: "user", text: "Steer." } })).rejects.toBeInstanceOf(HarnessCapabilityUnavailableError);

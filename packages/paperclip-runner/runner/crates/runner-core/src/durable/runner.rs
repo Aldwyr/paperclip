@@ -845,6 +845,60 @@ fn process_command_and_provider(
             )?;
             store.save(state)?;
         }
+        Some("turn.steer") => {
+            let steering = (|| -> Result<(String, String), DurableRunnerError> {
+                let text = command
+                    .pointer("/payload/text")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid("turn.steer payload.text is required")
+                    })?;
+                let turn_id = command
+                    .pointer("/payload/turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(state.turn_id.as_str());
+                if turn_id != state.turn_id || !state.active_turn {
+                    return Err(DurableRunnerError::invalid(
+                        "turn.steer named a stale turn",
+                    ));
+                }
+                provider
+                    .as_mut()
+                    .ok_or_else(|| DurableRunnerError::invalid("turn.steer requires a provider"))?
+                    .steer_turn(turn_id, text)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!("provider turn.steer failed: {error}"))
+                    })?;
+                Ok((turn_id.to_owned(), text.to_owned()))
+            })();
+            let (turn_id, _text) = match steering {
+                Ok(value) => value,
+                Err(error) => {
+                    // process_command persisted its dedupe entry before the
+                    // provider effect. Roll that state back so a rejected or
+                    // timed-out steering command remains genuinely retryable.
+                    *state = before;
+                    store.save(state)?;
+                    return Err(error);
+                }
+            };
+            enqueue_event(
+                state,
+                config,
+                "item.completed",
+                1,
+                json!({
+                    "kind": "steering_acknowledgement",
+                    "status": "acknowledged",
+                    "text": "Steering acknowledged for the active turn.",
+                    "commandId": command_id,
+                    "correlationId": command.pointer("/payload/correlationId").cloned().unwrap_or(Value::Null),
+                }),
+                Some(&format!("{}:steer:{}", turn_id, command_id)),
+            )?;
+            store.save(state)?;
+        }
         Some("semantic_tool.result") => {
             let result: crate::provider_bridge::ToolResult =
                 serde_json::from_value(command["payload"].clone()).map_err(|error| {
@@ -1429,11 +1483,62 @@ mod tests {
     use crate::local_runner::LocalRunnerError;
     use crate::provider_bridge::ToolResult;
     use std::net::TcpListener;
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct OversizedFrameProvider;
+
+    struct SteeringProvider {
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+        fail_next: Arc<Mutex<bool>>,
+    }
+
+    impl Provider for SteeringProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+        fn runtime_identity(&self) -> crate::codex_provider::ProviderRuntimeIdentity {
+            crate::codex_provider::ProviderRuntimeIdentity::LocalProcess {
+                process_id: 2,
+                provider_session_id: "steering".to_owned(),
+            }
+        }
+        fn session_identity(&self) -> &str {
+            "steering-thread"
+        }
+        fn provider_session_id(&self) -> Option<&str> {
+            Some("steering-session")
+        }
+        fn start_turn(&mut self, _message: &str, _cwd: &str, _turn_id: &str) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn steer_turn(&mut self, turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
+            let mut fail_next = self.fail_next.lock().unwrap();
+            if *fail_next {
+                *fail_next = false;
+                return Err(LocalRunnerError::invalid("provider rejected steering"));
+            }
+            drop(fail_next);
+            self.calls.lock().unwrap().push((turn_id.to_owned(), message.to_owned()));
+            Ok(json!({"acknowledged": true}))
+        }
+        fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn read(&mut self) -> Result<Value, LocalRunnerError> {
+            unreachable!()
+        }
+        fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
+            Ok(None)
+        }
+        fn deliver_tool_result(&mut self, _result: &ToolResult) -> Result<(), LocalRunnerError> {
+            unreachable!()
+        }
+        fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
+            Ok(())
+        }
+    }
 
     impl Provider for OversizedFrameProvider {
         fn kind(&self) -> ProviderKind {
@@ -1870,6 +1975,99 @@ mod tests {
             )
         )
         .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn steering_is_bound_to_the_active_turn_and_duplicate_commands_do_not_redispatch() {
+        let root = temporary_root("steering-command-dedupe");
+        let config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        state.active_turn = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fail_next = Arc::new(Mutex::new(false));
+        let mut provider: Option<Box<dyn Provider>> = Some(Box::new(SteeringProvider {
+            calls: calls.clone(),
+            fail_next,
+        }));
+        let steering = command(
+            "command-steer-1",
+            1,
+            "turn.steer",
+            json!({ "turnId": config.turn_id, "text": "Prioritize mobile overflow." }),
+        );
+
+        let first = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut provider,
+            &steering,
+        ).unwrap();
+        let event_count = state.outbox.len();
+        let duplicate = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut provider,
+            &steering,
+        ).unwrap();
+
+        assert_eq!(first.status, "completed");
+        assert_eq!(duplicate.result, first.result);
+        assert_eq!(calls.lock().unwrap().as_slice(), &[
+            (config.turn_id.clone(), "Prioritize mobile overflow.".to_owned()),
+        ]);
+        assert_eq!(state.outbox.len(), event_count);
+        assert!(state.outbox.iter().any(|event| {
+            event.envelope["payload"]["eventType"] == "item.completed"
+                && event.envelope["payload"]["payload"]["kind"] == "steering_acknowledgement"
+                && event.envelope["payload"]["payload"]["commandId"] == "command-steer-1"
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_steering_rolls_back_the_dedupe_ledger_for_retry() {
+        let root = temporary_root("steering-command-retry");
+        let config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        state.active_turn = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fail_next = Arc::new(Mutex::new(true));
+        let mut provider: Option<Box<dyn Provider>> = Some(Box::new(SteeringProvider {
+            calls: calls.clone(),
+            fail_next,
+        }));
+        let steering = command(
+            "command-steer-retry",
+            1,
+            "turn.steer",
+            json!({ "turnId": config.turn_id, "text": "Retry me." }),
+        );
+
+        let first_error = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut provider,
+            &steering,
+        ).unwrap_err();
+        assert!(first_error.to_string().contains("provider rejected steering"));
+        assert!(!state.processed_commands.contains_key("command-steer-retry"));
+        assert_eq!(state.last_controller_command_seq, 0);
+
+        let retry = process_command_and_provider(
+            &mut state,
+            &store,
+            &config,
+            &mut provider,
+            &steering,
+        ).unwrap();
+        assert_eq!(retry.status, "completed");
+        assert_eq!(calls.lock().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 

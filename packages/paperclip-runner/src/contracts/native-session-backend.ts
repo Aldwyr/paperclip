@@ -56,7 +56,7 @@ export interface NativeSession {
     message: NativeUserMessage;
     requestedCollaborationMode?: "default" | "plan";
   }): Promise<{ turnId: string; effectiveCollaborationMode?: "default" | "plan" }>;
-  steer?(input: { turnId: string; message: NativeUserMessage }): Promise<void>;
+  steer?(input: { turnId: string; message: NativeUserMessage; correlationId?: string }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;
   cancel?(input: { reason: string }): Promise<void>;
   result(): Promise<{

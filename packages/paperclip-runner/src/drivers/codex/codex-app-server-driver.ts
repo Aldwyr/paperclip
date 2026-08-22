@@ -786,6 +786,7 @@ class CodexHarnessSession implements HarnessSession {
   #goal: HarnessThreadGoal | null = null;
   #interruptQueued = false;
   #steerSequence = 0;
+  readonly #acknowledgedSteeringCorrelations = new Map<string, string>();
   #interruptSequence = 0;
 
   constructor(input: {
@@ -986,17 +987,28 @@ class CodexHarnessSession implements HarnessSession {
     };
   }
 
-  async steer(input: { turnId: string; message: NativeUserMessage }): Promise<void> {
+  async steer(input: { turnId: string; message: NativeUserMessage; correlationId?: string }): Promise<void> {
     this.#requireCapability("steering");
     this.#requireActiveTurn(input.turnId, "steering");
+    if (input.correlationId) {
+      const acknowledgedTurnId = this.#acknowledgedSteeringCorrelations.get(input.correlationId);
+      if (acknowledgedTurnId) {
+        if (acknowledgedTurnId !== input.turnId) throw new HarnessOperationAlreadyTerminalError("steering");
+        return;
+      }
+    }
     try {
       await this.#transport.request("turn/steer", {
         threadId: this.#opened.threadId,
         input: [userInput(input.message)],
         expectedTurnId: input.turnId,
+        correlationId: input.correlationId,
       });
       if (this.#activeTurnId !== input.turnId) {
         throw new HarnessOperationAlreadyTerminalError("steering");
+      }
+      if (input.correlationId) {
+        this.#acknowledgedSteeringCorrelations.set(input.correlationId, input.turnId);
       }
       this.#emit("item.completed", {
         kind: "steering_acknowledgement",
@@ -1004,11 +1016,20 @@ class CodexHarnessSession implements HarnessSession {
         status: "acknowledged",
       }, {
         turnId: input.turnId,
-        itemId: `${input.turnId}:steer:${++this.#steerSequence}`,
+        itemId: input.correlationId
+          ? `${input.turnId}:steer:${input.correlationId}`
+          : `${input.turnId}:steer:${++this.#steerSequence}`,
       });
     } catch (error) {
       if (error instanceof HarnessOperationAlreadyTerminalError) throw error;
-      throw this.#unsupported("steering", error);
+      const detail = redactCodexDiagnostic(String(error));
+      if (/unsupported|unavailable|capability|method not found/i.test(detail)) {
+        throw this.#unsupported("steering", detail);
+      }
+      // Steering rejection is a retryable operation failure, not evidence
+      // that the provider lacks the capability. Preserve that distinction for
+      // the control plane while keeping provider diagnostics redacted.
+      throw new Error(detail);
     }
   }
 

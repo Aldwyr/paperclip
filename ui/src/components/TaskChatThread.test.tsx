@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
 import type { ReactElement } from "react";
-import { forwardRef, useImperativeHandle, type ForwardedRef } from "react";
+import { act, forwardRef, useImperativeHandle, type ForwardedRef } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
+import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { TaskChatThread } from "./TaskChatThread";
 
 const transcriptState = vi.hoisted(() => ({ transcriptByRun: new Map() }));
@@ -557,6 +558,62 @@ describe("TaskChatThread queued message actions", () => {
     );
     expect(interrupting).not.toBeUndefined();
     expect(interrupting?.disabled).toBe(true);
+  });
+});
+
+describe("TaskChatThread Paperclip Runner queue", () => {
+  const queuedComment = {
+    id: "queued-prp-1",
+    companyId: "company-1",
+    issueId: "issue-1",
+    authorType: "user" as const,
+    authorAgentId: null,
+    authorUserId: "user-1",
+    body: "Render this queued message exactly once.",
+    presentation: null,
+    metadata: null,
+    createdAt: new Date("2026-08-22T15:00:00.000Z"),
+    updatedAt: new Date("2026-08-22T15:00:00.000Z"),
+  };
+  const queue: IssueQueuedCommentQueue = {
+    issueId: "issue-1",
+    targetRunId: "run-1",
+    revision: "revision-1",
+    protocol: "paperclip_runner_v1",
+    steeringDisposition: "available",
+    entries: [{ comment: queuedComment, position: 0, canEdit: true, canDiscard: true }],
+  };
+
+  function occurrenceCount(text: string) {
+    return container.textContent?.split(text).length! - 1;
+  }
+
+  it("suppresses the transcript echo until the queued entry is consumed", async () => {
+    const props = {
+      comments: [queuedComment],
+      onAdd: async () => {},
+      queuedCommentQueue: queue,
+      onEditQueuedComment: async () => {},
+      onReorderQueuedComments: async () => {},
+      onSteerQueuedComment: async () => {},
+      onDiscardQueuedComment: async () => {},
+    };
+    render(<TaskChatThread {...props} />);
+
+    const stack = container.querySelector('[data-testid="task-chat-composer-stack"]');
+    const queuePane = container.querySelector('[data-testid="task-chat-queued-messages"]');
+    expect(queuePane?.parentElement).toBe(stack);
+    expect(stack?.classList).not.toContain("gap-2");
+    expect(container.querySelector('[data-testid="task-chat-queued-message-queued-prp-1"]')).not.toBeNull();
+    expect(occurrenceCount(queuedComment.body)).toBe(1);
+
+    await act(async () => {
+      render(<TaskChatThread {...props} queuedCommentQueue={{ ...queue, revision: "revision-2", entries: [] }} />);
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-testid="task-chat-queued-message-queued-prp-1"]')).toBeNull();
+    expect(occurrenceCount(queuedComment.body)).toBe(1);
   });
 });
 

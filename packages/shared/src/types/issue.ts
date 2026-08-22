@@ -969,6 +969,33 @@ export interface IssueComment {
   updatedAt: Date;
 }
 
+export type IssueQueuedCommentProtocol = "paperclip_runner_v1" | "legacy";
+export type IssueQueuedCommentSteeringDisposition =
+  | "available"
+  | "unsupported"
+  | "temporarily_unavailable";
+
+export interface IssueQueuedCommentEntry {
+  comment: IssueComment;
+  position: number;
+  canEdit: boolean;
+  canDiscard: boolean;
+}
+
+/**
+ * Authoritative projection of the comments waiting behind one active issue
+ * run. `revision` is opaque and must be echoed by queue mutations so a stale
+ * browser cannot overwrite a newer ordering.
+ */
+export interface IssueQueuedCommentQueue {
+  issueId: string;
+  targetRunId: string | null;
+  revision: string;
+  protocol: IssueQueuedCommentProtocol;
+  steeringDisposition: IssueQueuedCommentSteeringDisposition;
+  entries: IssueQueuedCommentEntry[];
+}
+
 interface IssueCommentMetadataRowBase {
   type: IssueCommentMetadataRowType;
   label?: string | null;

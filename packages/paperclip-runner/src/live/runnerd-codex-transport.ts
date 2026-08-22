@@ -325,6 +325,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #threadId = "";
   #sessionId: string | null = null;
   #turnId = "";
+  #durableTurnId = "";
   #authorizedTools: Record<string, unknown> | null = null;
   #closed = false;
   #failure: Error | null = null;
@@ -389,6 +390,34 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : { data: [] };
     }
     if (method === "turn/start") return this.#startTurn(params);
+    if (method === "turn/steer") {
+      const input = Array.isArray(params.input) ? params.input.map(record) : [];
+      const text = input
+        .map((item) => (typeof item.text === "string" ? item.text : ""))
+        .join("\n");
+      const expectedTurnId =
+        typeof params.expectedTurnId === "string"
+          ? params.expectedTurnId
+          : this.#turnId;
+      if (!text.trim()) throw new Error("turn/steer requires a message");
+      if (expectedTurnId !== this.#turnId)
+        throw new Error("turn/steer named a stale turn");
+      const correlationId =
+        typeof params.correlationId === "string"
+          ? params.correlationId
+          : undefined;
+      await this.#command(
+        "turn.steer",
+        {
+          text,
+          turnId: this.#durableTurnId,
+          providerTurnId: expectedTurnId,
+          ...(correlationId ? { correlationId } : {}),
+        },
+        correlationId,
+      );
+      return {};
+    }
     if (method === "turn/interrupt") {
       await this.#command("turn.interrupt", params);
       return {};
@@ -450,6 +479,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ...(this.#authorizedTools === null ? {} : { authorizedTools: this.#authorizedTools }),
     });
     await this.#waitForAttachment(input.runId);
+    this.#durableTurnId = input.turnId;
     this.#turnId = input.turnId;
   }
 
@@ -520,6 +550,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       turnId: `turn_lab_${token}`,
       itemId: `item_lab_${token}`,
     };
+    this.#durableTurnId = identity.turnId;
     const dynamicTools = Array.isArray(params.dynamicTools) ? params.dynamicTools.map(record) : [];
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
@@ -693,6 +724,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     const controlPlaneDirectory = resolve(this.#root, "control-plane");
     const identity = recoveredControlPlaneIdentity(controlPlaneDirectory, desiredIdentity);
+    this.#durableTurnId = identity.turnId;
     const attachingNewRun = identity.runId !== desiredIdentity.runId;
     const core = new DurablePrpControlPlane({
       stateDirectory: controlPlaneDirectory,
@@ -789,11 +821,35 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return { turn: { id: this.#turnId, status: "inProgress" } };
   }
 
-  async #command(type: string, payload: Record<string, unknown>): Promise<void> {
+  async #command(
+    type: string,
+    payload: Record<string, unknown>,
+    correlationId?: string,
+  ): Promise<void> {
     const core = this.#core;
     if (core === null) throw new Error("PRP provider thread is not started");
-    const commandId = `command_lab_${randomUUID().replaceAll("-", "")}`;
-    core.queueCommand(type, payload, commandId, true);
+    const commandId = correlationId
+      ? `command_steer_${createHash("sha256")
+          .update(`${this.#durableTurnId}:${correlationId}`)
+          .digest("hex")
+          .slice(0, 32)}`
+      : `command_lab_${randomUUID().replaceAll("-", "")}`;
+    const existing = core.store.state.commands.find(
+      (command) => command.commandId === commandId,
+    );
+    if (existing) {
+      if (
+        existing.type !== type ||
+        durableRecoveryInternals.canonicalJson(existing.payload) !==
+          durableRecoveryInternals.canonicalJson(payload)
+      ) {
+        throw new Error(
+          `PRP steering correlation ${correlationId} was reused with different content`,
+        );
+      }
+    } else {
+      core.queueCommand(type, payload, commandId, true);
+    }
     await this.#waitCommand(type, commandId);
   }
 

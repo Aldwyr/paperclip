@@ -31,10 +31,13 @@ import {
   buildNativeProviderEnvironment,
   cancelNativeSession,
   executePaperclipNativeSession,
+  getNativeSessionSteeringState,
+  NativeSessionSteeringError,
   nativeSessionFailureDisposition,
   nativeSessionFailureSourceCode,
   providerPlanMarkdown,
   semanticProviderPlanMarkdown,
+  steerNativeSession,
 } from "./native-session-executor.js";
 
 describe("native provider bootstrap environment", () => {
@@ -261,6 +264,116 @@ describe("native session cancellation", () => {
     await expect(cancelNativeSession(execution.binding.runId, "retry budget stop"))
       .resolves.toBe(true);
     expect(state.cancel).toHaveBeenNthCalledWith(2, { reason: "retry budget stop" });
+
+    state.release?.();
+    await running;
+  });
+});
+
+describe("native session same-turn steering", () => {
+  const capabilities = vi.fn();
+  const snapshot = vi.fn();
+  const steer = vi.fn();
+
+  beforeEach(() => {
+    state.release = null;
+    capabilities.mockReset().mockResolvedValue({ steering: true });
+    snapshot.mockReset().mockResolvedValue({ activeTurnId: "provider-turn-1" });
+    steer.mockReset().mockResolvedValue(undefined);
+    state.execute.mockReset().mockImplementation(async (options) => {
+      options.onSession?.({ capabilities, snapshot, steer, cancel: vi.fn() });
+      await new Promise<void>((resolve) => { state.release = resolve; });
+      options.onSession?.(null);
+      return {
+        result: { summary: "completed" },
+        terminal: { runTerminalState: "succeeded" },
+        turnId: "provider-turn-1",
+        normalizedSessionId: "session",
+        providerSessionId: null,
+        driverKind: "test",
+        driverVersion: "1",
+        nativeEventCount: 1,
+        highestContiguousSourceSeq: 1,
+      };
+    });
+  });
+
+  async function startActiveSession() {
+    const running = executePaperclipNativeSession({
+      db: leaseDb(),
+      execution,
+      runnerInstanceId: "runner",
+    });
+    await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
+    return { running };
+  }
+
+  it("correlates the queued comment with the active provider turn acknowledgement", async () => {
+    const { running } = await startActiveSession();
+
+    await expect(getNativeSessionSteeringState(execution.binding.runId)).resolves.toEqual({
+      disposition: "available",
+      activeTurnId: "provider-turn-1",
+    });
+    await expect(steerNativeSession({
+      runId: execution.binding.runId,
+      message: "Check mobile overflow first.",
+      correlationId: "queued-comment-1",
+    })).resolves.toEqual({ turnId: "provider-turn-1" });
+    expect(steer).toHaveBeenCalledWith({
+      turnId: "provider-turn-1",
+      message: { role: "user", text: "Check mobile overflow first." },
+      correlationId: "queued-comment-1",
+    });
+
+    state.release?.();
+    await running;
+  });
+
+  it.each([
+    {
+      label: "unsupported provider",
+      prepare: () => capabilities.mockResolvedValue({ steering: false }),
+      code: "steering_unsupported",
+    },
+    {
+      label: "stale turn",
+      prepare: () => snapshot.mockResolvedValue({ activeTurnId: null }),
+      code: "steering_stale_turn",
+    },
+    {
+      label: "provider rejection",
+      prepare: () => steer.mockRejectedValue(new Error("request rejected")),
+      code: "steering_rejected",
+    },
+  ])("keeps $label retryable with a stable code", async ({ prepare, code }) => {
+    prepare();
+    const { running } = await startActiveSession();
+
+    const error = await steerNativeSession({
+      runId: execution.binding.runId,
+      message: "Retryable steering",
+      correlationId: "queued-comment-error",
+    }).catch((value) => value);
+    expect(error).toBeInstanceOf(NativeSessionSteeringError);
+    expect(error.code).toBe(code);
+
+    state.release?.();
+    await running;
+  });
+
+  it("bounds the provider acknowledgement wait", async () => {
+    steer.mockReturnValue(new Promise(() => undefined));
+    const { running } = await startActiveSession();
+
+    const error = await steerNativeSession({
+      runId: execution.binding.runId,
+      message: "Do not wait forever",
+      correlationId: "queued-comment-timeout",
+      timeoutMs: 5,
+    }).catch((value) => value);
+    expect(error).toBeInstanceOf(NativeSessionSteeringError);
+    expect(error.code).toBe("steering_timeout");
 
     state.release?.();
     await running;

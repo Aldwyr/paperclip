@@ -59,6 +59,10 @@ interface TaskChatComposerProps {
   mobile?: boolean;
   /** Storage key used to restore, persist, and clear this task's text draft. */
   draftKey?: string;
+  /** When set, the main composer temporarily edits this queued message. */
+  queuedEdit?: { commentId: string; body: string; stale?: boolean } | null;
+  onSaveQueuedEdit?: (commentId: string, body: string) => Promise<void>;
+  onCancelQueuedEdit?: () => void;
 }
 
 /** Per-mode hue token (see ui/src/index.css `--tc-mode-*`). */
@@ -98,6 +102,13 @@ type ComposerAttachment = {
   error?: string;
   /** Set once uploaded; the submit path appends `[name](contentPath)` lines. */
   contentPath?: string;
+};
+
+type QueuedEditBackup = {
+  body: string;
+  attachments: ComposerAttachment[];
+  pendingMode: IssueWorkMode;
+  pendingAssignee: string | null;
 };
 
 /** Local duplicate of IssueChatThread's module-private helper (same rule). */
@@ -151,6 +162,9 @@ export function TaskChatComposer({
   issueStatus,
   mobile = false,
   draftKey,
+  queuedEdit = null,
+  onSaveQueuedEdit,
+  onCancelQueuedEdit,
 }: TaskChatComposerProps) {
   const [body, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
   const [submitting, setSubmitting] = useState(false);
@@ -166,42 +180,96 @@ export function TaskChatComposer({
   const bodyRef = useRef(body);
   bodyRef.current = body;
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queuedEditRef = useRef(queuedEdit);
+  queuedEditRef.current = queuedEdit;
+  const queuedEditBackupRef = useRef<QueuedEditBackup | null>(null);
+  const previousQueuedEditIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!draftKey) return;
+    const previousId = previousQueuedEditIdRef.current;
+    const nextEdit = queuedEdit;
+    const nextId = nextEdit?.commentId ?? null;
+
+    if (nextEdit && previousId !== nextId) {
+      if (!queuedEditBackupRef.current) {
+        queuedEditBackupRef.current = {
+          body: bodyRef.current,
+          attachments: attachmentsRef.current,
+          pendingMode,
+          pendingAssignee: pendingAssigneeRef.current,
+        };
+        if (draftKey) saveDraft(draftKey, bodyRef.current);
+      }
+      if (draftTimer.current) {
+        clearTimeout(draftTimer.current);
+        draftTimer.current = null;
+      }
+      bodyRef.current = nextEdit.body;
+      setBody(nextEdit.body);
+      setAttachments([]);
+      requestAnimationFrame(() => editorRef.current?.focus());
+    } else if (!nextId && previousId) {
+      const backup = queuedEditBackupRef.current;
+      if (backup) {
+        bodyRef.current = backup.body;
+        setBody(backup.body);
+        setAttachments(backup.attachments);
+        setPendingMode(backup.pendingMode);
+        setPendingAssignee(backup.pendingAssignee);
+        if (draftKey) saveDraft(draftKey, backup.body);
+      }
+      queuedEditBackupRef.current = null;
+      requestAnimationFrame(() => editorRef.current?.focus());
+    }
+
+    previousQueuedEditIdRef.current = nextId;
+  }, [draftKey, pendingMode, queuedEdit]);
+
+  useEffect(() => {
+    if (!draftKey || queuedEdit) return;
     setBody(loadDraft(draftKey));
-  }, [draftKey]);
+  }, [draftKey, queuedEdit]);
 
   useEffect(() => {
-    if (!draftKey) return;
+    if (!draftKey || queuedEdit) {
+      if (draftTimer.current) {
+        clearTimeout(draftTimer.current);
+        draftTimer.current = null;
+      }
+      return;
+    }
     if (draftTimer.current) clearTimeout(draftTimer.current);
     draftTimer.current = setTimeout(() => {
       saveDraft(draftKey, body);
     }, DRAFT_DEBOUNCE_MS);
-  }, [body, draftKey]);
+  }, [body, draftKey, queuedEdit]);
 
   useEffect(() => {
     return () => {
       if (draftTimer.current) clearTimeout(draftTimer.current);
-      if (draftKey) saveDraft(draftKey, bodyRef.current);
+      if (draftKey && !queuedEditRef.current) saveDraft(draftKey, bodyRef.current);
     };
   }, [draftKey]);
 
   useEffect(() => {
     if (!draftKey) return;
-    const flushDraft = () => saveDraft(draftKey, bodyRef.current);
+    const flushDraft = () => {
+      if (!queuedEditRef.current) saveDraft(draftKey, bodyRef.current);
+    };
     window.addEventListener("beforeunload", flushDraft);
     return () => window.removeEventListener("beforeunload", flushDraft);
   }, [draftKey]);
 
   const modeMeta = workModeMetaFor(pendingMode);
-  const canAcceptFiles = Boolean(onAttachImage || onImageUpload);
+  const canAcceptFiles = !queuedEdit && Boolean(onAttachImage || onImageUpload);
   const showAssignee = Boolean(enableReassign && reassignOptions && reassignOptions.length > 0);
   const assigneeValue = pendingAssignee ?? currentAssigneeValue;
   const assigneeLabel =
     reassignOptions?.find((o) => o.id === assigneeValue)?.label ?? "Unassigned";
   const assigneeName = assigneeLabel === "Unassigned" ? "the agent" : assigneeLabel;
-  const effectivePlaceholder = placeholder ?? modePlaceholder(pendingMode, assigneeName);
+  const effectivePlaceholder = queuedEdit
+    ? "Edit queued message…"
+    : (placeholder ?? modePlaceholder(pendingMode, assigneeName));
 
   /** Upload an image and return its URL for inline `![](src)` markdown. */
   async function uploadInlineImage(file: File): Promise<string> {
@@ -331,13 +399,23 @@ export function TaskChatComposer({
     const refLines = attachedRefs
       .map((item) => `[${escapeMarkdownLabel(item.name)}](${item.contentPath})`)
       .join("\n");
-    const fullBody = [trimmed, refLines].filter(Boolean).join("\n\n");
+    // A queued edit must preserve the complete Markdown source. Normal sends
+    // keep the longstanding trimmed-body behavior.
+    const fullBody = queuedEdit
+      ? submittedBody
+      : [trimmed, refLines].filter(Boolean).join("\n\n");
     const hasReassignment = showAssignee && assigneeValue !== currentAssigneeValue;
     const reassignment = hasReassignment ? parseAssigneeValue(assigneeValue) : undefined;
     const reopen = shouldImplicitlyReopenComment(issueStatus, assigneeValue) ? true : undefined;
 
     setSubmitting(true);
     try {
+      if (queuedEdit) {
+        if (!onSaveQueuedEdit) return;
+        await onSaveQueuedEdit(queuedEdit.commentId, fullBody);
+        onCancelQueuedEdit?.();
+        return;
+      }
       if (pendingMode !== workMode && onWorkModeChange) {
         await onWorkModeChange(pendingMode);
       }
@@ -376,7 +454,7 @@ export function TaskChatComposer({
       onKeyDownCapture={(e) => {
         // Shift+Tab cycles the pending mode; captured on the wrapper so it
         // wins over Lexical's list-outdent binding inside the editor.
-        if (disabled) return;
+        if (disabled || queuedEdit) return;
         if (e.key === "Tab" && e.shiftKey) {
           e.preventDefault();
           e.stopPropagation();
@@ -480,6 +558,11 @@ export function TaskChatComposer({
           </>
         ) : null}
 
+        {queuedEdit ? (
+          <span className="px-1 text-xs font-medium text-muted-foreground">
+            {queuedEdit.stale ? "Queued message changed" : "Editing queued message"}
+          </span>
+        ) : (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -519,10 +602,11 @@ export function TaskChatComposer({
             })}
           </DropdownMenuContent>
         </DropdownMenu>
+        )}
 
         <div className="flex-1" />
 
-        {showAssignee ? (
+        {showAssignee && !queuedEdit ? (
           <InlineEntitySelector
             value={assigneeValue}
             options={reassignOptions ?? []}
@@ -543,6 +627,17 @@ export function TaskChatComposer({
           />
         ) : null}
 
+        {queuedEdit ? (
+          <button
+            type="button"
+            onClick={onCancelQueuedEdit}
+            disabled={submitting}
+            className="h-8 shrink-0 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        ) : null}
+
         <button
           type="button"
           onClick={() => void submit()}
@@ -554,13 +649,23 @@ export function TaskChatComposer({
             (body.trim().length === 0 && attachedRefs.length === 0)
           }
           title={
-            uploadPending
+            queuedEdit
+              ? queuedEdit.stale
+                ? "Queue as new message"
+                : "Save queued message"
+              : uploadPending
               ? "Waiting for upload to finish"
               : uploadFailed
                 ? "Remove the failed attachment to send"
                 : "Send (⌘+Enter)"
           }
-          aria-label="Send"
+          aria-label={
+            queuedEdit
+              ? queuedEdit.stale
+                ? "Queue as new message"
+                : "Save queued message"
+              : "Send"
+          }
           className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground transition-transform hover:scale-105 disabled:scale-100 disabled:bg-muted disabled:text-muted-foreground"
           data-testid="task-chat-composer-send"
         >

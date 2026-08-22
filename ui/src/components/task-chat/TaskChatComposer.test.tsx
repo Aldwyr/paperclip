@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { StrictMode, type ReactElement } from "react";
+import { StrictMode, useState, type ReactElement } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -754,6 +754,100 @@ describe("TaskChatComposer", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  describe("queued message editing", () => {
+    const draftKey = "task-chat-draft:queued-edit";
+
+    function Harness({
+      onSave,
+      stale = false,
+    }: {
+      onSave: (commentId: string, body: string) => Promise<void>;
+      stale?: boolean;
+    }) {
+      const [queuedEdit, setQueuedEdit] = useState<{
+        commentId: string;
+        body: string;
+        stale?: boolean;
+      } | null>({
+        commentId: "queued-1",
+        body: "Complete queued markdown",
+        stale,
+      });
+      return (
+        <TaskChatComposer
+          onAdd={vi.fn()}
+          workMode="standard"
+          draftKey={draftKey}
+          queuedEdit={queuedEdit}
+          onSaveQueuedEdit={onSave}
+          onCancelQueuedEdit={() => setQueuedEdit(null)}
+        />
+      );
+    }
+
+    it("restores the existing composer draft after cancelling an edit", async () => {
+      localStorage.setItem(draftKey, "Unsent normal draft");
+      render(<Harness onSave={vi.fn().mockResolvedValue(undefined)} />);
+      await flushAsync();
+      expect(editable().textContent).toBe("Complete queued markdown");
+      expect(localStorage.getItem(draftKey)).toBe("Unsent normal draft");
+
+      const cancel = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Cancel");
+      flushSync(() => cancel?.click());
+      await flushAsync();
+
+      expect(editable().textContent).toBe("Unsent normal draft");
+      expect(localStorage.getItem(draftKey)).toBe("Unsent normal draft");
+    });
+
+    it("saves through the queue callback without posting a new comment", async () => {
+      localStorage.setItem(draftKey, "Normal draft stays here");
+      const onSave = vi.fn().mockResolvedValue(undefined);
+      render(<Harness onSave={onSave} />);
+      await flushAsync();
+      typeText("Edited queued markdown");
+
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      await flushAsync();
+
+      expect(onSave).toHaveBeenCalledWith("queued-1", "Edited queued markdown");
+      expect(editable().textContent).toBe("Normal draft stays here");
+    });
+
+    it("retains edited text when the queue target rejects the save", async () => {
+      const onSave = vi.fn().mockRejectedValue(new Error("queued_comment_stale_target"));
+      render(<Harness onSave={onSave} />);
+      await flushAsync();
+      typeText("Keep this replacement text");
+
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+
+      expect(editable().textContent).toBe("Keep this replacement text");
+      expect(container.textContent).toContain("Editing queued message");
+    });
+
+    it("offers a stale edit as a new queued message and preserves its Markdown source", async () => {
+      const onSave = vi.fn().mockResolvedValue(undefined);
+      render(<Harness onSave={onSave} stale />);
+      await flushAsync();
+
+      typeText("  replacement with trailing Markdown  ");
+      expect(container.textContent).toContain("Queued message changed");
+      expect(sendButton().getAttribute("aria-label")).toBe("Queue as new message");
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      await flushAsync();
+
+      expect(onSave).toHaveBeenCalledWith(
+        "queued-1",
+        "  replacement with trailing Markdown  ",
+      );
     });
   });
 });

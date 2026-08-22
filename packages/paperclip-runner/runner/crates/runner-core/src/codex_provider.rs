@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -250,6 +250,9 @@ pub enum ProviderSessionIdentity {
 
 pub trait Provider {
     fn kind(&self) -> ProviderKind;
+    fn agent_process_id(&self) -> Option<u32> {
+        None
+    }
     fn runtime_identity(&self) -> ProviderRuntimeIdentity;
     fn session_identity(&self) -> &str;
     fn provider_session_id(&self) -> Option<&str>;
@@ -295,6 +298,11 @@ pub trait Provider {
         cwd: &str,
         turn_id: &str,
     ) -> Result<Value, LocalRunnerError>;
+    fn steer_turn(&mut self, _turn_id: &str, _message: &str) -> Result<Value, LocalRunnerError> {
+        Err(LocalRunnerError::invalid(
+            "provider does not support same-turn steering",
+        ))
+    }
     fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError>;
     fn read(&mut self) -> Result<Value, LocalRunnerError>;
     fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError>;
@@ -332,6 +340,8 @@ pub struct CodexProvider {
     next_request_id: u64,
     thread_id: String,
     session_id: Option<String>,
+    active_provider_turn_id: Option<String>,
+    pending_messages: VecDeque<Value>,
     pending_tool_requests: BTreeMap<String, Value>,
     collaboration_mode: String,
     collaboration_mode_payload: Option<Value>,
@@ -358,6 +368,8 @@ impl CodexProvider {
             next_request_id: 1,
             thread_id: String::new(),
             session_id: None,
+            active_provider_turn_id: None,
+            pending_messages: VecDeque::new(),
             pending_tool_requests: BTreeMap::new(),
             collaboration_mode: config.collaboration_mode.clone(),
             collaboration_mode_payload: None,
@@ -504,14 +516,45 @@ impl CodexProvider {
                 .expect("turn parameters are an object")
                 .insert("collaborationMode".to_owned(), collaboration_mode);
         }
-        self.request("turn/start", params)
+        let response = self.request("turn/start", params)?;
+        self.active_provider_turn_id = response
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if self.active_provider_turn_id.is_none() {
+            return Err(LocalRunnerError::invalid(
+                "Codex turn/start omitted turn.id",
+            ));
+        }
+        Ok(response)
     }
 
-    pub fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
+    pub fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
         let thread_id = self.thread_id.clone();
+        let provider_turn_id = self
+            .active_provider_turn_id
+            .clone()
+            .ok_or_else(|| LocalRunnerError::invalid("Codex has no active provider turn"))?;
         self.request(
             "turn/interrupt",
-            json!({ "threadId": thread_id, "turnId": turn_id }),
+            json!({ "threadId": thread_id, "turnId": provider_turn_id }),
+        )
+    }
+
+    pub fn steer_turn(&mut self, _turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
+        let thread_id = self.thread_id.clone();
+        let provider_turn_id = self
+            .active_provider_turn_id
+            .clone()
+            .ok_or_else(|| LocalRunnerError::invalid("Codex has no active provider turn"))?;
+        self.request(
+            "turn/steer",
+            json!({
+                "threadId": thread_id,
+                "expectedTurnId": provider_turn_id,
+                "input": [{"type": "text", "text": message, "text_elements": []}],
+            }),
         )
     }
 
@@ -524,16 +567,20 @@ impl CodexProvider {
     }
 
     pub fn poll(&mut self) -> Result<Option<ProviderEvent>, LocalRunnerError> {
-        let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
-            return if self.process.try_wait()?.is_some() {
-                Ok(Some(ProviderEvent::Exited))
-            } else {
-                Ok(None)
+        let message = if let Some(message) = self.pending_messages.pop_front() {
+            message
+        } else {
+            let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+                return if self.process.try_wait()?.is_some() {
+                    Ok(Some(ProviderEvent::Exited))
+                } else {
+                    Ok(None)
+                };
             };
+            serde_json::from_str(&line).map_err(|error| {
+                LocalRunnerError::invalid(format!("Codex emitted invalid JSON-RPC: {error}"))
+            })?
         };
-        let message: Value = serde_json::from_str(&line).map_err(|error| {
-            LocalRunnerError::invalid(format!("Codex emitted invalid JSON-RPC: {error}"))
-        })?;
         if message.get("id").is_some()
             && message.get("method").and_then(Value::as_str) == Some("item/tool/call")
         {
@@ -633,6 +680,7 @@ impl CodexProvider {
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
+            self.pending_messages.push_back(message);
         }
     }
 }
@@ -660,6 +708,9 @@ impl Provider for CodexProvider {
         _turn_id: &str,
     ) -> Result<Value, LocalRunnerError> {
         CodexProvider::start_turn(self, message, cwd)
+    }
+    fn steer_turn(&mut self, turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
+        CodexProvider::steer_turn(self, turn_id, message)
     }
     fn interrupt_turn(&mut self, turn_id: &str) -> Result<Value, LocalRunnerError> {
         CodexProvider::interrupt_turn(self, turn_id)

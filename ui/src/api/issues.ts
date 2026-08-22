@@ -13,6 +13,7 @@ import type {
   IssueAttachment,
   IssueCostSummary,
   IssueComment,
+  IssueQueuedCommentQueue,
   IssueDocument,
   IssueLabel,
   IssueRecoveryAction,
@@ -237,6 +238,39 @@ export const issuesApi = {
     const qs = params.toString();
     return api.get<IssueComment[]>(`/issues/${id}/comments${qs ? `?${qs}` : ""}`);
   },
+  getQueuedComments: (id: string) =>
+    api.get<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments`),
+  editQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { body: string; targetRunId: string; revision: string },
+  ) =>
+    api.patch<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}`,
+      data,
+    ),
+  reorderQueuedComments: (
+    id: string,
+    data: { orderedCommentIds: string[]; targetRunId: string; revision: string },
+  ) => api.put<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/order`, data),
+  steerQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { targetRunId: string; revision: string },
+  ) =>
+    api.post<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}/steer`,
+      data,
+    ),
+  discardQueuedComment: (
+    id: string,
+    commentId: string,
+    data: { targetRunId: string; revision: string },
+  ) =>
+    api.delete<IssueQueuedCommentQueue>(
+      `/issues/${id}/queued-comments/${commentId}`,
+      data,
+    ),
   listInteractions: (id: string) =>
     api.get<IssueThreadInteraction[]>(`/issues/${id}/interactions`),
   listAcceptedPlanDecompositions: (id: string) =>

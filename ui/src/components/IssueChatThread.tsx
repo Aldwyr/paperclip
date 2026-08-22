@@ -39,6 +39,7 @@ import type {
   IssueDocumentSummary,
   IssueBlockerAttention,
   IssueRecoveryAction,
+  IssueQueuedCommentQueue,
   IssueRelationIssueSummary,
   IssueScheduledRetry,
   SuccessfulRunHandoffState,
@@ -537,6 +538,12 @@ interface IssueChatThreadProps {
   includeSucceededRunsWithoutOutput?: boolean;
   onInterruptQueued?: (runId: string) => Promise<void>;
   onCancelQueued?: (commentId: string) => void;
+  /** Authoritative PRP queue. The classic thread intentionally ignores it. */
+  queuedCommentQueue?: IssueQueuedCommentQueue | null;
+  onEditQueuedComment?: (commentId: string, body: string, revision: string) => Promise<void>;
+  onReorderQueuedComments?: (orderedCommentIds: string[], revision: string) => Promise<void>;
+  onSteerQueuedComment?: (commentId: string, revision: string) => Promise<void>;
+  onDiscardQueuedComment?: (commentId: string, revision: string) => Promise<void>;
   onDeleteComment?: (commentId: string) => Promise<void> | void;
   interruptingQueuedRunId?: string | null;
   stoppingRunId?: string | null;

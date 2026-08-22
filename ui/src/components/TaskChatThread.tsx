@@ -42,6 +42,7 @@ import { TaskChatBubbleActions } from "@/components/task-chat/TaskChatBubbleActi
 import type { FeedbackVoteValue } from "@paperclipai/shared";
 import { TaskChatThreadView, taskChatContentKey } from "@/components/task-chat/TaskChatThreadView";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
+import { TaskChatQueuedMessages } from "@/components/task-chat/TaskChatQueuedMessages";
 import { useWindowAutoFollow } from "@/components/task-chat/useWindowAutoFollow";
 import { useSidebar } from "@/context/SidebarContext";
 import { cn } from "@/lib/utils";
@@ -183,10 +184,117 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     draftKey,
     onInterruptQueued,
     interruptingQueuedRunId,
+    queuedCommentQueue,
+    onEditQueuedComment,
+    onReorderQueuedComments,
+    onSteerQueuedComment,
+    onDiscardQueuedComment,
     blockedBy = [],
     blockerAttention,
     liveIssueIds,
   } = props;
+
+  const paperclipQueue =
+    queuedCommentQueue?.protocol === "paperclip_runner_v1"
+      ? queuedCommentQueue
+      : null;
+  const queuedCommentIds = useMemo(
+    () =>
+      new Set(paperclipQueue?.entries.map((entry) => entry.comment.id) ?? []),
+    [paperclipQueue],
+  );
+  const [queuedEdit, setQueuedEdit] = useState<{
+    commentId: string;
+    body: string;
+    revision: string;
+    stale?: boolean;
+  } | null>(null);
+
+  const beginQueuedEdit = useCallback(
+    (commentId: string) => {
+      const entry = paperclipQueue?.entries.find(
+        (candidate) => candidate.comment.id === commentId,
+      );
+      if (!entry?.canEdit || !paperclipQueue) return;
+      setQueuedEdit({
+        commentId,
+        body: entry.comment.body,
+        revision: paperclipQueue.revision,
+      });
+    },
+    [paperclipQueue],
+  );
+
+  const saveQueuedEdit = useCallback(
+    async (commentId: string, body: string) => {
+      if (!queuedEdit || queuedEdit.commentId !== commentId) {
+        throw new Error("This queued message is no longer editable.");
+      }
+      if (queuedEdit.stale) {
+        await onAdd(body);
+        return;
+      }
+      if (!onEditQueuedComment)
+        throw new Error("This queued message is no longer editable.");
+      try {
+        await onEditQueuedComment(commentId, body, queuedEdit.revision);
+      } catch (error) {
+        const payload =
+          typeof error === "object" && error !== null
+            ? (error as { status?: unknown; body?: unknown; message?: unknown })
+            : null;
+        const responseBody =
+          typeof payload?.body === "object" && payload.body !== null
+            ? (payload.body as { code?: unknown; details?: unknown })
+            : null;
+        const details =
+          typeof responseBody?.details === "object" &&
+          responseBody.details !== null
+            ? (responseBody.details as { code?: unknown })
+            : null;
+        const code =
+          typeof details?.code === "string"
+            ? details.code
+            : typeof responseBody?.code === "string"
+              ? responseBody.code
+              : null;
+        const stale =
+          payload?.status === 409 &&
+          (code === "queued_comment_stale_target" ||
+            code === "queued_comment_not_pending");
+        if (stale) {
+          setQueuedEdit((current) =>
+            current?.commentId === commentId
+              ? { ...current, stale: true }
+              : current,
+          );
+        }
+        throw error;
+      }
+    },
+    [onAdd, onEditQueuedComment, queuedEdit],
+  );
+
+  useEffect(() => {
+    if (!queuedEdit || queuedEdit.stale) return;
+    const targetStillQueued = paperclipQueue?.entries.some(
+      (entry) => entry.comment.id === queuedEdit.commentId,
+    );
+    if (!targetStillQueued) {
+      setQueuedEdit((current) =>
+        current ? { ...current, stale: true } : current,
+      );
+    } else if (
+      paperclipQueue &&
+      queuedEdit.revision !== paperclipQueue.revision
+    ) {
+      // A concurrent reorder/edit refreshes the optimistic-lock token without
+      // replacing the Markdown currently in the editor.
+      setQueuedEdit((current) =>
+        current ? { ...current, revision: paperclipQueue.revision } : current,
+      );
+    }
+  }, [paperclipQueue, queuedEdit]);
 
   const liveWorkLinks = useMemo(
     () => issueStatus === "blocked" && blockerAttention?.state === "covered"
@@ -372,6 +480,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // two lists stay index-aligned.
     const visibleComments = comments.filter((comment) => !comment.deletedAt);
     visibleComments.forEach((comment, index) => {
+      if (queuedCommentIds.has(comment.id)) return;
       // The live/settling runner lane already renders this run's final answer.
       // Keep a just-persisted duplicate out of the backbone until the complete
       // canonical bubble + Worked header can replace that lane atomically.
@@ -499,7 +608,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
     );
-  }, [comments, commentItems, interactions, documents, workProducts, attachments, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText]);
+  }, [comments, commentItems, interactions, documents, workProducts, attachments, timelineEvents, linkedRuns, liveRuns, planDocument, heldPaperclipRunnerRunId, heldPaperclipRunnerStartedAtMs, heldPaperclipRunnerFinalText, queuedCommentIds]);
 
   // Boolean gate (stable across the host's per-render brief objects) so the
   // heavy assembly memo doesn't recompute on every parent render.
@@ -851,6 +960,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
 
   const renderQueuedAction = useCallback(
     (item: TaskChatMessageItem) => {
+      if (paperclipQueue) return null;
       const runId = item.queueTargetRunId;
       if (item.optimistic !== "queued" || !runId || !onInterruptQueued) return null;
 
@@ -867,7 +977,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         </Button>
       );
     },
-    [interruptingQueuedRunId, onInterruptQueued],
+    [interruptingQueuedRunId, onInterruptQueued, paperclipQueue],
   );
 
   const renderInteraction = useCallback(
@@ -1009,22 +1119,54 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )}
         >
           {composerAccessory}
-          <TaskChatComposer
-            onAdd={handleThreadAdd}
-            workMode={issueWorkMode}
-            onWorkModeChange={onWorkModeChange}
-            disabled={Boolean(runtimeComposerDisabledReason)}
-            disabledReason={runtimeComposerDisabledReason}
-            onAttachImage={onAttachImage}
-            onImageUpload={imageUploadHandler}
-            mentions={mentions}
-            enableReassign={enableReassign}
-            reassignOptions={reassignOptions}
-            currentAssigneeValue={currentAssigneeValue}
-            issueStatus={issueStatus}
-            mobile={isMobile}
-            draftKey={draftKey}
-          />
+          <div
+            className="relative isolate flex flex-col"
+            data-testid="task-chat-composer-stack"
+          >
+            {paperclipQueue && paperclipQueue.entries.length > 0 ? (
+              <TaskChatQueuedMessages
+                queue={paperclipQueue}
+                onEdit={beginQueuedEdit}
+                onReorder={async (orderedCommentIds, revision) => {
+                  if (!onReorderQueuedComments)
+                    throw new Error("Queue reordering is unavailable.");
+                  await onReorderQueuedComments(orderedCommentIds, revision);
+                }}
+                onSteer={async (commentId, revision) => {
+                  if (!onSteerQueuedComment)
+                    throw new Error("Steering is unavailable.");
+                  await onSteerQueuedComment(commentId, revision);
+                }}
+                onDiscard={async (commentId, revision) => {
+                  if (!onDiscardQueuedComment)
+                    throw new Error("Discard is unavailable.");
+                  await onDiscardQueuedComment(commentId, revision);
+                  if (queuedEdit?.commentId === commentId) setQueuedEdit(null);
+                }}
+              />
+            ) : null}
+            <div className="relative z-10">
+              <TaskChatComposer
+                onAdd={handleThreadAdd}
+                workMode={issueWorkMode}
+                onWorkModeChange={onWorkModeChange}
+                disabled={Boolean(runtimeComposerDisabledReason)}
+                disabledReason={runtimeComposerDisabledReason}
+                onAttachImage={onAttachImage}
+                onImageUpload={imageUploadHandler}
+                mentions={mentions}
+                enableReassign={enableReassign}
+                reassignOptions={reassignOptions}
+                currentAssigneeValue={currentAssigneeValue}
+                issueStatus={issueStatus}
+                mobile={isMobile}
+                draftKey={draftKey}
+                queuedEdit={queuedEdit}
+                onSaveQueuedEdit={saveQueuedEdit}
+                onCancelQueuedEdit={() => setQueuedEdit(null)}
+              />
+            </div>
+          </div>
           {footer}
         </div>
       ) : null}
