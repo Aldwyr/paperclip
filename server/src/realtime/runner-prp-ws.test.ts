@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -15,6 +16,14 @@ import {
   runnerPrpWebSocketInternals,
   setupRunnerPrpWebSocketServer,
 } from "./runner-prp-ws.js";
+
+const fakeCodexAppServer = resolve(
+  import.meta.dirname,
+  "../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server",
+);
+const runnerBinariesAvailable =
+  existsSync(defaultCapabilityRunnerdBinary()) && existsSync(fakeCodexAppServer);
+const runnerBinaryIt = runnerBinariesAvailable ? it : it.skip;
 
 describe("runner PRP websocket route", () => {
   afterEach(() => runnerPrpWebSocketInternals.resetForTests());
@@ -95,7 +104,7 @@ describe("runner PRP websocket route", () => {
     server.close();
   });
 
-  it("carries an authorized runnerd tool call over the shared Paperclip route", async () => {
+  runnerBinaryIt("carries an authorized runnerd tool call over the shared Paperclip route", async () => {
     const server = createServer();
     await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
     const address = server.address();
@@ -104,7 +113,7 @@ describe("runner PRP websocket route", () => {
     const runId = "00000000-0000-4000-8000-000000000779";
     const bundle = createRunnerdCodexTransport({
       runnerBinary: defaultCapabilityRunnerdBinary(),
-      codexCommand: resolve(import.meta.dirname, "../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
+      codexCommand: fakeCodexAppServer,
       codexArgs: [],
       prpIdentity: {
         runnerInstanceId: "runner-server-route",

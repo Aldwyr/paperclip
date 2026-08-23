@@ -58,14 +58,24 @@ describe("paperclip_runner Claude Agent environment probe", () => {
 
     expect(result.status).toBe("warn");
     expect(result.checks.some((check) => check.code === "claude_managed_profile_qualified")).toBe(true);
-    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.url)).toEqual([
+      "https://api.anthropic.com/v1/agents/agent_test?beta=true",
+      "https://api.anthropic.com/v1/environments/env_test?beta=true",
+      "https://api.anthropic.com/v1/agents/agent_test/versions?beta=true",
+      "https://api.anthropic.com/v1/skills?limit=1&source=custom",
+    ]);
     expect(calls.every((call) => (call.init.method ?? "GET") === "GET")).toBe(true);
     for (const call of calls) {
       expect(call.init.headers).toMatchObject({
         "x-api-key": "anthropic-config-secret",
-        "anthropic-beta": "managed-agents-2026-04-01",
       });
     }
+    expect(calls.slice(0, 3).every((call) =>
+      (call.init.headers as Record<string, string>)["anthropic-beta"] === "managed-agents-2026-04-01"
+    )).toBe(true);
+    expect(calls[3]?.init.headers).toMatchObject({
+      "anthropic-beta": "skills-2025-10-02",
+    });
     expect(JSON.stringify(result)).not.toContain("anthropic-config-secret");
   });
 

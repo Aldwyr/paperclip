@@ -1,5 +1,6 @@
-import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
@@ -19,6 +20,14 @@ import {
 } from "../../realtime/runner-prp-ws.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
+const fakeCodexAppServer = resolve(
+  import.meta.dirname,
+  "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server",
+);
+const runnerBinariesAvailable =
+  existsSync(defaultCapabilityRunnerdBinary()) && existsSync(fakeCodexAppServer);
+const runnerBinaryIt = runnerBinariesAvailable ? it : it.skip;
+
 describe("paperclip-runner real server vertical slice", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   const companyId = "00000000-0000-4000-8000-000000000701";
@@ -36,7 +45,7 @@ describe("paperclip-runner real server vertical slice", () => {
     await temporary.cleanup();
   });
 
-  it("runs Rust runnerd through Paperclip PRP and reads the real bound task", async () => {
+  runnerBinaryIt("runs Rust runnerd through Paperclip PRP and reads the real bound task", async () => {
     const db = createDb(temporary.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Real runner slice", issuePrefix: "RRS" });
     await db.insert(agents).values({
@@ -78,7 +87,7 @@ describe("paperclip-runner real server vertical slice", () => {
     const stateDirectory = await mkdtemp(resolve(tmpdir(), "paperclip-runner-real-resume-"));
     const bundle = createRunnerdCodexTransport({
       runnerBinary: defaultCapabilityRunnerdBinary(),
-      codexCommand: resolve(import.meta.dirname, "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
+      codexCommand: fakeCodexAppServer,
       codexArgs: [],
       stateDirectory,
       lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
@@ -147,7 +156,7 @@ describe("paperclip-runner real server vertical slice", () => {
       });
       const restored = createRunnerdCodexTransport({
         runnerBinary: defaultCapabilityRunnerdBinary(),
-        codexCommand: resolve(import.meta.dirname, "../../../../packages/paperclip-runner/runner/target/debug/fake-codex-app-server"),
+        codexCommand: fakeCodexAppServer,
         codexArgs: [],
         stateDirectory,
         lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },

@@ -51,7 +51,9 @@ describe("buildPaperclipTaskMarkdown", () => {
       },
     });
 
-    expect(acceptedConfirmation).toContain("Create child issues from the approved plan only");
+    expect(acceptedConfirmation).toContain(
+      "Use create_task to create exactly one standard implementation child containing the complete approved plan",
+    );
     expect(acceptedConfirmation).not.toContain("Make the plan only.");
   });
 
@@ -68,7 +70,9 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
 
     expect(acceptedConfirmation).toContain("Accepted plan directive:");
-    expect(acceptedConfirmation).toContain("Create child issues from the approved plan only");
+    expect(acceptedConfirmation).toContain(
+      "Use create_task to create exactly one standard implementation child containing the complete approved plan",
+    );
     expect(acceptedConfirmation).not.toContain("- Work mode: \"planning\"");
   });
 
