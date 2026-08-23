@@ -7141,6 +7141,26 @@ export function issueService(db: Db) {
           return withRelations;
         }
 
+        if (issueData.parentId) {
+          const parent = await tx
+            .select({
+              id: issues.id,
+              status: issues.status,
+              supersededByIssueId: issues.supersededByIssueId,
+            })
+            .from(issues)
+            .where(and(eq(issues.companyId, companyId), eq(issues.id, issueData.parentId)))
+            .for("key share")
+            .then((rows) => rows[0] ?? null);
+          if (!parent) throw notFound("Parent issue not found");
+          if (parent.status === "cancelled" && parent.supersededByIssueId) {
+            throw conflict("Cannot create a child issue under a superseded issue", {
+              parentIssueId: parent.id,
+              supersededByIssueId: parent.supersededByIssueId,
+            });
+          }
+        }
+
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;

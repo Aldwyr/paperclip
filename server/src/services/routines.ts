@@ -1669,7 +1669,8 @@ export function routineService(
             olderRunCondition,
           ),
         )
-        .orderBy(asc(routineRuns.triggeredAt), asc(routineRuns.createdAt), asc(routineRuns.id));
+        .orderBy(asc(routineRuns.triggeredAt), asc(routineRuns.createdAt), asc(routineRuns.id))
+        .for("update", { of: issues });
 
       if (candidates.length === 0) return [];
 
@@ -1708,8 +1709,9 @@ export function routineService(
       }
 
       for (const candidate of candidates) {
+        if (!liveDescendantIssueIdsByRoot.has(candidate.issueId)) continue;
         const descendantIssueIds = liveDescendantIssueIdsByRoot.get(candidate.issueId);
-        if (!descendantIssueIds?.length) continue;
+        if (!descendantIssueIds) continue;
 
         const existingDeferredActivity = await txDb
           .select({ id: activityLog.id })
