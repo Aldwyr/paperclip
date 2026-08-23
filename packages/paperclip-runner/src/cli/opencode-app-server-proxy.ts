@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import type { HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
+import type { HarnessRuntimeRequestResolution, HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { OpenCodeServerDriver } from "../drivers/opencode/opencode-server-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
@@ -176,6 +176,21 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
           itemId: event.itemId ?? "semantic-result",
           result: payload,
         },
+      });
+    } else if (event.eventType === "runtime_request.created") {
+      const request = record(payload.request);
+      const requestId = text(request.requestId);
+      const turnId = text(request.turnId, text(event.turnId, activeTurnId ?? ""));
+      if (!requestId || !turnId || !opened.resolveRuntimeRequest) {
+        throw new Error("OpenCode runtime request is not resolvable");
+      }
+      const controllerResponse = record(await requestController("paperclip/runtimeRequest", {
+        request,
+      }));
+      await opened.resolveRuntimeRequest({
+        requestId,
+        turnId,
+        resolution: record(controllerResponse.resolution) as HarnessRuntimeRequestResolution,
       });
     } else if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
       const status = event.eventType.slice("turn.".length);

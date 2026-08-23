@@ -334,6 +334,69 @@ describe("OpenCodeServerDriver", () => {
     await recovered!.session!.close({ reason: "recovery-test" });
   });
 
+  it("normalizes native question.asked events and replies with ordered OpenCode answer arrays", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-workspace-"));
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const session = await driver.openSession({
+      runId: "run-native-question",
+      normalizedSessionId: "native-question",
+      workingDirectory: workspace,
+    });
+    const { turnId } = await session.startTurn({ message: { role: "user", text: "native-question" } });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    let requestEvent: Awaited<ReturnType<typeof iterator.next>>["value"] | null = null;
+    for (let count = 0; count < 30; count += 1) {
+      const event = await iterator.next();
+      if (event.done) break;
+      if (event.value.eventType === "runtime_request.created") {
+        requestEvent = event.value;
+        break;
+      }
+    }
+    expect(requestEvent?.payload).toMatchObject({
+      request: {
+        schema: "paperclip.runtime_request.v2",
+        requestKind: "runtime",
+        type: "input",
+        input: {
+          schema: "paperclip.question_set.v1",
+          questions: [
+            { id: "environment", answerMode: "single_select", customAnswer: { enabled: true } },
+            { id: "regions", answerMode: "multi_select" },
+          ],
+        },
+      },
+    });
+    await session.resolveRuntimeRequest?.({
+      requestId: "question-native-1",
+      turnId,
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: {
+            environment: { selectedOptionIds: ["option-1"] },
+            regions: { selectedOptionIds: ["option-1", "option-2"] },
+          },
+        },
+      },
+    });
+    const reply = JSON.parse(await readFile(join(root, "native-question", "data", "fake-question-reply.json"), "utf8"));
+    expect(reply).toEqual({
+      url: expect.stringContaining(`directory=${encodeURIComponent(workspace)}`),
+      body: { answers: [["Staging"], ["US", "EU"]] },
+    });
+    await session.close({ reason: "test" });
+  });
+
   it("clears a stale active turn that already has a persisted terminal fingerprint", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-stale-turn-"));

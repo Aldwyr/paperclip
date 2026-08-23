@@ -10,6 +10,7 @@ export const RUNNER_WORKFLOW_REPORT_SCHEMA = "paperclip.runner.workflow-eval-rep
 export interface RunnerWorkflowReportBundle {
   id: string;
   runnerVersion: string;
+  runnerBuild?: string;
   promptPolicyId: string;
   providerVersions: Record<string, string>;
   scheduleSeed?: string;

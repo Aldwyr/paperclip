@@ -51,6 +51,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PAPERCLIP_EVAL_BASELINE_READY: "true"
+          PAPERCLIP_EVAL_RUNNER_BUILD: ${{ github.sha }}
           PAPERCLIP_EVAL_MAX_CAMPAIGN_COST_USD: "12"
           PAPERCLIP_EVAL_SCHEDULE_SEED: runner-live-seven-day-v1
         run: pnpm --filter @paperclipai/paperclip-runner report:runner-live-evals

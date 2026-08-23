@@ -17,8 +17,10 @@ const historyDirectory = resolve(process.env.PAPERCLIP_EVAL_HISTORY_DIR ?? resol
 await mkdir(outputDirectory, { recursive: true });
 
 function safeBundleId(schedule) {
+  const runnerBuild = process.env.PAPERCLIP_EVAL_RUNNER_BUILD ?? packageManifest.version;
   const identity = JSON.stringify({
     runnerVersion: packageManifest.version,
+    runnerBuild,
     promptPolicyId: "runner-live-workflow-v1",
     seed: schedule.seed,
     candidates: schedule.candidates.map(({ id, adapter, model, reasoningEffort }) => ({ id, adapter, model, reasoningEffort })),
@@ -125,6 +127,7 @@ if (mode === "nightly") {
     bundle: {
       id: bundleId,
       runnerVersion: packageManifest.version,
+      runnerBuild: process.env.PAPERCLIP_EVAL_RUNNER_BUILD ?? packageManifest.version,
       promptPolicyId: "runner-live-workflow-v1",
       providerVersions,
       scheduleSeed: schedule.seed,
