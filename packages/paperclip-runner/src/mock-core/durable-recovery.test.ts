@@ -384,8 +384,20 @@ describe.sequential("Durable transport and recovery", () => {
         prompt: "Record one progress update.",
         model: "gpt-native-resume-fixture",
         runnerBinaryPath: durableRecoveryInternals.runnerBinary,
+        sharedProviderCommand: process.execPath,
+        sharedProviderSocketPath: resolve(root, "provider.sock"),
+        sharedProviderArgs: [
+          providerFixture,
+          "server",
+          resolve(root, "provider.sock"),
+          resolve(root, "provider-state.json"),
+        ],
         providerCommand: process.execPath,
-        providerArgs: [providerFixture, resolve(root, "provider-state.json")],
+        providerArgs: [
+          providerFixture,
+          "proxy",
+          resolve(root, "provider.sock"),
+        ],
         seed: {
           actors: [{
             id: "actor-1",
@@ -445,6 +457,7 @@ describe.sequential("Durable transport and recovery", () => {
       });
       expect(new Set(proof.runnerProcessPids as number[]).size).toBe(2);
       expect(new Set(proof.providerProcessPids as number[]).size).toBe(2);
+      expect(proof.sharedCodexServerPid).toEqual(expect.any(Number));
       expect(evidence.filter((entry) => {
         const data = entry.data as Record<string, unknown>;
         return entry.kind === "tool_call" && data.callId === "call-native-resume";

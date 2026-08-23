@@ -11,6 +11,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  existsSync,
   fchmodSync,
   fstatSync,
   fsyncSync,
@@ -1992,6 +1993,10 @@ export interface DurableEvalSessionInput {
   /** Test-only provider process override; production eval callers omit these. */
   providerCommand?: string;
   providerArgs?: string[];
+  /** Test-only shared Codex server override; production eval callers omit these. */
+  sharedProviderCommand?: string;
+  sharedProviderArgs?: string[];
+  sharedProviderSocketPath?: string;
   /** Defaults on for Codex; set false only for an eval that needs the baseline prompt. */
   includeCollaborationModeInstructions?: boolean;
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -2417,6 +2422,23 @@ export async function runDurableEvalSession(
     providerKind === "acpx"
       ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", input.model)
       : null;
+  const sharedCodexSocket =
+    input.sharedProviderSocketPath ?? resolve(root, "c.sock");
+  const codexConfigArgs = providerArgs.slice(0, -1);
+  const effectiveProviderArgs =
+    input.providerArgs ??
+    (input.nativeResume === undefined
+      ? providerArgs
+      : [
+          ...codexConfigArgs,
+          "app-server",
+          "proxy",
+          "--sock",
+          sharedCodexSocket,
+        ]);
+  let sharedCodexServer: ChildProcessWithoutNullStreams | null = null;
+  let sharedCodexServerStderr = "";
+  let sharedCodexServerError: Error | null = null;
   core.queueCommand("run.prepare", {
     authorizedTools: {
       schema: "paperclip.runner.authorized-tools.v1",
@@ -2468,7 +2490,7 @@ export async function runDurableEvalSession(
                   input.providerArgs ??
                   (providerKind === "opencode"
                     ? [opencodeProxyPath]
-                    : providerArgs),
+                    : effectiveProviderArgs),
                 cwd: tmpdir(),
                 model: input.model,
                 instructions:
@@ -2482,6 +2504,49 @@ export async function runDurableEvalSession(
   core.queueCommand("session.open", { reuse: "same_session" });
   core.queueCommand("turn.start", { text: input.prompt });
   await core.start();
+  if (input.nativeResume !== undefined) {
+    const sharedCommand =
+      input.sharedProviderCommand ??
+      input.providerCommand ??
+      process.env.PAPERCLIP_CODEX_COMMAND ??
+      "codex";
+    const sharedArgs =
+      input.sharedProviderArgs ??
+      [
+        ...codexConfigArgs,
+        "app-server",
+        "--listen",
+        `unix://${sharedCodexSocket}`,
+      ];
+    sharedCodexServer = spawn(sharedCommand, sharedArgs, {
+      cwd: tmpdir(),
+      env: process.env,
+      stdio: "pipe",
+    });
+    sharedCodexServer.stdout.resume();
+    sharedCodexServer.once("error", (error) => {
+      sharedCodexServerError = error;
+    });
+    sharedCodexServer.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      sharedCodexServerStderr = `${sharedCodexServerStderr}${chunk}`.slice(-16_384);
+    });
+    const sharedServerDeadline = Date.now() + 10_000;
+    while (
+      !existsSync(sharedCodexSocket) &&
+      sharedCodexServerError === null &&
+      sharedCodexServer.exitCode === null &&
+      Date.now() < sharedServerDeadline
+    ) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    }
+    if (!existsSync(sharedCodexSocket)) {
+      sharedCodexServer.kill("SIGKILL");
+      const startError = sharedCodexServerError as Error | null;
+      throw new Error(
+        `shared Codex app-server did not create its socket: ${startError?.message ?? sharedCodexServerStderr}`,
+      );
+    }
+  }
   const launchRunner = (): RunnerProcessHandle =>
     spawnRunner({
         connectUrl: core.connectUrl,
@@ -2969,12 +3034,13 @@ export async function runDurableEvalSession(
               comments?: unknown[];
             };
             const finalComments = authority.snapshot().comments;
-            return {
-              schema: "paperclip.runner.native-resume-proof/v1",
-              triggered: true,
-              runnerRestarts,
-              runnerProcessPids,
-              providerProcessPids,
+          return {
+            schema: "paperclip.runner.native-resume-proof/v1",
+            triggered: true,
+            runnerRestarts,
+            runnerProcessPids,
+            providerProcessPids,
+            sharedCodexServerPid: sharedCodexServer?.pid ?? null,
               sameProviderThread:
                 providerThreadIds.length >= 2 &&
                 new Set(providerThreadIds).size === 1,
@@ -3166,6 +3232,20 @@ export async function runDurableEvalSession(
   } finally {
     releaseNativeSemanticDispatch();
     handle.child.kill("SIGKILL");
+    const sharedServer = sharedCodexServer;
+    if (sharedServer !== null && sharedServer.exitCode === null) {
+      sharedServer.kill("SIGTERM");
+      await new Promise<void>((resolveExit) => {
+        const timer = setTimeout(() => {
+          sharedServer.kill("SIGKILL");
+          resolveExit();
+        }, 2_000);
+        sharedServer.once("exit", () => {
+          clearTimeout(timer);
+          resolveExit();
+        });
+      });
+    }
     await core.stop();
     await authority.stop();
     if (process.env.PAPERCLIP_KEEP_EVAL_STATE !== "1")

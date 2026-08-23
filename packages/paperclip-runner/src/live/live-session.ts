@@ -265,6 +265,7 @@ export interface CapabilityLiveSessionSnapshot {
     runnerRestarts: number;
     runnerProcessPids: number[];
     providerProcessPids: number[];
+    sharedCodexServerPid: number | null;
     sameProviderThread: boolean;
     providerThreadDigest: string | null;
     callId: string;
