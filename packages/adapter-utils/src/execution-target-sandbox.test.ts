@@ -5784,6 +5784,7 @@ describe("sandbox duplex gateway", () => {
     createStdoutFrameWriter: (
       stream: FakeOutboundStream,
       onBackpressure?: (writableLength: number) => void,
+      stallTimeoutMs?: number,
     ) => (line: string) => Promise<void>;
   }
 
@@ -5883,6 +5884,90 @@ describe("sandbox duplex gateway", () => {
     await expect(first).rejects.toBe(boom);
     await expect(second).rejects.toBe(boom);
     await expect(third).rejects.toBe(boom);
+  });
+
+  it("ends a stalled outbound write on its own stall bound when the pipe never drains and never errors", async () => {
+    // Regression test for the stalled-write finding. A backpressured write
+    // that meets a pipe which stays open forever -- no drain, no "error"
+    // event -- used to wait without end. That left the write's caller
+    // waiting forever too, so an admission reserve tied to that write's
+    // completion never released. Pass a stall bound, and prove a wait that
+    // outlasts it ends the same way a stream error does: the queued write
+    // and every line still queued reject, and the writer never issues
+    // another write afterward.
+    vi.useFakeTimers();
+    try {
+      const { createStdoutFrameWriter } = loadEmbeddedStdoutFrameWriter();
+      const stream = new FakeOutboundStream({ accepting: false });
+      const writeLine = createStdoutFrameWriter(stream, undefined, 1000);
+
+      const first = writeLine("frame-1\n");
+      const second = writeLine("frame-2\n");
+      // Attach a throwaway handler to each promise right away. Both reject
+      // once the bound below elapses; a bare `.rejects` assertion later
+      // still sees the same rejection, but this stops the interpreter from
+      // reporting an unhandled rejection in the window before that assertion
+      // runs.
+      let firstSettled = false;
+      void first.catch(() => undefined).finally(() => {
+        firstSettled = true;
+      });
+      void second.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stream.writes).toEqual(["frame-1\n"]);
+
+      // The pipe never drains and never errors. Advance to just before the
+      // bound: the writer is still waiting, nothing has settled.
+      await vi.advanceTimersByTimeAsync(999);
+      expect(firstSettled).toBe(false);
+
+      // Cross the bound. The stall timer fires, ends the wait, and strands
+      // both queued lines.
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(first).rejects.toThrow(/did not drain within 1000ms/);
+      await expect(second).rejects.toThrow(/did not drain within 1000ms/);
+
+      // The writer treats the stall exactly like a stream error: it never
+      // issues another write once one has struck.
+      const third = writeLine("frame-3\n");
+      await expect(third).rejects.toThrow(/did not drain within 1000ms/);
+      expect(stream.writes).toEqual(["frame-1\n"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start a stall timer once the pipe drains before the bound elapses", async () => {
+    // The stall bound only ever fires against a write still waiting when it
+    // elapses. A write that drains first must settle normally and must leave
+    // no stray timer that could later reject an unrelated later write.
+    vi.useFakeTimers();
+    try {
+      const { createStdoutFrameWriter } = loadEmbeddedStdoutFrameWriter();
+      const stream = new FakeOutboundStream({ accepting: false });
+      const writeLine = createStdoutFrameWriter(stream, undefined, 1000);
+
+      const first = writeLine("frame-1\n");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(stream.writes).toEqual(["frame-1\n"]);
+
+      // Drain well before the bound elapses. The write settles normally.
+      stream.drain();
+      await first;
+
+      // Advance well past the bound the drained write would have hit. No
+      // stray timer fires and rejects an unrelated later write, because the
+      // writer cleared frame-1's timer the moment it drained.
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const second = writeLine("frame-2\n");
+      await vi.advanceTimersByTimeAsync(0);
+      stream.drain();
+      await second;
+      expect(stream.writes).toEqual(["frame-1\n", "frame-2\n"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("returns the same HTTP response as the file gateway for a forwarded request", async () => {

@@ -1462,4 +1462,78 @@ describe("duplex bridge local end-to-end harness", () => {
     });
     expect(later.status).toBe(502);
   }, 20000);
+
+  it("ends a stalled send on its own stall bound when the outbound pipe never drains and never breaks, and releases the reserve for a later request", async () => {
+    // Regression test for the stalled-write finding. The prior two tests
+    // release the reserve because the pipe eventually drains, or because it
+    // breaks. This proves the reserve also releases when neither happens:
+    // the reader on the other end just stops consuming, and the pipe itself
+    // stays open. Never resume or destroy the child's stdout in this test --
+    // a release here can only come from the writer's own stall bound.
+    const maxBodyBytes = 2 * 1024 * 1024;
+    const responseTimeoutMs = 900;
+    const harness = await createHarness({
+      maxBodyBytes,
+      // Admits exactly one concurrent body read at maxBodyBytes: the declared
+      // body size plus the fixed in-flight frame allowance.
+      maxInflightBodyBytes: maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES,
+      responseTimeoutMs,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+    harness.setForwardMode("hang");
+
+    // Stop reading the child's stdout, so the first request's send stalls
+    // mid-flight. Nothing in this test ever resumes or destroys it.
+    harness.child.stdout.pause();
+
+    const body = "a".repeat(maxBodyBytes);
+    const first = fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    void first.catch(() => undefined);
+
+    // Give the gateway time to read the body and drive its send into
+    // backpressure.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    // Confirm the reserve is held while the send is stalled: a second
+    // request cannot reserve, so the gateway sheds it with a clean 503.
+    const shedWhileStalled = await fetch(`${harness.baseUrl}/api/issues/issue-2/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(shedWhileStalled.status).toBe(503);
+
+    const firstResponse = await first;
+    // No response frame can ever arrive: the pipe never drains, so the
+    // gateway's own response timeout ends the request with a local 502.
+    expect(firstResponse.status).toBe(502);
+
+    // Give the writer's stall bound (== responseTimeoutMs) room to fire and
+    // release the reserve, well past the point where it must have struck.
+    await new Promise((resolve) => setTimeout(resolve, responseTimeoutMs + 300));
+
+    // The reserve released once the stalled send ended on its own stall
+    // bound and the timed-out response both finished. A later request is
+    // admitted again, even though the pipe still never drained.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-3/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(later.status).toBe(502);
+  }, 20000);
 });

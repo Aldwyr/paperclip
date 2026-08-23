@@ -2023,17 +2023,22 @@ class DuplexFrameDecoder {
 // body_chunk frame. The writer issues at most one `stream.write()` call at a
 // time and waits for the stream to drain before it starts the next queued
 // line, so a slow reader never lets the gateway queue a whole request's
-// frames at once. A stream "error" event ends an in-flight wait the same way
-// "drain" does, and it fails every line still queued, because a broken pipe
-// can never drain.
-const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(stream, onBackpressure) {
+// frames at once. Three conditions end an in-flight wait, all the same way:
+// the stream drains, the stream emits an "error" event, or the wait outlasts
+// `stallTimeoutMs`. The last one covers a pipe that stays open but never
+// drains -- for example a reader that stopped consuming without closing the
+// pipe -- which the "error" event never fires for on its own. Each of the
+// last two fails every line still queued, because neither a broken pipe nor
+// one stalled past its bound can ever be trusted to drain.
+const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(stream, onBackpressure, stallTimeoutMs) {
   const queue = [];
   let pumping = false;
   let streamError = null;
 
-  // Reject every entry still queued and empty the queue. Both the "error"
-  // listener below and the top-of-loop check inside pump call this, so a
-  // stream error always settles every entry that was queued when it struck,
+  // Reject every entry still queued and empty the queue. The "error"
+  // listener below, the stall timer inside pump's drain wait, and the
+  // top-of-loop check inside pump all call this, so a stream error or a
+  // stalled drain always settles every entry that was queued when it struck,
   // not only the one pump happened to be holding.
   function strandQueue(error) {
     const stranded = queue.splice(0, queue.length);
@@ -2067,26 +2072,49 @@ const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(st
           onBackpressure(stream.writableLength);
         }
         await new Promise((resolve) => {
+          let stallTimer = null;
+          const clearStallTimer = () => {
+            if (stallTimer !== null) clearTimeout(stallTimer);
+          };
           const onDrain = () => {
+            clearStallTimer();
             stream.off("error", onStreamErrorWhileWaiting);
             resolve();
           };
           const onStreamErrorWhileWaiting = () => {
+            clearStallTimer();
             stream.off("drain", onDrain);
             resolve();
           };
           stream.once("drain", onDrain);
           stream.once("error", onStreamErrorWhileWaiting);
+          if (typeof stallTimeoutMs === "number" && stallTimeoutMs > 0) {
+            // The pipe accepted the write but stayed above its high-water
+            // mark past this bound with no drain and no error. Treat that
+            // exactly like a stream error: a wait this long already means
+            // the reader on the other end is not consuming, so holding the
+            // admission reserve for this read any longer serves no request
+            // that can still complete.
+            stallTimer = setTimeout(() => {
+              stream.off("drain", onDrain);
+              stream.off("error", onStreamErrorWhileWaiting);
+              streamError = new Error(
+                "stdout write did not drain within " + stallTimeoutMs + "ms",
+              );
+              strandQueue(streamError);
+              resolve();
+            }, stallTimeoutMs);
+          }
         });
       }
       if (streamError) {
-        // The "error" listener already stranded and rejected every entry
-        // that was in the queue when the stream failed, including this one
-        // if it was still queued at that moment. Do not shift here: the
-        // queue head may now be a line a caller pushed after the stream
-        // failed but before this wait resumed, and shifting it here would
-        // discard that entry without ever settling its promise. The
-        // top-of-loop check above strands it on the next turn instead.
+        // The "error" listener or the stall timer above already stranded and
+        // rejected every entry that was in the queue when it struck,
+        // including this one if it was still queued at that moment. Do not
+        // shift here: the queue head may now be a line a caller pushed after
+        // the stream failed but before this wait resumed, and shifting it
+        // here would discard that entry without ever settling its promise.
+        // The top-of-loop check above strands it on the next turn instead.
         continue;
       }
       queue.shift();
@@ -2245,9 +2273,9 @@ export function getSandboxDuplexGatewayCodecSource(): string {
  * Return the exact zero-dependency outbound-writer source the generated duplex
  * gateway embeds. A test wraps this source with a fake stream, so it proves
  * the writer serializes every write, waits for drain, and ends a stalled write
- * on a stream error, all without a real child process. The source declares
- * `createStdoutFrameWriter` but exports it from no module; a caller wraps it
- * to read the name.
+ * on a stream error or on a bounded stall timeout, all without a real child
+ * process. The source declares `createStdoutFrameWriter` but exports it from
+ * no module; a caller wraps it to read the name.
  */
 export function getSandboxDuplexGatewayStdoutWriterSource(): string {
   return DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE;
@@ -2784,10 +2812,19 @@ function runDuplexGateway() {
 
   // The one serialized, backpressure-aware writer for this process. Every
   // outbound frame -- the heartbeat, the READY frame, one request envelope,
-  // and each body_chunk -- writes through it, in call order.
-  const writeStdoutFrameLine = createStdoutFrameWriter(process.stdout, (writableLength) => {
-    diag("stdout frame write backpressured: writableLength=" + writableLength);
-  });
+  // and each body_chunk -- writes through it, in call order. Its stall bound
+  // reuses responseTimeoutMs: a write that stays backpressured that long
+  // already means no response can arrive over this pipe in time, so ending
+  // the wait here costs nothing beyond what the response side already gives
+  // up on, and it lets a stalled read's admission reserve release instead of
+  // holding it for the rest of the process's life.
+  const writeStdoutFrameLine = createStdoutFrameWriter(
+    process.stdout,
+    (writableLength) => {
+      diag("stdout frame write backpressured: writableLength=" + writableLength);
+    },
+    responseTimeoutMs,
+  );
 
   // Write a control frame (heartbeat or READY). This is fire-and-forget: a
   // dropped heartbeat is not fatal, because the heartbeat repeats on its own
@@ -3102,10 +3139,12 @@ function runDuplexGateway() {
       // request charges no less than its true retained peak. A malformed
       // body cannot expand, because its raw bytes ride base64 frames
       // unchanged. The reserve for one read releases only once both its send
-      // finished (drained fully or ended by a stream error) and its response
-      // settled -- see releaseReserveWhenBothDone below -- so a slow host
-      // cannot make the gateway release a reserve while it still retains the
-      // bytes.
+      // finished (drained fully, ended by a stream error, or ended by the
+      // writer's own stall-timeout bound) and its response settled -- see
+      // releaseReserveWhenBothDone below -- so a slow host cannot make the
+      // gateway release a reserve while it still retains the bytes, and a
+      // host that stops reading without ever closing the pipe cannot make
+      // the gateway hold that reserve forever either.
       handedOffToSend = true;
       let sendDone = false;
       let responseDone = false;
@@ -3146,10 +3185,13 @@ function runDuplexGateway() {
         // already registered, so the response side and the send side start
         // from the same point and settle independently. There is no cancel
         // frame in the protocol: once this send writes the envelope, it must
-        // run to completion or the stdout stream must error, because a
-        // stopped send would leave a partial body only channel teardown
-        // reclaims. A response timeout above does not stop this send; it only
-        // resolves the HTTP caller early while the send keeps running.
+        // run to completion, or the stdout stream must error, or the writer's
+        // own stall bound must end it, because a stopped send would leave a
+        // partial body only channel teardown reclaims. A response timeout
+        // above does not stop this send; it only resolves the HTTP caller
+        // early while the send keeps running -- but the writer's own bound
+        // stops a send whose pipe never drains and never errors, so this
+        // read's admission reserve still releases even then.
         void (async () => {
           try {
             await writeStdoutFrameLine(encodedRequest.line);
@@ -3159,9 +3201,10 @@ function runDuplexGateway() {
               await writeStdoutFrameLine(encoded.line);
             }
           } catch (error) {
-            // The writer's only two end conditions for a stalled write are a
-            // drain and a stream error. This catches the stream-error case: it
-            // ends the send here instead of leaving it stalled forever.
+            // The writer's three end conditions for a stalled write are a
+            // drain, a stream error, and its own stall-timeout bound. This
+            // catches the latter two: it ends the send here instead of
+            // leaving it stalled forever.
             diag(
               "the outbound send for request " +
                 requestId +
