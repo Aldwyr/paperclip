@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import net from "node:net";
 import { execFile, spawn } from "node:child_process";
@@ -11,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getSandboxCallbackBridgeServerSource,
   getSandboxDuplexGatewayCodecSource,
+  getSandboxDuplexGatewayStdoutWriterSource,
 } from "./sandbox-callback-bridge.js";
 
 import {
@@ -5744,6 +5746,112 @@ describe("sandbox duplex gateway", () => {
     hostDecoder.dispose();
     expect(ledger.bytesInUse).toBe(0);
     expect(ledger.liveTokenCount).toBe(0);
+  });
+
+  /**
+   * A minimal fake outbound stream for the embedded stdout-writer tests below.
+   * It lets a test control exactly when one write "drains" and when the
+   * stream "errors", with no real pipe and no child process.
+   */
+  class FakeOutboundStream extends EventEmitter {
+    writes: string[] = [];
+    writableLength = 0;
+    private accepting: boolean;
+
+    constructor(options: { accepting?: boolean } = {}) {
+      super();
+      this.accepting = options.accepting ?? true;
+    }
+
+    write(line: string): boolean {
+      this.writes.push(line);
+      if (this.accepting) return true;
+      this.writableLength += Buffer.byteLength(line, "utf8");
+      return false;
+    }
+
+    drain(): void {
+      this.writableLength = 0;
+      this.emit("drain");
+    }
+
+    errorOut(error: Error): void {
+      this.emit("error", error);
+    }
+  }
+
+  interface EmbeddedStdoutWriter {
+    createStdoutFrameWriter: (
+      stream: FakeOutboundStream,
+      onBackpressure?: (writableLength: number) => void,
+    ) => (line: string) => Promise<void>;
+  }
+
+  function loadEmbeddedStdoutFrameWriter(): EmbeddedStdoutWriter {
+    const factory = new Function(
+      `${getSandboxDuplexGatewayStdoutWriterSource()}\nreturn { createStdoutFrameWriter };`,
+    ) as () => EmbeddedStdoutWriter;
+    return factory();
+  }
+
+  it("issues one outbound write at a time and waits for drain before the next", async () => {
+    // Regression test for the backpressure block. The old gateway called
+    // `stream.write()` for every frame in a tight loop and ignored the return
+    // value, so a slow reader let it queue a whole request's frames at once.
+    // The writer must issue at most one write, then wait for the stream to
+    // drain before it starts the next queued line.
+    const { createStdoutFrameWriter } = loadEmbeddedStdoutFrameWriter();
+    const stream = new FakeOutboundStream({ accepting: false });
+    const backpressureLengths: number[] = [];
+    const writeLine = createStdoutFrameWriter(stream, (length) => backpressureLengths.push(length));
+
+    const first = writeLine("frame-1\n");
+    const second = writeLine("frame-2\n");
+    const third = writeLine("frame-3\n");
+
+    // Only the first line reached the stream. The writer holds the rest back
+    // in its own queue; it never hands every queued line to the stream at
+    // once.
+    await Promise.resolve();
+    expect(stream.writes).toEqual(["frame-1\n"]);
+    expect(backpressureLengths).toEqual([Buffer.byteLength("frame-1\n", "utf8")]);
+
+    stream.drain();
+    await first;
+    expect(stream.writes).toEqual(["frame-1\n", "frame-2\n"]);
+
+    stream.drain();
+    await second;
+    expect(stream.writes).toEqual(["frame-1\n", "frame-2\n", "frame-3\n"]);
+
+    stream.drain();
+    await third;
+  });
+
+  it("ends a stalled outbound write and fails every queued line when the stream errors", async () => {
+    // The writer accepts exactly two end conditions for a stalled write: the
+    // stream drains, or the stream errors. This proves the second one: a
+    // stream error ends the wait at once and fails every line still queued,
+    // because a broken pipe can never drain.
+    const { createStdoutFrameWriter } = loadEmbeddedStdoutFrameWriter();
+    const stream = new FakeOutboundStream({ accepting: false });
+    const writeLine = createStdoutFrameWriter(stream);
+
+    const first = writeLine("frame-1\n");
+    const second = writeLine("frame-2\n");
+    await Promise.resolve();
+    expect(stream.writes).toEqual(["frame-1\n"]);
+
+    const boom = new Error("EPIPE");
+    stream.errorOut(boom);
+
+    await expect(first).rejects.toBe(boom);
+    await expect(second).rejects.toBe(boom);
+
+    // The writer never issues another write once the stream has errored.
+    const third = writeLine("frame-3\n");
+    await expect(third).rejects.toBe(boom);
+    expect(stream.writes).toEqual(["frame-1\n"]);
   });
 
   it("returns the same HTTP response as the file gateway for a forwarded request", async () => {

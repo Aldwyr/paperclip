@@ -15,6 +15,7 @@ import {
 } from "./sandbox-callback-bridge.js";
 import {
   DuplexFrameDecoder,
+  DEFAULT_MAX_DUPLEX_FRAME_BYTES,
   DUPLEX_BODY_CHUNK_RAW_BYTES,
   DUPLEX_FRAME_VERSION,
   encodeDuplexFrame,
@@ -978,4 +979,252 @@ describe("duplex bridge local end-to-end harness", () => {
     const later = await post();
     expect(later.status).toBe(200);
   }, 30000);
+
+  it("bounds the outbound writer to about one frame per active send while the pipe backpressures", async () => {
+    // Regression test for the backpressure block. The gateway used to call
+    // stdout.write() for every frame in a tight loop and ignore the return
+    // value, so a slow reader let one admitted read queue its whole body's
+    // worth of encoded frames. Pause the pipe read side, so every later write
+    // meets a full pipe, then post several concurrent cap-sized bodies at
+    // once and prove the writer never reports more than about one bounded
+    // frame stuck behind the full pipe.
+    const maxBodyBytes = 4 * 1024 * 1024;
+    const concurrency = 4;
+    const harness = await createHarness({
+      maxBodyBytes,
+      maxInflightBodyBytes: maxBodyBytes * concurrency,
+      responseTimeoutMs: 20000,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    // Stop reading the child's stdout, so the OS pipe fills and the gateway's
+    // writes meet real backpressure, the same as a slow host reader would
+    // cause in production.
+    harness.child.stdout.pause();
+
+    const body = "a".repeat(maxBodyBytes);
+    const posts = Array.from({ length: concurrency }, (_unused, index) =>
+      fetch(`${harness.baseUrl}/api/issues/issue-${index}/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      }).catch(() => undefined),
+    );
+
+    // Give the gateway time to read every body and drive its sends into
+    // backpressure.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const backpressureLines = harness
+      .stderr()
+      .split("\n")
+      .filter((line) => line.includes("stdout frame write backpressured"));
+    expect(backpressureLines.length).toBeGreaterThan(0);
+    const reportedLengths = backpressureLines.map((line) => {
+      const match = /writableLength=(\d+)/.exec(line);
+      if (!match) throw new Error("backpressure diagnostic is missing writableLength: " + line);
+      return Number(match[1]);
+    });
+    // One buffered frame is at most DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB). An
+    // unbounded queue would report a writableLength close to one whole body's
+    // worth of encoded frames -- several megabytes for a 4 MiB body. A
+    // generous multiple of one frame proves the writer never queued anywhere
+    // near that, regardless of how long the pipe stays full.
+    const oneFrameBound = DEFAULT_MAX_DUPLEX_FRAME_BYTES * 2;
+    for (const length of reportedLengths) {
+      expect(length).toBeLessThan(oneFrameBound);
+    }
+
+    // Resume so the harness can read the outstanding frames and tear down
+    // cleanly.
+    harness.child.stdout.resume();
+    await Promise.allSettled(posts);
+  }, 20000);
+
+  it("keeps one request's frames in sequence while a concurrent request interleaves its own", async () => {
+    const harness = await createHarness({
+      maxBodyBytes: 2 * 1024 * 1024,
+      maxInflightBodyBytes: 8 * 1024 * 1024,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    // Each body is large enough to split into several body_chunk frames, so a
+    // correct sequence is not a coincidence of a one-frame body.
+    const bodyA = "a".repeat(1_500_000);
+    const bodyB = "b".repeat(1_500_000);
+    const post = (body: string) =>
+      fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+    const [responseA, responseB] = await Promise.all([post(bodyA), post(bodyB)]);
+    expect(responseA.status).toBe(200);
+    expect(responseB.status).toBe(200);
+
+    const requestFrames = harness.observedFrames.filter(
+      (frame): frame is DuplexRequestFrame => frame.type === "request",
+    );
+    expect(requestFrames).toHaveLength(2);
+    for (const requestFrame of requestFrames) {
+      const chunkSeqs = harness.observedFrames
+        .filter(
+          (frame): frame is DuplexBodyChunkFrame =>
+            frame.type === "body_chunk" && frame.id === requestFrame.id,
+        )
+        .map((frame) => frame.seq);
+      expect(chunkSeqs.length).toBeGreaterThan(1);
+      // This request's own chunks arrive in increasing sequence order, even
+      // though the other request's frames may interleave between them.
+      expect(chunkSeqs).toEqual(Array.from({ length: chunkSeqs.length }, (_unused, index) => index));
+    }
+  }, 20000);
+
+  it("holds the admission reserve while a send is stalled behind a full pipe, then releases it once the send drains", async () => {
+    const maxBodyBytes = 2 * 1024 * 1024;
+    const harness = await createHarness({
+      maxBodyBytes,
+      // Admits exactly one concurrent body read.
+      maxInflightBodyBytes: maxBodyBytes,
+      responseTimeoutMs: 15000,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+    harness.setForwardMode("hang");
+
+    // Stop reading the child's stdout, so the first request's send stalls
+    // mid-flight, well before it ever reaches the host.
+    harness.child.stdout.pause();
+
+    const body = "a".repeat(maxBodyBytes);
+    const first = fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    void first.catch(() => undefined);
+
+    // Give the gateway time to read the body and drive its send into
+    // backpressure.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // The reserve is still held: a second request cannot reserve, so the
+    // gateway sheds it with a clean 503.
+    const shed = await fetch(`${harness.baseUrl}/api/issues/issue-2/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(shed.status).toBe(503);
+    await expect(shed.json()).resolves.toEqual({ error: "bridge_busy" });
+
+    // Resume the pipe and let the host answer. The stalled send drains and
+    // finishes, and the first request's response settles.
+    harness.child.stdout.resume();
+    harness.setForwardMode("proxy");
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const firstResponse = await first;
+    expect(firstResponse.status).toBe(200);
+
+    // The reserve released once the send finished. A later request is
+    // admitted again.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-3/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(later.status).toBe(200);
+  }, 20000);
+
+  it("ends a stalled send when the outbound pipe breaks, and releases the reserve for a later request", async () => {
+    const maxBodyBytes = 2 * 1024 * 1024;
+    const harness = await createHarness({
+      maxBodyBytes,
+      // Admits exactly one concurrent body read.
+      maxInflightBodyBytes: maxBodyBytes,
+      responseTimeoutMs: 1200,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    // Stop reading the child's stdout, so the first request's send is
+    // genuinely in flight -- stalled behind a full pipe -- when the pipe
+    // breaks.
+    harness.child.stdout.pause();
+
+    const body = "a".repeat(maxBodyBytes);
+    const first = fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    void first.catch(() => undefined);
+
+    // Give the gateway time to read the body and start writing frames into
+    // the full pipe.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    // Confirm the reserve is held before the pipe breaks: a second request
+    // cannot reserve, so the gateway sheds it with a clean 503.
+    const shedBeforeBreak = await fetch(`${harness.baseUrl}/api/issues/issue-2/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(shedBeforeBreak.status).toBe(503);
+
+    // Break the pipe. The stalled write meets a stream error, which ends the
+    // wait for drain -- the only other end condition the writer accepts.
+    harness.child.stdout.destroy();
+
+    const firstResponse = await first;
+    // No response frame can ever arrive over a broken pipe. The gateway's own
+    // wait budget ends the request with its local 502 timeout.
+    expect(firstResponse.status).toBe(502);
+
+    // The reserve released once the failed send and the timed-out response
+    // both finished. A later request is admitted again -- it is not shed with
+    // 503, even though it can never complete over the broken pipe either.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-3/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(later.status).toBe(502);
+  }, 20000);
 });

@@ -2009,6 +2009,79 @@ class DuplexFrameDecoder {
   }
 }`;
 
+// The embedded zero-dependency outbound frame writer. The duplex gateway
+// routes every stdout frame write through the one function this factory
+// returns: the heartbeat, the READY frame, one request envelope, and each
+// body_chunk frame. The writer issues at most one `stream.write()` call at a
+// time and waits for the stream to drain before it starts the next queued
+// line, so a slow reader never lets the gateway queue a whole request's
+// frames at once. A stream "error" event ends an in-flight wait the same way
+// "drain" does, and it fails every line still queued, because a broken pipe
+// can never drain.
+const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(stream, onBackpressure) {
+  const queue = [];
+  let pumping = false;
+  let streamError = null;
+
+  stream.on("error", (error) => {
+    streamError = error instanceof Error ? error : new Error(String(error));
+    const stranded = queue.splice(0, queue.length);
+    for (const entry of stranded) entry.reject(streamError);
+  });
+
+  async function pump() {
+    if (pumping) return;
+    pumping = true;
+    while (queue.length > 0) {
+      const entry = queue[0];
+      if (streamError) {
+        queue.length = 0;
+        entry.reject(streamError);
+        break;
+      }
+      let wroteOk = false;
+      try {
+        wroteOk = stream.write(entry.line);
+      } catch (error) {
+        queue.shift();
+        entry.reject(error instanceof Error ? error : new Error(String(error)));
+        continue;
+      }
+      if (!wroteOk && !streamError) {
+        if (typeof onBackpressure === "function") {
+          onBackpressure(stream.writableLength);
+        }
+        await new Promise((resolve) => {
+          const onDrain = () => {
+            stream.off("error", onStreamErrorWhileWaiting);
+            resolve();
+          };
+          const onStreamErrorWhileWaiting = () => {
+            stream.off("drain", onDrain);
+            resolve();
+          };
+          stream.once("drain", onDrain);
+          stream.once("error", onStreamErrorWhileWaiting);
+        });
+      }
+      queue.shift();
+      if (streamError) {
+        entry.reject(streamError);
+      } else {
+        entry.resolve();
+      }
+    }
+    pumping = false;
+  }
+
+  return function writeStdoutFrameLine(line) {
+    return new Promise((resolve, reject) => {
+      queue.push({ line: line, resolve: resolve, reject: reject });
+      void pump();
+    });
+  };
+}`;
+
 /**
  * Return the exact zero-dependency codec source the generated duplex gateway
  * embeds. A test runs every fixture vector against this source, so it proves the
@@ -2020,6 +2093,18 @@ class DuplexFrameDecoder {
  */
 export function getSandboxDuplexGatewayCodecSource(): string {
   return DUPLEX_GATEWAY_CODEC_SOURCE;
+}
+
+/**
+ * Return the exact zero-dependency outbound-writer source the generated duplex
+ * gateway embeds. A test wraps this source with a fake stream, so it proves
+ * the writer serializes every write, waits for drain, and ends a stalled write
+ * on a stream error, all without a real child process. The source declares
+ * `createStdoutFrameWriter` but exports it from no module; a caller wraps it
+ * to read the name.
+ */
+export function getSandboxDuplexGatewayStdoutWriterSource(): string {
+  return DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE;
 }
 
 export function getSandboxCallbackBridgeServerSource(): string {
@@ -2087,6 +2172,10 @@ if (bridgeMode !== "${SANDBOX_CALLBACK_BRIDGE_DUPLEX_MODE}" && !queueDir) {
 // gateway ignores it.
 ${DUPLEX_GATEWAY_CODEC_SOURCE}
 
+// The embedded zero-dependency outbound frame writer. The duplex gateway uses
+// it; the file gateway ignores it.
+${DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2135,22 +2224,40 @@ function reserveBodyRead() {
   };
 }
 
+// Read one request body into a single buffer sized to the admission charge.
+//
+// Accounting choice: the old code pushed each chunk onto a chunks array, then
+// called Buffer.concat on it. Both the array and the concat result held the
+// full body at once, so the transient peak was 2x the raw body while
+// admission charged 1x -- a dishonest bound. This version preallocates one
+// buffer of maxBodyBytes and copies each incoming chunk into it in place, then
+// returns a view over the written bytes. A view shares the same backing
+// memory; it adds no second copy. So the retained peak per active read is one
+// maxBodyBytes buffer, matching the charge exactly.
+//
+// The tradeoff: a small body now retains the full maxBodyBytes allocation for
+// the life of the request, where the old code retained only the small body's
+// own bytes. reserveBodyRead already charges maxBodyBytes for every active
+// read regardless of the real size, so this tradeoff raises no read past what
+// admission already assumed was possible; it only makes the real memory shape
+// match the existing worst-case charge instead of usually running under it.
 async function readBody(req) {
-  const chunks = [];
+  const out = Buffer.allocUnsafe(maxBodyBytes);
   let totalBytes = 0;
   for await (const chunk of req) {
     const nextChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    chunks.push(nextChunk);
-    totalBytes += nextChunk.byteLength;
-    if (totalBytes > maxBodyBytes) {
+    if (totalBytes + nextChunk.byteLength > maxBodyBytes) {
       throw new BridgeBodyTooLargeError();
     }
+    nextChunk.copy(out, totalBytes);
+    totalBytes += nextChunk.byteLength;
   }
-  // Return the raw request bytes. The duplex gateway base64-encodes these bytes
-  // unchanged, so a malformed body cannot expand during transport and cannot
-  // exceed the bytes that admission charged. The file gateway decodes a valid
-  // UTF-8 body with decodeUtf8Body and rejects an invalid one.
-  return Buffer.concat(chunks);
+  // Return the raw request bytes as a view, not a copy. The duplex gateway
+  // base64-encodes these bytes unchanged, so a malformed body cannot expand
+  // during transport and cannot exceed the bytes that admission charged. The
+  // file gateway decodes a valid UTF-8 body with decodeUtf8Body and rejects an
+  // invalid one.
+  return out.subarray(0, totalBytes);
 }
 
 // Strict UTF-8 decoder for the file gateway. It throws on any invalid byte, so
@@ -2368,8 +2475,27 @@ function runDuplexGateway() {
     process.stderr.write("[paperclip-bridge] " + message + "\\n");
   }
 
+  // The one serialized, backpressure-aware writer for this process. Every
+  // outbound frame -- the heartbeat, the READY frame, one request envelope,
+  // and each body_chunk -- writes through it, in call order.
+  const writeStdoutFrameLine = createStdoutFrameWriter(process.stdout, (writableLength) => {
+    diag("stdout frame write backpressured: writableLength=" + writableLength);
+  });
+
+  // Write a control frame (heartbeat or READY). This is fire-and-forget: a
+  // dropped heartbeat is not fatal, because the heartbeat repeats on its own
+  // interval, and a lost READY frame surfaces as a broker wait timeout. A
+  // request send awaits its own writes instead -- see the request handler
+  // below -- because it must run to completion once it starts.
   function writeFrame(frame) {
-    process.stdout.write(encodeDuplexFrame(frame));
+    writeStdoutFrameLine(encodeDuplexFrame(frame)).catch((error) => {
+      diag(
+        "failed to write a " +
+          frame.type +
+          " frame: " +
+          (error && error.message ? error.message : String(error)),
+      );
+    });
   }
 
   function stopTimers() {
@@ -2558,6 +2684,11 @@ function runDuplexGateway() {
         writeJsonResponse(res, 503, { error: "bridge_busy" });
         return;
       }
+      // Once the send below starts, releaseReserveWhenBothDone owns the
+      // reserve release. This flag stays false only while a return above the
+      // send can still happen, so the outer finally releases directly for
+      // every path that never commits to a send.
+      let handedOffToSend = false;
       try {
       const requestBodyBuffer = await readBody(req);
       if (unavailable) {
@@ -2598,37 +2729,100 @@ function runDuplexGateway() {
         writeJsonResponse(res, 413, { error: "request_too_large" });
         return;
       }
-      // Retained-peak note. The gateway preserves the raw request bytes end to
-      // end and streams the body as body_chunk frames, one frame at a time. It
-      // does not hold the raw body plus the full base64 frame array plus the
-      // full encoded-line array (about 3.7x the raw body). The retained peak per
-      // read is now the raw body plus one encoded frame:
-      //   raw body       <= maxBodyBytes (about 10 MiB)
-      //   one body_chunk <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
-      // so the peak is about maxBodyBytes + 1 MB per read. Admission charges
-      // maxBodyBytes per read against the 64 MiB inflight bound. The bound admits
-      // at most floor(64 MiB / maxBodyBytes) = 6 reads, so the true retained peak
-      // stays near 6 * (10 MiB + 1 MB) ~= 66 MiB. That is a fixed small margin
-      // over the admission threshold, not a multiple of the body. A malformed
-      // body cannot expand, because its raw bytes ride base64 frames unchanged.
+      // Retained-peak note. readBody preallocates one buffer sized to
+      // maxBodyBytes and returns a view over it, so no second (concatenated)
+      // copy of the body ever coexists with it -- see the comment on readBody.
+      // The send below builds and encodes one body_chunk frame at a time from
+      // that same view; it holds no per-request buffer of its own. Every
+      // frame -- this envelope, each body_chunk, and every heartbeat and READY
+      // frame from the rest of the process -- writes through the one
+      // serialized writer above. That writer issues at most one
+      // written-but-not-yet-drained line at a time, bounded by
+      // DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB), plus whatever the stream itself
+      // still buffers up to its own high-water mark; it never queues a whole
+      // request's frames at once behind a slow reader. So the retained peak
+      // per active read is about:
+      //   one body buffer     <= maxBodyBytes (about 10 MiB)
+      //   one in-flight frame <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
+      // and admission charges maxBodyBytes per read against the 64 MiB
+      // inflight bound, so the bound admits at most
+      // floor(64 MiB / maxBodyBytes) = 6 reads. The true retained peak across
+      // every admitted read stays near 6 * (10 MiB + 1 MB) ~= 66 MiB, the same
+      // fixed small margin over the admission threshold as before -- not a
+      // multiple of the body, and not made worse by a slow host. A malformed
+      // body cannot expand, because its raw bytes ride base64 frames
+      // unchanged. The reserve for one read releases only once both its send
+      // finished (drained fully or ended by a stream error) and its response
+      // settled -- see releaseReserveWhenBothDone below -- so a slow host
+      // cannot make the gateway release a reserve while it still retains the
+      // bytes.
+      handedOffToSend = true;
+      let sendDone = false;
+      let responseDone = false;
+      function releaseReserveWhenBothDone() {
+        if (sendDone && responseDone) {
+          // releaseBodyRead is itself idempotent, so a second call here (for
+          // example if both flags flip true in the same tick) is harmless.
+          releaseBodyRead();
+        }
+      }
+
       const response = await new Promise((resolve) => {
         const timer = setTimeout(() => {
           responseAssembly.delete(requestId);
           if (pending.delete(requestId)) {
-            resolve({
+            settleResponse({
               status: 502,
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ error: "Timed out waiting for host bridge response." }),
             });
           }
         }, responseTimeoutMs);
-        pending.set(requestId, { resolve: resolve, timer: timer });
-        process.stdout.write(encodedRequest.line);
-        for (const frame of duplexBodyChunkFrames(requestId, requestBodyBuffer)) {
-          const encoded = encodeDuplexFrameChecked(frame);
-          // Pass 1 proved every frame fits, so encoded.ok is always true here.
-          process.stdout.write(encoded.line);
+
+        // Every path that settles this request's response -- a real response,
+        // this timeout, a local 502 from failRequest, or the 409 triggerLoss
+        // sends on channel loss -- resolves through entry.resolve, which is
+        // this function. So responseDone flips true exactly once, on
+        // whichever of those settles first.
+        function settleResponse(value) {
+          clearTimeout(timer);
+          responseDone = true;
+          releaseReserveWhenBothDone();
+          resolve(value);
         }
+        pending.set(requestId, { resolve: settleResponse, timer: timer });
+
+        // Run the serialized send after the pending entry and the timer are
+        // already registered, so the response side and the send side start
+        // from the same point and settle independently. There is no cancel
+        // frame in the protocol: once this send writes the envelope, it must
+        // run to completion or the stdout stream must error, because a
+        // stopped send would leave a partial body only channel teardown
+        // reclaims. A response timeout above does not stop this send; it only
+        // resolves the HTTP caller early while the send keeps running.
+        void (async () => {
+          try {
+            await writeStdoutFrameLine(encodedRequest.line);
+            for (const frame of duplexBodyChunkFrames(requestId, requestBodyBuffer)) {
+              const encoded = encodeDuplexFrameChecked(frame);
+              // Pass 1 proved every frame fits, so encoded.ok is always true here.
+              await writeStdoutFrameLine(encoded.line);
+            }
+          } catch (error) {
+            // The writer's only two end conditions for a stalled write are a
+            // drain and a stream error. This catches the stream-error case: it
+            // ends the send here instead of leaving it stalled forever.
+            diag(
+              "the outbound send for request " +
+                requestId +
+                " ended: " +
+                (error && error.message ? error.message : String(error)),
+            );
+          } finally {
+            sendDone = true;
+            releaseReserveWhenBothDone();
+          }
+        })();
       });
       res.statusCode = typeof response.status === "number" ? response.status : 200;
       for (const [key, value] of Object.entries(response.headers || {})) {
@@ -2637,7 +2831,9 @@ function runDuplexGateway() {
       }
       res.end(typeof response.body === "string" ? response.body : "");
       } finally {
-        releaseBodyRead();
+        if (!handedOffToSend) {
+          releaseBodyRead();
+        }
       }
     } catch (error) {
       if (error && error.code === "request_too_large") {
