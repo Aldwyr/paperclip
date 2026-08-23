@@ -19,7 +19,7 @@
     "test": "pnpm run build && node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.11.0"
   },
   "license": "MIT",
   "devDependencies": {
