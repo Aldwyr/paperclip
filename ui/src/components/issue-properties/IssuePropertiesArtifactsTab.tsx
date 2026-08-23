@@ -149,14 +149,12 @@ function MarkdownWorkProductRow({
   metadata,
   reviewDoc,
   openRequestId,
-  onOpen,
 }: {
   issueId: string;
   workProduct: IssueWorkProduct;
   metadata: AttachmentArtifactWorkProductMetadata;
   reviewDoc: IssueDocument | undefined;
   openRequestId?: number;
-  onOpen?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [annotationPanelOpen, setAnnotationPanelOpen] = useState(false);
@@ -195,22 +193,6 @@ function MarkdownWorkProductRow({
     if (openRequestId === undefined || !expanded) return;
     headerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [expanded, openRequestId]);
-  if (onOpen) {
-    return (
-      <button
-        type="button"
-        onClick={onOpen}
-        className={cn(ROW_CLASS, "w-full text-left hover:bg-accent/50")}
-      >
-        <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate">{documentDisplayTitle(doc)}</span>
-        <span className="shrink-0 text-(length:--text-micro) text-muted-foreground">
-          {`Rev ${doc.latestRevisionNumber ?? 1}`}
-        </span>
-        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      </button>
-    );
-  }
   // Deep links land before the user clicks, so the deep-link expansion has to
   // request materialization the same way a manual expand does.
   useEffect(() => {
@@ -338,10 +320,12 @@ function DocumentRow({
   issueId,
   doc,
   openRequestId,
+  onOpen,
 }: {
   issueId: string;
   doc: IssueDocument;
   openRequestId?: number;
+  onOpen?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [annotationPanelOpen, setAnnotationPanelOpen] = useState(false);
@@ -356,6 +340,22 @@ function DocumentRow({
     if (openRequestId === undefined || !expanded) return;
     headerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [expanded, openRequestId]);
+  if (onOpen) {
+    return (
+      <button
+        type="button"
+        onClick={onOpen}
+        className={cn(ROW_CLASS, "w-full text-left hover:bg-accent/50")}
+      >
+        <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate">{documentDisplayTitle(doc)}</span>
+        <span className="shrink-0 text-(length:--text-micro) text-muted-foreground">
+          {`Rev ${doc.latestRevisionNumber ?? 1}`}
+        </span>
+        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      </button>
+    );
+  }
   return (
     <div className="rounded-md border border-border bg-card/50">
       <div ref={headerRef} className="flex items-center hover:bg-accent/50">

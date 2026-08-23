@@ -8,6 +8,7 @@ import { NavigationType } from "react-router-dom";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   canBoardManageRuntime,
   canBoardResolveRecoveryAction,
@@ -493,7 +494,7 @@ vi.mock("@/components/ui/sheet", () => ({
     className?: string;
     "data-testid"?: string;
   }) => (
-    <div className={className} data-testid={testId}>
+    <div data-slot="sheet-content" className={className} data-testid={testId}>
       {children}
       <button type="button" data-slot="sheet-close">Close</button>
     </div>
@@ -531,6 +532,18 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
+}
+
+function createTooltipRoot(container: Element): Root {
+  const root = createRoot(container);
+  return {
+    render(children) {
+      root.render(<TooltipProvider>{children}</TooltipProvider>);
+    },
+    unmount() {
+      root.unmount();
+    },
+  };
 }
 
 function createDeferred<T>() {
@@ -1052,7 +1065,7 @@ describe("IssueDetail", () => {
     mockSidebarState.isMobile = false;
     container = document.createElement("div");
     document.body.appendChild(container);
-    root = createRoot(container);
+    root = createTooltipRoot(container);
     queryClient = new QueryClient({
       defaultOptions: {
         queries: { retry: false },

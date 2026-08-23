@@ -249,7 +249,13 @@ export function TaskSidePanel({
     markInteracted();
     const tab = taskPanelWorkspaceFileTab(ref);
     controller.openTab(tab);
-    viewer?.open(ref, { fromBrowse: true });
+    viewer?.open({
+      ...ref,
+      projectId: ref.projectId ?? null,
+      workspaceId: ref.workspaceId ?? null,
+      line: ref.line ?? null,
+      column: ref.column ?? null,
+    }, { fromBrowse: true });
   }
 
   const documentByKey = useMemo(() => new Map(documents.map((document) => [document.key, document])), [documents]);

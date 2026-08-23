@@ -494,7 +494,7 @@ function runtimeRequestEntry(
 function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   const input = record(value);
   if (input.schema !== "paperclip.question_set.v1" || !Array.isArray(input.questions) || input.questions.length === 0) return null;
-  const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex) => {
+  const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex): PaperclipQuestion => {
     const answerMode: PaperclipQuestion["answerMode"] = question.answerMode === "single_select" || question.answerMode === "multi_select" ? question.answerMode : "text";
     const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
       id: text(option.id, `option-${optionIndex + 1}`).slice(0, 160),

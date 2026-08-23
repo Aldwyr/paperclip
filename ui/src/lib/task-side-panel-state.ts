@@ -59,7 +59,8 @@ function positiveInteger(value: unknown): number | null | undefined {
 
 function parsePayload(value: unknown): TaskSidePanelTabPayload | null {
   const input = record(value);
-  const kind = input?.kind;
+  if (!input) return null;
+  const kind = input.kind;
   if (kind === "properties") return { kind };
   if (kind === "artifacts") return { kind };
   if (kind === "issue-document") {
