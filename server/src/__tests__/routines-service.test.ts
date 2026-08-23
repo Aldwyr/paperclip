@@ -869,6 +869,80 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     ).resolves.toHaveLength(0);
   });
 
+  it("rejects a concurrent reparent when the supersession sweep locks the root first", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const candidate = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T09:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const orphan = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: "Live issue being reparented",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const winner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    await issueSvc.update(winner.issue.id, { status: "done" });
+
+    let releaseCandidateLock!: () => void;
+    const candidateLockReleased = new Promise<void>((resolve) => {
+      releaseCandidateLock = resolve;
+    });
+    let markCandidateLocked!: () => void;
+    const candidateLocked = new Promise<void>((resolve) => {
+      markCandidateLocked = resolve;
+    });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.companyId} = ${companyId}
+          and ${issues.id} = ${candidate.issue.id}
+        for update
+      `);
+      markCandidateLocked();
+      await candidateLockReleased;
+    });
+    await candidateLocked;
+
+    const sweepPromise = svc.syncRunStatusForIssue(winner.issue.id);
+    await expect(waitForBlockedQuery("%issues%", "%for update%")).resolves.toBe(true);
+    const reparentPromise = issueSvc.update(orphan.id, { parentId: candidate.issue.id });
+    await expect(waitForBlockedQuery("%ancestor_ids%", "%for key share%")).resolves.toBe(true);
+
+    releaseCandidateLock();
+    await lockTransaction;
+    const [sweepOutcome, reparentOutcome] = await Promise.allSettled([
+      sweepPromise,
+      reparentPromise,
+    ]);
+
+    expect(sweepOutcome.status).toBe("fulfilled");
+    expect(reparentOutcome.status).toBe("rejected");
+    await expect(issueSvc.getById(candidate.issue.id)).resolves.toMatchObject({
+      status: "cancelled",
+      supersededByIssueId: winner.issue.id,
+    });
+    await expect(issueSvc.getById(orphan.id)).resolves.toMatchObject({
+      parentId: null,
+      status: "in_progress",
+    });
+  });
+
   it("defers supersession when a concurrent direct child commits before the sweep lock", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
