@@ -7142,25 +7142,45 @@ export function issueService(db: Db) {
         }
 
         if (issueData.parentId) {
-          // This conflicts with the supersession sweep's FOR UPDATE lock. When
-          // creation wins the lock order, it commits before the sweep proceeds;
-          // the sweep's following descendant query then sees the new child in
-          // its fresh READ COMMITTED snapshot.
-          const parent = await tx
-            .select({
-              id: issues.id,
-              status: issues.status,
-              supersededByIssueId: issues.supersededByIssueId,
-            })
-            .from(issues)
-            .where(and(eq(issues.companyId, companyId), eq(issues.id, issueData.parentId)))
-            .for("key share")
-            .then((rows) => rows[0] ?? null);
+          // Lock the complete ancestor chain so nested child creation also
+          // conflicts with a supersession sweep's root FOR UPDATE lock. When
+          // creation wins, it commits before the sweep proceeds and the
+          // sweep's fresh READ COMMITTED descendant snapshot sees the child.
+          const ancestors = Array.from(await tx.execute(sql`
+            with recursive ancestor_ids(id, parent_id, depth) as (
+              select ${issues.id}, ${issues.parentId}, 0
+              from ${issues}
+              where ${issues.companyId} = ${companyId}
+                and ${issues.id} = ${issueData.parentId}
+              union all
+              select ancestor_issue.id, ancestor_issue.parent_id, ancestor_ids.depth + 1
+              from ${issues} ancestor_issue
+              join ancestor_ids on ancestor_issue.id = ancestor_ids.parent_id
+              where ancestor_issue.company_id = ${companyId}
+            )
+            select ancestor_issue.id,
+                   ancestor_issue.status as issue_status,
+                   ancestor_issue.superseded_by_issue_id
+            from ${issues} ancestor_issue
+            join ancestor_ids on ancestor_ids.id = ancestor_issue.id
+            where ancestor_issue.company_id = ${companyId}
+            order by ancestor_ids.depth desc
+            for key share of ancestor_issue
+          `)) as Array<{
+            id: string;
+            issue_status: string;
+            superseded_by_issue_id: string | null;
+          }>;
+          const parent = ancestors.find((ancestor) => ancestor.id === issueData.parentId) ?? null;
           if (!parent) throw notFound("Parent issue not found");
-          if (parent.status === "cancelled" && parent.supersededByIssueId) {
-            throw conflict("Cannot create a child issue under a superseded issue", {
+          const supersededAncestor = ancestors.find(
+            (ancestor) => ancestor.issue_status === "cancelled" && ancestor.superseded_by_issue_id,
+          );
+          if (supersededAncestor) {
+            throw conflict("Cannot create a descendant issue under a superseded issue", {
               parentIssueId: parent.id,
-              supersededByIssueId: parent.supersededByIssueId,
+              ancestorIssueId: supersededAncestor.id,
+              supersededByIssueId: supersededAncestor.superseded_by_issue_id,
             });
           }
         }

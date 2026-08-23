@@ -301,6 +301,23 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     return { issue, runId, heartbeatRunId };
   }
 
+  async function waitForBlockedQuery(...patterns: string[]) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const [waiting] = await db.execute<{ waiting: boolean }>(sql`
+        select exists (
+          select 1
+          from pg_stat_activity
+          where state = 'active'
+            and wait_event_type = 'Lock'
+            and ${sql.join(patterns.map((pattern) => sql`query ilike ${pattern}`), sql` and `)}
+        ) as waiting
+      `);
+      if (waiting?.waiting) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  }
+
   it("supersedes and links every older unfinished instance after an opted-in newer success", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
@@ -768,6 +785,90 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     }
   });
 
+  it("rejects a concurrent nested child when the supersession sweep locks the root first", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const candidate = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T09:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const terminalChild = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: candidate.issue.id,
+      title: "Completed direct child",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const winner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    await issueSvc.update(winner.issue.id, { status: "done" });
+
+    let releaseCandidateLock!: () => void;
+    const candidateLockReleased = new Promise<void>((resolve) => {
+      releaseCandidateLock = resolve;
+    });
+    let markCandidateLocked!: () => void;
+    const candidateLocked = new Promise<void>((resolve) => {
+      markCandidateLocked = resolve;
+    });
+    const lockTransaction = db.transaction(async (tx) => {
+      await tx.execute(sql`
+        select ${issues.id}
+        from ${issues}
+        where ${issues.companyId} = ${companyId}
+          and ${issues.id} = ${candidate.issue.id}
+        for update
+      `);
+      markCandidateLocked();
+      await candidateLockReleased;
+    });
+    await candidateLocked;
+
+    const sweepPromise = svc.syncRunStatusForIssue(winner.issue.id);
+    await expect(waitForBlockedQuery("%issues%", "%for update%")).resolves.toBe(true);
+    const grandchildPromise = issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: terminalChild.id,
+      title: "Nested child created during supersession",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await expect(waitForBlockedQuery("%ancestor_ids%", "%for key share%")).resolves.toBe(true);
+
+    releaseCandidateLock();
+    await lockTransaction;
+    const [sweepOutcome, grandchildOutcome] = await Promise.allSettled([
+      sweepPromise,
+      grandchildPromise,
+    ]);
+
+    expect(sweepOutcome.status).toBe("fulfilled");
+    expect(grandchildOutcome.status).toBe("rejected");
+    await expect(issueSvc.getById(candidate.issue.id)).resolves.toMatchObject({
+      status: "cancelled",
+      supersededByIssueId: winner.issue.id,
+    });
+    await expect(
+      db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.parentId, terminalChild.id))),
+    ).resolves.toHaveLength(0);
+  });
+
   it("defers supersession when a concurrent direct child commits before the sweep lock", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
@@ -789,23 +890,6 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       routineRevisionId: revisionId,
     });
     await issueSvc.update(winner.issue.id, { status: "done" });
-
-    const waitForBlockedQuery = async (...patterns: string[]) => {
-      for (let attempt = 0; attempt < 80; attempt += 1) {
-        const [waiting] = await db.execute<{ waiting: boolean }>(sql`
-          select exists (
-            select 1
-            from pg_stat_activity
-            where state = 'active'
-              and wait_event_type = 'Lock'
-              and ${sql.join(patterns.map((pattern) => sql`query ilike ${pattern}`), sql` and `)}
-          ) as waiting
-        `);
-        if (waiting?.waiting) return true;
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      return false;
-    };
 
     let releaseCompanyLock!: () => void;
     const companyLockReleased = new Promise<void>((resolve) => {
