@@ -803,7 +803,9 @@ describe("TaskChatComposer", () => {
       localStorage.setItem(draftKey, "Unsent normal draft");
       render(<Harness onSave={vi.fn().mockResolvedValue(undefined)} />);
       await flushAsync();
-      expect(editable().textContent).toBe("Complete queued markdown");
+      await vi.waitFor(() => {
+        expect(editable().textContent).toBe("Complete queued markdown");
+      });
       expect(localStorage.getItem(draftKey)).toBe("Unsent normal draft");
 
       const cancel = Array.from(container.querySelectorAll("button"))
@@ -839,8 +841,10 @@ describe("TaskChatComposer", () => {
       pressKey("Enter", { metaKey: true });
       await flushAsync();
 
-      expect(editable().textContent).toBe("Keep this replacement text");
-      expect(container.textContent).toContain("Editing queued message");
+      await vi.waitFor(() => {
+        expect(editable().textContent).toBe("Keep this replacement text");
+        expect(container.textContent).toContain("Editing queued message");
+      });
     });
 
     it("offers a stale edit as a new queued message and preserves its Markdown source", async () => {
