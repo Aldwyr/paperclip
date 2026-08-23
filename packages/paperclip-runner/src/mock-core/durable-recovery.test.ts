@@ -14,12 +14,14 @@ import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
 import {
   DurableRecoveryMockCore,
   durableRecoveryInternals,
+  runDurableEvalSession,
   runDurableRecoveryRecovery,
   runDurableToolBridgeConformance,
 } from "./durable-recovery.js";
@@ -366,6 +368,97 @@ async function runRunnerProcess(options: {
 }
 
 describe.sequential("Durable transport and recovery", () => {
+  it("resumes the original pending Codex tool call once after Runner D is killed", async () => {
+    const scratch =
+      process.env.PAPERCLIP_RUN_SCRATCH_DIR ??
+      process.env.PAPERCLIP_SCRATCH_DIR ??
+      tmpdir();
+    const root = mkdtempSync(resolve(scratch, "native-codex-resume-test-"));
+    const providerFixture = fileURLToPath(new URL(
+      "../../test/fixtures/fake-native-resume-codex-app-server.mjs",
+      import.meta.url,
+    ));
+    try {
+      const execution = await runDurableEvalSession({
+        attemptId: "native-resume-test",
+        prompt: "Record one progress update.",
+        model: "gpt-native-resume-fixture",
+        runnerBinaryPath: durableRecoveryInternals.runnerBinary,
+        providerCommand: process.execPath,
+        providerArgs: [providerFixture, resolve(root, "provider-state.json")],
+        seed: {
+          actors: [{
+            id: "actor-1",
+            companyId: "company-1",
+            name: "Resume tester",
+            role: "engineer",
+            status: "active",
+            budgetId: "budget-1",
+            capabilityGrants: [],
+          }],
+          tasks: [{
+            id: "task-1",
+            companyId: "company-1",
+            identifier: "TST-1",
+            title: "Resume one pending operation",
+            description: null,
+            status: "todo",
+            priority: "high",
+            workMode: "standard",
+            parentId: null,
+            assigneeActorId: "actor-1",
+            checkoutRunId: null,
+            executionRunId: null,
+            startedAt: null,
+            completedAt: null,
+          }],
+          comments: [],
+        },
+        actorId: "actor-1",
+        taskId: "task-1",
+        capabilities: [],
+        explicitClaims: [],
+        turnTimeoutMs: 10_000,
+        nativeResume: { operationId: "report_progress" },
+      });
+      const snapshot = execution.snapshot as Record<string, unknown>;
+      const proof = snapshot.nativeResume as Record<string, unknown>;
+      const evidence = snapshot.evidence as Array<Record<string, unknown>>;
+      const finalState = JSON.parse(String(snapshot.mockState)) as { comments: unknown[] };
+
+      expect(proof).toMatchObject({
+        schema: "paperclip.runner.native-resume-proof/v1",
+        triggered: true,
+        runnerRestarts: 1,
+        sameProviderThread: true,
+        callId: "call-native-resume",
+        operationId: "report_progress",
+        inputEventCount: 1,
+        resultEventCount: 1,
+        semanticHandlerCallCount: 1,
+        controlPlaneEffectCount: 1,
+        runnerReconciledEventCount: 1,
+        crashedRunnerSignal: "SIGKILL",
+        providerCalls: 1,
+        providerRequests: 1,
+        costNanodollars: 0,
+      });
+      expect(new Set(proof.runnerProcessPids as number[]).size).toBe(2);
+      expect(new Set(proof.providerProcessPids as number[]).size).toBe(2);
+      expect(evidence.filter((entry) => {
+        const data = entry.data as Record<string, unknown>;
+        return entry.kind === "tool_call" && data.callId === "call-native-resume";
+      })).toHaveLength(1);
+      expect(evidence.filter((entry) => {
+        const data = entry.data as Record<string, unknown>;
+        return entry.kind === "tool_result" && data.callId === "call-native-resume";
+      })).toHaveLength(1);
+      expect(finalState.comments).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("repeatedly completes the provider bridge and explicit runner shutdown", async () => {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const result = await runDurableToolBridgeConformance();

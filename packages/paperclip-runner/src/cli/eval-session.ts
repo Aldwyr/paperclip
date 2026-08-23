@@ -59,6 +59,7 @@ interface EvalSessionRequest {
   runnerd: { path: string; sha256: string };
   limits: { turnTimeoutMs: number; maxAgentTurns: number; maxEstimatedCostNanodollars: number };
   session: CreateCapabilityLiveSessionInput;
+  nativeResume?: { operationId: string };
   /** Codex collaboration/tool-preamble instructions are enabled unless explicitly false. */
   includeCollaborationModeInstructions?: boolean;
 }
@@ -123,6 +124,7 @@ try {
     toolExposure: request.session.toolExposure,
     includeCollaborationModeInstructions:
       request.includeCollaborationModeInstructions,
+    nativeResume: request.nativeResume,
   });
   const turn = execution.turn as Record<string, unknown>;
   const snapshot = execution.snapshot as Parameters<typeof reconcileCapabilityLiveUsage>[0];

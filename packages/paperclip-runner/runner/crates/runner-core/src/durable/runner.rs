@@ -1096,26 +1096,48 @@ fn poll_provider(
                 input,
             } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
+                let pending_before_resume = state
+                    .provider_tool_bridge
+                    .pending_calls()
+                    .any(|pending| pending.call_id == call_id);
                 let call = state
                     .provider_tool_bridge
                     .begin_call(call_id, operation_id, input)
                     .map_err(|error| {
                         DurableRunnerError::invalid(format!("provider tool call rejected: {error}"))
                     })?;
-                enqueue_event(
-                    state,
-                    config,
-                    "semantic_tool.input",
-                    0,
-                    json!({
-                        "semantic_tool": {
-                            "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
-                            "phase": "input", "operationId": call.operation_id,
-                            "callId": call.call_id, "input": call.input,
-                        }
-                    }),
-                    Some(&state.item_id.clone()),
-                )?;
+                if pending_before_resume {
+                    enqueue_event(
+                        state,
+                        config,
+                        "semantic_tool.reconciled",
+                        0,
+                        json!({
+                            "semantic_tool": {
+                                "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
+                                "phase": "reconciled", "operationId": call.operation_id,
+                                "callId": call.call_id,
+                            },
+                            "reason": "provider_replayed_pending_call",
+                        }),
+                        Some(&state.item_id.clone()),
+                    )?;
+                } else {
+                    enqueue_event(
+                        state,
+                        config,
+                        "semantic_tool.input",
+                        0,
+                        json!({
+                            "semantic_tool": {
+                                "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
+                                "phase": "input", "operationId": call.operation_id,
+                                "callId": call.call_id, "input": call.input,
+                            }
+                        }),
+                        Some(&state.item_id.clone()),
+                    )?;
+                }
                 store.save(state)?;
             }
             crate::codex_provider::ProviderEvent::Notification { method, params } => {

@@ -258,6 +258,27 @@ export interface CapabilityLiveSessionSnapshot {
   terminalTurns?: CapabilityLiveTurnTerminalFact[];
   /** Exact-once provider usage/cost receipts retained across every attempt. */
   usageLedger?: CapabilityLiveUsageReceipt[];
+  /** Process-level evidence for an interrupted Codex semantic-call resume. */
+  nativeResume?: {
+    schema: "paperclip.runner.native-resume-proof/v1";
+    triggered: true;
+    runnerRestarts: number;
+    runnerProcessPids: number[];
+    providerProcessPids: number[];
+    sameProviderThread: boolean;
+    providerThreadDigest: string | null;
+    callId: string;
+    operationId: string;
+    inputEventCount: number;
+    resultEventCount: number;
+    semanticHandlerCallCount: number;
+    controlPlaneEffectCount: number;
+    runnerReconciledEventCount: number;
+    crashedRunnerSignal: string | null;
+    providerCalls: number;
+    providerRequests: number;
+    costNanodollars: number;
+  };
   /** Bounded mock-control-plane snapshots for DevTools time travel and diffs. */
   stateHistory?: CapabilityLiveStateRevision[];
   /** Complete, bounded per-turn workspace changes verified by the runner. */

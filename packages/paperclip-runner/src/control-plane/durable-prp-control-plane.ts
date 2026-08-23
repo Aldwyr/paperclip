@@ -1987,6 +1987,11 @@ export interface DurableEvalSessionInput {
   explicitClaims: string[];
   turnTimeoutMs: number;
   toolExposure?: "eager" | "lazy";
+  /** Crash Runner D after this semantic input commits, then resume it natively. */
+  nativeResume?: { operationId: string };
+  /** Test-only provider process override; production eval callers omit these. */
+  providerCommand?: string;
+  providerArgs?: string[];
   /** Defaults on for Codex; set false only for an eval that needs the baseline prompt. */
   includeCollaborationModeInstructions?: boolean;
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -2222,6 +2227,12 @@ function sanitizedAwsEvalEnvironment(
 export async function runDurableEvalSession(
   input: DurableEvalSessionInput,
 ): Promise<Record<string, unknown>> {
+  if (
+    input.nativeResume !== undefined &&
+    (input.provider ?? "codex") !== "codex"
+  ) {
+    throw new Error("native resume eval requires the Codex provider");
+  }
   const identity = {
     runnerInstanceId: `runner_${createHash("sha256").update(input.attemptId).digest("hex").slice(0, 16)}`,
     environmentLeaseId: `lease_${createHash("sha256").update(`${input.attemptId}:lease`).digest("hex").slice(0, 16)}`,
@@ -2258,6 +2269,16 @@ export async function runDurableEvalSession(
   const authorized = dispatcher.listTools(identity.runId);
   const loadedOperations = new Set<string>();
   const discoveryEvidence: Array<Record<string, unknown>> = [];
+  let nativeResumeCall: {
+    callId: string;
+    operationId: string;
+    input: unknown;
+  } | null = null;
+  let releaseNativeSemanticDispatch!: () => void;
+  const nativeSemanticDispatchReleased = new Promise<void>((resolveDispatch) => {
+    releaseNativeSemanticDispatch = resolveDispatch;
+  });
+  let nativeSemanticHandlerCallCount = 0;
   const operations: Array<{
     operationId: string;
     version: number;
@@ -2342,6 +2363,11 @@ export async function runDurableEvalSession(
           success: invoked.ok,
           contentItems: [{ type: "inputText", text: JSON.stringify(invoked) }],
         };
+      }
+      if (call.operationId === input.nativeResume?.operationId) {
+        nativeResumeCall ??= structuredClone(call);
+        await nativeSemanticDispatchReleased;
+        nativeSemanticHandlerCallCount += 1;
       }
       return dispatcher.dispatch({ runId: identity.runId, ...call });
     },
@@ -2433,13 +2459,15 @@ export async function runDurableEvalSession(
             : {
                 kind: providerKind,
                 command:
-                  providerKind === "opencode"
+                  input.providerCommand ??
+                  (providerKind === "opencode"
                     ? process.execPath
-                    : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex"),
+                    : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex")),
                 args:
-                  providerKind === "opencode"
+                  input.providerArgs ??
+                  (providerKind === "opencode"
                     ? [opencodeProxyPath]
-                    : providerArgs,
+                    : providerArgs),
                 cwd: tmpdir(),
                 model: input.model,
                 instructions:
@@ -2453,33 +2481,43 @@ export async function runDurableEvalSession(
   core.queueCommand("session.open", { reuse: "same_session" });
   core.queueCommand("turn.start", { text: input.prompt });
   await core.start();
-  const handle = spawnRunner({
-    connectUrl: core.connectUrl,
-    stateDirectory: runnerStateDirectory,
-    identity,
-    ticket: core.issueBootstrapTicket(),
-    maxOutboxBytes: 256 * 1024,
-    p0ReserveBytes: 64 * 1024,
-    maxRuntimeMs: input.turnTimeoutMs + 30_000,
-    runnerBinaryPath: input.runnerBinaryPath,
-    environment:
-      providerKind === "opencode"
-        ? {
-            ...process.env,
-            PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
-            PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
-            PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
-            PAPERCLIP_RUN_ID: identity.runId,
-            PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
-          }
-        : providerKind === "claude_managed"
-          ? createSanitizedClaudeManagedEnvironment(process.env)
-          : providerKind === "aws_agentcore"
-            ? sanitizedAwsEvalEnvironment(process.env)
-            : providerKind === "acpx"
-              ? createSanitizedAcpxEnvironment(process.env, acpxProfile!.agent)
-              : process.env,
-  });
+  const launchRunner = (): RunnerProcessHandle =>
+    spawnRunner({
+        connectUrl: core.connectUrl,
+        stateDirectory: runnerStateDirectory,
+        identity,
+        ticket: core.issueBootstrapTicket(),
+        maxOutboxBytes: 256 * 1024,
+        p0ReserveBytes: 64 * 1024,
+        maxRuntimeMs: input.turnTimeoutMs + 30_000,
+        runnerBinaryPath: input.runnerBinaryPath,
+        environment:
+          providerKind === "opencode"
+            ? {
+                ...process.env,
+                PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
+                PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
+                PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+                PAPERCLIP_RUN_ID: identity.runId,
+                PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+              }
+            : providerKind === "claude_managed"
+              ? createSanitizedClaudeManagedEnvironment(process.env)
+              : providerKind === "aws_agentcore"
+                ? sanitizedAwsEvalEnvironment(process.env)
+                : providerKind === "acpx"
+                  ? createSanitizedAcpxEnvironment(
+                      process.env,
+                      acpxProfile!.agent,
+                    )
+                  : process.env,
+    });
+  let handle = launchRunner();
+  const runnerProcessPids = [handle.child.pid].filter(
+    (pid): pid is number => typeof pid === "number",
+  );
+  let runnerRestarts = 0;
+  let crashedRunner: RunnerProcessResult | null = null;
   try {
     const resolvedEvalRuntimeRequests = new Set<string>();
     let providerTerminalFailure: {
@@ -2488,6 +2526,48 @@ export async function runDurableEvalSession(
       retryable: boolean;
     } | null = null;
     const deadline = Date.now() + input.turnTimeoutMs;
+    if (input.nativeResume !== undefined) {
+      while (nativeResumeCall === null && Date.now() < deadline) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+      }
+      if (nativeResumeCall === null) {
+        throw new Error(
+          `native resume operation ${input.nativeResume.operationId} did not commit before timeout`,
+        );
+      }
+      handle.child.kill("SIGKILL");
+      crashedRunner = await waitForProcess(handle, 10_000);
+      if (crashedRunner.signal !== "SIGKILL") {
+        throw new Error(`native resume runner exited with ${String(crashedRunner.signal)}`);
+      }
+      runnerRestarts = 1;
+      handle = launchRunner();
+      if (typeof handle.child.pid === "number")
+        runnerProcessPids.push(handle.child.pid);
+      const pendingCall = nativeResumeCall;
+      const pendingCallWasReconciled = (): boolean =>
+        core.store.state.committedEvents.some((event) => {
+          if (event.eventType !== "semantic_tool.reconciled") return false;
+          const payload = (
+            event.envelope.payload as Record<string, unknown> | undefined
+          )?.payload as Record<string, unknown> | undefined;
+          const semantic = payload?.semantic_tool as
+            | Record<string, unknown>
+            | undefined;
+          return (
+            semantic?.callId === pendingCall.callId &&
+            semantic?.operationId === pendingCall.operationId
+          );
+        });
+      while (Date.now() < deadline) {
+        if (pendingCallWasReconciled()) break;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+      }
+      if (!pendingCallWasReconciled()) {
+        throw new Error("replacement Runner D did not reconcile the pending Codex tool call");
+      }
+      releaseNativeSemanticDispatch();
+    }
     while (Date.now() < deadline) {
       if (providerKind === "acpx") {
         for (const committed of core.store.state.committedEvents) {
@@ -2621,6 +2701,8 @@ export async function runDurableEvalSession(
     };
     let providerSessionId: string | null = null;
     let providerPid: number | null = null;
+    const providerProcessPids: number[] = [];
+    const providerThreadIds: string[] = [];
     let sidecarPid: number | null = null;
     let agentPid: number | null = null;
     let providerDriver: string | null = null;
@@ -2641,6 +2723,7 @@ export async function runDurableEvalSession(
           providerSessionId = descriptor.providerSessionId;
         if (typeof descriptor?.processId === "number") {
           providerPid = descriptor.processId;
+          providerProcessPids.push(descriptor.processId);
           if (descriptor.driver === "acpx_runtime")
             sidecarPid = descriptor.processId;
         }
@@ -2662,6 +2745,8 @@ export async function runDurableEvalSession(
           providerExecutionKind = descriptor.executionKind;
         if (typeof descriptor?.service === "string")
           providerService = descriptor.service;
+        if (typeof payload?.threadId === "string")
+          providerThreadIds.push(payload.threadId);
       }
       if (record.eventType === "harness.diagnostic") {
         if (
@@ -2780,17 +2865,32 @@ export async function runDurableEvalSession(
         if (runDelta) {
           usage = {
             ...usage,
-            providerRequests:
-              runDelta.requests ??
-              runDelta.providerRequests ??
-              usage.providerRequests,
-            inputTokens: runDelta.inputTokens ?? 0,
-            outputTokens: runDelta.outputTokens ?? 0,
-            cachedInputTokens: runDelta.cacheReadTokens ?? 0,
-            reasoningTokens: runDelta.reasoningTokens ?? 0,
+            providerRequests: Math.max(
+              usage.providerRequests ?? 0,
+              runDelta.requests ?? runDelta.providerRequests ?? 0,
+            ),
+            inputTokens: Math.max(
+              usage.inputTokens ?? 0,
+              runDelta.inputTokens ?? 0,
+            ),
+            outputTokens: Math.max(
+              usage.outputTokens ?? 0,
+              runDelta.outputTokens ?? 0,
+            ),
+            cachedInputTokens: Math.max(
+              usage.cachedInputTokens ?? 0,
+              runDelta.cacheReadTokens ?? 0,
+            ),
+            reasoningTokens: Math.max(
+              usage.reasoningTokens ?? 0,
+              runDelta.reasoningTokens ?? 0,
+            ),
             providerCostNanodollars:
               typeof runDelta.providerCostUsd === "number"
-                ? Math.round(runDelta.providerCostUsd * 1_000_000_000)
+                ? Math.max(
+                    usage.providerCostNanodollars ?? 0,
+                    Math.round(runDelta.providerCostUsd * 1_000_000_000),
+                  )
                 : usage.providerCostNanodollars,
           };
         }
@@ -2846,6 +2946,58 @@ export async function runDurableEvalSession(
     if (!assistantText)
       assistantText = "Provider completed the requested Paperclip operation.";
     const finalState = JSON.stringify(authority.snapshot());
+    const nativeResumeProof =
+      input.nativeResume === undefined || nativeResumeCall === null
+        ? undefined
+        : (() => {
+            const semanticEvents = records.flatMap((record) => {
+              const payload = record.payload as
+                | Record<string, unknown>
+                | undefined;
+              const semantic = payload?.semantic_tool as
+                | Record<string, unknown>
+                | undefined;
+              return semantic?.callId === nativeResumeCall.callId &&
+                semantic.operationId === nativeResumeCall.operationId
+                ? [{ eventType: record.eventType, semantic }]
+                : [];
+            });
+            const initialComments = JSON.parse(initialState) as {
+              comments?: unknown[];
+            };
+            const finalComments = authority.snapshot().comments;
+            return {
+              schema: "paperclip.runner.native-resume-proof/v1",
+              triggered: true,
+              runnerRestarts,
+              runnerProcessPids,
+              providerProcessPids,
+              sameProviderThread:
+                providerThreadIds.length >= 2 &&
+                new Set(providerThreadIds).size === 1,
+              providerThreadDigest: providerThreadIds[0]
+                ? `sha256:${createHash("sha256").update(providerThreadIds[0]).digest("hex")}`
+                : null,
+              callId: nativeResumeCall.callId,
+              operationId: nativeResumeCall.operationId,
+              inputEventCount: semanticEvents.filter(
+                (event) => event.eventType === "semantic_tool.input",
+              ).length,
+              resultEventCount: semanticEvents.filter(
+                (event) => event.eventType === "semantic_tool.result",
+              ).length,
+              semanticHandlerCallCount: nativeSemanticHandlerCallCount,
+              controlPlaneEffectCount:
+                finalComments.length - (initialComments.comments?.length ?? 0),
+              runnerReconciledEventCount: semanticEvents.filter(
+                (event) => event.eventType === "semantic_tool.reconciled",
+              ).length,
+              crashedRunnerSignal: crashedRunner?.signal ?? null,
+              providerCalls: usage.providerCalls ?? 1,
+              providerRequests: usage.providerRequests ?? 0,
+              costNanodollars: usage.providerCostNanodollars ?? 0,
+            };
+          })();
     const now = new Date().toISOString();
     return {
       turn: { turnId: identity.turnId, status: "completed", assistantText },
@@ -2883,6 +3035,7 @@ export async function runDurableEvalSession(
         status: "idle",
         activeTurnId: null,
         semanticResult,
+        ...(nativeResumeProof === undefined ? {} : { nativeResume: nativeResumeProof }),
         createdAt: now,
         updatedAt: now,
         authority: {
@@ -3008,6 +3161,7 @@ export async function runDurableEvalSession(
       },
     };
   } finally {
+    releaseNativeSemanticDispatch();
     handle.child.kill("SIGKILL");
     await core.stop();
     await authority.stop();
