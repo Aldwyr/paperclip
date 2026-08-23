@@ -133,6 +133,10 @@ import {
   RunnerPrpRuntimeRequestResolutionError,
 } from "../realtime/runner-prp-ws.js";
 import {
+  NativeRuntimeRequestResolutionError,
+  resolveNativeRuntimeRequest,
+} from "../services/native-runtime/native-session-executor.js";
+import {
   renderOrgChartSvg,
   renderOrgChartPng,
   type OrgNode,
@@ -2652,6 +2656,14 @@ export function agentRoutes(
       requestedSkillEntries,
       mode,
     );
+    if (
+      adapterType === "paperclip_runner" &&
+      desiredSkillEntries.some((entry) => entry.key === "paperclipai/paperclip/paperclip")
+    ) {
+      throw unprocessable(
+        "paperclip_runner does not support the legacy Paperclip operational skill (paperclipai/paperclip/paperclip); remove it from this agent",
+      );
+    }
     const desiredSkills = desiredSkillEntries.map((entry) => entry.key);
     const resolvedKeys = new Set([
       ...resolvedCurrentSkillEntries.map((entry) => entry.key),
@@ -6245,19 +6257,41 @@ export function agentRoutes(
       ) {
         throw badRequest("Runtime request and turn identifiers are required.");
       }
-      if (
-        !runtimeRequestKinds.includes(
-          rawRequestKind as HarnessRuntimeRequestKind,
-        )
-      ) {
+      if (rawRequestKind !== "runtime" && !runtimeRequestKinds.includes(
+        rawRequestKind as HarnessRuntimeRequestKind,
+      )) {
         throw badRequest("Unsupported runtime request kind.");
       }
       let resolution: HarnessRuntimeRequestResolution;
       try {
-        resolution = parseHarnessRuntimeRequestResolution(
-          rawRequestKind as HarnessRuntimeRequestKind,
-          req.body?.resolution,
-        );
+        if (rawRequestKind === "runtime") {
+          const candidate = req.body?.resolution;
+          const action = candidate?.action;
+          if (action === "decline" || action === "cancel") {
+            resolution = { action };
+          } else if (
+            action === "submit"
+            && candidate?.response?.schema === "paperclip.question_response.v1"
+            && candidate.response.answers
+            && typeof candidate.response.answers === "object"
+            && !Array.isArray(candidate.response.answers)
+          ) {
+            // The active session/durable runner validates this untrusted
+            // response against its persisted question set immediately before
+            // translating it back to the provider.
+            resolution = { action: "submit", response: candidate.response };
+          } else {
+            throw new HarnessRuntimeRequestResolutionError(
+              "user_input",
+              "runtime input requires a canonical submit, decline, or cancel",
+            );
+          }
+        } else {
+          resolution = parseHarnessRuntimeRequestResolution(
+            rawRequestKind as HarnessRuntimeRequestKind,
+            req.body?.resolution,
+          );
+        }
       } catch (error) {
         if (error instanceof HarnessRuntimeRequestResolutionError) {
           throw badRequest("Invalid runtime request response.");
@@ -6266,12 +6300,47 @@ export function agentRoutes(
       }
 
       try {
-        const queued = queueRunnerPrpRuntimeRequestResolution({
-          runId,
-          requestId,
-          turnId,
-          resolution,
-        });
+        let queued: { commandId: string };
+        try {
+          queued = await resolveNativeRuntimeRequest({
+            runId,
+            requestId,
+            turnId,
+            resolution,
+          });
+        } catch (error) {
+          if (
+            error instanceof NativeRuntimeRequestResolutionError
+            && error.code === "runtime_request_resolution_conflict"
+          ) {
+            throw conflict(
+              "A different response was already submitted for this runtime request.",
+            );
+          }
+          if (
+            !(error instanceof NativeRuntimeRequestResolutionError)
+            || ![
+              "native_session_not_active",
+              "runtime_request_resolution_unsupported",
+            ].includes(error.code)
+          ) {
+            if (
+              error instanceof NativeRuntimeRequestResolutionError
+              && error.code === "runtime_request_stale_turn"
+            ) {
+              throw conflict(
+                "The runner session is no longer accepting runtime responses.",
+              );
+            }
+            throw error;
+          }
+          queued = queueRunnerPrpRuntimeRequestResolution({
+            runId,
+            requestId,
+            turnId,
+            resolution,
+          });
+        }
         await logActivity(db, {
           companyId: existing.companyId,
           actorType: "user",

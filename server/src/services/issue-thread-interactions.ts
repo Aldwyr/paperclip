@@ -64,7 +64,7 @@ import {
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -243,6 +243,17 @@ type ResolvedInteractionResult = {
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
 type IssueTouchDb = Pick<Db, "update">;
 
+function isNativeCompletionReview(row: Pick<IssueThreadInteractionRow, "kind" | "payload">) {
+  if (row.kind !== "request_confirmation") return false;
+  const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+    ? row.payload as unknown as Record<string, unknown>
+    : {};
+  const target = payload.target && typeof payload.target === "object" && !Array.isArray(payload.target)
+    ? payload.target as Record<string, unknown>
+    : {};
+  return target.type === "custom" && target.key === "native_completion_review";
+}
+
 export const DEFAULT_RESOLVER_POLICY_BY_KIND: Record<
   IssueThreadInteractionKind,
   IssueThreadInteractionCanonicalResolverPolicy
@@ -419,6 +430,7 @@ function isEquivalentCreateRequest(
     row.kind === input.kind
     && row.requestedResolverPolicy === input.resolverPolicy
     && (row.addresseeAgentId ?? null) === (input.addresseeAgentId ?? null)
+    && (row.addresseeUserId ?? null) === (input.addresseeUserId ?? null)
     && row.continuationPolicy === input.continuationPolicy
     && (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null)
     && (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null)
@@ -476,6 +488,7 @@ function hydrateInteraction(
     ...row,
     idempotencyKey: row.idempotencyKey ?? null,
     addresseeAgentId: row.addresseeAgentId ?? null,
+    addresseeUserId: row.addresseeUserId ?? null,
     status: row.status as IssueThreadInteraction["status"],
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
     resolverPolicy: requestedResolverPolicy,
@@ -1579,6 +1592,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
     if (expired) throw interactionTerminalError({ status: expired.status, result: expired.result });
 
     const now = new Date();
+    const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -1672,7 +1686,21 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       }
 
       let continuationIssue: IssueWakeTarget | null = null;
-      if (shouldReturnAcceptedConfirmationToCreatorAgent({
+      if (isNativeCompletionReview(lockedCurrent)) {
+        const completedIssue = await issueService(db).update(args.issue.id, {
+          status: "done",
+          actorAgentId: args.actor.agentId ?? null,
+          actorUserId: args.actor.userId ?? null,
+        }, tx, postCommitActivityPublications);
+        if (completedIssue) {
+          continuationIssue = {
+            id: completedIssue.id,
+            assigneeAgentId: completedIssue.assigneeAgentId ?? null,
+            assigneeUserId: completedIssue.assigneeUserId ?? null,
+            status: completedIssue.status,
+          };
+        }
+      } else if (shouldReturnAcceptedConfirmationToCreatorAgent({
         issue: issueContext,
         current: lockedCurrent,
         actor: args.actor,
@@ -1684,7 +1712,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
           assigneeUserId: null,
           actorAgentId: args.actor.agentId ?? null,
           actorUserId: args.actor.userId ?? null,
-        }, tx);
+        }, tx, postCommitActivityPublications);
 
         if (returnedIssue) {
           continuationIssue = {
@@ -1725,6 +1753,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         continuationIssue,
       };
     });
+    for (const publication of postCommitActivityPublications) publishActivity(publication);
     await emitInteractionResolvedTelemetry(db, result.interaction);
     return result;
   }
@@ -1838,7 +1867,17 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
           "Interaction has already been resolved",
         );
       }
-      await touchIssue(tx, args.issue.id);
+      if (isNativeCompletionReview(lockedCurrent)) {
+        await issueService(db).update(args.issue.id, {
+          status: "todo",
+          assigneeAgentId: issueContext.assigneeAgentId,
+          assigneeUserId: null,
+          actorAgentId: args.actor.agentId ?? null,
+          actorUserId: args.actor.userId ?? null,
+        }, tx);
+      } else {
+        await touchIssue(tx, args.issue.id);
+      }
       return resolved;
     });
 
@@ -2407,6 +2446,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
               summary: data.summary ?? null,
               createdByAgentId: actor.agentId ?? null,
               addresseeAgentId: data.addresseeAgentId ?? null,
+              addresseeUserId: data.addresseeUserId ?? null,
               createdByUserId: actor.userId ?? null,
               payload: data.payload,
             })

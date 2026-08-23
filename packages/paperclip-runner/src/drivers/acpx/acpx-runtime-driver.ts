@@ -5,11 +5,13 @@ import { join, resolve } from "node:path";
 import type { AcpPermissionDecision, AcpPermissionRequest, AcpRuntimeEvent } from "acpx/runtime";
 
 import {
-  CODEX_BLOCK_TOOL_NAME,
-  CODEX_COMPLETION_TOOL_NAME,
   createCodexTaskEnvelope,
   type CodexTaskEnvelope,
 } from "../../contracts/codex.js";
+import {
+  PRP_BLOCK_TOOL_NAME,
+  PRP_COMPLETION_TOOL_NAME,
+} from "../../contracts/completion-result.js";
 import {
   HarnessCapabilityUnavailableError,
   HarnessStaleTurnError,
@@ -154,28 +156,55 @@ export class AcpxRuntimeDriver implements HarnessDriver {
         join(sessionRoot(this.#options.runtimeDirectory, snapshot.normalizedSessionId), "workspace"),
         "utf8",
       )).trim();
-      const session = await this.#open({
+      const input = {
         runId: snapshot.runId,
         normalizedSessionId: snapshot.normalizedSessionId,
         workingDirectory: workspace,
-      }, snapshot);
+      };
+      const replaceProviderSession =
+        snapshot.providerRecoveryPolicy ===
+        "allow_replacement_after_governed_wait";
+      if (replaceProviderSession) {
+        this.#options.onDiagnostic?.(
+          "ACPX is opening a replacement provider session for a durable governed-wait continuation while preserving the Paperclip session lineage.",
+        );
+      }
+      // ACPX 0.13 may not surface an unresumable persistent child until the
+      // first prompt, after ensureSession has already returned successfully.
+      // The explicit governed-wait policy therefore rotates proactively; all
+      // other recovery remains strict same-session-only.
+      const session = await this.#open(
+        input,
+        snapshot,
+        replaceProviderSession,
+      );
       return { recovered: true, session };
     } catch (error) {
       return { recovered: false, reason: redact(String(error), this.#options.environment) };
     }
   }
 
-  async #open(input: OpenHarnessSessionInput, snapshot: PersistedHarnessSession | null): Promise<HarnessSession> {
+  async #open(
+    input: OpenHarnessSessionInput,
+    snapshot: PersistedHarnessSession | null,
+    replaceProviderSession = false,
+  ): Promise<HarnessSession> {
     let session: AcpxHarnessSession | null = null;
     const host = await AcpxRuntimeHost.open({
       runtimeDirectory: this.#options.runtimeDirectory,
       normalizedSessionId: input.normalizedSessionId,
+      ...(replaceProviderSession
+        ? {
+            providerSessionKey:
+              `${input.normalizedSessionId}:governed-wait-replacement:${input.runId}`,
+          }
+        : {}),
       workingDirectory: input.workingDirectory,
       agent: this.#options.agent,
       model: this.#options.model,
       systemInstructions: this.#options.systemInstructions,
       runtimeContext: this.#options.runtimeContext,
-      ...(snapshot?.providerIdentity?.kind === "acpx"
+      ...(!replaceProviderSession && snapshot?.providerIdentity?.kind === "acpx"
         ? { expectedIdentity: snapshot.providerIdentity }
         : {}),
       environment: this.#options.environment,
@@ -194,7 +223,7 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       onDiagnostic: this.#options.onDiagnostic,
     });
     try {
-      if (snapshot?.providerIdentity?.kind === "acpx") {
+      if (!replaceProviderSession && snapshot?.providerIdentity?.kind === "acpx") {
         assertRecoveryIdentity(snapshot.providerIdentity, host.identity(), input.workingDirectory);
       }
       session = new AcpxHarnessSession({
@@ -224,6 +253,7 @@ class AcpxHarnessSession implements HarnessSession {
   readonly #taskEnvelope: CodexTaskEnvelope;
   readonly #dynamicToolHandler?: DynamicToolHandler;
   readonly #runnerInstanceId: string;
+  readonly #providerRecoveryPolicy: PersistedHarnessSession["providerRecoveryPolicy"];
   readonly #now: () => Date;
   readonly #events = new AsyncQueue<PrpEvent>();
   readonly #transcript: PrpEvent[] = [];
@@ -239,6 +269,9 @@ class AcpxHarnessSession implements HarnessSession {
   #resultTurnId: string | null;
   #usage: Record<string, unknown> | null = null;
   #assistantText = "";
+  #assistantTextSinceLastWorkTool = "";
+  #assistantTextAtSemanticResult: string | null = null;
+  #traceCorrelationEventIds: string[] | null = null;
   #thinking = false;
   #closed = false;
 
@@ -260,6 +293,8 @@ class AcpxHarnessSession implements HarnessSession {
     this.#taskEnvelope = input.taskEnvelope;
     this.#dynamicToolHandler = input.dynamicToolHandler;
     this.#runnerInstanceId = input.runnerInstanceId;
+    this.#providerRecoveryPolicy =
+      input.snapshot?.providerRecoveryPolicy ?? "same_session_only";
     this.#now = input.now;
     this.#sourceSequence = input.snapshot?.lastSourceSequence ?? 0;
     this.#activeTurnId = input.snapshot?.activeTurnId ?? null;
@@ -269,6 +304,9 @@ class AcpxHarnessSession implements HarnessSession {
     this.#resultTurnId = input.snapshot?.semanticResult?.turnId ?? null;
     for (const terminal of input.snapshot?.terminalTurns ?? []) {
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
+    }
+    if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
+      this.#activeTurnId = null;
     }
   }
 
@@ -292,6 +330,8 @@ class AcpxHarnessSession implements HarnessSession {
     this.#resultCallId = null;
     this.#resultTurnId = null;
     this.#assistantText = "";
+    this.#assistantTextSinceLastWorkTool = "";
+    this.#assistantTextAtSemanticResult = null;
     this.#emit("run.attached", { runId: input.runId, sameSession: true });
   }
 
@@ -301,6 +341,8 @@ class AcpxHarnessSession implements HarnessSession {
     const turnId = `turn-${randomBytes(12).toString("hex")}`;
     this.#activeTurnId = turnId;
     this.#assistantText = "";
+    this.#assistantTextSinceLastWorkTool = "";
+    this.#assistantTextAtSemanticResult = null;
     this.#activeTurnAbort = new AbortController();
     this.#emit("turn.submitted", { envelopeSchema: this.#taskEnvelope.schema, text: input.message.text });
     this.#emit("turn.accepted", { turnId }, { turnId });
@@ -399,37 +441,40 @@ class AcpxHarnessSession implements HarnessSession {
     const turnId = this.#activeTurnId;
     if (!turnId) throw new Error("ACPX semantic tool call is not bound to an active turn");
     const tool = canonicalRunnerToolName(call.tool);
-    this.#emit("item.started", {
+    const traceFrameId = this.#host.latestInboundTraceFrameId();
+    const traceEventIds: string[] = [];
+    traceEventIds.push(this.#emit("item.started", {
       kind: "dynamicToolCall",
       item: { type: "tool_call", id: call.callId, name: tool, arguments: bounded(call.arguments) },
-    }, { turnId, itemId: call.callId });
-    if (tool === CODEX_COMPLETION_TOOL_NAME || tool === CODEX_BLOCK_TOOL_NAME) {
-      const validation = validatePrpStructuredRunResult(call.arguments);
-      if (!validation.ok) throw new Error("Invalid semantic result");
-      if (
-        (tool === CODEX_BLOCK_TOOL_NAME && validation.result.reportedWorkDisposition !== "blocked")
-        || (tool === CODEX_COMPLETION_TOOL_NAME && validation.result.reportedWorkDisposition === "blocked")
-      ) throw new Error("Semantic result disposition does not match the terminal tool");
-      if (validation.result.completionClaim.contractRevision !== this.#taskEnvelope.completionContract.revision) {
-        throw new Error("Semantic result completion contract revision does not match");
-      }
-      const fingerprint = canonicalJson(validation.result);
-      if (this.#resultFingerprint && this.#resultFingerprint !== fingerprint) throw new Error("A different semantic result was already committed");
-      if (!this.#resultFingerprint) {
-        this.#result = structuredClone(validation.result);
-        this.#resultFingerprint = fingerprint;
-        this.#resultCallId = call.callId;
-        this.#resultTurnId = turnId;
-        this.#emit("run.result.proposed", validation.result, { turnId, itemId: call.callId });
-      }
-      this.#emit("item.completed", {
-        kind: "dynamicToolCall",
-        item: { type: "tool_result", id: call.callId, tool_use_id: call.callId, result: "Semantic completion accepted." },
-      }, { turnId, itemId: call.callId });
-      return { accepted: true };
-    }
-    if (!this.#dynamicToolHandler) throw new Error("Unsupported Paperclip operation");
+    }, { turnId, itemId: call.callId }));
     try {
+      if (tool === PRP_COMPLETION_TOOL_NAME || tool === PRP_BLOCK_TOOL_NAME) {
+        const validation = validatePrpStructuredRunResult(call.arguments);
+        if (!validation.ok) throw new Error("Invalid semantic result");
+        if (
+          (tool === PRP_BLOCK_TOOL_NAME && validation.result.reportedWorkDisposition !== "blocked")
+          || (tool === PRP_COMPLETION_TOOL_NAME && validation.result.reportedWorkDisposition === "blocked")
+        ) throw new Error("Semantic result disposition does not match the terminal tool");
+        if (validation.result.completionClaim.contractRevision !== this.#taskEnvelope.completionContract.revision) {
+          throw new Error("Semantic result completion contract revision does not match");
+        }
+        const fingerprint = canonicalJson(validation.result);
+        if (this.#resultFingerprint && this.#resultFingerprint !== fingerprint) throw new Error("A different semantic result was already committed");
+        if (!this.#resultFingerprint) {
+          this.#result = structuredClone(validation.result);
+          this.#resultFingerprint = fingerprint;
+          this.#resultCallId = call.callId;
+          this.#resultTurnId = turnId;
+          this.#assistantTextAtSemanticResult = this.#assistantTextSinceLastWorkTool.trim() || null;
+          traceEventIds.push(this.#emit("run.result.proposed", validation.result, { turnId, itemId: call.callId }));
+        }
+        traceEventIds.push(this.#emit("item.completed", {
+          kind: "dynamicToolCall",
+          item: { type: "tool_result", id: call.callId, tool_use_id: call.callId, result: "Semantic completion accepted." },
+        }, { turnId, itemId: call.callId }));
+        return { accepted: true };
+      }
+      if (!this.#dynamicToolHandler) throw new Error("Unsupported Paperclip operation");
       const result = await this.#dynamicToolHandler({
         tool,
         callId: call.callId,
@@ -437,17 +482,19 @@ class AcpxHarnessSession implements HarnessSession {
         turnId,
         arguments: call.arguments,
       });
-      this.#emit("item.completed", {
+      traceEventIds.push(this.#emit("item.completed", {
         kind: "dynamicToolCall",
         item: { type: "tool_result", id: call.callId, tool_use_id: call.callId, result: bounded(result) },
-      }, { turnId, itemId: call.callId });
+      }, { turnId, itemId: call.callId }));
       return result;
     } catch (error) {
-      this.#emit("item.completed", {
+      traceEventIds.push(this.#emit("item.completed", {
         kind: "dynamicToolCall",
         item: { type: "tool_result", id: call.callId, tool_use_id: call.callId, error: redact(String(error)), is_error: true },
-      }, { turnId, itemId: call.callId });
+      }, { turnId, itemId: call.callId }));
       throw error;
+    } finally {
+      this.#host.correlateProviderFrame(traceFrameId, traceEventIds, `semantic_tool.${tool}`);
     }
   }
 
@@ -513,6 +560,7 @@ class AcpxHarnessSession implements HarnessSession {
         requestedModel: identity.requestedModel,
         effectiveModel: identity.effectiveModel,
       },
+      providerRecoveryPolicy: this.#providerRecoveryPolicy,
       runId: this.#runId,
       normalizedSessionId: this.#normalizedSessionId,
       activeTurnId: this.#activeTurnId,
@@ -543,7 +591,17 @@ class AcpxHarnessSession implements HarnessSession {
   async #pumpTurn(turnId: string, turn: ReturnType<AcpxRuntimeHost["startTurn"]>): Promise<void> {
     try {
       let index = 0;
-      for await (const event of turn.events) this.#mapRuntimeEvent(event, turnId, ++index);
+      for await (const event of turn.events) {
+        const frameId = this.#host.latestInboundTraceFrameId();
+        const emittedEventIds: string[] = [];
+        this.#traceCorrelationEventIds = emittedEventIds;
+        try {
+          this.#mapRuntimeEvent(event, turnId, ++index);
+        } finally {
+          this.#traceCorrelationEventIds = null;
+        }
+        this.#host.correlateProviderFrame(frameId, emittedEventIds, event.type);
+      }
       const result = await turn.result;
       if (this.#thinking) {
         this.#emit("item.completed", { kind: "thinking", text: "Reasoning completed." }, { turnId, itemId: `${turnId}:thinking` });
@@ -564,7 +622,27 @@ class AcpxHarnessSession implements HarnessSession {
           reason: "ACP agent reported an effective model change",
         }, { turnId, itemId: `${turnId}:model-route` });
       }
+      if (this.#activeTurnId === turnId) this.#activeTurnId = null;
+      this.#activeTurnAbort = null;
       if (result.status === "completed") {
+        const finalText = selectAcpxFinalAgentMessage({
+          semanticResultCommitted: this.#resultFingerprint !== null,
+          textAtSemanticResult: this.#assistantTextAtSemanticResult,
+          textAfterLastWorkTool: this.#assistantTextSinceLastWorkTool,
+        });
+        if (finalText) {
+          this.#emit("item.completed", {
+            kind: "agentMessage",
+            channel: "final",
+            providerPhase: "final_answer",
+            text: finalText,
+            item: {
+              type: "agentMessage",
+              phase: "final_answer",
+              text: finalText,
+            },
+          }, { turnId, itemId: `${turnId}:final-answer` });
+        }
         this.#terminalTurns.set(turnId, canonicalJson({ status: "completed", semanticResult: this.#resultFingerprint }));
         this.#emit("turn.completed", { status: "completed", stopReason: result.stopReason ?? null }, { turnId });
       } else if (result.status === "cancelled") {
@@ -585,6 +663,8 @@ class AcpxHarnessSession implements HarnessSession {
         this.#emit("turn.failed", { status: "failed", error: { code: result.error.code ?? null, message: redact(result.error.message) } }, { turnId });
       }
     } catch (error) {
+      if (this.#activeTurnId === turnId) this.#activeTurnId = null;
+      this.#activeTurnAbort = null;
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
       this.#emit("turn.failed", { status: "failed", error: { message: redact(String(error)) } }, { turnId });
     } finally {
@@ -597,6 +677,19 @@ class AcpxHarnessSession implements HarnessSession {
     const itemId = event.type === "tool_call" && event.toolCallId
       ? safeId(event.toolCallId, `${turnId}:acp:${index}`)
       : `${turnId}:acp:${index}`;
+    if (
+      event.type === "tool_call"
+      && event.tag === "tool_call"
+      && ![PRP_COMPLETION_TOOL_NAME, PRP_BLOCK_TOOL_NAME].includes(
+        canonicalAcpxRuntimeToolName(event.title) as typeof PRP_COMPLETION_TOOL_NAME,
+      )
+    ) {
+      // ACP agents do not label commentary and final-answer channels. Text
+      // emitted after the last work tool is the only safe final candidate;
+      // the accepted completion-tool boundary below then excludes any trailing
+      // acknowledgement emitted after Paperclip already accepted the result.
+      this.#assistantTextSinceLastWorkTool = "";
+    }
     if (event.type === "text_delta") {
       if (event.stream === "thought" || event.tag === "agent_thought_chunk") {
         if (!this.#thinking) {
@@ -607,6 +700,7 @@ class AcpxHarnessSession implements HarnessSession {
       }
       const output = event.text.slice(0, 64 * 1024);
       this.#assistantText = `${this.#assistantText}${output}`.slice(-256 * 1024);
+      this.#assistantTextSinceLastWorkTool = `${this.#assistantTextSinceLastWorkTool}${output}`.slice(-256 * 1024);
       this.#emit("item.delta", { kind: "agent_message", text: output }, { turnId, itemId });
       for (const reference of paperclipWorkspaceFileReferencesFromText(this.#workingDirectory, output, turnId)) {
         if (this.#emittedFileReferences.has(reference.referenceId)) continue;
@@ -679,7 +773,7 @@ class AcpxHarnessSession implements HarnessSession {
     this.#emit("item.completed", { kind: "usage", usage: this.#usage }, { turnId, itemId });
   }
 
-  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, refs: { turnId?: string; itemId?: string } = {}): void {
+  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, refs: { turnId?: string; itemId?: string } = {}): string {
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1",
@@ -697,8 +791,10 @@ class AcpxHarnessSession implements HarnessSession {
       emittedAt: this.#now().toISOString(),
       payload,
     };
+    this.#traceCorrelationEventIds?.push(event.sourceEventId);
     this.#transcript.push(structuredClone(event));
     this.#events.push(event);
+    return event.sourceEventId;
   }
 
   #optionsEnvironment(): NodeJS.ProcessEnv { return {}; }
@@ -751,6 +847,25 @@ function toolOperation(kind: unknown): "create" | "modify" | "delete" {
 
 function canonicalToolTerminal(status: unknown): boolean {
   return ["completed", "failed", "cancelled", "canceled"].includes(text(status).toLowerCase());
+}
+
+function canonicalAcpxRuntimeToolName(value: unknown): string {
+  const nativeName = text(value).trim();
+  const bridgeName = nativeName
+    .replace(/^mcp__[^_]+__/, "")
+    .replace(/^mcp\.paperclip\./, "");
+  return canonicalRunnerToolName(bridgeName);
+}
+
+export function selectAcpxFinalAgentMessage(input: {
+  semanticResultCommitted: boolean;
+  textAtSemanticResult: string | null;
+  textAfterLastWorkTool: string;
+}): string | null {
+  const candidate = input.semanticResultCommitted
+    ? input.textAtSemanticResult
+    : input.textAfterLastWorkTool;
+  return candidate?.trim() || null;
 }
 
 function safeWorkspacePath(value: string): string | null {

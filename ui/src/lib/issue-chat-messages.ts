@@ -38,6 +38,8 @@ export interface IssueChatComment extends IssueComment {
   followUpRequested?: boolean;
   /** Causal conversation slot: the run that actually consumed this input. */
   consumedByRunId?: string | null;
+  /** Same-turn PRP steering acknowledgement for this human input. */
+  steeredIntoRunId?: string | null;
   conversationAnchorAt?: Date | string | null;
   conversationAnchorSequence?: number;
 }

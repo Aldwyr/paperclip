@@ -94,6 +94,7 @@ const mockSetPanelVisible = vi.hoisted(() => vi.fn());
 const mockPanelState = vi.hoisted(() => ({ panelVisible: true }));
 const mockSidebarState = vi.hoisted(() => ({ isMobile: false }));
 const mockIssuePropertiesRender = vi.hoisted(() => vi.fn());
+const mockTaskSidePanelRender = vi.hoisted(() => vi.fn());
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockSetMobileToolbar = vi.hoisted(() => vi.fn());
 const mockPushToast = vi.hoisted(() => vi.fn());
@@ -370,6 +371,13 @@ vi.mock("../components/IssueProperties", () => ({
   IssueProperties: (props: unknown) => {
     mockIssuePropertiesRender(props);
     return <div>Properties</div>;
+  },
+}));
+
+vi.mock("../components/task-side-panel", () => ({
+  TaskSidePanel: (props: unknown) => {
+    mockTaskSidePanelRender(props);
+    return <div>Task side panel</div>;
   },
 }));
 
@@ -1100,6 +1108,7 @@ describe("IssueDetail", () => {
     mockClosePanel.mockClear();
     mockSetPanelVisible.mockClear();
     mockIssuePropertiesRender.mockClear();
+    mockTaskSidePanelRender.mockClear();
     mockIssuesListRender.mockClear();
     mockIssueChatThreadRender.mockClear();
     mockImageGalleryRender.mockClear();
@@ -1149,7 +1158,7 @@ describe("IssueDetail", () => {
     ).toBe(false);
   });
 
-  it("opens a closed desktop pane and routes an ordinary document to Artifacts on direct load", async () => {
+  it("opens a closed desktop pane and routes an ordinary document to its own tab on direct load", async () => {
     mockPanelState.panelVisible = false;
     mockLocation.hash = "#document-qa-evidence";
     mockIssuesApi.get.mockResolvedValue(createIssue());
@@ -1166,7 +1175,7 @@ describe("IssueDetail", () => {
       expect(mockSetPanelVisible).toHaveBeenCalledWith(true);
       const panel = mockOpenPanel.mock.calls.at(-1)?.[0] as { props?: Record<string, unknown> } | undefined;
       expect(panel?.props?.documentDeepLink).toMatchObject({
-        tab: "artifacts",
+        tab: "document",
         documentKey: "qa-evidence",
       });
     });
@@ -1304,10 +1313,10 @@ describe("IssueDetail", () => {
     });
 
     await waitForAssertion(() => {
-      expect(mockIssuePropertiesRender).toHaveBeenCalledWith(expect.objectContaining({
+      expect(mockTaskSidePanelRender).toHaveBeenCalledWith(expect.objectContaining({
         inline: true,
         documentDeepLink: expect.objectContaining({
-          tab: "artifacts",
+          tab: "document",
           documentKey: "qa-evidence",
         }),
       }));
@@ -1315,7 +1324,7 @@ describe("IssueDetail", () => {
     expect(mockSetPanelVisible).not.toHaveBeenCalled();
   });
 
-  it("opens a plan deep link in a dismissible full-screen mobile panel", async () => {
+  it("opens a plan deep link in the shared mobile side-panel sheet", async () => {
     mockSidebarState.isMobile = true;
     mockLocation.hash = "#document-plan";
     mockIssuesApi.get.mockResolvedValue(createIssue());
@@ -1329,7 +1338,7 @@ describe("IssueDetail", () => {
     });
 
     await waitForAssertion(() => {
-      expect(mockIssuePropertiesRender).toHaveBeenCalledWith(expect.objectContaining({
+      expect(mockTaskSidePanelRender).toHaveBeenCalledWith(expect.objectContaining({
         inline: true,
         documentDeepLink: expect.objectContaining({
           tab: "plans",
@@ -1338,11 +1347,10 @@ describe("IssueDetail", () => {
       }));
     });
 
-    const panel = document.querySelector('[data-testid="mobile-plan-panel"]');
+    const panel = document.querySelector('[data-slot="sheet-content"]');
     expect(panel).not.toBeNull();
-    expect(panel?.className).toContain("h-dvh");
-    expect(panel?.className).toContain("w-screen");
-    expect(panel?.textContent).toContain("Plan");
+    expect(panel?.className).toContain("max-h-(--sz-85dvh)");
+    expect(panel?.textContent).toContain("Task side panel");
     expect(panel?.querySelector('[data-slot="sheet-close"]')).not.toBeNull();
   });
 
@@ -2243,7 +2251,7 @@ describe("IssueDetail", () => {
     // Even though panelVisible is true, the suppressed first task keeps the
     // opt-in button visible instead of fading it out.
     const showPropertiesButton = container.querySelector<HTMLButtonElement>(
-      'button[title="Show properties"]',
+      'button[aria-label="Toggle side panel"]',
     );
     expect(showPropertiesButton).toBeTruthy();
     expect(showPropertiesButton!.className).not.toContain("pointer-events-none");

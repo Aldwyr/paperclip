@@ -4,6 +4,7 @@ import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
 
 type BackendFactoryOptions = {
   runnerInstanceId?: string;
+  acpxRuntimeDirectory?: string;
   onSpawn?: (meta: {
     pid: number;
     processGroupId: number | null;
@@ -23,18 +24,23 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("@paperclipai/paperclip-runner", () => ({
+  CAPABILITY_SEMANTIC_TOOL_CATALOG: [],
   createNativeSessionBackend: state.createBackend,
   executeNativeSession: state.execute,
 }));
 
 import {
+  continuingPendingInteractionIds,
   buildNativeProviderEnvironment,
   cancelNativeSession,
+  createRunnerdBackend,
   executePaperclipNativeSession,
   getNativeSessionSteeringState,
   NativeSessionSteeringError,
   nativeSessionFailureDisposition,
   nativeSessionFailureSourceCode,
+  nativeSessionRecoveryProjection,
+  nativeGovernedWaitResult,
   providerPlanMarkdown,
   semanticProviderPlanMarkdown,
   steerNativeSession,
@@ -175,6 +181,59 @@ describe("provider plan synchronization", () => {
     ].join("\n"));
     expect(markdown).not.toContain("must-not-appear");
     expect(markdown).not.toContain("native-secret");
+  });
+});
+
+describe("native governed waits", () => {
+  it("turns a durable pending interaction into a response-wake result", () => {
+    expect(nativeGovernedWaitResult({
+      interaction: {
+        id: "interaction-1",
+        title: "Choose an output format",
+        summary: null,
+      },
+      completionContract: {
+        revision: "contract-v3",
+        objective: "Create the requested output",
+        criteria: [{ id: "objective", requirement: "The output is created" }],
+      },
+    })).toEqual(expect.objectContaining({
+      schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "yielded",
+      summary: "Waiting for Choose an output format.",
+      completionClaim: expect.objectContaining({
+        contractRevision: "contract-v3",
+        objectiveSatisfied: false,
+        criteria: [{
+          criterionId: "objective",
+          status: "unknown",
+          evidenceRefs: ["interaction:interaction-1"],
+        }],
+      }),
+      evidence: [{ ref: "interaction:interaction-1" }],
+      attentionRequests: [],
+      continuation: {
+        kind: "response_wake",
+        summary: "Resume from the resolved interaction response without repeating prior work.",
+        idempotencyKey: "interaction-response:interaction-1",
+      },
+    }));
+  });
+
+  it("keeps an authority-checked partial item-verdict interaction as the wait target", () => {
+    const partial = structuredClone(execution);
+    partial.interactionResponses = [{
+      interactionId: "interaction-partial",
+      kind: "request_item_verdicts",
+      response: {
+        status: "pending",
+        result: { version: 1, complete: false, items: [{ id: "alpha", verdict: "approve" }] },
+      },
+    }];
+    expect(continuingPendingInteractionIds(partial)).toEqual(["interaction-partial"]);
+
+    partial.interactionResponses[0]!.response.status = "answered";
+    expect(continuingPendingInteractionIds(partial)).toEqual([]);
   });
 });
 
@@ -468,6 +527,35 @@ describe("native session bounded recovery", () => {
       nextAttemptAt: null,
     });
   });
+
+  it("escalates exhausted result-less sessions to board review instead of leaving the provider as its own owner", () => {
+    expect(nativeSessionRecoveryProjection({
+      phase: "retryable_failure",
+      failureCode: "native_session_interrupted",
+      agentId: "agent-low-capability",
+    })).toEqual({
+      exhausted: false,
+      issueStatus: null,
+      recoveryOwner: { kind: "agent", agentId: "agent-low-capability" },
+      recoveryActionOwnerType: "agent",
+      recoveryActionOwnerAgentId: "agent-low-capability",
+      recoveryActionCause: "native_session_interrupted",
+      supersedeOnIdentityChange: true,
+    });
+    expect(nativeSessionRecoveryProjection({
+      phase: "terminal_failure",
+      failureCode: "native_session_retry_exhausted",
+      agentId: "agent-low-capability",
+    })).toEqual({
+      exhausted: true,
+      issueStatus: "in_review",
+      recoveryOwner: { kind: "board" },
+      recoveryActionOwnerType: "board",
+      recoveryActionOwnerAgentId: null,
+      recoveryActionCause: "native_session_retry_exhausted",
+      supersedeOnIdentityChange: true,
+    });
+  });
 });
 
 describe("native process ownership", () => {
@@ -510,5 +598,61 @@ describe("native process ownership", () => {
       onSpawn,
     }));
     expect(onSpawn).toHaveBeenCalledWith(processMetadata);
+  });
+});
+
+describe("runnerd provider runtime wiring", () => {
+  it("passes the isolated ACPX runtime directory to the native backend factory", async () => {
+    const acpxExecution = {
+      ...execution,
+      schema: "paperclip.native-execution-input.v3",
+      task: {
+        identifier: "DOT-ACPX",
+        title: "ACPX task",
+        description: null,
+        prompt: "Complete the ACPX task.",
+        workMode: "standard",
+      },
+      workspace: { cwd: "/tmp/acpx-native", repoUrl: null, repoRef: null, branchName: null },
+      session: {
+        normalizedSessionId: "acpx-session",
+        driverKind: "acpx_runtime",
+        protocolVersion: 1,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+      },
+      provider: {
+        kind: "acpx",
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        permissionPolicy: "interactive",
+        profile: {
+          driverKind: "acpx_runtime",
+          protocolVersion: 1,
+          acpxVersion: "0.13.1",
+          agent: "codex",
+          agentProfileVersion: 1,
+          agentServerPackage: "@agentclientprotocol/codex-acp",
+          agentServerVersion: "1.6.2",
+          agentRuntimePackage: null,
+          agentRuntimeVersion: null,
+          commandDigest: "sha256:test",
+        },
+      },
+      executionMode: "default",
+      planningContext: null,
+      interactionResponses: [],
+      credentialBindings: [],
+      runtimeContext: {},
+    } as unknown as NativeExecutionInputV1;
+    state.createBackend.mockClear();
+    createRunnerdBackend({
+      db: leaseDb(acpxExecution),
+      execution: acpxExecution,
+      runnerInstanceId: "runner",
+    });
+
+    expect(state.createBackend).toHaveBeenCalledWith(acpxExecution, expect.objectContaining({
+      acpxRuntimeDirectory: expect.stringContaining("/runtime/paperclip-runner/acpx"),
+    }));
   });
 });

@@ -12,8 +12,17 @@
  * inventory for the mapping. No timing/motion values live here — those are
  * CSS motion tokens in ui/src/index.css.
  */
-import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
-import type { IssueAttachment, IssueDocumentSummary, IssueWorkProduct } from "@paperclipai/shared";
+import type {
+  IssueAttachment,
+  IssueCommentMetadata,
+  IssueCommentPresentation,
+  IssueDocument,
+  IssueDocumentSummary,
+  IssueWorkProduct,
+} from "@paperclipai/shared";
+import type { PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
+
+export type { PaperclipQuestionResponse, PaperclipQuestionSet };
 
 export type TaskChatProviderActivityFamily =
   | "plan" | "tool_execution" | "research" | "delegation" | "model_identity"
@@ -37,7 +46,7 @@ import type { IssueThreadInteraction } from "@/lib/issue-thread-interactions";
 export type TaskChatAuthorKind = "human" | "agent" | "system";
 
 /** ACP ToolCallStatus. */
-export type TaskChatToolStatus = "pending" | "in_progress" | "completed" | "failed";
+export type TaskChatToolStatus = "pending" | "in_progress" | "completed" | "failed" | "interrupted";
 
 /** ACP PermissionOptionKind. */
 export type TaskChatApprovalOptionKind =
@@ -90,6 +99,12 @@ export interface TaskChatMessageItem {
   optimistic?: "pending" | "queued";
   /** Live run this queued message is waiting behind. */
   queueTargetRunId?: string | null;
+  /** Non-blocking verification limitations attached to the run's durable reply. */
+  verificationCaveats?: Array<{
+    commandOrCheck: string;
+    reasonCode?: string | null;
+    detail?: string | null;
+  }>;
   /** Assigned agent icon name (AgentIconName) for the avatar header. */
   agentIcon?: string | null;
   /**
@@ -104,6 +119,8 @@ export interface TaskChatMessageItem {
   channel?: "progress" | "final" | "unknown";
   /** Epoch ms of the message's first streamed chunk. */
   atMs?: number;
+  /** Index of the latest transcript event folded into this logical block. */
+  transcriptIndex?: number;
   /**
    * The settled run turn "attached" to this bubble (round 9): when the run's
    * final reply lands, the live parent row transforms into the "Worked · …"
@@ -139,6 +156,8 @@ export interface TaskChatThinkingItem {
   channel?: "summary" | "detail" | "unknown";
   /** A real provider reasoning lifecycle with no provider-authored text. */
   lifecycleOnly?: boolean;
+  /** Index of the latest transcript event folded into this logical block. */
+  transcriptIndex?: number;
 }
 
 /** A tool invocation row (ACP tool_call / tool_call_update). */
@@ -253,6 +272,13 @@ export interface TaskChatInteractionItem {
   interaction: IssueThreadInteraction;
 }
 
+/** A canonical, atomically saved Plan document interleaved into the thread. */
+export interface TaskChatPlanDocumentItem {
+  id: string;
+  kind: "plan_document";
+  document: IssueDocument;
+}
+
 export interface TaskChatProtocolDetail {
   label: string;
   value: string;
@@ -294,6 +320,8 @@ export interface TaskChatProviderActivityItem {
   children: TaskChatProtocolChild[];
   output?: string;
   outputTruncated?: boolean;
+  /** Index of the latest provider event coalesced into this activity. */
+  transcriptIndex?: number;
 }
 
 export interface TaskChatWorkspaceChangeItem {
@@ -330,18 +358,20 @@ export interface TaskChatRuntimeRequestItem {
   surface: "runtime_request";
   runId: string;
   requestId: string;
-  requestKind: "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null;
+  requestKind: "runtime" | "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null;
   turnId: string | null;
   requestType: "permission" | "input";
   status: "pending" | "resolved" | "expired" | "cancelled";
   prompt: string;
   choices: Array<{ key: string; label: string }>;
   fields: Array<{ name: string; label: string; placeholder: string | null }>;
+  questionSet?: PaperclipQuestionSet | null;
 }
 
 export type TaskChatRuntimeRequestDecision =
   | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
-  | { action: "submit"; values: Record<string, string> };
+  | { action: "submit"; values: Record<string, string> }
+  | { action: "submit"; response: PaperclipQuestionResponse };
 
 export interface TaskChatRunResultItem {
   id: string;
@@ -446,6 +476,7 @@ export type TaskChatItem =
   | TaskChatUsageItem
   | TaskChatActivityPhaseItem
   | TaskChatInteractionItem
+  | TaskChatPlanDocumentItem
   | TaskChatTurnItem
   | TaskChatBriefItem
   | TaskChatProtocolItem;

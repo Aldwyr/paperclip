@@ -11,6 +11,18 @@ export function nativeSystemInstructions(input: NativeExecutionInput): string {
 }
 
 export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
-  if (!("runtimeContext" in input)) return ["Do not discover or invoke skills.", "Do not call a control-plane API."];
-  return ["Use only the assigned skills and provider-native tools.", "Use Paperclip semantic tools for coordination and finalization."];
+  const finalResponseConstraint =
+    "Write the complete user-facing final response exactly once before invoking paperclip_finish or paperclip_block. Treat that semantic completion tool as the last action and do not emit a trailing acknowledgement.";
+  if (!("runtimeContext" in input)) {
+    return [
+      "Do not discover or invoke skills.",
+      "Do not call a control-plane API.",
+      finalResponseConstraint,
+    ];
+  }
+  return [
+    "Use only the assigned skills and provider-native tools.",
+    "Use Paperclip semantic tools for coordination and finalization.",
+    finalResponseConstraint,
+  ];
 }

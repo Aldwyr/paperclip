@@ -17,6 +17,7 @@ import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskMessageScroller } from "./TaskMessageScroller";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
+import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 
 interface TaskChatThreadViewProps {
   items: TaskChatItem[];
@@ -116,6 +117,8 @@ function renderItem(
       return <TaskChatActivityPhase item={item} renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)} />;
     case "interaction":
       return renderInteraction ? renderInteraction(item) : null;
+    case "plan_document":
+      return <TaskChatPlanPreviewCard source={{ kind: "saved", document: item.document }} />;
     case "brief":
       return renderBrief ? renderBrief() : null;
     case "turn":
@@ -195,6 +198,9 @@ function signatureOf(it: TaskChatItem): number {
   if (it.kind === "message") return it.text.length + (it.attachedTurn ? 1 : 0);
   if (it.kind === "thinking") return it.lines.reduce((n, l) => n + l.length, 0);
   if (it.kind === "tool") return (it.diff?.lines?.length ?? 0) + (it.status === "completed" ? 1 : 0);
+  if (it.kind === "plan_document") {
+    return it.document.body.length + it.document.latestRevisionNumber;
+  }
   if (it.kind === "turn") {
     if (it.settled) return 1;
     // The live parent row's header changes (gerund ↔ tool-state flashes,

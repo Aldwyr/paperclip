@@ -1132,6 +1132,8 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
     };
     expect(adapterInput.runtime.sessionId).toBe("accepted-plan-retry-session");
     expect(adapterInput.context.acceptedPlanWakeRouting).toBeUndefined();
-    expect(adapterInput.context.paperclipTaskMarkdown).toContain("Create child issues from the approved plan only");
+    expect(adapterInput.context.paperclipTaskMarkdown).toContain(
+      "Use create_task to create exactly one standard implementation child containing the complete approved plan",
+    );
   }, 20_000);
 });

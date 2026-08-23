@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import type { AcpPermissionDecision, AcpRuntimeEvent, AcpRuntimeStatus } from "acpx/runtime";
 
 import {
-  CODEX_BLOCK_TOOL_NAME,
-  CODEX_COMPLETION_TOOL_NAME,
-} from "../contracts/codex.js";
+  PRP_BLOCK_TOOL_NAME,
+  PRP_COMPLETION_TOOL_NAME,
+} from "../contracts/completion-result.js";
 import { AcpxRuntimeHost } from "../drivers/acpx/acpx-runtime-host.js";
 import { resolveQualifiedAcpxProfile, type QualifiedAcpxAgent } from "../drivers/acpx/qualified-profiles.js";
 import {
@@ -24,6 +25,7 @@ import {
   type AcpxSidecarResponse,
 } from "../drivers/acpx/sidecar-protocol.js";
 import { validatePrpStructuredRunResult } from "../protocol/replay-contract.js";
+import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 
 interface PendingResolution<T> {
   turnId: string;
@@ -224,12 +226,12 @@ async function pumpTurn(currentTurnId: string, runtimeTurn: ReturnType<AcpxRunti
 
 function waitForTool(call: { tool: string; callId: string; arguments: unknown }): Promise<unknown> {
   if (!turnId || tools.has(call.callId)) throw new Error("ACPX tool call is unbound or duplicated");
-  if (call.tool === CODEX_COMPLETION_TOOL_NAME || call.tool === CODEX_BLOCK_TOOL_NAME) {
+  if (call.tool === PRP_COMPLETION_TOOL_NAME || call.tool === PRP_BLOCK_TOOL_NAME) {
     const validation = validatePrpStructuredRunResult(call.arguments);
     if (!validation.ok) throw new Error("ACPX semantic result failed PRP schema validation");
     if (
-      (call.tool === CODEX_BLOCK_TOOL_NAME && validation.result.reportedWorkDisposition !== "blocked")
-      || (call.tool === CODEX_COMPLETION_TOOL_NAME && validation.result.reportedWorkDisposition === "blocked")
+      (call.tool === PRP_BLOCK_TOOL_NAME && validation.result.reportedWorkDisposition !== "blocked")
+      || (call.tool === PRP_COMPLETION_TOOL_NAME && validation.result.reportedWorkDisposition === "blocked")
     ) throw new Error("ACPX semantic result disposition does not match its terminal operation");
     emit("runtime.event", {
       type: "semantic_result",
@@ -380,12 +382,17 @@ function parseOpenParams(value: Record<string, unknown>): AcpxSidecarOpenParams 
   const agent = requiredAgent(value.agent);
   const model = requiredText(value.model, "model");
   resolveQualifiedAcpxProfile(agent, model);
+  const runtimeContextPath = process.env.PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH?.trim();
   return {
     runtimeDirectory: requiredText(value.runtimeDirectory, "runtimeDirectory"),
     normalizedSessionId: requiredText(value.normalizedSessionId, "normalizedSessionId"),
     workingDirectory: requiredText(value.workingDirectory, "workingDirectory"),
     agent,
     model,
+    systemInstructions: requiredText(value.systemInstructions, "systemInstructions"),
+    runtimeContext: runtimeContextPath
+      ? parseNativeRuntimeContext(JSON.parse(readFileSync(runtimeContextPath, "utf8")))
+      : null,
     tools: Array.isArray(value.tools) ? value.tools.slice(0, 512).map(record) : [],
     ...(value.expectedIdentity === undefined || value.expectedIdentity === null
       ? {}

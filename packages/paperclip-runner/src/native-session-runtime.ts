@@ -5,7 +5,7 @@ import type { NativeExecutionInput, NativeSessionExecutionResult } from "./contr
 import { buildNativeModelEnvelope, parseNativeExecutionInput } from "./contracts/native-execution.js";
 import type { NativeSession, NativeSessionBackend } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
-import type { PrpEvent, PrpTerminalState } from "./protocol/replay-contract.js";
+import type { PrpEvent, PrpStructuredRunResult, PrpTerminalState } from "./protocol/replay-contract.js";
 
 export interface ExecuteNativeSessionOptions {
   input: NativeExecutionInput;
@@ -19,6 +19,26 @@ export interface ExecuteNativeSessionOptions {
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
   onCheckpoint?: (snapshot: PersistedNativeSession) => Promise<void> | void;
+  /**
+   * Control-plane policy seam for a provider turn that completed after
+   * durably creating a governed wait, but did not emit a semantic finish
+   * result. The runner package cannot inspect server-owned interactions, so
+   * it asks the embedding control plane whether that missing result is an
+   * intentional yield before treating it as provider failure.
+   */
+  resolveMissingResult?: (input: {
+    turnId: string | null;
+    terminalEvent: PrpEvent;
+  }) => Promise<PrpStructuredRunResult | null>;
+  /**
+   * Detect a durable server-owned wait as soon as its provider tool event is
+   * committed. Models are not trusted to stop or avoid polling after creating
+   * a question/review interaction; the control plane may park the turn here.
+   */
+  resolveGovernedWait?: (input: {
+    turnId: string | null;
+    event: PrpEvent;
+  }) => Promise<PrpStructuredRunResult | null>;
 }
 
 function isTurnTerminal(event: PrpEvent): boolean {
@@ -36,18 +56,37 @@ function terminalFromEvent(event: PrpEvent, disposition: PrpTerminalState["repor
   return { schema: "paperclip.prp.terminal.v1", ...states, reportedWorkDisposition: disposition };
 }
 
-async function consumeTurn(session: NativeSession, controlPlane: ControlPlanePort, timeoutMs: number) {
+async function consumeTurn(
+  session: NativeSession,
+  controlPlane: ControlPlanePort,
+  timeoutMs: number,
+  resolveGovernedWait?: ExecuteNativeSessionOptions["resolveGovernedWait"],
+) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       (async () => {
         let eventCount = 0;
         let highestContiguousSourceSeq = 0;
+        let governedResult: PrpStructuredRunResult | null = null;
         for await (const event of session.events()) {
           const receipt = await controlPlane.appendEvent(event);
           eventCount += receipt.disposition === "committed" ? 1 : 0;
           highestContiguousSourceSeq = Math.max(highestContiguousSourceSeq, receipt.highestContiguousSourceSeq);
-          if (isTurnTerminal(event)) return { event, eventCount, highestContiguousSourceSeq };
+          if (governedResult === null && resolveGovernedWait) {
+            governedResult = await resolveGovernedWait({
+              turnId: event.turnId ?? null,
+              event,
+            });
+            if (governedResult !== null && !isTurnTerminal(event)) {
+              await session.cancel?.({
+                reason: "Paperclip parked this turn on a durable governed interaction.",
+              }).catch(() => undefined);
+            }
+          }
+          if (isTurnTerminal(event)) {
+            return { event, eventCount, highestContiguousSourceSeq, governedResult };
+          }
         }
         throw new Error("native event stream closed before a turn terminal fact");
       })(),
@@ -143,7 +182,12 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
     await options.controlPlane.checkpointSession?.(recoveredSnapshot);
     await options.onCheckpoint?.(recoveredSnapshot);
 
-    let consumed = { event: null as PrpEvent | null, eventCount: 0, highestContiguousSourceSeq: 0 };
+    let consumed = {
+      event: null as PrpEvent | null,
+      eventCount: 0,
+      highestContiguousSourceSeq: 0,
+      governedResult: null as PrpStructuredRunResult | null,
+    };
     const completionSnapshot = recoveredSnapshot.semanticResult && recoveredSnapshot.terminal
       ? recoveredSnapshot
       : persistedSession;
@@ -155,29 +199,84 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
         }
       : null;
     if (!completed) {
-      const consuming = consumeTurn(session, options.controlPlane, options.timeoutMs ?? 900_000);
+      const consuming = consumeTurn(
+        session,
+        options.controlPlane,
+        options.timeoutMs ?? 900_000,
+        options.resolveGovernedWait,
+      );
       // Event consumption must begin before startTurn so an eager provider cannot
       // outrun us. Observe its rejection immediately, though: if startTurn or
       // checkpointing fails first, the outer finally closes the session and the
       // abandoned consumer will reject when its stream closes. Without a handler
       // that later rejection becomes process-fatal under Node's strict policy.
       void consuming.catch(() => undefined);
-      const recoveredActiveTurnId = recoveredSnapshot.activeTurnId ?? persistedSession?.activeTurnId ?? null;
+      // A recovered driver is authoritative about whether a provider turn is
+      // still active. In particular, drivers normalize the checkpoint race
+      // where a terminal fingerprint was persisted before activeTurnId was
+      // cleared. Falling back to the older control-plane checkpoint here
+      // resurrects that terminal turn and waits forever for an event that was
+      // already consumed.
+      const recoveredActiveTurnId = recovered
+        ? recoveredSnapshot.activeTurnId ?? null
+        : persistedSession?.activeTurnId ?? null;
       if (!recovered || !recoveredActiveTurnId) {
+        const modelEnvelope = buildNativeModelEnvelope(input);
+        const dispositionOnlyRecovery = Boolean(
+          recovered &&
+          !recoveredSnapshot.semanticResult &&
+          (persistedSession?.terminalTurns?.length ?? 0) > 0 &&
+          !recoveredActiveTurnId
+        );
+        if (dispositionOnlyRecovery) {
+          modelEnvelope.task.prompt = [
+            "Paperclip semantic-result recovery for a prior completed provider turn.",
+            "The prior turn already performed the work and its user-facing final answer is recorded.",
+            "Do not repeat implementation, tests, research, or the final answer.",
+            "Use the existing session context to invoke exactly one paperclip_finish or paperclip_block with the accurate current disposition, then stop without additional user-facing prose.",
+          ].join("\n");
+        }
         await session.startTurn({
-          message: { role: "user", text: JSON.stringify(buildNativeModelEnvelope(input)) },
+          message: { role: "user", text: JSON.stringify(modelEnvelope) },
           requestedCollaborationMode: "executionMode" in input ? input.executionMode : "default",
         });
         await checkpoint();
       }
       const terminalEvent = await consuming;
       consumed = terminalEvent;
-      completed = await session.result();
+      completed = terminalEvent.governedResult === null
+        ? await session.result()
+        : {
+            result: terminalEvent.governedResult,
+            terminal: {
+              schema: "paperclip.prp.terminal.v1",
+              turnTerminalState: "completed",
+              runTerminalState: "succeeded",
+              reportedWorkDisposition:
+                terminalEvent.governedResult.reportedWorkDisposition,
+            },
+            turnId: terminalEvent.event.turnId ?? null,
+          };
+      if (completed === null && options.resolveMissingResult) {
+        const recoveredResult = await options.resolveMissingResult({
+          turnId: terminalEvent.event.turnId ?? null,
+          terminalEvent: terminalEvent.event,
+        });
+        if (recoveredResult !== null) {
+          completed = {
+            result: recoveredResult,
+            terminal: terminalFromEvent(terminalEvent.event, recoveredResult.reportedWorkDisposition),
+            turnId: terminalEvent.event.turnId ?? null,
+          };
+        }
+      }
       await checkpoint();
     }
     if (completed === null) throw new Error("native_finalization_missing: session returned no semantic result");
     let terminal: PrpTerminalState;
-    if (completionSnapshot?.semanticResult && completionSnapshot.terminal) {
+    if (consumed.governedResult !== null) {
+      terminal = completed.terminal;
+    } else if (completionSnapshot?.semanticResult && completionSnapshot.terminal) {
       terminal = completionSnapshot.terminal;
     } else {
       terminal = terminalFromEvent(consumed.event!, completed.result.reportedWorkDisposition);

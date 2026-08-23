@@ -130,6 +130,41 @@ export interface ResolvedHeartbeatRunResponse {
   decision: RunPresentationDecision;
 }
 
+export interface CompletedFinalAgentMessageCandidate {
+  seq: number;
+  text: string;
+  sourceEventId: string | null;
+}
+
+/**
+ * A bounded native retry can exist solely because a completed provider turn
+ * omitted its semantic result. In that case the retry is a disposition-only
+ * recovery turn: prose it emits must not displace the real final response
+ * already produced by the completed work turn. The boundary is protocol
+ * state, not a length heuristic or narration regex.
+ */
+export function selectHeartbeatRunFinalAgentMessage(input: {
+  candidates: CompletedFinalAgentMessageCandidate[];
+  semanticResultRecoveryAfterSeq?: number | null;
+}): (CompletedFinalAgentMessageCandidate & { reasonCode: string }) | null {
+  const candidates = [...input.candidates].sort((a, b) => b.seq - a.seq);
+  if (candidates.length === 0) return null;
+  const boundary = input.semanticResultRecoveryAfterSeq;
+  if (typeof boundary === "number") {
+    const preRecovery = candidates.find((candidate) => candidate.seq < boundary);
+    if (preRecovery) {
+      return {
+        ...preRecovery,
+        reasonCode: "pre_semantic_result_recovery_final_agent_message",
+      };
+    }
+  }
+  return {
+    ...candidates[0]!,
+    reasonCode: "latest_non_empty_completed_final_agent_message",
+  };
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -137,17 +172,39 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function readAcceptedSemanticSummary(resultJson: Record<string, unknown>) {
-  const candidates = [
-    record(resultJson.nativeResult),
-    record(resultJson.acceptedResult),
-    record(record(resultJson.semanticResult).result),
-  ];
+  const candidates = semanticResultCandidates(resultJson);
   for (const candidate of candidates) {
     if (candidate.schema !== "paperclip.run_result.v1") continue;
+    // A yielded result is a control-plane liveness fact, not a final assistant
+    // response. Its summary belongs in diagnostics/system state while the
+    // durable interaction card remains the user-facing surface.
+    if (candidate.reportedWorkDisposition === "yielded") continue;
     const summary = readCommentText(candidate.summary);
     if (summary) return summary;
   }
   return null;
+}
+
+function semanticResultCandidates(resultJson: Record<string, unknown>) {
+  return [
+    record(resultJson.nativeResult),
+    record(resultJson.acceptedResult),
+    record(record(resultJson.semanticResult).result),
+  ];
+}
+
+export function hasAcceptedSemanticResult(
+  resultJson: Record<string, unknown> | null | undefined,
+) {
+  return semanticResultCandidates(record(resultJson)).some(
+    (candidate) => candidate.schema === "paperclip.run_result.v1",
+  );
+}
+
+function hasYieldedSemanticResult(resultJson: Record<string, unknown>) {
+  return semanticResultCandidates(resultJson).some((candidate) =>
+    candidate.schema === "paperclip.run_result.v1"
+    && candidate.reportedWorkDisposition === "yielded");
 }
 
 export function projectHistoricalHeartbeatRunComment(
@@ -217,7 +274,11 @@ function decision(
 export function resolveHeartbeatRunResponse(input: {
   resultJson: Record<string, unknown> | null | undefined;
   existingComment?: { id: string; body?: string | null } | null;
-  finalAgentMessage?: { text: string; sourceEventId: string | null } | null;
+  finalAgentMessage?: {
+    text: string;
+    sourceEventId: string | null;
+    reasonCode?: string;
+  } | null;
 }): ResolvedHeartbeatRunResponse {
   const existingText = readCommentText(input.existingComment?.body);
   if (input.existingComment && existingText) {
@@ -238,7 +299,10 @@ export function resolveHeartbeatRunResponse(input: {
       decision: decision("final_agent_message", {
         sourceEventId: input.finalAgentMessage?.sourceEventId,
         commentAction: "create",
-        reasonCodes: ["latest_non_empty_completed_final_agent_message"],
+        reasonCodes: [
+          input.finalAgentMessage?.reasonCode ??
+            "latest_non_empty_completed_final_agent_message",
+        ],
       }),
     };
   }
@@ -262,6 +326,21 @@ export function resolveHeartbeatRunResponse(input: {
       decision: decision("adapter_final_response", {
         commentAction: "create",
         reasonCodes: ["adapter_output_marked_final"],
+      }),
+    };
+  }
+
+  // Native governed waits also carry a top-level adapter summary for run-list
+  // diagnostics. Do not let that compatibility field leak back into the
+  // issue thread as an artificial "Waiting for …" assistant reply. Explicit
+  // comments, provider final messages, and marked adapter finals above retain
+  // their normal precedence.
+  if (hasYieldedSemanticResult(resultJson)) {
+    return {
+      text: null,
+      decision: decision("none", {
+        commentAction: "none",
+        reasonCodes: ["yielded_control_plane_wait"],
       }),
     };
   }

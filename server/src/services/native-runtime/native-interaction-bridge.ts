@@ -129,8 +129,6 @@ export async function applyNativeAttentionStatusDecision(input: {
         )).returning({ runId: nativeRunFinalizations.runId });
         if (!coordinator) throw new NativeInteractionBridgeError("native_finalization_coordinator_missing", "Native coordinator is required");
         await tx.update(heartbeatRuns).set({
-          status: "failed",
-          finishedAt: new Date(),
           nativePhase: "terminal_failure",
           nativePhaseUpdatedAt: new Date(),
           errorCode: effect.cause,
@@ -225,21 +223,22 @@ export async function materializeNativeInteractionResponses(input: {
         `Run ${input.runId} cannot consume a response it resolved itself`,
       );
     }
-    if (!interaction.resolvedByUserId && !interaction.resolvedByAgentId) {
+    const hasInteractionResolver = Boolean(interaction.resolvedByUserId || interaction.resolvedByAgentId);
+    if (interaction.kind !== "request_item_verdicts" && !hasInteractionResolver) {
       throw new NativeInteractionBridgeError(
         "native_interaction_unresolved",
         `Interaction ${interaction.id} has no authorized resolver`,
       );
     }
 
-    if (interaction.kind === "request_confirmation") {
+    if (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation") {
       if (interaction.resolvedByAgentId === input.agentId) {
         throw new NativeInteractionBridgeError(
           "native_interaction_self_approval",
           `Agent ${input.agentId} cannot consume a confirmation it resolved`,
         );
       }
-      if (interaction.payload.toolAction !== undefined) {
+      if (interaction.kind === "request_confirmation" && interaction.payload.toolAction !== undefined) {
         throw new NativeInteractionBridgeError(
           "native_interaction_governed_request_unsupported",
           "Governed tool-action confirmations cannot enter a native model envelope",
@@ -267,6 +266,27 @@ export async function materializeNativeInteractionResponses(input: {
       });
       if (resolution.reasonCode !== "attention_resolved_from_context") {
         throw new NativeInteractionBridgeError("native_attention_resolution_invalid", "Resolved interaction has no continuation policy");
+      }
+      responses.push({
+        interactionId: interaction.id,
+        kind: interaction.kind,
+        response: {
+          status: interaction.status,
+          result: structuredClone(interaction.result) as unknown as Record<string, unknown>,
+        },
+      });
+      continue;
+    }
+
+    if (interaction.kind === "suggest_tasks") {
+      if (
+        (interaction.status !== "accepted" && interaction.status !== "rejected")
+        || !interaction.result
+      ) {
+        throw new NativeInteractionBridgeError(
+          "native_interaction_unresolved",
+          `Suggested-task interaction ${interaction.id} is not authoritatively resolved`,
+        );
       }
       responses.push({
         interactionId: interaction.id,
@@ -310,9 +330,46 @@ export async function materializeNativeInteractionResponses(input: {
       continue;
     }
 
+    if (interaction.kind === "request_item_verdicts") {
+      const result = record(interaction.result);
+      const items = Array.isArray(result.items) ? result.items.map(record) : [];
+      const complete = result.complete === true;
+      const hasAuthorizedItemResolver = items.some((item) =>
+        typeof item.resolvedByUserId === "string"
+        || (typeof item.resolvedByAgentId === "string" && item.resolvedByAgentId !== input.agentId));
+      const hasSelfResolvedItem = items.some((item) => item.resolvedByAgentId === input.agentId);
+      if (hasSelfResolvedItem) {
+        throw new NativeInteractionBridgeError(
+          "native_interaction_self_approval",
+          `Agent ${input.agentId} cannot consume item verdicts it resolved`,
+        );
+      }
+      if (
+        !interaction.result
+        || (interaction.status !== "pending" && interaction.status !== "answered")
+        || (interaction.status === "answered" && !complete)
+        || items.length === 0
+        || !hasAuthorizedItemResolver
+      ) {
+        throw new NativeInteractionBridgeError(
+          "native_interaction_unresolved",
+          `Item-verdict interaction ${interaction.id} has no authoritative response`,
+        );
+      }
+      responses.push({
+        interactionId: interaction.id,
+        kind: interaction.kind,
+        response: {
+          status: interaction.status,
+          result: structuredClone(interaction.result) as unknown as Record<string, unknown>,
+        },
+      });
+      continue;
+    }
+
     throw new NativeInteractionBridgeError(
       "native_runtime_request_unsupported",
-      `Interaction kind ${interaction.kind} is not supported by the native input contract`,
+      "Interaction kind is not supported by the native input contract",
     );
   }
 
@@ -541,6 +598,7 @@ export async function routePersistedNativeResultAttention(input: {
     const coordinator = await input.db.select({
       phase: nativeRunFinalizations.phase,
       assessmentId: nativeRunFinalizations.assessmentId,
+      decisionId: nativeRunFinalizations.decisionId,
     }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, input.runId))
       .limit(1).then((rows) => rows[0] ?? null);
     if (!coordinator) throw new NativeInteractionBridgeError("native_attention_binding_mismatch", "Coordinator binding not found");
@@ -564,7 +622,9 @@ export async function routePersistedNativeResultAttention(input: {
       db: input.db,
       runId: input.runId,
       assessmentId: assessment.id,
-      allowSupersedingCommittedDecision: coordinator.phase === "committed",
+      supersedesCommittedDecisionId: coordinator.phase === "committed"
+        ? coordinator.decisionId ?? undefined
+        : undefined,
       candidate,
     });
     receipts.push({
@@ -606,7 +666,7 @@ export async function routeNativeAttention(input: {
   db: Db;
   runId: string;
   assessmentId?: string;
-  allowSupersedingCommittedDecision?: boolean;
+  supersedesCommittedDecisionId?: string;
   candidate: NativeAttentionCandidate;
 }) {
   const binding = await input.db.select({
@@ -706,7 +766,7 @@ export async function routeNativeAttention(input: {
     priorStatusVersion: Number(binding.issueStatusVersion),
     priorDecisionId: binding.issueDecisionId,
     decision,
-    allowSupersedingCommittedDecision: input.allowSupersedingCommittedDecision,
+    supersedesCommittedDecisionId: input.supersedesCommittedDecisionId,
   });
   return {
     decision,

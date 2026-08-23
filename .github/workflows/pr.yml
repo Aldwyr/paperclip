@@ -230,11 +230,56 @@ jobs:
             pnpm test:run:general -- --group '${{ matrix.group }}'
           fi
 
+  runner_workflow_evals:
+    name: Runner workflow evals
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Restore regenerated PR lockfile (if policy uploaded one)
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: pr-lockfile
+          path: .
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run deterministic Runner workflow gate
+        run: |
+          pnpm test:runner-workflow-evals
+          pnpm report:runner-workflow-evals
+
+      - name: Upload Runner workflow report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-workflow-evals
+          path: packages/paperclip-runner/.paperclip-local/evals/workflows/
+          retention-days: 30
+          if-no-files-found: error
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, runner_workflow_evals, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -243,10 +288,12 @@ jobs:
         env:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
+          RUNNER_WORKFLOW_EVALS_RESULT: ${{ needs.runner_workflow_evals.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
+          test "$RUNNER_WORKFLOW_EVALS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
 
   build:

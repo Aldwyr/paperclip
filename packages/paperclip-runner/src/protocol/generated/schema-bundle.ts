@@ -2302,11 +2302,340 @@ export const terminalSchema = {
   "additionalProperties": true
 } as const;
 
+export const questionSetSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/question-set.schema.json",
+  "title": "Paperclip question set",
+  "type": "object",
+  "required": [
+    "schema",
+    "questions"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.question_set.v1"
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "submitLabel": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "questions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "$ref": "#/$defs/question"
+      }
+    }
+  },
+  "$defs": {
+    "option": {
+      "type": "object",
+      "required": [
+        "id",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4000
+        }
+      },
+      "additionalProperties": false
+    },
+    "customAnswer": {
+      "type": "object",
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "placeholder": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      },
+      "additionalProperties": false
+    },
+    "textValidation": {
+      "type": "object",
+      "properties": {
+        "minLength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "pattern": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "inputType": {
+          "enum": [
+            "text",
+            "number",
+            "integer"
+          ]
+        },
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false
+    },
+    "question": {
+      "type": "object",
+      "required": [
+        "id",
+        "prompt",
+        "required",
+        "answerMode"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "header": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "helpText": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "answerMode": {
+          "enum": [
+            "single_select",
+            "multi_select",
+            "text"
+          ]
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/option"
+          }
+        },
+        "customAnswer": {
+          "$ref": "#/$defs/customAnswer"
+        },
+        "textValidation": {
+          "$ref": "#/$defs/textValidation"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+} as const;
+
+export const questionResponseSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/question-response.schema.json",
+  "title": "Paperclip question response",
+  "type": "object",
+  "required": [
+    "schema",
+    "answers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.question_response.v1"
+    },
+    "answers": {
+      "type": "object",
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 160
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "selectedOptionIds": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "customText": {
+            "type": "string",
+            "maxLength": 100000
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+} as const;
+
+export const questionAdapterFixtureSchema = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.dev/schemas/prp/v1/question-adapter-fixture.schema.json",
+  "title": "Harness question adapter conformance fixture",
+  "type": "object",
+  "required": [
+    "schema",
+    "adapter",
+    "nativeRequest",
+    "canonicalQuestionSet",
+    "canonicalResponse",
+    "nativeResponse"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.question_adapter_fixture.v1"
+    },
+    "adapter": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "nativeRequest": {},
+    "canonicalQuestionSet": {
+      "$ref": "https://paperclip.dev/schemas/prp/v1/question-set.schema.json"
+    },
+    "canonicalResponse": {
+      "$ref": "https://paperclip.dev/schemas/prp/v1/question-response.schema.json"
+    },
+    "nativeResponse": {}
+  },
+  "additionalProperties": false
+} as const;
+
 export const requestSchema = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://paperclip.dev/schemas/prp/v1/request.schema.json",
   "title": "PRP request",
   "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "schema",
+        "requestKind",
+        "requestId",
+        "type",
+        "status",
+        "prompt",
+        "input"
+      ],
+      "properties": {
+        "schema": {
+          "const": "paperclip.runtime_request.v2"
+        },
+        "requestKind": {
+          "const": "runtime"
+        },
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "type": {
+          "const": "input"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "resolved",
+            "expired",
+            "cancelled"
+          ]
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "input": {
+          "$ref": "https://paperclip.dev/schemas/prp/v1/question-set.schema.json"
+        },
+        "origin": {
+          "type": "object",
+          "required": [
+            "adapter"
+          ],
+          "properties": {
+            "adapter": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "method": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          },
+          "additionalProperties": false
+        },
+        "turnId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "itemId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      },
+      "additionalProperties": false
+    },
     {
       "type": "object",
       "required": [
@@ -2529,6 +2858,7 @@ export const resultSchema = {
     },
     "verification": {
       "type": "array",
+      "description": "Checks used to verify the work. Use failed only when the check actually ran and found a defect in the work. If a check could not run or complete because the environment, tool, dependency, permission, credential, policy, external service, or budget was unavailable, use not_run with reasonCode even when the attempted command exited non-zero.",
       "items": {
         "type": "object",
         "required": [
@@ -2545,6 +2875,21 @@ export const resultSchema = {
               "passed",
               "failed",
               "not_run"
+            ],
+            "description": "passed means the check ran and succeeded; failed means it ran to a meaningful verdict and found the work incorrect; not_run means no meaningful verdict was possible because the check was not attempted or could not complete."
+          },
+          "reasonCode": {
+            "description": "Required for not_run; identify why the check had no meaningful verdict.",
+            "enum": [
+              "environment_unavailable",
+              "tool_unavailable",
+              "dependency_missing",
+              "permission_denied",
+              "credential_missing",
+              "policy_restricted",
+              "external_service_unavailable",
+              "budget_exhausted",
+              "other"
             ]
           },
           "detail": {
@@ -2590,7 +2935,29 @@ export const resultSchema = {
     "attentionRequests": {
       "type": "array",
       "items": {
-        "type": "object"
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "minLength": 1
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ownerClass": {
+            "enum": [
+              "human",
+              "agent",
+              "external_system"
+            ]
+          },
+          "targetAgentId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": true
       }
     },
     "artifacts": {
@@ -3424,6 +3791,9 @@ export const prpSchemaBundle = {
   "usage": usageSchema,
   "stop-reason": stopReasonSchema,
   "terminal": terminalSchema,
+  "question-set": questionSetSchema,
+  "question-response": questionResponseSchema,
+  "question-adapter-fixture": questionAdapterFixtureSchema,
   "request": requestSchema,
   "result": resultSchema,
   "event": eventSchema,

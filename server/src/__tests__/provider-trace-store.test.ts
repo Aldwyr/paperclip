@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import {
   assessProviderTraceEntries,
+  providerTraceRequiredChannels,
   redactProviderTraceFrame,
 } from "../services/provider-trace-store.js";
 
@@ -64,6 +65,15 @@ describe("provider trace redaction", () => {
 });
 
 describe("provider trace channel integrity", () => {
+  it("requires each provider's actual native transport topology", () => {
+    expect(providerTraceRequiredChannels("codex")).toEqual([
+      "rust_native",
+      "typescript_runnerd_rehydration",
+    ]);
+    expect(providerTraceRequiredChannels("opencode")).toEqual(["typescript_opencode_native"]);
+    expect(providerTraceRequiredChannels("acpx")).toEqual(["typescript_acpx_native"]);
+  });
+
   function completeChannel(channel: string, raw = Buffer.from("{}")) {
     return [
       {

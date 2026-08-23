@@ -1,5 +1,6 @@
 import { useId, useRef, useState, type ComponentType, type SVGProps } from "react";
-import { Check, ChevronRight, OctagonX, X } from "lucide-react";
+import type { IssueDocument } from "@paperclipai/shared";
+import { Brain, Check, ChevronRight, OctagonX, X } from "lucide-react";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { useSecondTick } from "@/hooks/useSecondTick";
 import { cn } from "@/lib/utils";
@@ -8,6 +9,7 @@ import type {
   TaskChatMessageItem,
   TaskChatMarkerItem,
   TaskChatProtocolItem,
+  TaskChatProviderActivityItem,
   TaskChatRuntimeRequestDecision,
   TaskChatRuntimeRequestItem,
   TaskChatThinkingItem,
@@ -16,6 +18,7 @@ import type {
 import { TaskChatAgentIdentity } from "./TaskChatBubble";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
+import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import {
@@ -39,6 +42,148 @@ function lastOf<T extends TaskChatItem>(items: readonly TaskChatItem[], predicat
 
 function isHeadlineProtocolActivity(item: TaskChatItem): item is TaskChatProtocolItem {
   return item.kind === "protocol" && protocolActivityPresentation(item) !== null;
+}
+
+function latestPlanActivity(items: readonly TaskChatItem[]): TaskChatProviderActivityItem | undefined {
+  let latest: TaskChatProviderActivityItem | undefined;
+  let latestOrder = -1;
+  for (const [index, item] of items.entries()) {
+    if (item.kind !== "protocol" || item.surface !== "provider_activity" || item.family !== "plan") continue;
+    const order = item.transcriptIndex ?? index;
+    if (order >= latestOrder) {
+      latest = item;
+      latestOrder = order;
+    }
+  }
+  return latest;
+}
+
+function providerPlanRevision(activity: TaskChatProviderActivityItem): number | null {
+  const detail = activity.details.find(({ label }) =>
+    label === "Revision" || label === "Document Revision",
+  );
+  if (!detail) return null;
+  const revision = Number.parseInt(detail.value, 10);
+  return Number.isFinite(revision) ? revision : null;
+}
+
+type FoldedNarration =
+  | { kind: "commentary"; item: TaskChatMessageItem; order: number }
+  | {
+      kind: "reasoning";
+      item: TaskChatThinkingItem;
+      line: string | null;
+      lineIndex: number;
+      order: number;
+    };
+
+function latestFoldedNarration(items: readonly TaskChatItem[]): FoldedNarration | null {
+  let latest: FoldedNarration | null = null;
+  for (const [index, item] of items.entries()) {
+    const order = item.kind === "message" || item.kind === "thinking"
+      ? item.transcriptIndex ?? index
+      : -1;
+    if (item.kind === "message" && item.interstitial && item.text.trim()) {
+      if (!latest || order >= latest.order) latest = { kind: "commentary", item, order };
+      continue;
+    }
+    if (item.kind !== "thinking") continue;
+    let lineIndex = -1;
+    for (let candidate = item.lines.length - 1; candidate >= 0; candidate -= 1) {
+      if (item.lines[candidate]?.trim()) {
+        lineIndex = candidate;
+        break;
+      }
+    }
+    if (!latest || order >= latest.order) {
+      latest = {
+        kind: "reasoning",
+        item,
+        line: lineIndex < 0 ? null : item.lines[lineIndex]!.trim(),
+        lineIndex,
+        order,
+      };
+    }
+  }
+  return latest;
+}
+
+function FoldedReasoningTicker({
+  logicalKey,
+  text,
+}: {
+  logicalKey: string;
+  text: string;
+}) {
+  const [ticker, setTicker] = useState({
+    logicalKey,
+    motionKey: 0,
+    current: text,
+    exiting: null as string | null,
+  });
+  if (ticker.logicalKey !== logicalKey) {
+    setTicker({
+      logicalKey,
+      motionKey: ticker.motionKey + 1,
+      current: text,
+      exiting: ticker.current,
+    });
+  } else if (ticker.current !== text) {
+    // Token fragments update the mounted line. Only the logical key advances
+    // the slide motion (a newline or a new reasoning block).
+    setTicker({ ...ticker, current: text });
+  }
+
+  return (
+    <div className="flex min-w-0 gap-2 px-1 py-1.5" data-testid="task-chat-reasoning-ticker">
+      <div className="flex shrink-0 items-center">
+        <Brain className="h-3.5 w-3.5 text-muted-foreground/50" aria-hidden />
+      </div>
+      <div className="relative h-5 min-w-0 flex-1 overflow-hidden">
+        {ticker.exiting !== null ? (
+          <span
+            key={`out-${ticker.motionKey}`}
+            className="cot-line-exit absolute inset-x-0 truncate text-(length:--text-compact) italic leading-5 text-muted-foreground"
+            onAnimationEnd={() => setTicker((current) => ({ ...current, exiting: null }))}
+          >
+            {ticker.exiting}
+          </span>
+        ) : null}
+        <span
+          key={`in-${ticker.motionKey}`}
+          className={cn(
+            "absolute inset-x-0 truncate text-(length:--text-compact) italic leading-5 text-muted-foreground",
+            ticker.motionKey > 0 && "cot-line-enter",
+          )}
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {ticker.current}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function FoldedLiveNarration({ narration }: { narration: FoldedNarration }) {
+  if (narration.kind === "reasoning") {
+    if (!narration.line) return null;
+    return (
+      <FoldedReasoningTicker
+        logicalKey={`${narration.item.id}:${narration.lineIndex}`}
+        text={narration.line}
+      />
+    );
+  }
+  return (
+    <div
+      key={narration.item.id}
+      className="tc-enter-cot-line min-w-0 px-1 py-1.5 text-sm text-foreground/90"
+      data-testid="task-chat-progress-update"
+    >
+      <MarkdownBody softBreaks linkIssueReferences>{narration.item.text}</MarkdownBody>
+    </div>
+  );
 }
 
 function formatCompactDuration(ms: number | null): string | null {
@@ -216,6 +361,7 @@ export function TaskChatRunnerTurn({
   status,
   startedAtMs,
   finishedAtMs,
+  planDocument,
   onRuntimeRequestDecision,
 }: {
   /** Stable identity used to clear replay-latched final text for the next turn. */
@@ -226,6 +372,8 @@ export function TaskChatRunnerTurn({
   status: string;
   startedAtMs: number | null;
   finishedAtMs?: number | null;
+  /** Current canonical Plan revision, used to replace a streamed provider draft. */
+  planDocument?: IssueDocument | null;
   onRuntimeRequestDecision?: (
     item: TaskChatRuntimeRequestItem,
     decision: TaskChatRuntimeRequestDecision,
@@ -245,7 +393,15 @@ export function TaskChatRunnerTurn({
       && item.surface === "runtime_request"
       && item.status === "pending",
   );
-  const progress = lastOf<TaskChatMessageItem>(activityItems, (item): item is TaskChatMessageItem => item.kind === "message");
+  const narration = latestFoldedNarration(items);
+  const livePlan = latestPlanActivity(activityItems);
+  const livePlanRevision = livePlan ? providerPlanRevision(livePlan) : null;
+  const canonicalPlanUpdatedDuringRun = Boolean(
+    planDocument
+    && startedAtMs != null
+    && new Date(planDocument.updatedAt).getTime() >= startedAtMs
+    && (livePlanRevision == null || planDocument.latestRevisionNumber >= livePlanRevision),
+  );
   const observedFinal = lastOf<TaskChatMessageItem>(items, (item): item is TaskChatMessageItem => item.kind === "message" && item.channel === "final");
   // A reconnect/replay can briefly rebuild the transcript without the final
   // item (or with an earlier, shorter prefix). Once durable answer text is on
@@ -264,11 +420,14 @@ export function TaskChatRunnerTurn({
           <TaskChatAgentIdentity agentName={agentName} agentIcon={agentIcon} />
         </div>
       ) : null}
-      {!open && progress && !final && !terminal ? (
-        <div className="flex min-w-0 flex-col py-1">
-          <div className="tc-enter-cot-line min-w-0 px-1 py-1.5 text-sm text-foreground/90" data-testid="task-chat-progress-update">
-            <MarkdownBody softBreaks linkIssueReferences>{progress.text}</MarkdownBody>
-          </div>
+      {!open && !terminal && livePlan && !canonicalPlanUpdatedDuringRun ? (
+        <div className="py-1" data-testid="task-chat-live-plan-preview">
+          <TaskChatPlanPreviewCard source={{ kind: "live", activity: livePlan }} />
+        </div>
+      ) : null}
+      {!open && narration && !final && !terminal ? (
+        <div className="flex min-w-0 flex-col py-1" data-testid="task-chat-live-narration">
+          <FoldedLiveNarration narration={narration} />
         </div>
       ) : null}
       <RunnerActivityDisclosure
@@ -280,7 +439,13 @@ export function TaskChatRunnerTurn({
         onToggle={() => setDisclosure((current) => ({ ...current, open: !current.open }))}
         controlsId={controlsId}
       />
-      <div id={controlsId} className="tc-turn-fold" data-folded={open ? "false" : "true"} aria-hidden={!open}>
+      <div
+        id={controlsId}
+        className="tc-turn-fold"
+        data-folded={open ? "false" : "true"}
+        aria-hidden={!open}
+        inert={open ? undefined : true}
+      >
         <div>
           <div className="py-1">
             <RunnerActivityTimeline items={activityItems} />

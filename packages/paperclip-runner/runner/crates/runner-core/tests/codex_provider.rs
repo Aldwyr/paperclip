@@ -29,6 +29,8 @@ fn codex_plan_mode_is_qualified_and_selected_on_turn_start() {
             instructions: "Author a plan without editing files.".to_owned(),
             collaboration_mode: "plan".to_owned(),
             include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
         },
         vec![test_tool()].into_iter(),
         None,
@@ -50,6 +52,8 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -116,6 +120,74 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
 }
 
 #[test]
+fn dot_185_runtime_question_round_trips_through_the_rust_provider_boundary() {
+    let mut provider = CodexProvider::start(
+        &LocalProviderConfig {
+            kind: ProviderKind::Codex,
+            command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
+            args: vec!["--runtime-question".to_owned()],
+            cwd: "/tmp".to_owned(),
+            model: None,
+            instructions: "Ask for deployment input.".to_owned(),
+            collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
+        },
+        vec![test_tool()].into_iter(),
+        None,
+    )
+    .unwrap();
+    provider
+        .start_turn("Ask the deployment questions.", "/tmp")
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "fake Codex did not request runtime input"
+        );
+        if let Some(ProviderEvent::RuntimeRequest { request }) = provider.poll().unwrap() {
+            assert_eq!(request["schema"], "paperclip.runtime_request.v2");
+            assert_eq!(request["requestKind"], "runtime");
+            assert_eq!(request["type"], "input");
+            assert_eq!(request["input"]["questions"].as_array().unwrap().len(), 3);
+            Provider::resolve_runtime_request(
+                &mut provider,
+                "rpc-question-1",
+                "paperclip-turn",
+                &json!({
+                    "action": "submit",
+                    "response": {
+                        "schema": "paperclip.question_response.v1",
+                        "answers": {
+                            "environment": {"selectedOptionIds": ["option-1"]},
+                            "regions": {"selectedOptionIds": ["option-1", "option-2"]},
+                            "notes": {"text": "Ship during the maintenance window."}
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            break;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "fake Codex did not finish after input"
+        );
+        if let Some(ProviderEvent::Notification { method, .. }) = provider.poll().unwrap() {
+            if method == "turn/completed" {
+                break;
+            }
+        }
+    }
+    provider.shutdown().unwrap();
+}
+
+#[test]
 fn provider_contract_preserves_the_opencode_tag() {
     let mut provider = CodexProvider::start(
         &LocalProviderConfig {
@@ -127,6 +199,8 @@ fn provider_contract_preserves_the_opencode_tag() {
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: false,
+            include_skill_instructions: false,
+            runtime_context: None,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -155,6 +229,8 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),
@@ -215,6 +291,8 @@ fn codex_provider_rejects_an_event_above_the_four_megabyte_hard_limit() {
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
         },
         vec![AuthorizedTool {
             operation_id: "get_task_context".to_owned(),

@@ -27,6 +27,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -1065,7 +1066,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           eq(issueThreadInteractions.companyId, companyId),
           eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "accepted"),
+          inArray(issueThreadInteractions.status, ["accepted", "answered"]),
           inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
         ),
       )
@@ -4162,6 +4163,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      // A board-owned recovery action is already the durable, human-owned
+      // continuation path. Generic stranded-work recovery must not race that
+      // authority by launching another provider turn (most importantly after
+      // bounded native-session recovery has reached terminal exhaustion).
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+        issue.companyId,
+        issue.id,
+      );
+      if (activeRecoveryAction?.ownerType === "board") {
+        result.skipped += 1;
+        continue;
+      }
+
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
         result.skipped += 1;
         continue;
@@ -6120,6 +6134,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           (typeof pid === "number" && isPidAlive(pid)) ||
           (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
         processGone = !processAlive;
+      }
+    }
+
+    // A result-less native run may intentionally have no live provider process
+    // while the native finalization coordinator waits to resume the same
+    // provider session. That coordinator, rather than this generic
+    // process-death backstop, owns retryable/resumed attempts. Preserve issue
+    // terminality as the stronger authority, but never interrupt coordinator-
+    // owned recovery merely because the provider process has exited.
+    if (!issueTerminalStatus && processGone && run.runtimeMode === "native") {
+      const coordinator = await db
+        .select({
+          phase: nativeRunFinalizations.phase,
+          resultId: nativeRunFinalizations.resultId,
+          attempt: nativeRunFinalizations.attempt,
+        })
+        .from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, run.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const nativeResumeOwnsRun = coordinator?.resultId === null && (
+        coordinator.phase === "retryable_failure"
+        || (coordinator.phase === "observed" && coordinator.attempt > 0)
+      );
+      if (nativeResumeOwnsRun) {
+        return { terminalized: false, status: run.status };
       }
     }
 

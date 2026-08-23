@@ -2,12 +2,19 @@ import { and, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   approvals,
+  agents,
   heartbeatRunEvents,
   issueApprovals,
   issueAttachments,
   issueThreadInteractions,
   issueWorkProducts,
 } from "@paperclipai/db";
+import {
+  normalizePrpResultSignals,
+  type PrpIgnoredAttentionRequest,
+  type PrpNormalizedAttentionRequest,
+  type PrpVerificationReasonCode,
+} from "@paperclipai/paperclip-runner";
 
 export type NativeEvidenceOutcome = "accepted" | "missing" | "rejected" | "unverifiable";
 
@@ -20,9 +27,11 @@ export interface NativeEvidenceRefAssessment {
 }
 
 export interface NativeEvidenceAssessment {
+  objectiveClaimSatisfied: boolean;
   objectiveSatisfied: boolean;
   allCriteriaSatisfied: boolean;
   verificationPassed: boolean;
+  hasFailedVerification: boolean;
   hasBlockingRemainingWork: boolean;
   reportedDisposition: "done" | "blocked" | "needs_review" | "yielded";
   summary: string;
@@ -40,6 +49,13 @@ export interface NativeEvidenceAssessment {
     outcome: NativeEvidenceOutcome;
     evidenceRef: NativeEvidenceRefAssessment | null;
     reasonCode: string;
+    reportedReasonCode: PrpVerificationReasonCode | null;
+    detail: string | null;
+  }>;
+  verificationCaveats: Array<{
+    commandOrCheck: string;
+    reasonCode: PrpVerificationReasonCode | null;
+    detail: string | null;
   }>;
   acceptedEvidenceRefs: string[];
   missingRequirements: string[];
@@ -55,7 +71,9 @@ export interface NativeEvidenceAssessment {
     summary: string;
     idempotencyKey: string;
   } | null;
-  attentionRequests: Record<string, unknown>[];
+  /** Actionable, blocking requests only. */
+  attentionRequests: PrpNormalizedAttentionRequest[];
+  ignoredAttentionRequests: PrpIgnoredAttentionRequest[];
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -70,7 +88,14 @@ function text(value: unknown): string | null {
 
 function uuidRef(ref: string, prefixes: string[]): string | null {
   for (const prefix of prefixes) {
-    if (ref.startsWith(`${prefix}:`)) return text(ref.slice(prefix.length + 1));
+    if (!ref.startsWith(`${prefix}:`)) continue;
+    const value = ref.slice(prefix.length + 1).trim();
+    // Model-authored evidence often annotates a durable reference, for example
+    // `interaction:<uuid> (request_confirmation, status accepted)`. Extract the
+    // canonical UUID only; never pass the descriptive suffix (or arbitrary
+    // malformed text) to a Postgres UUID comparison.
+    const match = /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?=$|[^0-9a-f-])/i.exec(value);
+    return match?.[1] ?? null;
   }
   return null;
 }
@@ -221,7 +246,8 @@ export async function classifyNativeEvidence(input: {
   const claimedCriteria = Array.isArray(claim.criteria) ? claim.criteria.map(record) : [];
   const contractCriteria = Array.isArray(input.contract.criteria) ? input.contract.criteria.map(record) : [];
   const remaining = Array.isArray(claim.remainingWork) ? claim.remainingWork.map(record) : [];
-  const verification = Array.isArray(input.result.verification) ? input.result.verification.map(record) : [];
+  const normalizedSignals = normalizePrpResultSignals(input.result);
+  const verification = normalizedSignals.verification;
   const reported = input.result.reportedWorkDisposition;
   const blocker = record(input.result.blocker);
   const blockerOwner = record(blocker.owner);
@@ -285,21 +311,18 @@ export async function classifyNativeEvidence(input: {
     return { criterionId, claimStatus, outcome, evidenceRefs, reasonCode };
   }));
 
-  const verificationAssessments = await Promise.all(verification.map(async (entry, index) => {
-    const commandOrCheck = text(entry.commandOrCheck) ?? `verification-${index + 1}`;
-    const claimStatus = ["passed", "failed", "not_run"].includes(String(entry.status))
-      ? entry.status as "passed" | "failed" | "not_run"
-      : "not_run";
-    const ref = text(entry.artifactRef);
+  const verificationAssessments = await Promise.all(verification.map(async (entry) => {
+    const commandOrCheck = entry.commandOrCheck;
+    const claimStatus = entry.status;
+    const ref = entry.artifactRef;
     const evidenceRef = ref ? await resolveRef(ref) : null;
-    if (claimStatus === "failed") return { commandOrCheck, claimStatus, outcome: "rejected" as const, evidenceRef, reasonCode: "verification_reported_failed" };
-    if (claimStatus === "not_run") return { commandOrCheck, claimStatus, outcome: "missing" as const, evidenceRef, reasonCode: "verification_not_run" };
-    if (!evidenceRef) return { commandOrCheck, claimStatus, outcome: "unverifiable" as const, evidenceRef, reasonCode: "verification_has_no_durable_reference" };
+    const common = { commandOrCheck, claimStatus, evidenceRef, reportedReasonCode: entry.reasonCode, detail: entry.detail };
+    if (claimStatus === "failed") return { ...common, outcome: "rejected" as const, reasonCode: "verification_reported_failed" };
+    if (claimStatus === "not_run") return { ...common, outcome: "missing" as const, reasonCode: "verification_not_run" };
+    if (!evidenceRef) return { ...common, outcome: "unverifiable" as const, reasonCode: "verification_has_no_durable_reference" };
     return {
-      commandOrCheck,
-      claimStatus,
+      ...common,
       outcome: evidenceRef.outcome,
-      evidenceRef,
       reasonCode: evidenceRef.outcome === "accepted" ? "verification_evidence_accepted" : evidenceRef.reasonCode,
     };
   }));
@@ -315,18 +338,51 @@ export async function classifyNativeEvidence(input: {
   const unverifiableEvidence = resolvedRefs.filter((entry) => entry.outcome === "unverifiable").map((entry) => ({ ref: entry.ref, reasonCode: entry.reasonCode }));
   const allCriteriaSatisfied = contractCriteria.length > 0 && criterionAssessments.every((entry) => entry.outcome === "accepted");
   const verificationPassed = verificationAssessments.length > 0 && verificationAssessments.every((entry) => entry.outcome === "accepted");
+  const hasFailedVerification = verificationAssessments.some((entry) => entry.claimStatus === "failed");
   const continuationKind = continuation.kind;
+  const actionableAttentionRequests: PrpNormalizedAttentionRequest[] = [];
+  const ignoredAttentionRequests = [...normalizedSignals.ignoredAttentionRequests];
+  for (const request of normalizedSignals.actionableAttentionRequests) {
+    if (request.ownerClass === "agent" && request.targetAgentId) {
+      const targetExists = await input.db.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, request.targetAgentId),
+        eq(agents.companyId, input.companyId),
+      )).limit(1).then((rows) => rows.length > 0);
+      if (!targetExists) {
+        ignoredAttentionRequests.push({
+          sourceIndex: request.sourceIndex,
+          sourceKind: request.sourceKind,
+          summary: request.summary,
+          disposition: "rejected",
+          reasonCode: "attention_request_target_agent_unavailable",
+        });
+        continue;
+      }
+    }
+    actionableAttentionRequests.push(request);
+  }
 
   return {
+    objectiveClaimSatisfied: claim.objectiveSatisfied === true,
     objectiveSatisfied: claim.objectiveSatisfied === true && allCriteriaSatisfied,
     allCriteriaSatisfied,
     verificationPassed,
-    hasBlockingRemainingWork: remaining.some((entry) => entry.blocksCompletion === true),
+    hasFailedVerification,
+    hasBlockingRemainingWork:
+      remaining.some((entry) => entry.blocksCompletion === true)
+      || (reported === "done" && Object.keys(blocker).length > 0),
     reportedDisposition: reported as NativeEvidenceAssessment["reportedDisposition"],
     summary: typeof input.result.summary === "string" ? input.result.summary : "Native run completed.",
     contractRevisionMatches,
     criterionAssessments,
     verificationAssessments,
+    verificationCaveats: verificationAssessments
+      .filter((entry) => entry.claimStatus === "not_run")
+      .map((entry) => ({
+        commandOrCheck: entry.commandOrCheck,
+        reasonCode: entry.reportedReasonCode,
+        detail: entry.detail,
+      })),
     acceptedEvidenceRefs,
     missingRequirements,
     rejectedEvidence,
@@ -348,8 +404,7 @@ export async function classifyNativeEvidence(input: {
           idempotencyKey: text(continuation.idempotencyKey)!,
         }
       : null,
-    attentionRequests: Array.isArray(input.result.attentionRequests)
-      ? input.result.attentionRequests.map(record)
-      : [],
+    attentionRequests: actionableAttentionRequests,
+    ignoredAttentionRequests,
   };
 }

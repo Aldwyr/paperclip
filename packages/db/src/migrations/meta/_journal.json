@@ -1604,6 +1604,13 @@
       "when": 1787416987133,
       "tag": "0230_pink_longshot",
       "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "version": "7",
+      "when": 1787433588265,
+      "tag": "0231_pretty_meteorite",
+      "breakpoints": true
     }
   ]
 }

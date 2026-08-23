@@ -24,7 +24,7 @@ function required(value: unknown, label: string): string {
 
 function validateConfiguration(service: RemoteAgentService, configuration: Record<string, unknown>) {
   const keys = service === "aws_bedrock_agentcore_harness"
-    ? ["region", "accountId", "harnessArn", "harnessVersion", "endpointArn", "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn", "qualificationRevision", "defaultModel"]
+    ? ["region", "accountId", "harnessArn", "harnessVersion", "endpointArn", "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn", "contextBucket", "contextPrefix", "contextKmsKeyArn", "qualificationRevision", "defaultModel"]
     : ["anthropicAgentId", "agentVersion", "environmentId", "betaVersion", "defaultModel"];
   for (const key of keys) required(configuration[key], `configuration.${key}`);
   if (service === "aws_bedrock_agentcore_harness" && configuration.eventExpiryDays !== 90) {

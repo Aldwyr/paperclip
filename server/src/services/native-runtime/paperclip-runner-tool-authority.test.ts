@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { activityLog, agents, companies, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { documentService } from "../documents.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("PaperclipRunnerToolAuthority", () => {
@@ -64,6 +65,17 @@ describe("PaperclipRunnerToolAuthority", () => {
       .resolves.toMatchObject({ activeTask: { id: issueId, identifier: "RNT-1" }, actor: { id: agentId } });
     await expect(authority.execute({ tool: "finish_task", callId: "hidden", arguments: {} }))
       .rejects.toThrow("paperclip_runner_tool_not_advertised");
+  });
+
+  it("advertises structured human input in ask mode", () => {
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      workMode: "ask",
+    });
+    expect(authority.definitions().map((tool) => tool.name)).toContain("request_human_input");
   });
 
   it("writes progress through the real issue service and replays idempotently", async () => {
@@ -136,7 +148,9 @@ describe("PaperclipRunnerToolAuthority", () => {
         key: "plan",
         title: "Execution plan",
         body: "Use the real document service.",
-        baseRevisionId: null,
+        // OpenCode serializes nullable string inputs as the literal "null".
+        // The protocol boundary must treat that as document creation.
+        baseRevisionId: "null",
         changeSummary: "Initial plan",
       },
     };
@@ -149,10 +163,148 @@ describe("PaperclipRunnerToolAuthority", () => {
       document: { key: "plan", body: "Use the real document service." },
     });
     expect(await db.select().from(documents).where(eq(documents.companyId, companyId))).toHaveLength(1);
+    const documentActivity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(documentActivity.filter((entry) => entry.action === "issue.document_created")).toEqual([
+      expect.objectContaining({
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId,
+        entityType: "issue",
+        details: expect.objectContaining({
+          key: "plan",
+          source: "paperclip_runner_protocol",
+        }),
+      }),
+    ]);
     await expect(authority.execute({
       ...call,
       arguments: { ...call.arguments, body: "Conflicting retry." },
     })).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+  });
+
+  it("creates and wakes one durable implementation child after plan acceptance", async () => {
+    const planningIssueId = "00000000-0000-4000-8000-000000000105";
+    const planningRunId = "00000000-0000-4000-8000-000000000106";
+    await db.insert(issues).values({
+      id: planningIssueId,
+      companyId,
+      issueNumber: 2,
+      identifier: "RNT-2",
+      title: "Plan then implement",
+      status: "in_progress",
+      workMode: "planning",
+      assigneeAgentId: agentId,
+    });
+    await db.update(issues).set({ issueNumber: 1 }).where(eq(issues.id, issueId));
+    await db.update(companies).set({ issueCounter: 2 }).where(eq(companies.id, companyId));
+    await db.insert(heartbeatRuns).values({
+      id: planningRunId,
+      companyId,
+      agentId,
+      status: "running",
+      runtimeMode: "native",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      contextSnapshot: { issueId: planningIssueId },
+    });
+    await db.update(issues).set({ executionRunId: planningRunId }).where(eq(issues.id, planningIssueId));
+    const written = await documentService(db).upsertIssueDocument({
+      issueId: planningIssueId,
+      key: "plan",
+      title: "Approved plan",
+      format: "markdown",
+      body: "Implement and test the utility.",
+      baseRevisionId: null,
+      changeSummary: "Initial plan",
+      createdByAgentId: agentId,
+      createdByRunId: planningRunId,
+    });
+    const planningAuthority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId: planningIssueId,
+      runId: planningRunId,
+      workMode: "planning",
+    });
+    const requested = await planningAuthority.execute({
+      tool: "request_human_input",
+      callId: "approve-plan",
+      arguments: {
+        idempotencyKey: `confirmation:${planningIssueId}:plan:${written.document.latestRevisionId}`,
+        interactionKind: "confirmation",
+        title: "Approve the plan",
+        prompt: "Approve this exact plan revision?",
+        payload: {},
+        targetRevisionId: written.document.latestRevisionId,
+        continuationPolicy: "wake_assignee_on_accept",
+      },
+    });
+    expect(requested).toMatchObject({
+      interaction: {
+        kind: "request_confirmation",
+        status: "pending",
+        payload: {
+          target: {
+            type: "issue_document",
+            issueId: planningIssueId,
+            key: "plan",
+            revisionId: written.document.latestRevisionId,
+          },
+        },
+      },
+    });
+    await db.update(issueThreadInteractions).set({
+      status: "accepted",
+      resolvedByUserId: "test-user",
+      resolvedAt: new Date(),
+      result: { outcome: "accepted" } as never,
+    }).where(eq(issueThreadInteractions.issueId, planningIssueId));
+    const wakes: Array<{ agentId: string; options: Record<string, unknown> }> = [];
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId: planningIssueId,
+      runId: planningRunId,
+      workMode: "planning",
+      acceptedPlanContinuation: true,
+      enqueueWakeup: async (wakeAgentId, options) => {
+        wakes.push({ agentId: wakeAgentId, options });
+        return null;
+      },
+    });
+    expect(authority.definitions().map((tool) => tool.name)).toContain("create_task");
+
+    const result = await authority.execute({
+      tool: "create_task",
+      callId: "create-implementation-child",
+      arguments: {
+        idempotencyKey: "approved-plan-child",
+        title: "Implement the approved plan",
+        description: "Implement and test the utility from the accepted parent plan.",
+      },
+    });
+
+    expect(result).toMatchObject({
+      disposition: "applied",
+      acceptedPlanRevisionId: written.document.latestRevisionId,
+      childIssue: {
+        parentId: planningIssueId,
+        workMode: "standard",
+        status: "todo",
+        assigneeAgentId: agentId,
+      },
+    });
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({
+      agentId,
+      options: {
+        reason: "issue_assigned",
+        payload: { parentIssueId: planningIssueId },
+      },
+    });
+    expect(await db.select().from(issues).where(eq(issues.parentId, planningIssueId)))
+      .toHaveLength(1);
   });
 
   it("fails closed once the run is no longer active", async () => {

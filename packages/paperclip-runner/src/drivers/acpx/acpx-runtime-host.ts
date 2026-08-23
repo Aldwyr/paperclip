@@ -31,6 +31,10 @@ import {
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { nativeMcpLaunchBinding } from "../native-mcp.js";
 import { materializeNativeRuntimeSkills } from "../runtime-context-materializer.js";
+import {
+  createProviderTraceFileSink,
+  type ProviderTraceFileSink,
+} from "../../contracts/provider-trace-file-sink.js";
 
 const PI_PERMISSION_TOOL = "__paperclip_runtime_permission";
 
@@ -75,6 +79,8 @@ interface SecureAcpRuntimeOptions extends AcpRuntimeOptions {
 export interface AcpxRuntimeHostOptions {
   runtimeDirectory: string;
   normalizedSessionId: string;
+  /** Provider-record key may rotate while Paperclip's normalized session stays stable. */
+  providerSessionKey?: string;
   workingDirectory: string;
   agent: QualifiedAcpxAgent;
   model: string;
@@ -143,6 +149,8 @@ export class AcpxRuntimeHost {
   readonly #root: string;
   readonly #ephemeralCredentialFiles: string[];
   readonly #agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
+  readonly #trace: ProviderTraceFileSink | null;
+  readonly #traceState: { latestInboundFrameId: number | null };
   #activeTurn: AcpRuntimeTurn | null = null;
   #closed = false;
 
@@ -154,6 +162,8 @@ export class AcpxRuntimeHost {
     root: string;
     ephemeralCredentialFiles: string[];
     agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
+    trace: ProviderTraceFileSink | null;
+    traceState: { latestInboundFrameId: number | null };
   }) {
     this.#runtime = input.runtime;
     this.#handle = input.handle;
@@ -162,6 +172,8 @@ export class AcpxRuntimeHost {
     this.#root = input.root;
     this.#ephemeralCredentialFiles = input.ephemeralCredentialFiles;
     this.#agentProcessIdentity = input.agentProcessIdentity;
+    this.#trace = input.trace;
+    this.#traceState = input.traceState;
   }
 
   static async open(options: AcpxRuntimeHostOptions): Promise<AcpxRuntimeHost> {
@@ -178,6 +190,13 @@ export class AcpxRuntimeHost {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       await chmod(directory, 0o700);
     }
+    const trace = await createProviderTraceFileSink({
+      path: options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH,
+      provider: `acpx:${options.agent}`,
+      channel: "typescript_acpx_native",
+      maxBytes: options.environment?.PAPERCLIP_PROVIDER_TRACE_MAX_BYTES,
+    });
+    const traceState = { latestInboundFrameId: null as number | null };
     if (options.expectedIdentity) {
       await verifyExpectedIdentity(options.expectedIdentity, root, options.normalizedSessionId, cwd, profile, options.model);
     }
@@ -246,9 +265,14 @@ export class AcpxRuntimeHost {
       ...(options.agent === "claude" ? { CLAUDE_CONFIG_DIR: agentHome } : {}),
       ...(options.agent === "codex" ? { CODEX_HOME: agentHome } : {}),
       PAPERCLIP_ACPX_PROFILE: options.agent,
+      PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
     }, options.agent);
     const safeSessionEnvironment = withoutCredentials(agentEnvironment);
     const nativeMcp = nativeMcpLaunchBinding(options.environment ?? process.env);
+    const runnerOwnedMcpServerNames = new Set([
+      "paperclip",
+      ...(nativeMcp ? [nativeMcp.name] : []),
+    ]);
     const mcpServers: NonNullable<AcpRuntimeOptions["mcpServers"]> = options.agent === "pi" ? [] : [{
       type: "http",
       name: "paperclip",
@@ -281,16 +305,28 @@ export class AcpxRuntimeHost {
         escalate: ["execute", "write", "edit", "delete", "move"],
         defaultAction: "escalate",
       },
-      elicitationModes: ["form", "url"],
+      // Paperclip routes durable user interaction through PRP semantic tools.
+      // Advertising ACP form elicitation to Codex diverts MCP-tool approvals
+      // into a separate UI callback that this headless runner does not own.
+      // With no generic elicitation capability advertised, Codex-ACP uses the
+      // governed permission channel where the runner-owned server identity is
+      // correlated and external tool calls remain subject to policy.
+      elicitationModes: options.agent === "codex" ? [] : ["form", "url"],
       onPermissionRequest: async (request, context) => {
-        // Claude Code asks its ACP client to authorize every MCP invocation,
+        // Claude Code and Codex ask their ACP client to authorize MCP
+        // invocations,
         // including calls to Paperclip's own authenticated semantic bridge.
         // Those calls must reach PRP, whose attached run catalog and schema
         // checks are the authority. Treating this duplicate provider prompt as
         // a human approval prevents even read-only semantic tools from running.
         // Built-in filesystem/process calls do not have this closed namespace
         // and continue through the durable interactive permission flow.
-        if (options.agent === "claude" && isRunnerOwnedSemanticPermission(request)) {
+        if (shouldAutoApproveRunnerOwnedSemanticPermission(
+          options.agent,
+          request,
+          runnerOwnedMcpServerNames,
+          true,
+        )) {
           return { outcome: "allow_once" };
         }
         return options.onPermissionRequest
@@ -299,6 +335,37 @@ export class AcpxRuntimeHost {
       },
       spawnEnvironment: () => ({ ...agentEnvironment }),
       onAgentStderr: routeAgentStderr,
+      onAcpMessage: (direction, message) => {
+        try {
+          const raw = `${JSON.stringify(message)}\n`;
+          const nativeMethod = message && typeof message === "object" && !Array.isArray(message)
+            && typeof (message as Record<string, unknown>).method === "string"
+            ? (message as Record<string, unknown>).method as string
+            : undefined;
+          const frameId = trace?.frame({
+            direction: direction === "outbound" ? "client_to_provider" : "provider_to_client",
+            raw,
+            transport: "acp_json_rpc_object",
+            ...(nativeMethod ? { nativeMethod } : {}),
+          });
+          if (direction === "inbound" && frameId !== null && frameId !== undefined) {
+            traceState.latestInboundFrameId = frameId;
+          }
+          if (frameId !== null && frameId !== undefined) {
+            trace?.interpretation({
+              frameId,
+              stage: "typescript_acpx_transport",
+              ruleId: direction === "outbound" ? "acpx.transport.outbound" : "acpx.transport.inbound",
+              disposition: direction === "outbound" ? "operator_only" : "generic",
+              reason: direction === "outbound"
+                ? "Captured the ACP client request before provider delivery."
+                : "Captured the parsed ACP provider message before runtime-event normalization.",
+            });
+          }
+        } catch {
+          // Debug capture must never alter provider execution.
+        }
+      },
       onAgentSpawn: async (meta) => {
         agentProcessIdentity = { pid: meta.pid, processGroupId: null, startedAt: meta.startedAt };
         await options.onSpawn?.(agentProcessIdentity);
@@ -309,7 +376,12 @@ export class AcpxRuntimeHost {
     let handle: AcpRuntimeHandle | null = null;
     try {
       handle = await runtime.ensureSession({
-        sessionKey: profileSessionKey(options.normalizedSessionId, cwd, profile, options.model),
+        sessionKey: profileSessionKey(
+          options.providerSessionKey ?? options.normalizedSessionId,
+          cwd,
+          profile,
+          options.model,
+        ),
         agent: options.agent,
         mode: "persistent",
         cwd,
@@ -351,12 +423,15 @@ export class AcpxRuntimeHost {
         root,
         ephemeralCredentialFiles,
         agentProcessIdentity,
+        trace,
+        traceState,
       });
     } catch (error) {
       if (handle) {
         await runtime.close({ handle, reason: "ACPX startup failed", discardPersistentState: false }).catch(() => {});
       }
       await bridge.close().catch(() => {});
+      await trace?.finish({ reason: "acpx_session_start_failed" });
       await removeEphemeralCredentialFiles(ephemeralCredentialFiles);
       throw error;
     }
@@ -364,6 +439,22 @@ export class AcpxRuntimeHost {
 
   identity(): AcpxRuntimeIdentity {
     return structuredClone(this.#identity);
+  }
+
+  latestInboundTraceFrameId(): number | null {
+    return this.#traceState.latestInboundFrameId;
+  }
+
+  correlateProviderFrame(frameId: number | null, eventIds: string[], runtimeEventType: string): void {
+    if (frameId === null || eventIds.length === 0) return;
+    this.#trace?.interpretation({
+      frameId,
+      stage: "typescript_acpx_runtime_normalization",
+      ruleId: `acpx.runtime.${runtimeEventType}`,
+      disposition: "mapped",
+      emittedEventIds: eventIds,
+      reason: `Normalized the ACP runtime ${runtimeEventType} event into canonical PRP.`,
+    });
   }
 
   async status(): Promise<AcpRuntimeStatus> {
@@ -425,6 +516,7 @@ export class AcpxRuntimeHost {
       }
     } finally {
       await this.#bridge.close().catch(() => {});
+      await this.#trace?.finish();
       await removeEphemeralCredentialFiles(this.#ephemeralCredentialFiles);
     }
   }
@@ -448,6 +540,15 @@ function isRunnerOwnedSemanticPermission(request: AcpPermissionRequest): boolean
   const toolCall = raw.toolCall;
   if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) return false;
   const call = toolCall as Record<string, unknown>;
+  const requestMeta = raw._meta;
+  const isMcpToolApproval = requestMeta && typeof requestMeta === "object" && !Array.isArray(requestMeta)
+    ? (requestMeta as Record<string, unknown>).is_mcp_tool_approval === true
+    : false;
+  const rawInput = call.rawInput;
+  const serverName = rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
+    ? (rawInput as Record<string, unknown>).serverName
+    : null;
+  if (isMcpToolApproval && serverName === "paperclip") return true;
   const meta = call._meta;
   const claudeCode = meta && typeof meta === "object" && !Array.isArray(meta)
     ? (meta as Record<string, unknown>).claudeCode
@@ -456,8 +557,33 @@ function isRunnerOwnedSemanticPermission(request: AcpPermissionRequest): boolean
     ? (claudeCode as Record<string, unknown>).toolName
     : null;
   return [call.name, call.title, metadataToolName].some((value) => (
-    typeof value === "string" && value.startsWith("mcp__paperclip__")
+    typeof value === "string"
+    && (value.startsWith("mcp__paperclip__") || value.startsWith("mcp.paperclip."))
   ));
+}
+
+export function shouldAutoApproveRunnerOwnedSemanticPermission(
+  agent: QualifiedAcpxAgent,
+  request: AcpPermissionRequest,
+  runnerOwnedMcpServerNames: ReadonlySet<string> = new Set(["paperclip"]),
+  allConfiguredMcpServersAreRunnerOwned = false,
+): boolean {
+  if (agent === "pi") return false;
+  const raw = request.raw as unknown as Record<string, unknown>;
+  const requestMeta = raw._meta;
+  const isMcpToolApproval = requestMeta && typeof requestMeta === "object" && !Array.isArray(requestMeta)
+    ? (requestMeta as Record<string, unknown>).is_mcp_tool_approval === true
+    : false;
+  if (agent === "codex" && isMcpToolApproval && allConfiguredMcpServersAreRunnerOwned) return true;
+  const toolCall = raw.toolCall;
+  if (toolCall && typeof toolCall === "object" && !Array.isArray(toolCall)) {
+    const rawInput = (toolCall as Record<string, unknown>).rawInput;
+    if (rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)) {
+      const serverName = (rawInput as Record<string, unknown>).serverName;
+      if (typeof serverName === "string" && runnerOwnedMcpServerNames.has(serverName)) return true;
+    }
+  }
+  return isRunnerOwnedSemanticPermission(request);
 }
 
 async function stageManagedCodexCredential(
@@ -689,6 +815,7 @@ function sanitizedAgentEnvironment(
   const allowedExact = new Set([
     "PATH", "LANG", "LANGUAGE", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
   ]);
   const credentialNames = agent === "pi"
     ? ["OPENROUTER_API_KEY"]

@@ -18,6 +18,7 @@ import type {
   ReplayControlPlaneEventsInput,
 } from "../../vendor/paperclip-runner/index.js";
 import {
+  normalizePrpResultSignals,
   validatePrpEvent,
   validatePrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
@@ -234,6 +235,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
 
   async completeRun(value: NativeRunResult | CompleteControlPlaneRunInput): Promise<void> {
     if (!isCompleteInput(value)) throw new Error("native_structured_result_required");
+    // Capture compatibility diagnostics before canonical validation removes
+    // legacy/non-actionable attention payloads. They are operator evidence,
+    // not part of the authoritative semantic result.
+    const normalizationDiagnostics = normalizePrpResultSignals(value.result);
     const validated = validatePrpStructuredRunResult(value.result);
     if (!validated.ok) throw new Error(`native_result_schema_invalid:${validated.issues[0]?.message ?? "unknown"}`);
     assertTerminal(value.terminal);
@@ -278,6 +283,9 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       const resultJson = {
         result: validated.result,
         terminal: value.terminal,
+        normalizationDiagnostics: {
+          ignoredAttentionRequests: normalizationDiagnostics.ignoredAttentionRequests,
+        },
       } as unknown as Record<string, unknown>;
       const inserted = await tx.insert(nativeRunResults).values({
         companyId: this.#binding.companyId,
@@ -313,6 +321,12 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       await tx.update(heartbeatRuns).set({
         nativePhase: "workspace_finalizing",
         nativePhaseUpdatedAt: new Date(),
+        resultJson: {
+          ...record(run.resultJson),
+          prpTurnTerminalState: value.terminal.turnTerminalState,
+          prpRunTerminalState: value.terminal.runTerminalState,
+          prpReportedWorkDisposition: value.terminal.reportedWorkDisposition,
+        },
         updatedAt: new Date(),
       }).where(eq(heartbeatRuns.id, this.#binding.runId));
     });

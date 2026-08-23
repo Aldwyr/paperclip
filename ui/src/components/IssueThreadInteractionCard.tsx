@@ -3613,9 +3613,10 @@ export function IssueThreadInteractionCard({
   // P4: audit-visible distinction between agent and human resolution.
   const resolvedByAgent = Boolean(interaction.resolvedByAgentId);
   // P3: interactions directed at a specific agent addressee.
-  const addresseeLabel = interaction.addresseeAgentId
+  const addresseeLabel = interaction.addresseeAgentId || interaction.addresseeUserId
     ? resolveActorLabel({
         agentId: interaction.addresseeAgentId,
+        userId: interaction.addresseeUserId,
         agentMap,
         currentUserId,
         userLabelMap,

@@ -10,6 +10,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
+  issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -37,6 +38,7 @@ import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 
 describe("PaperclipControlPlanePort conformance", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -248,6 +250,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       await db.delete(nativeRunResults);
       await db.delete(issueThreadInteractions);
       await db.delete(issueWorkProducts);
+      await db.delete(issueRelations);
       await db.delete(heartbeatRunEvents);
       await db.delete(heartbeatRuns);
       await db.delete(completionContracts);
@@ -292,13 +295,13 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect.objectContaining({ phase: "committed" }),
     ]);
     await expect(db.select().from(issues).where(eq(issues.id, identity.issueId))).resolves.toEqual([
-      expect.objectContaining({ status: "in_progress", statusVersion: 1 }),
+      expect.objectContaining({ status: "in_review", statusVersion: 1 }),
     ]);
     await expect(db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, identity.runId))).resolves.toEqual([
       expect.objectContaining({ phase: "committed" }),
     ]);
     await expect(db.select().from(statusDecisions).where(eq(statusDecisions.issueId, identity.issueId))).resolves.toEqual([
-      expect.objectContaining({ toStatus: "in_progress", reasonCode: "completion_evidence_incomplete", applicationState: "applied" }),
+      expect.objectContaining({ toStatus: "in_review", reasonCode: "external_verification_required", applicationState: "applied" }),
     ]);
     await expect(db.select().from(activityLog).where(eq(activityLog.entityId, identity.issueId))).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ action: "issue.updated" })]),
@@ -340,6 +343,7 @@ describe("PaperclipControlPlanePort conformance", () => {
           name: "phase6-scripted",
           version: "1",
           capabilities: { resume: false, typedEvents: true, steering: false, interruption: true, structuredResult: true },
+          runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
         };
       },
       async openSession(input) {
@@ -473,6 +477,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       title: "Native review interaction",
       status: "in_progress",
       assigneeAgentId: identity.agentId,
+      responsibleUserId: "reviewer-24",
       workMode: "standard",
     });
     await db.insert(completionContracts).values({
@@ -526,12 +531,304 @@ describe("PaperclipControlPlanePort conformance", () => {
     await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
       expect.objectContaining({ status: "in_review", statusVersion: 1 }),
     ]);
-    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).resolves.toEqual([
-      expect.objectContaining({ kind: "request_confirmation", status: "pending", sourceRunId: runId }),
-    ]);
+    const [reviewInteraction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(reviewInteraction).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      sourceRunId: runId,
+      addresseeUserId: "reviewer-24",
+      effectiveResolverPolicy: "human_only",
+    });
     await expect(db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.issueId, issueId))).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ effectKind: "bind_reviewer", targetType: "issue_thread_interaction" })]),
     );
+
+    await issueThreadInteractionService(db).acceptInteraction(
+      { id: issueId, companyId: identity.companyId, projectId: null, goalId: null, status: "in_review" },
+      reviewInteraction!.id,
+      {},
+      { userId: "reviewer-24" },
+    );
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
+      expect.objectContaining({ status: "done" }),
+    ]);
+  });
+
+  it("completes DOT-29-style low-risk work with an environment caveat and no corrective run", async () => {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = "30000000-0000-4000-8000-000000000029";
+    const localContractId = "31000000-0000-4000-8000-000000000029";
+    const runId = "32000000-0000-4000-8000-000000000029";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: identity.companyId,
+      title: "DOT-29 completion caveat",
+      status: "in_progress",
+      assigneeAgentId: identity.agentId,
+      workMode: "standard",
+    });
+    await db.insert(completionContracts).values({
+      id: localContractId,
+      companyId: identity.companyId,
+      issueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v3",
+      risk: "low",
+      completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {
+        revision: "phase6-v3",
+        objective: "Complete the low-risk task",
+        criteria: [{ id: "objective", requirement: "Complete the requested work" }],
+      },
+      canonicalSha256: "dot-29-contract",
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: identity.companyId,
+      agentId: identity.agentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      completionContractId: localContractId,
+      completionContractSha256: "dot-29-contract",
+      contextSnapshot: { issueId },
+    });
+    const port = new PaperclipControlPlanePort(db, {
+      companyId: identity.companyId,
+      issueId,
+      runId,
+      agentId: identity.agentId,
+      completionContractId: localContractId,
+      completionContractSha256: "dot-29-contract",
+      sourceInstanceId: "dot-29-runner",
+      controlPlaneSourceInstanceId: "dot-29-control",
+    });
+    await port.openRun({
+      identity: { ...identity, issueId, runId },
+      backendKind: "mock",
+      sourceInstanceId: "dot-29-runner",
+    });
+    const result: PrpStructuredRunResult = {
+      ...structuredClone(CONTROL_PLANE_CONFORMANCE_RESULT),
+      summary: "The requested work is complete; local Node verification could not run.",
+      completionClaim: {
+        contractRevision: "phase6-v3",
+        objectiveSatisfied: true,
+        criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [] }],
+        remainingWork: [],
+      },
+      evidence: [],
+      verification: [{ commandOrCheck: "Run npm test", status: "not_run" }],
+      attentionRequests: [{
+        kind: "environment_constraint",
+        summary: "Node and npm are unavailable in this sandbox.",
+      }],
+    };
+    await port.completeRun({
+      result,
+      terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: "dot-29-result",
+    });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
+      expect.objectContaining({ status: "done", statusVersion: 1 }),
+    ]);
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).resolves.toEqual([]);
+    await expect(db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, identity.companyId)))
+      .resolves.not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ payload: expect.objectContaining({ issueId, sourceRunId: runId }) }),
+      ]));
+    await expect(db.select().from(statusDecisions).where(eq(statusDecisions.issueId, issueId))).resolves.toEqual([
+      expect.objectContaining({ toStatus: "done", reasonCode: "completion_claim_policy_accepted" }),
+    ]);
+    const [persistedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(persistedRun).toMatchObject({ status: "succeeded", nativePhase: "committed" });
+    expect(persistedRun?.resultJson).toMatchObject({
+      finalizationReasonCode: "completion_claim_policy_accepted",
+      verificationCaveats: [{
+        commandOrCheck: "Run npm test",
+        reasonCode: "tool_unavailable",
+        detail: "Node and npm are unavailable in this sandbox.",
+      }],
+      ignoredAttentionRequests: [expect.objectContaining({
+        sourceKind: "environment_constraint",
+        disposition: "verification_caveat",
+      })],
+    });
+  });
+
+  it("coalesces a completed child dependency into one rich parent wake", async () => {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const parentIssueId = "30000000-0000-4000-8000-000000000145";
+    const childIssueId = "30000000-0000-4000-8000-000000000146";
+    const localContractId = "31000000-0000-4000-8000-000000000146";
+    const runId = "32000000-0000-4000-8000-000000000146";
+    await db.insert(issues).values([
+      {
+        id: parentIssueId,
+        companyId: identity.companyId,
+        title: "Accepted plan parent",
+        status: "in_progress",
+        assigneeAgentId: identity.agentId,
+        workMode: "planning",
+      },
+      {
+        id: childIssueId,
+        companyId: identity.companyId,
+        parentId: parentIssueId,
+        title: "Implement the accepted plan",
+        status: "in_progress",
+        assigneeAgentId: identity.agentId,
+        workMode: "standard",
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId: identity.companyId,
+      issueId: childIssueId,
+      relatedIssueId: parentIssueId,
+      type: "blocks",
+    });
+    await db.insert(completionContracts).values({
+      id: localContractId,
+      companyId: identity.companyId,
+      issueId: childIssueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v3",
+      risk: "low",
+      completionAuthority: "agent_claim_policy",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {
+        revision: "child-wake-v1",
+        objective: "Implement the accepted plan",
+        criteria: [{ id: "objective", requirement: "Implement and test" }],
+      },
+      canonicalSha256: "child-wake-contract",
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: identity.companyId,
+      agentId: identity.agentId,
+      status: "running",
+      runtimeMode: "native",
+      completionContractId: localContractId,
+      completionContractSha256: "child-wake-contract",
+      contextSnapshot: { issueId: childIssueId },
+    });
+    const port = new PaperclipControlPlanePort(db, {
+      companyId: identity.companyId,
+      issueId: childIssueId,
+      runId,
+      agentId: identity.agentId,
+      completionContractId: localContractId,
+      completionContractSha256: "child-wake-contract",
+      sourceInstanceId: "child-wake-runner",
+      controlPlaneSourceInstanceId: "child-wake-control",
+    });
+    await port.openRun({
+      identity: { ...identity, issueId: childIssueId, runId },
+      backendKind: "mock",
+      sourceInstanceId: "child-wake-runner",
+    });
+    const result: PrpStructuredRunResult = {
+      ...structuredClone(CONTROL_PLANE_CONFORMANCE_RESULT),
+      summary: "Implemented the accepted plan and passed 44/44 tests.",
+      completionClaim: {
+        contractRevision: "child-wake-v1",
+        objectiveSatisfied: true,
+        criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [] }],
+        remainingWork: [],
+      },
+      verification: [{ commandOrCheck: "node --test", status: "passed" }],
+      attentionRequests: [],
+    };
+    await port.completeRun({
+      result,
+      terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: "child-wake-result",
+    });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
+
+    const parentWakes = await db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, identity.companyId))
+      .then((rows) => rows.filter((row) => row.payload?.issueId === parentIssueId));
+    expect(parentWakes).toHaveLength(1);
+    expect(parentWakes[0]).toMatchObject({
+      reason: "issue_children_completed",
+      payload: {
+        issueId: parentIssueId,
+        completedChildIssueId: childIssueId,
+        childIssueIds: [childIssueId],
+        childIssueSummaries: [{
+          id: childIssueId,
+          title: "Implement the accepted plan",
+          status: "done",
+          summary: "Implemented the accepted plan and passed 44/44 tests.",
+        }],
+        childIssueSummaryTruncated: false,
+        _paperclipWakeContext: {
+          wakeReason: "issue_children_completed",
+          childIssueSummaries: [{
+            id: childIssueId,
+            summary: "Implemented the accepted plan and passed 44/44 tests.",
+          }],
+        },
+      },
+    });
+  });
+
+  it("returns a rejected native completion review to the original agent with the reviewer reason", async () => {
+    const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
+    const issueId = "30000000-0000-4000-8000-000000000027";
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: identity.companyId,
+      title: "Rejected native completion review",
+      status: "in_review",
+      assigneeAgentId: identity.agentId,
+      responsibleUserId: "reviewer-25",
+      workMode: "standard",
+    });
+    const [interaction] = await db.insert(issueThreadInteractions).values({
+      companyId: identity.companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      sourceRunId: taskRunId,
+      addresseeUserId: "reviewer-25",
+      payload: {
+        version: 1,
+        prompt: "Approve completion?",
+        rejectRequiresReason: true,
+        target: { type: "custom", key: "native_completion_review", revisionId: "decision-25" },
+      },
+    }).returning();
+
+    const rejected = await issueThreadInteractionService(db).rejectInteraction(
+      { id: issueId, companyId: identity.companyId, status: "in_review" },
+      interaction!.id,
+      { reason: "Add the missing external verification." },
+      { userId: "reviewer-25" },
+    );
+
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      result: { outcome: "rejected", reason: "Add the missing external verification." },
+    });
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toEqual([
+      expect.objectContaining({ status: "todo", assigneeAgentId: identity.agentId }),
+    ]);
   });
 
   it("preserves the result and issue status when workspace finalization fails", async () => {
@@ -566,7 +863,7 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect.objectContaining({ status: "in_progress", statusVersion: 0, lastStatusDecisionId: null }),
     ]);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, workspaceFailureRunId))).resolves.toEqual([
-      expect.objectContaining({ status: "failed", nativePhase: "retryable_failure" }),
+      expect.objectContaining({ status: "succeeded", nativePhase: "retryable_failure" }),
     ]);
     await expect(db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, workspaceFailureRunId))).resolves.toHaveLength(1);
   });

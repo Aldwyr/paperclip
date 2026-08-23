@@ -1,6 +1,6 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns, issueApprovals, issueComments, issues } from "@paperclipai/db";
+import { agents, heartbeatRuns, issueApprovals, issueComments, issues, issueThreadInteractions } from "@paperclipai/db";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/index.js";
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
@@ -12,6 +12,7 @@ import { persistActivity, publishActivity } from "../activity-log.js";
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
   "request_human_input",
+  "create_task",
   "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -21,7 +22,18 @@ type Binding = {
   issueId: string;
   runId: string;
   agentId: string;
-  workMode?: "standard" | "planning";
+  workMode?: "standard" | "planning" | "ask";
+  acceptedPlanContinuation?: boolean;
+  enqueueWakeup?: (agentId: string, options: {
+    source: "assignment";
+    triggerDetail: "system";
+    reason: "issue_assigned";
+    payload: Record<string, unknown>;
+    idempotencyKey: string;
+    requestedByActorType: "agent";
+    requestedByActorId: string;
+    contextSnapshot: Record<string, unknown>;
+  }) => Promise<unknown>;
 };
 
 type ToolReceipt = {
@@ -53,7 +65,17 @@ export class PaperclipRunnerToolAuthority {
     return CAPABILITY_SEMANTIC_TOOL_CATALOG
       .filter((descriptor) =>
         IMPLEMENTED_OPERATIONS.has(descriptor.operationId)
-        && descriptor.allowedModes.includes(workMode)
+        && (
+          descriptor.allowedModes.includes(workMode)
+          || (
+            descriptor.operationId === "create_task"
+            && this.binding.acceptedPlanContinuation === true
+          )
+        )
+        && (
+          descriptor.operationId !== "create_task"
+          || this.binding.acceptedPlanContinuation === true
+        )
       )
       .map((descriptor) => ({
         name: descriptor.operationId,
@@ -66,7 +88,12 @@ export class PaperclipRunnerToolAuthority {
     if (!IMPLEMENTED_OPERATIONS.has(call.tool)) throw new Error("paperclip_runner_tool_not_advertised");
     const context = await this.#boundContext();
     const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find((candidate) => candidate.operationId === call.tool);
-    if (!descriptor?.allowedModes.includes(context.issue.workMode as "standard" | "planning")) {
+    const acceptedPlanCreate = call.tool === "create_task"
+      && this.binding.acceptedPlanContinuation === true;
+    if (!descriptor || (
+      !descriptor.allowedModes.includes(context.issue.workMode as "standard" | "planning" | "ask")
+      && !acceptedPlanCreate
+    )) {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
     const input = record(call.arguments);
@@ -124,6 +151,7 @@ export class PaperclipRunnerToolAuthority {
       }
       case "report_progress": return this.#reportProgress(call.callId, input, context.issue);
       case "request_human_input": return this.#requestHumanInput(input, context.issue);
+      case "create_task": return this.#createAcceptedPlanTask(input);
       default: throw new Error("paperclip_runner_tool_not_bound");
     }
   }
@@ -219,26 +247,156 @@ export class PaperclipRunnerToolAuthority {
 
   async #writeDocument(input: Record<string, unknown>): Promise<unknown> {
     const idempotencyKey = requiredString(input.idempotencyKey);
-    return this.#withMutationReceipt("write_document", idempotencyKey, input, async (tx) => {
+    let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    const result = await this.#withMutationReceipt("write_document", idempotencyKey, input, async (tx) => {
       const write = await documentService(tx).upsertIssueDocument({
         issueId: this.binding.issueId,
         key: requiredString(input.key),
         title: requiredString(input.title),
         format: "markdown",
         body: requiredString(input.body),
-        baseRevisionId: input.baseRevisionId === null ? null : requiredString(input.baseRevisionId),
+        baseRevisionId: nullableProviderId(input.baseRevisionId),
         changeSummary: input.changeSummary === null || input.changeSummary === undefined
           ? null
           : requiredString(input.changeSummary),
         createdByAgentId: this.binding.agentId,
         createdByRunId: this.binding.runId,
       });
+      const activity = await persistActivity(tx, {
+        companyId: this.binding.companyId,
+        actorType: "agent",
+        actorId: this.binding.agentId,
+        agentId: this.binding.agentId,
+        runId: this.binding.runId,
+        issueId: this.binding.issueId,
+        action: write.created ? "issue.document_created" : "issue.document_updated",
+        entityType: "issue",
+        entityId: this.binding.issueId,
+        details: {
+          key: write.document.key,
+          documentId: write.document.id,
+          title: write.document.title,
+          format: write.document.format,
+          revisionNumber: write.document.latestRevisionNumber,
+          source: "paperclip_runner_protocol",
+        },
+      });
+      publication = activity.publication;
       return {
         disposition: "applied",
         created: write.created,
         document: write.document,
       };
     });
+    if (publication) publishActivity(publication);
+    return result;
+  }
+
+  async #createAcceptedPlanTask(input: Record<string, unknown>): Promise<unknown> {
+    if (!this.binding.acceptedPlanContinuation) {
+      throw new Error("paperclip_runner_tool_mode_denied");
+    }
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    const acceptedPlanRevisionId = await this.#acceptedPlanRevisionId();
+    if (!acceptedPlanRevisionId) {
+      throw new Error("paperclip_runner_accepted_plan_revision_not_found");
+    }
+    const assigneeAgentId = input.assigneeActorId === null || input.assigneeActorId === undefined
+      ? this.binding.agentId
+      : requiredString(input.assigneeActorId);
+    const assignee = await agentService(this.db).getById(assigneeAgentId);
+    if (!assignee || assignee.companyId !== this.binding.companyId) {
+      throw new Error("paperclip_runner_agent_not_found");
+    }
+    const priority = input.priority === "critical" || input.priority === "high"
+      || input.priority === "medium" || input.priority === "low"
+      ? input.priority
+      : "medium";
+    const blockedByIssueIds = Array.isArray(input.blockedByTaskIds)
+      ? input.blockedByTaskIds.map(requiredString)
+      : undefined;
+    const result = await this.#withMutationReceipt("create_task", idempotencyKey, input, async (tx) => {
+      const decomposition = await issueService(tx).decomposeAcceptedPlan(this.binding.issueId, {
+        acceptedPlanRevisionId,
+        children: [{
+          title: requiredString(input.title),
+          description: input.description === null || input.description === undefined
+            ? null
+            : requiredString(input.description),
+          status: "todo",
+          workMode: "standard",
+          priority,
+          assigneeAgentId,
+          ...(blockedByIssueIds ? { blockedByIssueIds } : {}),
+          blockParentUntilDone: true,
+          actorAgentId: this.binding.agentId,
+          actorRunId: this.binding.runId,
+        }],
+        actorAgentId: this.binding.agentId,
+        actorRunId: this.binding.runId,
+      });
+      const child = decomposition.childIssues[0];
+      if (!child) throw new Error("paperclip_runner_accepted_plan_child_not_created");
+      return {
+        commandId: `accepted-plan:${acceptedPlanRevisionId}`,
+        disposition: decomposition.newlyCreatedIssues.length > 0 ? "applied" : "duplicate",
+        stateRevision: 1,
+        entityRefs: [child.id],
+        scheduledWakeIds: [`accepted-plan-child:${child.id}`],
+        childIssue: child,
+        acceptedPlanRevisionId,
+        decompositionId: decomposition.decomposition.id,
+      };
+    }) as Record<string, unknown>;
+
+    const child = record(result.childIssue);
+    const childId = requiredString(child.id);
+    if (this.binding.enqueueWakeup) {
+      await this.binding.enqueueWakeup(assigneeAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: {
+          issueId: childId,
+          mutation: "accepted_plan_decomposition",
+          acceptedPlanRevisionId,
+          parentIssueId: this.binding.issueId,
+        },
+        idempotencyKey: `accepted-plan-child:${acceptedPlanRevisionId}:${childId}`,
+        requestedByActorType: "agent",
+        requestedByActorId: this.binding.agentId,
+        contextSnapshot: {
+          issueId: childId,
+          source: "paperclip_runner.create_task",
+          acceptedPlanRevisionId,
+          parentIssueId: this.binding.issueId,
+        },
+      });
+    }
+    return result;
+  }
+
+  async #acceptedPlanRevisionId(): Promise<string | null> {
+    const rows = await this.db.select({ payload: issueThreadInteractions.payload })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, this.binding.companyId),
+        eq(issueThreadInteractions.issueId, this.binding.issueId),
+        eq(issueThreadInteractions.kind, "request_confirmation"),
+        eq(issueThreadInteractions.status, "accepted"),
+      ))
+      .orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.createdAt));
+    for (const row of rows) {
+      const target = record(record(row.payload).target);
+      if (
+        target.type === "issue_document"
+        && (target.issueId === undefined || target.issueId === this.binding.issueId)
+        && target.key === "plan"
+        && typeof target.revisionId === "string"
+        && target.revisionId.length > 0
+      ) return target.revisionId;
+    }
+    return null;
   }
 
   async #withMutationReceipt(
@@ -284,9 +442,34 @@ export class PaperclipRunnerToolAuthority {
     } as const)[interactionKind as "confirmation"];
     if (!kind) throw new Error("paperclip_runner_interaction_kind_invalid");
     const suppliedPayload = record(input.payload);
-    if (input.targetRevisionId && suppliedPayload.target === undefined) {
+    const targetRevisionId = nullableProviderId(input.targetRevisionId);
+    const suppliedTarget = record(suppliedPayload.target);
+    const inferredPlanningTarget = targetRevisionId !== null
+      && suppliedPayload.target === undefined
+      && kind === "request_confirmation"
+      && this.binding.workMode === "planning"
+      ? {
+          type: "issue_document",
+          issueId: issue.id,
+          key: "plan",
+          revisionId: targetRevisionId,
+        }
+      : null;
+    if (targetRevisionId !== null && suppliedPayload.target === undefined && inferredPlanningTarget === null) {
       throw new Error("paperclip_runner_interaction_target_incomplete");
     }
+    const normalizedPayload = inferredPlanningTarget !== null
+      ? { ...suppliedPayload, target: inferredPlanningTarget }
+      : suppliedTarget.type === "issue_document"
+      ? {
+          ...suppliedPayload,
+          target: {
+            ...suppliedTarget,
+            issueId: suppliedTarget.issueId ?? issue.id,
+            revisionId: suppliedTarget.revisionId ?? targetRevisionId,
+          },
+        }
+      : suppliedPayload;
     const prompt = requiredString(input.prompt);
     const interaction = await issueThreadInteractionService(this.db).create(issue, {
       kind,
@@ -296,15 +479,15 @@ export class PaperclipRunnerToolAuthority {
       summary: prompt,
       continuationPolicy: requiredString(input.continuationPolicy),
       payload: {
-        ...suppliedPayload,
+        ...normalizedPayload,
         version: 1,
         prompt,
         ...(kind === "request_confirmation" ? {
-          detailsMarkdown: suppliedPayload.detailsMarkdown ?? "",
-          acceptLabel: suppliedPayload.acceptLabel ?? "Confirm",
-          rejectLabel: suppliedPayload.rejectLabel ?? "Request changes",
-          rejectRequiresReason: suppliedPayload.rejectRequiresReason ?? false,
-          supersedeOnUserComment: suppliedPayload.supersedeOnUserComment ?? true,
+          detailsMarkdown: normalizedPayload.detailsMarkdown ?? "",
+          acceptLabel: normalizedPayload.acceptLabel ?? "Confirm",
+          rejectLabel: normalizedPayload.rejectLabel ?? "Request changes",
+          rejectRequiresReason: normalizedPayload.rejectRequiresReason ?? false,
+          supersedeOnUserComment: normalizedPayload.supersedeOnUserComment ?? true,
         } : {}),
       },
     } as never, { agentId: this.binding.agentId, userId: null });
@@ -334,6 +517,19 @@ export class PaperclipRunnerToolAuthority {
 function requiredString(value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") throw new Error("paperclip_runner_tool_input_invalid");
   return value.trim();
+}
+
+/**
+ * Some native tool transports cannot faithfully express a nullable string in
+ * their provider-facing schema and send the JSON null sentinel as a string.
+ * Normalize only the well-known empty/null sentinels at the control-plane
+ * boundary; real revision ids remain untouched and optimistic concurrency is
+ * still enforced by the document service.
+ */
+function nullableProviderId(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const normalized = requiredString(value);
+  return normalized === "null" || normalized === "undefined" ? null : normalized;
 }
 
 function boundedLimit(value: unknown): number {

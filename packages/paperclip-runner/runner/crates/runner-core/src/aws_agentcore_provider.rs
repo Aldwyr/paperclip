@@ -5,6 +5,8 @@
 //! bridge. No Paperclip credential or callback address enters AgentCore.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -13,11 +15,13 @@ use aws_config::sts::AssumeRoleProvider;
 use aws_sdk_bedrockagentcore::error::SdkError;
 use aws_sdk_bedrockagentcore::types::{
     HarnessContentBlock, HarnessContentBlockDelta, HarnessContentBlockStart,
-    HarnessConversationRole, HarnessInlineFunctionConfig, HarnessMessage, HarnessTool,
+    HarnessConversationRole, HarnessInlineFunctionConfig, HarnessMessage, HarnessRemoteMcpConfig,
+    HarnessSkill, HarnessSkillS3Source, HarnessSystemContentBlock, HarnessTool,
     HarnessToolConfiguration, HarnessToolResultBlock, HarnessToolResultContentBlock,
     HarnessToolType, HarnessToolUseBlock, HarnessToolUseStatus, HarnessToolUseType,
     InvokeHarnessStreamOutput,
 };
+use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::{Document, Number};
 use aws_types::region::Region;
@@ -38,6 +42,7 @@ const MAX_AGENTCORE_TOOLS: usize = 64;
 // bounded cold start, but leave enough of the eval's outer deadline for the
 // durable runner to classify the failure and service runner.shutdown cleanly.
 const AGENTCORE_INVOCATION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CONTEXT_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 const AGENTCORE_INLINE_TOOL_ALLOWLIST: &str = "@*/pc_*";
 #[derive(Clone, Debug)]
@@ -192,6 +197,247 @@ impl Drop for NetworkWorker {
     }
 }
 
+fn take_agentcore_mcp_tool() -> Result<Option<(HarnessTool, String)>, LocalRunnerError> {
+    let name = std::env::var("PAPERCLIP_NATIVE_MCP_NAME").ok();
+    let url = std::env::var("PAPERCLIP_NATIVE_MCP_URL").ok();
+    let token = std::env::var("PAPERCLIP_NATIVE_MCP_TOKEN").ok();
+    for key in [
+        "PAPERCLIP_NATIVE_MCP_NAME",
+        "PAPERCLIP_NATIVE_MCP_URL",
+        "PAPERCLIP_NATIVE_MCP_TOKEN",
+    ] {
+        std::env::remove_var(key);
+    }
+    match (name, url, token) {
+        (None, None, None) => Ok(None),
+        (Some(name), Some(url), Some(mut token))
+            if !name.trim().is_empty() && url.starts_with("https://") && !token.is_empty() =>
+        {
+            let remote = HarnessRemoteMcpConfig::builder()
+                .url(url)
+                .headers("Authorization", format!("Bearer {token}"))
+                .build()
+                .map_err(|_| {
+                    LocalRunnerError::invalid("failed to build AgentCore remote MCP configuration")
+                })?;
+            token.clear();
+            let tool = HarnessTool::builder()
+                .r#type(HarnessToolType::RemoteMcp)
+                .name(name.clone())
+                .config(HarnessToolConfiguration::RemoteMcp(remote))
+                .build()
+                .map_err(|_| {
+                    LocalRunnerError::invalid("failed to build AgentCore remote MCP tool")
+                })?;
+            Ok(Some((tool, format!("@{name}/*"))))
+        }
+        (_, _, Some(mut token)) => {
+            token.clear();
+            Err(LocalRunnerError::invalid(
+                "AgentCore MCP binding is incomplete or unsafe",
+            ))
+        }
+        _ => Err(LocalRunnerError::invalid(
+            "AgentCore MCP binding is incomplete",
+        )),
+    }
+}
+
+fn context_text<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("runtimeContext {pointer} is missing"))
+}
+
+fn collect_context_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        files: &mut Vec<(PathBuf, Vec<u8>)>,
+        total: &mut usize,
+    ) -> Result<(), String> {
+        let mut entries = fs::read_dir(current)
+            .map_err(|error| format!("failed to read runtime context asset: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to enumerate runtime context asset: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("failed to inspect runtime context asset: {error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err("AgentCore context bundles may not contain symlinks".to_owned());
+            }
+            if metadata.is_dir() {
+                visit(root, &path, files, total)?;
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| "runtime context asset escaped its root".to_owned())?
+                    .to_path_buf();
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("failed to read runtime context file: {error}"))?;
+                *total = total.saturating_add(bytes.len());
+                if *total > MAX_CONTEXT_UPLOAD_BYTES {
+                    return Err("AgentCore context upload exceeded its size limit".to_owned());
+                }
+                files.push((relative, bytes));
+            }
+        }
+        Ok(())
+    }
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("runtime context asset is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("runtime context asset root must be a real directory".to_owned());
+    }
+    let mut files = Vec::new();
+    let mut total = 0;
+    visit(root, root, &mut files, &mut total)?;
+    Ok(files)
+}
+
+async fn upload_context_directory(
+    client: &aws_sdk_s3::Client,
+    config: &AwsAgentCoreProviderConfig,
+    digest: &str,
+    files: Vec<(PathBuf, Vec<u8>)>,
+    generated_skill: Option<String>,
+) -> Result<HarnessSkill, String> {
+    let prefix = config.context_prefix.trim_matches('/');
+    let asset_prefix = format!("{prefix}/assets/{digest}");
+    let mut files = files;
+    if let Some(skill) = generated_skill {
+        files.push((PathBuf::from("SKILL.md"), skill.into_bytes()));
+    }
+    for (relative, bytes) in files {
+        let relative = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if relative.is_empty()
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("runtime context upload path is unsafe".to_owned());
+        }
+        let key = format!("{asset_prefix}/{relative}");
+        let content_digest = format!("{:x}", Sha256::digest(&bytes));
+        if let Ok(existing) = client
+            .head_object()
+            .bucket(&config.context_bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            let metadata_digest = existing
+                .metadata()
+                .and_then(|metadata| metadata.get("paperclip-sha256"))
+                .map(String::as_str);
+            if existing.content_length() != Some(bytes.len() as i64)
+                || metadata_digest != Some(content_digest.as_str())
+                || existing.server_side_encryption()
+                    != Some(&aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                || existing.ssekms_key_id() != Some(config.context_kms_key_arn.as_str())
+            {
+                return Err(format!(
+                    "AgentCore context S3 asset verification failed: {}",
+                    sha_hex(&key, 16)
+                ));
+            }
+            continue;
+        }
+        client
+            .put_object()
+            .bucket(&config.context_bucket)
+            .key(&key)
+            .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            .ssekms_key_id(&config.context_kms_key_arn)
+            .metadata("paperclip-sha256", content_digest)
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "AgentCore context S3 upload failed: {}",
+                    redact_aws_error(&error.to_string())
+                )
+            })?;
+    }
+    let source = HarnessSkillS3Source::builder()
+        .uri(format!("s3://{}/{asset_prefix}/", config.context_bucket))
+        .build()
+        .map_err(|_| "failed to build AgentCore S3 skill source".to_owned())?;
+    Ok(HarnessSkill::S3(source))
+}
+
+async fn upload_agentcore_runtime_context(
+    client: &aws_sdk_s3::Client,
+    config: &AwsAgentCoreProviderConfig,
+) -> Result<Vec<HarnessSkill>, String> {
+    let context = config.runtime_context.as_ref().ok_or_else(|| {
+        "AgentCore requires paperclip.native-execution-input.v3 runtimeContext".to_owned()
+    })?;
+    let instruction_digest = context_text(context, "/instructions/bundle/digest")?;
+    let instruction_root = Path::new(context_text(context, "/instructions/bundle/rootPath")?);
+    let entry_path = context_text(context, "/instructions/entryPath")?;
+    let instruction_files = collect_context_files(instruction_root)?
+        .into_iter()
+        .map(|(path, bytes)| (PathBuf::from("instructions").join(path), bytes))
+        .collect();
+    let instruction_companion = format!(
+        "---\nname: paperclip-instructions-{}\ndescription: Paperclip agent instruction sibling bundle\n---\nRead `instructions/{entry_path}` and its sibling files as read-only context.\n",
+        &instruction_digest[..12]
+    );
+    let instruction_asset_digest = sha_hex(
+        &format!("{instruction_digest}\0{entry_path}\0{instruction_companion}"),
+        64,
+    );
+    let mut skills = vec![
+        upload_context_directory(
+            client,
+            config,
+            &instruction_asset_digest,
+            instruction_files,
+            Some(instruction_companion),
+        )
+        .await?,
+    ];
+    let assigned = context
+        .get("skills")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "runtimeContext.skills must be an array".to_owned())?;
+    for skill in assigned {
+        let digest = context_text(skill, "/bundle/digest")?;
+        let root = Path::new(context_text(skill, "/bundle/rootPath")?);
+        let files = collect_context_files(root)?;
+        if !files.iter().any(|(path, _)| path == Path::new("SKILL.md")) {
+            return Err("AgentCore custom skill bundle is missing SKILL.md".to_owned());
+        }
+        skills.push(upload_context_directory(client, config, digest, files, None).await?);
+    }
+    Ok(skills)
+}
+
+fn agentcore_system_instructions(config: &AwsAgentCoreProviderConfig) -> Result<String, String> {
+    let Some(context) = config.runtime_context.as_ref() else {
+        return Ok(config.instructions.clone());
+    };
+    let instruction_root = context_text(context, "/instructions/bundle/rootPath")?;
+    let local_directive = format!("Read-only instruction sibling root: {instruction_root}");
+    config
+        .instructions
+        .strip_suffix(&local_directive)
+        .map(|prefix| format!(
+            "{prefix}Read-only instruction siblings are in the attached Paperclip HarnessSkill under `instructions/`."
+        ))
+        .ok_or_else(|| "AgentCore instruction-root directive is missing or inconsistent".to_owned())
+}
+
 fn network_loop(
     config: AwsAgentCoreProviderConfig,
     session_id: String,
@@ -231,10 +477,24 @@ fn network_loop(
             .credentials_provider(assumed)
             .load()
             .await;
-        (aws_sdk_bedrockagentcore::Client::new(&shared), config)
+        let s3 = aws_sdk_s3::Client::new(&shared);
+        let skills = upload_agentcore_runtime_context(&s3, &config).await?;
+        let system_instructions = agentcore_system_instructions(&config)?;
+        Ok::<_, String>((
+            aws_sdk_bedrockagentcore::Client::new(&shared),
+            config,
+            skills,
+            system_instructions,
+        ))
     });
+    let (client, config, skills, system_instructions) = match clients {
+        Ok(clients) => clients,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
     let _ = ready.send(Ok(()));
-    let (client, config) = clients;
     while let Ok(command) = commands.recv() {
         match command {
             NetworkCommand::Invoke {
@@ -249,6 +509,8 @@ fn network_loop(
                 let session_id = session_id.clone();
                 let actor_id = actor_id.clone();
                 let events = events.clone();
+                let skills = skills.clone();
+                let system_instructions = system_instructions.clone();
                 runtime.spawn(async move {
                     // The qualified Harness version is the immutable model
                     // authority. Supplying a redundant invocation override
@@ -269,7 +531,10 @@ fn network_loop(
                         // silently withheld, so admit each authorized tool as
                         // `@*/<collision-resistant pc_ name>` and nothing else.
                         .set_allowed_tools(Some(allowed_tools))
-                        .set_skills(Some(Vec::new()))
+                        .set_system_prompt(Some(vec![HarnessSystemContentBlock::Text(
+                            system_instructions,
+                        )]))
+                        .set_skills(Some(skills))
                         .max_iterations(config.max_iterations as i32)
                         .max_tokens(config.max_output_tokens as i32)
                         .timeout_seconds(config.timeout_seconds as i32)
@@ -524,6 +789,8 @@ pub struct AwsAgentCoreHarnessProvider {
     usage: Value,
     interrupted: bool,
     max_estimated_cost_usd: f64,
+    assigned_mcp_tool: Option<HarnessTool>,
+    assigned_mcp_allowed: Option<String>,
 }
 
 impl AwsAgentCoreHarnessProvider {
@@ -538,8 +805,13 @@ impl AwsAgentCoreHarnessProvider {
             .map(str::to_owned)
             .unwrap_or_else(new_runtime_session_id);
         let actor_id = format!("paperclip-{}", sha_hex(&session_id, 32));
+        let assigned_mcp = take_agentcore_mcp_tool()?;
         let worker = NetworkWorker::start(config.clone(), session_id.clone(), actor_id.clone())?;
-        let (encoded, allowed, reverse, schemas) = encode_tools(&tools)?;
+        let (mut encoded, mut allowed, reverse, schemas) = encode_tools(&tools)?;
+        if let Some((tool, allow)) = assigned_mcp.as_ref() {
+            encoded.push(tool.clone());
+            allowed.push(allow.clone());
+        }
         Ok(Self {
             config: config.clone(),
             session_id,
@@ -559,6 +831,8 @@ impl AwsAgentCoreHarnessProvider {
             usage: json!({ "inputTokens": 0, "outputTokens": 0, "cacheReadInputTokens": 0, "cacheWriteInputTokens": 0, "requestCount": 0, "estimatedCostUsd": 0.0, "costSource": "paperclip_estimate" }),
             interrupted: false,
             max_estimated_cost_usd: config.max_estimated_session_cost_usd,
+            assigned_mcp_tool: assigned_mcp.as_ref().map(|value| value.0.clone()),
+            assigned_mcp_allowed: assigned_mcp.as_ref().map(|value| value.1.clone()),
         })
     }
 
@@ -614,7 +888,13 @@ impl Provider for AwsAgentCoreHarnessProvider {
                 "cannot replace AgentCore tools while a turn is active",
             ));
         }
-        let (encoded, allowed, reverse, schemas) = encode_tools(&tools)?;
+        let (mut encoded, mut allowed, reverse, schemas) = encode_tools(&tools)?;
+        if let Some(tool) = self.assigned_mcp_tool.as_ref() {
+            encoded.push(tool.clone());
+        }
+        if let Some(allow) = self.assigned_mcp_allowed.as_ref() {
+            allowed.push(allow.clone());
+        }
         self.tools = encoded;
         self.allowed_tools = allowed;
         self.remote_to_canonical = reverse;
@@ -992,13 +1272,28 @@ fn validate_config(config: &AwsAgentCoreProviderConfig) -> Result<(), LocalRunne
         config.memory_arn.as_str(),
         config.memory_id.as_str(),
         config.invocation_role_arn.as_str(),
+        config.context_bucket.as_str(),
+        config.context_prefix.as_str(),
+        config.context_kms_key_arn.as_str(),
         config.qualification_revision.as_str(),
+        config.instructions.as_str(),
     ]
     .iter()
     .any(|value| value.trim().is_empty())
     {
         return Err(LocalRunnerError::invalid(
             "AgentCore profile fields must be non-empty",
+        ));
+    }
+    if config.context_prefix.starts_with('/')
+        || config
+            .context_prefix
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !config.context_kms_key_arn.starts_with("arn:aws:kms:")
+    {
+        return Err(LocalRunnerError::invalid(
+            "AgentCore context S3 qualification is unsafe",
         ));
     }
     if config.event_expiry_days != 90 {
@@ -1267,12 +1562,80 @@ mod tests {
         HarnessToolUseBlockDelta, HarnessToolUseBlockStart,
     };
 
+    fn config() -> AwsAgentCoreProviderConfig {
+        AwsAgentCoreProviderConfig {
+            model: "global.anthropic.claude-sonnet-4-6".to_owned(),
+            profile_id: "profile-test".to_owned(),
+            region: "us-east-1".to_owned(),
+            account_id: "123456789012".to_owned(),
+            harness_arn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:harness/test".to_owned(),
+            harness_version: "1".to_owned(),
+            endpoint_arn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:endpoint/test"
+                .to_owned(),
+            endpoint_qualifier: "1".to_owned(),
+            agent_runtime_arn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+                .to_owned(),
+            memory_arn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/test".to_owned(),
+            memory_id: "memory-test".to_owned(),
+            invocation_role_arn: "arn:aws:iam::123456789012:role/paperclip-agentcore".to_owned(),
+            context_bucket: "paperclip-context-test".to_owned(),
+            context_prefix: "companies/company-test/profiles/profile-test".to_owned(),
+            context_kms_key_arn: "arn:aws:kms:us-east-1:123456789012:key/test".to_owned(),
+            qualification_revision: "aws-agentcore-harness-v1".to_owned(),
+            event_expiry_days: 90,
+            max_estimated_session_cost_usd: 1.0,
+            max_iterations: 8,
+            max_output_tokens: 4096,
+            timeout_seconds: 300,
+            instructions: "Paperclip test instructions".to_owned(),
+            runtime_context: None,
+        }
+    }
+
     #[test]
     fn runtime_session_ids_are_valid_and_unique() {
         let first = new_runtime_session_id();
         let second = new_runtime_session_id();
         assert!(first.len() >= 33);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn agentcore_system_replaces_the_local_instruction_path_with_the_harness_skill() {
+        let mut config = config();
+        let local_root = "/paperclip/runtime/instructions";
+        config.instructions = format!(
+            "paperclip prompt\n\nAGENTS entry\n\nRead-only instruction sibling root: {local_root}"
+        );
+        config.runtime_context = Some(json!({
+            "instructions": {
+                "entryPath": "AGENTS.md",
+                "bundle": { "digest": "abc123", "rootPath": local_root }
+            },
+            "skills": []
+        }));
+
+        let instructions = agentcore_system_instructions(&config).unwrap();
+        assert!(instructions.starts_with("paperclip prompt\n\nAGENTS entry\n\n"));
+        assert!(instructions.ends_with("attached Paperclip HarnessSkill under `instructions/`."));
+        assert!(!instructions.contains(local_root));
+    }
+
+    #[test]
+    fn agentcore_rejects_unsafe_context_prefixes_before_cloud_access() {
+        for unsafe_prefix in [
+            "/absolute",
+            "company//profile",
+            "company/../profile",
+            "company/./profile",
+        ] {
+            let mut config = config();
+            config.context_prefix = unsafe_prefix.to_owned();
+            assert!(
+                validate_config(&config).is_err(),
+                "prefix should fail: {unsafe_prefix}"
+            );
+        }
     }
 
     #[test]

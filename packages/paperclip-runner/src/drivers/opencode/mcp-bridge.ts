@@ -3,11 +3,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 
 import {
-  CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
-  CODEX_BLOCK_TOOL_NAME,
-  CODEX_COMPLETION_TOOL_NAME,
-  CODEX_RESULT_OUTPUT_SCHEMA,
-} from "../../contracts/codex.js";
+  PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_BLOCK_TOOL_NAME,
+  PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_COMPLETION_TOOL_NAME,
+} from "../../contracts/completion-result.js";
 
 export interface OpenCodeMcpToolDefinition {
   name: string;
@@ -43,7 +43,7 @@ const DEFAULT_MAX_BODY_BYTES = 1_048_576;
 
 export function canonicalOpenCodeMcpToolName(name: string): string {
   const trimmed = name.trim();
-  if (trimmed === CODEX_COMPLETION_TOOL_NAME || trimmed === CODEX_BLOCK_TOOL_NAME) return trimmed;
+  if (trimmed === PRP_COMPLETION_TOOL_NAME || trimmed === PRP_BLOCK_TOOL_NAME) return trimmed;
   for (const prefix of ["paperclip__", "paperclip_", "paperclip."]) {
     if (trimmed.startsWith(prefix)) return trimmed.slice(prefix.length);
   }
@@ -113,8 +113,8 @@ function normalizeTools(
     seen.add(name);
   }
   if (includeTerminalTools) for (const terminal of [
-    { name: CODEX_COMPLETION_TOOL_NAME, description: "Return the semantic completion result.", inputSchema: CODEX_RESULT_OUTPUT_SCHEMA },
-    { name: CODEX_BLOCK_TOOL_NAME, description: "Return the semantic blocked result.", inputSchema: CODEX_BLOCK_RESULT_OUTPUT_SCHEMA },
+    { name: PRP_COMPLETION_TOOL_NAME, description: "Return the semantic completion result.", inputSchema: PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA },
+    { name: PRP_BLOCK_TOOL_NAME, description: "Return the semantic blocked result.", inputSchema: PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA },
   ]) {
     if (!seen.has(terminal.name)) tools.push(terminal);
   }

@@ -70,11 +70,16 @@ pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, V
             result.push((event.to_owned(), payload, item_id.to_owned()))
         };
     if (method == "item/started" || complete) && kind == "plan" || method == "turn/plan/updated" {
-        let steps = params.get("plan").and_then(Value::as_array).map(|values| values.iter().take(256).enumerate().map(|(index, value)| json!({"stepId": format!("step-{}", index + 1), "body": text(value.get("step")).chars().take(4000).collect::<String>(), "status": match text(value.get("status")) { "inProgress" | "in_progress" => "in_progress", "completed" => "completed", "blocked" => "blocked", _ => "pending" }})).collect()).unwrap_or_else(Vec::new);
+        let steps: Vec<Value> = params.get("plan").and_then(Value::as_array).map(|values| values.iter().take(256).enumerate().map(|(index, value)| json!({"stepId": format!("step-{}", index + 1), "body": text(value.get("step")).chars().take(4000).collect::<String>(), "status": match text(value.get("status")) { "inProgress" | "in_progress" => "in_progress", "completed" => "completed", "blocked" => "blocked", _ => "pending" }})).collect()).unwrap_or_else(Vec::new);
+        let plan_complete = complete
+            || (!steps.is_empty()
+                && steps
+                    .iter()
+                    .all(|step| text(step.get("status")) == "completed"));
         push(
             &mut result,
             "plan.updated",
-            json!({"schema":"paperclip.plan.updated.v1","planId":item_id,"revision":params.get("revision").and_then(Value::as_u64).unwrap_or(1),"explanation":params.get("explanation").and_then(Value::as_str),"steps":steps,"complete":complete,"syncStatus":if complete {"pending"} else {"streaming"},"documentRevision":Value::Null}),
+            json!({"schema":"paperclip.plan.updated.v1","planId":item_id,"revision":params.get("revision").and_then(Value::as_u64).unwrap_or(1),"explanation":params.get("explanation").and_then(Value::as_str),"steps":steps,"complete":plan_complete,"syncStatus":if plan_complete {"pending"} else {"streaming"},"documentRevision":Value::Null}),
             &item_id,
         );
     } else if (method == "item/started" || complete)
@@ -387,5 +392,19 @@ mod tests {
         assert_eq!(events[0].1["sources"].as_array().unwrap().len(), 1);
         assert_eq!(events[0].1["sources"][0]["sourceId"], "source-1");
         assert_eq!(events[0].1["sources"][0]["url"], "https://example.com/prp");
+    }
+
+    #[test]
+    fn completed_turn_plan_is_terminal_without_an_item_completion() {
+        let events = canonical_provider_events(
+            "turn/plan/updated",
+            &json!({"turnId":"turn-1","plan":[
+                {"step":"Inspect","status":"completed"},
+                {"step":"Implement","status":"completed"}
+            ]}),
+        );
+        assert_eq!(events[0].0, "plan.updated");
+        assert_eq!(events[0].1["complete"], true);
+        assert_eq!(events[0].1["syncStatus"], "pending");
     }
 }

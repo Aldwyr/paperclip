@@ -28,6 +28,7 @@ import {
   materializeNativeInteractionResponses,
   rejectUnsupportedNativeRuntimeRequest,
   resolveNativeAttentionStatus,
+  routePersistedNativeResultAttention,
 } from "../services/native-runtime/native-interaction-bridge.js";
 import {
   cancelNativeSession,
@@ -44,6 +45,7 @@ import {
 } from "../services/native-runtime/runtime-mode.js";
 import {
   arbitrateNativeStatus,
+  NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeStatusDecision,
   type NativeStatusEffect,
 } from "../services/native-runtime/status-arbiter.js";
@@ -526,7 +528,9 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       triggerActorCompanyId: companyId,
       priorIssueStatus: completionState === "board_cancelled_before_cas" ? "in_progress" : priorStatus,
       priorStatusVersion: 0,
-      policyVersion: completionState === "new_policy_requires_review" ? "phase6-v1" : "phase6-v2",
+      policyVersion: completionState === "new_policy_requires_review"
+        ? "phase6-v1"
+        : NATIVE_STATUS_ARBITER_POLICY_VERSION,
       assessmentJson: {
         fixtureId: fixture.id,
         ...(completionState === "new_evidence_satisfies_contract" ? { allCriteriaSatisfied: false } : {}),
@@ -706,13 +710,10 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
           },
         },
       }).where(eq(nativeRunResults.id, seeded.resultId!));
-      const finalized = await finalizeNativeRun({
-        db,
-        runId: seeded.runId,
-        workspaceFinalizeStatus: "succeeded",
-        projectRunStatus: true,
-      });
-      const [receipt] = "attentionReceipts" in finalized ? finalized.attentionReceipts : [];
+      const attentionReceipts = await routePersistedNativeResultAttention({ db, runId: seeded.runId });
+      const finalized = await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, seeded.runId)).then((rows) => rows[0] ?? null);
+      const [receipt] = attentionReceipts;
       if (!receipt) throw new Error(`${fixture.id}: persisted attention route missing`);
       const persistedDecision = receipt.decisionId
         ? await db.select().from(statusDecisions).where(eq(statusDecisions.id, receipt.decisionId))
@@ -736,7 +737,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       consumerExecutions.push({
         consumer: "native-attention-finalizer",
         observed: {
-          phase: finalized.phase,
+          phase: finalized?.phase,
           decisionId: receipt.decisionId,
           resolvedTargetAgentId: receipt.resolvedTargetAgentId,
           reasonCode: receipt.reasonCode,
@@ -754,13 +755,10 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
           : null;
         const assessmentCount = await db.select().from(workAssessments)
           .where(eq(workAssessments.runId, seeded.runId)).then((rows) => rows.length);
-        const replayed = await finalizeNativeRun({
-          db,
-          runId: seeded.runId,
-          workspaceFinalizeStatus: "succeeded",
-          projectRunStatus: true,
-        });
-        expect(replayed, `${fixture.id}:audit replay coordinator`).toMatchObject({ phase: "committed", decisionId: null });
+        await routePersistedNativeResultAttention({ db, runId: seeded.runId });
+        const replayed = await db.select().from(nativeRunFinalizations)
+          .where(eq(nativeRunFinalizations.runId, seeded.runId)).then((rows) => rows[0] ?? null);
+        expect(replayed, `${fixture.id}:audit replay coordinator`).toMatchObject({ phase: "assessing", decisionId: null });
         if (liveAttentionInteractionId) {
           await expect(db.select({
             summary: issueThreadInteractions.summary,
@@ -939,7 +937,9 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
         issueId: seeded.issueId,
         assessmentId: seeded.assessmentId,
         decisionVersion: 1,
-        policyVersion: completionState === "new_policy_requires_review" ? "phase6-v1" : "phase6-v2",
+        policyVersion: completionState === "new_policy_requires_review"
+          ? "phase6-v1"
+          : NATIVE_STATUS_ARBITER_POLICY_VERSION,
         fromStatus: completionState === "board_cancelled_before_cas" ? "in_progress" : priorIssueStatus,
         toStatus: completionState === "board_cancelled_before_cas" ? "in_progress" : priorIssueStatus,
         reasonCode: "prior_fixture_decision",
@@ -1150,7 +1150,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
         issueId: seeded.issueId,
         assessmentId: seeded.assessmentId,
         decisionVersion: 1,
-        policyVersion: "phase6-v2",
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
         fromStatus: priorIssueStatus,
         toStatus: priorIssueStatus,
         reasonCode: "live_continuation_registered",
@@ -1346,11 +1346,6 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
         consumer: "native-finalization-failure",
         observed: { phase: failure.phase, failureCode: failure.failureCode },
       });
-    } else if (seeded.nativeRecords && consumerDecision?.effects.some((effect) => effect.kind === "record_finalization_error")) {
-      await db.update(heartbeatRuns).set({
-        status: projectNativeTerminalRunStatus("failed"),
-        finishedAt: new Date(),
-      }).where(eq(heartbeatRuns.id, seeded.runId));
     }
 
     if (["attention_response", "attention_candidate", "interaction", "monitor"].includes(String(fixture.given.trigger))) {
@@ -1572,7 +1567,10 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     if (persistedEffects.includes("render_four_layers")) expect(persistedRunResult.nativeOutcomeLayers, `${fixture.id}:four-layer target`).toBeDefined();
     if (persistedEffects.includes("record_mode_labeled_divergence")) expect(persistedRunResult.nativeLegacyDivergence, `${fixture.id}:divergence target`).toBeDefined();
     if (persistedEffects.includes("record_mode_native")) expect(persistedRun?.runtimeMode, `${fixture.id}:mode target`).toBe("native");
-    if (persistedEffects.includes("record_policy_version")) expect(persistedRunnerProfile.nativeStatusPolicyVersion, `${fixture.id}:policy target`).toBe("phase6-v2");
+    if (persistedEffects.includes("record_policy_version")) {
+      expect(persistedRunnerProfile.nativeStatusPolicyVersion, `${fixture.id}:policy target`)
+        .toBe(NATIVE_STATUS_ARBITER_POLICY_VERSION);
+    }
     if (persistedEffects.includes("finish_as_native")) expect(persistedRunResult.nativeKillSwitchDisposition, `${fixture.id}:finish-native target`).toBe("finish_as_native");
     if (materializedEffects.has("link_canonical_request")) {
       expect(interactionRows.some((row) => row.summary?.startsWith("Canonical native attention request:")), `${fixture.id}:canonical link target`).toBe(true);
@@ -1580,7 +1578,14 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     if (materializedEffects.has("record_stale_response")) {
       expect(interactionRows.some((row) => row.summary === "Response retained for audit after native supersession."), `${fixture.id}:stale audit target`).toBe(true);
     }
-    if (materializedEffects.has("record_finalization_error")) expect(persistedRun?.status, `${fixture.id}:finalization failure target`).toBe("failed");
+    if (
+      materializedEffects.has("record_finalization_error")
+      && fixture.given.nativeFinalization !== "invalid"
+      && fixture.expected.runStatus === initialRunStatus(fixture)
+    ) {
+      expect(persistedRun?.status, `${fixture.id}:issue finalization must not rewrite provider run status`)
+        .toBe(initialRunStatus(fixture));
+    }
     const observedNativeRecords = nativeRows.length > 0;
     const compatibilityState = (fixture.covers.compatibilityRows ?? []).length > 0
       ? inspectNativeCompatibilityState({
@@ -1900,7 +1905,7 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       issueId: seeded.issueId,
       assessmentId: seeded.assessmentId,
       decisionVersion: 1,
-      policyVersion: "phase6-v2",
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       fromStatus: "in_progress",
       toStatus: "in_progress",
       reasonCode: "live_continuation_registered",
@@ -1947,12 +1952,227 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
       .rejects.toThrow("native_pending_effect_target_missing:enqueue_continuation");
   }, 30_000);
 
+  it("preserves terminal issues when a newer reconciliation policy is available", () => {
+    expect(resolveNativeReconciliationStatus({
+      facts: { policyVersionChanged: true },
+      priorIssueStatus: "done",
+      agentId,
+    })).toMatchObject({
+      statusAction: "preserve",
+      toStatus: "done",
+      reasonCode: "prior_status_terminal_preserved",
+      effects: [{ kind: "append_superseding_assessment" }],
+    });
+    expect(resolveNativeReconciliationStatus({
+      facts: { authoritativeStatusChanged: true, policyVersionChanged: true },
+      priorIssueStatus: "blocked",
+      agentId,
+    })).toMatchObject({
+      statusAction: "preserve",
+      toStatus: "blocked",
+      reasonCode: "prior_status_terminal_preserved",
+    });
+  });
+
+  it("supersedes the exact committed coordinator decision and sequences preserve decisions independently of issue status versions", async () => {
+    const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
+    if (!fixture) throw new Error("native corpus fixture missing");
+    const seeded = await seedFixture(fixture);
+    const priorStatus = String(fixture.given.priorIssueStatus ?? "in_progress") as NativeStatusDecision["toStatus"];
+    const preserveDecision = (reasonCode: string): NativeStatusDecision => ({
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "preserve",
+      toStatus: priorStatus,
+      reasonCode,
+      unblockDescriptor: null,
+      effects: [],
+    });
+
+    const first = await commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      assessmentId: seeded.assessmentId,
+      priorStatus,
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision: preserveDecision("preserve_sequence_one"),
+    });
+    const supersedingAssessmentId = randomUUID();
+    await db.insert(workAssessments).values({
+      id: supersedingAssessmentId,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      contractId: seeded.contractId!,
+      resultId: seeded.resultId!,
+      triggerKind: "reconciliation",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: priorStatus,
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: { reason: "preserve_sequence_two" },
+      inputDigest: `preserve-sequence:${supersedingAssessmentId}`,
+      supersedesAssessmentId: seeded.assessmentId,
+    });
+    const second = await commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      assessmentId: supersedingAssessmentId,
+      priorStatus,
+      priorStatusVersion: 0,
+      priorDecisionId: null,
+      decision: preserveDecision("preserve_sequence_two"),
+      supersedesCommittedDecisionId: first.decision.id,
+    });
+
+    expect(second.decision.decisionVersion).toBe(2);
+    expect(second.decision.decisionJson).toMatchObject({
+      priorStatusVersion: 0,
+      projectedStatusVersion: 0,
+    });
+    await expect(db.select({
+      status: issues.status,
+      statusVersion: issues.statusVersion,
+      lastStatusDecisionId: issues.lastStatusDecisionId,
+    }).from(issues).where(eq(issues.id, seeded.issueId))).resolves.toEqual([
+      { status: priorStatus, statusVersion: 0, lastStatusDecisionId: null },
+    ]);
+  });
+
+  it("ignores historical committed finalizations superseded by a newer authoritative decision", async () => {
+    const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
+    if (!fixture) throw new Error("native corpus fixture missing");
+    const seeded = await seedFixture(fixture);
+    const priorStatus = String(fixture.given.priorIssueStatus ?? "in_progress");
+    const [historicalDecision] = await db.insert(statusDecisions).values({
+      companyId,
+      issueId: seeded.issueId,
+      assessmentId: seeded.assessmentId,
+      decisionVersion: 1,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      fromStatus: priorStatus,
+      toStatus: priorStatus,
+      reasonCode: "historical_decision",
+      decisionJson: { statusAction: "in_progress" },
+      decisionDigest: `historical-decision:${seeded.issueId}`,
+      applicationState: "applied",
+      appliedAt: new Date(),
+    }).returning({ id: statusDecisions.id });
+    const authoritativeAssessmentId = randomUUID();
+    await db.insert(workAssessments).values({
+      id: authoritativeAssessmentId,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      contractId: seeded.contractId!,
+      resultId: seeded.resultId!,
+      triggerKind: "reconciliation",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: priorStatus,
+      priorStatusVersion: 1,
+      priorDecisionId: historicalDecision!.id,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: { reason: "authoritative_decision" },
+      inputDigest: `authoritative-assessment:${seeded.issueId}`,
+      supersedesAssessmentId: seeded.assessmentId,
+    });
+    const [authoritativeDecision] = await db.insert(statusDecisions).values({
+      companyId,
+      issueId: seeded.issueId,
+      assessmentId: authoritativeAssessmentId,
+      decisionVersion: 2,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      fromStatus: priorStatus,
+      toStatus: priorStatus,
+      reasonCode: "authoritative_decision",
+      decisionJson: { statusAction: "in_progress" },
+      decisionDigest: `authoritative-decision:${seeded.issueId}`,
+      applicationState: "applied",
+      appliedAt: new Date(),
+    }).returning({ id: statusDecisions.id });
+    await db.update(issues).set({
+      statusVersion: 2,
+      lastStatusDecisionId: authoritativeDecision!.id,
+    }).where(eq(issues.id, seeded.issueId));
+    await db.update(nativeRunFinalizations).set({
+      phase: "committed",
+      decisionId: historicalDecision!.id,
+    }).where(eq(nativeRunFinalizations.runId, seeded.runId));
+
+    await expect(reconcileNativeFinalizations(db, [seeded.runId])).resolves.toEqual([]);
+    await expect(db.select({
+      decisionId: nativeRunFinalizations.decisionId,
+    }).from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, seeded.runId))).resolves.toEqual([
+      { decisionId: historicalDecision!.id },
+    ]);
+  });
+
+  it("records superseding assessment lineage when a board transition has no native decision predecessor", async () => {
+    const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
+    if (!fixture) throw new Error("native corpus fixture missing");
+    const seeded = await seedFixture(fixture);
+    await db.update(issues).set({
+      status: "blocked",
+      statusVersion: 1,
+      lastStatusDecisionId: null,
+    }).where(eq(issues.id, seeded.issueId));
+    const supersedingAssessmentId = randomUUID();
+    await db.insert(workAssessments).values({
+      id: supersedingAssessmentId,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      contractId: seeded.contractId!,
+      resultId: seeded.resultId!,
+      triggerKind: "reconciliation",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: "blocked",
+      priorStatusVersion: 1,
+      priorDecisionId: null,
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      assessmentJson: { reason: "board_transition_without_native_decision" },
+      inputDigest: `board-transition-assessment:${seeded.issueId}`,
+      supersedesAssessmentId: seeded.assessmentId,
+    });
+
+    const committed = await commitNativeStatusDecision({
+      db,
+      companyId,
+      issueId: seeded.issueId,
+      runId: seeded.runId,
+      assessmentId: supersedingAssessmentId,
+      priorStatus: "blocked",
+      priorStatusVersion: 1,
+      priorDecisionId: null,
+      decision: {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "preserve",
+        toStatus: "blocked",
+        reasonCode: "prior_status_terminal_preserved",
+        unblockDescriptor: null,
+        effects: [{ kind: "append_superseding_assessment" }],
+      },
+    });
+
+    expect(committed.decision.supersedesDecisionId).toBeNull();
+    await expect(db.select({
+      supersedesAssessmentId: workAssessments.supersedesAssessmentId,
+    }).from(workAssessments).where(eq(workAssessments.id, supersedingAssessmentId))).resolves.toEqual([
+      { supersedesAssessmentId: seeded.assessmentId },
+    ]);
+  });
+
   it("fails the transaction closed for an unknown status effect", async () => {
     const fixture = corpus.fixtures.find((candidate) => candidate.mode === "native");
     if (!fixture) throw new Error("native corpus fixture missing");
     const seeded = await seedFixture(fixture);
     const decision: NativeStatusDecision = {
-      policyVersion: "phase6-v2",
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "preserve",
       toStatus: String(fixture.given.priorIssueStatus ?? "in_progress") as NativeStatusDecision["toStatus"],
       reasonCode: "unknown_effect_test",

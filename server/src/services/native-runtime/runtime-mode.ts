@@ -138,8 +138,15 @@ export function resolveNativeRuntimeMode(input: {
   ) {
     throw new NativeRuntimeEligibilityError("agent must be an active Codex-backed native agent");
   }
-  if (!input.issue || !["standard", "planning"].includes(input.issue.workMode)) {
-    throw new NativeRuntimeEligibilityError("run must be bound to a standard or planning issue");
+  const allowedWorkModes = runnerAdapterSelected
+    ? ["standard", "planning", "ask"]
+    : ["standard", "planning"];
+  if (!input.issue || !allowedWorkModes.includes(input.issue.workMode)) {
+    throw new NativeRuntimeEligibilityError(
+      runnerAdapterSelected
+        ? "run must be bound to a standard, planning, or ask issue"
+        : "run must be bound to a standard or planning issue",
+    );
   }
   if (input.issue.workMode === "planning" && !runnerAdapterSelected) {
     throw new NativeRuntimeEligibilityError("native planning requires the paperclip_runner adapter");

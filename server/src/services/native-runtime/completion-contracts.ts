@@ -5,7 +5,17 @@ import type { StrictCompletionContractInput } from "../../vendor/paperclip-runne
 import { nativeSha256 } from "./canonical.js";
 
 export const NATIVE_COMPLETION_CONTRACT_SCHEMA = "paperclip.completion-contract.v1";
-export const NATIVE_COMPLETION_POLICY_VERSION = "phase6-v2";
+export const NATIVE_COMPLETION_POLICY_VERSION = "phase6-v3";
+
+export function resolveNativeCompletionPolicy(issue: {
+  reviewPolicy?: string | null;
+}) {
+  const externalReviewRequired = issue.reviewPolicy === "human_only"
+    || issue.reviewPolicy === "not_creator";
+  return externalReviewRequired
+    ? { risk: "standard", completionAuthority: "server_arbiter" } as const
+    : { risk: "low", completionAuthority: "agent_claim_policy" } as const;
+}
 
 export function buildNativeCompletionContract(
   issue: { title: string; description: string | null },
@@ -25,14 +35,21 @@ export function buildNativeCompletionContract(
 export async function ensureNativeCompletionContract(input: {
   db: Db;
   companyId: string;
-  issue: { id: string; title: string; description: string | null };
+  issue: {
+    id: string;
+    title: string;
+    description: string | null;
+    reviewPolicy?: string | null;
+  };
   actorId: string;
   immediateRequest?: string | null;
 }) {
   const contract = buildNativeCompletionContract(input.issue, input.immediateRequest);
+  const completionPolicy = resolveNativeCompletionPolicy(input.issue);
   const canonicalSha256 = nativeSha256({
     schemaVersion: NATIVE_COMPLETION_CONTRACT_SCHEMA,
     policyVersion: NATIVE_COMPLETION_POLICY_VERSION,
+    ...completionPolicy,
     contract,
   });
   const existing = await input.db
@@ -63,12 +80,10 @@ export async function ensureNativeCompletionContract(input: {
     revision: (latest?.revision ?? 0) + 1,
     schemaVersion: NATIVE_COMPLETION_CONTRACT_SCHEMA,
     policyVersion: NATIVE_COMPLETION_POLICY_VERSION,
-    // Completing an ordinary issue changes workflow state only; governed side
-    // effects remain independently authorized by their tools and approval
-    // gates. Accept a schema-valid completion claim so a successful one-shot
-    // task does not manufacture an endless evidence-retry loop.
-    risk: "low",
-    completionAuthority: "agent_claim_policy",
+    // Ordinary issues use the model's schema-valid claim. Explicit human
+    // review policies retain server authority so completion materializes an
+    // owned review interaction instead of bypassing the issue policy.
+    ...completionPolicy,
     incompleteCriteriaPolicy: "preserve_non_terminal",
     contractJson: contract as unknown as Record<string, unknown>,
     canonicalSha256,

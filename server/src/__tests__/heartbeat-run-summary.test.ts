@@ -7,7 +7,40 @@ import {
   findHeartbeatRunCompletionComment,
   mergeHeartbeatRunResultJson,
   resolveHeartbeatRunResponse,
+  selectHeartbeatRunFinalAgentMessage,
 } from "../services/heartbeat-run-summary.js";
+
+describe("selectHeartbeatRunFinalAgentMessage", () => {
+  const substantive = {
+    seq: 80,
+    text: "Implemented the requested package and all nine tests pass.",
+    sourceEventId: "runner:80",
+  };
+  const acknowledgement = {
+    seq: 103,
+    text: "The finish call was accepted.",
+    sourceEventId: "runner:103",
+  };
+
+  it("uses the latest final message for an ordinary run", () => {
+    expect(selectHeartbeatRunFinalAgentMessage({
+      candidates: [substantive, acknowledgement],
+    })).toMatchObject({
+      sourceEventId: "runner:103",
+      reasonCode: "latest_non_empty_completed_final_agent_message",
+    });
+  });
+
+  it("preserves the completed work reply across a disposition-only recovery", () => {
+    expect(selectHeartbeatRunFinalAgentMessage({
+      candidates: [substantive, acknowledgement],
+      semanticResultRecoveryAfterSeq: 82,
+    })).toMatchObject({
+      sourceEventId: "runner:80",
+      reasonCode: "pre_semantic_result_recovery_final_agent_message",
+    });
+  });
+});
 
 describe("summarizeHeartbeatRunResultJson", () => {
   it("truncates text fields and preserves cost aliases", () => {
@@ -191,6 +224,39 @@ describe("resolveHeartbeatRunResponse", () => {
     expect(resolveHeartbeatRunResponse({ resultJson: null })).toMatchObject({
       text: null,
       decision: { chosenSource: "none", commentAction: "none" },
+    });
+  });
+
+  it("keeps a yielded control-plane wait out of the assistant conversation", () => {
+    expect(resolveHeartbeatRunResponse({
+      resultJson: {
+        nativeResult: {
+          schema: "paperclip.run_result.v1",
+          reportedWorkDisposition: "yielded",
+          summary: "Waiting for Choose an output format.",
+        },
+      },
+    })).toMatchObject({
+      text: null,
+      decision: { chosenSource: "none", commentAction: "none" },
+    });
+
+    expect(resolveHeartbeatRunResponse({
+      resultJson: {
+        summary: "Waiting for Choose an output format.",
+        nativeResult: {
+          schema: "paperclip.run_result.v1",
+          reportedWorkDisposition: "yielded",
+          summary: "Waiting for Choose an output format.",
+        },
+      },
+    })).toMatchObject({
+      text: null,
+      decision: {
+        chosenSource: "none",
+        commentAction: "none",
+        reasonCodes: ["yielded_control_plane_wait"],
+      },
     });
   });
 

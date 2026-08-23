@@ -74,7 +74,7 @@ export const QUALIFIED_ACPX_PROFILES: Readonly<Record<QualifiedAcpxAgent, Qualif
     agentServerVersion: "1.6.2",
     agentRuntimePackage: null,
     agentRuntimeVersion: null,
-    commandDigest: "sha256:8c7fc8af156596668a95ce23d52309f70ad576e75bac6dc209d30378bdbb8ebe",
+    commandDigest: "sha256:94049b3e3c3aee87de62703786e4fa81d031d7bd979f99bdf516d84f28791a79",
     qualificationModel: "gpt-5.6-sol",
     reportedModelId: "gpt-5.6-sol",
     permissionPolicy: "interactive",

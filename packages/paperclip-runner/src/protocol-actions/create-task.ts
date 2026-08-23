@@ -20,16 +20,16 @@ export const createTaskAction = {
     "idempotency": "required",
     "disabledByDefault": false,
     "realBindingStatus": "live_codex",
-    "realServiceBinding": "unbound",
+    "realServiceBinding": "issues.decomposeAcceptedPlan",
     "prpEvidence": "semantic-operation item event plus company-entity state diff and audit record",
-    "prpBindingStatus": "audit_pending",
+    "prpBindingStatus": "bound",
     "legacyAliases": [
       "mcp:paperclipCreateIssue"
     ]
   },
   "documentation": {
     "title": "Create child task",
-    "description": "Create one child mock task under the active task.",
+    "description": "Create one durable implementation child under an accepted planning task.",
     "note": null
   },
   "examples": {
@@ -63,7 +63,7 @@ export const createTaskAction = {
       "operationId": "create_task",
       "version": 1,
       "title": "Create child task",
-      "description": "Create one child mock task under the active task.",
+      "description": "Create one durable implementation child under an accepted planning task. Include the complete approved plan in the child description.",
       "exposure": "optional",
       "requiredClaims": [
         "delegation:tasks:create"
@@ -100,7 +100,7 @@ export const createTaskAction = {
               "string",
               "null"
             ],
-            "description": "Optional mock actor assignee.",
+            "description": "Optional agent assignee. Omit to assign the current agent.",
             "maxLength": 20000
           },
           "priority": {

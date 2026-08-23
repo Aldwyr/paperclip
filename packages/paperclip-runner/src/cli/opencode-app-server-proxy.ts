@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import type { HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { OpenCodeServerDriver } from "../drivers/opencode/opencode-server-driver.js";
+import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 
 type RpcMessage = { id?: string | number; method?: string; params?: unknown; result?: unknown; error?: unknown };
 
@@ -48,6 +50,10 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
   const model = text(params.model);
   if (!model.includes("/")) throw new Error("OpenCode proxy requires model in provider/model form");
   const dynamicTools = Array.isArray(params.dynamicTools) ? params.dynamicTools.map(record) : [];
+  const runtimeContextPath = process.env.PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH?.trim();
+  const runtimeContext = runtimeContextPath
+    ? parseNativeRuntimeContext(JSON.parse(readFileSync(runtimeContextPath, "utf8")))
+    : null;
   driver = new OpenCodeServerDriver({
     model,
     command: process.env.PAPERCLIP_OPENCODE_COMMAND?.trim() || "opencode",
@@ -62,6 +68,8 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
         "Use Paperclip MCP tools for semantic operations.",
       ],
     }),
+    systemInstructions: text(params.baseInstructions, "Complete only the supplied task."),
+    runtimeContext,
     dynamicTools,
     dynamicToolHandler: async (call) => requestController("item/tool/call", {
       threadId: session?.ids().driverSessionId ?? "opening",

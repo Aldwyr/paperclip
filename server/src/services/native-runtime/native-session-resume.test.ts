@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { rebindNativeSessionCheckpoint } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -101,7 +102,34 @@ describe("rebindNativeSessionCheckpoint", () => {
       activeTurnId: null,
       terminalTurns: [],
       pendingRuntimeRequests: [],
+      providerRecoveryPolicy: "same_session_only",
       identity: { runId: currentRunId, sessionId: normalizedSessionId, companyId, issueId, agentId },
+    });
+  });
+
+  it("allows a provider replacement only after a durable response wake", () => {
+    const source = previousRun();
+    const profile = source.runnerProfileJson as Record<string, unknown>;
+    const checkpoint = profile.sessionCheckpoint as Record<string, unknown>;
+    checkpoint.semanticResult = {
+      schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "yielded",
+      summary: "Waiting for a response.",
+      continuation: {
+        kind: "response_wake",
+        idempotencyKey: "interaction-response:one",
+      },
+    };
+
+    expect(
+      rebindNativeSessionCheckpoint({
+        previousRun: source,
+        currentExecution: execution(currentRunId),
+      }),
+    ).toMatchObject({
+      providerRecoveryPolicy: "allow_replacement_after_governed_wait",
+      semanticResult: null,
+      activeTurnId: null,
     });
   });
 
@@ -109,6 +137,35 @@ describe("rebindNativeSessionCheckpoint", () => {
     expect(rebindNativeSessionCheckpoint({
       previousRun: previousRun(),
       currentExecution: execution(currentRunId, "/different-workspace"),
+    })).toBeNull();
+  });
+
+  it("rotates when assigned context changes but permits a fresh run-scoped MCP binding", () => {
+    const reboundCredential = execution(currentRunId);
+    reboundCredential.runtimeContext.mcp.bindingId = "native-mcp:fresh-run";
+    expect(rebindNativeSessionCheckpoint({
+      previousRun: previousRun(),
+      currentExecution: reboundCredential,
+    })).not.toBeNull();
+
+    const changedAssignment = execution(currentRunId);
+    const withoutAggregate = {
+      prompt: changedAssignment.runtimeContext.prompt,
+      instructions: changedAssignment.runtimeContext.instructions,
+      skills: changedAssignment.runtimeContext.skills,
+      mcp: {
+        assignmentSetId: `sha256:${"1".repeat(64)}`,
+        digest: "1".repeat(64),
+        bindingId: "native-mcp:fresh-run",
+      },
+    };
+    changedAssignment.runtimeContext = {
+      ...withoutAggregate,
+      aggregateDigest: canonicalNativeRuntimeContextDigest(withoutAggregate),
+    };
+    expect(rebindNativeSessionCheckpoint({
+      previousRun: previousRun(),
+      currentExecution: changedAssignment,
     })).toBeNull();
   });
 
@@ -130,5 +187,73 @@ describe("rebindNativeSessionCheckpoint", () => {
       previousRun: source,
       currentExecution: execution(currentRunId),
     })).toBeNull();
+  });
+});
+
+describe("buildNativeExecutionInput wake projection", () => {
+  it("places child completion summaries in the closed provider prompt", () => {
+    const input = buildNativeExecutionInput({
+      companyId,
+      runId: currentRunId,
+      issue: {
+        id: issueId,
+        identifier: "DOT-146",
+        title: "Finish after child handoff",
+        description: "Use the child result.",
+        workMode: "standard",
+      },
+      taskPrompt: "Paperclip task context:\n- Issue: DOT-146",
+      wakePayload: {
+        reason: "issue_children_completed",
+        issue: {
+          id: issueId,
+          identifier: "DOT-146",
+          title: "Finish after child handoff",
+          description: "Use the child result.",
+          status: "in_progress",
+          priority: "medium",
+          workMode: "standard",
+        },
+        childIssueSummaries: [{
+          id: "child-147",
+          identifier: "DOT-147",
+          title: "Build utility",
+          status: "done",
+          summary: "Created three files and passed 7/7 tests.",
+        }],
+        childIssueSummaryTruncated: false,
+        checkedOutByHarness: true,
+      },
+      resumedSession: true,
+      agentId,
+      workspace: {
+        id: currentRunId,
+        cwd: "/workspace",
+        repoUrl: null,
+        repoRef: null,
+        branchName: null,
+      },
+      normalizedSessionId,
+      provider: "opencode",
+      model: "openrouter/z-ai/glm-5.2",
+      completionContract: {
+        id: "70000000-0000-4000-8000-000000000007",
+        sha256: `sha256:${"a".repeat(64)}`,
+        schemaVersion: "paperclip.run-result.v1",
+        contract: {
+          revision: "1",
+          objective: "Finish after the child",
+          criteria: [{ id: "objective", requirement: "Report the child result" }],
+        },
+      },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+
+    expect(input.task.prompt).toContain("## Paperclip Resume Delta");
+    expect(input.task.prompt).toContain("reason: issue_children_completed");
+    expect(input.task.prompt).toContain("DOT-147 Build utility (done)");
+    expect(input.task.prompt).toContain("Created three files and passed 7/7 tests.");
+    expect(input.task.prompt).toContain("Paperclip task context:\n- Issue: DOT-146");
+    expect(input.task.prompt).not.toContain("Use the child result.");
   });
 });

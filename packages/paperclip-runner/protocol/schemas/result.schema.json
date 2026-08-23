@@ -57,12 +57,30 @@
     "evidence": { "type": "array", "items": { "type": "object" } },
     "verification": {
       "type": "array",
+      "description": "Checks used to verify the work. Use failed only when the check actually ran and found a defect in the work. If a check could not run or complete because the environment, tool, dependency, permission, credential, policy, external service, or budget was unavailable, use not_run with reasonCode even when the attempted command exited non-zero.",
       "items": {
         "type": "object",
         "required": ["commandOrCheck", "status"],
         "properties": {
           "commandOrCheck": { "type": "string", "minLength": 1 },
-          "status": { "enum": ["passed", "failed", "not_run"] },
+          "status": {
+            "enum": ["passed", "failed", "not_run"],
+            "description": "passed means the check ran and succeeded; failed means it ran to a meaningful verdict and found the work incorrect; not_run means no meaningful verdict was possible because the check was not attempted or could not complete."
+          },
+          "reasonCode": {
+            "description": "Required for not_run; identify why the check had no meaningful verdict.",
+            "enum": [
+              "environment_unavailable",
+              "tool_unavailable",
+              "dependency_missing",
+              "permission_denied",
+              "credential_missing",
+              "policy_restricted",
+              "external_service_unavailable",
+              "budget_exhausted",
+              "other"
+            ]
+          },
           "detail": { "type": "string" },
           "artifactRef": { "type": "string" }
         },
@@ -80,7 +98,19 @@
       },
       "additionalProperties": true
     },
-    "attentionRequests": { "type": "array", "items": { "type": "object" } },
+    "attentionRequests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string", "minLength": 1 },
+          "ownerClass": { "enum": ["human", "agent", "external_system"] },
+          "targetAgentId": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    },
     "artifacts": {
       "type": "array",
       "items": {

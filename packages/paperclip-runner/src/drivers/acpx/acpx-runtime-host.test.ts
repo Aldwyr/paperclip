@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import type {
+  AcpPermissionRequest,
   AcpRuntime,
   AcpRuntimeHandle,
   AcpRuntimeOptions,
@@ -11,7 +12,18 @@ import type {
 } from "acpx/runtime";
 import { describe, expect, it } from "vitest";
 
-import { AcpxRuntimeHost } from "./acpx-runtime-host.js";
+import {
+  NATIVE_RUNTIME_ASSET_SCHEMA,
+  PAPERCLIP_EXECUTION_PROMPT,
+  PAPERCLIP_EXECUTION_PROMPT_REVISION,
+  canonicalNativeRuntimeContextDigest,
+  nativeRuntimePromptDigest,
+  type NativeRuntimeContextSnapshot,
+} from "../../contracts/runtime-context.js";
+import {
+  AcpxRuntimeHost,
+  shouldAutoApproveRunnerOwnedSemanticPermission,
+} from "./acpx-runtime-host.js";
 
 function completedTurn(requestId: string): AcpRuntimeTurn {
   return {
@@ -24,7 +36,113 @@ function completedTurn(requestId: string): AcpRuntimeTurn {
   };
 }
 
+async function createRuntimeContext(root: string): Promise<NativeRuntimeContextSnapshot> {
+  const instructionRoot = join(root, "instruction-source");
+  const skillRoot = join(root, "skill-source");
+  await Promise.all([
+    mkdir(instructionRoot, { recursive: true }),
+    mkdir(join(skillRoot, "references"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(join(instructionRoot, "AGENTS.md"), "Read sibling.md\n"),
+    writeFile(join(instructionRoot, "sibling.md"), "instruction sibling\n"),
+    writeFile(join(skillRoot, "SKILL.md"), "# Assigned\nRead references/support.md\n"),
+    writeFile(join(skillRoot, "references", "support.md"), "skill support\n"),
+  ]);
+  const digest = "0".repeat(64);
+  const value = {
+    prompt: {
+      revision: PAPERCLIP_EXECUTION_PROMPT_REVISION,
+      text: PAPERCLIP_EXECUTION_PROMPT,
+      digest: nativeRuntimePromptDigest(),
+    },
+    instructions: {
+      entryPath: "AGENTS.md",
+      bundle: {
+        schema: NATIVE_RUNTIME_ASSET_SCHEMA,
+        digest,
+        manifestDigest: digest,
+        rootPath: instructionRoot,
+        fileCount: 2,
+        totalBytes: 2,
+      },
+    },
+    skills: [{
+      key: "company/assigned",
+      runtimeName: "assigned",
+      versionId: "version-1",
+      bundle: {
+        schema: NATIVE_RUNTIME_ASSET_SCHEMA,
+        digest,
+        manifestDigest: digest,
+        rootPath: skillRoot,
+        fileCount: 2,
+        totalBytes: 2,
+      },
+    }],
+    mcp: { assignmentSetId: "assigned", digest, bindingId: "binding" },
+  } satisfies Omit<NativeRuntimeContextSnapshot, "aggregateDigest">;
+  return { ...value, aggregateDigest: canonicalNativeRuntimeContextDigest(value) };
+}
+
 describe("AcpxRuntimeHost", () => {
+  it("auto-approves only runner-owned semantic MCP calls for non-Pi ACP agents", () => {
+    const permission = (title: string) => ({
+      raw: { toolCall: { title } },
+    }) as unknown as AcpPermissionRequest;
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "claude",
+      permission("mcp__paperclip__paperclip_finish"),
+    )).toBe(true);
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "codex",
+      ({
+        raw: {
+          _meta: { is_mcp_tool_approval: true },
+          toolCall: {
+            rawInput: { serverName: "paperclip" },
+          },
+        },
+      }) as unknown as AcpPermissionRequest,
+    )).toBe(true);
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "codex",
+      ({
+        raw: {
+          toolCall: {
+            rawInput: { serverName: "paperclip-assigned" },
+          },
+        },
+      }) as unknown as AcpPermissionRequest,
+      new Set(["paperclip", "paperclip-assigned"]),
+    )).toBe(true);
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "codex",
+      ({
+        raw: {
+          _meta: { is_mcp_tool_approval: true },
+          toolCall: {},
+        },
+      }) as unknown as AcpPermissionRequest,
+      new Set(["paperclip", "paperclip-assigned"]),
+      true,
+    )).toBe(true);
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "pi",
+      permission("mcp__paperclip__paperclip_finish"),
+    )).toBe(false);
+    expect(shouldAutoApproveRunnerOwnedSemanticPermission(
+      "codex",
+      ({
+        raw: {
+          _meta: { is_mcp_tool_approval: true },
+          toolCall: {
+            rawInput: { serverName: "company-github" },
+          },
+        },
+      }) as unknown as AcpPermissionRequest,
+    )).toBe(false);
+  });
   it("resolves a pinned profile, isolates state, and keeps credentials out of session records", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-acpx-host-"));
     const workspace = join(root, "workspace");
@@ -128,6 +246,122 @@ describe("AcpxRuntimeHost", () => {
     } finally {
       await host.close({ reason: "test complete" });
     }
+  });
+
+  it.each([
+    { agent: "pi" as const, model: "openrouter/deepseek/deepseek-v4-flash-0731" },
+    { agent: "claude" as const, model: "claude-sonnet-5" },
+    { agent: "codex" as const, model: "gpt-5.6-sol" },
+  ])("realizes the complete Paperclip context for ACPX $agent", async ({ agent, model }) => {
+    const root = await mkdtemp(join(tmpdir(), `paperclip-acpx-${agent}-context-`));
+    const workspace = join(root, "workspace");
+    const tracePath = join(root, "provider-trace.ndjson");
+    await mkdir(workspace);
+    const runtimeContext = await createRuntimeContext(root);
+    const systemInstructions = `${PAPERCLIP_EXECUTION_PROMPT}\n\nRead sibling.md\n\nRead-only instruction sibling root: ${runtimeContext.instructions.bundle.rootPath}`;
+    let capturedOptions: AcpRuntimeOptions | null = null;
+    let ensureInput: Parameters<AcpRuntime["ensureSession"]>[0] | null = null;
+    const host = await AcpxRuntimeHost.open({
+      runtimeDirectory: root,
+      normalizedSessionId: `${agent}-runtime-context`,
+      workingDirectory: workspace,
+      agent,
+      model,
+      systemInstructions,
+      runtimeContext,
+      environment: {
+        PATH: process.env.PATH,
+        PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
+        PAPERCLIP_NATIVE_MCP_URL: "https://paperclip.example/mcp",
+        PAPERCLIP_NATIVE_MCP_TOKEN: "x".repeat(40),
+        PAPERCLIP_PROVIDER_TRACE_PATH: tracePath,
+      },
+      dynamicToolHandler: async () => ({}),
+      runtimeFactory: (options) => {
+        capturedOptions = options;
+        return {
+          ensureSession: async (input) => {
+            ensureInput = input;
+            return {
+              sessionKey: `${agent}-session-key`,
+              backend: "acpx",
+              runtimeSessionName: `${agent}-runtime`,
+              acpxRecordId: `${agent}-record`,
+              backendSessionId: `${agent}-backend`,
+              agentSessionId: `${agent}-agent`,
+            };
+          },
+          startTurn: (input) => completedTurn(input.requestId),
+          runTurn: async function* () {},
+          getStatus: async () => ({
+            acpxRecordId: `${agent}-record`,
+            backendSessionId: `${agent}-backend`,
+            agentSessionId: `${agent}-agent`,
+            models: {
+              currentModelId: agent === "claude" ? "sonnet" : model,
+              availableModelIds: [agent === "claude" ? "sonnet" : model],
+            },
+          }),
+          setConfigOption: async () => {},
+          cancel: async () => {},
+          close: async () => {},
+        };
+      },
+    });
+    try {
+      const options = capturedOptions as AcpRuntimeOptions & { spawnEnvironment?: () => Record<string, string> };
+      const environment = options.spawnEnvironment?.() ?? {};
+      options.onAcpMessage?.("outbound", {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "session/new",
+        params: {},
+      } as never);
+      options.onAcpMessage?.("inbound", {
+        jsonrpc: "2.0",
+        id: 1,
+        result: { sessionId: "provider-session" },
+      } as never);
+      host.correlateProviderFrame(
+        host.latestInboundTraceFrameId(),
+        ["event-1", "event-2", "event-3"],
+        "semantic_tool.paperclip_finish",
+      );
+      expect(environment.PAPERCLIP_ACPX_ISOLATED_CONTEXT).toBe("1");
+      expect(options.elicitationModes).toEqual(agent === "codex" ? [] : ["form", "url"]);
+      expect(ensureInput).toMatchObject({
+        sessionOptions: { systemPrompt: { append: systemInstructions } },
+      });
+      expect(JSON.stringify(ensureInput)).not.toContain("x".repeat(40));
+      await expect(readFile(join(host.runtimeRoot(), `${agent}-home`, "skills", "assigned", "references", "support.md"), "utf8"))
+        .resolves.toBe("skill support\n");
+      if (agent === "pi") {
+        expect(JSON.parse(environment.PI_ACP_PI_ARGS_JSON ?? "[]")).not.toContain("--no-skills");
+        expect(options.mcpServers).toEqual([]);
+        expect(environment.PAPERCLIP_NATIVE_MCP_URL).toBe("https://paperclip.example/mcp");
+      } else {
+        expect(options.mcpServers).toEqual(expect.arrayContaining([
+          expect.objectContaining({ name: "paperclip-assigned", url: "https://paperclip.example/mcp" }),
+        ]));
+      }
+    } finally {
+      await host.close({ reason: "test complete" });
+    }
+    const traceEntries = (await readFile(tracePath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(traceEntries.filter((entry) => entry.kind === "frame")).toHaveLength(2);
+    expect(traceEntries.filter((entry) => entry.kind === "interpretation")).toHaveLength(3);
+    expect(traceEntries).toContainEqual(expect.objectContaining({
+      kind: "interpretation",
+      frameId: 2,
+      stage: "typescript_acpx_runtime_normalization",
+      ruleId: "acpx.runtime.semantic_tool.paperclip_finish",
+      disposition: "mapped",
+      emittedEventIds: ["event-1", "event-2", "event-3"],
+    }));
+    expect(traceEntries.at(-1)).toMatchObject({ kind: "trace_status", status: "complete" });
   });
 
   it("rejects model fallback before starting the runtime", async () => {

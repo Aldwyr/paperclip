@@ -14,6 +14,12 @@ import { logActivity } from "./activity-log.js";
 export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
 export const PROVIDER_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
 
+export function providerTraceRequiredChannels(provider: string): string[] {
+  if (provider === "opencode") return ["typescript_opencode_native"];
+  if (provider === "acpx") return ["typescript_acpx_native"];
+  return ["rust_native", "typescript_runnerd_rehydration"];
+}
+
 type TraceRow = typeof providerTraceRecords.$inferSelect;
 
 function traceRoot() {
@@ -408,9 +414,10 @@ export function providerTraceStore(db: Db) {
         }
       });
     const frames = entries.filter((entry) => entry.kind === "frame");
+    const requiredChannels = providerTraceRequiredChannels(row.provider);
     const integrity = assessProviderTraceEntries(entries, {
       invalidRecordCount,
-      requiredChannels: ["rust_native", "typescript_runnerd_rehydration"],
+      requiredChannels,
     });
     const terminalStatus = failureReason ? "incomplete" : integrity.status;
     return db

@@ -97,8 +97,13 @@
     "test:capability-inventory": "node scripts/check-capability-inventory.test.mjs",
     "test:capability-evals": "vitest run src/conformance/capability-eval-suite.test.ts",
     "test:eval-slice": "vitest run src/eval",
+    "test:runner-workflow-evals": "vitest run src/eval/workflow-evals.test.ts",
+    "check:runner-workflow-traceability": "pnpm run build:typescript && node scripts/check-runner-workflow-traceability.mjs",
     "report:capability-evals": "pnpm run build:typescript && node scripts/run-capability-eval-suite.mjs",
     "report:capability-live-evals": "pnpm run build:typescript && cargo build --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd && node scripts/run-capability-live-eval-matrix.mjs",
+    "report:runner-workflow-evals": "pnpm run build:typescript && node scripts/run-runner-workflow-evals.mjs",
+    "report:runner-live-evals": "pnpm run build:typescript && pnpm run build:runner-binaries && node scripts/run-runner-live-eval-schedule.mjs --mode nightly --execute",
+    "report:runner-chaos-evals": "pnpm run build:typescript && node scripts/run-runner-live-eval-schedule.mjs --mode chaos",
     "check:conformance-parity": "vitest run src/tracer/conformance-runner.test.ts && cargo test --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core runs_the_mock_core_path_with_stable_output && node -e \"process.stdout.write('Rust and TypeScript Conformance tracer output matches the shared golden fixture.\\n')\"",
     "check:replay-parity": "vitest run src/reducer/session-reducer.test.ts && cargo test --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core replay_fixture_parity && node -e \"process.stdout.write('Rust and TypeScript Replay reducer summaries match the shared golden fixtures.\\n')\"",
     "docs:validate": "node scripts/validate-doc-links.mjs && node scripts/validate-okf.mjs",
@@ -142,6 +147,7 @@
     "verify:rootless": "bash scripts/verify-rootless-linux.sh"
   },
   "dependencies": {
+    "@paperclipai/paperclip-eval-kernel": "workspace:*",
     "@agentclientprotocol/claude-agent-acp": "0.70.0",
     "@agentclientprotocol/codex-acp": "1.6.2",
     "@earendil-works/pi-coding-agent": "0.84.2",

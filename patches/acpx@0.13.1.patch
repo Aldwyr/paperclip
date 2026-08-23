@@ -97,7 +97,7 @@ index e8102acb03c4c38830ad5ec22f356125eb0423b7..efea5921f1c5dd5523325bc443469fae
  //#region src/agent-registry.d.ts
  declare const DEFAULT_AGENT_NAME = "codex";
  //#endregion
-@@ -313,6 +313,28 @@ type AcpRuntimeOptions = {
+@@ -313,6 +313,29 @@ type AcpRuntimeOptions = {
    onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
@@ -107,6 +107,7 @@ index e8102acb03c4c38830ad5ec22f356125eb0423b7..efea5921f1c5dd5523325bc443469fae
 +  spawnCwd?: string;
 +  onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void> | void;
 +  onAgentStderr?: (chunk: string) => void;
++  onAcpMessage?: (direction: "inbound" | "outbound", message: unknown) => void;
 +  onAgentExit?: (meta: {
 +    pid?: number;
 +    exitCode: number | null;
@@ -130,7 +131,7 @@ diff --git a/dist/runtime.js b/dist/runtime.js
 index a1f4a70a003792c6eacf68b6b038f37bfec1db53..ee3e155db800222aaf2353906dbad93698d17b74 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
-@@ -812,7 +812,15 @@ var AcpRuntimeManager = class {
+@@ -812,7 +812,16 @@ var AcpRuntimeManager = class {
  		this.deps = deps;
  	}
  	createClient(options) {
@@ -141,13 +142,19 @@ index a1f4a70a003792c6eacf68b6b038f37bfec1db53..ee3e155db800222aaf2353906dbad936
 +			spawnEnvironment: this.options.spawnEnvironment,
 +			onAgentSpawn: this.options.onAgentSpawn,
 +			onAgentStderr: this.options.onAgentStderr,
-+			onAgentExit: this.options.onAgentExit
++			onAgentExit: this.options.onAgentExit,
++			onAcpMessage: this.options.onAcpMessage
 +		};
 +		return this.deps.clientFactory?.(patchedOptions) ?? new AcpClient(patchedOptions);
  	}
  	createSessionOwner(input) {
  		const owner = {
-@@ -827,6 +835,9 @@ var AcpRuntimeManager = class {
+@@ -823,10 +832,14 @@ var AcpRuntimeManager = class {
+ 		input.client.setEventHandlers({
++			onAcpMessage: this.options.onAcpMessage,
+ 			onSessionUpdate: (notification) => this.routeOwnedSessionUpdate(owner, notification),
+ 			onClientOperation: (operation) => this.routeOwnedClientOperation(owner, operation)
+ 		});
  		return owner;
  	}
  	routeOwnedSessionUpdate(owner, notification) {

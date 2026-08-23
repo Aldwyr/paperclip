@@ -16,6 +16,7 @@ const runtimeConfig = JSON.parse(await readFile(join(process.env.XDG_CONFIG_HOME
 const mcp = runtimeConfig.mcp?.paperclip;
 let mcpRequestId = 1;
 const mcpEvidence = { tools: [], calls: [] };
+let pendingQuestion = null;
 
 await mkdir(process.env.XDG_DATA_HOME, { recursive: true });
 await writeFile(join(process.env.XDG_DATA_HOME, "fake-environment.json"), JSON.stringify({
@@ -111,6 +112,25 @@ const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === `/session/${session.id}`) return json(response, 200, session);
   if (request.method === "GET" && request.url === `/session/${session.id}/message`) return json(response, 200, []);
   if (request.method === "GET" && request.url === "/session/status") return json(response, 200, { [session.id]: { type: "idle" } });
+  if (request.method === "GET" && request.url?.startsWith("/question?")) return json(response, 200, pendingQuestion ? [pendingQuestion] : []);
+  if (request.method === "POST" && request.url?.startsWith("/question/question-native-1/reply?")) {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      await writeFile(join(process.env.XDG_DATA_HOME, "fake-question-reply.json"), JSON.stringify({ url: request.url, body }));
+      pendingQuestion = null;
+      json(response, 200, true);
+      setTimeout(() => emit({ type: "session.idle", id: "event-question-idle", properties: { sessionID: session.id } }), 10);
+    });
+    return;
+  }
+  if (request.method === "POST" && request.url?.startsWith("/question/question-native-1/reject?")) {
+    pendingQuestion = null;
+    json(response, 200, true);
+    setTimeout(() => emit({ type: "session.idle", id: "event-question-rejected-idle", properties: { sessionID: session.id } }), 10);
+    return;
+  }
   if (request.method === "POST" && request.url === `/session/${session.id}/abort`) return json(response, 200, true);
   if (request.method === "POST" && request.url === `/session/${session.id}/prompt_async`) {
     const chunks = [];
@@ -123,14 +143,82 @@ const server = createServer(async (request, response) => {
       json(response, 204, null);
       setTimeout(async () => {
         await callFirstPaperclipTool();
-        await callTerminalTool(promptPayload);
+        const parsedPrompt = JSON.parse(promptPayload.parts?.[0]?.text ?? "{}");
+        if (String(parsedPrompt.message ?? "").includes("native-question")) {
+          pendingQuestion = {
+            id: "question-native-1",
+            sessionID: session.id,
+            questions: [
+              {
+                id: "environment",
+                header: "Environment",
+                question: "Where should we deploy?",
+                options: [
+                  { label: "Staging", description: "Deploy to staging first." },
+                  { label: "Production", description: "Deploy directly to production." }
+                ],
+                custom: true
+              },
+              {
+                id: "regions",
+                header: "Regions",
+                question: "Which regions?",
+                options: [{ label: "US" }, { label: "EU" }],
+                multiple: true
+              }
+            ]
+          };
+          emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
+          return;
+        }
+        if (String(parsedPrompt.message ?? "").includes("session-aborted")) {
+          emit({
+            type: "session.error",
+            id: "event-session-aborted",
+            properties: {
+              sessionID: session.id,
+              error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+            },
+          });
+          return;
+        }
+        const textBeforeFinish = String(parsedPrompt.message ?? "").includes("text-before-finish");
+        const correlatedFinal = String(parsedPrompt.message ?? "").includes("correlated-final-message");
+        const finalAfterToolCommentary = String(parsedPrompt.message ?? "").includes("final-after-tool-commentary");
+        const commentaryOnlyBeforeWork = String(parsedPrompt.message ?? "").includes("commentary-only-before-work");
         emit({ type: "message.updated", id: "event-user", properties: { sessionID: session.id, info: { id: "message-user", sessionID: session.id, role: "user" } } });
         emit({ type: "message.part.updated", id: "event-user-part", properties: { sessionID: session.id, part: { id: "part-user", messageID: "message-user", type: "text", text: "submitted prompt must not become assistant text" } } });
         emit({ type: "message.updated", id: "event-assistant", properties: { sessionID: session.id, info: { id: "message-assistant", sessionID: session.id, role: "assistant" } } });
         emit({ type: "message.part.updated", id: "event-patch", properties: { sessionID: session.id, part: { id: "part-patch", messageID: "message-assistant", type: "patch", files: ["src/index.ts"] } } });
-        emit({ type: "message.part.updated", id: "event-1", properties: { sessionID: session.id, part: { id: "part-1", messageID: "message-assistant", type: "text", text: "done [guide](guide.md)" } } });
-        emit({ type: "message.part.updated", id: "event-1", properties: { sessionID: session.id, part: { id: "part-1", messageID: "message-assistant", type: "text", text: "done" } } });
-        emit({ type: "message.updated", id: "event-2", properties: { info: { sessionID: session.id, tokens: { input: 3, output: 2 }, cost: 0.001 } } });
+        if (commentaryOnlyBeforeWork) {
+          emit({ type: "message.part.updated", id: "event-opening-commentary", properties: { sessionID: session.id, part: { id: "part-opening-commentary", messageID: "message-assistant", type: "text", text: "I will inspect the workspace first.", time: { start: 1, end: 2 } } } });
+          emit({ type: "message.part.updated", id: "event-work-tool", properties: { sessionID: session.id, part: { id: "part-work-tool", messageID: "message-assistant", type: "tool", tool: "bash", state: { status: "completed", input: { command: "pwd" }, output: "/workspace" } } } });
+          await callTerminalTool(promptPayload);
+        } else if (finalAfterToolCommentary) {
+          emit({ type: "message.part.updated", id: "event-tool-commentary", properties: { sessionID: session.id, part: { id: "part-tool-commentary", messageID: "message-assistant", type: "text", text: "The schema might need another value; I will try again.", time: { start: 1, end: 2 } } } });
+          await callTerminalTool(promptPayload);
+          emit({ type: "message.part.updated", id: "event-tool-part", properties: { sessionID: session.id, part: { id: "part-tool", messageID: "message-assistant", type: "tool", tool: "paperclip_paperclip_finish", state: { status: "completed", output: "accepted" } } } });
+          emit({ type: "message.updated", id: "event-post-tool-final-message", properties: { sessionID: session.id, info: { id: "message-post-tool-final", sessionID: session.id, role: "assistant" } } });
+          emit({ type: "message.part.updated", id: "event-post-tool-final", properties: { sessionID: session.id, part: { id: "part-post-tool-final", messageID: "message-post-tool-final", type: "text", text: "This is the complete substantive answer emitted after the accepted completion tool call.", time: { start: 3, end: 4 } } } });
+        } else if (correlatedFinal) {
+          emit({ type: "message.part.updated", id: "event-commentary", properties: { sessionID: session.id, part: { id: "part-commentary", messageID: "message-assistant", type: "text", text: "I will write the result now.", time: { start: 1, end: 2 } } } });
+          await callTerminalTool(promptPayload);
+          emit({ type: "message.updated", id: "event-final-message", properties: { sessionID: session.id, info: { id: "message-final", sessionID: session.id, role: "assistant" } } });
+          emit({ type: "message.part.updated", id: "event-finish-part", properties: { sessionID: session.id, part: { id: "part-finish", messageID: "message-final", type: "tool", tool: "paperclip_paperclip_finish", state: { status: "completed", output: "accepted" } } } });
+          emit({ type: "message.part.updated", id: "event-correlated-answer", properties: { sessionID: session.id, part: { id: "part-correlated-answer", messageID: "message-final", type: "text", text: "Correlated substantive final answer.", time: { start: 3, end: 4 } } } });
+          emit({ type: "message.part.updated", id: "event-duplicate-finish", properties: { sessionID: session.id, part: { id: "part-duplicate-finish", messageID: "message-final", type: "tool", tool: "unknown", callID: "functions.paperclip_paperclip_finish:24", state: { status: "error", error: "Tool execution aborted", metadata: { interrupted: true } } } } });
+          emit({ type: "message.updated", id: "event-trailing-message", properties: { sessionID: session.id, info: { id: "message-trailing", sessionID: session.id, role: "assistant" } } });
+          emit({ type: "message.part.updated", id: "event-trailing-ack", properties: { sessionID: session.id, part: { id: "part-trailing-ack", messageID: "message-trailing", type: "text", text: "Done.", time: { start: 5, end: 6 } } } });
+        } else if (textBeforeFinish) {
+          emit({ type: "message.part.updated", id: "event-answer", properties: { sessionID: session.id, part: { id: "part-answer", messageID: "message-assistant", type: "text", text: "Substantive answer before finish.", time: { start: 1, end: 2 } } } });
+          await callTerminalTool(promptPayload);
+          emit({ type: "message.part.updated", id: "event-ack", properties: { sessionID: session.id, part: { id: "part-ack", messageID: "message-assistant", type: "text", text: "Done.", time: { start: 3, end: 4 } } } });
+        } else {
+          await callTerminalTool(promptPayload);
+          emit({ type: "message.part.updated", id: "event-1", properties: { sessionID: session.id, part: { id: "part-1", messageID: "message-assistant", type: "text", text: "done [guide](guide.md)", time: { start: 1, end: 2 } } } });
+          emit({ type: "message.part.updated", id: "event-1", properties: { sessionID: session.id, part: { id: "part-1", messageID: "message-assistant", type: "text", text: "done" } } });
+        }
+        emit({ type: "message.updated", id: "event-2", properties: { info: { id: "message-assistant", sessionID: session.id, role: "assistant", tokens: { input: 3, output: 2 }, cost: 0.001 } } });
         emit({ type: "session.idle", id: "event-3", properties: { sessionID: session.id } });
       }, 100);
     });

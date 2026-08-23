@@ -16,12 +16,14 @@ vi.mock("@/api/instanceSettings", () => ({
 
 const mockPanelState = vi.hoisted(() => ({
   panelContent: null as unknown,
+  panelContentMode: "padded" as const,
   panelVisible: true,
 }));
 
 vi.mock("../context/PanelContext", () => ({
   usePanel: () => ({
     panelContent: mockPanelState.panelContent,
+    panelContentMode: mockPanelState.panelContentMode,
     panelVisible: mockPanelState.panelVisible,
     openPanel: vi.fn(),
     closePanel: vi.fn(),
@@ -85,7 +87,7 @@ describe("PropertiesPanel", () => {
       expect(aside).not.toBeNull();
       expect(aside!.style.width).toBe("320px");
       expect(aside!.querySelector('[role="separator"]')).toBeNull();
-      expect(container.querySelector('[aria-label="Maximize panel"]')).toBeNull();
+      expect(container.querySelector('[aria-label="Maximize side panel"]')).toBeNull();
       // Inner wrapper keeps the hardcoded width classes exactly as today.
       expect(aside!.querySelector(".w-80")).not.toBeNull();
     });
@@ -111,7 +113,7 @@ describe("PropertiesPanel", () => {
       expect(aside).not.toBeNull();
       expect(aside!.style.width).toBe("322px");
       expect(aside!.querySelector('[role="separator"][aria-label="Resize panel"]')).not.toBeNull();
-      expect(container.querySelector('[aria-label="Maximize panel"]')).not.toBeNull();
+      expect(container.querySelector('[aria-label="Maximize side panel"]')).not.toBeNull();
       const inner = aside!.querySelector<HTMLDivElement>(":scope > div:not([role])");
       expect(inner!.style.width).toBe("322px");
       expect(inner!.style.minWidth).toBe("322px");

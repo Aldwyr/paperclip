@@ -7,10 +7,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TaskChatThread } from "./TaskChatThread";
-import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
+import type { IssueDocument, IssueQueuedCommentQueue, IssueThreadInteraction } from "@paperclipai/shared";
 
 const transcriptState = vi.hoisted(() => ({ transcriptByRun: new Map() }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
+const planState = vi.hoisted(() => ({ data: null as IssueDocument | null }));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
   useLiveRunTranscripts: () => transcriptState,
@@ -19,7 +20,7 @@ vi.mock("@/context/SidebarContext", () => ({
   useSidebar: () => ({ isMobile: sidebarState.isMobile }),
 }));
 vi.mock("@/hooks/useIssuePlanDocument", () => ({
-  useIssuePlanDocument: () => ({ data: null }),
+  useIssuePlanDocument: () => planState,
 }));
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, ...props }: { to: string; children: React.ReactNode }) => (
@@ -43,6 +44,7 @@ beforeEach(() => {
   localStorage.clear();
   transcriptState.transcriptByRun.clear();
   sidebarState.isMobile = false;
+  planState.data = null;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -73,6 +75,70 @@ function fakeScrollGeometry(
     },
     configurable: true,
   });
+}
+
+function planDocument(overrides: Partial<IssueDocument> = {}): IssueDocument {
+  return {
+    id: "document-plan",
+    companyId: "company-1",
+    issueId: "issue-1",
+    key: "plan",
+    title: "Plan",
+    format: "markdown",
+    body: "# Preview the Plan\n- Reuse the review card.\n- Stream live steps.\n- Reconcile the revision.",
+    latestRevisionId: "revision-3",
+    latestRevisionNumber: 3,
+    createdByAgentId: "agent-1",
+    createdByUserId: null,
+    updatedByAgentId: "agent-1",
+    updatedByUserId: null,
+    lockedAt: null,
+    lockedByAgentId: null,
+    lockedByUserId: null,
+    createdAt: new Date("2026-08-23T10:00:00.000Z"),
+    updatedAt: new Date("2026-08-23T10:01:00.000Z"),
+    ...overrides,
+  };
+}
+
+function planReviewInteraction(status: "pending" | "accepted" = "pending", revisionId = "revision-3"): IssueThreadInteraction {
+  return {
+    id: "plan-review",
+    companyId: "company-1",
+    issueId: "issue-1",
+    kind: "request_confirmation",
+    title: "Review the Plan",
+    summary: null,
+    status,
+    continuationPolicy: "wake_assignee",
+    resolverPolicy: "anyone",
+    requestedResolverPolicy: "anyone",
+    effectiveResolverPolicy: "anyone",
+    resolverPolicyProvenance: "inherited",
+    effectiveResolverPolicySource: "requested",
+    legacyResolverPolicyAliases: { requested: "board_or_agents", effective: "board_or_agents" },
+    createdByAgentId: "agent-1",
+    createdByUserId: null,
+    resolvedByAgentId: null,
+    resolvedByUserId: status === "accepted" ? "user-1" : null,
+    createdAt: new Date("2026-08-23T10:01:01.000Z"),
+    updatedAt: new Date("2026-08-23T10:01:01.000Z"),
+    resolvedAt: status === "accepted" ? new Date("2026-08-23T10:02:00.000Z") : null,
+    payload: {
+      version: 1,
+      prompt: "Approve this Plan?",
+      target: {
+        type: "issue_document",
+        issueId: "issue-1",
+        documentId: "document-plan",
+        key: "plan",
+        revisionId,
+        revisionNumber: 3,
+        label: "Plan revision 3",
+      },
+    },
+    result: status === "accepted" ? { outcome: "accepted" } : null,
+  } as IssueThreadInteraction;
 }
 
 describe("TaskChatThread draft pass-through", () => {
@@ -157,6 +223,131 @@ describe("TaskChatThread causal comment ordering", () => {
     expect(text.indexOf("Initial recipe request")).toBeLessThan(text.indexOf("Pork shoulder recipe"));
     expect(text.indexOf("Pork shoulder recipe")).toBeLessThan(text.indexOf("What about BBQ sauce?"));
     expect(text.indexOf("What about BBQ sauce?")).toBeLessThan(text.indexOf("BBQ sauce recipe"));
+  });
+
+  it("places same-turn steering between collapsed work and the final reply", () => {
+    transcriptState.transcriptByRun.set("run-steered", [
+      {
+        kind: "assistant",
+        ts: "2026-08-22T12:01:30.000Z",
+        channel: "commentary",
+        text: "Implementing the original request.",
+      },
+      {
+        kind: "assistant",
+        ts: "2026-08-22T12:02:30.000Z",
+        channel: "commentary",
+        text: "Incorporating the steering request.",
+      },
+    ]);
+    const comment = (
+      id: string,
+      body: string,
+      createdAt: string,
+      authorType: "user" | "agent",
+      extra: Record<string, unknown> = {},
+    ) => ({
+      id,
+      companyId: "company-1",
+      issueId: "issue-1",
+      authorType,
+      authorAgentId: authorType === "agent" ? "agent-1" : null,
+      authorUserId: authorType === "user" ? "user-1" : null,
+      body,
+      presentation: null,
+      metadata: null,
+      createdAt: new Date(createdAt),
+      updatedAt: new Date(createdAt),
+      ...extra,
+    });
+
+    render(<TaskChatThread
+      comments={[
+        comment("initial", "Initial implementation request", "2026-08-22T12:00:00.000Z", "user"),
+        comment("steer", "Also add kebab case", "2026-08-22T12:00:30.000Z", "user", {
+          consumedByRunId: "run-steered",
+          steeredIntoRunId: "run-steered",
+          conversationAnchorAt: "2026-08-22T12:02:00.000Z",
+          conversationAnchorSequence: 0,
+        }),
+        comment("reply", "Implemented both requests", "2026-08-22T12:03:00.000Z", "agent", {
+          runId: "run-steered",
+        }),
+      ]}
+      linkedRuns={[{
+        runId: "run-steered",
+        status: "succeeded",
+        agentId: "agent-1",
+        agentName: "Runner",
+        adapterType: "paperclip_runner",
+        createdAt: "2026-08-22T12:01:00.000Z",
+        startedAt: "2026-08-22T12:01:00.000Z",
+        finishedAt: "2026-08-22T12:03:00.000Z",
+        resultJson: null,
+      }]}
+      onAdd={async () => {}}
+    />);
+
+    const text = container.textContent ?? "";
+    expect(text.indexOf("Initial implementation request")).toBeLessThan(text.indexOf("Worked"));
+    expect(text.indexOf("Worked")).toBeLessThan(text.indexOf("Also add kebab case"));
+    expect(text.indexOf("Also add kebab case")).toBeLessThan(text.lastIndexOf("Worked"));
+    expect(text.lastIndexOf("Worked")).toBeLessThan(text.indexOf("Implemented both requests"));
+  });
+});
+
+describe("TaskChatThread Plan previews", () => {
+  it("renders the canonical Plan document instead of a created divider", () => {
+    planState.data = planDocument();
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueId="issue-1" />);
+
+    const preview = container.querySelector('[data-testid="task-chat-plan-preview"]');
+    expect(preview?.getAttribute("href")).toBe("#document-plan");
+    expect(preview?.textContent).toContain("Plan· rev 3");
+    expect(preview?.textContent).toContain("Preview the Plan");
+    expect(container.textContent).not.toContain("Plan created");
+  });
+
+  it("lets a visible pending review own the same revision preview, then restores the standalone card", () => {
+    planState.data = planDocument();
+    render(
+      <TaskChatThread
+        comments={[]}
+        interactions={[planReviewInteraction("pending")]}
+        onAdd={async () => {}}
+        issueId="issue-1"
+      />,
+    );
+
+    expect(container.querySelectorAll('a[href="#document-plan"]')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="plan-review-preview"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-plan-preview"]')).toBeNull();
+
+    render(
+      <TaskChatThread
+        comments={[]}
+        interactions={[planReviewInteraction("accepted")]}
+        onAdd={async () => {}}
+        issueId="issue-1"
+      />,
+    );
+    expect(container.querySelector('[data-testid="plan-review-preview"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-plan-preview"]')).not.toBeNull();
+  });
+
+  it("keeps the standalone preview when the pending review targets another revision", () => {
+    planState.data = planDocument();
+    render(
+      <TaskChatThread
+        comments={[]}
+        interactions={[planReviewInteraction("pending", "revision-2")]}
+        onAdd={async () => {}}
+        issueId="issue-1"
+      />,
+    );
+
+    expect(container.querySelector('[data-testid="plan-review-preview"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-plan-preview"]')).not.toBeNull();
   });
 });
 

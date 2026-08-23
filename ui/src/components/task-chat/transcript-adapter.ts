@@ -140,6 +140,17 @@ function thoughtDurationLabel(startTs: string | undefined, endTs: string): strin
   return secs < 60 ? `Thought for ${secs}s` : `Thought for ${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
+/** Append token deltas onto the open logical line while preserving real newlines. */
+function appendThinkingText(lines: string[], text: string, delta: boolean | undefined) {
+  const fragments = text.split("\n");
+  if (!delta || lines.length === 0) {
+    lines.push(...fragments);
+    return;
+  }
+  lines[lines.length - 1] = `${lines[lines.length - 1] ?? ""}${fragments[0] ?? ""}`;
+  lines.push(...fragments.slice(1));
+}
+
 const DETAIL_MAX = 600;
 const PROTOCOL_OUTPUT_MAX = 8 * 1024;
 
@@ -282,6 +293,7 @@ function providerActivityItem(
     children,
     output: rawOutput ? rawOutput.slice(0, PROTOCOL_OUTPUT_MAX) : undefined,
     outputTruncated,
+    transcriptIndex: index,
   };
 }
 
@@ -335,9 +347,10 @@ export function transcriptToTaskChatItems(
           const it = items[thinkingIndex];
           if (it.kind === "thinking") {
             if (entry.text) {
-              it.lines.push(...entry.text.split("\n"));
+              appendThinkingText(it.lines, entry.text, entry.delta);
               it.lifecycleOnly = false;
             }
+            it.transcriptIndex = i;
             const startTs = thinkingStartTs.get(thinkingIndex);
             const label = thoughtDurationLabel(startTs, entry.ts);
             if (label) it.summaryLabel = label;
@@ -354,6 +367,7 @@ export function transcriptToTaskChatItems(
             collapsed: !running,
             channel: entry.channel,
             lifecycleOnly,
+            transcriptIndex: i,
           });
           thinkingIndex = items.length - 1;
           thinkingChannel = entry.channel;
@@ -374,7 +388,10 @@ export function transcriptToTaskChatItems(
         const channel = entry.channel;
         if (messageIndex >= 0 && messageChannel === channel) {
           const it = items[messageIndex];
-          if (it.kind === "message") it.text += entry.text;
+          if (it.kind === "message") {
+            it.text += entry.text;
+            it.transcriptIndex = i;
+          }
         } else {
           const atMs = Date.parse(entry.ts);
           items.push({
@@ -390,6 +407,7 @@ export function transcriptToTaskChatItems(
             interstitial: channel !== "final",
             channel,
             atMs: Number.isFinite(atMs) ? atMs : undefined,
+            transcriptIndex: i,
           });
           messageIndex = items.length - 1;
           messageChannel = channel;
@@ -570,6 +588,7 @@ export function transcriptToTaskChatItems(
           prompt: entry.prompt,
           choices: entry.choices,
           fields: entry.fields,
+          questionSet: entry.questionSet,
         };
         const existingIndex = protocolIndexByKey.get(key);
         if (existingIndex == null) {
@@ -677,6 +696,34 @@ export function transcriptToTaskChatItems(
     for (const [idx, it] of items.entries()) {
       if (it.kind === "message" && idx !== messageIndex) it.streaming = false;
     }
+  } else {
+    // A terminal transcript cannot retain live spinners forever when a
+    // provider disconnects or the operator cancels while a tool is active.
+    // Preserve the unfinished lifecycle honestly instead of inventing a
+    // success/failure result the provider never emitted.
+    for (const item of items) {
+      if (item.kind === "tool" && (item.status === "pending" || item.status === "in_progress")) {
+        item.status = "interrupted";
+        item.detail = item.detail
+          ? `${item.detail}\nInterrupted before the provider reported completion.`
+          : "Interrupted before the provider reported completion.";
+      } else if (
+        item.kind === "protocol" &&
+        item.surface === "provider_activity" &&
+        item.status === "running"
+      ) {
+        item.status = "interrupted";
+        item.summary = item.summary
+          ? `${item.summary} · Interrupted before completion.`
+          : "Interrupted before completion.";
+      } else if (
+        item.kind === "protocol" &&
+        item.surface === "runtime_request" &&
+        item.status === "pending"
+      ) {
+        item.status = "cancelled";
+      }
+    }
   }
 
   return items;
@@ -743,6 +790,7 @@ export function paperclipRunnerActivityItems(parsed: readonly TaskChatItem[]): T
       case "interaction":
       case "turn":
       case "brief":
+      case "plan_document":
         return false;
     }
   });

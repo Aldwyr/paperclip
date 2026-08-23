@@ -1,5 +1,6 @@
 import { useMemo, useState, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { IssueDocument } from "@paperclipai/shared";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import { paperclipRunnerUIAdapter } from "@/adapters/paperclip-runner";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
@@ -217,6 +218,61 @@ const mixedLiveActivity: TaskChatItem[] = [
   { id: "test", kind: "tool", name: "Command", rawName: "bash", target: "pnpm vitest TaskChatRunnerTurn", status: "in_progress", detail: "82 tests running" },
 ];
 
+const savedPlanDocument: IssueDocument = {
+  id: "storybook-plan",
+  companyId: "storybook-company",
+  issueId: "storybook-issue",
+  key: "plan",
+  title: "Plan",
+  format: "markdown",
+  body: "# Plan preview and streaming reasoning\n\n- Extract the review preview into a shared card.\n- Stream provider plan and reasoning events in place.\n- Reconcile live Plan activity to the canonical revision.\n- Verify desktop and mobile task layouts.",
+  latestRevisionId: "storybook-plan-revision-4",
+  latestRevisionNumber: 4,
+  createdByAgentId: "storybook-agent",
+  createdByUserId: null,
+  updatedByAgentId: "storybook-agent",
+  updatedByUserId: null,
+  lockedAt: null,
+  lockedByAgentId: null,
+  lockedByUserId: null,
+  createdAt: new Date("2026-08-23T11:50:00.000Z"),
+  updatedAt: new Date("2026-08-23T12:00:00.000Z"),
+};
+
+const streamingPlanActivity = providerActivity("plan", "plan.updated", "running", {
+  title: "Plan",
+  details: [{ label: "Revision", value: "5" }],
+  steps: [
+    { id: "plan-step-1", label: "Reuse the Plan review preview", status: "completed" },
+    { id: "plan-step-2", label: "Stream provider-authored plan steps", status: "in_progress" },
+    { id: "plan-step-3", label: "Reconcile the saved revision", status: "pending" },
+  ],
+  transcriptIndex: 3,
+});
+
+const longOpenCodeReasoning: TaskChatItem[] = [
+  { id: "opencode-commentary", kind: "message", author: "agent", text: "I’m checking the thread model and the existing Plan review card.", interstitial: true, channel: "progress", transcriptIndex: 1 },
+  {
+    id: "opencode-reasoning",
+    kind: "thinking",
+    channel: "detail",
+    streaming: true,
+    transcriptIndex: 4,
+    lines: [
+      "The current Plan marker is a presentation-only item, so replacing it with a canonical document item does not require a protocol or persistence change.",
+      "The folded runner can arbitrate provider-authored commentary and reasoning by the latest transcript event while the expanded activity list keeps both blocks available for inspection.",
+      "The last visible line is intentionally much longer than the available row so the one-line OpenCode reasoning ticker demonstrates truncation without losing the complete provider trace in expanded history.",
+    ],
+  },
+];
+
+const commentaryReasoningAlternation: TaskChatItem[] = [
+  { id: "alternation-commentary-1", kind: "message", author: "agent", text: "First I’ll inspect the Plan review component.", interstitial: true, channel: "progress", transcriptIndex: 1 },
+  { id: "alternation-reasoning-1", kind: "thinking", lines: ["The review preview already has the correct information hierarchy."], channel: "summary", transcriptIndex: 2 },
+  { id: "alternation-commentary-2", kind: "message", author: "agent", text: "The shared card is ready; now I’m testing stream reconciliation.", interstitial: true, channel: "progress", transcriptIndex: 3 },
+  { id: "alternation-reasoning-2", kind: "thinking", lines: ["A canonical document updated after the run starts can safely replace the live provider draft."], channel: "detail", streaming: true, transcriptIndex: 4 },
+];
+
 const allProviderActivity: TaskChatItem[] = [
   providerActivity("plan", "plan.updated", "completed", { summary: "Three implementation steps", steps: [{ id: "step-1", label: "Build disclosure", status: "completed" }, { id: "step-2", label: "Add stories", status: "in_progress" }] }),
   providerActivity("tool_execution", "tool.execution.completed", "completed", { summary: "pnpm vitest", output: "82 tests passed" }),
@@ -425,6 +481,49 @@ export const RunnerThinkingNoEvents: Story = {
     await expect(canvas.getByTestId("task-chat-current-activity")).toHaveTextContent("Thinking");
     await expect(canvas.queryByTestId("task-chat-current-activity-icon")).not.toBeInTheDocument();
     await expect(canvas.queryByTestId("task-chat-runner-disclosure-caret")).not.toBeInTheDocument();
+  },
+};
+
+export const SavedPlanPreview: Story = {
+  name: "Plan Preview / Saved Revision",
+  render: () => <ThreadStory items={[{ id: "saved-plan", kind: "plan_document", document: savedPlanDocument }]} />,
+};
+
+export const SavedPlanPreviewMobile: Story = {
+  name: "Plan Preview / Saved Revision / Mobile",
+  render: () => (
+    <div className="mx-auto max-w-(--sz-390px)">
+      <ThreadStory items={[{ id: "saved-plan-mobile", kind: "plan_document", document: savedPlanDocument }]} />
+    </div>
+  ),
+};
+
+export const RunnerStreamingPlanSteps: Story = {
+  name: "Plan Preview / Streaming Provider Steps",
+  render: () => <RunnerTurnStory items={[streamingPlanActivity]} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByTestId("task-chat-live-plan-preview")).toHaveTextContent("Stream provider-authored plan steps");
+    await userEvent.click(canvas.getByRole("button", { name: /expand run activity/i }));
+    await expect(canvas.queryByTestId("task-chat-live-plan-preview")).not.toBeInTheDocument();
+    await expect(canvas.getByTestId("task-chat-runner-activity-list")).toHaveTextContent("Plan");
+  },
+};
+
+export const RunnerLongOpenCodeReasoning: Story = {
+  name: "Runner Activity / Reasoning / Long OpenCode Trace",
+  render: () => <RunnerTurnStory items={longOpenCodeReasoning} />,
+};
+
+export const RunnerCommentaryReasoningAlternation: Story = {
+  name: "Runner Activity / Reasoning / Commentary Alternation",
+  render: () => <RunnerTurnStory items={commentaryReasoningAlternation} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByTestId("task-chat-reasoning-ticker")).toHaveTextContent("canonical document");
+    await userEvent.click(canvas.getByRole("button", { name: /expand run activity/i }));
+    await expect(canvas.getAllByTestId("task-chat-activity-commentary")).toHaveLength(2);
+    await expect(canvas.getAllByTestId("task-chat-thinking")).toHaveLength(2);
   },
 };
 

@@ -83,6 +83,7 @@ export interface WatchdogDecisionInput {
 }
 
 export type RuntimeRequestKind =
+  | "runtime"
   | "command_approval"
   | "file_approval"
   | "permission_approval"
@@ -92,7 +93,8 @@ export type RuntimeRequestKind =
 export type RuntimeRequestResolution =
   | { action: "accept" | "accept_for_session" | "decline" | "cancel" }
   | { action: "submit"; answers: Record<string, { answers: string[] }> }
-  | { action: "submit"; content: Record<string, unknown> };
+  | { action: "submit"; content: Record<string, unknown> }
+  | { action: "submit"; response: import("@paperclipai/adapter-utils").PaperclipQuestionResponse };
 
 export interface HeartbeatRunListOptions {
   summary?: boolean;

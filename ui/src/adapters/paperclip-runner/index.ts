@@ -1,4 +1,4 @@
-import type { TranscriptEntry } from "@paperclipai/adapter-utils";
+import type { PaperclipQuestion, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
 import type { UIAdapterModule } from "../types";
 import { parseCodexStdoutLine, buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { CodexLocalConfigFields } from "../codex-local/config-fields";
@@ -419,7 +419,9 @@ function runtimeRequestEntry(
     ? rawStatus
     : "pending";
   const rawKind = text(request.requestKind, previous?.requestKind ?? undefined);
-  const requestKind = rawKind === "command_approval"
+  const requestKind = rawKind === "runtime"
+    ? "runtime"
+    : rawKind === "command_approval"
     || rawKind === "file_approval"
     || rawKind === "permission_approval"
     || rawKind === "user_input"
@@ -471,6 +473,7 @@ function runtimeRequestEntry(
     }))
     .filter((field) => field.name && field.label)
     .slice(0, 16);
+  const questionSet = parseQuestionSet(request.input) ?? previous?.questionSet ?? null;
   const entry: Extract<TranscriptEntry, { kind: "runtime_request" }> = {
     kind: "runtime_request",
     ts,
@@ -482,9 +485,54 @@ function runtimeRequestEntry(
     prompt: text(request.prompt, previous?.prompt ?? "Runtime approval requested"),
     choices,
     fields,
+    questionSet,
   };
   state.runtimeRequests.set(requestId, entry);
   return entry;
+}
+
+function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
+  const input = record(value);
+  if (input.schema !== "paperclip.question_set.v1" || !Array.isArray(input.questions) || input.questions.length === 0) return null;
+  const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex) => {
+    const answerMode: PaperclipQuestion["answerMode"] = question.answerMode === "single_select" || question.answerMode === "multi_select" ? question.answerMode : "text";
+    const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
+      id: text(option.id, `option-${optionIndex + 1}`).slice(0, 160),
+      label: text(option.label, `Option ${optionIndex + 1}`).slice(0, 1_000),
+      ...(nullableText(option.description) ? { description: text(option.description).slice(0, 4_000) } : {}),
+    }));
+    const customAnswer = record(question.customAnswer);
+    const validation = record(question.textValidation);
+    return {
+      id: text(question.id, `question-${questionIndex + 1}`).slice(0, 160),
+      ...(nullableText(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
+      prompt: text(question.prompt, `Question ${questionIndex + 1}`).slice(0, 4_000),
+      ...(nullableText(question.helpText) ? { helpText: text(question.helpText).slice(0, 4_000) } : {}),
+      required: question.required === true,
+      answerMode,
+      ...(answerMode !== "text" ? { options } : {}),
+      ...(customAnswer.enabled === true ? { customAnswer: {
+        enabled: true as const,
+        ...(nullableText(customAnswer.label) ? { label: text(customAnswer.label).slice(0, 1_000) } : {}),
+        ...(nullableText(customAnswer.placeholder) ? { placeholder: text(customAnswer.placeholder).slice(0, 1_000) } : {}),
+      } } : {}),
+      ...(Object.keys(validation).length > 0 ? { textValidation: {
+        ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
+        ...(typeof validation.maxLength === "number" ? { maxLength: validation.maxLength } : {}),
+        ...(typeof validation.pattern === "string" ? { pattern: validation.pattern.slice(0, 1_000) } : {}),
+        ...(validation.inputType === "number" || validation.inputType === "integer" || validation.inputType === "text" ? { inputType: validation.inputType } : {}),
+        ...(typeof validation.minimum === "number" ? { minimum: validation.minimum } : {}),
+        ...(typeof validation.maximum === "number" ? { maximum: validation.maximum } : {}),
+      } } : {}),
+    };
+  });
+  return {
+    schema: "paperclip.question_set.v1",
+    ...(nullableText(input.title) ? { title: text(input.title).slice(0, 1_000) } : {}),
+    ...(nullableText(input.description) ? { description: text(input.description).slice(0, 4_000) } : {}),
+    ...(nullableText(input.submitLabel) ? { submitLabel: text(input.submitLabel).slice(0, 200) } : {}),
+    questions,
+  };
 }
 
 function runResultEntry(payload: JsonRecord, ts: string): Extract<TranscriptEntry, { kind: "run_result" }> {

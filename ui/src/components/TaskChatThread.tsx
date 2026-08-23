@@ -129,7 +129,7 @@ const EMPTY_LIVE_ISSUE_IDS: ReadonlySet<string> = new Set<string>();
 const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
 
-function acceptedSemanticResultSummary(value: unknown): string | null {
+function acceptedSemanticResult(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const resultJson = value as Record<string, unknown>;
   const semanticResult = resultJson.semanticResult;
@@ -147,10 +147,49 @@ function acceptedSemanticResultSummary(value: unknown): string | null {
       continue;
     const result = candidate as Record<string, unknown>;
     if (result.schema !== "paperclip.run_result.v1") continue;
-    if (typeof result.summary === "string" && result.summary.trim())
-      return result.summary;
+    return result;
   }
   return null;
+}
+
+function acceptedSemanticResultSummary(value: unknown): string | null {
+  const result = acceptedSemanticResult(value);
+  return typeof result?.summary === "string" && result.summary.trim()
+    ? result.summary
+    : null;
+}
+
+function acceptedSemanticResultVerificationCaveats(value: unknown) {
+  const runResult = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const finalizedCaveats = Array.isArray(runResult.verificationCaveats)
+    ? runResult.verificationCaveats
+    : [];
+  if (finalizedCaveats.length > 0) {
+    return finalizedCaveats.flatMap((candidate) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+      const caveat = candidate as Record<string, unknown>;
+      if (typeof caveat.commandOrCheck !== "string") return [];
+      return [{
+        commandOrCheck: caveat.commandOrCheck,
+        reasonCode: typeof caveat.reasonCode === "string" ? caveat.reasonCode : null,
+        detail: typeof caveat.detail === "string" ? caveat.detail : null,
+      }];
+    });
+  }
+  const result = acceptedSemanticResult(value);
+  const verification = Array.isArray(result?.verification) ? result.verification : [];
+  return verification.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    const check = candidate as Record<string, unknown>;
+    if (check.status !== "not_run" || typeof check.commandOrCheck !== "string") return [];
+    return [{
+      commandOrCheck: check.commandOrCheck,
+      reasonCode: typeof check.reasonCode === "string" ? check.reasonCode : null,
+      detail: typeof check.detail === "string" ? check.detail : null,
+    }];
+  });
 }
 
 function resolvedWithoutUserFacingResponse(value: unknown): boolean {
@@ -422,6 +461,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return map;
   }, [linkedRuns]);
 
+  const verificationCaveatsByRunId = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof acceptedSemanticResultVerificationCaveats>>();
+    for (const run of linkedRuns ?? []) {
+      const caveats = acceptedSemanticResultVerificationCaveats(run.resultJson);
+      if (caveats.length > 0) map.set(run.runId, caveats);
+    }
+    return map;
+  }, [linkedRuns]);
+
   // Historical placeholder comments remain untouched in storage. Projection
   // prefers the accepted semantic result so runs such as DOT-20 recover their
   // real upstream response without a data migration.
@@ -445,6 +493,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         userLabelMap,
         currentUserId,
         issueAssigneeAgentId,
+        verificationCaveatsByRunId,
       }),
     [
       projectedComments,
@@ -452,6 +501,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       userLabelMap,
       currentUserId,
       issueAssigneeAgentId,
+      verificationCaveatsByRunId,
     ],
   );
 
@@ -572,6 +622,34 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (comment.deletedAt || !comment.runId || !comment.id) continue;
       map.set(comment.runId, comment.id);
     }
+    // A settled Paperclip turn normally attaches to its durable final reply.
+    // Same-turn steering splits that causal interval: the activity began at
+    // run start, the human input arrived during it, and the final reply landed
+    // later. Leave that turn unanchored so the chronological assembler places
+    // its collapsed Worked row at run start, before the injected human bubble;
+    // anchoring it to either comment would necessarily put one of them on the
+    // wrong side of the whole (currently indivisible) activity disclosure.
+    for (const comment of comments) {
+      const runId = comment.steeredIntoRunId;
+      if (!comment.deletedAt && runId && comment.conversationAnchorAt) {
+        map.delete(runId);
+      }
+    }
+    return map;
+  }, [comments]);
+
+  const steeringAnchorsByRun = useMemo(() => {
+    const map = new Map<string, number[]>();
+    for (const comment of comments) {
+      const runId = comment.steeredIntoRunId;
+      if (comment.deletedAt || !runId || !comment.conversationAnchorAt) continue;
+      const anchorMs = toMs(comment.conversationAnchorAt);
+      if (!Number.isFinite(anchorMs)) continue;
+      const anchors = map.get(runId) ?? [];
+      if (!anchors.includes(anchorMs)) anchors.push(anchorMs);
+      map.set(runId, anchors);
+    }
+    for (const anchors of map.values()) anchors.sort((a, b) => a - b);
     return map;
   }, [comments]);
 
@@ -727,20 +805,28 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       });
     }
     if (planDocument) {
-      const revision = planDocument.latestRevisionNumber ?? 1;
-      const id = `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`;
-      entries.push({
-        ms: toMs(planDocument.updatedAt),
-        order: 0,
-        id,
-        item: {
-          id,
-          kind: "marker",
-          variant: "turn_boundary",
-          label: revision > 1 ? "Plan updated" : "Plan created",
-          detail: `rev ${revision} — see the Plan tab`,
-        },
+      const pendingReviewAlreadyPreviewsRevision = (interactions ?? []).some((interaction) => {
+        if (interaction.kind !== "request_confirmation" || interaction.status !== "pending") return false;
+        if (isSuppressedThreadInteraction(interaction) || shouldHideInteractionCard(interaction)) return false;
+        const target = interaction.payload.target;
+        if (target?.type !== "issue_document" || target.key !== "plan") return false;
+        if (target.issueId && target.issueId !== planDocument.issueId) return false;
+        if (planDocument.latestRevisionId) return target.revisionId === planDocument.latestRevisionId;
+        return target.revisionNumber === planDocument.latestRevisionNumber;
       });
+      if (!pendingReviewAlreadyPreviewsRevision) {
+        const id = `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`;
+        entries.push({
+          ms: toMs(planDocument.updatedAt),
+          order: 0,
+          id,
+          item: {
+            id,
+            kind: "plan_document",
+            document: planDocument,
+          },
+        });
+      }
     }
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
@@ -847,18 +933,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         Number.isFinite(started) && Number.isFinite(finished)
           ? Math.max(0, finished - started)
           : undefined;
-      const parsed = transcriptToTaskChatItems(entries, {
-        runId: source.id,
-        agentName: meta?.agentName,
-        running: false,
-      });
-      const children = settledRunChildren(
-        source.adapterType === "paperclip_runner"
-          ? paperclipRunnerHistoryItems(parsed)
-          : parsed,
-      );
-      if (children.length === 0 && source.adapterType !== "paperclip_runner")
-        continue;
       if (
         source.status === "succeeded" &&
         !lastCommentIdByRun.has(source.id) &&
@@ -878,31 +952,77 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
         });
       }
-      settledRunIds.add(source.id);
       const failed = source.status !== "succeeded";
       const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
-      turnMergeMetaById.set(`${source.id}:turn`, {
-        agentKey: meta?.agentId ?? "",
-        agentName: meta?.agentName,
-        parts: [{ entries, durationMs, failed }],
-      });
-      settledTurns.push({
-        turn: {
-          id: `${source.id}:turn`,
-          kind: "turn",
-          settled: true,
-          standaloneHeader: source.adapterType === "paperclip_runner",
-          animateFold: liveSeenRef.current.has(source.id),
-          items: children,
-          summary: buildTurnSummary(entries, { durationMs, failed }),
-        },
-        anchorCommentId: lastCommentIdByRun.get(source.id) ?? null,
-        // Chronological slot for a turn with no reply comment to anchor to
-        // (PAP-367): the run's start time. A run with no linked meta yet
-        // (just-settled, list not refetched) sits at the thread tail —
-        // where it last rendered as the live turn — until meta arrives.
-        startMs: startSlotRaw ? toMs(startSlotRaw) : Number.POSITIVE_INFINITY,
-      });
+      const startSlotMs = startSlotRaw ? toMs(startSlotRaw) : Number.POSITIVE_INFINITY;
+      const steeringAnchors = source.adapterType === "paperclip_runner"
+        ? steeringAnchorsByRun.get(source.id) ?? []
+        : [];
+      const segments = steeringAnchors.length === 0
+        ? [{ startMs: startSlotMs, endMs: Number.POSITIVE_INFINITY, entries }]
+        : [startSlotMs, ...steeringAnchors].map((segmentStartMs, index) => {
+            const segmentEndMs = steeringAnchors[index] ?? Number.POSITIVE_INFINITY;
+            return {
+              startMs: segmentStartMs,
+              endMs: segmentEndMs,
+              entries: entries.filter((entry) => {
+                const entryMs = toMs(entry.ts);
+                const afterStart = index === 0 || entryMs >= segmentStartMs;
+                return afterStart && entryMs < segmentEndMs;
+              }),
+            };
+          });
+      for (const [segmentIndex, segment] of segments.entries()) {
+        if (segment.entries.length === 0) continue;
+        const parsed = transcriptToTaskChatItems(segment.entries, {
+          runId: source.id,
+          agentName: meta?.agentName,
+          running: false,
+        });
+        const children = settledRunChildren(
+          source.adapterType === "paperclip_runner"
+            ? paperclipRunnerHistoryItems(parsed)
+            : parsed,
+        );
+        if (children.length === 0 && source.adapterType !== "paperclip_runner") continue;
+        settledRunIds.add(source.id);
+        const segmented = steeringAnchors.length > 0;
+        const turnId = segmented
+          ? `${source.id}:turn:${segmentIndex}`
+          : `${source.id}:turn`;
+        const segmentFinishedMs = Number.isFinite(segment.endMs)
+          ? segment.endMs
+          : finished;
+        const segmentDurationMs = Number.isFinite(segment.startMs) && Number.isFinite(segmentFinishedMs)
+          ? Math.max(0, segmentFinishedMs - segment.startMs)
+          : durationMs;
+        turnMergeMetaById.set(turnId, {
+          agentKey: meta?.agentId ?? "",
+          agentName: meta?.agentName,
+          parts: [{ entries: segment.entries, durationMs: segmentDurationMs, failed }],
+        });
+        settledTurns.push({
+          turn: {
+            id: turnId,
+            kind: "turn",
+            settled: true,
+            standaloneHeader: source.adapterType === "paperclip_runner",
+            animateFold: liveSeenRef.current.has(source.id),
+            items: children,
+            summary: buildTurnSummary(segment.entries, {
+              durationMs: segmentDurationMs,
+              failed,
+            }),
+          },
+          anchorCommentId: segmented
+            ? null
+            : lastCommentIdByRun.get(source.id) ?? null,
+          // A post-steering segment ties the acknowledgement-backed human
+          // bubble and is therefore inserted immediately after it. The first
+          // segment retains the normal run-start slot.
+          startMs: segment.startMs,
+        });
+      }
     }
     settledTurns.sort((a, b) =>
       a.startMs < b.startMs ? -1 : a.startMs > b.startMs ? 1 : 0,
@@ -958,6 +1078,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     transcriptByRun,
     linkedRunMetaById,
     lastCommentIdByRun,
+    steeringAnchorsByRun,
     hasBrief,
   ]);
 
@@ -1113,6 +1234,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       let resolution: RuntimeRequestResolution;
       if (decision.action !== "submit") {
         resolution = decision;
+      } else if ("response" in decision) {
+        resolution = { action: "submit", response: decision.response };
       } else if (item.requestKind === "user_input") {
         resolution = {
           action: "submit",
@@ -1348,6 +1471,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           }
                           startedAtMs={tailStartedAtMs}
                           finishedAtMs={tailFinishedAtMs}
+                          planDocument={planDocument}
                           onRuntimeRequestDecision={
                             handleRuntimeRequestDecision
                           }

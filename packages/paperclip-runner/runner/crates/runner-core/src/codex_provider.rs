@@ -222,9 +222,12 @@ fn default_collaboration_mode_instructions() -> bool {
     true
 }
 
-fn skillless_thread_config(include_collaboration_mode_instructions: bool) -> Value {
+fn isolated_thread_config(
+    include_collaboration_mode_instructions: bool,
+    include_skill_instructions: bool,
+) -> Value {
     json!({
-        "skills.include_instructions": false,
+        "skills.include_instructions": include_skill_instructions,
         "include_apps_instructions": false,
         "include_collaboration_mode_instructions": include_collaboration_mode_instructions,
         "features.apps": false,
@@ -261,6 +264,10 @@ pub struct LocalProviderConfig {
     pub collaboration_mode: String,
     #[serde(default = "default_collaboration_mode_instructions")]
     pub include_collaboration_mode_instructions: bool,
+    #[serde(default)]
+    pub include_skill_instructions: bool,
+    #[serde(default)]
+    pub runtime_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -273,6 +280,9 @@ pub struct ClaudeManagedProviderConfig {
     pub environment_id: String,
     pub beta_version: String,
     pub max_session_list_cost_usd: f64,
+    pub instructions: String,
+    #[serde(default)]
+    pub runtime_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -290,12 +300,18 @@ pub struct AwsAgentCoreProviderConfig {
     pub memory_arn: String,
     pub memory_id: String,
     pub invocation_role_arn: String,
+    pub context_bucket: String,
+    pub context_prefix: String,
+    pub context_kms_key_arn: String,
     pub qualification_revision: String,
     pub event_expiry_days: u16,
     pub max_estimated_session_cost_usd: f64,
     pub max_iterations: u32,
     pub max_output_tokens: u32,
     pub timeout_seconds: u32,
+    pub instructions: String,
+    #[serde(default)]
+    pub runtime_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -318,6 +334,8 @@ pub struct AcpxProviderConfig {
     pub cwd: String,
     pub instructions: String,
     pub permission_policy: String,
+    #[serde(default)]
+    pub runtime_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -552,10 +570,7 @@ pub enum ProviderEvent {
         item_id: Option<String>,
     },
     RuntimeRequest {
-        request_id: String,
-        request_kind: String,
-        title: String,
-        details: Value,
+        request: Value,
     },
     Exited,
 }
@@ -569,10 +584,457 @@ pub struct CodexProvider {
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<(Value, Option<u64>)>,
     pending_tool_requests: BTreeMap<String, Value>,
+    pending_runtime_requests: BTreeMap<String, PendingCodexRuntimeRequest>,
     collaboration_mode: String,
     collaboration_mode_payload: Option<Value>,
     trace: Option<ProviderTraceSink>,
     last_trace_frame_id: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCodexRuntimeRequest {
+    rpc_id: Value,
+    method: String,
+    provider_params: Value,
+    question_set: Value,
+}
+
+fn latest_active_provider_turn_id(thread_read: &Value) -> Option<String> {
+    thread_read
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| {
+            turns.iter().rev().find_map(|turn| {
+                let status = turn.get("status").and_then(Value::as_str)?;
+                if matches!(status, "inProgress" | "in_progress" | "running" | "active") {
+                    turn.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn runtime_request_kind(method: &str) -> Option<&'static str> {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => Some("command_approval"),
+        "item/fileChange/requestApproval" | "applyPatchApproval" => Some("file_approval"),
+        "item/permissions/requestApproval" => Some("permission_approval"),
+        "item/tool/requestUserInput" | "tool/requestUserInput" => Some("user_input"),
+        "mcpServer/elicitation/request" => Some("elicitation"),
+        "paperclip/runtimeRequest" => Some("runtime"),
+        _ => None,
+    }
+}
+
+fn bounded_string(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
+    if matches!(
+        method,
+        "item/tool/requestUserInput" | "tool/requestUserInput"
+    ) {
+        let raw_questions = params.get("questions")?.as_array()?;
+        if raw_questions.is_empty() {
+            return None;
+        }
+        let questions = raw_questions
+            .iter()
+            .take(64)
+            .enumerate()
+            .map(|(question_index, question)| {
+                let question_id = question
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| bounded_string(value, 160))
+                    .unwrap_or_else(|| format!("question-{}", question_index + 1));
+                let options = question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .take(128)
+                            .enumerate()
+                            .map(|(option_index, option)| {
+                                let label = option
+                                    .get("label")
+                                    .or_else(|| option.get("value"))
+                                    .and_then(Value::as_str)
+                                    .or_else(|| option.as_str())
+                                    .map(|value| bounded_string(value, 1_000))
+                                    .unwrap_or_else(|| format!("Option {}", option_index + 1));
+                                let mut normalized = json!({
+                                    "id": format!("option-{}", option_index + 1),
+                                    "label": label,
+                                });
+                                if let Some(description) =
+                                    option.get("description").and_then(Value::as_str)
+                                {
+                                    normalized["description"] =
+                                        json!(bounded_string(description, 4_000));
+                                }
+                                normalized
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut normalized = json!({
+                    "id": question_id,
+                    "prompt": bounded_string(
+                        question.get("question")
+                            .or_else(|| question.get("prompt"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Question"),
+                        4_000,
+                    ),
+                    "required": question.get("required").and_then(Value::as_bool).unwrap_or(true),
+                    "answerMode": if options.is_empty() {
+                        "text"
+                    } else if question.get("multiSelect").and_then(Value::as_bool).unwrap_or(false)
+                        || question.get("multiple").and_then(Value::as_bool).unwrap_or(false) {
+                        "multi_select"
+                    } else {
+                        "single_select"
+                    },
+                });
+                if let Some(header) = question.get("header").and_then(Value::as_str) {
+                    normalized["header"] = json!(bounded_string(header, 1_000));
+                }
+                if let Some(description) = question.get("description").and_then(Value::as_str) {
+                    normalized["helpText"] = json!(bounded_string(description, 4_000));
+                }
+                if !options.is_empty() {
+                    normalized["options"] = json!(options);
+                }
+                if question
+                    .get("isOther")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || question
+                        .get("allowOther")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    normalized["customAnswer"] = json!({
+                        "enabled": true,
+                        "label": "Other",
+                        "placeholder": "Enter another answer",
+                    });
+                }
+                normalized
+            })
+            .collect::<Vec<_>>();
+        return Some(json!({
+            "schema": "paperclip.question_set.v1",
+            "title": params.get("title").and_then(Value::as_str).unwrap_or("Codex needs your input"),
+            "submitLabel": params.get("submitLabel").and_then(Value::as_str).unwrap_or("Submit answers"),
+            "questions": questions,
+        }));
+    }
+    if method == "mcpServer/elicitation/request" {
+        let requested_schema = params
+            .get("requestedSchema")
+            .or_else(|| params.get("schema"))?;
+        let properties = requested_schema.get("properties")?.as_object()?;
+        if properties.is_empty() {
+            return None;
+        }
+        let required = requested_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let questions = properties
+            .iter()
+            .take(64)
+            .map(|(name, property)| {
+                let property_type = property.get("type").and_then(Value::as_str).unwrap_or("string");
+                let select_schema = if property_type == "array" {
+                    property.get("items").unwrap_or(&Value::Null)
+                } else {
+                    property
+                };
+                let option_values = select_schema.get("enum").and_then(Value::as_array).cloned()
+                    .or_else(|| select_schema.get("oneOf").and_then(Value::as_array).map(|entries| entries.iter().map(|entry| entry.get("const").cloned().unwrap_or(Value::Null)).collect()))
+                    .unwrap_or_default();
+                let options = if property_type == "boolean" {
+                    vec![json!({"id":"true","label":"Yes"}), json!({"id":"false","label":"No"})]
+                } else {
+                    option_values.iter().enumerate().map(|(index, value)| {
+                        let one_of = select_schema.get("oneOf").and_then(Value::as_array).and_then(|items| items.get(index));
+                        json!({
+                            "id": format!("option-{}", index + 1),
+                            "label": one_of.and_then(|item| item.get("title")).and_then(Value::as_str)
+                                .map(str::to_owned).unwrap_or_else(|| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())),
+                            "description": one_of.and_then(|item| item.get("description")).and_then(Value::as_str),
+                        })
+                    }).collect::<Vec<_>>()
+                };
+                let answer_mode = if property_type == "array" && !options.is_empty() {
+                    "multi_select"
+                } else if !options.is_empty() {
+                    "single_select"
+                } else {
+                    "text"
+                };
+                let mut question = json!({
+                    "id": name,
+                    "header": property.get("title").and_then(Value::as_str),
+                    "prompt": property.get("title").and_then(Value::as_str).unwrap_or(name),
+                    "helpText": property.get("description").and_then(Value::as_str),
+                    "required": required.iter().any(|entry| entry.as_str() == Some(name)),
+                    "answerMode": answer_mode,
+                });
+                if !options.is_empty() {
+                    question["options"] = json!(options);
+                } else {
+                    question["textValidation"] = json!({
+                        "inputType": match property_type { "number" => "number", "integer" => "integer", _ => "text" },
+                        "minLength": property.get("minLength"),
+                        "maxLength": property.get("maxLength"),
+                        "minimum": property.get("minimum"),
+                        "maximum": property.get("maximum"),
+                        "pattern": property.get("pattern"),
+                    });
+                }
+                question
+            })
+            .collect::<Vec<_>>();
+        return Some(json!({
+            "schema": "paperclip.question_set.v1",
+            "title": "A tool needs your input",
+            "description": params.get("message").and_then(Value::as_str),
+            "submitLabel": "Submit",
+            "questions": questions,
+        }));
+    }
+    None
+}
+
+fn canonical_runtime_request(
+    kind: ProviderKind,
+    request_id: &str,
+    method: &str,
+    params: &Value,
+    question_set: &Value,
+) -> Value {
+    json!({
+        "schema": "paperclip.runtime_request.v2",
+        "requestKind": "runtime",
+        "requestId": request_id,
+        "type": "input",
+        "status": "pending",
+        "prompt": if method == "mcpServer/elicitation/request" { "A tool requests structured user input." } else { "Codex requests user input." },
+        "input": question_set,
+        "origin": {
+            "adapter": if kind == ProviderKind::Opencode { "opencode-app-server-proxy" } else { "codex-app-server" },
+            "provider": if kind == ProviderKind::Opencode { "opencode" } else { "codex" },
+            "method": method,
+        },
+        "itemId": params.get("itemId").and_then(Value::as_str).unwrap_or(request_id),
+    })
+}
+
+fn canonical_codex_answers(question_set: &Value, response: &Value) -> Value {
+    let answers = response.get("answers").and_then(Value::as_object);
+    let mut native = serde_json::Map::new();
+    for question in question_set
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(question_id) = question.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(answer) = answers.and_then(|values| values.get(question_id)) else {
+            continue;
+        };
+        let mut values = Vec::new();
+        for selected in answer
+            .get("selectedOptionIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(option_id) = selected.as_str() {
+                if let Some(label) = question
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|option| option.get("id").and_then(Value::as_str) == Some(option_id))
+                    .and_then(|option| option.get("label"))
+                    .and_then(Value::as_str)
+                {
+                    values.push(json!(label));
+                }
+            }
+        }
+        if let Some(value) = answer.get("text").and_then(Value::as_str) {
+            values.push(json!(value));
+        }
+        if let Some(value) = answer.get("customText").and_then(Value::as_str) {
+            values.push(json!(value));
+        }
+        native.insert(question_id.to_owned(), json!({"answers": values}));
+    }
+    Value::Object(native)
+}
+
+fn elicitation_option_value(schema: &Value, option_id: &str) -> Value {
+    if option_id == "true" {
+        return json!(true);
+    }
+    if option_id == "false" {
+        return json!(false);
+    }
+    let index = option_id
+        .strip_prefix("option-")
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.checked_sub(1));
+    if let Some(index) = index {
+        if let Some(value) = schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(index))
+        {
+            return value.clone();
+        }
+        if let Some(value) = schema
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(index))
+            .and_then(|entry| entry.get("const"))
+        {
+            return value.clone();
+        }
+    }
+    json!(option_id)
+}
+
+fn canonical_elicitation_content(pending: &PendingCodexRuntimeRequest, response: &Value) -> Value {
+    let schema = pending
+        .provider_params
+        .get("requestedSchema")
+        .or_else(|| pending.provider_params.get("schema"))
+        .unwrap_or(&Value::Null);
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let answers = response.get("answers").and_then(Value::as_object);
+    let mut content = serde_json::Map::new();
+    for question in pending
+        .question_set
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(question_id) = question.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(answer) = answers.and_then(|values| values.get(question_id)) else {
+            continue;
+        };
+        let property = properties
+            .and_then(|values| values.get(question_id))
+            .unwrap_or(&Value::Null);
+        let mode = question
+            .get("answerMode")
+            .and_then(Value::as_str)
+            .unwrap_or("text");
+        let value = if mode == "text" {
+            let raw = answer
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match property.get("type").and_then(Value::as_str) {
+                Some("integer") => raw.parse::<i64>().map(Value::from).unwrap_or(Value::Null),
+                Some("number") => raw
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null),
+                _ => json!(raw),
+            }
+        } else if mode == "multi_select" {
+            let item_schema = property.get("items").unwrap_or(&Value::Null);
+            Value::Array(
+                answer
+                    .get("selectedOptionIds")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|option_id| elicitation_option_value(item_schema, option_id))
+                    .collect(),
+            )
+        } else if let Some(option_id) = answer
+            .get("selectedOptionIds")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+        {
+            elicitation_option_value(property, option_id)
+        } else {
+            answer.get("customText").cloned().unwrap_or(Value::Null)
+        };
+        content.insert(question_id.to_owned(), value);
+    }
+    Value::Object(content)
+}
+
+fn codex_runtime_response(pending: &PendingCodexRuntimeRequest, resolution: &Value) -> Value {
+    let action = resolution
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("cancel");
+    match pending.method.as_str() {
+        "item/tool/requestUserInput" | "tool/requestUserInput" => {
+            if action == "submit" {
+                if let Some(response) = resolution.get("response") {
+                    json!({"answers": canonical_codex_answers(&pending.question_set, response)})
+                } else {
+                    json!({"answers": resolution.get("answers").cloned().unwrap_or_else(|| json!({}))})
+                }
+            } else {
+                json!({"answers": {}})
+            }
+        }
+        "mcpServer/elicitation/request" => {
+            if action == "submit" {
+                json!({
+                    "action": "accept",
+                    "content": resolution.get("content").cloned().unwrap_or_else(|| {
+                        resolution.get("response").map(|response| canonical_elicitation_content(pending, response)).unwrap_or_else(|| json!({}))
+                    }),
+                    "_meta": Value::Null,
+                })
+            } else {
+                json!({"action": action, "content": Value::Null, "_meta": Value::Null})
+            }
+        }
+        "paperclip/runtimeRequest" => json!({"resolution": resolution}),
+        "item/permissions/requestApproval" => json!({
+            "permissions": {},
+            "scope": if action == "accept_for_session" { "session" } else { "turn" },
+        }),
+        _ => json!({
+            "decision": match action {
+                "accept_for_session" => "acceptForSession",
+                "accept" => "accept",
+                "decline" => "decline",
+                _ => "cancel",
+            }
+        }),
+    }
 }
 
 impl CodexProvider {
@@ -599,6 +1061,7 @@ impl CodexProvider {
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
             pending_tool_requests: BTreeMap::new(),
+            pending_runtime_requests: BTreeMap::new(),
             collaboration_mode: config.collaboration_mode.clone(),
             collaboration_mode_payload: None,
             trace: ProviderTraceSink::from_environment(config.kind),
@@ -638,7 +1101,10 @@ impl CodexProvider {
                     "approvalPolicy": "never",
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(config.include_collaboration_mode_instructions),
+                    "config": isolated_thread_config(
+                        config.include_collaboration_mode_instructions,
+                        config.include_skill_instructions,
+                    ),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -654,7 +1120,10 @@ impl CodexProvider {
                     "approvalPolicy": "never",
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
-                    "config": skillless_thread_config(config.include_collaboration_mode_instructions),
+                    "config": isolated_thread_config(
+                        config.include_collaboration_mode_instructions,
+                        config.include_skill_instructions,
+                    ),
                     "baseInstructions": config.instructions,
                     "dynamicTools": dynamic_tools,
                     "experimentalRawEvents": true,
@@ -715,6 +1184,10 @@ impl CodexProvider {
             })
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
+        if resume_thread_id.is_some() {
+            let recovered = provider.read_thread()?;
+            provider.active_provider_turn_id = latest_active_provider_turn_id(&recovered);
+        }
         Ok(provider)
     }
 
@@ -839,6 +1312,8 @@ impl CodexProvider {
                     .map(|value| {
                         if value == "item/tool/call" {
                             "codex.tool_call"
+                        } else if runtime_request_kind(value).is_some() {
+                            "provider.runtime_request"
                         } else {
                             "codex.notification"
                         }
@@ -880,6 +1355,72 @@ impl CodexProvider {
                 operation_id,
                 input: params.get("arguments").cloned().unwrap_or(Value::Null),
             }));
+        }
+        if let (Some(rpc_id), Some(method)) = (
+            message.get("id").cloned(),
+            message.get("method").and_then(Value::as_str),
+        ) {
+            if let Some(request_kind) = runtime_request_kind(method) {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if method != "paperclip/runtimeRequest"
+                    && params.get("threadId").and_then(Value::as_str)
+                        != Some(self.thread_id.as_str())
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "provider runtime request named another thread",
+                    ));
+                }
+                let request_id = params
+                    .pointer("/request/requestId")
+                    .or_else(|| params.get("requestId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        rpc_id
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| rpc_id.to_string())
+                    });
+                if self.pending_runtime_requests.contains_key(&request_id) {
+                    return Err(LocalRunnerError::invalid(
+                        "provider reused a pending runtime request id",
+                    ));
+                }
+                let question_set = codex_question_set(method, &params)
+                    .or_else(|| params.pointer("/request/input").cloned())
+                    .unwrap_or(Value::Null);
+                let request = params.get("request").cloned().unwrap_or_else(|| {
+                    if !question_set.is_null() {
+                        canonical_runtime_request(self.kind, &request_id, method, &params, &question_set)
+                    } else {
+                        json!({
+                            "schema": "paperclip.runtime_request.v1",
+                            "requestKind": "runtime",
+                            "requestId": request_id,
+                            "type": "permission",
+                            "status": "pending",
+                            "prompt": params.get("reason").or_else(|| params.get("message")).and_then(Value::as_str)
+                                .unwrap_or("The provider requests runtime approval."),
+                            "origin": {
+                                "adapter": if self.kind == ProviderKind::Opencode { "opencode-app-server-proxy" } else { "codex-app-server" },
+                                "provider": if self.kind == ProviderKind::Opencode { "opencode" } else { "codex" },
+                                "method": method,
+                                "kind": request_kind,
+                            }
+                        })
+                    }
+                });
+                self.pending_runtime_requests.insert(
+                    request_id,
+                    PendingCodexRuntimeRequest {
+                        rpc_id,
+                        method: method.to_owned(),
+                        provider_params: params,
+                        question_set,
+                    },
+                );
+                return Ok(Some(ProviderEvent::RuntimeRequest { request }));
+            }
         }
         if let Some(method) = message.get("method").and_then(Value::as_str) {
             if method == "paperclip/runResult" {
@@ -1111,6 +1652,24 @@ impl Provider for CodexProvider {
     fn deliver_tool_result(&mut self, result: &ToolResult) -> Result<(), LocalRunnerError> {
         CodexProvider::deliver_tool_result(self, result)
     }
+    fn resolve_runtime_request(
+        &mut self,
+        request_id: &str,
+        _turn_id: &str,
+        resolution: &Value,
+    ) -> Result<(), LocalRunnerError> {
+        let pending = self
+            .pending_runtime_requests
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| {
+                LocalRunnerError::invalid("runtime request has no pending JSON-RPC request")
+            })?;
+        let result = codex_runtime_response(&pending, resolution);
+        self.send_frame(&json!({"id": pending.rpc_id, "result": result}))?;
+        self.pending_runtime_requests.remove(request_id);
+        Ok(())
+    }
     fn shutdown(&mut self) -> Result<(), LocalRunnerError> {
         CodexProvider::shutdown(self)
     }
@@ -1119,6 +1678,27 @@ impl Provider for CodexProvider {
 #[cfg(test)]
 mod provider_trace_tests {
     use super::*;
+
+    #[test]
+    fn recovers_the_latest_active_codex_turn_from_thread_read() {
+        assert_eq!(
+            latest_active_provider_turn_id(&json!({
+                "thread": {
+                    "turns": [
+                        {"id": "turn-complete", "status": "completed"},
+                        {"id": "turn-active", "status": "inProgress"}
+                    ]
+                }
+            })),
+            Some("turn-active".to_owned())
+        );
+        assert_eq!(
+            latest_active_provider_turn_id(&json!({
+                "thread": {"turns": [{"id": "turn-complete", "status": "completed"}]}
+            })),
+            None
+        );
+    }
 
     #[test]
     fn collaboration_instructions_default_on_and_allow_explicit_opt_out() {
@@ -1134,8 +1714,10 @@ mod provider_trace_tests {
         .unwrap();
         assert!(default_config.include_collaboration_mode_instructions);
         assert_eq!(
-            skillless_thread_config(default_config.include_collaboration_mode_instructions)
-                ["include_collaboration_mode_instructions"],
+            isolated_thread_config(
+                default_config.include_collaboration_mode_instructions,
+                default_config.include_skill_instructions,
+            )["include_collaboration_mode_instructions"],
             json!(true)
         );
 
@@ -1152,8 +1734,10 @@ mod provider_trace_tests {
         .unwrap();
         assert!(!opt_out_config.include_collaboration_mode_instructions);
         assert_eq!(
-            skillless_thread_config(opt_out_config.include_collaboration_mode_instructions)
-                ["include_collaboration_mode_instructions"],
+            isolated_thread_config(
+                opt_out_config.include_collaboration_mode_instructions,
+                opt_out_config.include_skill_instructions,
+            )["include_collaboration_mode_instructions"],
             json!(false)
         );
     }

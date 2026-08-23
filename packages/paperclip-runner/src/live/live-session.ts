@@ -140,6 +140,9 @@ export interface CapabilityLiveSessionConfigSnapshot {
     memoryArn: string;
     memoryId: string;
     invocationRoleArn: string;
+    contextBucket: string;
+    contextPrefix: string;
+    contextKmsKeyArn: string;
     qualificationRevision: string;
     eventExpiryDays: 90;
     maxEstimatedSessionCostUsd: number;
@@ -573,7 +576,7 @@ export function assertCapabilityLiveSessionSnapshot(
   }
   if (provider === "aws_agentcore") {
     const profile = record(config.agentCoreProfile);
-    for (const field of ["profileId", "region", "accountId", "harnessArn", "harnessVersion", "endpointArn", "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn", "qualificationRevision"] as const) {
+    for (const field of ["profileId", "region", "accountId", "harnessArn", "harnessVersion", "endpointArn", "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn", "contextBucket", "contextPrefix", "contextKmsKeyArn", "qualificationRevision"] as const) {
       if (text(profile[field]).trim().length === 0) {
         throw new Error(`capability_live_checkpoint_corrupt: missing agentCoreProfile.${field}`);
       }

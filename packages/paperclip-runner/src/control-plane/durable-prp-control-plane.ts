@@ -195,6 +195,9 @@ export interface DurablePrpControlPlaneOptions {
     callId: string;
     operationId: string;
     input: unknown;
+    /** Internal trace lineage for the canonical semantic_tool.input event. */
+    sourceEventId?: string;
+    sourceEventType?: string;
   }) => Promise<unknown>;
   connectionLeaseTtlMs?: number;
 }
@@ -1468,6 +1471,8 @@ export class DurablePrpControlPlane {
         callId: semantic.callId,
         operationId: semantic.operationId,
         input: semantic.input,
+        sourceEventId,
+        sourceEventType: eventType,
       };
       void this.#onSemanticToolInput(call).then((value) => {
         const outcome =
@@ -1553,6 +1558,7 @@ function runnerEnvironment(
   for (const key of [
     "PATH",
     "HOME",
+    "CODEX_HOME",
     "SystemRoot",
     "WINDIR",
     "PATHEXT",
@@ -1590,6 +1596,7 @@ function runnerEnvironment(
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
     "PAPERCLIP_NATIVE_MCP_TOKEN",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
     // Short-lived, controller-selected sidecar capture. These never enter the
     // canonical PRP environment or provider payload; runnerd alone consumes them.
     "PAPERCLIP_PROVIDER_TRACE_PATH",
@@ -2025,6 +2032,9 @@ export interface DurableEvalSessionInput {
     memoryArn: string;
     memoryId: string;
     invocationRoleArn: string;
+    contextBucket: string;
+    contextPrefix: string;
+    contextKmsKeyArn: string;
     qualificationRevision: string;
     eventExpiryDays: 90;
     maxEstimatedSessionCostUsd: number;

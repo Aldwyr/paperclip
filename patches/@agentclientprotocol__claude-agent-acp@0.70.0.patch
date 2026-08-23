@@ -25,3 +25,27 @@ diff --git a/dist/acp-agent.js b/dist/acp-agent.js
                                      },
                                  });
                              }
+@@ -4866,8 +4876,12 @@
+         const options = {
+             systemPrompt,
+             settingSources: ["user", "project", "local"],
+             ...(thinking !== undefined && { thinking }),
+             ...userProvidedOptions,
++            // Paperclip Runner owns the complete session context. Its isolated
++            // user root contains only assigned skills; project/local settings
++            // would reintroduce host prompts, plugins, skills, and MCP servers.
++            ...(process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT === "1" && { settingSources: ["user"] }),
+             ...(settings && { settings }),
+             env,
+             // Override certain fields that must be controlled by ACP
+@@ -4875,7 +4889,9 @@
+             includePartialMessages: true,
+             forwardSubagentText,
+             mcpServers: {
+-                ...(userProvidedOptions?.mcpServers || {}),
++                ...(process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT === "1"
++                    ? {}
++                    : (userProvidedOptions?.mcpServers || {})),
+                 ...mcpServers,
+                 ...(fileChangeAuditSupport
+                     ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }

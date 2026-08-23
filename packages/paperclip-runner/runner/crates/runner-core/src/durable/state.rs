@@ -163,6 +163,8 @@ pub struct PendingProviderRuntimeRequest {
     pub turn_id: String,
     pub request_kind: String,
     pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub request: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

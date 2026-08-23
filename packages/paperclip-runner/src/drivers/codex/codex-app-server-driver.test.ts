@@ -449,6 +449,35 @@ describe("Codex app-server Codex driver", () => {
     });
   });
 
+  it("places Paperclip runtime instructions in Codex's system channel and enables only selected skill instructions", async () => {
+    const transport = new FakeCodexTransport();
+    const baseInstructions = [
+      "You are running as a Paperclip agent.",
+      "Follow the attached AGENTS.md instructions.",
+      "Read-only instruction sibling root: /paperclip/context/instructions",
+    ].join("\n\n");
+    const driver = makeDriver([transport], {
+      baseInstructions,
+      includeSkillInstructions: true,
+    });
+
+    await driver.openSession({
+      runId: "run-runtime-context",
+      normalizedSessionId: "normalized-runtime-context",
+      workingDirectory: "/workspace",
+    });
+
+    const threadStart = transport.calls.find((call) => call.method === "thread/start");
+    expect(threadStart?.params).toMatchObject({
+      baseInstructions,
+      config: {
+        "skills.include_instructions": true,
+        include_apps_instructions: false,
+      },
+    });
+    expect(JSON.stringify(threadStart?.params.input ?? null)).not.toContain(baseInstructions);
+  });
+
   it("passes the common typed-event contract and reports one provider turn terminal", async () => {
     const transport = new FakeCodexTransport();
     const driver = makeDriver([transport]);
@@ -1169,6 +1198,12 @@ describe("Codex app-server Codex driver", () => {
       message: { role: "user", text: "Stay concise." },
       correlationId: "queued-comment-1",
     });
+    transport.push("item/completed", {
+      kind: "steering_acknowledgement",
+      status: "acknowledged",
+      commandId: "runnerd-steer-command",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await session.steer?.({
       turnId,
       message: { role: "user", text: "Stay concise." },
@@ -1257,6 +1292,8 @@ describe("Codex app-server Codex driver", () => {
         }),
       ]),
     );
+    expect(observed.some((event) => event.eventType === "session.failed"))
+      .toBe(false);
     await session.close({ reason: "fixture complete" });
   });
 
@@ -1508,6 +1545,93 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "fixture complete" });
   });
 
+  it("replays the DOT-185 requestUserInput shape as one canonical three-question request", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-dot-185",
+      normalizedSessionId: "normalized-dot-185",
+      workingDirectory: "/workspace",
+    });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask the deployment questions." },
+    });
+    const nativeResponse = transport.invoke({
+      id: "dot-185-request",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "dot-185-item",
+        questions: [
+          {
+            id: "environment",
+            header: "Environment",
+            question: "Where should we deploy?",
+            options: [
+              { label: "Staging", description: "Deploy to staging first." },
+              { label: "Production", description: "Deploy directly to production." },
+            ],
+            isOther: true,
+          },
+          {
+            id: "regions",
+            header: "Regions",
+            question: "Which regions should receive the release?",
+            options: [{ label: "US" }, { label: "EU" }],
+            multiSelect: true,
+          },
+          {
+            id: "notes",
+            header: "Notes",
+            question: "Anything else we should know?",
+            required: false,
+          },
+        ],
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const [pending] = session.pendingRuntimeRequests?.() ?? [];
+    expect(pending?.input).toMatchObject({
+      schema: "paperclip.question_set.v1",
+      questions: [
+        {
+          id: "environment",
+          answerMode: "single_select",
+          customAnswer: { enabled: true },
+          options: [
+            { id: "option-1", label: "Staging", description: "Deploy to staging first." },
+            { id: "option-2", label: "Production", description: "Deploy directly to production." },
+          ],
+        },
+        { id: "regions", answerMode: "multi_select" },
+        { id: "notes", answerMode: "text", required: false },
+      ],
+    });
+    await session.resolveRuntimeRequest?.({
+      requestId: "dot-185-request",
+      turnId,
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: {
+            environment: { selectedOptionIds: ["option-1"] },
+            regions: { selectedOptionIds: ["option-1", "option-2"] },
+            notes: { text: "Ship during the maintenance window." },
+          },
+        },
+      },
+    });
+    expect(await nativeResponse).toEqual({
+      answers: {
+        environment: { answers: ["Staging"] },
+        regions: { answers: ["US", "EU"] },
+        notes: { answers: ["Ship during the maintenance window."] },
+      },
+    });
+    await session.close({ reason: "fixture complete" });
+  });
+
   it("emits one canonical outcome payload for every terminal runtime request fact", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({
@@ -1643,6 +1767,10 @@ describe("Codex app-server Codex driver", () => {
     const request = {
       id: 1,
       method: "item/tool/call",
+      paperclipTrace: {
+        sourceEventId: "event_runner_000101",
+        sourceEventType: "semantic_tool.input",
+      },
       params: {
         threadId: "thread-1",
         turnId: "turn-1",
@@ -1652,6 +1780,21 @@ describe("Codex app-server Codex driver", () => {
       },
     };
     expect(await transport.invoke(request)).toMatchObject({ success: true });
+    const resultMapping = transport.traceInterpretations.find(
+      (entry) =>
+        entry.sourceEventId === "event_runner_000101" &&
+        entry.providerMethod === "item/tool/call",
+    );
+    expect(resultMapping).toMatchObject({
+      sourceEventType: "semantic_tool.input",
+      disposition: "mapped",
+    });
+    expect(resultMapping?.emittedEventIds).toHaveLength(2);
+    expect(resultMapping?.emittedEventIds).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(":run-result:"),
+      ]),
+    );
     expect(
       await transport.invoke({
         ...request,

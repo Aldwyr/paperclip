@@ -78,7 +78,10 @@ function aggregatePayload(value: Omit<NativeRuntimeContextSnapshot, "aggregateDi
     skills: [...value.skills].sort((a, b) => a.key.localeCompare(b.key)).map((skill) => ({
       key: skill.key, runtimeName: skill.runtimeName, versionId: skill.versionId, bundleDigest: skill.bundle.digest,
     })),
-    mcp: value.mcp,
+    // The binding is deliberately run-scoped. Compatibility is determined by the
+    // assigned access set so a fresh capability can be rebound without forcing a
+    // provider-session rotation when policy has not changed.
+    mcp: { assignmentSetId: value.mcp.assignmentSetId, digest: value.mcp.digest },
   };
 }
 

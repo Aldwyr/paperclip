@@ -12,6 +12,7 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
   statusDecisionEffects,
   statusDecisions,
   workAssessments,
@@ -244,6 +245,7 @@ async function enqueueWake(input: {
   reason: string;
   idempotencyKey: string;
   payload: Record<string, unknown>;
+  contextSnapshot?: Record<string, unknown>;
 }) {
   const existing = await input.tx.select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -266,6 +268,7 @@ async function enqueueWake(input: {
       _paperclipWakeContext: {
         issueId: input.issueId,
         taskId: input.issueId,
+        ...(input.contextSnapshot ?? {}),
         wakeReason: input.reason,
         source: "native_status_decision",
       },
@@ -371,17 +374,27 @@ async function materializeDecisionEffect(input: {
       kind: "request_confirmation",
       idempotencyKey: `native-review:${input.decisionId}`,
       sourceRunId: input.runId,
+      resolverPolicy: effect.ownerAgentId ? "anyone" : "human_only",
+      addresseeAgentId: effect.ownerAgentId ?? null,
+      addresseeUserId: effect.ownerUserId,
       title: "Native completion review",
       summary: "The native runner requires authoritative review before completion.",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
         prompt: effect.prompt,
+        detailsMarkdown: effect.detailsMarkdown ?? null,
         acceptLabel: "Approve completion",
         rejectLabel: "Continue work",
         allowDeclineReason: true,
         rejectRequiresReason: true,
         supersedeOnUserComment: false,
+        target: {
+          type: "custom",
+          key: "native_completion_review",
+          revisionId: input.decisionId,
+          label: "Completion decision",
+        },
       },
     };
     const interaction = await issueThreadInteractionService(input.tx).create(
@@ -393,7 +406,12 @@ async function materializeDecisionEffect(input: {
       effectKind: effect.kind,
       targetType: "issue_thread_interaction",
       targetId: interaction.id,
-      payload: { interactionId: interaction.id, interactionKind: interaction.kind },
+      payload: {
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        ownerUserId: effect.ownerUserId,
+        ownerAgentId: effect.ownerAgentId ?? null,
+      },
     };
   }
   if (effect.kind === "notify_owner") {
@@ -684,20 +702,43 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "append_superseding_assessment") {
-    if (!input.issue.lastStatusDecisionId) throw new Error("native_superseded_decision_missing");
     const lineage = await input.tx.select({
       currentAssessmentId: statusDecisions.assessmentId,
     }).from(statusDecisions).where(and(
       eq(statusDecisions.id, input.decisionId),
       eq(statusDecisions.companyId, input.companyId),
     )).limit(1).then((rows) => rows[0] ?? null);
+    if (!lineage) throw new Error("native_superseded_assessment_missing");
+    if (!input.issue.lastStatusDecisionId) {
+      const assessment = await input.tx.select({
+        id: workAssessments.id,
+        supersedesAssessmentId: workAssessments.supersedesAssessmentId,
+      }).from(workAssessments).where(and(
+        eq(workAssessments.id, lineage.currentAssessmentId),
+        eq(workAssessments.companyId, input.companyId),
+        eq(workAssessments.issueId, input.issue.id),
+      )).limit(1).then((rows) => rows[0] ?? null);
+      if (!assessment?.supersedesAssessmentId) {
+        throw new Error("native_superseding_assessment_not_linked");
+      }
+      return {
+        effectKind: effect.kind,
+        targetType: "status_decision",
+        targetId: input.decisionId,
+        payload: {
+          supersedesDecisionId: null,
+          assessmentId: assessment.id,
+          supersedesAssessmentId: assessment.supersedesAssessmentId,
+        },
+      };
+    }
     const prior = await input.tx.select({
       assessmentId: statusDecisions.assessmentId,
     }).from(statusDecisions).where(and(
       eq(statusDecisions.id, input.issue.lastStatusDecisionId),
       eq(statusDecisions.companyId, input.companyId),
     )).limit(1).then((rows) => rows[0] ?? null);
-    if (!lineage || !prior) throw new Error("native_superseded_assessment_missing");
+    if (!prior) throw new Error("native_superseded_assessment_missing");
     const [assessment] = await input.tx.update(workAssessments).set({
       supersedesAssessmentId: prior.assessmentId,
     }).where(and(
@@ -985,7 +1026,7 @@ export async function commitNativeStatusDecision(input: {
   decision: NativeStatusDecision;
   failpoint?: NativeStatusCommitFailpoint;
   preMaterializedEffects?: NativeMaterializedStatusEffect[];
-  allowSupersedingCommittedDecision?: boolean;
+  supersedesCommittedDecisionId?: string;
 }) {
   if (input.decision.reasonCode === null) {
     throw new Error("native_status_reason_code_required");
@@ -1005,9 +1046,9 @@ export async function commitNativeStatusDecision(input: {
     )).for("update").limit(1).then((rows) => rows[0] ?? null);
     if (!issue) throw new NativeStatusRaceError();
     if (coordinator.phase === "committed" && coordinator.decisionId) {
-      if (input.allowSupersedingCommittedDecision) {
+      if (input.supersedesCommittedDecisionId) {
         if (
-          coordinator.decisionId !== input.priorDecisionId
+          coordinator.decisionId !== input.supersedesCommittedDecisionId
           || coordinator.assessmentId === input.assessmentId
         ) {
           throw new NativeStatusRaceError();
@@ -1035,6 +1076,10 @@ export async function commitNativeStatusDecision(input: {
       reasonCode,
       unblockDescriptor: input.decision.unblockDescriptor,
       effects: input.decision.effects,
+      priorStatusVersion: input.priorStatusVersion,
+      projectedStatusVersion: input.decision.statusAction === "preserve"
+        ? input.priorStatusVersion
+        : input.priorStatusVersion + 1,
     };
     const decisionDigest = nativeSha256({
       issueId: input.issueId,
@@ -1053,11 +1098,18 @@ export async function commitNativeStatusDecision(input: {
       return { decision: decisionRow, issue, replayed: true };
     }
     if (!decisionRow) {
+      const latestDecisionVersion = await tx.select({
+        decisionVersion: statusDecisions.decisionVersion,
+      }).from(statusDecisions).where(and(
+        eq(statusDecisions.companyId, input.companyId),
+        eq(statusDecisions.issueId, input.issueId),
+      )).orderBy(desc(statusDecisions.decisionVersion)).limit(1)
+        .then((rows) => Number(rows[0]?.decisionVersion ?? 0));
       [decisionRow] = await tx.insert(statusDecisions).values({
         companyId: input.companyId,
         issueId: input.issueId,
         assessmentId: input.assessmentId,
-        decisionVersion: input.priorStatusVersion + 1,
+        decisionVersion: Math.max(input.priorStatusVersion, latestDecisionVersion) + 1,
         policyVersion: input.decision.policyVersion,
         fromStatus: issue.status,
         toStatus: input.decision.toStatus,
@@ -1116,30 +1168,69 @@ export async function commitNativeStatusDecision(input: {
     if (input.decision.statusAction === "done" && issue.status !== "done") {
       const issueSvc = issueService(tx as unknown as Db);
       const dependents = await issueSvc.listWakeableBlockedDependents(input.issueId);
-      for (const dependent of dependents) {
-        const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
-          dependentIssueId: dependent.id,
-          resolvedBlockerIssueId: input.issueId,
+      const completedResultSummary = await tx
+        .select({ resultJson: nativeRunResults.resultJson })
+        .from(nativeRunResults)
+        .where(and(
+          eq(nativeRunResults.companyId, input.companyId),
+          eq(nativeRunResults.runId, input.runId),
+        ))
+        .limit(1)
+        .then((rows) => {
+          const summary = record(record(rows[0]?.resultJson).result).summary;
+          return typeof summary === "string" && summary.trim().length > 0 ? summary.trim() : null;
         });
+      const parent = issue.parentId
+        ? await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId, {
+            issueId: input.issueId,
+            summary: completedResultSummary,
+          })
+        : null;
+      const parentIsDependent = parent
+        ? dependents.some((dependent) => dependent.id === parent.id)
+        : false;
+      for (const dependent of dependents) {
+        const isCompletedChildParent = parent?.id === dependent.id;
+        const idempotencyKey = isCompletedChildParent
+          ? `issue_children_completed:${dependent.id}:${input.issueId}`
+          : buildIssueBlockersResolvedWakeIdempotencyKey({
+              dependentIssueId: dependent.id,
+              resolvedBlockerIssueId: input.issueId,
+            });
+        const childCompletionContext = isCompletedChildParent && parent
+          ? {
+              completedChildIssueId: input.issueId,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            }
+          : null;
         const wakeId = await enqueueWake({
           tx: tx as unknown as Db,
           companyId: input.companyId,
           issueId: dependent.id,
           agentId: dependent.assigneeAgentId,
-          reason: "issue_blockers_resolved",
+          reason: isCompletedChildParent ? "issue_children_completed" : "issue_blockers_resolved",
           idempotencyKey,
-          payload: { resolvedBlockerIssueId: input.issueId, blockerIssueIds: dependent.blockerIssueIds },
+          payload: {
+            resolvedBlockerIssueId: input.issueId,
+            blockerIssueIds: dependent.blockerIssueIds,
+            ...(childCompletionContext ?? {}),
+          },
+          contextSnapshot: childCompletionContext ?? undefined,
         });
         materialized.push({
-          effectKind: "dependency_wake",
+          effectKind: isCompletedChildParent ? "parent_dependency_wake" : "dependency_wake",
           targetType: "agent_wakeup_request",
           targetId: wakeId,
-          payload: { dependentIssueId: dependent.id, resolvedBlockerIssueId: input.issueId },
+          payload: {
+            dependentIssueId: dependent.id,
+            resolvedBlockerIssueId: input.issueId,
+            ...(childCompletionContext ?? {}),
+          },
         });
       }
-      if (issue.parentId) {
-        const parent = await issueSvc.getWakeableParentAfterChildCompletion(issue.parentId);
-        if (parent) {
+      if (parent && !parentIsDependent) {
           const wakeId = await enqueueWake({
             tx: tx as unknown as Db,
             companyId: input.companyId,
@@ -1147,15 +1238,30 @@ export async function commitNativeStatusDecision(input: {
             agentId: parent.assigneeAgentId,
             reason: "issue_children_completed",
             idempotencyKey: `issue_children_completed:${parent.id}:${input.issueId}`,
-            payload: { completedChildIssueId: input.issueId, childIssueIds: parent.childIssueIds },
+            payload: {
+              completedChildIssueId: input.issueId,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
+            contextSnapshot: {
+              completedChildIssueId: input.issueId,
+              childIssueIds: parent.childIssueIds,
+              childIssueSummaries: parent.childIssueSummaries,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
           });
           materialized.push({
             effectKind: "parent_wake",
             targetType: "agent_wakeup_request",
             targetId: wakeId,
-            payload: { parentIssueId: parent.id, completedChildIssueId: input.issueId },
+            payload: {
+              parentIssueId: parent.id,
+              completedChildIssueId: input.issueId,
+              childIssueSummaries: parent.childIssueSummaries,
+              childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
+            },
           });
-        }
       }
     }
 
