@@ -781,13 +781,20 @@ describe("duplex bridge local end-to-end harness", () => {
     expect(receivedBodyLength).toBe(apiLimitBytes);
   }, 30000);
 
-  it("answers 413 request_too_large, not 502, when the body passes the bridge cap", async () => {
+  it("answers 413 from the declared length alone, before it reserves or reads any body byte", async () => {
     // Regression test: the body-size overflow path threw a generic Error that
     // unwound to the 502 catch. A 502 is retryable and leaked the internal
     // message. The overflow must answer a clean 413 request_too_large. Assert the
     // status code specifically, because the wrong 502 stood for a long time.
     const maxBodyBytes = 4096;
-    const harness = await createHarness({ maxBodyBytes });
+    const laterBodySize = "small".length;
+    // Just enough admission budget for the later small read below (its
+    // declared size plus the fixed in-flight frame allowance), with no
+    // margin. If the gateway reserved the oversize request's declared length
+    // before it rejected the request, this budget would stay exhausted and
+    // the later request would be shed with a 503 instead of admitted.
+    const maxInflightBodyBytes = laterBodySize + DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+    const harness = await createHarness({ maxBodyBytes, maxInflightBodyBytes });
     harnesses.push(harness);
     await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
 
@@ -812,18 +819,126 @@ describe("duplex bridge local end-to-end harness", () => {
     // The oversize body never reached the API, and the response leaked no
     // internal message.
     expect(apiWasCalled).toBe(false);
+
+    // The rejected request reserved nothing, so a small request right after
+    // is still admitted -- proving the gateway answered the 413 from the
+    // declared length header alone, before it ever reserved or read a byte.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(later.status).toBe(200);
+    expect(apiWasCalled).toBe(true);
+  }, 20000);
+
+  it("reserves the worst case and answers 413 for a chunked request with no declared length that overruns the cap", async () => {
+    // A request with no Content-Length header -- for example a chunked
+    // request -- gives the gateway no declared size ahead of time. The
+    // gateway must fall back to the worst case (maxBodyBytes) for its
+    // reserve, and it must still answer a clean 413 once the body it
+    // actually reads exceeds the cap.
+    const maxBodyBytes = 4096;
+    const harness = await createHarness({ maxBodyBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    let apiWasCalled = false;
+    harness.api.setResponder((_req, res) => {
+      apiWasCalled = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    const oversizeBody = "a".repeat(maxBodyBytes + 1024);
+    // A ReadableStream body sends with chunked transfer-encoding and no
+    // Content-Length header, so the gateway cannot know the real size ahead
+    // of time.
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(oversizeBody));
+        controller.close();
+      },
+    });
+    const response = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: stream,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({ error: "request_too_large" });
+    expect(apiWasCalled).toBe(false);
+
+    // The rejected read released its reserve, so a later request is admitted
+    // again and reaches the API.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "small",
+    });
+    expect(later.status).toBe(200);
+  }, 20000);
+
+  it("admits many small concurrent requests that the old flat 10 MiB charge would have shed with 503", async () => {
+    // Production constants. Under the old flat charge every active read
+    // reserved maxBodyBytes (about 10 MiB) regardless of the real body size,
+    // so the 64 MiB inflight bound admitted at most
+    // floor(64 MiB / (10 MiB + 1)) = 6 concurrent reads. Charging the
+    // declared body size instead means a control-plane-sized body reserves
+    // only its own few hundred bytes plus the fixed frame allowance, so the
+    // same bound admits far more than 6 concurrent small reads at once.
+    const maxBodyBytes = 10 * 1024 * 1024 + 1;
+    const maxInflightBodyBytes = 64 * 1024 * 1024;
+    const concurrency = 20;
+    const harness = await createHarness({ maxBodyBytes, maxInflightBodyBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    const body = JSON.stringify({ body: "a small status comment" });
+    const post = () =>
+      fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    const responses = await Promise.all(Array.from({ length: concurrency }, () => post()));
+    expect(responses.map((response) => response.status)).toEqual(
+      Array.from({ length: concurrency }, () => 200),
+    );
   }, 20000);
 
   it("sheds a concurrent body read past the admission bound, then releases the reserve", async () => {
-    // The gateway reserves one worst-case body per active read against the local
-    // admission bound. With the bound set to one body, the first read is admitted
-    // and the second read is shed with a 503. The gateway releases the reserve on
-    // the response timeout, so a later request is admitted again.
+    // The gateway reserves the declared body size plus the fixed in-flight
+    // frame allowance for each active read against the local admission
+    // bound. With the bound set to exactly one such reserve, the first read
+    // is admitted and the second read is shed with a 503. The gateway
+    // releases the reserve on the response timeout, so a later request is
+    // admitted again.
     const maxBodyBytes = 4096;
+    const bodySize = 1024;
+    const reservePerRead = bodySize + DEFAULT_MAX_DUPLEX_FRAME_BYTES;
     const harness = await createHarness({
       maxBodyBytes,
-      // The bound admits exactly one concurrent body read.
-      maxInflightBodyBytes: maxBodyBytes,
+      // The bound admits exactly one concurrent body read at bodySize.
+      maxInflightBodyBytes: reservePerRead,
       // A short response deadline releases the first (hung) read fast.
       responseTimeoutMs: 700,
     });
@@ -833,7 +948,7 @@ describe("duplex bridge local end-to-end harness", () => {
     // The first admitted request hangs on the forward until it times out. The
     // second request cannot reserve, so the gateway sheds it with a 503.
     harness.setForwardMode("hang");
-    const body = "a".repeat(1024);
+    const body = "a".repeat(bodySize);
     const post = () =>
       fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
         method: "POST",
@@ -923,16 +1038,21 @@ describe("duplex bridge local end-to-end harness", () => {
   }, 30000);
 
   it("caps concurrent body reads at the retained-byte model, then releases the reserve", async () => {
-    // Production-size accounting. Admission charges maxBodyBytes per read against
-    // the inflight bound, so the bound admits floor(bound / maxBodyBytes) reads.
-    // With the production constants that is floor(64 MiB / (10 MiB + 1)) = 6. The
-    // reservation is the worst-case body per read, so a small body still charges
-    // the full maxBodyBytes. So the test drives the model with small bodies and
-    // asserts the admitted count matches the model.
+    // Production-size accounting. The gateway charges each active read the
+    // declared body size plus the fixed in-flight frame allowance, not the
+    // flat body cap, so the bound admits
+    // floor(inflightBound / (declaredBytes + frameAllowance)) reads. The
+    // declared body here is well under the cap, so this model admits far
+    // more than the old flat-charge model's 6 -- but the test still keeps
+    // the count under the gateway's separate maxQueueDepth bound (64), so
+    // that unrelated queue-depth gate does not also shed a request and
+    // confound the assertions below.
     const maxBodyBytes = 10 * 1024 * 1024 + 1;
     const maxInflightBodyBytes = 64 * 1024 * 1024;
-    const admitCount = Math.floor(maxInflightBodyBytes / maxBodyBytes);
-    expect(admitCount).toBe(6);
+    const bodySize = 1024 * 1024;
+    const reservePerRead = bodySize + DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+    const admitCount = Math.floor(maxInflightBodyBytes / reservePerRead);
+    expect(admitCount).toBe(32);
     const harness = await createHarness({
       maxBodyBytes,
       maxInflightBodyBytes,
@@ -945,7 +1065,7 @@ describe("duplex bridge local end-to-end harness", () => {
     // Each admitted read hangs on the forward until it times out, so all admitted
     // reads hold their reserve at once and the next read cannot reserve.
     harness.setForwardMode("hang");
-    const body = "a".repeat(1024);
+    const body = "a".repeat(bodySize);
     const post = () =>
       fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
         method: "POST",
@@ -992,7 +1112,9 @@ describe("duplex bridge local end-to-end harness", () => {
     const concurrency = 4;
     const harness = await createHarness({
       maxBodyBytes,
-      maxInflightBodyBytes: maxBodyBytes * concurrency,
+      // Each concurrent read charges its declared body size plus the fixed
+      // in-flight frame allowance, so the bound must admit all four at once.
+      maxInflightBodyBytes: (maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES) * concurrency,
       responseTimeoutMs: 20000,
     });
     harnesses.push(harness);
@@ -1098,8 +1220,9 @@ describe("duplex bridge local end-to-end harness", () => {
     const maxBodyBytes = 2 * 1024 * 1024;
     const harness = await createHarness({
       maxBodyBytes,
-      // Admits exactly one concurrent body read.
-      maxInflightBodyBytes: maxBodyBytes,
+      // Admits exactly one concurrent body read at maxBodyBytes: the declared
+      // body size plus the fixed in-flight frame allowance.
+      maxInflightBodyBytes: maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES,
       responseTimeoutMs: 15000,
     });
     harnesses.push(harness);
@@ -1166,8 +1289,9 @@ describe("duplex bridge local end-to-end harness", () => {
     const maxBodyBytes = 2 * 1024 * 1024;
     const harness = await createHarness({
       maxBodyBytes,
-      // Admits exactly one concurrent body read.
-      maxInflightBodyBytes: maxBodyBytes,
+      // Admits exactly one concurrent body read at maxBodyBytes: the declared
+      // body size plus the fixed in-flight frame allowance.
+      maxInflightBodyBytes: maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES,
       responseTimeoutMs: 1200,
     });
     harnesses.push(harness);

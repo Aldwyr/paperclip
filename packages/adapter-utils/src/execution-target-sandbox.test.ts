@@ -5854,6 +5854,37 @@ describe("sandbox duplex gateway", () => {
     expect(stream.writes).toEqual(["frame-1\n"]);
   });
 
+  it("settles every write queued in the same tick as a stream error, not only the queue head", async () => {
+    // Regression test. The writer's top-of-loop error check rejected only the
+    // queue head and discarded the rest of the queue with no reject call, so
+    // a second write queued in the same synchronous tick as the error never
+    // settled. Separately, the code path that resumed after a stalled write
+    // shifted the queue head unconditionally, so a write queued during that
+    // stall -- after the stream had already errored, but before the writer's
+    // pending wait had a chance to resume -- was removed and never settled
+    // either. Queue two more writes in the same tick as the error, so both
+    // failure modes are on the table, and prove every one of the three
+    // pending promises rejects.
+    const { createStdoutFrameWriter } = loadEmbeddedStdoutFrameWriter();
+    const stream = new FakeOutboundStream({ accepting: false });
+    const writeLine = createStdoutFrameWriter(stream);
+
+    const first = writeLine("frame-1\n");
+    await Promise.resolve();
+    expect(stream.writes).toEqual(["frame-1\n"]);
+
+    const boom = new Error("EPIPE");
+    // Queue two more lines in the same synchronous tick as the error, before
+    // the writer's drain-or-error wait for frame-1 resumes.
+    stream.errorOut(boom);
+    const second = writeLine("frame-2\n");
+    const third = writeLine("frame-3\n");
+
+    await expect(first).rejects.toBe(boom);
+    await expect(second).rejects.toBe(boom);
+    await expect(third).rejects.toBe(boom);
+  });
+
   it("returns the same HTTP response as the file gateway for a forwarded request", async () => {
     const token = "duplex-token-forward";
     const gateway = await startDuplexGateway({ PAPERCLIP_BRIDGE_TOKEN: token });

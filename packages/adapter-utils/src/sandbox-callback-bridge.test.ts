@@ -885,6 +885,166 @@ describe("sandbox callback bridge", () => {
     });
   });
 
+  it("reserves the declared body size, not the flat body cap, against the file gateway's admission bound", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-body-reserve-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge body reserve test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const maxBodyBytes = 4096;
+    const bodySize = 1024;
+    // The file gateway charges 15x the declared body size for its reserve:
+    // 1x for the raw buffer, up to 2x for the decoded string, and up to 6x
+    // each for the JSON-escaped string and its UTF-8 write buffer. See the
+    // comment on FILE_GATEWAY_BODY_RESERVE_FACTOR in sandbox-callback-bridge.ts.
+    const reservePerRead = bodySize * 15;
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+      // No worker answers in this test, so an admitted read hangs until this
+      // deadline and times out with a 502. A shed read never reaches that
+      // far; it answers a 503 at once.
+      responseTimeoutMs: 300,
+      maxBodyBytes,
+      // Admits exactly one concurrent body read at bodySize.
+      maxInflightBodyBytes: reservePerRead,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const body = "a".repeat(bodySize);
+    const post = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    const [first, second] = await Promise.all([post(), post()]);
+    const statuses = [first.status, second.status].sort((a, b) => a - b);
+    // One request was admitted (it later times out with a 502, because no
+    // worker answers). One request was shed with a 503 before it could
+    // buffer a second body.
+    expect(statuses).toEqual([502, 503]);
+    const shed = first.status === 503 ? first : second;
+    await expect(shed.json()).resolves.toEqual({ error: "bridge_busy" });
+
+    // The timed-out read released its reserve, so a later request is
+    // admitted again -- it also times out with a 502, not a 503.
+    const later = await post();
+    expect(later.status).toBe(502);
+  }, 20000);
+
+  it("admits many small concurrent file-gateway requests that the old flat 10 MiB charge would have shed with 503", async () => {
+    // Production constants. Under the old flat charge every active read
+    // reserved maxBodyBytes (about 10 MiB) regardless of the real body size,
+    // so the 64 MiB inflight bound admitted at most
+    // floor(64 MiB / (10 MiB + 1)) = 6 concurrent reads. Charging the
+    // declared body size instead (times the file gateway's factor) means a
+    // control-plane-sized body reserves only a small multiple of its own
+    // size, so the same bound admits far more than 6 concurrent small reads
+    // at once.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-small-concurrent-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge small concurrent test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => ({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ok: true, id: request.id }),
+      }),
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+      maxBodyBytes: 10 * 1024 * 1024 + 1,
+      // maxInflightBodyBytes stays at the production default (64 MiB).
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const concurrency = 20;
+    const body = JSON.stringify({ body: "a small status comment" });
+    const post = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    const responses = await Promise.all(Array.from({ length: concurrency }, () => post()));
+    expect(responses.map((response) => response.status)).toEqual(
+      Array.from({ length: concurrency }, () => 200),
+    );
+  }, 20000);
+
   it("returns a 502 when the host response times out", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-timeout-"));
     cleanupDirs.push(rootDir);

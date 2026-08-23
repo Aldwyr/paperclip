@@ -44,11 +44,12 @@ const DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES = 8 * 1024 * 1024;
 // operating-system process inside the sandbox, so it cannot share the host
 // aggregate byte ledger. At a 10 MiB body cap, the 64-deep pending queue could
 // let many concurrent reads each retain a full body and exhaust the sandbox
-// process memory before any host limit applies. The gateway reserves one
-// worst-case body per active read against this bound, and sheds a new read with
-// a 503 when the bound is full. The host passes the value through
-// PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES. This bound protects the sandbox
-// process; it is separate from the host aggregate byte ledger.
+// process memory before any host limit applies. The gateway reserves bytes for
+// each active read against this bound -- the declared body size times a
+// per-gateway representation factor, not a flat per-request charge -- and sheds
+// a new read with a 503 when the bound is full. The host passes the value
+// through PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES. This bound protects the
+// sandbox process; it is separate from the host aggregate byte ledger.
 const DEFAULT_BRIDGE_MAX_INFLIGHT_BODY_BYTES = 64 * 1024 * 1024;
 // Per-iteration timeout for one poll-loop client call. A healthy control-plane
 // round trip finishes in well under one second, so 10s is far above a normal
@@ -476,6 +477,7 @@ export function buildSandboxCallbackBridgeEnv(input: {
   responseTimeoutMs?: number | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  maxInflightBodyBytes?: number | null;
 }): Record<string, string> {
   return {
     PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_FILE_MODE,
@@ -494,6 +496,9 @@ export function buildSandboxCallbackBridgeEnv(input: {
     ),
     PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(
       normalizeTimeoutMs(input.maxBodyBytes, DEFAULT_BRIDGE_MAX_BODY_BYTES),
+    ),
+    PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES: String(
+      normalizeTimeoutMs(input.maxInflightBodyBytes, DEFAULT_BRIDGE_MAX_INFLIGHT_BODY_BYTES),
     ),
   };
 }
@@ -1643,6 +1648,7 @@ export async function startSandboxCallbackBridgeServer(input: {
   shellCommand?: "bash" | "sh" | null;
   maxQueueDepth?: number | null;
   maxBodyBytes?: number | null;
+  maxInflightBodyBytes?: number | null;
 }): Promise<StartedSandboxCallbackBridgeServer> {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
@@ -1668,6 +1674,7 @@ export async function startSandboxCallbackBridgeServer(input: {
     responseTimeoutMs: input.responseTimeoutMs,
     maxQueueDepth: input.maxQueueDepth,
     maxBodyBytes: input.maxBodyBytes,
+    maxInflightBodyBytes: input.maxInflightBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
   const startResult = await input.runner.execute({
@@ -2023,22 +2030,29 @@ const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(st
   let pumping = false;
   let streamError = null;
 
+  // Reject every entry still queued and empty the queue. Both the "error"
+  // listener below and the top-of-loop check inside pump call this, so a
+  // stream error always settles every entry that was queued when it struck,
+  // not only the one pump happened to be holding.
+  function strandQueue(error) {
+    const stranded = queue.splice(0, queue.length);
+    for (const entry of stranded) entry.reject(error);
+  }
+
   stream.on("error", (error) => {
     streamError = error instanceof Error ? error : new Error(String(error));
-    const stranded = queue.splice(0, queue.length);
-    for (const entry of stranded) entry.reject(streamError);
+    strandQueue(streamError);
   });
 
   async function pump() {
     if (pumping) return;
     pumping = true;
     while (queue.length > 0) {
-      const entry = queue[0];
       if (streamError) {
-        queue.length = 0;
-        entry.reject(streamError);
+        strandQueue(streamError);
         break;
       }
+      const entry = queue[0];
       let wroteOk = false;
       try {
         wroteOk = stream.write(entry.line);
@@ -2064,12 +2078,18 @@ const DUPLEX_GATEWAY_STDOUT_WRITER_SOURCE = `function createStdoutFrameWriter(st
           stream.once("error", onStreamErrorWhileWaiting);
         });
       }
-      queue.shift();
       if (streamError) {
-        entry.reject(streamError);
-      } else {
-        entry.resolve();
+        // The "error" listener already stranded and rejected every entry
+        // that was in the queue when the stream failed, including this one
+        // if it was still queued at that moment. Do not shift here: the
+        // queue head may now be a line a caller pushed after the stream
+        // failed but before this wait resumed, and shifting it here would
+        // discard that entry without ever settling its promise. The
+        // top-of-loop check above strands it on the next turn instead.
+        continue;
       }
+      queue.shift();
+      entry.resolve();
     }
     pumping = false;
   }
@@ -2140,9 +2160,10 @@ const maxDuplexDecoderBytes = Number(
   process.env.PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES || "${DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES}",
 );
 // The host passes the local in-sandbox body-read admission bound here. The
-// gateway reserves one worst-case body (maxBodyBytes) per active read and sheds
-// a new read with a 503 when the reserve is full. This bound protects the
-// sandbox process memory; it never shares the host aggregate byte ledger.
+// gateway reserves declaredBytes times a per-gateway factor for each active
+// read and sheds a new read with a 503 when the reserve is full. This bound
+// protects the sandbox process memory; it never shares the host aggregate
+// byte ledger.
 const maxInflightBodyBytes = Number(
   process.env.PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_INFLIGHT_BODY_BYTES}",
 );
@@ -2193,9 +2214,10 @@ function normalizeHeaders(headers) {
   return out;
 }
 
-// Typed marker for a request body that exceeds maxBodyBytes. readBody throws it,
-// so each gateway answers a clean 413 request_too_large instead of the generic
-// 502. A 502 is retryable by convention and would leak the internal message.
+// Typed marker for a request body that exceeds its declared length or the
+// bridge cap. readBody throws it, so each gateway answers a clean 413
+// request_too_large instead of the generic 502. A 502 is retryable by
+// convention and would leak the internal message.
 class BridgeBodyTooLargeError extends Error {
   constructor() {
     super("request_too_large");
@@ -2203,50 +2225,98 @@ class BridgeBodyTooLargeError extends Error {
   }
 }
 
+// Read the declared body size from the Content-Length request header. Node's
+// HTTP server validates the header's syntax before a request reaches a
+// handler, so this only needs to guard the two cases that leave the gateway
+// with no declared size: the header is absent, or its value is not a plain
+// non-negative integer (a chunked request carries no Content-Length header
+// at all). Both cases return maxBodyBytes, the prior worst-case charge, so a
+// request that declares nothing keeps the old admission behavior.
+function declaredBodyBytes(req) {
+  const raw = req.headers["content-length"];
+  if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) {
+    return maxBodyBytes;
+  }
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) ? parsed : maxBodyBytes;
+}
+
+// The file gateway holds four representations of one request body at once
+// after it reads the raw bytes -- see the comment at the writeFile call in
+// runFileGateway. Each one's size relative to the declared body size D:
+//   raw body buffer        1x D  (readBody allocates exactly D)
+//   decodeUtf8Body string  2x D  (worst case: V8 stores the string two bytes
+//                                 per character)
+//   JSON.stringify string  6x D  (worst case: every raw byte is a JSON
+//                                 control character, so it escapes to
+//                                 "\\u00XX", six characters, for one input
+//                                 byte)
+//   fs.writeFile Buffer    6x D  (the escaped string above is pure ASCII, so
+//                                 its UTF-8 encoding is one byte per
+//                                 character, matching the escaped string's
+//                                 six-to-one ratio)
+// 1 + 2 + 6 + 6 = 15. The factor charges the sum of every representation's
+// own worst case, not the true instantaneous peak, so it stays a safe upper
+// bound even if a future change makes two representations overlap that do
+// not overlap today.
+const FILE_GATEWAY_BODY_RESERVE_FACTOR = 15;
+
+// The duplex gateway holds one body buffer plus at most one in-flight
+// base64-encoded frame while it sends that buffer to the host -- see the
+// retained-peak note in runDuplexGateway. The frame never exceeds
+// DEFAULT_MAX_DUPLEX_FRAME_BYTES, and that bound does not grow with the body
+// (the gateway always sends the body as a series of fixed-size frames), so
+// the reserve adds it as a fixed term instead of folding it into a
+// multiplier.
+const DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES = DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+
 // The running total of reserved body-read bytes across all active reads.
 let reservedBodyBytes = 0;
 const noopRelease = () => {};
 
-// Reserve capacity for one body read against the local admission bound. Return a
-// release function on success, or null when the bound is full. Each caller
-// releases on every terminal path: success, size rejection, other error,
-// timeout, and connection close.
-function reserveBodyRead() {
-  if (reservedBodyBytes + maxBodyBytes > maxInflightBodyBytes) {
+// Reserve reserveBytes against the local admission bound for one active read.
+// Return a release function on success, or null when the bound is full. Each
+// caller releases on every terminal path: success, size rejection, other
+// error, timeout, and connection close.
+//
+// A caller passes the bytes the read will actually retain -- the declared
+// body size times the calling gateway's representation factor -- not a flat
+// per-request charge.
+function reserveBodyRead(reserveBytes) {
+  if (reservedBodyBytes + reserveBytes > maxInflightBodyBytes) {
     return null;
   }
-  reservedBodyBytes += maxBodyBytes;
+  reservedBodyBytes += reserveBytes;
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    reservedBodyBytes -= maxBodyBytes;
+    reservedBodyBytes -= reserveBytes;
   };
 }
 
-// Read one request body into a single buffer sized to the admission charge.
+// Read one request body into a single buffer sized to the declared body
+// length.
 //
 // Accounting choice: the old code pushed each chunk onto a chunks array, then
 // called Buffer.concat on it. Both the array and the concat result held the
-// full body at once, so the transient peak was 2x the raw body while
-// admission charged 1x -- a dishonest bound. This version preallocates one
-// buffer of maxBodyBytes and copies each incoming chunk into it in place, then
-// returns a view over the written bytes. A view shares the same backing
-// memory; it adds no second copy. So the retained peak per active read is one
-// maxBodyBytes buffer, matching the charge exactly.
+// full body at once, so the transient peak was 2x the raw body -- a
+// dishonest bound. This version preallocates one buffer of declaredBytes and
+// copies each incoming chunk into it in place, then returns a view over the
+// written bytes. A view shares the same backing memory; it adds no second
+// copy. So the retained peak for the raw body is exactly one declaredBytes
+// buffer, matching the reserve for it.
 //
-// The tradeoff: a small body now retains the full maxBodyBytes allocation for
-// the life of the request, where the old code retained only the small body's
-// own bytes. reserveBodyRead already charges maxBodyBytes for every active
-// read regardless of the real size, so this tradeoff raises no read past what
-// admission already assumed was possible; it only makes the real memory shape
-// match the existing worst-case charge instead of usually running under it.
-async function readBody(req) {
-  const out = Buffer.allocUnsafe(maxBodyBytes);
+// Buffer.allocUnsafe is safe here because the returned view never exposes a
+// byte the loop did not write: out.subarray(0, totalBytes) stops at
+// totalBytes, and totalBytes only ever advances by the byte count a copy
+// call actually wrote.
+async function readBody(req, declaredBytes) {
+  const out = Buffer.allocUnsafe(declaredBytes);
   let totalBytes = 0;
   for await (const chunk of req) {
     const nextChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    if (totalBytes + nextChunk.byteLength > maxBodyBytes) {
+    if (totalBytes + nextChunk.byteLength > declaredBytes) {
       throw new BridgeBodyTooLargeError();
     }
     nextChunk.copy(out, totalBytes);
@@ -2347,13 +2417,22 @@ async function runFileGateway() {
       }
       const requestId = randomUUID();
       const hasRequestBody = req.method && req.method !== "GET" && req.method !== "HEAD";
-      const releaseBodyRead = hasRequestBody ? reserveBodyRead() : noopRelease;
+      const declaredBytes = hasRequestBody ? declaredBodyBytes(req) : 0;
+      if (hasRequestBody && declaredBytes > maxBodyBytes) {
+        // Reject an oversize body from its declared length alone, before the
+        // gateway reserves or reads one byte of it.
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
+      const releaseBodyRead = hasRequestBody
+        ? reserveBodyRead(declaredBytes * FILE_GATEWAY_BODY_RESERVE_FACTOR)
+        : noopRelease;
       if (!releaseBodyRead) {
         writeJsonResponse(res, 503, { error: "bridge_busy" });
         return;
       }
       try {
-      const requestBody = decodeUtf8Body(await readBody(req));
+      const requestBody = decodeUtf8Body(await readBody(req, declaredBytes));
       const payload = {
         id: requestId,
         method: req.method || "GET",
@@ -2365,6 +2444,11 @@ async function runFileGateway() {
       };
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);
       const tempPath = \`\${requestPath}.tmp\`;
+      // JSON.stringify builds a third representation of the body (the escaped
+      // copy inside payload), and fs.writeFile's "utf8" encoding builds a
+      // fourth (the write Buffer). FILE_GATEWAY_BODY_RESERVE_FACTOR charges
+      // for all four representations at once; see its comment for the
+      // worst-case size of each.
       await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, "utf8");
       await fs.rename(tempPath, requestPath);
 
@@ -2679,7 +2763,16 @@ function runDuplexGateway() {
       }
       const requestId = randomUUID();
       const hasRequestBody = req.method && req.method !== "GET" && req.method !== "HEAD";
-      const releaseBodyRead = hasRequestBody ? reserveBodyRead() : noopRelease;
+      const declaredBytes = hasRequestBody ? declaredBodyBytes(req) : 0;
+      if (hasRequestBody && declaredBytes > maxBodyBytes) {
+        // Reject an oversize body from its declared length alone, before the
+        // gateway reserves or reads one byte of it.
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
+      const releaseBodyRead = hasRequestBody
+        ? reserveBodyRead(declaredBytes + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES)
+        : noopRelease;
       if (!releaseBodyRead) {
         writeJsonResponse(res, 503, { error: "bridge_busy" });
         return;
@@ -2690,7 +2783,7 @@ function runDuplexGateway() {
       // every path that never commits to a send.
       let handedOffToSend = false;
       try {
-      const requestBodyBuffer = await readBody(req);
+      const requestBodyBuffer = await readBody(req, declaredBytes);
       if (unavailable) {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
         return;
@@ -2730,7 +2823,7 @@ function runDuplexGateway() {
         return;
       }
       // Retained-peak note. readBody preallocates one buffer sized to
-      // maxBodyBytes and returns a view over it, so no second (concatenated)
+      // declaredBytes and returns a view over it, so no second (concatenated)
       // copy of the body ever coexists with it -- see the comment on readBody.
       // The send below builds and encodes one body_chunk frame at a time from
       // that same view; it holds no per-request buffer of its own. Every
@@ -2742,20 +2835,18 @@ function runDuplexGateway() {
       // still buffers up to its own high-water mark; it never queues a whole
       // request's frames at once behind a slow reader. So the retained peak
       // per active read is about:
-      //   one body buffer     <= maxBodyBytes (about 10 MiB)
+      //   one body buffer     <= declaredBytes
       //   one in-flight frame <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
-      // and admission charges maxBodyBytes per read against the 64 MiB
-      // inflight bound, so the bound admits at most
-      // floor(64 MiB / maxBodyBytes) = 6 reads. The true retained peak across
-      // every admitted read stays near 6 * (10 MiB + 1 MB) ~= 66 MiB, the same
-      // fixed small margin over the admission threshold as before -- not a
-      // multiple of the body, and not made worse by a slow host. A malformed
-      // body cannot expand, because its raw bytes ride base64 frames
-      // unchanged. The reserve for one read releases only once both its send
-      // finished (drained fully or ended by a stream error) and its response
-      // settled -- see releaseReserveWhenBothDone below -- so a slow host
-      // cannot make the gateway release a reserve while it still retains the
-      // bytes.
+      // and admission charges exactly that sum
+      // (declaredBytes + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES) per
+      // read against the 64 MiB inflight bound, so a small request no longer
+      // charges the full 10 MiB body cap and a large request charges no less
+      // than its true retained peak. A malformed body cannot expand, because
+      // its raw bytes ride base64 frames unchanged. The reserve for one read
+      // releases only once both its send finished (drained fully or ended by
+      // a stream error) and its response settled -- see
+      // releaseReserveWhenBothDone below -- so a slow host cannot make the
+      // gateway release a reserve while it still retains the bytes.
       handedOffToSend = true;
       let sendDone = false;
       let responseDone = false;
