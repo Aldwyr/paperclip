@@ -1010,6 +1010,84 @@ describe("duplex bridge local end-to-end harness", () => {
     expect(later.status).toBe(200);
   }, 20000);
 
+  it("reserves twice the body cap for an unknown-length read, so three cap-sized chunked reads exhaust the bound", async () => {
+    // Regression coverage for PAP-5049 (Stage-2 round 7). readBody holds a
+    // chunk list and the Buffer.concat result together for one instant when
+    // the declared length is unknown -- see its comment -- so an
+    // unknown-length read's true retained peak is up to two times
+    // maxBodyBytes, not one time. The reserve charge must match that peak:
+    // 2 * maxBodyBytes plus the fixed frame allowance (the 2x factor here
+    // matches DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR in the
+    // gateway source). This test sets the in-flight bound to admit exactly
+    // three such reads at once, holds the host forward so the reserves
+    // overlap, and proves a fourth read is shed with a 503 -- then proves a
+    // later read is admitted once a terminal releases a reserve.
+    //
+    // maxBodyBytes must be large relative to the fixed frame allowance for
+    // the 2x factor to change the admitted count: a body far smaller than
+    // the frame allowance would admit the same count either way, and the
+    // test would not tell the two charges apart.
+    const maxBodyBytes = 2 * 1024 * 1024;
+    const reservePerRead = 2 * maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+    const admitCount = 3;
+    const harness = await createHarness({
+      maxBodyBytes,
+      maxInflightBodyBytes: admitCount * reservePerRead,
+      // A short response deadline releases each hung read fast.
+      responseTimeoutMs: 700,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    // Each admitted read hangs on the forward until it times out, so all
+    // admitted reads hold their reserve at once and the next read cannot
+    // reserve.
+    harness.setForwardMode("hang");
+    const chunkedBody = "a".repeat(maxBodyBytes);
+    const postChunked = () => {
+      // A ReadableStream body sends with chunked transfer-encoding and no
+      // Content-Length header, so the gateway cannot know the real size
+      // ahead of time.
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(chunkedBody));
+          controller.close();
+        },
+      });
+      return fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body: stream,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" });
+    };
+    const responses = await Promise.all(
+      Array.from({ length: admitCount + 1 }, () => postChunked()),
+    );
+    const statuses = responses.map((response) => response.status);
+    // Three reads were admitted (each later times out with a 502). One read
+    // past the model is shed with a 503 before it buffers a body.
+    const shedCount = statuses.filter((status) => status === 503).length;
+    const admittedTimedOut = statuses.filter((status) => status === 502).length;
+    expect(shedCount).toBe(1);
+    expect(admittedTimedOut).toBe(admitCount);
+    const shed = responses.find((response) => response.status === 503);
+    await expect(shed?.json()).resolves.toEqual({ error: "bridge_busy" });
+
+    // The admitted reads timed out and released their reserve. A later
+    // chunked request is admitted again and reaches the API.
+    harness.setForwardMode("proxy");
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const later = await postChunked();
+    expect(later.status).toBe(200);
+  }, 30000);
+
   it("forwards a cap-sized malformed-UTF-8 body byte-for-byte and emits no expanded frame", async () => {
     // Regression test for the admission-bypass block. The gateway used to decode
     // the raw body to a UTF-8 string, then re-encode it. Each invalid byte

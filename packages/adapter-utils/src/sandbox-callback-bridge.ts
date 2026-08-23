@@ -2377,14 +2377,23 @@ const FILE_GATEWAY_BODY_RESERVE_FACTOR = 4;
 const FILE_GATEWAY_BODY_WRITE_SLICE_CHARS = 65536;
 const FILE_GATEWAY_BODY_RESERVE_EXTRA_BYTES = FILE_GATEWAY_BODY_WRITE_SLICE_CHARS * 6;
 
-// The duplex gateway holds one body buffer plus at most one in-flight
-// base64-encoded frame while it sends that buffer to the host -- see the
-// retained-peak note in runDuplexGateway. The frame never exceeds
+// The duplex gateway holds the read request body -- one buffer for a
+// declared-length read, up to two for an unknown-length read (see
+// DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR below) -- plus at most
+// one in-flight base64-encoded frame while it sends that buffer to the host
+// -- see the retained-peak note in runDuplexGateway. The frame never exceeds
 // DEFAULT_MAX_DUPLEX_FRAME_BYTES, and that bound does not grow with the body
 // (the gateway always sends the body as a series of fixed-size frames), so
 // the reserve adds it as a fixed term instead of folding it into a
 // multiplier.
 const DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES = DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+
+// readBody holds a chunk list and the Buffer.concat result together for one
+// instant when the length is unknown -- see the comment on readBody -- so an
+// unknown-length read's retained peak is up to two times maxBodyBytes, not
+// one time. This constant names that factor so the duplex reserve charge
+// below carries no bare literal 2.
+const DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR = 2;
 
 // The running total of reserved body-read bytes across all active reads.
 let reservedBodyBytes = 0;
@@ -2984,23 +2993,31 @@ function runDuplexGateway() {
         writeJsonResponse(res, 413, { error: "request_too_large" });
         return;
       }
-      // The charge substitutes maxBodyBytes for an unknown declared length --
-      // the same worst-case charge as before -- but readBody itself never
-      // preallocates that worst case; see its comment. declaredBodyBytes now
-      // returns 0, not null, for a request with neither a Content-Length nor
-      // a Transfer-Encoding header, so a bodyless request charges the
-      // zero-length reserve here, not this worst-case fallback. The charge
-      // for a declared length and for an unknown length is unchanged in
-      // value from before.
+      // For a declared length, readBody preallocates exactly that many bytes
+      // and returns a view over them, so that read retains one copy: the
+      // charge below is the declared length itself. For an unknown declared
+      // length, readBody instead holds a chunk list and the Buffer.concat
+      // result together for one instant -- see its comment -- so that read's
+      // true retained peak is up to
+      // DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR times maxBodyBytes,
+      // not one time; the charge below matches that true peak.
+      // declaredBodyBytes returns 0, not null, for a request with neither a
+      // Content-Length nor a Transfer-Encoding header, so a bodyless request
+      // still charges the zero-length reserve, not this worst-case fallback.
       //
       // A chunked request still declares no length (declaredBodyBytes
-      // returns null for it), so it still charges the whole cap here. At
+      // returns null for it), so it still charges the worst case here. At
       // the production defaults (maxBodyBytes 10,485,761, extra bytes
-      // 1,048,576) that charge is about 11.5 MB, and the 64 MiB inflight
-      // bound admits up to 5 such requests at a time. This is intentional:
-      // the gateway cannot know a chunked body's size before it reads it,
-      // so an honest worst-case charge is the correct, safe answer.
-      const reserveCharge = hasRequestBody ? (declaredLength !== null ? declaredLength : maxBodyBytes) : 0;
+      // 1,048,576) that charge is about 22.0 MB, and the 64 MiB inflight
+      // bound admits up to 3 such requests at a time. This is intentional:
+      // the gateway cannot know a chunked body's size before it reads it, so
+      // an honest worst-case charge -- one that matches readBody's true
+      // retained peak -- is the correct, safe answer.
+      const reserveCharge = hasRequestBody
+        ? declaredLength !== null
+          ? declaredLength
+          : DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR * maxBodyBytes
+        : 0;
       const reserved = hasRequestBody
         ? reserveBodyRead(reserveCharge + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES)
         : noopRelease;
@@ -3060,30 +3077,35 @@ function runDuplexGateway() {
       }
       // Retained-peak note. For a declared length, readBody preallocates one
       // buffer sized to it and returns a view over it, so no second
-      // (concatenated) copy of the body ever coexists with it. For an unknown
-      // length, readBody instead holds a chunk list and one Buffer.concat
-      // result together for one instant -- see the comment on readBody. The
-      // send below builds and encodes one body_chunk frame at a time from the
-      // read body; it holds no per-request buffer of its own. Every frame --
-      // this envelope, each body_chunk, and every heartbeat and READY frame
-      // from the rest of the process -- writes through the one serialized
-      // writer above. That writer issues at most one written-but-not-yet-
-      // drained line at a time, bounded by DEFAULT_MAX_DUPLEX_FRAME_BYTES
-      // (1 MB), plus whatever the stream itself still buffers up to its own
-      // high-water mark; it never queues a whole request's frames at once
-      // behind a slow reader. So the retained peak per active read is about:
-      //   one body buffer     <= reserveCharge
-      //   one in-flight frame <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
+      // (concatenated) copy of the body ever coexists with it: that read's
+      // body-buffer footprint is exactly one declaredLength buffer. For an
+      // unknown length, readBody instead holds a chunk list and one
+      // Buffer.concat result together for one instant -- see the comment on
+      // readBody -- so that read's body-buffer footprint is up to
+      // DUPLEX_GATEWAY_UNKNOWN_LENGTH_BODY_RESERVE_FACTOR times maxBodyBytes,
+      // not one time. The send below builds and encodes one body_chunk frame
+      // at a time from the read body; it holds no per-request buffer of its
+      // own. Every frame -- this envelope, each body_chunk, and every
+      // heartbeat and READY frame from the rest of the process -- writes
+      // through the one serialized writer above. That writer issues at most
+      // one written-but-not-yet-drained line at a time, bounded by
+      // DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB), plus whatever the stream
+      // itself still buffers up to its own high-water mark; it never queues a
+      // whole request's frames at once behind a slow reader. So the retained
+      // peak per active read is about:
+      //   body-buffer footprint <= reserveCharge
+      //   one in-flight frame   <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
       // and admission charges exactly that sum
       // (reserveCharge + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES) per
       // read against the 64 MiB inflight bound, so a small request no longer
-      // charges the full 10 MiB body cap and a large request charges no less
-      // than its true retained peak. A malformed body cannot expand, because
-      // its raw bytes ride base64 frames unchanged. The reserve for one read
-      // releases only once both its send finished (drained fully or ended by
-      // a stream error) and its response settled -- see
-      // releaseReserveWhenBothDone below -- so a slow host cannot make the
-      // gateway release a reserve while it still retains the bytes.
+      // charges the full 10 MiB body cap and an unknown-length or large
+      // request charges no less than its true retained peak. A malformed
+      // body cannot expand, because its raw bytes ride base64 frames
+      // unchanged. The reserve for one read releases only once both its send
+      // finished (drained fully or ended by a stream error) and its response
+      // settled -- see releaseReserveWhenBothDone below -- so a slow host
+      // cannot make the gateway release a reserve while it still retains the
+      // bytes.
       handedOffToSend = true;
       let sendDone = false;
       let responseDone = false;
