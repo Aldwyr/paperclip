@@ -44,12 +44,18 @@ describe("Paperclip task protocol surface registry", () => {
   it("classifies both runtime request types and all issue-thread request kinds", () => {
     const requestSchema = schema("request.schema.json");
     const alternatives = Array.isArray(requestSchema.oneOf) ? requestSchema.oneOf.map(record) : [];
-    const runtimeProperties = record(alternatives.find((candidate) => record(record(candidate.properties).requestKind).const === "runtime")?.properties);
+    const runtimeProperties = alternatives
+      .filter((candidate) => record(record(candidate.properties).requestKind).const === "runtime")
+      .map((candidate) => record(candidate.properties));
     const issueProperties = record(alternatives.find((candidate) => record(record(candidate.properties).requestKind).const === "issue_thread")?.properties);
-    const expected = [
-      ...enumStrings(record(runtimeProperties.type).enum).map((kind) => `runtime.${kind}`),
+    const expected = [...new Set([
+      ...runtimeProperties.flatMap((properties) => {
+        const type = record(properties.type);
+        const kinds = typeof type.const === "string" ? [type.const] : enumStrings(type.enum);
+        return kinds.map((kind) => `runtime.${kind}`);
+      }),
       ...enumStrings(record(issueProperties.kind).enum).map((kind) => `issue_thread.${kind}`),
-    ].sort();
+    ])].sort();
     expect(Object.keys(TASK_PROTOCOL_REQUEST_SURFACE_REGISTRY).sort()).toEqual(expected);
   });
 

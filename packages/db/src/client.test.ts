@@ -1407,11 +1407,11 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
   );
 
   it(
-    "replays migration 0228 when remote agent profiles already exist",
+    "replays migration 0229 when remote agent profiles already exist",
     async () => {
       const connectionString = await createTempDatabase();
       await applyPendingMigrations(connectionString);
-      const hash = await migrationHash("0228_late_landau.sql");
+      const hash = await migrationHash("0229_late_landau.sql");
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         await sql`DELETE FROM "drizzle"."__drizzle_migrations" WHERE "hash" = ${hash}`;
