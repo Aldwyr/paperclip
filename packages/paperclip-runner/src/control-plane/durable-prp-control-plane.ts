@@ -2596,8 +2596,14 @@ export async function runDurableEvalSession(
         await new Promise((resolveWait) => setTimeout(resolveWait, 20));
       }
       if (nativeResumeCall === null) {
+        handle.child.kill("SIGKILL");
+        const timedOutRunner = await handle.completion;
+        const diagnostics =
+          timedOutRunner.stderr.trim() ||
+          sharedCodexServerStderr.trim() ||
+          "no process diagnostics";
         throw new Error(
-          `native resume operation ${input.nativeResume.operationId} did not commit before timeout`,
+          `native resume operation ${input.nativeResume.operationId} did not commit before timeout: ${diagnostics}`,
         );
       }
       handle.child.kill("SIGKILL");

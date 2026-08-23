@@ -394,8 +394,13 @@ describe.sequential("Durable transport and recovery", () => {
         ],
         providerCommand: process.execPath,
         providerArgs: [
-          providerFixture,
-          "proxy",
+          fileURLToPath(
+            new URL(
+              "../../dist/cli/codex-app-server-unix-proxy.js",
+              import.meta.url,
+            ),
+          ),
+          "--socket",
           resolve(root, "provider.sock"),
         ],
         seed: {
