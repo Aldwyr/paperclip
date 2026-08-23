@@ -92,6 +92,7 @@ describe("OpenCode MCP bridge", () => {
     expect(canonicalOpenCodeMcpToolName("paperclip_documents.read")).toBe("documents.read");
     expect(canonicalOpenCodeMcpToolName("paperclip__documents.read")).toBe("documents.read");
     expect(canonicalOpenCodeMcpToolName("paperclip.documents.read")).toBe("documents.read");
+    expect(canonicalOpenCodeMcpToolName("paperclip_paperclip_finish")).toBe("paperclip_finish");
   });
 
   it("validates inputs before dispatch", async () => {

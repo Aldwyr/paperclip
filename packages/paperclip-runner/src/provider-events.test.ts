@@ -84,9 +84,90 @@ describe("provider-neutral events", () => {
     expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
   });
 
+  it("marks a turn plan complete when every native step is complete", () => {
+    const event = canonicalProviderEventsFromCodex("turn/plan/updated", {
+      turnId: "turn-1",
+      plan: [
+        { step: "Inspect", status: "completed" },
+        { step: "Implement", status: "completed" },
+      ],
+    })[0]!;
+    expect(event).toMatchObject({
+      eventType: "plan.updated",
+      payload: { complete: true, syncStatus: "pending" },
+    });
+  });
+
   it("classifies only structured OpenCode parts and never assistant prose", () => {
     expect(canonicalProviderEventsFromOpenCodePart({ id: "tool-1", type: "tool", tool: "read", state: { status: "completed", output: "done" } })[0]?.eventType).toBe("tool.execution.completed");
     expect(canonicalProviderEventsFromOpenCodePart({ id: "text-1", type: "text", text: "I ran a command and delegated work" })).toEqual([]);
+  });
+
+  it("maps OpenCode pending dynamic tools to a valid builtin execution start", () => {
+    const event = canonicalProviderEventsFromOpenCodePart({
+      id: "prt_02c35c313001X42cqyvQrpXOFv",
+      type: "tool",
+      tool: "paperclip_report_progress",
+      callID: "call_6cd0302e681d44c2aba3c164",
+      state: { status: "pending", input: {}, raw: "" },
+    })[0]!;
+    expect(event).toMatchObject({
+      eventType: "tool.execution.started",
+      payload: {
+        schema: "paperclip.tool.execution.v1",
+        transport: "builtin",
+        status: "running",
+        name: "paperclip_report_progress",
+      },
+    });
+    expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
+  });
+
+  it("presents OpenCode's server-qualified semantic tool with its canonical name", () => {
+    const event = canonicalProviderEventsFromOpenCodePart({
+      id: "finish-1",
+      type: "tool",
+      tool: "paperclip_paperclip_finish",
+      state: { status: "running", input: {} },
+    })[0]!;
+    expect(event.payload).toMatchObject({ name: "paperclip_finish", transport: "builtin" });
+    expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
+  });
+
+  it("recovers an interrupted OpenCode function label and error from its structured call id", () => {
+    const event = canonicalProviderEventsFromOpenCodePart({
+      id: "prt_interrupted",
+      type: "tool",
+      tool: "unknown",
+      callID: "functions.todowrite:0",
+      state: {
+        status: "error",
+        input: {},
+        error: "Tool execution aborted",
+        metadata: { interrupted: true },
+      },
+    })[0]!;
+    expect(event).toMatchObject({
+      eventType: "tool.execution.completed",
+      payload: {
+        name: "todowrite",
+        status: "failed",
+        output: "Tool execution aborted",
+        outputBytes: 22,
+      },
+    });
+    expect(validatePrpEvent(envelope(event))).toEqual({ ok: true, event: expect.any(Object), issues: [] });
+  });
+
+  it("does not infer a tool label from an opaque provider call id", () => {
+    const event = canonicalProviderEventsFromOpenCodePart({
+      id: "prt_unknown",
+      type: "tool",
+      tool: "unknown",
+      callID: "call_f3d79e",
+      state: { status: "error", error: "Unavailable" },
+    })[0]!;
+    expect(event.payload).toMatchObject({ name: "unknown", output: "Unavailable" });
   });
 
   it("redacts secrets at durable ingestion while retaining bounded canonical output", () => {

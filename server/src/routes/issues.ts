@@ -691,6 +691,24 @@ function readConfirmationResultForWake(result: unknown) {
   };
 }
 
+function readNativeCompletionReviewForWake(input: {
+  payload: unknown;
+  result: unknown;
+  status: string;
+}) {
+  const target = readObject(readObject(input.payload).target);
+  if (target.type !== "custom" || target.key !== "native_completion_review") return null;
+  const result = readConfirmationResultForWake(input.result);
+  return {
+    decisionId: readNonEmptyString(target.revisionId),
+    outcome: result?.outcome ?? input.status,
+    reviewerReason: result?.reason ?? null,
+    instruction: input.status === "rejected"
+      ? "Address only the reviewer rejection for the accepted source run. Use the existing result and evidence; do not redo completed implementation or unrelated work."
+      : "The completion review was resolved; preserve the accepted source-run result and disposition lineage.",
+  };
+}
+
 function hasIssueWorkspaceAuditChange(previous: Record<string, unknown>) {
   return Object.keys(previous).some((key) => ISSUE_WORKSPACE_AUDIT_FIELDS.has(key));
 }
@@ -2122,11 +2140,29 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     input.interaction.continuationPolicy === "wake_assignee"
     || (
       input.interaction.continuationPolicy === "wake_assignee_on_accept"
-      && input.interaction.status === "accepted"
+      // Question interactions resolve as `answered`, not `accepted`. An
+      // authoritative answer is the positive resolution that this policy is
+      // waiting for, just as acceptance is for confirmation interactions.
+      && (input.interaction.status === "accepted" || input.interaction.status === "answered")
     );
-  if (!continuationPolicyAllowsWake && !reviewPathLost) return;
+  const rejectedPlanNeedsRevision =
+    input.interaction.status === "rejected"
+    && input.interaction.kind === "request_confirmation"
+    && readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id) !== null;
+  // A plan confirmation presents rejection as "Request changes". That action
+  // is incomplete unless the plan author receives the requested revisions,
+  // even when an adapter/model selected the accept-only continuation policy.
+  // Keep this as a resolution-time invariant so existing pending interactions
+  // and future providers receive the same behavior.
+  if (!continuationPolicyAllowsWake && !rejectedPlanNeedsRevision && !reviewPathLost) return;
   if (input.interaction.status === "expired" && !reviewPathLost) return;
+  // A normal interaction continuation is itself the durable recovery path.
+  // Do not contaminate that wake with the fallback "review path lost"
+  // instruction merely because the just-consumed interaction now appears
+  // stalled before its continuation has had a chance to run.
   const reviewPathContext = reviewPathLost
+    && !continuationPolicyAllowsWake
+    && !rejectedPlanNeedsRevision
     ? {
         reviewPathLost: true,
         reviewPathConsumedRef: input.interaction.id,
@@ -2138,6 +2174,11 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
   const interactionResult = readConfirmationResultForWake(input.interaction.result);
+  const nativeCompletionReview = readNativeCompletionReviewForWake({
+    payload: input.interaction.payload,
+    result: input.interaction.result,
+    status: input.interaction.status,
+  });
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
   const toolAction = readToolActionContinuationContext(input.interaction);
   const secretProposal = readSecretProposalContinuationContext(input.interaction);
@@ -2171,6 +2212,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
+      ...(nativeCompletionReview ? { nativeCompletionReview } : {}),
       ...(checkboxSelection ? { checkboxSelection } : {}),
       ...(toolAction ? { toolAction } : {}),
       ...(secretProposal ? { secretProposal } : {}),
@@ -2190,6 +2232,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
+      ...(nativeCompletionReview ? { nativeCompletionReview } : {}),
       ...(checkboxSelection ? { checkboxSelection } : {}),
       ...(toolAction ? { toolAction } : {}),
       ...(secretProposal ? { secretProposal } : {}),
@@ -12040,7 +12083,7 @@ export function issueRoutes(
       }
 
       const acceptedPlanTarget = interaction.kind === "request_confirmation"
-        ? readAcceptedPlanConfirmationTarget(interaction.payload)
+        ? readAcceptedPlanConfirmationTarget(interaction.payload, issue.id)
         : null;
       const acceptedPlanConfirmation =
         interaction.kind === "request_confirmation" &&

@@ -4466,6 +4466,51 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/provider-traces",
+  tags: ["runs"],
+  summary: "List provider trace metadata for selected runs",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/managed-agent-profiles",
+  tags: ["agents"],
+  summary: "List managed agent profiles for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/managed-agent-profiles",
+  tags: ["agents"],
+  summary: "Create a managed agent profile",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/remote-agent-profiles",
+  tags: ["agents"],
+  summary: "List remote agent profiles for a company",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/remote-agent-profiles",
+  tags: ["agents"],
+  summary: "Create a remote agent profile",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/live-runs",
   tags: ["runs"],
   summary: "List live runs for a company",
@@ -4507,6 +4552,87 @@ registry.registerPath({
   summary: "Cancel a heartbeat run",
   request: { params: z.object({ runId: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/heartbeat-runs/{runId}/provider-trace",
+  tags: ["runs"],
+  summary: "Inspect a redacted provider trace",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/heartbeat-runs/{runId}/provider-trace/frames/{frameId}/reveal",
+  tags: ["runs"],
+  summary: "Reveal one exact provider trace frame",
+  request: { params: z.object({ runId: z.string(), frameId: z.coerce.number().int().positive() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/heartbeat-runs/{runId}/provider-trace/download",
+  tags: ["runs"],
+  summary: "Download an exact provider trace as NDJSON",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/heartbeat-runs/{runId}/provider-trace",
+  tags: ["runs"],
+  summary: "Permanently delete a provider trace",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/queued-comments",
+  tags: ["issues"],
+  summary: "List queued comments for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/issues/{id}/queued-comments/{commentId}",
+  tags: ["issues"],
+  summary: "Edit a queued issue comment",
+  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/issues/{id}/queued-comments/order",
+  tags: ["issues"],
+  summary: "Reorder queued issue comments",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/queued-comments/{commentId}/steer",
+  tags: ["issues"],
+  summary: "Steer a queued issue comment into the active run",
+  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/issues/{id}/queued-comments/{commentId}",
+  tags: ["issues"],
+  summary: "Delete a queued issue comment",
+  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({

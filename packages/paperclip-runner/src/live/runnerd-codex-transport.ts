@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -48,6 +49,22 @@ const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const MAX_NOTIFICATION_COUNT = 2_048;
 const MAX_NOTIFICATION_BYTES = 4 * 1024 * 1024;
+
+const CODEX_COLLABORATION_RUNTIME_INSTRUCTIONS = `## Codex-style collaboration
+
+- Before the first tool call in a turn, send a brief commentary update describing the immediate work you are starting.
+- During tool-driven work, send concise commentary updates at meaningful transitions so the user can follow progress without opening raw logs.
+- Reserve \`report_progress\` for meaningful durable milestones on longer work. Do not call it merely to create a completion comment on a short run; Paperclip materializes the final assistant response as the durable completion comment.
+- After semantic finalization, send one self-contained final assistant response with the outcome and verification.`;
+
+export function withCodexCollaborationRuntimeInstructions(
+  instructions: string,
+  enabled = true,
+): string {
+  if (!enabled) return instructions;
+  const base = instructions.trimEnd();
+  return `${base}\n\n${CODEX_COLLABORATION_RUNTIME_INSTRUCTIONS}`;
+}
 
 function recoveredControlPlaneIdentity(
   directory: string,
@@ -122,6 +139,9 @@ export interface CapabilityRunnerdCodexTransportOptions {
     memoryArn: string;
     memoryId: string;
     invocationRoleArn: string;
+    contextBucket: string;
+    contextPrefix: string;
+    contextKmsKeyArn: string;
     qualificationRevision: string;
     eventExpiryDays: 90;
     maxEstimatedSessionCostUsd: number;
@@ -450,6 +470,39 @@ export function rehydrateRunnerdUsageNotification(
   };
 }
 
+export function rehydrateRunnerdPlanNotification(
+  rawParams: Record<string, unknown>,
+  openedThreadId: string,
+  activeTurnId: string,
+): Record<string, unknown> {
+  const steps = Array.isArray(rawParams.steps) ? rawParams.steps : [];
+  return {
+    ...rawParams,
+    threadId:
+      typeof rawParams.threadId === "string"
+        ? rawParams.threadId
+        : openedThreadId,
+    turnId:
+      typeof rawParams.turnId === "string"
+        ? rawParams.turnId
+        : activeTurnId,
+    // Rust has already normalized the provider's plan entries into PRP's
+    // { stepId, body, status } shape. Rebuild Codex's notification contract
+    // so the strict TypeScript driver can perform (and expose) its second
+    // interpretation stage instead of silently dropping the plan.
+    plan: Array.isArray(rawParams.plan)
+      ? rawParams.plan
+      : steps.map((value) => {
+          const step = record(value);
+          return {
+            step: typeof step.body === "string" ? step.body : "",
+            status:
+              typeof step.status === "string" ? step.status : "pending",
+          };
+        }),
+  };
+}
+
 function commandDigest(value: unknown): string {
   return `sha256:${createHash("sha256").update(durableRecoveryInternals.canonicalJson(value)).digest("hex")}`;
 }
@@ -506,10 +559,59 @@ export function createSanitizedAwsAgentCoreEnvironment(
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
     "PAPERCLIP_NATIVE_MCP_TOKEN",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
   ]) {
     if (typeof source[key] === "string") result[key] = source[key];
   }
   return result;
+}
+
+/**
+ * Raw provider tracing is consumed by runnerd itself. The provider child still
+ * receives the narrower allowlist enforced by Rust's `SupervisedProcess`, so
+ * these controller-selected sidecar paths never enter the harness process.
+ */
+function withRunnerdProviderTrace(
+  environment: NodeJS.ProcessEnv,
+  source: NodeJS.ProcessEnv | undefined,
+): NodeJS.ProcessEnv {
+  const result = { ...environment };
+  for (const key of [
+    "PAPERCLIP_PROVIDER_TRACE_PATH",
+    "PAPERCLIP_PROVIDER_TRACE_MAX_BYTES",
+  ] as const) {
+    const value = source?.[key];
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
+export function resolveSourceCodexHome(
+  environment: NodeJS.ProcessEnv | undefined,
+): string | null {
+  const explicit = environment?.CODEX_HOME?.trim();
+  if (explicit) return explicit;
+  const home = environment?.HOME?.trim();
+  return home ? resolve(home, ".codex") : null;
+}
+
+export function trustedRuntimeReadOnlyRoots(
+  environment: NodeJS.ProcessEnv | undefined,
+): string[] {
+  const path = environment?.PATH ?? "";
+  const roots = new Set<string>();
+  for (const entry of path.split(process.platform === "win32" ? ";" : ":")) {
+    if (entry === "/opt/homebrew" || entry.startsWith("/opt/homebrew/")) {
+      roots.add("/opt/homebrew");
+    } else if (entry === "/usr/local" || entry.startsWith("/usr/local/")) {
+      roots.add("/usr/local");
+    } else if (entry === "/opt/local" || entry.startsWith("/opt/local/")) {
+      roots.add("/opt/local");
+    } else if (entry === "/nix/store" || entry.startsWith("/nix/store/")) {
+      roots.add("/nix/store");
+    }
+  }
+  return [...roots];
 }
 
 function unwrapToolResponse(
@@ -900,6 +1002,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               tool: call.operationId,
               arguments: call.input,
             },
+            ...(call.sourceEventId && call.sourceEventType
+              ? {
+                  paperclipTrace: {
+                    sourceEventId: call.sourceEventId,
+                    sourceEventType: call.sourceEventType,
+                  },
+                }
+              : {}),
           }),
         ),
       connectionLeaseTtlMs: 60 * 60 * 1_000,
@@ -908,12 +1018,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     mkdirSync(resolve(this.#root, "runner"), { recursive: true, mode: 0o700 });
     const provider = this.options.provider ?? "codex";
     const runtimeContext = this.options.runtimeContext ?? null;
+    const runtimeContextPath = resolve(this.#root, "runtime-context.json");
+    if (runtimeContext !== null) {
+      writeFileSync(runtimeContextPath, `${JSON.stringify(runtimeContext)}\n`, { mode: 0o600 });
+    }
     const codexHome = resolve(this.#root, "codex-home");
     if (provider === "codex") {
       await prepareIsolatedCodexHome({
         context: runtimeContext,
         codexHome,
-        sourceCodexHome: this.options.environment?.CODEX_HOME,
+        sourceCodexHome: resolveSourceCodexHome(this.options.environment),
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
@@ -941,6 +1055,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const acpxAgent =
       provider === "acpx" ? (this.options.acpxAgent ?? "pi") : null;
     const requestedModel = typeof params.model === "string" ? params.model : "";
+    const includeCodexCollaborationInstructions =
+      provider === "codex" &&
+      record(params.config).include_collaboration_mode_instructions !== false;
+    const baseInstructions = String(
+      params.baseInstructions ?? "You are a Paperclip agent.",
+    );
     const acpxProfile =
       provider === "acpx"
         ? resolveQualifiedAcpxProfile(acpxAgent!, requestedModel)
@@ -976,6 +1096,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 memoryArn: agentCore!.memoryArn,
                 memoryId: agentCore!.memoryId,
                 invocationRoleArn: agentCore!.invocationRoleArn,
+                contextBucket: agentCore!.contextBucket,
+                contextPrefix: agentCore!.contextPrefix,
+                contextKmsKeyArn: agentCore!.contextKmsKeyArn,
                 qualificationRevision: agentCore!.qualificationRevision,
                 eventExpiryDays: agentCore!.eventExpiryDays,
                 maxEstimatedSessionCostUsd:
@@ -1005,9 +1128,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                   normalizedSessionId: identity.normalizedSessionId,
                   runId: identity.runId,
                   cwd: String(params.cwd ?? tmpdir()),
-                  instructions: String(
-                    params.baseInstructions ?? "You are a Paperclip agent.",
-                  ),
+                  instructions: baseInstructions,
                   permissionPolicy: "interactive",
                   runtimeContext,
                 }
@@ -1023,22 +1144,27 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                       : (this.options.codexArgs ??
                         createIsolatedCodexAppServerArgs(
                           this.options.environment,
-                          runtimeContext ? [codexHome, runtimeContext.instructions.bundle.rootPath, ...runtimeContext.skills.map((skill) => skill.bundle.rootPath)] : [],
+                          [
+                            ...trustedRuntimeReadOnlyRoots(this.options.environment),
+                            ...(runtimeContext ? [codexHome, runtimeContext.instructions.bundle.rootPath, ...runtimeContext.skills.map((skill) => skill.bundle.rootPath)] : []),
+                          ],
                         )),
                   cwd: String(params.cwd ?? tmpdir()),
                   model: typeof params.model === "string" ? params.model : null,
-                  instructions: String(
-                    params.baseInstructions ?? "You are a Paperclip agent.",
-                  ),
+                  instructions:
+                    provider === "codex"
+                      ? withCodexCollaborationRuntimeInstructions(
+                          baseInstructions,
+                          includeCodexCollaborationInstructions,
+                        )
+                      : baseInstructions,
                   collaborationMode:
                     params.permissions ===
                     "paperclip-runner-workspace-read-only"
                       ? "plan"
                       : "default",
                   includeCollaborationModeInstructions:
-                    provider === "codex" &&
-                    record(params.config)
-                      .include_collaboration_mode_instructions !== false,
+                    includeCodexCollaborationInstructions,
                   includeSkillInstructions: provider === "codex" && runtimeContext !== null,
                   runtimeContext,
                 },
@@ -1060,7 +1186,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath:
         this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
-      environment:
+      environment: withRunnerdProviderTrace(
         provider === "opencode"
           ? {
               ...process.env,
@@ -1073,6 +1199,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
               PAPERCLIP_RUN_ID: identity.runId,
               PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+              ...(runtimeContext ? { PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH: runtimeContextPath } : {}),
             }
           : provider === "acpx"
             ? {
@@ -1083,6 +1210,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
                 PAPERCLIP_RUN_ID: identity.runId,
                 PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+                ...(runtimeContext ? { PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH: runtimeContextPath } : {}),
               }
             : provider === "claude_managed"
               ? createSanitizedClaudeManagedEnvironment(
@@ -1093,6 +1221,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                     this.options.environment,
                   )
                 : createSanitizedCodexEnvironment({ ...this.options.environment, HOME: codexHome, CODEX_HOME: codexHome }),
+        this.options.environment,
+      ),
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -1148,7 +1278,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       await prepareIsolatedCodexHome({
         context: this.options.runtimeContext ?? null,
         codexHome,
-        sourceCodexHome: this.options.environment?.CODEX_HOME,
+        sourceCodexHome: resolveSourceCodexHome(this.options.environment),
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
@@ -1167,6 +1297,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               tool: call.operationId,
               arguments: call.input,
             },
+            ...(call.sourceEventId && call.sourceEventType
+              ? {
+                  paperclipTrace: {
+                    sourceEventId: call.sourceEventId,
+                    sourceEventType: call.sourceEventType,
+                  },
+                }
+              : {}),
           }),
         ),
       connectionLeaseTtlMs: 60 * 60 * 1_000,
@@ -1189,7 +1327,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath:
         this.options.runnerBinary ?? defaultCapabilityRunnerdBinary(),
-      environment:
+      environment: withRunnerdProviderTrace(
         this.options.provider === "claude_managed"
           ? createSanitizedClaudeManagedEnvironment(this.options.environment)
           : this.options.provider === "aws_agentcore"
@@ -1201,7 +1339,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 )
               : provider === "codex"
                 ? createSanitizedCodexEnvironment({ ...this.options.environment, HOME: codexHome, CODEX_HOME: codexHome })
-                : this.options.environment,
+                : (this.options.environment ?? {}),
+        this.options.environment,
+      ),
     });
     this.#handle = handle;
     this.#watchRunner(handle);
@@ -1465,6 +1605,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           "turn.interrupted": "turn/completed",
           "turn.cancelled": "turn/completed",
           "usage.reported": "thread/tokenUsage/updated",
+          "plan.updated": "turn/plan/updated",
           "session.updated":
             sessionUpdatePayload.status === "budget_reached"
               ? "provider/budgetReached"
@@ -1488,6 +1629,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 this.#threadId,
                 this.#turnId,
               )
+            : method === "turn/plan/updated"
+              ? rehydrateRunnerdPlanNotification(
+                  rawParams,
+                  this.#threadId,
+                  this.#turnId,
+                )
             : method === "turn/started" || method === "turn/completed"
               ? {
                   ...rawParams,

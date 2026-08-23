@@ -201,6 +201,23 @@ export function TaskChatBubble({
           })}
         </AttachmentGroup>
       ) : null}
+      {!isHuman && item.verificationCaveats?.length ? (
+        <div
+          className="mx-1 w-(--sz-calc-7) rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs"
+          data-testid="task-chat-verification-caveats"
+        >
+          <p className="font-medium text-amber-800 dark:text-amber-200">Verification caveat</p>
+          <ul className="mt-1 space-y-1 text-muted-foreground">
+            {item.verificationCaveats.map((caveat, index) => (
+              <li key={`${caveat.commandOrCheck}:${index}`}>
+                <span className="font-mono text-foreground">{caveat.commandOrCheck}</span>
+                {caveat.reasonCode ? ` · ${caveat.reasonCode.replaceAll("_", " ")}` : ""}
+                {caveat.detail ? <span className="block">{caveat.detail}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {item.optimistic ? (
         <span className="flex items-center gap-1 px-1 text-(length:--text-micro) text-muted-foreground">
           <span>{item.optimistic === "queued" ? "Queued" : "Sending…"}</span>

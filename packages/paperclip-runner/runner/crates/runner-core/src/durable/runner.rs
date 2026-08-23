@@ -804,23 +804,21 @@ fn process_command_and_provider(
             let resolution = command
                 .pointer("/payload/resolution")
                 .unwrap_or(&command["payload"]);
-            if matches!(
-                state.provider_config,
-                Some(crate::codex_provider::ProviderConfig::Acpx(_))
-            ) {
+            {
                 let pending = state
                     .pending_provider_runtime_requests
                     .get(request_id)
                     .ok_or_else(|| {
                         DurableRunnerError::invalid(
-                            "request.resolve named a stale or expired ACPX permission request",
+                            "request.resolve named a stale or expired runtime request",
                         )
                     })?;
                 if pending.turn_id != turn_id {
                     return Err(DurableRunnerError::invalid(
-                        "request.resolve named a stale ACPX permission turn",
+                        "request.resolve named a stale runtime request turn",
                     ));
                 }
+                validate_runtime_request_resolution(&pending.request, resolution)?;
             }
             provider
                 .as_mut()
@@ -1039,7 +1037,7 @@ fn poll_provider(
             Ok(None) => break,
             Err(error) => {
                 let detail = error.to_string();
-                expire_acpx_permission_requests_after_provider_loss(state, config)?;
+                expire_provider_runtime_requests_after_provider_loss(state, config)?;
                 persist_provider_failure(state, store, &detail)?;
                 return Err(DurableRunnerError::invalid(format!(
                     "provider failed: {detail}"
@@ -1048,7 +1046,7 @@ fn poll_provider(
         };
         let trace_frame_id = runtime.take_provider_trace_frame_id();
         let trace_first_source_seq = state.next_source_seq;
-        let (trace_rule_id, trace_disposition, trace_dropped_fields, trace_reason) = match &event {
+        let (mut trace_rule_id, mut trace_disposition, trace_dropped_fields, mut trace_reason) = match &event {
             crate::codex_provider::ProviderEvent::ToolCall { .. } => (
                 "provider.tool_call",
                 "mapped",
@@ -1100,12 +1098,71 @@ fn poll_provider(
                     .provider_tool_bridge
                     .pending_calls()
                     .any(|pending| pending.call_id == call_id);
-                let call = state
-                    .provider_tool_bridge
-                    .begin_call(call_id, operation_id, input)
-                    .map_err(|error| {
-                        DurableRunnerError::invalid(format!("provider tool call rejected: {error}"))
-                    })?;
+                let call = match state.provider_tool_bridge.begin_call(
+                    call_id.clone(),
+                    operation_id.clone(),
+                    input,
+                ) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        runtime
+                            .deliver_tool_result(&crate::provider_bridge::ToolResult {
+                                call_id: call_id.clone(),
+                                operation_id: operation_id.clone(),
+                                result: json!({
+                                    "error": {
+                                        "code": "invalid_tool_call",
+                                        "message": reason,
+                                        "retryable": true,
+                                    }
+                                }),
+                                is_error: true,
+                            })
+                            .map_err(|delivery_error| {
+                                DurableRunnerError::invalid(format!(
+                                    "provider tool rejection could not be delivered: {delivery_error}"
+                                ))
+                            })?;
+                        enqueue_event(
+                            state,
+                            config,
+                            "harness.diagnostic",
+                            1,
+                            json!({
+                                "operationId": operation_id,
+                                "callId": call_id,
+                                "code": "semantic_tool_denied",
+                                "status": "failed",
+                                "paperclipExecuted": false,
+                                "reasons": ["schema_invalid_or_unauthorized_input"],
+                                "summary": "Provider tool call was rejected before Paperclip execution.",
+                            }),
+                            Some(&state.item_id.clone()),
+                        )?;
+                        trace_rule_id = "provider.tool_call.rejected";
+                        trace_disposition = "rejected";
+                        trace_reason = "Provider tool call failed authorization or input validation and was returned to the provider for correction";
+                        store.save(state)?;
+                        if let Some(frame_id) = trace_frame_id {
+                            let emitted_event_ids = (trace_first_source_seq..state.next_source_seq)
+                                .map(|source_seq| {
+                                    format!("event_{}_{source_seq:06}", state.runner_instance_id)
+                                })
+                                .collect::<Vec<_>>();
+                            runtime.record_provider_trace_interpretation(
+                                frame_id,
+                                "rust_durable_normalization",
+                                trace_rule_id,
+                                trace_disposition,
+                                emitted_event_ids,
+                                trace_dropped_fields,
+                                trace_reason,
+                            );
+                        }
+                        continue;
+                    }
+                };
                 if pending_before_resume {
                     enqueue_event(
                         state,
@@ -1247,13 +1304,14 @@ fn poll_provider(
                 )?;
                 store.save(state)?;
             }
-            crate::codex_provider::ProviderEvent::RuntimeRequest {
-                request_id,
-                request_kind,
-                title,
-                details,
-            } => {
+            crate::codex_provider::ProviderEvent::RuntimeRequest { request } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
+                let request_id = request.get("requestId").and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| DurableRunnerError::invalid("provider runtime request omitted requestId"))?
+                    .to_owned();
+                let request_kind = request.pointer("/origin/kind").and_then(Value::as_str)
+                    .unwrap_or("runtime").to_owned();
                 if state.pending_provider_runtime_requests.contains_key(&request_id) {
                     return Err(DurableRunnerError::invalid(
                         "provider reused a pending runtime request id",
@@ -1266,6 +1324,7 @@ fn poll_provider(
                         turn_id: state.turn_id.clone(),
                         request_kind: request_kind.clone(),
                         created_at_unix_ms: state.last_activity_at_unix_ms,
+                        request: request.clone(),
                     },
                 );
                 state.lifecycle = "waiting_input".to_owned();
@@ -1274,24 +1333,13 @@ fn poll_provider(
                     config,
                     "runtime_request.created",
                     0,
-                    json!({
-                        "request": {
-                            "schema": "paperclip.runtime_request.v1",
-                            "requestKind": request_kind,
-                            "requestId": request_id,
-                            "type": "permission",
-                            "status": "pending",
-                            "prompt": title,
-                            "turnId": state.turn_id,
-                            "details": details,
-                        }
-                    }),
+                    json!({ "request": request }),
                     Some(&state.item_id.clone()),
                 )?;
                 store.save(state)?;
             }
             crate::codex_provider::ProviderEvent::Exited => {
-                expire_acpx_permission_requests_after_provider_loss(state, config)?;
+                expire_provider_runtime_requests_after_provider_loss(state, config)?;
                 persist_provider_failure(state, store, "local provider exited unexpectedly")?;
                 return Err(DurableRunnerError::invalid(
                     "native_runner_process_exited: local provider exited unexpectedly",
@@ -1422,17 +1470,156 @@ fn should_suspend_for_idle_at(
     Ok(now_unix_ms.saturating_sub(state.last_activity_at_unix_ms) >= timeout_ms)
 }
 
-fn expire_acpx_permission_requests_after_provider_loss(
+fn validate_runtime_request_resolution(
+    request: &Value,
+    resolution: &Value,
+) -> Result<(), DurableRunnerError> {
+    let action = resolution.get("action").and_then(Value::as_str).ok_or_else(|| {
+        DurableRunnerError::invalid("runtime request resolution.action is required")
+    })?;
+    if !matches!(action, "accept" | "accept_for_session" | "decline" | "cancel" | "submit") {
+        return Err(DurableRunnerError::invalid("unsupported runtime request resolution action"));
+    }
+    if request.get("schema").and_then(Value::as_str) != Some("paperclip.runtime_request.v2") {
+        return Ok(());
+    }
+    if action != "submit" {
+        if matches!(action, "accept" | "accept_for_session") {
+            return Err(DurableRunnerError::invalid(
+                "structured input requires submit, decline, or cancel",
+            ));
+        }
+        return Ok(());
+    }
+    let response = resolution.get("response").ok_or_else(|| {
+        DurableRunnerError::invalid("structured input submission requires response")
+    })?;
+    if response.get("schema").and_then(Value::as_str) != Some("paperclip.question_response.v1") {
+        return Err(DurableRunnerError::invalid(
+            "structured input response must use paperclip.question_response.v1",
+        ));
+    }
+    let answers = response.get("answers").and_then(Value::as_object).ok_or_else(|| {
+        DurableRunnerError::invalid("structured input response.answers must be an object")
+    })?;
+    let questions = request.pointer("/input/questions").and_then(Value::as_array).ok_or_else(|| {
+        DurableRunnerError::invalid("persisted runtime request has no question set")
+    })?;
+    for answer_id in answers.keys() {
+        if !questions.iter().any(|question| question.get("id").and_then(Value::as_str) == Some(answer_id)) {
+            return Err(DurableRunnerError::invalid(format!(
+                "structured input response named unknown question {answer_id}"
+            )));
+        }
+    }
+    for question in questions {
+        let question_id = question.get("id").and_then(Value::as_str).ok_or_else(|| {
+            DurableRunnerError::invalid("persisted question omitted id")
+        })?;
+        let answer = answers.get(question_id);
+        if answer.is_none() {
+            if question.get("required").and_then(Value::as_bool).unwrap_or(false) {
+                return Err(DurableRunnerError::invalid(format!(
+                    "structured input response omitted required question {question_id}"
+                )));
+            }
+            continue;
+        }
+        let answer = answer.and_then(Value::as_object).ok_or_else(|| {
+            DurableRunnerError::invalid(format!("answer {question_id} must be an object"))
+        })?;
+        let selected = answer.get("selectedOptionIds").and_then(Value::as_array).cloned().unwrap_or_default();
+        if selected.iter().any(|value| value.as_str().is_none()) {
+            return Err(DurableRunnerError::invalid(format!(
+                "answer {question_id} selectedOptionIds must contain strings"
+            )));
+        }
+        let mode = question.get("answerMode").and_then(Value::as_str).unwrap_or("");
+        let text = answer.get("text").and_then(Value::as_str);
+        let custom = answer.get("customText").and_then(Value::as_str);
+        if mode == "text" {
+            if !selected.is_empty() || custom.is_some() {
+                return Err(DurableRunnerError::invalid(format!(
+                    "text answer {question_id} carries select fields"
+                )));
+            }
+        } else {
+            if text.is_some() {
+                return Err(DurableRunnerError::invalid(format!(
+                    "select answer {question_id} carries text"
+                )));
+            }
+            if mode == "single_select" && selected.len() > 1 {
+                return Err(DurableRunnerError::invalid(format!(
+                    "single-select answer {question_id} selected multiple options"
+                )));
+            }
+            let options = question.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+            for option_id in selected.iter().filter_map(Value::as_str) {
+                if !options.iter().any(|option| option.get("id").and_then(Value::as_str) == Some(option_id)) {
+                    return Err(DurableRunnerError::invalid(format!(
+                        "answer {question_id} selected unknown option {option_id}"
+                    )));
+                }
+            }
+            if custom.is_some() && question.pointer("/customAnswer/enabled").and_then(Value::as_bool) != Some(true) {
+                return Err(DurableRunnerError::invalid(format!(
+                    "answer {question_id} used a disabled custom answer"
+                )));
+            }
+        }
+        let has_value = !selected.is_empty()
+            || text.is_some_and(|value| !value.trim().is_empty())
+            || custom.is_some_and(|value| !value.trim().is_empty());
+        if question.get("required").and_then(Value::as_bool).unwrap_or(false) && !has_value {
+            return Err(DurableRunnerError::invalid(format!(
+                "answer {question_id} is required"
+            )));
+        }
+        let bounded = if mode == "text" { text } else { custom };
+        if let Some(value) = bounded {
+            let validation = question.get("textValidation").unwrap_or(&Value::Null);
+            if let Some(minimum) = validation.get("minLength").and_then(Value::as_u64) {
+                if value.chars().count() < minimum as usize {
+                    return Err(DurableRunnerError::invalid(format!("answer {question_id} is too short")));
+                }
+            }
+            if let Some(maximum) = validation.get("maxLength").and_then(Value::as_u64) {
+                if value.chars().count() > maximum as usize {
+                    return Err(DurableRunnerError::invalid(format!("answer {question_id} is too long")));
+                }
+            }
+            if let Some(input_type) = validation.get("inputType").and_then(Value::as_str) {
+                if matches!(input_type, "number" | "integer") {
+                    let numeric = value.parse::<f64>().map_err(|_| DurableRunnerError::invalid(format!(
+                        "answer {question_id} must be a valid {input_type}"
+                    )))?;
+                    if input_type == "integer" && numeric.fract() != 0.0 {
+                        return Err(DurableRunnerError::invalid(format!("answer {question_id} must be an integer")));
+                    }
+                    if validation.get("minimum").and_then(Value::as_f64).is_some_and(|minimum| numeric < minimum)
+                        || validation.get("maximum").and_then(Value::as_f64).is_some_and(|maximum| numeric > maximum)
+                    {
+                        return Err(DurableRunnerError::invalid(format!("answer {question_id} is outside its numeric bounds")));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expire_provider_runtime_requests_after_provider_loss(
     state: &mut DurableRunnerState,
     config: &DurableRunnerConfig,
 ) -> Result<(), DurableRunnerError> {
-    if !matches!(
-        state.provider_config,
-        Some(crate::codex_provider::ProviderConfig::Acpx(_))
-    ) || state.pending_provider_runtime_requests.is_empty()
-    {
+    if state.pending_provider_runtime_requests.is_empty() {
         return Ok(());
     }
+    let is_acpx = matches!(
+        state.provider_config,
+        Some(crate::codex_provider::ProviderConfig::Acpx(_))
+    );
     let pending = std::mem::take(&mut state.pending_provider_runtime_requests);
     for request in pending.into_values() {
         enqueue_event(
@@ -1444,28 +1631,31 @@ fn expire_acpx_permission_requests_after_provider_loss(
                 "requestId": request.request_id,
                 "turnId": request.turn_id,
                 "requestKind": request.request_kind,
-                "reason": "acpx_provider_process_lost",
+                "reason": "provider_process_lost",
                 "replayAllowed": false,
+                "request": request.request,
             }),
             Some(&state.item_id.clone()),
         )?;
     }
-    state.active_turn = false;
-    enqueue_event(
-        state,
-        config,
-        "turn.failed",
-        0,
-        json!({
-            "turn": { "id": state.turn_id, "status": "failed" },
-            "error": {
-                "code": "acpx_permission_transport_lost",
-                "message": "The ACP process exited while permission was pending; the prompt and approval will not be replayed.",
-                "recoverable": true,
-            }
-        }),
-        Some(&state.item_id.clone()),
-    )?;
+    if is_acpx {
+        state.active_turn = false;
+        enqueue_event(
+            state,
+            config,
+            "turn.failed",
+            0,
+            json!({
+                "turn": { "id": state.turn_id, "status": "failed" },
+                "error": {
+                    "code": "acpx_permission_transport_lost",
+                    "message": "The ACP process exited while runtime input was pending; the request will not be replayed against the dead provider.",
+                    "recoverable": true,
+                }
+            }),
+            Some(&state.item_id.clone()),
+        )?;
+    }
     Ok(())
 }
 
@@ -1769,6 +1959,7 @@ mod tests {
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
                 permission_policy: "interactive".to_owned(),
+                runtime_context: None,
             },
         ));
         state.lifecycle = "waiting_input".to_owned();
@@ -1808,6 +1999,7 @@ mod tests {
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
                 permission_policy: "interactive".to_owned(),
+                runtime_context: None,
             },
         ));
         state.active_turn = true;
@@ -1819,10 +2011,11 @@ mod tests {
                 turn_id: state.turn_id.clone(),
                 request_kind: "file_approval".to_owned(),
                 created_at_unix_ms: 1,
+                request: Value::Null,
             },
         );
 
-        expire_acpx_permission_requests_after_provider_loss(&mut state, &runner_config).unwrap();
+        expire_provider_runtime_requests_after_provider_loss(&mut state, &runner_config).unwrap();
 
         assert!(state.pending_provider_runtime_requests.is_empty());
         assert!(!state.active_turn);

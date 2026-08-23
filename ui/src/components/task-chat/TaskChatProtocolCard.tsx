@@ -31,6 +31,7 @@ import type {
   TaskChatWorkspaceChangeItem,
   TaskChatWorkspaceFileItem,
 } from "./task-chat-model";
+import { QuestionForm } from "./QuestionForm";
 
 export interface TaskChatProtocolCardProps {
   item: TaskChatProtocolItem;
@@ -295,7 +296,7 @@ function titleCaseKey(value: string): string {
 }
 
 function RuntimeRequestCard({ item, onDecision }: { item: TaskChatRuntimeRequestItem; onDecision?: TaskChatProtocolCardProps["onRuntimeRequestDecision"] }) {
-  const title = item.requestType === "permission" ? "Runtime permission" : "Runtime input";
+  const title = item.questionSet?.title ?? (item.requestType === "permission" ? "Runtime permission" : "Runtime input");
   const fields = item.fields.length > 0
     ? item.fields
     : [{ name: "answer", label: "Response", placeholder: null }];
@@ -322,7 +323,15 @@ function RuntimeRequestCard({ item, onDecision }: { item: TaskChatRuntimeRequest
   const canSubmitInput = fields.some((field) => (values[field.name] ?? "").trim().length > 0);
   return (
     <CardShell icon={ShieldCheck} title={title} status={item.status} summary={item.prompt} testId="task-chat-runtime-request">
-      {item.requestType === "input" && item.status === "pending" ? (
+      {item.requestType === "input" && item.status === "pending" && item.questionSet ? (
+        <QuestionForm
+          id={item.id}
+          questionSet={item.questionSet}
+          disabled={!onDecision || submitting}
+          onSubmit={(response) => submit({ action: "submit", response })}
+          onCancel={() => submit({ action: "cancel" })}
+        />
+      ) : item.requestType === "input" && item.status === "pending" ? (
         <form
           className="flex flex-col gap-3"
           onSubmit={(event) => {

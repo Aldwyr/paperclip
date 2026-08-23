@@ -1200,7 +1200,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       model: "test-model",
     });
 
-    const { agentId, runId } = await seedQueuedIssueRunFixture();
+    const { companyId, agentId, runId } = await seedQueuedIssueRunFixture();
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
@@ -1233,6 +1233,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         retryReason: "issue_continuation_needed",
       }),
     });
+    const missingCommentWakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "missing_issue_comment"),
+      ));
+    expect(missingCommentWakeups).toHaveLength(0);
     expect(agent).toEqual({ status: "running", errorReason: null });
   });
 
@@ -5953,6 +5961,161 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       interactionContinuationPolicy: "wake_assignee_on_accept",
       interactionResolvedAt: resolvedAt.toISOString(),
     });
+  });
+
+  it("recovers an answered question with its interaction-specific continuation context", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-19T00:05:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "OpenCodeCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Answered question never resumed",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: {
+        version: 1,
+        questions: [{
+          id: "format",
+          prompt: "Choose a format",
+          selectionMode: "single",
+          required: true,
+          options: [{ id: "markdown", label: "Markdown" }],
+        }],
+      },
+      result: { version: 1, answers: [{ questionId: "format", optionIds: ["markdown"] }] },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    const run = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.contextSnapshot).toMatchObject({
+      issueId,
+      interactionId,
+      interactionKind: "ask_user_questions",
+      interactionStatus: "answered",
+      interactionContinuationPolicy: "wake_assignee_on_accept",
+      source: "issue.interaction_continuation_recovery",
+    });
+  });
+
+  it("does not requeue an answered interaction after native recovery is board-owned", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        retryReason: "issue_continuation_needed",
+        runErrorCode: "native_session_retry_exhausted",
+        runError: "native session recovery exhausted",
+      });
+    const interactionId = randomUUID();
+    const resolvedAt = new Date("2026-03-19T00:04:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "in_review", checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "format",
+            prompt: "Choose a format",
+            selectionMode: "single",
+            required: true,
+            options: [{ id: "markdown", label: "Markdown" }],
+          },
+        ],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "format", optionIds: ["markdown"] }],
+      },
+    });
+    const [action] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "active_run_watchdog",
+        status: "active",
+        ownerType: "board",
+        ownerAgentId: null,
+        returnOwnerAgentId: agentId,
+        cause: "native_session_retry_exhausted",
+        fingerprint: `native-exhausted:${runId}`,
+        evidence: { runId, coordinatorAttempt: 3 },
+        nextAction: "Inspect the trace and explicitly choose a retry.",
+        wakePolicy: null,
+        attemptCount: 3,
+        maxAttempts: 3,
+      })
+      .returning();
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    const [issue, runs, persistedAction] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)).then((rows) => rows[0] ?? null),
+    ]);
+    expect(issue?.status).toBe("in_review");
+    expect(runs).toHaveLength(1);
+    expect(persistedAction).toMatchObject({ status: "active", ownerType: "board" });
   });
 
   it("counts five historical review-park cancellations against the upgraded disposition-repair ceiling", async () => {

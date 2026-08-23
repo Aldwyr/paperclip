@@ -5,10 +5,12 @@ import { resolve } from "node:path";
 import type { AdapterExecutionResult } from "../../adapters/index.js";
 import type { NativeFinalizationResult } from "@paperclipai/shared";
 import type {
+  HarnessRuntimeRequestResolution,
   NativeExecutionInput,
   NativeSession,
   NativeSessionBackend,
   PersistedNativeSession,
+  PrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
 import {
   createNativeSessionBackend,
@@ -16,8 +18,15 @@ import {
   executeNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
-import { and, desc, eq, sql } from "drizzle-orm";
-import { documentRevisions, heartbeatRuns, issueDocuments, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import {
+  documentRevisions,
+  heartbeatRuns,
+  issueDocuments,
+  issueThreadInteractions,
+  issues,
+  nativeRunFinalizations,
+} from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
@@ -41,6 +50,14 @@ type ActiveNativeSession = {
 };
 
 const activeNativeSessions = new Map<string, ActiveNativeSession>();
+const nativeRuntimeRequestResolutions = new Map<
+  string,
+  {
+    fingerprint: string;
+    commandId: string;
+    pending: Promise<void>;
+  }
+>();
 
 type WarmNativeSession = {
   session: NativeSession;
@@ -195,6 +212,62 @@ export function semanticProviderPlanMarkdown(result: Record<string, unknown>): s
     if (body) return `# Plan\n\n${body}`.slice(0, 256_000);
   }
   return null;
+}
+
+/**
+ * Convert a server-owned pending interaction into the semantic wait that a
+ * provider omitted. This is not a fabricated final response: it records that
+ * the current turn intentionally yielded to a durable governance surface.
+ */
+export function nativeGovernedWaitResult(input: {
+  interaction: { id: string; title: string | null; summary: string | null };
+  completionContract: NativeExecutionInput["completionContract"]["contract"];
+}): PrpStructuredRunResult {
+  const interactionRef = `interaction:${input.interaction.id}`;
+  const label = input.interaction.title?.trim()
+    || input.interaction.summary?.trim()
+    || "the requested response";
+  return {
+    schema: "paperclip.run_result.v1",
+    reportedWorkDisposition: "yielded",
+    summary: `Waiting for ${label}.`,
+    completionClaim: {
+      contractRevision: input.completionContract.revision,
+      objectiveSatisfied: false,
+      criteria: input.completionContract.criteria.map((criterion) => ({
+        criterionId: criterion.id,
+        status: "unknown",
+        evidenceRefs: [interactionRef],
+      })),
+      remainingWork: [{
+        description: "Resume after the durable interaction is resolved.",
+        blocksCompletion: true,
+      }],
+    },
+    evidence: [{ ref: interactionRef }],
+    verification: [],
+    attentionRequests: [],
+    artifacts: [{ kind: "issue_thread_interaction", ref: interactionRef }],
+    continuation: {
+      kind: "response_wake",
+      summary: "Resume from the resolved interaction response without repeating prior work.",
+      idempotencyKey: `interaction-response:${input.interaction.id}`,
+    },
+  };
+}
+
+/**
+ * Partial item-verdict responses deliberately leave their original durable
+ * interaction pending. They are already authority-checked before entering the
+ * closed native envelope, so that exact interaction may park the continuation
+ * run without requiring the model to recreate a second request.
+ */
+export function continuingPendingInteractionIds(execution: NativeExecutionInput): string[] {
+  return execution.interactionResponses
+    .filter((response) =>
+      response.kind === "request_item_verdicts"
+      && response.response.status === "pending")
+    .map((response) => response.interactionId);
 }
 
 export async function synchronizeCompletedProviderPlan(input: {
@@ -390,6 +463,7 @@ function nativeSessionConfigDigest(execution: NativeExecutionInput): string {
     driverKind: execution.session.driverKind,
     lifecyclePolicy: execution.session.lifecyclePolicy,
     executionMode: "executionMode" in execution ? execution.executionMode : "default",
+    runtimeContextDigest: "runtimeContext" in execution ? execution.runtimeContext.aggregateDigest : null,
   })).digest("hex")}`;
 }
 
@@ -481,6 +555,25 @@ export function nativeSessionFailureDisposition(attempt: number, now = new Date(
   };
 }
 
+export function nativeSessionRecoveryProjection(input: {
+  phase: "retryable_failure" | "terminal_failure";
+  failureCode: "native_session_interrupted" | "native_session_retry_exhausted";
+  agentId: string;
+}) {
+  const exhausted = input.phase === "terminal_failure";
+  return {
+    exhausted,
+    issueStatus: exhausted ? "in_review" as const : null,
+    recoveryOwner: exhausted
+      ? { kind: "board" as const }
+      : { kind: "agent" as const, agentId: input.agentId },
+    recoveryActionOwnerType: exhausted ? "board" as const : "agent" as const,
+    recoveryActionOwnerAgentId: exhausted ? null : input.agentId,
+    recoveryActionCause: input.failureCode,
+    supersedeOnIdentityChange: true as const,
+  };
+}
+
 export function nativeSessionFailureSourceCode(error: unknown):
   | "provider_frame_too_large"
   | "provider_transport_failed"
@@ -526,6 +619,91 @@ export class NativeSessionSteeringError extends Error {
   ) {
     super(message);
     this.name = "NativeSessionSteeringError";
+  }
+}
+
+export class NativeRuntimeRequestResolutionError extends Error {
+  constructor(
+    readonly code:
+      | "native_session_not_active"
+      | "runtime_request_resolution_unsupported"
+      | "runtime_request_stale_turn"
+      | "runtime_request_resolution_conflict",
+    message: string,
+  ) {
+    super(message);
+    this.name = "NativeRuntimeRequestResolutionError";
+  }
+}
+
+/** Resolve a provider runtime request on an in-process native backend. */
+export async function resolveNativeRuntimeRequest(input: {
+  runId: string;
+  requestId: string;
+  turnId: string;
+  resolution: HarnessRuntimeRequestResolution;
+}): Promise<{ commandId: string }> {
+  const active = activeNativeSessions.get(input.runId);
+  if (!active) {
+    throw new NativeRuntimeRequestResolutionError(
+      "native_session_not_active",
+      "The active native session is not attached.",
+    );
+  }
+  const capabilities = await active.session.capabilities();
+  if (
+    !capabilities.runtimeRequestResolution
+    || active.session.resolveRuntimeRequest === undefined
+  ) {
+    throw new NativeRuntimeRequestResolutionError(
+      "runtime_request_resolution_unsupported",
+      "This native session does not resolve runtime requests in-process.",
+    );
+  }
+  const snapshot = await active.session.snapshot();
+  if (snapshot.activeTurnId !== input.turnId) {
+    throw new NativeRuntimeRequestResolutionError(
+      "runtime_request_stale_turn",
+      "The runtime request belongs to a turn that is no longer active.",
+    );
+  }
+
+  const key = `${input.runId}:${input.requestId}`;
+  const fingerprint = JSON.stringify({
+    turnId: input.turnId,
+    resolution: input.resolution,
+  });
+  const prior = nativeRuntimeRequestResolutions.get(key);
+  if (prior) {
+    if (prior.fingerprint !== fingerprint) {
+      throw new NativeRuntimeRequestResolutionError(
+        "runtime_request_resolution_conflict",
+        "A different response was already submitted for this runtime request.",
+      );
+    }
+    await prior.pending;
+    return { commandId: prior.commandId };
+  }
+
+  const commandId = `native-runtime-response:${randomUUID()}`;
+  const pending = active.session.resolveRuntimeRequest({
+    requestId: input.requestId,
+    turnId: input.turnId,
+    resolution: input.resolution,
+  });
+  nativeRuntimeRequestResolutions.set(key, {
+    fingerprint,
+    commandId,
+    pending,
+  });
+  try {
+    await pending;
+    return { commandId };
+  } catch (error) {
+    if (nativeRuntimeRequestResolutions.get(key)?.pending === pending) {
+      nativeRuntimeRequestResolutions.delete(key);
+    }
+    throw error;
   }
 }
 
@@ -804,6 +982,16 @@ export async function executePaperclipNativeSession(input: {
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   /** Resolved adapter env; the runner transport applies a provider allowlist before spawn. */
   runnerEnvironment?: NodeJS.ProcessEnv;
+  enqueueWakeup?: (agentId: string, options: {
+    source: "assignment";
+    triggerDetail: "system";
+    reason: "issue_assigned";
+    payload: Record<string, unknown>;
+    idempotencyKey: string;
+    requestedByActorType: "agent";
+    requestedByActorId: string;
+    contextSnapshot: Record<string, unknown>;
+  }) => Promise<unknown>;
 }): Promise<AdapterExecutionResult> {
   const durableRunnerBinding = input.useRunnerd ? loadRunnerdDurableBinding(input.execution) : null;
   const effectiveRunnerInstanceId = durableRunnerBinding?.runnerInstanceId ?? input.runnerInstanceId;
@@ -922,6 +1110,32 @@ export async function executePaperclipNativeSession(input: {
       persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest);
     }
   }
+  const resolvePendingGovernedWait = async () => {
+    const continuingInteractionIds = continuingPendingInteractionIds(input.execution);
+    const interaction = await input.db.select({
+      id: issueThreadInteractions.id,
+      title: issueThreadInteractions.title,
+      summary: issueThreadInteractions.summary,
+    }).from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.companyId, input.execution.binding.companyId),
+      eq(issueThreadInteractions.issueId, input.execution.binding.issueId),
+      or(
+        eq(issueThreadInteractions.sourceRunId, input.execution.binding.runId),
+        ...(continuingInteractionIds.length > 0
+          ? [inArray(issueThreadInteractions.id, continuingInteractionIds)]
+          : []),
+      ),
+      eq(issueThreadInteractions.status, "pending"),
+    )).orderBy(desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return interaction
+      ? nativeGovernedWaitResult({
+          interaction,
+          completionContract: input.execution.completionContract.contract,
+        })
+      : null;
+  };
   try {
     const runnerdBackend = input.useRunnerd && input.backend === undefined
       ? createRunnerdBackend({
@@ -944,6 +1158,18 @@ export async function executePaperclipNativeSession(input: {
       controlPlane,
       runnerInstanceId: effectiveRunnerInstanceId,
       controlPlaneInstanceId,
+      resolveGovernedWait: async ({ event }) =>
+        event.eventType === "item.completed"
+          ? resolvePendingGovernedWait()
+          : null,
+      resolveMissingResult: async ({ terminalEvent }) => {
+        // A model may correctly create a durable question/confirmation and
+        // then end its provider turn without also invoking paperclip_finish.
+        // Recover only completed turns with a pending interaction created by
+        // this exact run; unrelated or failed turns still fail closed.
+        if (terminalEvent.eventType !== "turn.completed") return null;
+        return resolvePendingGovernedWait();
+      },
       existingSession: existingWarmSession,
       persistedSession: persistedWarmSession,
       keepSessionOpen: warmSessionId !== null,
@@ -977,7 +1203,12 @@ export async function executePaperclipNativeSession(input: {
     }
     const now = new Date();
     const { phase, failureCode, nextAttemptAt } = nativeSessionFailureDisposition(attempt, now);
-    const exhausted = phase === "terminal_failure";
+    const recoveryProjection = nativeSessionRecoveryProjection({
+      phase,
+      failureCode,
+      agentId: input.execution.binding.agentId,
+    });
+    const { exhausted } = recoveryProjection;
     const message = error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000);
     const sourceFailureCode = nativeSessionFailureSourceCode(error);
     await input.db.transaction(async (tx) => {
@@ -989,7 +1220,7 @@ export async function executePaperclipNativeSession(input: {
         failureDetail: {
           message,
           originalFailureCode: sourceFailureCode,
-          recoveryOwner: { kind: "agent", agentId: input.execution.binding.agentId },
+          recoveryOwner: recoveryProjection.recoveryOwner,
           nextAction: exhausted
             ? "Inspect the persisted native session after its bounded resume budget was exhausted."
             : "Resume this same run from its persisted native provider checkpoint after the retry delay.",
@@ -1008,15 +1239,23 @@ export async function executePaperclipNativeSession(input: {
         errorCode: sourceFailureCode,
         updatedAt: now,
       }).where(eq(heartbeatRuns.id, input.execution.binding.runId));
+      if (recoveryProjection.issueStatus) {
+        await issueService(tx as unknown as Db).update(
+          input.execution.binding.issueId,
+          { status: recoveryProjection.issueStatus },
+          tx,
+        );
+      }
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: input.execution.binding.companyId,
         sourceIssueId: input.execution.binding.issueId,
         kind: "active_run_watchdog",
-        ownerType: "agent",
-        ownerAgentId: input.execution.binding.agentId,
-        cause: sourceFailureCode,
+        ownerType: recoveryProjection.recoveryActionOwnerType,
+        ownerAgentId: recoveryProjection.recoveryActionOwnerAgentId,
+        returnOwnerAgentId: input.execution.binding.agentId,
+        cause: recoveryProjection.recoveryActionCause,
         fingerprint: createHash("sha256")
-          .update(`${input.execution.binding.runId}:${sourceFailureCode}`)
+          .update(`${input.execution.binding.runId}:${failureCode}`)
           .digest("hex"),
         evidence: {
           runId: input.execution.binding.runId,
@@ -1025,12 +1264,13 @@ export async function executePaperclipNativeSession(input: {
           recoveryDisposition: failureCode,
         },
         nextAction: exhausted
-          ? "Inspect or explicitly restart the exhausted persisted native session."
+          ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
           : "Resume the persisted native session on the same heartbeat run.",
         wakePolicy: nextAttemptAt
           ? { kind: "resume_native_run", runId: input.execution.binding.runId, notBefore: nextAttemptAt.toISOString() }
           : null,
         maxAttempts: 3,
+        supersedeOnIdentityChange: recoveryProjection.supersedeOnIdentityChange,
       });
     });
     throw error;
@@ -1149,13 +1389,24 @@ function normalizeNativeUsage(usage: Record<string, unknown> | null) {
   };
 }
 
-function createRunnerdBackend(input: {
+/** Production runnerd backend seam, exported so provider wiring can be regression tested. */
+export function createRunnerdBackend(input: {
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
   durableEnvironmentLeaseId?: string;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   runnerEnvironment?: NodeJS.ProcessEnv;
+  enqueueWakeup?: (agentId: string, options: {
+    source: "assignment";
+    triggerDetail: "system";
+    reason: "issue_assigned";
+    payload: Record<string, unknown>;
+    idempotencyKey: string;
+    requestedByActorType: "agent";
+    requestedByActorId: string;
+    contextSnapshot: Record<string, unknown>;
+  }) => Promise<unknown>;
 }): NativeSessionBackend {
   const authority = new PaperclipRunnerToolAuthority(input.db, {
     companyId: input.execution.binding.companyId,
@@ -1163,6 +1414,11 @@ function createRunnerdBackend(input: {
     runId: input.execution.binding.runId,
     agentId: input.execution.binding.agentId,
     workMode: input.execution.task.workMode,
+    acceptedPlanContinuation:
+      input.execution.task.workMode === "planning"
+      && "executionMode" in input.execution
+      && input.execution.executionMode === "default",
+    enqueueWakeup: input.enqueueWakeup,
   });
   const sessionId = nativeSessionKey(input.execution);
   const existingRouter = sessionToolRouters.get(sessionId);
@@ -1178,6 +1434,7 @@ function createRunnerdBackend(input: {
     dynamicToolHandler: (call) => authorityRouter.execute(call),
     environment: input.runnerEnvironment ?? process.env,
     opencodeRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode"),
+    acpxRuntimeDirectory: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "acpx"),
     codexTransportFactory: () => createRunnerdCodexTransport({
       provider: input.execution.provider.kind === "codex"
         ? "codex"

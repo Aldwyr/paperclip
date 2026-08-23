@@ -67,6 +67,21 @@ async function makeDirectoriesReadOnly(directory: string): Promise<void> {
   await fs.chmod(directory, 0o555);
 }
 
+async function verifyMaterializedAsset(
+  rootPath: string,
+  manifestFiles: Array<{ path: string; sha256: string; mode: number; size: number }>,
+): Promise<void> {
+  const actual = await collectDirectoryFiles(rootPath);
+  const actualByPath = new Map(actual.map((file) => [file.path, file]));
+  if (actualByPath.size !== manifestFiles.length) throw new Error("runtime context asset file count mismatch");
+  for (const expected of manifestFiles) {
+    const file = actualByPath.get(expected.path);
+    if (!file || file.content.byteLength !== expected.size || sha256(file.content) !== expected.sha256 || (file.mode & 0o555) !== expected.mode) {
+      throw new Error(`runtime context asset digest mismatch: ${expected.path}`);
+    }
+  }
+}
+
 async function materializeAsset(files: AssetFile[]): Promise<NativeRuntimeAssetReference> {
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
   const manifestFiles = sorted.map((file) => ({ path: safeRelativePath(file.path, "runtime context path"), sha256: sha256(file.content), mode: file.mode & 0o555, size: file.content.byteLength }));
@@ -81,6 +96,7 @@ async function materializeAsset(files: AssetFile[]): Promise<NativeRuntimeAssetR
   const existing = await fs.readFile(manifestPath, "utf8").catch(() => null);
   if (existing !== null) {
     if (sha256(existing) !== manifestDigest || !(await fs.stat(rootPath).catch(() => null))?.isDirectory()) throw new Error(`runtime context asset verification failed: ${assetDigest}`);
+    await verifyMaterializedAsset(rootPath, manifestFiles);
     return { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest: assetDigest, manifestDigest, rootPath, fileCount: manifestFiles.length, totalBytes };
   }
   const stagingRoot = path.join(assetsRoot, ".staging", randomUUID());
@@ -103,6 +119,7 @@ async function materializeAsset(files: AssetFile[]): Promise<NativeRuntimeAssetR
       if (error.code !== "EEXIST") throw error;
       if (sha256(await fs.readFile(manifestPath, "utf8")) !== manifestDigest) throw new Error(`runtime context manifest race mismatch: ${assetDigest}`);
     });
+    await verifyMaterializedAsset(rootPath, manifestFiles);
   } catch (error) {
     await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
     throw error;
@@ -111,7 +128,7 @@ async function materializeAsset(files: AssetFile[]): Promise<NativeRuntimeAssetR
 }
 
 async function materializeInstructionBundle(agent: RuntimeAgent) {
-  const exported = await agentInstructionsService().exportFiles(agent);
+  const exported = await agentInstructionsService().exportFiles(agent, { rejectSymlinks: true });
   const entryPath = safeRelativePath(exported.entryFile, "instruction entry path");
   if (!(entryPath in exported.files)) throw new Error(`configured instruction entry is missing: ${entryPath}`);
   const files = Object.entries(exported.files).map(([relativePath, content]) => ({ path: safeRelativePath(relativePath, "instruction path"), content: Buffer.from(content, "utf8"), mode: 0o444 }));
@@ -133,6 +150,12 @@ async function materializeSelectedSkills(runtimeConfig: Record<string, unknown>,
 export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(input.agent.companyId, input.agent.id);
   const permitted = new Set([...effective.entries.filter((entry) => entry.effect === "include" && entry.connectionId).map((entry) => entry.connectionId!), ...effective.allowedTools.map((tool) => tool.connectionId)]);
+  const unhealthy = effective.installedConnections.filter((connection) =>
+    permitted.has(connection.id)
+    && ["mcp_remote", "local_stdio"].includes(connection.transport)
+    && (!connection.enabled || connection.status !== "active" || ["degraded", "failed", "error", "missing_secret"].includes(connection.healthStatus)),
+  );
+  if (unhealthy.length) throw new Error(`assigned native MCP connection is unavailable: ${unhealthy.map((connection) => connection.id).join(", ")}`);
   const assignment = {
     version: 1,
     agentId: input.agent.id,

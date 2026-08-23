@@ -1,6 +1,6 @@
 import type { NativeEvidenceAssessment } from "./evidence-classifier.js";
 
-export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v2";
+export const NATIVE_STATUS_ARBITER_POLICY_VERSION = "phase6-v3";
 
 export type NativeAuthoritativeIssueStatus =
   | "backlog"
@@ -18,7 +18,13 @@ export type NativeGovernanceGate = {
 
 export type NativeStatusEffect =
   | { kind: "create_interaction"; gate?: NativeGovernanceGate; prompt?: string }
-  | { kind: "bind_reviewer"; prompt: string }
+  | {
+      kind: "bind_reviewer";
+      prompt: string;
+      detailsMarkdown?: string | null;
+      ownerUserId?: string | null;
+      ownerAgentId?: string | null;
+    }
   | { kind: "notify_owner"; agentId: string; reason: string }
   | {
       kind: "enqueue_continuation";
@@ -69,6 +75,15 @@ export function arbitrateNativeStatus(input: {
   governanceGate?: NativeGovernanceGate | null;
   completionClaimPolicyAccepted?: boolean;
   allowIncompleteContinuation?: boolean;
+  /**
+   * True when the issue already has a durable unresolved dependency edge.
+   * A "current_track" result cannot remain in_progress in that state because
+   * checkout is intentionally gated until the dependency resolves.
+   */
+  hasUnresolvedIssueBlockers?: boolean;
+  /** A governance interaction created by this run was accepted before the run settled. */
+  governanceResolvedForRun?: boolean;
+  reviewOwnerUserId?: string | null;
   agentId: string;
   priorIssueStatus: NativeAuthoritativeIssueStatus;
 }): NativeStatusDecision {
@@ -123,6 +138,22 @@ export function arbitrateNativeStatus(input: {
     };
   }
   if (input.governanceGate) {
+    if (
+      input.assessment.reportedDisposition === "yielded"
+      && input.assessment.continuation?.kind === "response_wake"
+    ) {
+      return {
+        policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+        statusAction: "in_review",
+        toStatus: "in_review",
+        reasonCode: "governed_response_waiting",
+        unblockDescriptor: null,
+        // The existing interaction is the liveness path. Its authoritative
+        // resolution owns the response wake; dispatching one now would start a
+        // duplicate provider turn before the human has answered.
+        effects: [{ kind: "create_interaction", gate: input.governanceGate }],
+      };
+    }
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "in_review",
@@ -135,20 +166,64 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  if (
+    input.governanceResolvedForRun === true
+    && ["needs_review", "blocked"].includes(input.assessment.reportedDisposition)
+    && input.assessment.attentionRequests.length > 0
+    && input.assessment.attentionRequests.every((request) =>
+      request.ownerClass === "human" && ["review", "approval"].includes(request.kind)
+    )
+  ) {
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "in_review",
+      toStatus: "in_review",
+      reasonCode: "governance_response_continuation_queued",
+      unblockDescriptor: null,
+      // The accepted interaction already queued the response wake. Creating a
+      // second completion-review interaction here would strand that continuation.
+      // Planning turns commonly report `blocked` while awaiting their own
+      // confirmation; once accepted, that response wake is authoritative too.
+      effects: [],
+    };
+  }
+  if (
+    input.hasUnresolvedIssueBlockers === true
+    && ["done", "blocked"].includes(input.assessment.reportedDisposition)
+  ) {
+    const owner = input.assessment.blocker?.boardOwned ? "board" as const : { agentId: input.agentId };
+    return {
+      policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+      statusAction: "blocked",
+      toStatus: "blocked",
+      reasonCode: "durable_dependency_blocker_bound",
+      unblockDescriptor: {
+        owner,
+        action: input.assessment.blocker?.unblockAction
+          ?? "Wait for the issue's durable dependency blockers to complete.",
+      },
+      // Dependency completion owns the wake. Do not immediately rerun the
+      // blocked issue merely because the provider mislabeled its scope/status.
+      effects: [],
+    };
+  }
   const evidenceComplete =
     input.assessment.reportedDisposition === "done" &&
     input.assessment.objectiveSatisfied &&
     input.assessment.allCriteriaSatisfied &&
     input.assessment.verificationPassed &&
+    !input.assessment.hasFailedVerification &&
+    input.assessment.attentionRequests.length === 0 &&
     !input.assessment.hasBlockingRemainingWork;
   const policyClaimComplete =
     input.completionClaimPolicyAccepted === true &&
     input.assessment.reportedDisposition === "done" &&
     input.assessment.contractRevisionMatches &&
+    input.assessment.objectiveClaimSatisfied &&
     input.assessment.criterionAssessments.length > 0 &&
     input.assessment.criterionAssessments.every((entry) => entry.claimStatus === "satisfied") &&
-    input.assessment.verificationAssessments.length > 0 &&
-    input.assessment.verificationAssessments.every((entry) => entry.claimStatus === "passed") &&
+    !input.assessment.hasFailedVerification &&
+    input.assessment.attentionRequests.length === 0 &&
     !input.assessment.hasBlockingRemainingWork;
   const complete = evidenceComplete || policyClaimComplete;
   if (complete) {
@@ -163,19 +238,55 @@ export function arbitrateNativeStatus(input: {
       effects: [{ kind: "release_checkout" }],
     };
   }
-  if (input.assessment.reportedDisposition === "needs_review") {
+  if (
+    input.assessment.reportedDisposition === "needs_review"
+    || input.assessment.reportedDisposition === "done"
+    || input.assessment.attentionRequests.length > 0
+  ) {
+    const failedVerification = input.assessment.verificationAssessments
+      .filter((entry) => entry.claimStatus === "failed")
+      .map((entry) => entry.commandOrCheck);
+    const unrunVerification = input.assessment.verificationCaveats
+      .map((entry) => entry.commandOrCheck);
+    const attention = input.assessment.attentionRequests.map((entry) => entry.summary);
+    const reasonCode = failedVerification.length > 0
+      ? "completion_claim_conflict"
+      : attention.length > 0
+        ? "actionable_attention_pending"
+        : input.completionClaimPolicyAccepted === true
+          ? "completion_claim_incomplete"
+          : "external_verification_required";
+    const reviewReasons = [
+      ...failedVerification.map((value) => `Failed verification: ${value}`),
+      ...unrunVerification.map((value) => `Verification not run: ${value}`),
+      ...attention.map((value) => `Action required: ${value}`),
+    ];
+    const reviewPrompt = [
+      "Review the persisted native-run evidence and confirm whether this issue may be completed.",
+      ...reviewReasons.slice(0, 5),
+    ].join("\n").slice(0, 1_000);
+    const detailsMarkdown = [
+      reviewReasons.length > 0 ? `## Missing or conflicting verification\n${reviewReasons.map((value) => `- ${value}`).join("\n")}` : null,
+      input.assessment.acceptedEvidenceRefs.length > 0
+        ? `## Accepted evidence\n${input.assessment.acceptedEvidenceRefs.map((value) => `- \`${value}\``).join("\n")}`
+        : "## Accepted evidence\nNo durable accepted evidence was recorded.",
+    ].filter(Boolean).join("\n\n").slice(0, 20_000);
+    const requestedAgentOwner = input.assessment.attentionRequests
+      .find((entry) => entry.ownerClass === "agent" && entry.targetAgentId)?.targetAgentId ?? null;
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "in_review",
       toStatus: "in_review",
-      reasonCode: "completion_review_required",
+      reasonCode,
       unblockDescriptor: null,
       effects: [
         {
           kind: "bind_reviewer",
-          prompt: "Review the persisted native-run evidence and confirm whether this issue may be completed.",
+          prompt: reviewPrompt,
+          detailsMarkdown,
+          ownerUserId: requestedAgentOwner ? null : input.reviewOwnerUserId ?? null,
+          ownerAgentId: requestedAgentOwner,
         },
-        { kind: "notify_owner", agentId: input.agentId, reason: "completion_review_required" },
       ],
     };
   }

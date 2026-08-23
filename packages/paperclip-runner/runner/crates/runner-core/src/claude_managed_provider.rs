@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
@@ -21,11 +23,19 @@ use crate::provider_bridge::{AuthorizedTool, ToolResult};
 const ANTHROPIC_ORIGIN: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const QUALIFIED_BETA: &str = "managed-agents-2026-04-01";
+const SKILLS_BETA: &str = "skills-2025-10-02";
 const MAX_REMOTE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REMOTE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REMOTE_TOOLS: usize = 128;
 const MAX_HISTORY_EVENTS: usize = 10_000;
 const MAX_HISTORY_PAGES: usize = 100;
+const MAX_SKILL_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+struct ManagedMcpBinding {
+    name: String,
+    capability_url: String,
+}
 
 struct SensitiveApiKey(String);
 
@@ -182,6 +192,376 @@ impl Drop for NetworkWorker {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn take_managed_mcp_binding() -> Result<Option<ManagedMcpBinding>, LocalRunnerError> {
+    let name = std::env::var("PAPERCLIP_NATIVE_MCP_NAME").ok();
+    let url = std::env::var("PAPERCLIP_NATIVE_MCP_URL").ok();
+    let token = std::env::var("PAPERCLIP_NATIVE_MCP_TOKEN").ok();
+    for key in [
+        "PAPERCLIP_NATIVE_MCP_NAME",
+        "PAPERCLIP_NATIVE_MCP_URL",
+        "PAPERCLIP_NATIVE_MCP_TOKEN",
+    ] {
+        std::env::remove_var(key);
+    }
+    match (name, url, token) {
+        (None, None, None) => Ok(None),
+        (Some(name), Some(url), Some(mut token))
+            if !name.trim().is_empty() && url.starts_with("https://") && !token.is_empty() =>
+        {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let capability_url = format!(
+                "{url}{separator}paperclip_capability={}",
+                percent_encode_query(&token)
+            );
+            token.clear();
+            Ok(Some(ManagedMcpBinding {
+                name,
+                capability_url,
+            }))
+        }
+        (_, _, Some(mut token)) => {
+            token.clear();
+            Err(LocalRunnerError::invalid(
+                "Claude Managed MCP binding is incomplete or unsafe",
+            ))
+        }
+        _ => Err(LocalRunnerError::invalid(
+            "Claude Managed MCP binding is incomplete",
+        )),
+    }
+}
+
+fn runtime_array<'a>(context: &'a Value, field: &str) -> Result<&'a Vec<Value>, LocalRunnerError> {
+    context.get(field).and_then(Value::as_array).ok_or_else(|| {
+        LocalRunnerError::invalid(format!("runtimeContext.{field} must be an array"))
+    })
+}
+
+fn runtime_text<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, LocalRunnerError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| LocalRunnerError::invalid(format!("runtimeContext {pointer} is missing")))
+}
+
+fn collect_bundle_files(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>, LocalRunnerError> {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        files: &mut Vec<(PathBuf, Vec<u8>)>,
+        total: &mut usize,
+    ) -> Result<(), LocalRunnerError> {
+        let mut entries = fs::read_dir(current)
+            .map_err(|error| {
+                LocalRunnerError::invalid(format!("failed to read runtime asset: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                LocalRunnerError::invalid(format!("failed to enumerate runtime asset: {error}"))
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                LocalRunnerError::invalid(format!("failed to inspect runtime asset: {error}"))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(LocalRunnerError::invalid(
+                    "managed skill bundles may not contain symlinks",
+                ));
+            }
+            if metadata.is_dir() {
+                visit(root, &path, files, total)?;
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| LocalRunnerError::invalid("runtime asset escaped its root"))?
+                    .to_path_buf();
+                let bytes = fs::read(&path).map_err(|error| {
+                    LocalRunnerError::invalid(format!("failed to read runtime asset file: {error}"))
+                })?;
+                *total = total.saturating_add(bytes.len());
+                if *total > MAX_SKILL_UPLOAD_BYTES {
+                    return Err(LocalRunnerError::invalid(
+                        "managed skill upload exceeded its size limit",
+                    ));
+                }
+                files.push((relative, bytes));
+            }
+        }
+        Ok(())
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        LocalRunnerError::invalid(format!("runtime asset is unavailable: {error}"))
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(LocalRunnerError::invalid(
+            "runtime asset root must be a real directory",
+        ));
+    }
+    let mut files = Vec::new();
+    let mut total = 0;
+    visit(root, root, &mut files, &mut total)?;
+    Ok(files)
+}
+
+fn multipart_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
+fn multipart_file(body: &mut Vec<u8>, boundary: &str, filename: &str, bytes: &[u8]) {
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"files[]\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn upload_managed_skill(
+    client: &Client,
+    title: &str,
+    top_level: &str,
+    mut files: Vec<(PathBuf, Vec<u8>)>,
+    generated_skill: Option<String>,
+) -> Result<Value, LocalRunnerError> {
+    let listed: Value = client
+        .get(format!(
+            "{ANTHROPIC_ORIGIN}/v1/skills?limit=1000&source=custom"
+        ))
+        .send()
+        .map_err(|_| LocalRunnerError::invalid("Anthropic skill mapping lookup failed"))?
+        .json()
+        .map_err(|_| {
+            LocalRunnerError::invalid("Anthropic skill mapping lookup returned invalid JSON")
+        })?;
+    if let Some(existing) = listed
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|skill| {
+            skill.get("display_title").and_then(Value::as_str) == Some(title)
+                || skill.get("title").and_then(Value::as_str) == Some(title)
+        })
+    {
+        let skill_id = existing
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LocalRunnerError::invalid("Anthropic skill mapping omitted id"))?;
+        let version = existing.get("latest_version").cloned().ok_or_else(|| {
+            LocalRunnerError::invalid("Anthropic skill mapping omitted latest_version")
+        })?;
+        return Ok(json!({ "type": "custom", "skill_id": skill_id, "version": version }));
+    }
+    if let Some(skill) = generated_skill {
+        files.push((PathBuf::from("SKILL.md"), skill.into_bytes()));
+    }
+    if !files.iter().any(|(path, _)| path == Path::new("SKILL.md")) {
+        return Err(LocalRunnerError::invalid(
+            "managed custom skill bundle is missing SKILL.md",
+        ));
+    }
+    let boundary = format!(
+        "paperclip-{}",
+        &format!("{:x}", Sha256::digest(title.as_bytes()))[..24]
+    );
+    let mut body = Vec::new();
+    multipart_field(&mut body, &boundary, "display_title", title);
+    multipart_field(
+        &mut body,
+        &boundary,
+        "description",
+        "Paperclip-owned immutable runtime context asset",
+    );
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, bytes) in files {
+        let relative = path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        multipart_file(
+            &mut body,
+            &boundary,
+            &format!("{top_level}/{relative}"),
+            &bytes,
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let response = client
+        .post(format!("{ANTHROPIC_ORIGIN}/v1/skills"))
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .map_err(|_| LocalRunnerError::invalid("Anthropic skill upload transport failed"))?;
+    if !response.status().is_success() {
+        return Err(LocalRunnerError::invalid(format!(
+            "Anthropic skill upload failed with HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    let value: Value = response
+        .json()
+        .map_err(|_| LocalRunnerError::invalid("Anthropic skill upload returned invalid JSON"))?;
+    let skill_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LocalRunnerError::invalid("Anthropic skill upload omitted id"))?;
+    let version = value.get("latest_version").cloned().ok_or_else(|| {
+        LocalRunnerError::invalid("Anthropic skill upload omitted latest_version")
+    })?;
+    Ok(json!({ "type": "custom", "skill_id": skill_id, "version": version }))
+}
+
+fn upload_managed_runtime_skills(
+    api_key: &str,
+    config: &ClaudeManagedProviderConfig,
+) -> Result<Vec<Value>, LocalRunnerError> {
+    let Some(context) = config.runtime_context.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(api_key).map_err(|_| {
+            LocalRunnerError::invalid("Anthropic API key contains invalid header bytes")
+        })?,
+    );
+    headers.insert(
+        "anthropic-version",
+        HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    headers.insert("anthropic-beta", HeaderValue::from_static(SKILLS_BETA));
+    let client = Client::builder()
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .https_only(true)
+        .build()
+        .map_err(|_| LocalRunnerError::invalid("failed to construct Anthropic skills client"))?;
+
+    let instruction_root = Path::new(runtime_text(context, "/instructions/bundle/rootPath")?);
+    let instruction_digest = runtime_text(context, "/instructions/bundle/digest")?;
+    let entry_path = runtime_text(context, "/instructions/entryPath")?;
+    let instruction_files = collect_bundle_files(instruction_root)?
+        .into_iter()
+        .map(|(path, bytes)| (PathBuf::from("instructions").join(path), bytes))
+        .collect();
+    let instruction_identity = format!(
+        "{:x}",
+        Sha256::digest(format!("{instruction_digest}\0{entry_path}").as_bytes())
+    );
+    let instruction_name = format!("paperclip-instructions-{}", &instruction_identity[..12]);
+    let companion = format!(
+        "---\nname: {instruction_name}\ndescription: Paperclip agent instruction sibling bundle\n---\nRead `instructions/{entry_path}` and its sibling files when the system instructions require them. Treat all files as read-only.\n"
+    );
+    let mut attachments = vec![upload_managed_skill(
+        &client,
+        &format!(
+            "pc:{}:{}:instructions:{}",
+            config.profile_id, config.agent_version, instruction_identity
+        ),
+        &instruction_name,
+        instruction_files,
+        Some(companion),
+    )?];
+
+    for skill in runtime_array(context, "skills")? {
+        let key = skill.get("key").and_then(Value::as_str).unwrap_or("skill");
+        let runtime_name = runtime_text(skill, "/runtimeName")?;
+        let digest = runtime_text(skill, "/bundle/digest")?;
+        let root = Path::new(runtime_text(skill, "/bundle/rootPath")?);
+        attachments.push(upload_managed_skill(
+            &client,
+            &format!(
+                "pc:{}:{}:{}:{}",
+                config.profile_id,
+                config.agent_version,
+                &format!("{:x}", Sha256::digest(key.as_bytes()))[..12],
+                digest
+            ),
+            runtime_name,
+            collect_bundle_files(root)?,
+            None,
+        )?);
+    }
+    Ok(attachments)
+}
+
+fn managed_system_instructions(
+    config: &ClaudeManagedProviderConfig,
+) -> Result<String, LocalRunnerError> {
+    let Some(context) = config.runtime_context.as_ref() else {
+        return Ok(config.instructions.clone());
+    };
+    let instruction_root = runtime_text(context, "/instructions/bundle/rootPath")?;
+    let instruction_digest = runtime_text(context, "/instructions/bundle/digest")?;
+    let entry_path = runtime_text(context, "/instructions/entryPath")?;
+    let instruction_identity = format!(
+        "{:x}",
+        Sha256::digest(format!("{instruction_digest}\0{entry_path}").as_bytes())
+    );
+    let instruction_name = format!("paperclip-instructions-{}", &instruction_identity[..12]);
+    let local_directive = format!("Read-only instruction sibling root: {instruction_root}");
+    let replacement = format!(
+        "Read-only instruction siblings are in the attached `{instruction_name}` skill under `instructions/`."
+    );
+    config
+        .instructions
+        .strip_suffix(&local_directive)
+        .map(|prefix| format!("{prefix}{replacement}"))
+        .ok_or_else(|| {
+            LocalRunnerError::invalid(
+                "Claude Managed instruction-root directive is missing or inconsistent",
+            )
+        })
+}
+
+fn managed_agent_overrides(
+    config: &ClaudeManagedProviderConfig,
+    system_instructions: &str,
+    mut custom_tools: Vec<Value>,
+    skills: &[Value],
+    mcp: Option<&ManagedMcpBinding>,
+) -> Value {
+    let mut tools = vec![json!({
+        "type": "agent_toolset_20260401",
+        "default_config": { "enabled": false },
+        "configs": [{ "name": "read", "enabled": true }]
+    })];
+    tools.append(&mut custom_tools);
+    let mcp_servers = mcp
+        .map(|binding| {
+            vec![json!({
+                "type": "url",
+                "name": binding.name,
+                "url": binding.capability_url,
+            })]
+        })
+        .unwrap_or_default();
+    if let Some(binding) = mcp {
+        tools.push(json!({
+            "type": "mcp_toolset",
+            "mcp_server_name": binding.name,
+            "default_config": { "enabled": true }
+        }));
+    }
+    json!({
+        "model": { "id": config.model },
+        "system": system_instructions,
+        "tools": tools,
+        "mcp_servers": mcp_servers,
+        "skills": skills,
+    })
 }
 
 fn network_loop(
@@ -445,6 +825,10 @@ pub struct ClaudeManagedProvider {
     model_request_count: u64,
     current_budget_cents: u64,
     reconnect_backoff: Duration,
+    config: ClaudeManagedProviderConfig,
+    system_instructions: String,
+    managed_skills: Vec<Value>,
+    mcp_binding: Option<ManagedMcpBinding>,
 }
 
 impl ClaudeManagedProvider {
@@ -459,12 +843,16 @@ impl ClaudeManagedProvider {
             LocalRunnerError::invalid("ANTHROPIC_API_KEY is required for Claude Agent")
         })?;
         std::env::remove_var("ANTHROPIC_API_KEY");
+        let mcp_binding = take_managed_mcp_binding()?;
+        let managed_skills = upload_managed_runtime_skills(&api_key, config)?;
         Self::start_with_worker(
             config,
             tools,
             resume_session_id,
             resume_event_cursor,
             resume_model_request_count,
+            managed_skills,
+            mcp_binding,
             SensitiveApiKey(api_key),
             NetworkWorker::start,
         )
@@ -476,6 +864,8 @@ impl ClaudeManagedProvider {
         resume_session_id: Option<&str>,
         resume_event_cursor: Option<&str>,
         resume_model_request_count: u64,
+        managed_skills: Vec<Value>,
+        mcp_binding: Option<ManagedMcpBinding>,
         api_key: SensitiveApiKey,
         start_worker: F,
     ) -> Result<Self, LocalRunnerError>
@@ -483,8 +873,16 @@ impl ClaudeManagedProvider {
         F: FnOnce(SensitiveApiKey, &str) -> Result<NetworkWorker, LocalRunnerError>,
     {
         validate_config(config)?;
+        let system_instructions = managed_system_instructions(config)?;
         let worker = start_worker(api_key, &config.beta_version)?;
         let (tool_payload, reverse, operation_input_schemas) = encode_tools(&tools)?;
+        let agent_overrides = managed_agent_overrides(
+            config,
+            &system_instructions,
+            tool_payload,
+            &managed_skills,
+            mcp_binding.as_ref(),
+        );
         let mut replay_queue = VecDeque::new();
         let session_id = if let Some(session_id) = resume_session_id {
             let session = worker.request(
@@ -496,7 +894,7 @@ impl ClaudeManagedProvider {
             worker.request(
                 Method::POST,
                 format!("/v1/sessions/{session_id}?beta=true"),
-                Some(json!({ "agent": { "tools": tool_payload, "mcp_servers": [] } })),
+                Some(json!({ "agent": agent_overrides })),
             )?;
             session_id.to_owned()
         } else {
@@ -516,10 +914,11 @@ impl ClaudeManagedProvider {
                         "type": "agent_with_overrides",
                         "id": config.anthropic_agent_id,
                         "version": version,
-                        "model": { "id": config.model },
-                        "tools": tool_payload,
-                        "mcp_servers": [],
-                        "skills": []
+                        "model": agent_overrides["model"].clone(),
+                        "system": agent_overrides["system"].clone(),
+                        "tools": agent_overrides["tools"].clone(),
+                        "mcp_servers": agent_overrides["mcp_servers"].clone(),
+                        "skills": agent_overrides["skills"].clone()
                     },
                     "environment_id": config.environment_id,
                     "budget": {
@@ -558,6 +957,10 @@ impl ClaudeManagedProvider {
             model_request_count: resume_model_request_count,
             current_budget_cents: spend_cap_cents(config.max_session_list_cost_usd)?,
             reconnect_backoff: Duration::from_millis(250),
+            config: config.clone(),
+            system_instructions,
+            managed_skills,
+            mcp_binding,
         })
     }
 
@@ -806,10 +1209,17 @@ impl Provider for ClaudeManagedProvider {
 
     fn configure_tools(&mut self, tools: Vec<AuthorizedTool>) -> Result<(), LocalRunnerError> {
         let (payload, reverse, operation_input_schemas) = encode_tools(&tools)?;
+        let overrides = managed_agent_overrides(
+            &self.config,
+            &self.system_instructions,
+            payload,
+            &self.managed_skills,
+            self.mcp_binding.as_ref(),
+        );
         self.worker.request(
             Method::POST,
             format!("/v1/sessions/{}?beta=true", self.session_id),
-            Some(json!({ "agent": { "tools": payload, "mcp_servers": [] } })),
+            Some(json!({ "agent": overrides })),
         )?;
         self.remote_to_canonical = reverse;
         self.operation_input_schemas = operation_input_schemas;
@@ -999,6 +1409,7 @@ fn validate_config(config: &ClaudeManagedProviderConfig) -> Result<(), LocalRunn
         config.anthropic_agent_id.as_str(),
         config.agent_version.as_str(),
         config.environment_id.as_str(),
+        config.instructions.as_str(),
     ]
     .iter()
     .any(|value| value.trim().is_empty())
@@ -1432,6 +1843,8 @@ mod tests {
             environment_id: "env_test".to_owned(),
             beta_version: QUALIFIED_BETA.to_owned(),
             max_session_list_cost_usd: 1.0,
+            instructions: "Paperclip test system instructions".to_owned(),
+            runtime_context: None,
         }
     }
 
@@ -1463,6 +1876,8 @@ mod tests {
             resume_session_id,
             cursor,
             0,
+            Vec::new(),
+            None,
             SensitiveApiKey("anthropic-test-secret".to_owned()),
             move |key, beta| NetworkWorker::start_at(key, beta, &origin, false),
         )
@@ -1478,6 +1893,62 @@ mod tests {
             .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-')));
         assert_ne!(first, second);
         assert_eq!(first, remote_tool_name("issues.comment:create"));
+    }
+
+    #[test]
+    fn managed_overrides_replace_saved_context_and_pin_skills_and_mcp() {
+        let binding = ManagedMcpBinding {
+            name: "paperclip-assigned".to_owned(),
+            capability_url: "https://paperclip.example/mcp?paperclip_capability=secret".to_owned(),
+        };
+        let overrides = managed_agent_overrides(
+            &config(),
+            "Paperclip test system instructions",
+            vec![json!({ "type": "custom", "name": "pc_finish" })],
+            &[json!({ "type": "custom", "skill_id": "skill_1", "version": 7 })],
+            Some(&binding),
+        );
+        assert_eq!(
+            overrides.get("system"),
+            Some(&json!("Paperclip test system instructions"))
+        );
+        assert_eq!(overrides.pointer("/skills/0/version"), Some(&json!(7)));
+        assert_eq!(
+            overrides.pointer("/mcp_servers/0/name"),
+            Some(&json!("paperclip-assigned"))
+        );
+        assert!(overrides
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools
+                .iter()
+                .any(|tool| tool.get("type") == Some(&json!("agent_toolset_20260401")))));
+        assert!(serde_json::to_string(&config())
+            .unwrap()
+            .find("paperclip_capability")
+            .is_none());
+    }
+
+    #[test]
+    fn managed_system_replaces_the_local_instruction_path_with_the_companion_skill() {
+        let mut config = config();
+        let local_root = "/paperclip/runtime/instructions";
+        config.instructions = format!(
+            "paperclip prompt\n\nAGENTS entry\n\nRead-only instruction sibling root: {local_root}"
+        );
+        config.runtime_context = Some(json!({
+            "instructions": {
+                "entryPath": "AGENTS.md",
+                "bundle": { "digest": "abc123", "rootPath": local_root }
+            },
+            "skills": []
+        }));
+
+        let instructions = managed_system_instructions(&config).unwrap();
+        assert!(instructions.starts_with("paperclip prompt\n\nAGENTS entry\n\n"));
+        assert!(instructions.contains("attached `paperclip-instructions-"));
+        assert!(instructions.ends_with("skill under `instructions/`."));
+        assert!(!instructions.contains(local_root));
     }
 
     #[test]

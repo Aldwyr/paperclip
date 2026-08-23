@@ -9,6 +9,7 @@ struct Mode {
     large_event: bool,
     oversized_event: bool,
     linger_after_turn_start: bool,
+    runtime_question: bool,
 }
 
 fn send(value: Value) -> io::Result<()> {
@@ -24,11 +25,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         large_event: args.iter().any(|arg| arg == "--large-event"),
         oversized_event: args.iter().any(|arg| arg == "--oversized-event"),
         linger_after_turn_start: args.iter().any(|arg| arg == "--linger-after-turn-start"),
+        runtime_question: args.iter().any(|arg| arg == "--runtime-question"),
     };
     let mut turn_count = 0_u64;
     let mut active_turn_id: Option<String> = None;
     let mut planning_thread = false;
     let mut pending_tool_turns = BTreeMap::<String, String>::new();
+    let mut pending_question_turns = BTreeMap::<String, String>::new();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let request: Value = serde_json::from_str(&line?)?;
@@ -149,6 +152,45 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if mode.linger_after_turn_start {
                     continue;
                 }
+                if mode.runtime_question {
+                    let request_id = format!("rpc-question-{turn_count}");
+                    pending_question_turns.insert(request_id.clone(), turn_id.clone());
+                    send(json!({
+                        "id": request_id,
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "threadId": "fake-thread",
+                            "turnId": turn_id,
+                            "itemId": "question-item",
+                            "questions": [
+                                {
+                                    "id": "environment",
+                                    "header": "Environment",
+                                    "question": "Where should we deploy?",
+                                    "options": [
+                                        {"label": "Staging", "description": "Deploy to staging first."},
+                                        {"label": "Production", "description": "Deploy directly to production."}
+                                    ],
+                                    "isOther": true
+                                },
+                                {
+                                    "id": "regions",
+                                    "header": "Regions",
+                                    "question": "Which regions?",
+                                    "options": [{"label": "US"}, {"label": "EU"}],
+                                    "multiSelect": true
+                                },
+                                {
+                                    "id": "notes",
+                                    "header": "Notes",
+                                    "question": "Anything else?",
+                                    "required": false
+                                }
+                            ]
+                        }
+                    }))?;
+                    continue;
+                }
                 pending_tool_turns.insert(request_id.clone(), turn_id.clone());
                 send(json!({
                     "id": request_id, "method": "item/tool/call",
@@ -186,6 +228,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "schema": "paperclip.prp.result.v1",
                         "reportedWorkDisposition": "done",
                         "summary": "Fake provider completed the operation."
+                    }
+                }
+            }))?;
+            send(
+                json!({"method": "turn/completed", "params": {"threadId": "fake-thread", "turn": {"id": turn_id, "status": "completed"}}}),
+            )?;
+        }
+        let completed_question = request
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|request_id| pending_question_turns.remove(request_id));
+        if let Some(turn_id) = completed_question.filter(|_| request.get("result").is_some()) {
+            if request.pointer("/result/answers")
+                != Some(&json!({
+                    "environment": {"answers": ["Staging"]},
+                    "regions": {"answers": ["US", "EU"]},
+                    "notes": {"answers": ["Ship during the maintenance window."]}
+                }))
+            {
+                return Err(
+                    format!("runtime question received wrong response: {}", request).into(),
+                );
+            }
+            send(json!({
+                "method": "paperclip/runResult",
+                "params": {
+                    "threadId": "fake-thread",
+                    "turnId": turn_id,
+                    "itemId": "semantic-result",
+                    "result": {
+                        "schema": "paperclip.prp.result.v1",
+                        "reportedWorkDisposition": "done",
+                        "summary": "Fake provider completed after runtime input."
                     }
                 }
             }))?;

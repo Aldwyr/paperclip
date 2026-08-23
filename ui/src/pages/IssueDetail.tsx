@@ -132,6 +132,8 @@ import {
 } from "../components/IssueMonitorBanner";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { IssueProperties, type IssuePropertiesDocumentDeepLink } from "../components/IssueProperties";
+import { TaskSidePanel } from "../components/task-side-panel";
+import { SidePanelToggleButton } from "../components/side-panel";
 import { PauseAffectsSummaryView } from "../components/interrupt-handoff/InterruptHandoffViews";
 import { computePauseAffectsSummary } from "../lib/interrupt-handoff";
 import { useIssueExternalObjects } from "../hooks/useIssueExternalObjects";
@@ -274,6 +276,7 @@ type IssueDetailComment = (IssueComment | OptimisticIssueComment) & {
   queueTargetRunId?: string | null;
   queueReason?: "hold" | "active_run" | "other";
   consumedByRunId?: string | null;
+  steeredIntoRunId?: string | null;
   conversationAnchorAt?: Date | string | null;
   conversationAnchorSequence?: number;
 };
@@ -1229,7 +1232,13 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     const agentIdByRunId = new Map<string, string>();
     const inputPlacementByCommentId = new Map<
       string,
-      { runId: string; anchorAt: string; sequence: number; anchorMs: number }
+      {
+        runId: string;
+        anchorAt: string;
+        sequence: number;
+        anchorMs: number;
+        kind: "run_start" | "steer";
+      }
     >();
 
     for (const run of resolvedLinkedRuns) {
@@ -1256,7 +1265,48 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           anchorAt,
           sequence,
           anchorMs,
+          kind: "run_start",
         });
+      });
+    }
+    // Same-turn steering has a durable PRP acknowledgement and a matching
+    // activity fact keyed by commentId/targetRunId. Its acknowledgement time,
+    // not the comment submission time, is the causal conversation slot. Use
+    // only the first acknowledgement; an idempotent replay emits a diagnostic
+    // activity row with duplicate=true but must not move the message later.
+    const steeringEvents = resolvedActivity
+      .filter((evt) => evt.action === "issue.queued_comment_steered")
+      .sort(
+        (a, b) =>
+          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+      );
+    const steeringSequenceByRunId = new Map<string, number>();
+    for (const evt of steeringEvents) {
+      const details = evt.details ?? {};
+      if (details["duplicate"] === true) continue;
+      const commentId =
+        typeof details["commentId"] === "string"
+          ? details["commentId"]
+          : null;
+      const targetRunId =
+        typeof details["targetRunId"] === "string"
+          ? details["targetRunId"]
+          : null;
+      if (!commentId || !targetRunId) continue;
+      const anchorAt =
+        evt.createdAt instanceof Date
+          ? evt.createdAt.toISOString()
+          : evt.createdAt;
+      const anchorMs = new Date(anchorAt).getTime();
+      if (!Number.isFinite(anchorMs)) continue;
+      const sequence = steeringSequenceByRunId.get(targetRunId) ?? 0;
+      steeringSequenceByRunId.set(targetRunId, sequence + 1);
+      inputPlacementByCommentId.set(commentId, {
+        runId: targetRunId,
+        anchorAt,
+        sequence,
+        anchorMs,
+        kind: "steer",
       });
     }
     for (const evt of resolvedActivity) {
@@ -1291,6 +1341,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         ...(inputPlacement
           ? {
               consumedByRunId: inputPlacement.runId,
+              ...(inputPlacement.kind === "steer"
+                ? { steeredIntoRunId: inputPlacement.runId }
+                : {}),
               conversationAnchorAt: inputPlacement.anchorAt,
               conversationAnchorSequence: inputPlacement.sequence,
             }
@@ -1308,6 +1361,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       });
       if (locallyQueuedComment !== nextComment) {
         return locallyQueuedComment;
+      }
+      if (inputPlacement?.kind === "steer") {
+        return nextComment;
       }
       // A queued target is fixed when the message is submitted. If that run
       // settles while the request is still in flight, do not rebind the
@@ -3725,22 +3781,33 @@ export function IssueDetail() {
       closePanel();
       return;
     }
-    openPanel(
-      <IssueProperties
-        issue={panelIssue}
-        childIssues={panelChildIssues}
-        onAddSubIssue={openNewSubIssue}
-        onUpdate={handleIssuePropertiesUpdate}
-        hasActiveRun={resolvedHasActiveRun}
-        externalObjects={externalObjectsState.isEnabled ? externalObjectsState.groups : undefined}
-        externalObjectsLoading={externalObjectsState.isEnabled ? externalObjectsState.isLoading : undefined}
-        externalObjectsError={externalObjectsState.isEnabled ? externalObjectsState.isError : undefined}
-        onRetryExternalObjects={externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined}
-        onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
-        checkingMonitorNow={checkIssueMonitorNow.isPending}
-        documentDeepLink={documentDeepLink?.issueId === panelIssue.id ? documentDeepLink : null}
-      />
-    );
+    const sharedProps = {
+      issue: panelIssue,
+      childIssues: panelChildIssues,
+      onAddSubIssue: openNewSubIssue,
+      onUpdate: handleIssuePropertiesUpdate,
+      hasActiveRun: resolvedHasActiveRun,
+      externalObjects: externalObjectsState.isEnabled ? externalObjectsState.groups : undefined,
+      externalObjectsLoading: externalObjectsState.isEnabled ? externalObjectsState.isLoading : undefined,
+      externalObjectsError: externalObjectsState.isEnabled ? externalObjectsState.isError : undefined,
+      onRetryExternalObjects: externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined,
+      onCheckMonitorNow: () => checkIssueMonitorNow.mutate(),
+      checkingMonitorNow: checkIssueMonitorNow.isPending,
+      documentDeepLink: documentDeepLink?.issueId === panelIssue.id ? documentDeepLink : null,
+    };
+    if (taskChatShellEnabled) {
+      openPanel(
+        <TaskSidePanel
+          key={panelIssue.id}
+          {...sharedProps}
+          accountScope={currentUserId ?? "anonymous"}
+          fileTabsEnabled={fileViewerEnabled}
+        />,
+        { contentMode: "full-bleed" },
+      );
+    } else {
+      openPanel(<IssueProperties {...sharedProps} />);
+    }
     return () => closePanel();
   }, [
     closePanel,
@@ -3760,6 +3827,9 @@ export function IssueDetail() {
     externalObjectsState.isError,
     externalObjectsState.refetch,
     documentDeepLink,
+    taskChatShellEnabled,
+    currentUserId,
+    fileViewerEnabled,
   ]);
 
   const goToInboxShortcutArmedRef = useRef(false);
@@ -4912,25 +4982,17 @@ export function IssueDetail() {
             >
               {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
             </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className={cn(
-                "shrink-0 transition-opacity duration-200",
-                panelVisible && !suppressPanelForFirstTask
-                  ? "opacity-0 pointer-events-none w-0 overflow-hidden"
-                  : "opacity-100",
-              )}
-              onClick={() => {
+            <SidePanelToggleButton
+              open={panelVisible && !suppressPanelForFirstTask}
+              onToggle={() => {
                 if (suppressPanelForFirstTask && issue?.id) {
                   setFirstTaskPanelOverrideIssueId(issue.id);
                 }
-                setPanelVisible(true);
+                setPanelVisible(!(panelVisible && !suppressPanelForFirstTask));
               }}
-              title="Show properties"
-            >
-              <SlidersHorizontal className="h-4 w-4" />
-            </Button>
+              shortcut="]"
+              className="shrink-0"
+            />
 
             <Popover open={moreOpen} onOpenChange={setMoreOpen}>
               <PopoverTrigger asChild>
@@ -5803,23 +5865,25 @@ export function IssueDetail() {
       {/* Mobile properties drawer */}
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
         <SheetContent
-          side={documentDeepLink?.documentKey === "plan" ? "right" : "bottom"}
+          side={taskChatShellEnabled ? "bottom" : documentDeepLink?.documentKey === "plan" ? "right" : "bottom"}
           className={cn(
-            documentDeepLink?.documentKey === "plan"
+            taskChatShellEnabled
+              ? "h-(--sz-85dvh) max-h-(--sz-85dvh) gap-0 p-0 pb-(--sz-safe-bottom)"
+              : documentDeepLink?.documentKey === "plan"
               ? "inset-0 h-dvh w-screen max-w-none gap-0 border-0 p-0 sm:max-w-none"
               : "max-h-(--sz-85dvh) pb-(--sz-safe-bottom)",
           )}
-          data-testid={documentDeepLink?.documentKey === "plan" ? "mobile-plan-panel" : undefined}
+          data-testid={!taskChatShellEnabled && documentDeepLink?.documentKey === "plan" ? "mobile-plan-panel" : undefined}
         >
-          <SheetHeader>
-            <SheetTitle className="text-sm">
-              {documentDeepLink?.documentKey === "plan" ? "Plan" : "Properties"}
-            </SheetTitle>
-          </SheetHeader>
-          <ScrollArea className="flex-1 overflow-y-auto">
-            <div className="px-4 pb-4">
-              <IssueProperties
+          {taskChatShellEnabled ? (
+            <>
+              <SheetHeader className="sr-only">
+                <SheetTitle>Task side panel</SheetTitle>
+              </SheetHeader>
+              <TaskSidePanel
+                key={`${issue.id}:mobile`}
                 issue={issue}
+                accountScope={currentUserId ?? "anonymous"}
                 childIssues={childIssues}
                 onAddSubIssue={openNewSubIssue}
                 onUpdate={(data) => updateIssue.mutate(data)}
@@ -5831,10 +5895,38 @@ export function IssueDetail() {
                 onRetryExternalObjects={externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined}
                 onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
                 checkingMonitorNow={checkIssueMonitorNow.isPending}
+                fileTabsEnabled={fileViewerEnabled}
                 documentDeepLink={documentDeepLink?.issueId === issue.id ? documentDeepLink : null}
               />
-            </div>
-          </ScrollArea>
+            </>
+          ) : (
+            <>
+              <SheetHeader>
+                <SheetTitle className="text-sm">
+                  {documentDeepLink?.documentKey === "plan" ? "Plan" : "Properties"}
+                </SheetTitle>
+              </SheetHeader>
+              <ScrollArea className="flex-1 overflow-y-auto">
+                <div className="px-4 pb-4">
+                  <IssueProperties
+                    issue={issue}
+                    childIssues={childIssues}
+                    onAddSubIssue={openNewSubIssue}
+                    onUpdate={(data) => updateIssue.mutate(data)}
+                    inline
+                    hasActiveRun={resolvedHasActiveRun}
+                    externalObjects={externalObjectsState.isEnabled ? externalObjectsState.groups : undefined}
+                    externalObjectsLoading={externalObjectsState.isEnabled ? externalObjectsState.isLoading : undefined}
+                    externalObjectsError={externalObjectsState.isEnabled ? externalObjectsState.isError : undefined}
+                    onRetryExternalObjects={externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined}
+                    onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
+                    checkingMonitorNow={checkIssueMonitorNow.isPending}
+                    documentDeepLink={documentDeepLink?.issueId === issue.id ? documentDeepLink : null}
+                  />
+                </div>
+              </ScrollArea>
+            </>
+          )}
         </SheetContent>
       </Sheet>
       {fileViewerEnabled ? (
@@ -5843,6 +5935,7 @@ export function IssueDetail() {
           companyId={issue.companyId}
           promptOpen={fileViewerPromptOpen}
           onPromptOpenChange={setFileViewerPromptOpen}
+          useSidePanel={taskChatShellEnabled}
         />
       ) : null}
       <ScrollToBottom />
@@ -5856,21 +5949,33 @@ function IssueFileViewer({
   companyId,
   promptOpen,
   onPromptOpenChange,
+  useSidePanel = false,
 }: {
   issueId: string;
   companyId: string;
   promptOpen: boolean;
   onPromptOpenChange: (next: boolean) => void;
+  useSidePanel?: boolean;
 }) {
   const viewer = useRequiredFileViewer();
+
+  useEffect(() => {
+    if (!useSidePanel || !promptOpen) return;
+    viewer.openBrowse();
+    onPromptOpenChange(false);
+  }, [onPromptOpenChange, promptOpen, useSidePanel, viewer]);
+
   const open = viewer.state !== null || viewer.browse || promptOpen;
   const showPromptWhenEmpty = (promptOpen || viewer.browse) && viewer.state === null;
 
   useEffect(() => {
+    if (useSidePanel) return;
     if (!promptOpen) return;
     if (viewer.state === null && !viewer.browse) return;
     onPromptOpenChange(false);
-  }, [onPromptOpenChange, promptOpen, viewer.browse, viewer.state]);
+  }, [onPromptOpenChange, promptOpen, useSidePanel, viewer.browse, viewer.state]);
+
+  if (useSidePanel) return null;
 
   return (
     <FileViewerSheet

@@ -4,15 +4,24 @@ import type {
   PrpStructuredRunResult,
 } from "../protocol/replay-contract.js";
 import type { SessionSnapshot } from "../reducer/session-reducer.js";
+import {
+  PRP_BLOCK_RESULT_OUTPUT_SCHEMA,
+  PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_BLOCK_TOOL_NAME,
+  PRP_COMPLETION_RESULT_OUTPUT_SCHEMA,
+  PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA,
+  PRP_COMPLETION_TOOL_NAME,
+  PRP_SEMANTIC_TOOL_NAMES,
+} from "./completion-result.js";
 
 export const CODEX_TASK_ENVELOPE_SCHEMA = "paperclip.skillless_task.v1" as const;
 export const CODEX_CODEX_PROTOCOL_VERSION = "v2" as const;
-export const CODEX_COMPLETION_TOOL_NAME = "paperclip_finish" as const;
-export const CODEX_BLOCK_TOOL_NAME = "paperclip_block" as const;
-export const CODEX_SEMANTIC_TOOL_NAMES = [
-  CODEX_COMPLETION_TOOL_NAME,
-  CODEX_BLOCK_TOOL_NAME,
-] as const;
+/** @deprecated Use the provider-neutral PRP completion contract exports. */
+export const CODEX_COMPLETION_TOOL_NAME = PRP_COMPLETION_TOOL_NAME;
+/** @deprecated Use the provider-neutral PRP completion contract exports. */
+export const CODEX_BLOCK_TOOL_NAME = PRP_BLOCK_TOOL_NAME;
+/** @deprecated Use the provider-neutral PRP completion contract exports. */
+export const CODEX_SEMANTIC_TOOL_NAMES = PRP_SEMANTIC_TOOL_NAMES;
 export const CODEX_SKILLLESS_BASE_INSTRUCTIONS =
   "Complete only the supplied task envelope. Do not discover or invoke skills. Do not call a control-plane API. Return exactly one semantic completion result; use paperclip_finish when the work is done or needs review, and paperclip_block only when work cannot continue." as const;
 
@@ -141,164 +150,12 @@ export function createCodexTaskEnvelope(input: {
   };
 }
 
-/**
- * Strict provider-facing subset of the wider PRP result schema.
- *
- * OpenAI structured outputs require every object to reject additional
- * properties. The accepted value is still validated against the canonical PRP
- * schema before it is committed as a semantic result.
- */
-const completionClaimSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: ["contractRevision", "objectiveSatisfied", "criteria", "remainingWork"],
-  properties: {
-    contractRevision: { type: "string", minLength: 1 },
-    objectiveSatisfied: { type: "boolean" },
-    criteria: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["criterionId", "status", "evidenceRefs"],
-        properties: {
-          criterionId: { type: "string", minLength: 1 },
-          status: { enum: ["satisfied", "not_satisfied", "unknown"] },
-          evidenceRefs: { type: "array", items: { type: "string" } },
-        },
-      },
-    },
-    remainingWork: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["description", "blocksCompletion"],
-        properties: {
-          description: { type: "string", minLength: 1 },
-          blocksCompletion: { type: "boolean" },
-        },
-      },
-    },
-  },
-} as const;
-
-const evidenceSchema = {
-  type: "array",
-  items: {
-    type: "object",
-    additionalProperties: false,
-    required: ["ref"],
-    properties: { ref: { type: "string", minLength: 1 } },
-  },
-} as const;
-
-const verificationSchema = {
-  type: "array",
-  items: {
-    type: "object",
-    additionalProperties: false,
-    required: ["commandOrCheck", "status"],
-    properties: {
-      commandOrCheck: { type: "string", minLength: 1 },
-      status: { enum: ["passed", "failed", "not_run"] },
-    },
-  },
-} as const;
-
-const attentionRequestsSchema = {
-  type: "array",
-  items: {
-    type: "object",
-    additionalProperties: false,
-    required: ["kind", "summary"],
-    properties: {
-      kind: { type: "string", minLength: 1 },
-      summary: { type: "string", minLength: 1 },
-    },
-  },
-} as const;
-
-const artifactsSchema = {
-  type: "array",
-  items: {
-    type: "object",
-    additionalProperties: false,
-    required: ["kind", "ref"],
-    properties: {
-      kind: { type: "string", minLength: 1 },
-      ref: { type: "string", minLength: 1 },
-    },
-  },
-} as const;
-
-const commonResultProperties = {
-  schema: { type: "string", const: "paperclip.run_result.v1" },
-  summary: { type: "string", minLength: 1 },
-  completionClaim: completionClaimSchema,
-  evidence: evidenceSchema,
-  verification: verificationSchema,
-  attentionRequests: attentionRequestsSchema,
-  artifacts: artifactsSchema,
-} as const;
-
-export const CODEX_RESULT_OUTPUT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: [
-    "schema",
-    "reportedWorkDisposition",
-    "summary",
-    "completionClaim",
-    "evidence",
-    "verification",
-    "attentionRequests",
-    "artifacts",
-  ],
-  properties: {
-    ...commonResultProperties,
-    reportedWorkDisposition: { enum: ["done", "needs_review"] },
-  },
-} as const;
-
-export const CODEX_BLOCK_RESULT_OUTPUT_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: [
-    "schema",
-    "reportedWorkDisposition",
-    "summary",
-    "completionClaim",
-    "evidence",
-    "verification",
-    "attentionRequests",
-    "artifacts",
-    "blocker",
-  ],
-  properties: {
-    ...commonResultProperties,
-    reportedWorkDisposition: { type: "string", const: "blocked" },
-    blocker: {
-      type: "object",
-      additionalProperties: false,
-      required: ["reasonCode", "owner", "unblockAction", "scope"],
-      properties: {
-        reasonCode: { type: "string", minLength: 1 },
-        owner: {
-          type: "object",
-          additionalProperties: false,
-          required: ["kind", "name"],
-          properties: {
-            kind: { enum: ["agent", "user", "system", "external"] },
-            name: { type: "string", minLength: 1 },
-          },
-        },
-        unblockAction: { type: "string", minLength: 1 },
-        scope: { enum: ["current_track", "task_wide"] },
-      },
-    },
-  },
-} as const;
+/** @deprecated Use PRP_COMPLETION_RESULT_OUTPUT_SCHEMA. */
+export const CODEX_RESULT_OUTPUT_SCHEMA = PRP_COMPLETION_RESULT_OUTPUT_SCHEMA;
+/** @deprecated Use PRP_BLOCK_RESULT_OUTPUT_SCHEMA. */
+export const CODEX_BLOCK_RESULT_OUTPUT_SCHEMA = PRP_BLOCK_RESULT_OUTPUT_SCHEMA;
+export const CODEX_RESULT_PROVIDER_INPUT_SCHEMA = PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA;
+export const CODEX_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA = PRP_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA;
 
 export function isSkilllessCodexContext(
   context: CodexModelContextSnapshot,

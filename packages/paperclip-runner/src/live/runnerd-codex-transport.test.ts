@@ -10,10 +10,44 @@ import {
   createSanitizedClaudeManagedEnvironment,
   createSanitizedAwsAgentCoreEnvironment,
   defaultCapabilityRunnerdBinary,
+  rehydrateRunnerdPlanNotification,
   rehydrateRunnerdUsageNotification,
+  resolveSourceCodexHome,
+  trustedRuntimeReadOnlyRoots,
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
+  withCodexCollaborationRuntimeInstructions,
 } from "./runnerd-codex-transport.js";
+
+it("adds Codex-style turn updates only when collaboration instructions are enabled", () => {
+  const base = "Base Paperclip instructions.";
+  const enabled = withCodexCollaborationRuntimeInstructions(base, true);
+  expect(enabled).toContain(base);
+  expect(enabled).toContain("Before the first tool call in a turn");
+  expect(enabled).toContain("Do not call it merely to create a completion comment");
+  expect(withCodexCollaborationRuntimeInstructions(base, false)).toBe(base);
+});
+
+it("resolves the ordinary ~/.codex credential home when CODEX_HOME is unset", () => {
+  expect(resolveSourceCodexHome({ HOME: "/Users/tester" })).toBe(
+    "/Users/tester/.codex",
+  );
+  expect(
+    resolveSourceCodexHome({
+      HOME: "/Users/tester",
+      CODEX_HOME: "/managed/codex",
+    }),
+  ).toBe("/managed/codex");
+});
+
+it("allows trusted package-manager runtime roots without exposing HOME paths", () => {
+  expect(
+    trustedRuntimeReadOnlyRoots({
+      HOME: "/Users/tester",
+      PATH: "/Users/tester/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    }),
+  ).toEqual(["/opt/homebrew", "/usr/local"]);
+});
 
 it("passes only runtime basics and the Anthropic key to a Claude Managed runner", () => {
   const sanitized = createSanitizedClaudeManagedEnvironment({
@@ -74,6 +108,30 @@ it("rehydrates normalized usage with the provider thread binding", () => {
       total: { inputTokens: 10 },
       runDelta: { inputTokens: 3 },
     },
+  });
+});
+
+it("rehydrates normalized plans into the Codex notification contract", () => {
+  expect(
+    rehydrateRunnerdPlanNotification(
+      {
+        explanation: "Ship in small steps",
+        steps: [
+          { stepId: "step-1", body: "Inspect", status: "completed" },
+          { stepId: "step-2", body: "Implement", status: "in_progress" },
+        ],
+      },
+      "thread-1",
+      "turn-1",
+    ),
+  ).toMatchObject({
+    threadId: "thread-1",
+    turnId: "turn-1",
+    explanation: "Ship in small steps",
+    plan: [
+      { step: "Inspect", status: "completed" },
+      { step: "Implement", status: "in_progress" },
+    ],
   });
 });
 

@@ -147,14 +147,15 @@ function planPayload(params: Record<string, unknown>, item: Record<string, unkno
         return { stepId: `step-${index + 1}`, body: text(step.step).slice(0, 4000), status: planStepStatus(step.status) };
       })
     : textPlan.split("\n").filter(Boolean).slice(0, 256).map((body, index) => ({ stepId: `step-${index + 1}`, body: body.slice(0, 4000), status: "pending" }));
+  const planComplete = complete || (steps.length > 0 && steps.every((step) => step.status === "completed"));
   return {
     schema: "paperclip.plan.updated.v1",
     planId: safeId(text(item.id, text(params.turnId)), "plan"),
     revision: Number.isSafeInteger(params.revision) ? Number(params.revision) : 1,
     explanation: text(params.explanation) || null,
     steps,
-    complete,
-    syncStatus: complete ? "pending" : "streaming",
+    complete: planComplete,
+    syncStatus: planComplete ? "pending" : "streaming",
     documentRevision: null,
   };
 }
@@ -254,14 +255,20 @@ export function canonicalProviderEventsFromOpenCodePart(partValue: unknown): Can
   const type = text(part.type).toLowerCase();
   const itemId = safeId(text(part.id, text(part.callID, text(part.callId))), "opencode-part");
   const state = record(part.state);
+  const nativeStatus = text(state.status).toLowerCase().replaceAll("_", "-");
   const status = canonicalStatus(state.status, "running");
   if (["tool", "tool-call", "tool_call", "bash", "command"].includes(type)) {
-    const tool = text(part.tool, text(part.name, type));
-    const output = text(state.output, text(part.output));
+    const tool = canonicalOpenCodeDisplayToolName(
+      text(part.tool, text(part.name, type)),
+      text(part.callID, text(part.callId)),
+    );
+    // OpenCode places terminal tool failures in `state.error`, not `output`.
+    // Preserve the bounded provider message so a failed row is actionable.
+    const output = text(state.output, text(part.output, text(state.error)));
     const payload = {
       schema: "paperclip.tool.execution.v1",
       executionId: itemId,
-      transport: type === "tool" || type.includes("tool") ? "built_in" : "process",
+      transport: type === "tool" || type.includes("tool") ? "builtin" : "process",
       operation: /read/i.test(tool) ? "read" : /search|grep|find/i.test(tool) ? "search" : /list|glob/i.test(tool) ? "list" : /edit|write|patch/i.test(tool) ? "edit" : "execute",
       name: tool || null,
       target: null,
@@ -273,7 +280,12 @@ export function canonicalProviderEventsFromOpenCodePart(partValue: unknown): Can
       progress: status === "running" ? text(state.title).slice(0, 4000) || null : null,
       ...boundedOutput(output),
     };
-    return [{ eventType: status === "running" ? "tool.execution.progressed" : "tool.execution.completed", payload, itemId }];
+    const eventType = nativeStatus === "pending"
+      ? "tool.execution.started"
+      : status === "running"
+        ? "tool.execution.progressed"
+        : "tool.execution.completed";
+    return [{ eventType, payload, itemId }];
   }
   if (["websearch", "web_search"].includes(type)) {
     return [{ eventType: status === "running" ? "research.progressed" : "research.completed", payload: { schema: "paperclip.research.v1", researchId: itemId, action: "search", status: status === "interrupted" ? "cancelled" : status, query: text(part.query) || null, url: null, pattern: null, sources: [] }, itemId }];
@@ -330,7 +342,7 @@ export function canonicalProviderEventsFromAcpxRuntimeEvent(
     const payload = {
       schema: "paperclip.tool.execution.v1",
       executionId: itemId,
-      transport: "built_in",
+      transport: "builtin",
       operation,
       name: text(event.title) || null,
       target: safeAcpLocation(event.locations?.[0]),
@@ -402,6 +414,26 @@ export function canonicalProviderEventsFromAcpxRuntimeEvent(
     }];
   }
   return [];
+}
+
+export function canonicalOpenCodeDisplayToolName(value: string, callId = ""): string {
+  let name = value.trim();
+  // Some OpenRouter models ask OpenCode for a function using a qualified
+  // `callID` while OpenCode reports the display tool as `unknown`. Recover
+  // only this documented, structured prefix; opaque provider call IDs remain
+  // opaque and continue to display as unknown.
+  if (!name || name === "unknown" || name === "tool") {
+    const qualified = /^functions[./:_-]([^:/.]+)(?::\d+)?$/i.exec(callId.trim());
+    if (qualified?.[1]) name = qualified[1];
+  }
+  // OpenCode exposes MCP tools as `<server>_<tool>`. Paperclip's semantic
+  // tools already carry the paperclip prefix, producing names such as
+  // `paperclip_paperclip_finish` in native events. Keep the transport-native
+  // name in the raw trace, while presenting the stable protocol operation.
+  while (name.startsWith("paperclip_paperclip_")) {
+    name = name.slice("paperclip_".length);
+  }
+  return name;
 }
 
 function safeAcpLocation(value: unknown): string | null {

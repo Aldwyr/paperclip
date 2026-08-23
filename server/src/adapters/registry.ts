@@ -22,6 +22,11 @@ import {
 } from "@paperclipai/adapter-utils";
 import type { AdapterLoginCapability } from "@paperclipai/adapter-utils";
 import {
+  buildRuntimeMountedSkillSnapshot,
+  readPaperclipRuntimeSkillEntries,
+  resolvePaperclipDesiredSkillNames,
+} from "@paperclipai/adapter-utils/server-utils";
+import {
   execute as claudeExecute,
   listClaudeSkills,
   syncClaudeSkills,
@@ -386,12 +391,16 @@ async function testPaperclipRunnerClaudeManagedEnvironment(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
-    const [agentResponse, environmentResponse, versionsResponse] = await Promise.all([
+    const [agentResponse, environmentResponse, versionsResponse, skillsResponse] = await Promise.all([
       fetch(`https://api.anthropic.com/v1/agents/${encodeURIComponent(String(context.config.anthropicAgentId))}?beta=true`, { headers, signal: controller.signal }),
       fetch(`https://api.anthropic.com/v1/environments/${encodeURIComponent(String(context.config.anthropicEnvironmentId))}?beta=true`, { headers, signal: controller.signal }),
       fetch(`https://api.anthropic.com/v1/agents/${encodeURIComponent(String(context.config.anthropicAgentId))}/versions?beta=true`, { headers, signal: controller.signal }),
+      fetch("https://api.anthropic.com/v1/skills?limit=1&source=custom", {
+        headers: { ...headers, "anthropic-beta": "skills-2025-10-02" },
+        signal: controller.signal,
+      }),
     ]);
-    if (!agentResponse.ok || !environmentResponse.ok || !versionsResponse.ok) {
+    if (!agentResponse.ok || !environmentResponse.ok || !versionsResponse.ok || !skillsResponse.ok) {
       return {
         adapterType: "paperclip_runner",
         status: "fail" as const,
@@ -399,7 +408,7 @@ async function testPaperclipRunnerClaudeManagedEnvironment(
         checks: [{
           code: "claude_managed_resource_probe_failed",
           level: "error" as const,
-          message: `Anthropic resource probe failed (Agent HTTP ${agentResponse.status}; Environment HTTP ${environmentResponse.status}; versions HTTP ${versionsResponse.status}).`,
+          message: `Anthropic resource probe failed (Agent HTTP ${agentResponse.status}; Environment HTTP ${environmentResponse.status}; versions HTTP ${versionsResponse.status}; Skills HTTP ${skillsResponse.status}).`,
         }],
       };
     }
@@ -481,6 +490,8 @@ async function testPaperclipRunnerAwsAgentCoreEnvironment(
     ["harnessId", "Harness ID"], ["harnessVersion", "Harness version"],
     ["endpointQualifier", "endpoint qualifier"], ["memoryId", "Memory ID"],
     ["invocationRoleArn", "invocation role ARN"], ["model", "Bedrock model"],
+    ["contextBucket", "private context bucket"], ["contextPrefix", "context object prefix"],
+    ["contextKmsKeyArn", "context KMS key ARN"],
   ] as const;
   const missing = required.filter(([key]) => typeof context.config[key] !== "string" || String(context.config[key]).trim().length === 0);
   if (missing.length > 0 || context.config.agentCoreRetentionAcknowledged !== true) {
@@ -520,6 +531,8 @@ async function testPaperclipRunnerAwsAgentCoreEnvironment(
       execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-harness", "--harness-id", String(context.config.harnessId), "--harness-version", String(context.config.harnessVersion)], { timeout: 15_000, env }),
       execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-harness-endpoint", "--harness-id", String(context.config.harnessId), "--endpoint-name", String(context.config.endpointQualifier)], { timeout: 15_000, env }),
       execFileAsync("aws", ["--region", region, "bedrock-agentcore-control", "get-memory", "--memory-id", String(context.config.memoryId), "--view", "full"], { timeout: 15_000, env }),
+      execFileAsync("aws", ["--region", region, "s3api", "head-bucket", "--bucket", String(context.config.contextBucket)], { timeout: 15_000, env }),
+      execFileAsync("aws", ["--region", region, "kms", "describe-key", "--key-id", String(context.config.contextKmsKeyArn)], { timeout: 15_000, env }),
     ]);
     return {
       adapterType: "paperclip_runner", status: "warn" as const, testedAt,
@@ -778,8 +791,24 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       : await codexTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
   },
-  listSkills: listCodexSkills,
-  syncSkills: syncCodexSkills,
+  async listSkills(context) {
+    const availableEntries = await readPaperclipRuntimeSkillEntries(context.config, import.meta.dirname);
+    return buildRuntimeMountedSkillSnapshot({
+      adapterType: "paperclip_runner",
+      availableEntries,
+      desiredSkills: resolvePaperclipDesiredSkillNames(context.config, availableEntries),
+      configuredDetail: "Will be copied into the immutable Paperclip Runner context on the next run.",
+    });
+  },
+  async syncSkills(context) {
+    const availableEntries = await readPaperclipRuntimeSkillEntries(context.config, import.meta.dirname);
+    return buildRuntimeMountedSkillSnapshot({
+      adapterType: "paperclip_runner",
+      availableEntries,
+      desiredSkills: resolvePaperclipDesiredSkillNames(context.config, availableEntries),
+      configuredDetail: "Will be copied into the immutable Paperclip Runner context on the next run.",
+    });
+  },
   sessionCodec: codexSessionCodec,
   models: [
     ...codexModels,
@@ -916,6 +945,15 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       meta: { provider: "aws_agentcore" },
     }, {
       key: "invocationRoleArn", label: "Invocation role ARN", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "contextBucket", label: "Private context S3 bucket", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "contextPrefix", label: "Context S3 prefix", type: "text", required: true,
+      meta: { provider: "aws_agentcore" },
+    }, {
+      key: "contextKmsKeyArn", label: "Context KMS key ARN", type: "text", required: true,
       meta: { provider: "aws_agentcore" },
     }, {
       key: "maxEstimatedSessionCostUsd", label: "Estimated session ceiling (USD)", type: "number", default: 1,

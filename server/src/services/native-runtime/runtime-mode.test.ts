@@ -139,4 +139,18 @@ describe("resolveNativeRuntimeMode", () => {
       issue: { id: "plan-issue", workMode: "planning" },
     })).toThrow("planning requires the paperclip_runner adapter");
   });
+
+  it("admits ask mode through paperclip_runner while preserving the legacy native boundary", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      issue: { id: "ask-issue", workMode: "ask" },
+      runtimeConfig: {},
+      adapterConfig: { provider: "opencode", model: "opencode/nemotron-3.5-lightning-free" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toMatchObject({ kind: "native", profile: { backend: "opencode_server" } });
+    expect(() => resolveNativeRuntimeMode({
+      ...eligible,
+      issue: { id: "ask-issue", workMode: "ask" },
+    })).toThrow("standard or planning issue");
+  });
 });

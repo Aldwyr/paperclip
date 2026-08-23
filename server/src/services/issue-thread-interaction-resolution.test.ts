@@ -12,6 +12,7 @@ function interaction(overrides: Record<string, unknown> = {}) {
     createdByUserId: null,
     sourceRunId: "run-1",
     addresseeAgentId: null,
+    addresseeUserId: null,
     effectiveResolverPolicy: "anyone",
     ...overrides,
   };
@@ -48,6 +49,25 @@ describe("issue-thread interaction resolver audience", () => {
       interaction: interaction({ addresseeAgentId: "agent-2" }),
     });
     expect(decision).toMatchObject({ allowed: false, code: "interaction_addressee_mismatch" });
+  });
+
+  it("enforces a named human review owner", () => {
+    const owned = interaction({
+      addresseeUserId: "reviewer-1",
+      effectiveResolverPolicy: "human_only",
+    });
+    expect(evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: "reviewer-1" },
+      interaction: owned,
+    })).toMatchObject({ allowed: true, reason: "allow_addressee" });
+    expect(evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: "reviewer-2" },
+      interaction: owned,
+    })).toMatchObject({ allowed: false, code: "interaction_addressee_mismatch" });
+    expect(evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "agent", agentId: "agent-2", runId: "run-2" },
+      interaction: owned,
+    })).toMatchObject({ allowed: false, code: "interaction_human_only" });
   });
 
   it("requires run attribution for agents", () => {

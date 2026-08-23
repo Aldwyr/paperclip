@@ -72,7 +72,18 @@ export function rebindNativeSessionCheckpoint(input: {
     || ("executionMode" in previousExecution ? previousExecution.executionMode : "default")
       !== ("executionMode" in current ? current.executionMode : "default")
     || !sameProvider(previousExecution.provider, current.provider)
+    || previousExecution.schema !== current.schema
+    || ("runtimeContext" in previousExecution && "runtimeContext" in current
+      && previousExecution.runtimeContext.aggregateDigest !== current.runtimeContext.aggregateDigest)
   ) return null;
+
+  const priorSemanticResult = record(rawCheckpoint.semanticResult);
+  const priorContinuation = record(priorSemanticResult.continuation);
+  const providerRecoveryPolicy =
+    priorSemanticResult.reportedWorkDisposition === "yielded"
+    && priorContinuation.kind === "response_wake"
+      ? "allow_replacement_after_governed_wait" as const
+      : "same_session_only" as const;
 
   return {
     ...(structuredClone(rawCheckpoint) as unknown as PersistedNativeSession),
@@ -89,5 +100,6 @@ export function rebindNativeSessionCheckpoint(input: {
     activeTurnId: null,
     terminalTurns: [],
     pendingRuntimeRequests: [],
+    providerRecoveryPolicy,
   };
 }

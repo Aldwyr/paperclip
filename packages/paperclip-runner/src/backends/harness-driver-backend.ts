@@ -55,6 +55,12 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       driverKind: snapshot.driverKind ?? snapshot.backendKind,
       driverSessionId: snapshot.sessionId,
       providerSessionId: snapshot.providerSessionId,
+      ...(snapshot.providerIdentity === undefined
+        ? {}
+        : { providerIdentity: structuredClone(snapshot.providerIdentity) }),
+      ...(snapshot.providerRecoveryPolicy === undefined
+        ? {}
+        : { providerRecoveryPolicy: snapshot.providerRecoveryPolicy }),
       runId: snapshot.identity.runId,
       normalizedSessionId: snapshot.identity.sessionId,
       activeTurnId: snapshot.activeTurnId ?? snapshot.terminalTurns?.at(-1)?.turnId ?? null,
@@ -170,6 +176,17 @@ class HarnessNativeSession implements NativeSession {
     }
   }
 
+  resolveRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    resolution: Parameters<NonNullable<HarnessSession["resolveRuntimeRequest"]>>[0]["resolution"];
+  }) {
+    if (this.#session.resolveRuntimeRequest === undefined) {
+      throw new Error("native_runtime_request_resolution_unavailable");
+    }
+    return this.#session.resolveRuntimeRequest(input);
+  }
+
   async result() {
     const snapshot = await this.#session.snapshot();
     if (snapshot.semanticResult === undefined || snapshot.semanticResult === null) {
@@ -193,6 +210,12 @@ class HarnessNativeSession implements NativeSession {
       sessionId: snapshot.driverSessionId,
       identity: structuredClone(this.#input.identity),
       providerSessionId: snapshot.providerSessionId,
+      ...(snapshot.providerIdentity === undefined
+        ? {}
+        : { providerIdentity: structuredClone(snapshot.providerIdentity) }),
+      ...(snapshot.providerRecoveryPolicy === undefined
+        ? {}
+        : { providerRecoveryPolicy: snapshot.providerRecoveryPolicy }),
       cursor:
         snapshot.lastSourceSequence === undefined
           ? null

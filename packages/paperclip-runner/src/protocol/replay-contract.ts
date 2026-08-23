@@ -6,6 +6,7 @@ import {
   commandSchema,
   eventSchema,
   identitySchema,
+  questionSetSchema,
   requestSchema,
   resultSchema,
   semanticToolSchema,
@@ -17,6 +18,7 @@ import {
   fixtureValidator as standaloneFixtureValidator,
   resultValidator as standaloneResultValidator,
 } from "./generated/standalone-validators.js";
+import { normalizeLegacyPrpStructuredRunResult } from "./result-normalization.js";
 
 export const PRP_PROTOCOL_NAME = "paperclip.runner";
 export const PRP_PROTOCOL_VERSION = 1;
@@ -38,7 +40,8 @@ export type PrpTerminalState = FromSchema<
   typeof terminalSchema,
   { references: TerminalReferences }
 >;
-export type PrpRequest = FromSchema<typeof requestSchema>;
+type RequestReferences = [typeof questionSetSchema];
+export type PrpRequest = FromSchema<typeof requestSchema, { references: RequestReferences }>;
 export type PrpStructuredRunResult = FromSchema<typeof resultSchema>;
 export type PrpEvent = FromSchema<
   typeof eventSchema,
@@ -391,14 +394,15 @@ export type StructuredResultValidationResult =
 export function validatePrpStructuredRunResult(
   value: unknown,
 ): StructuredResultValidationResult {
-  if (!resultValidator(value)) {
+  const normalized = normalizeLegacyPrpStructuredRunResult(value);
+  if (!resultValidator(normalized)) {
     return {
       ok: false,
       result: null,
       issues: (resultValidator.errors ?? []).map(ajvIssue),
     };
   }
-  return { ok: true, result: value, issues: [] };
+  return { ok: true, result: normalized, issues: [] };
 }
 
 export function negotiateProtocolVersion(

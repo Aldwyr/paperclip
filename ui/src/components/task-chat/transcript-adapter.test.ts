@@ -163,6 +163,20 @@ describe("transcriptToTaskChatItems tool_call updates", () => {
     if (items[0].kind !== "tool") return;
     expect(items[0].name).toBe("Read");
   });
+
+  it("marks an unfinished tool interrupted once the transcript is settled", () => {
+    const items = transcriptToTaskChatItems(
+      [toolCall("Terminal", { command: "sleep 120" })],
+      opts,
+    );
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "tool",
+      name: "Terminal",
+      status: "interrupted",
+      detail: "Interrupted before the provider reported completion.",
+    });
+  });
 });
 
 describe("transcriptToTaskChatItems protocol surfaces", () => {
@@ -175,6 +189,18 @@ describe("transcriptToTaskChatItems protocol surfaces", () => {
     ], opts);
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ kind: "protocol", surface: "provider_activity", family: "plan", status: "completed", summary: "Ready" });
+  });
+
+  it("marks a running provider activity interrupted in a settled transcript", () => {
+    const items = transcriptToTaskChatItems([
+      { kind: "provider_activity", ts: TS, family: "tool_execution", eventType: "tool.execution.started", status: "running", title: "Tool execution", summary: "sleep 120", payload: {} },
+    ], opts);
+    expect(items[0]).toMatchObject({
+      kind: "protocol",
+      surface: "provider_activity",
+      status: "interrupted",
+      summary: "sleep 120 · Interrupted before completion.",
+    });
   });
 
   it("coalesces workspace revisions and runtime request lifecycle states", () => {
@@ -546,6 +572,23 @@ describe("settledRunChildren (PAP-361)", () => {
 });
 
 describe("paperclip runner semantic channels", () => {
+  it("concatenates fragmented reasoning deltas into logical lines", () => {
+    const parsed = transcriptToTaskChatItems([
+      { kind: "thinking", ts: TS, text: "Inspect", delta: true, channel: "summary" },
+      { kind: "thinking", ts: TS, text: "ing the ", delta: true, channel: "summary" },
+      { kind: "thinking", ts: TS, text: "runner", delta: true, channel: "summary" },
+      { kind: "thinking", ts: TS, text: "\nThen ", delta: true, channel: "summary" },
+      { kind: "thinking", ts: TS, text: "verify streaming", delta: true, channel: "summary" },
+    ], { runId: "run-fragmented-reasoning", running: true });
+
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]).toMatchObject({
+      kind: "thinking",
+      lines: ["Inspecting the runner", "Then verify streaming"],
+      transcriptIndex: 4,
+    });
+  });
+
   it("turns empty reasoning lifecycle frames into a visible thinking item", () => {
     const parsed = transcriptToTaskChatItems([
       { kind: "thinking", ts: "2026-08-21T12:00:00.000Z", text: "", lifecycle: "started", channel: "summary" },

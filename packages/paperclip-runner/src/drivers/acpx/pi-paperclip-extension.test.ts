@@ -40,7 +40,7 @@ describe("paperclip Pi extension", () => {
         return new Response(JSON.stringify({
           jsonrpc: "2.0",
           id: request.id,
-          result: { content: [{ type: "text", text: JSON.stringify({ decision: "accept" }) }] },
+          result: { content: [{ type: "text", text: JSON.stringify({ decision: "accept_for_session" }) }] },
         }), { status: 200 });
       }
       return request.id === undefined
@@ -61,6 +61,8 @@ describe("paperclip Pi extension", () => {
     expect(JSON.stringify(tools)).not.toContain("__paperclip_runtime_permission");
     expect(await toolCallHandler!({ toolName: "read", toolCallId: "read-1", input: { path: "/etc/passwd" } })).toMatchObject({ block: true });
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-1", input: { command: "printf hello" } })).toBeUndefined();
+    expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-relative", input: { command: "mkdir -p nested/dir && printf hello > nested/dir/file.txt" } })).toBeUndefined();
+    expect(await toolCallHandler!({ toolName: "write", toolCallId: "write-nested", input: { path: "new/nested/file.txt" } })).toBeUndefined();
 
     const permissionCall = requests.find((request) =>
       request.method === "tools/call"
@@ -68,7 +70,12 @@ describe("paperclip Pi extension", () => {
     );
     const permissionArguments = ((permissionCall?.params as Record<string, unknown>)?.arguments ?? {}) as Record<string, unknown>;
     expect(permissionArguments.target).toMatch(/^command-sha256:[a-f0-9]{64}$/);
+    expect(requests.filter((request) =>
+      request.method === "tools/call"
+      && (request.params as Record<string, unknown>)?.name === "__paperclip_runtime_permission"
+    )).toHaveLength(1);
     expect(JSON.stringify(requests)).not.toContain("printf hello");
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-2", input: { command: "cat /etc/passwd" } })).toMatchObject({ block: true });
+    expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-parent", input: { command: "cat safe/../../etc/passwd" } })).toMatchObject({ block: true });
   });
 });

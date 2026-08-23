@@ -14,10 +14,8 @@ import {
   Circle,
   CircleHelp,
   GitBranch,
-  Lightbulb,
   ListChecks,
   Loader2,
-  Maximize2,
   MessageSquareQuote,
   X,
 } from "lucide-react";
@@ -48,6 +46,8 @@ import {
   type SuggestedTaskTreeNode,
 } from "@/lib/issue-thread-interactions";
 import { cn } from "@/lib/utils";
+import { QuestionForm } from "./QuestionForm";
+import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 
 type SharedInteractionProps = Omit<
   ComponentProps<typeof IssueThreadInteractionCard>,
@@ -58,8 +58,6 @@ export interface TaskChatCompactInteractionCardProps extends SharedInteractionPr
   interaction: IssueThreadInteraction;
   planDocument?: IssueDocument | null;
 }
-
-const OTHER_ANSWER_ID = "__paperclip_other__";
 
 const KIND_COPY = {
   suggest_tasks: { fallbackTitle: "Suggested tasks", label: "Tasks", icon: GitBranch },
@@ -186,30 +184,6 @@ function CompactTarget({ interaction }: { interaction: RequestConfirmationIntera
   return <span className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-muted-foreground">{label}</span>;
 }
 
-function planPreviewContent(markdown: string) {
-  const lines = markdown
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const headingIndex = lines.findIndex((line) => /^#\s+/.test(line));
-  const title = headingIndex >= 0
-    ? lines[headingIndex]!.replace(/^#\s+/, "").trim()
-    : "Plan";
-  const preview = lines
-    .filter((_, index) => index !== headingIndex)
-    .map((line) => line
-      .replace(/^#{1,6}\s+/, "")
-      .replace(/^[-*+]\s+/, "")
-      .replace(/^\d+[.)]\s+/, "")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/\*\*([^*]+)\*\*/g, "$1")
-      .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
-      .trim())
-    .filter(Boolean)
-    .slice(0, 3);
-  return { title, preview };
-}
-
 function PlanReviewPreview({
   interaction,
   planDocument,
@@ -225,44 +199,19 @@ function PlanReviewPreview({
     planDocument
     && (targetRevision == null || planDocument.latestRevisionNumber === targetRevision),
   );
-  const content = documentMatchesTarget && planDocument
-    ? planPreviewContent(planDocument.body)
-    : { title: target.label ?? "Plan", preview: [] as string[] };
-  const revisionLabel = targetRevision == null ? null : `v${targetRevision}`;
 
   return (
-    <a
+    <TaskChatPlanPreviewCard
+      source={{
+        kind: "saved",
+        document: documentMatchesTarget ? planDocument : null,
+        revision: targetRevision,
+        fallbackTitle: target.label,
+      }}
       href="#document-plan"
-      data-testid="plan-review-preview"
-      aria-label={`Open ${target.label ?? revisionLabel ?? "plan"}`}
-      className="group block overflow-hidden rounded-md border border-border bg-muted/25 text-left transition-colors hover:border-foreground/25 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2.5 text-sm text-muted-foreground">
-        <Lightbulb aria-hidden className="h-4 w-4 shrink-0" />
-        <span className="font-medium">Plan</span>
-        {revisionLabel ? <span className="text-xs">{revisionLabel}</span> : null}
-        <Maximize2
-          aria-hidden
-          className="ml-auto h-4 w-4 transition-transform group-hover:scale-105 group-hover:text-foreground"
-        />
-      </div>
-      <div className="relative max-h-36 overflow-hidden px-4 py-3">
-        <h3 className="text-base font-semibold leading-6 text-foreground">{content.title}</h3>
-        {content.preview.length > 0 ? (
-          <ul className="mt-2 space-y-1.5 text-sm leading-5 text-muted-foreground">
-            {content.preview.map((line, index) => (
-              <li key={`${index}-${line}`} className="flex gap-2">
-                <span aria-hidden className="shrink-0 text-muted-foreground/60">•</span>
-                <span className="line-clamp-1">{line}</span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="mt-1 text-sm text-muted-foreground">Open the synchronized plan to review it.</p>
-        )}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-linear-to-b from-transparent to-card/95" />
-      </div>
-    </a>
+      testId="plan-review-preview"
+      ariaLabel={`Open ${target.label ?? (targetRevision == null ? "plan" : `plan revision ${targetRevision}`)}`}
+    />
   );
 }
 
@@ -311,51 +260,6 @@ function ResolvedInteraction({ interaction }: { interaction: IssueThreadInteract
   );
 }
 
-function QuestionOption({
-  id,
-  label,
-  description,
-  selected,
-  mode,
-  onClick,
-}: {
-  id: string;
-  label: string;
-  description?: string | null;
-  selected: boolean;
-  mode: "single" | "multi";
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      id={id}
-      role={mode === "single" ? "radio" : "checkbox"}
-      aria-checked={selected}
-      className={cn(
-        "flex w-full items-start gap-2 rounded-sm border px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        selected ? "border-primary/60 bg-primary/8" : "border-border/70 bg-background/50 hover:bg-muted/50",
-      )}
-      onClick={onClick}
-    >
-      <span
-        aria-hidden
-        className={cn(
-          "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border",
-          mode === "single" ? "rounded-full" : "rounded-sm",
-          selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/50",
-        )}
-      >
-        {selected ? (mode === "single" ? <span className="h-1.5 w-1.5 rounded-full bg-current" /> : <Check className="h-3 w-3" />) : null}
-      </span>
-      <span className="min-w-0">
-        <span className="block text-sm font-medium leading-5 text-foreground">{label}</span>
-        {description ? <span className="block text-xs leading-4 text-muted-foreground">{description}</span> : null}
-      </span>
-    </button>
-  );
-}
-
 function AskUserQuestionsCard({
   interaction,
   onSubmitInteractionAnswers,
@@ -367,171 +271,61 @@ function AskUserQuestionsCard({
   onCancelInteraction?: SharedInteractionProps["onCancelInteraction"];
   errorMessage: (error: unknown) => string;
 }) {
-  const questions = interaction.payload.questions;
-  const [page, setPage] = useState(0);
-  const [draftAnswers, setDraftAnswers] = useState<Record<string, string[]>>(() =>
-    Object.fromEntries((interaction.result?.answers ?? []).map((answer) => [answer.questionId, [...answer.optionIds]])),
-  );
-  const [draftOtherAnswers, setDraftOtherAnswers] = useState<Record<string, string>>(() =>
-    Object.fromEntries((interaction.result?.answers ?? []).filter((answer) => answer.otherText).map((answer) => [answer.questionId, answer.otherText ?? ""])),
-  );
-  const [otherActiveQuestions, setOtherActiveQuestions] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries((interaction.result?.answers ?? []).filter((answer) => answer.otherText).map((answer) => [answer.questionId, true])),
-  );
-  const [working, setWorking] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-
-  useEffect(() => setPage((current) => Math.min(current, Math.max(questions.length - 1, 0))), [questions.length]);
-
-  const question = questions[page];
-  if (!question) return <p className="text-sm text-muted-foreground">No answerable questions were provided.</p>;
-  const selected = draftAnswers[question.id] ?? [];
-  const otherActive = otherActiveQuestions[question.id] === true;
-  const otherText = draftOtherAnswers[question.id] ?? "";
-  const pageComplete = !question.required || selected.length > 0 || (otherActive && otherText.trim().length > 0);
-  const allRequiredComplete = questions.every((candidate) => {
-    if (!candidate.required) return true;
-    return (draftAnswers[candidate.id]?.length ?? 0) > 0
-      || (otherActiveQuestions[candidate.id] === true && (draftOtherAnswers[candidate.id]?.trim().length ?? 0) > 0);
-  });
-  const hasFreeTextOption = question.options.some((option) => option.freeText === true);
-
-  function toggleOption(optionId: string, isFreeText = false) {
-    if (optionId === OTHER_ANSWER_ID || isFreeText) {
-      setOtherActiveQuestions((current) => ({ ...current, [question.id]: !current[question.id] }));
-      if (question.selectionMode === "single") setDraftAnswers((current) => ({ ...current, [question.id]: [] }));
-      return;
-    }
-    setDraftAnswers((current) => {
-      const existing = current[question.id] ?? [];
-      const next = question.selectionMode === "single"
-        ? [optionId]
-        : existing.includes(optionId) ? existing.filter((id) => id !== optionId) : [...existing, optionId];
-      return { ...current, [question.id]: next };
-    });
-    if (question.selectionMode === "single") setOtherActiveQuestions((current) => ({ ...current, [question.id]: false }));
-  }
-
-  async function submit() {
-    if (!onSubmitInteractionAnswers || !allRequiredComplete) return;
-    const answers: AskUserQuestionsAnswer[] = questions.map((candidate) => {
-      const candidateOther = otherActiveQuestions[candidate.id] ? draftOtherAnswers[candidate.id]?.trim() : "";
+  const questionSet = {
+    schema: "paperclip.question_set.v1" as const,
+    ...(interaction.title ? { title: interaction.title } : {}),
+    ...(interaction.payload.submitLabel ? { submitLabel: interaction.payload.submitLabel } : {}),
+    questions: interaction.payload.questions.map((question) => {
+      const freeText = question.options.find((option) => option.freeText === true);
       return {
-        questionId: candidate.id,
-        optionIds: draftAnswers[candidate.id] ?? [],
-        ...(candidateOther ? { otherText: candidateOther } : {}),
+        id: question.id,
+        prompt: question.prompt,
+        ...(question.helpText ? { helpText: question.helpText } : {}),
+        required: question.required === true,
+        answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+        options: question.options.filter((option) => option.freeText !== true).map((option) => ({
+          id: option.id,
+          label: option.label,
+          ...(option.description ? { description: option.description } : {}),
+        })),
+        ...(freeText ? { customAnswer: { enabled: true as const, label: freeText.label, ...(freeText.description ? { placeholder: freeText.description } : {}) } } : {}),
       };
-    });
-    setWorking(true);
-    setActionError(null);
-    try {
-      await onSubmitInteractionAnswers(interaction, answers);
-    } catch (error) {
-      setActionError(errorMessage(error));
-    } finally {
-      setWorking(false);
-    }
-  }
-
-  async function cancel() {
-    if (!onCancelInteraction) return;
-    setCancelling(true);
-    setActionError(null);
-    try {
-      await onCancelInteraction(interaction);
-    } catch (error) {
-      setActionError(errorMessage(error));
-    } finally {
-      setCancelling(false);
-    }
-  }
-
+    }),
+  };
+  const initialResponse = interaction.result?.answers ? {
+    schema: "paperclip.question_response.v1" as const,
+    answers: Object.fromEntries(interaction.result.answers.map((answer) => [answer.questionId, {
+      selectedOptionIds: answer.optionIds,
+      ...(answer.otherText ? { customText: answer.otherText } : {}),
+    }])),
+  } : null;
   return (
-    <div>
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
-        <span>Question {page + 1} of {questions.length}</span>
-        <span>{question.selectionMode === "multi" ? "Choose all that apply" : "Choose one"}{question.required ? " · Required" : " · Optional"}</span>
-      </div>
-      <p id={`${interaction.id}-${question.id}-prompt`} className="text-sm font-medium leading-5 text-foreground">{question.prompt}</p>
-      {question.helpText ? <p className="mt-1 text-xs leading-4 text-muted-foreground">{question.helpText}</p> : null}
-      <div
-        className="mt-3 grid gap-1.5"
-        role={question.selectionMode === "single" ? "radiogroup" : "group"}
-        aria-labelledby={`${interaction.id}-${question.id}-prompt`}
-      >
-        {question.options.map((option) => {
-          const isFreeText = option.freeText === true;
-          const optionSelected = isFreeText ? otherActive : selected.includes(option.id);
-          return (
-            <div key={option.id} className="space-y-1.5">
-              <QuestionOption
-                id={`${interaction.id}-${question.id}-${option.id}`}
-                label={option.label}
-                description={option.description}
-                selected={optionSelected}
-                mode={question.selectionMode}
-                onClick={() => toggleOption(option.id, isFreeText)}
-              />
-              {isFreeText && optionSelected ? (
-                <Textarea
-                  aria-label={`Describe your answer for ${question.prompt}`}
-                  value={otherText}
-                  onChange={(event) => setDraftOtherAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
-                  placeholder="Type your answer"
-                  className="min-h-16 resize-y bg-background text-sm"
-                  autoFocus
-                />
-              ) : null}
-            </div>
-          );
-        })}
-        {!hasFreeTextOption ? (
-          <div className="space-y-1.5">
-            <QuestionOption
-              id={`${interaction.id}-${question.id}-other`}
-              label="Other"
-              selected={otherActive}
-              mode={question.selectionMode}
-              onClick={() => toggleOption(OTHER_ANSWER_ID)}
-            />
-            {otherActive ? (
-              <Textarea
-                aria-label={`Other answer for ${question.prompt}`}
-                value={otherText}
-                onChange={(event) => setDraftOtherAnswers((current) => ({ ...current, [question.id]: event.target.value }))}
-                placeholder="Type your answer"
-                className="min-h-16 resize-y bg-background text-sm"
-                autoFocus
-              />
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-      <InteractionActionError message={actionError} />
-      <ActionRow hint={`${page + 1} / ${questions.length}`}>
-        {onCancelInteraction ? (
-          <Button type="button" size="sm" variant="ghost" disabled={working || cancelling} onClick={() => void cancel()}>
-            {cancelling ? <Loader2 aria-hidden className="h-4 w-4 animate-spin" /> : null} Cancel
-          </Button>
-        ) : null}
-        {page > 0 ? (
-          <Button type="button" size="sm" variant="outline" disabled={working || cancelling} onClick={() => setPage((current) => current - 1)}>
-            <ChevronLeft aria-hidden className="h-4 w-4" /> Back
-          </Button>
-        ) : null}
-        {page < questions.length - 1 ? (
-          <Button type="button" size="sm" disabled={!pageComplete || working || cancelling} onClick={() => setPage((current) => current + 1)}>
-            Next <ChevronRight aria-hidden className="h-4 w-4" />
-          </Button>
-        ) : (
-          <Button type="button" size="sm" disabled={!allRequiredComplete || working || cancelling || !onSubmitInteractionAnswers} onClick={() => void submit()}>
-            {working ? <Loader2 aria-hidden className="h-4 w-4 animate-spin" /> : null}
-            {interaction.payload.submitLabel ?? "Submit answers"}
-          </Button>
-        )}
-      </ActionRow>
-    </div>
+    <QuestionForm
+      id={interaction.id}
+      questionSet={questionSet}
+      initialResponse={initialResponse}
+      implicitCustomAnswer
+      disabled={!onSubmitInteractionAnswers}
+      onSubmit={async (response) => {
+        const answers: AskUserQuestionsAnswer[] = questionSet.questions.map((question) => ({
+          questionId: question.id,
+          optionIds: response.answers[question.id]?.selectedOptionIds ?? [],
+          ...(response.answers[question.id]?.customText?.trim() ? { otherText: response.answers[question.id]?.customText?.trim() } : {}),
+        }));
+        try {
+          await onSubmitInteractionAnswers?.(interaction, answers);
+        } catch (error) {
+          throw new Error(errorMessage(error));
+        }
+      }}
+      onCancel={onCancelInteraction ? async () => {
+        try {
+          await onCancelInteraction(interaction);
+        } catch (error) {
+          throw new Error(errorMessage(error));
+        }
+      } : undefined}
+    />
   );
 }
 
@@ -995,7 +789,13 @@ export function TaskChatCompactInteractionCard({
     : interaction.createdByUserId
       ? interaction.createdByUserId === currentUserId ? "You" : userLabelMap?.get(interaction.createdByUserId)
       : null;
-  const addresseeLabel = interaction.addresseeAgentId ? agentMap?.get(interaction.addresseeAgentId)?.name : null;
+  const addresseeLabel = interaction.addresseeAgentId
+    ? agentMap?.get(interaction.addresseeAgentId)?.name
+    : interaction.addresseeUserId
+      ? interaction.addresseeUserId === currentUserId
+        ? "You"
+        : userLabelMap?.get(interaction.addresseeUserId) ?? interaction.addresseeUserId
+      : null;
   const audience = describeInteractionAudience({ interaction, creatorLabel, addresseeLabel });
   const errorMessage = (error: unknown) => interactionResolutionErrorMessage(error, audience);
   const audienceLabel = interaction.status === "pending" && !audience.isOpen ? audience.shortSummary : null;

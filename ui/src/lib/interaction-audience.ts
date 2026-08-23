@@ -152,7 +152,7 @@ export function describeInteractionAudience({
       requestedResolverPolicy: interaction.requestedResolverPolicy,
       effectiveResolverPolicySource: interaction.effectiveResolverPolicySource,
       resolverPolicyProvenance: interaction.resolverPolicyProvenance,
-      hasAddressee: Boolean(interaction.addresseeAgentId),
+      hasAddressee: Boolean(interaction.addresseeAgentId || interaction.addresseeUserId),
     },
     creatorLabel,
     addresseeLabel,
@@ -176,11 +176,13 @@ export function describeResolverAudience({
   const policy = facts.effectiveResolverPolicy;
   const requestedPolicy = facts.requestedResolverPolicy;
   const hasAddressee = facts.hasAddressee;
-  const addressee = addresseeLabel?.trim() || "the addressed agent";
+  const addressee = addresseeLabel?.trim() || "the addressed reviewer";
   const creator = creatorLabel?.trim() || "the agent that created it";
 
   const summary = policy === "human_only"
-    ? "Only a person on the board can respond — agents cannot resolve this card."
+    ? hasAddressee
+      ? `Assigned to ${addressee}. Only a person on the board can respond — agents cannot resolve this card.`
+      : "Only a person on the board can respond — agents cannot resolve this card."
     : hasAddressee
       ? `Only ${addressee} or a person on the board can respond.`
       : policy === "not_creator"
@@ -190,7 +192,9 @@ export function describeResolverAudience({
   // Same fact, fewer words: a collapsed row has to answer "is this mine to
   // decide?" in one glance, next to the buttons that act on the answer.
   const shortSummary = policy === "human_only"
-    ? "Only the board can respond"
+    ? hasAddressee
+      ? `Assigned to ${addressee} · board only`
+      : "Only the board can respond"
     : hasAddressee
       ? `Only ${addressee} or the board can respond`
       : policy === "not_creator"

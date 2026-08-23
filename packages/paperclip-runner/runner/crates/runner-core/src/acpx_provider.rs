@@ -86,6 +86,7 @@ impl AcpxProvider {
                 "workingDirectory": config.cwd,
                 "agent": config.agent,
                 "model": config.model,
+                "systemInstructions": config.instructions,
                 "tools": provider.tools,
                 "expectedIdentity": expected_identity,
             }),
@@ -262,15 +263,24 @@ impl AcpxProvider {
                 }))
             }
             GeneratedAcpxSidecarEventType::RuntimePermissionRequested => {
+                let request_id = required_text(&payload, "requestId", "permission request")?;
+                let request_kind = permission_kind(payload.get("kind").and_then(Value::as_str));
                 Ok(Some(ProviderEvent::RuntimeRequest {
-                    request_id: required_text(&payload, "requestId", "permission request")?,
-                    request_kind: permission_kind(payload.get("kind").and_then(Value::as_str)),
-                    title: payload
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or("ACP permission request")
-                        .to_owned(),
-                    details: payload,
+                    request: json!({
+                        "schema": "paperclip.runtime_request.v1",
+                        "requestKind": "runtime",
+                        "requestId": request_id,
+                        "type": "permission",
+                        "status": "pending",
+                        "prompt": payload.get("title").and_then(Value::as_str).unwrap_or("ACP permission request"),
+                        "origin": {
+                            "adapter": "acpx-runtime-sidecar",
+                            "provider": "acpx",
+                            "method": "runtime.permission_requested",
+                            "kind": request_kind,
+                        },
+                        "details": payload,
+                    }),
                 }))
             }
             GeneratedAcpxSidecarEventType::RuntimeTurnTerminal => {
@@ -734,6 +744,7 @@ mod tests {
             cwd: "/tmp/workspace".to_owned(),
             instructions: "safe".to_owned(),
             permission_policy: "interactive".to_owned(),
+            runtime_context: None,
         };
         assert!(validate_config(&config).is_err());
     }

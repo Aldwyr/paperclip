@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { buildNativeModelEnvelope, parseNativeExecutionInput, type NativeExecutionInputV1 } from "./native-execution.js";
+import {
+  NATIVE_RUNTIME_ASSET_SCHEMA,
+  PAPERCLIP_EXECUTION_PROMPT,
+  PAPERCLIP_EXECUTION_PROMPT_REVISION,
+  canonicalNativeRuntimeContextDigest,
+  composeNativeSystemInstructions,
+  nativeRuntimePromptDigest,
+} from "./runtime-context.js";
 
 const input: NativeExecutionInputV1 = {
   schema: "paperclip.native-execution-input.v1",
@@ -47,6 +55,66 @@ const input: NativeExecutionInputV1 = {
 };
 
 describe("NativeExecutionInputV1", () => {
+  it("parses v3 immutable runtime context without changing the model task envelope", () => {
+    const digest = "0".repeat(64);
+    const context = {
+      prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+      instructions: {
+        entryPath: "AGENTS.md",
+        bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 2, totalBytes: 42 },
+      },
+      skills: [{
+        key: "company/research",
+        runtimeName: "research",
+        versionId: "version-1",
+        bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/skills/research", fileCount: 2, totalBytes: 42 },
+      }],
+      mcp: { assignmentSetId: "sha256:test", digest, bindingId: "native-mcp:run-1" },
+    } as const;
+    const parsed = parseNativeExecutionInput({
+      ...input,
+      schema: "paperclip.native-execution-input.v3",
+      executionMode: "default",
+      planningContext: null,
+      runtimeContext: { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) },
+    });
+    expect(parsed.schema).toBe("paperclip.native-execution-input.v3");
+    const envelope = buildNativeModelEnvelope(parsed);
+    expect(envelope.task).toEqual(buildNativeModelEnvelope(input).task);
+    expect(envelope.completionContract).toEqual(buildNativeModelEnvelope(input).completionContract);
+    expect(JSON.stringify(envelope)).not.toContain("runtimeContext");
+    expect(JSON.stringify(envelope)).not.toContain(PAPERCLIP_EXECUTION_PROMPT);
+    expect(composeNativeSystemInstructions(parsed.runtimeContext, "Follow sibling.md")).toBe(
+      `${PAPERCLIP_EXECUTION_PROMPT}\n\nFollow sibling.md\n\nRead-only instruction sibling root: /runtime/instructions`,
+    );
+    expect(canonicalNativeRuntimeContextDigest({
+      ...context,
+      mcp: { ...context.mcp, bindingId: "native-mcp:run-2" },
+    })).toBe(parsed.runtimeContext.aggregateDigest);
+  });
+
+  it("rejects runtime-context traversal and aggregate digest drift", () => {
+    const digest = "0".repeat(64);
+    const context = {
+      prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+      instructions: {
+        entryPath: "../AGENTS.md",
+        bundle: { schema: NATIVE_RUNTIME_ASSET_SCHEMA, digest, manifestDigest: digest, rootPath: "/runtime/instructions", fileCount: 1, totalBytes: 1 },
+      },
+      skills: [],
+      mcp: { assignmentSetId: "none", digest, bindingId: null },
+      aggregateDigest: digest,
+    } as const;
+    expect(() => parseNativeExecutionInput({ ...input, schema: "paperclip.native-execution-input.v3", executionMode: "default", planningContext: null, runtimeContext: context })).toThrow("bundle root");
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      schema: "paperclip.native-execution-input.v3",
+      executionMode: "default",
+      planningContext: null,
+      runtimeContext: { ...context, instructions: { ...context.instructions, entryPath: "AGENTS.md" } },
+    })).toThrow("aggregateDigest");
+  });
+
   it("builds a model envelope without authority or credential bindings", () => {
     const parsed = parseNativeExecutionInput(input);
     const model = buildNativeModelEnvelope(parsed);
@@ -143,6 +211,9 @@ describe("NativeExecutionInputV1", () => {
           memoryArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/memory-1",
           memoryId: "memory-1",
           invocationRoleArn: "arn:aws:iam::123456789012:role/paperclip-agentcore-runner",
+          contextBucket: "paperclip-agentcore-context",
+          contextPrefix: "paperclip/runtime",
+          contextKmsKeyArn: "arn:aws:kms:us-east-1:123456789012:key/test",
           qualificationRevision: "aws-agentcore-harness-v1",
           eventExpiryDays: 90,
         },
@@ -271,5 +342,45 @@ describe("NativeExecutionInputV2 planning", () => {
       executionMode: "default",
       planningContext: null,
     })).toMatchObject({ task: { workMode: "planning" }, executionMode: "default" });
+  });
+});
+
+describe("NativeExecutionInputV2 ask mode", () => {
+  it("round-trips ask mode as a default execution without planning context", () => {
+    const parsed = parseNativeExecutionInput({
+      ...input,
+      schema: "paperclip.native-execution-input.v2",
+      executionMode: "default",
+      task: { ...input.task, workMode: "ask" },
+      planningContext: null,
+    });
+    expect(parsed).toMatchObject({
+      schema: "paperclip.native-execution-input.v2",
+      executionMode: "default",
+      task: { workMode: "ask" },
+    });
+    expect(buildNativeModelEnvelope(parsed)).toMatchObject({
+      schema: "paperclip.native-model-envelope.v2",
+      task: { workMode: "ask" },
+      executionMode: "default",
+      planningContext: null,
+    });
+  });
+
+  it("rejects plan execution for ask mode", () => {
+    expect(() => parseNativeExecutionInput({
+      ...input,
+      schema: "paperclip.native-execution-input.v2",
+      executionMode: "plan",
+      task: { ...input.task, workMode: "ask" },
+      planningContext: {
+        documentId: null,
+        baseRevisionId: null,
+        baseRevisionNumber: 0,
+        markdown: "",
+        sha256: "digest",
+        reviewContext: {},
+      },
+    })).toThrow("plan execution mode requires planning work mode");
   });
 });

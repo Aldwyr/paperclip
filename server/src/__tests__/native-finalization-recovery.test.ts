@@ -11,6 +11,7 @@ import {
   nativeRunFinalizations,
   nativeRunResults,
   statusDecisions,
+  workAssessments,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -30,6 +31,9 @@ describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
   const issueId = "72000000-0000-4000-8000-000000000003";
   const contractId = "72000000-0000-4000-8000-000000000004";
   const runId = "72000000-0000-4000-8000-000000000005";
+  const staleIssueId = "72000000-0000-4000-8000-000000000013";
+  const staleContractId = "72000000-0000-4000-8000-000000000014";
+  const staleRunId = "72000000-0000-4000-8000-000000000015";
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-recovery-");
@@ -115,6 +119,81 @@ describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
       phase: "workspace_finalize",
       status: "succeeded",
     });
+
+    await db.insert(issues).values({
+      id: staleIssueId,
+      companyId,
+      title: "Retire a stale invalid finalizer",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      workMode: "standard",
+    });
+    await db.insert(completionContracts).values({
+      id: staleContractId,
+      companyId,
+      issueId: staleIssueId,
+      revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1",
+      policyVersion: "phase6-v1",
+      risk: "standard",
+      completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: {
+        revision: "phase6-v1",
+        objective: "Retire a stale invalid finalizer",
+        criteria: [{ id: "objective", requirement: "Keep the newer decision" }],
+      },
+      canonicalSha256: "stale-finalizer-contract",
+      createdByActorType: "system",
+      createdByActorId: "test",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: staleRunId,
+      companyId,
+      agentId,
+      status: "running",
+      runtimeMode: "native",
+      runtimeModeReason: "persisted_before_kill_switch",
+      completionContractId: staleContractId,
+      completionContractSha256: "stale-finalizer-contract",
+      contextSnapshot: { issueId: staleIssueId },
+    });
+    const stalePort = new PaperclipControlPlanePort(db, {
+      companyId,
+      issueId: staleIssueId,
+      runId: staleRunId,
+      agentId,
+      completionContractId: staleContractId,
+      completionContractSha256: "stale-finalizer-contract",
+      sourceInstanceId: "stale-runner",
+      controlPlaneSourceInstanceId: "stale-control",
+    });
+    await stalePort.openRun({
+      ...CONTROL_PLANE_CONFORMANCE_OPEN,
+      identity: { companyId, issueId: staleIssueId, runId: staleRunId, agentId, normalizedSessionId: "stale-session" },
+      sourceInstanceId: "stale-runner",
+    });
+    await stalePort.completeRun({
+      result: CONTROL_PLANE_CONFORMANCE_RESULT,
+      terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      callerResultId: "stale-result",
+    });
+    const staleStored = await db.select().from(nativeRunResults)
+      .where(eq(nativeRunResults.runId, staleRunId))
+      .limit(1).then((rows) => rows[0]!);
+    await db.update(nativeRunResults).set({
+      resultJson: {
+        ...(staleStored.resultJson as Record<string, unknown>),
+        terminal: { ...CONTROL_PLANE_CONFORMANCE_TERMINAL, runTerminalState: "unknown" },
+      },
+    }).where(eq(nativeRunResults.id, staleStored.id));
+    await db.insert(workspaceOperations).values({
+      companyId,
+      heartbeatRunId: staleRunId,
+      issueId: staleIssueId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+    });
   }, 30_000);
 
   afterAll(async () => {
@@ -147,8 +226,90 @@ describe("P6-16/P6-25/P6-28 native finalization recovery", () => {
       }),
     ]);
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toEqual([
-      expect.objectContaining({ runtimeMode: "native", status: "failed", nativePhase: "terminal_failure" }),
+      expect.objectContaining({
+        runtimeMode: "native",
+        status: "succeeded",
+        nativePhase: "terminal_failure",
+        resultJson: expect.objectContaining({ prpRunTerminalState: "succeeded" }),
+      }),
     ]);
     await expect(reconcileNativeFinalizations(db, [runId])).resolves.toEqual([]);
+  });
+
+  it("retires an older failed finalizer when a newer run already committed the issue", async () => {
+    await expect(reconcileNativeFinalizations(db, [staleRunId])).resolves.toEqual([
+      expect.objectContaining({ phase: "retryable_failure", failureCode: "native_finalization_invalid" }),
+    ]);
+
+    const newerRunId = "72000000-0000-4000-8000-000000000016";
+    await db.insert(heartbeatRuns).values({
+      id: newerRunId,
+      companyId,
+      agentId,
+      status: "succeeded",
+      runtimeMode: "native",
+      completionContractId: staleContractId,
+      completionContractSha256: "stale-finalizer-contract",
+      contextSnapshot: { issueId: staleIssueId },
+    });
+    const [newerResult] = await db.insert(nativeRunResults).values({
+      companyId,
+      issueId: staleIssueId,
+      runId: newerRunId,
+      completionContractId: staleContractId,
+      callerResultId: "newer-result",
+      serverFingerprint: "newer-result-fingerprint",
+      schemaStatus: "accepted",
+      resultJson: {},
+      canonicalSha256: "newer-result-sha",
+    }).returning();
+    const [newerAssessment] = await db.insert(workAssessments).values({
+      companyId,
+      issueId: staleIssueId,
+      runId: newerRunId,
+      contractId: staleContractId,
+      resultId: newerResult!.id,
+      triggerKind: "native_result",
+      triggerRef: newerResult!.id,
+      triggerCapability: "server_native_finalizer",
+      triggerActorCompanyId: companyId,
+      priorIssueStatus: "in_progress",
+      priorStatusVersion: 0,
+      policyVersion: "phase6-v3",
+      assessmentJson: {},
+      inputDigest: "newer-assessment-digest",
+    }).returning();
+    const [newerDecision] = await db.insert(statusDecisions).values({
+      companyId,
+      issueId: staleIssueId,
+      assessmentId: newerAssessment!.id,
+      decisionVersion: 1,
+      policyVersion: "phase6-v3",
+      fromStatus: "in_progress",
+      toStatus: "done",
+      reasonCode: "completion_claim_policy_accepted",
+      decisionJson: {},
+      decisionDigest: "newer-decision-digest",
+      applicationState: "applied",
+      appliedAt: new Date(),
+    }).returning();
+    await db.update(issues).set({
+      status: "done",
+      statusVersion: 1,
+      lastStatusDecisionId: newerDecision!.id,
+    }).where(eq(issues.id, staleIssueId));
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(0) })
+      .where(eq(nativeRunFinalizations.runId, staleRunId));
+
+    await expect(reconcileNativeFinalizations(db, [staleRunId])).resolves.toEqual([
+      expect.objectContaining({ phase: "terminal_failure", failureCode: "native_finalization_superseded" }),
+    ]);
+    await expect(db.select().from(issues).where(eq(issues.id, staleIssueId))).resolves.toEqual([
+      expect.objectContaining({ status: "done", lastStatusDecisionId: newerDecision!.id }),
+    ]);
+    await expect(db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, staleIssueId))).resolves.toEqual([
+        expect.objectContaining({ status: "resolved", outcome: "false_positive" }),
+      ]);
   });
 });

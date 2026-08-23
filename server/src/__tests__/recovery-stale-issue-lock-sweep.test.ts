@@ -11,6 +11,7 @@ import {
   issueComments,
   issueRelations,
   issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(nativeRunFinalizations);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -276,6 +278,51 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRunEvents.runId, runningRunId))
       .then((rows) => rows[0]);
     expect(event?.message).toContain("process and sandbox gone");
+  });
+
+  it("preserves a process-less native run while same-run resumption owns its retry", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        runtimeMode: "native",
+        nativePhase: "retryable_failure",
+        processPid: 2_000_000_000,
+      })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Native same-run retry remains live",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId: runningRunId,
+      companyId,
+      issueId,
+      phase: "retryable_failure",
+      attempt: 1,
+      nextAttemptAt: new Date(Date.now() + 30_000),
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    await expect(db.select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId)))
+      .resolves.toEqual([{ status: "running" }]);
+    await expect(db.select({
+      checkoutRunId: issues.checkoutRunId,
+      executionRunId: issues.executionRunId,
+    }).from(issues).where(eq(issues.id, issueId)))
+      .resolves.toEqual([{ checkoutRunId: runningRunId, executionRunId: runningRunId }]);
   });
 
   it("terminalizes a running run whose issue is terminal, even while the process stays alive (reuse-lease path)", async () => {

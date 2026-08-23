@@ -10,6 +10,9 @@ import type {
   HarnessRuntimeRequest,
   HarnessRuntimeRequestKind,
   HarnessRuntimeRequestResolution,
+  PaperclipQuestion,
+  PaperclipQuestionResponse,
+  PaperclipQuestionSet,
   HarnessThreadGoal,
   HarnessThreadLineageEntry,
   OpenHarnessSessionInput,
@@ -23,14 +26,17 @@ import {
   HarnessReconciliationError,
   HarnessStaleTurnError,
   harnessRuntimeRequestOutcome,
+  PAPERCLIP_QUESTION_SET_SCHEMA,
+  PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   parseHarnessRuntimeRequestResolution,
 } from "../../contracts/harness-driver.js";
 import {
-  CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
+  CODEX_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
   CODEX_BLOCK_TOOL_NAME,
   CODEX_CODEX_PROTOCOL_VERSION,
   CODEX_COMPLETION_TOOL_NAME,
   CODEX_RESULT_OUTPUT_SCHEMA,
+  CODEX_RESULT_PROVIDER_INPUT_SCHEMA,
   CODEX_SEMANTIC_TOOL_NAMES,
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
   type CodexModelContextSnapshot,
@@ -246,7 +252,7 @@ function finishToolSpec(): Record<string, unknown> {
   return {
     name: CODEX_COMPLETION_TOOL_NAME,
     description: "Return the one semantic completion result for this task.",
-    inputSchema: CODEX_RESULT_OUTPUT_SCHEMA,
+    inputSchema: CODEX_RESULT_PROVIDER_INPUT_SCHEMA,
   };
 }
 
@@ -255,7 +261,7 @@ function blockToolSpec(): Record<string, unknown> {
     name: CODEX_BLOCK_TOOL_NAME,
     description:
       "Return the one semantic result when the task cannot continue.",
-    inputSchema: CODEX_BLOCK_RESULT_OUTPUT_SCHEMA,
+    inputSchema: CODEX_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
   };
 }
 
@@ -1013,8 +1019,13 @@ class CodexHarnessSession implements HarnessSession {
       }
       this.#terminalTurns.set(terminal.turnId, terminal.fingerprint);
     }
+    if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
+      this.#activeTurnId = null;
+    }
     this.#terminal =
-      this.#conversationMode === "task" && this.#terminalTurns.size > 0;
+      this.#conversationMode === "task"
+      && this.#terminalTurns.size > 0
+      && this.#result !== null;
     this.#transport.setServerRequestHandler((request) =>
       this.#handleServerRequest(request),
     );
@@ -1330,6 +1341,7 @@ class CodexHarnessSession implements HarnessSession {
     const resolution = parseHarnessRuntimeRequestResolution(
       pending.request.requestKind,
       input.resolution,
+      pending.request.input,
     );
     const response = runtimeRequestResponse(pending.request, resolution);
     this.#pendingRuntimeRequests.delete(input.requestId);
@@ -1749,6 +1761,17 @@ class CodexHarnessSession implements HarnessSession {
       pending.settle(safeRequestResponse(pending.request.method, "cancel"));
       return;
     }
+    if (
+      notification.method === "item/completed"
+      && text(params.kind) === "steering_acknowledgement"
+      && Object.keys(item).length === 0
+    ) {
+      // runnerd persists its own command acknowledgement as a canonical PRP
+      // item. The request() call is already the authoritative acknowledgement
+      // and steer() emits the user-visible item with the active turn binding.
+      // Do not reinterpret this transport-level echo as an unbound Codex item.
+      return;
+    }
     if (threadId !== this.#opened.threadId) {
       this.#failProtocol(
         "thread_binding_mismatch",
@@ -2007,6 +2030,55 @@ class CodexHarnessSession implements HarnessSession {
   async #handleServerRequest(
     request: CodexRpcServerRequest,
   ): Promise<Record<string, unknown>> {
+    const sourceSequenceBefore = this.#sourceSequence;
+    let rejected = false;
+    try {
+      const response = await this.#handleServerRequestBody(request);
+      rejected = response.success === false;
+      return response;
+    } catch (error) {
+      rejected = true;
+      throw error;
+    } finally {
+      const correlation = request.paperclipTrace;
+      if (correlation !== undefined) {
+        const emittedEventIds: string[] = [];
+        for (
+          let sourceSeq = sourceSequenceBefore + 1;
+          sourceSeq <= this.#sourceSequence;
+          sourceSeq += 1
+        ) {
+          emittedEventIds.push(
+            `${this.#runnerInstanceId}:${this.#runId}:${sourceSeq}`,
+          );
+        }
+        try {
+          this.#transport.recordTraceInterpretation?.({
+            sourceEventId: correlation.sourceEventId,
+            sourceEventType: correlation.sourceEventType,
+            providerMethod: request.method,
+            disposition: rejected
+              ? "rejected"
+              : emittedEventIds.length > 0
+                ? "mapped"
+                : "ignored",
+            emittedEventIds,
+            reason: rejected
+              ? "Codex driver rejected the correlated provider server request"
+              : emittedEventIds.length > 0
+                ? "Codex driver mapped the correlated provider server request into canonical PRP events"
+                : "Codex driver accepted the correlated provider server request without emitting a canonical PRP event",
+          });
+        } catch {
+          // Trace delivery is deliberately outside run authority.
+        }
+      }
+    }
+  }
+
+  async #handleServerRequestBody(
+    request: CodexRpcServerRequest,
+  ): Promise<Record<string, unknown>> {
     if (request.method === "item/tool/call") {
       const tool = text(request.params.tool);
       const threadId = text(request.params.threadId);
@@ -2165,6 +2237,7 @@ class CodexHarnessSession implements HarnessSession {
       );
       return safeRequestResponse(request.method);
     }
+    const input = codexQuestionSet(request.method, request.params);
     const runtimeRequest: HarnessRuntimeRequest = {
       requestId,
       requestKind,
@@ -2174,11 +2247,17 @@ class CodexHarnessSession implements HarnessSession {
       status: "pending",
       prompt: runtimeRequestPrompt(requestKind, request.params),
       details: record(redactCodexValue(boundedCodexValue(request.params))),
+      ...(input !== null ? { input } : {}),
+      origin: {
+        adapter: "codex-app-server",
+        provider: "codex",
+        method: request.method,
+      },
     };
     this.#emit(
       "runtime_request.created",
       {
-        request: { ...runtimeRequest, type: runtimeRequest.method },
+        request: runtimeRequestProtocolPayload(runtimeRequest),
       },
       {
         turnId: requestTurnId,
@@ -2324,6 +2403,8 @@ class CodexHarnessSession implements HarnessSession {
             ? "turn.cancelled"
             : "turn.completed";
     this.#cancelPendingRequests("turn_terminal");
+    this.#activeTurnId = null;
+    this.#turnStarted = false;
     this.#emit(
       eventType,
       boundedPayload({
@@ -2332,8 +2413,6 @@ class CodexHarnessSession implements HarnessSession {
       }),
       { turnId },
     );
-    this.#activeTurnId = null;
-    this.#turnStarted = false;
     this.#finalize(status);
   }
 
@@ -2710,6 +2789,198 @@ function runtimeRequestPrompt(
   return labels[kind];
 }
 
+function stableQuestionId(value: unknown, index: number): string {
+  const candidate = text(value).trim();
+  return candidate.length > 0 ? candidate.slice(0, 160) : `question-${index + 1}`;
+}
+
+function codexOptions(value: unknown): NonNullable<PaperclipQuestion["options"]> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.slice(0, 128).map((rawOption, index) => {
+    const option = record(rawOption);
+    const label = text(option.label, text(option.value, text(rawOption))).slice(0, 1_000);
+    return {
+      id: stableQuestionId(option.id, index).replace(/^question-/, "option-"),
+      label: label || `Option ${index + 1}`,
+      ...(text(option.description).length > 0
+        ? { description: boundedText(redactCodexDiagnostic(text(option.description))) }
+        : {}),
+    };
+  });
+}
+
+function jsonSchemaOptions(schema: Record<string, unknown>): NonNullable<PaperclipQuestion["options"]> {
+  const values = Array.isArray(schema.enum)
+    ? schema.enum
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf.map((entry) => record(entry).const)
+      : [];
+  return values.slice(0, 128).map((value, index) => {
+    const oneOf = Array.isArray(schema.oneOf) ? record(schema.oneOf[index]) : {};
+    return {
+      id: `option-${index + 1}`,
+      label: text(oneOf.title, typeof value === "string" ? value : JSON.stringify(value)).slice(0, 1_000),
+      ...(text(oneOf.description).length > 0
+        ? { description: boundedText(text(oneOf.description)) }
+        : {}),
+    };
+  });
+}
+
+/** Codex-native requests are converted once, before they enter PRP. */
+function codexQuestionSet(method: string, params: Record<string, unknown>): PaperclipQuestionSet | null {
+  if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") {
+    if (!Array.isArray(params.questions) || params.questions.length === 0) return null;
+    const questions = params.questions.slice(0, 64).map((rawQuestion, index): PaperclipQuestion => {
+      const question = record(rawQuestion);
+      const options = codexOptions(question.options);
+      return {
+        id: stableQuestionId(question.id, index),
+        ...(text(question.header).length > 0 ? { header: boundedText(text(question.header), "", 1_000) } : {}),
+        prompt: boundedText(text(question.question, text(question.prompt, `Question ${index + 1}`))),
+        ...(text(question.description).length > 0 ? { helpText: boundedText(text(question.description)) } : {}),
+        required: question.required !== false,
+        answerMode: options && options.length > 0
+          ? question.multiSelect === true || question.multiple === true ? "multi_select" : "single_select"
+          : "text",
+        ...(options && options.length > 0 ? { options } : {}),
+        ...(question.isOther === true || question.allowOther === true
+          ? { customAnswer: { enabled: true, label: "Other", placeholder: "Enter another answer" } }
+          : {}),
+        ...(!(options && options.length > 0) && (typeof question.minLength === "number" || typeof question.maxLength === "number")
+          ? { textValidation: {
+              ...(typeof question.minLength === "number" ? { minLength: question.minLength } : {}),
+              ...(typeof question.maxLength === "number" ? { maxLength: question.maxLength } : {}),
+            } }
+          : {}),
+      };
+    });
+    return {
+      schema: PAPERCLIP_QUESTION_SET_SCHEMA,
+      title: text(params.title, "Codex needs your input"),
+      ...(text(params.description).length > 0 ? { description: boundedText(text(params.description)) } : {}),
+      submitLabel: text(params.submitLabel, "Submit answers"),
+      questions,
+    };
+  }
+  if (method !== "mcpServer/elicitation/request") return null;
+  const requestedSchema = record(params.requestedSchema ?? params.schema);
+  const properties = record(requestedSchema.properties);
+  const required = new Set(Array.isArray(requestedSchema.required) ? requestedSchema.required.filter((entry): entry is string => typeof entry === "string") : []);
+  const questions = Object.entries(properties).slice(0, 64).map(([id, rawProperty]): PaperclipQuestion => {
+    const property = record(rawProperty);
+    const propertyType = text(property.type);
+    const itemSchema = record(property.items);
+    const selectSchema = propertyType === "array" ? itemSchema : property;
+    const options = propertyType === "boolean"
+      ? [{ id: "true", label: "Yes" }, { id: "false", label: "No" }]
+      : jsonSchemaOptions(selectSchema);
+    const answerMode: PaperclipQuestion["answerMode"] = propertyType === "array" && options.length > 0
+      ? "multi_select"
+      : options.length > 0
+        ? "single_select"
+        : "text";
+    const inputType = propertyType === "integer" ? "integer" : propertyType === "number" ? "number" : "text";
+    return {
+      id,
+      ...(text(property.title).length > 0 ? { header: boundedText(text(property.title), "", 1_000) } : {}),
+      prompt: boundedText(text(property.title, id)),
+      ...(text(property.description).length > 0 ? { helpText: boundedText(text(property.description)) } : {}),
+      required: required.has(id),
+      answerMode,
+      ...(options.length > 0 ? { options } : {}),
+      ...(answerMode === "text" ? { textValidation: {
+        inputType,
+        ...(typeof property.minLength === "number" ? { minLength: property.minLength } : {}),
+        ...(typeof property.maxLength === "number" ? { maxLength: property.maxLength } : {}),
+        ...(typeof property.minimum === "number" ? { minimum: property.minimum } : {}),
+        ...(typeof property.maximum === "number" ? { maximum: property.maximum } : {}),
+        ...(typeof property.pattern === "string" ? { pattern: property.pattern } : {}),
+      } } : {}),
+    };
+  });
+  if (questions.length === 0) return null;
+  return {
+    schema: PAPERCLIP_QUESTION_SET_SCHEMA,
+    title: "A tool needs your input",
+    ...(text(params.message).length > 0 ? { description: boundedText(text(params.message)) } : {}),
+    submitLabel: "Submit",
+    questions,
+  };
+}
+
+function runtimeRequestProtocolPayload(request: HarnessRuntimeRequest): Record<string, unknown> {
+  if (request.input !== undefined) {
+    return {
+      schema: PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
+      requestKind: "runtime",
+      requestId: request.requestId,
+      type: "input",
+      status: request.status,
+      prompt: request.prompt,
+      input: structuredClone(request.input),
+      origin: structuredClone(request.origin),
+      turnId: request.turnId,
+      itemId: request.itemId,
+    };
+  }
+  return { ...request, type: request.method };
+}
+
+function canonicalCodexAnswers(
+  request: HarnessRuntimeRequest,
+  response: PaperclipQuestionResponse,
+): Record<string, { answers: string[] }> {
+  const result: Record<string, { answers: string[] }> = {};
+  for (const question of request.input?.questions ?? []) {
+    const answer = response.answers[question.id];
+    if (answer === undefined) continue;
+    const labels = (answer.selectedOptionIds ?? []).map((optionId) =>
+      question.options?.find((option) => option.id === optionId)?.label,
+    ).filter((label): label is string => typeof label === "string");
+    if (answer.text !== undefined) labels.push(answer.text);
+    if (answer.customText !== undefined) labels.push(answer.customText);
+    result[question.id] = { answers: labels };
+  }
+  return result;
+}
+
+function jsonSchemaOptionValue(schema: Record<string, unknown>, optionId: string): unknown {
+  if (optionId === "true") return true;
+  if (optionId === "false") return false;
+  const index = Number(optionId.match(/^option-(\d+)$/)?.[1] ?? "0") - 1;
+  if (index < 0) return optionId;
+  if (Array.isArray(schema.enum)) return schema.enum[index];
+  if (Array.isArray(schema.oneOf)) return record(schema.oneOf[index]).const;
+  return optionId;
+}
+
+function canonicalElicitationContent(
+  request: HarnessRuntimeRequest,
+  response: PaperclipQuestionResponse,
+): Record<string, unknown> {
+  const requestedSchema = record(request.details.requestedSchema ?? request.details.schema);
+  const properties = record(requestedSchema.properties);
+  const content: Record<string, unknown> = {};
+  for (const question of request.input?.questions ?? []) {
+    const answer = response.answers[question.id];
+    if (answer === undefined) continue;
+    const property = record(properties[question.id]);
+    const itemSchema = record(property.items);
+    if (question.answerMode === "text") {
+      const value = answer.text ?? "";
+      content[question.id] = property.type === "integer" || property.type === "number" ? Number(value) : value;
+    } else if (question.answerMode === "multi_select") {
+      content[question.id] = (answer.selectedOptionIds ?? []).map((optionId) => jsonSchemaOptionValue(itemSchema, optionId));
+    } else {
+      const optionId = answer.selectedOptionIds?.[0];
+      if (optionId !== undefined) content[question.id] = jsonSchemaOptionValue(property, optionId);
+      else if (answer.customText !== undefined) content[question.id] = answer.customText;
+    }
+  }
+  return content;
+}
+
 /**
  * Maps an already-validated resolution onto the provider's response shape.
  * `parseHarnessRuntimeRequestResolution` is the only gate on shape, so every
@@ -2748,12 +3019,22 @@ function runtimeRequestResponse(
     };
   }
   if (request.requestKind === "user_input") {
+    if (resolution.action === "submit" && "response" in resolution) {
+      return { answers: canonicalCodexAnswers(request, resolution.response) };
+    }
     if (resolution.action !== "submit" || !("answers" in resolution)) {
       // Declines and cancels are the only non-submit answers the validator
       // lets through, and neither carries form data.
       return { answers: {} };
     }
     return { answers: structuredClone(resolution.answers) };
+  }
+  if (resolution.action === "submit" && "response" in resolution) {
+    return {
+      action: "accept",
+      content: canonicalElicitationContent(request, resolution.response),
+      _meta: null,
+    };
   }
   if (resolution.action === "submit" && "content" in resolution) {
     return {

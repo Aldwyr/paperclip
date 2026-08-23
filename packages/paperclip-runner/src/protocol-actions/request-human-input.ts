@@ -13,6 +13,7 @@ export const requestHumanInputAction = {
     "taskModes": [
       "standard",
       "planning",
+      "ask",
       "skill_test"
     ],
     "sideEffectClass": "task_write",
@@ -69,6 +70,7 @@ export const requestHumanInputAction = {
       "allowedModes": [
         "standard",
         "planning",
+        "ask",
         "skill_test"
       ],
       "inputSchema": {
@@ -103,6 +105,7 @@ export const requestHumanInputAction = {
           },
           "payload": {
             "type": "object",
+            "description": "Kind-specific interaction data. For interactionKind='questions', use exactly {version:1, questions:[{id,prompt,selectionMode:'single'|'multi',required?,options:[{id,label,description?,freeText?}]}]}; option keys are id/label, not value, and question choice cardinality is selectionMode, not type. For confirmation, payload may be {}. Keep all ids stable across retries.",
             "additionalProperties": true
           },
           "targetRevisionId": {
@@ -209,7 +212,9 @@ export const requestHumanInputAction = {
             "type": "string",
             "minLength": 1
           },
-          "payload": {},
+          "payload": {
+            "description": "Kind-specific interaction data. Questions use {version:1, questions:[{id,prompt,selectionMode:'single'|'multi',required?,options:[{id,label,description?,freeText?}]}]}; do not use type:'single_choice' or option.value."
+          },
           "targetRevisionId": {
             "oneOf": [
               {
@@ -279,6 +284,7 @@ export const requestHumanInputAction = {
       "taskModes": [
         "standard",
         "planning",
+        "ask",
         "skill_test"
       ],
       "sideEffectClass": "task_write",

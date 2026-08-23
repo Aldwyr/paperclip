@@ -16,6 +16,7 @@ const STATUS_ICON = {
   in_progress: { Icon: Loader2, spin: true, tone: "text-(--status-agent-running)" },
   completed: { Icon: Check, spin: false, tone: "text-muted-foreground" },
   failed: { Icon: X, spin: false, tone: "text-destructive" },
+  interrupted: { Icon: X, spin: false, tone: "text-muted-foreground" },
 } as const;
 
 /**
@@ -68,6 +69,9 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
             />
           ) : null}
           <Icon className={cn("h-3.5 w-3.5", tone, spin && "animate-spin")} aria-hidden />
+          {item.status === "interrupted" ? (
+            <span className="text-(length:--text-micro) text-muted-foreground">Interrupted</span>
+          ) : null}
         </span>
       </button>
       {item.detail && showDetail ? (

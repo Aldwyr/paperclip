@@ -5,6 +5,32 @@
   "oneOf": [
     {
       "type": "object",
+      "required": ["schema", "requestKind", "requestId", "type", "status", "prompt", "input"],
+      "properties": {
+        "schema": { "const": "paperclip.runtime_request.v2" },
+        "requestKind": { "const": "runtime" },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "type": { "const": "input" },
+        "status": { "enum": ["pending", "resolved", "expired", "cancelled"] },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "input": { "$ref": "https://paperclip.dev/schemas/prp/v1/question-set.schema.json" },
+        "origin": {
+          "type": "object",
+          "required": ["adapter"],
+          "properties": {
+            "adapter": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "provider": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "method": { "type": "string", "minLength": 1, "maxLength": 500 }
+          },
+          "additionalProperties": false
+        },
+        "turnId": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "itemId": { "type": "string", "minLength": 1, "maxLength": 160 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
       "required": ["schema", "requestKind", "requestId", "type", "status", "prompt"],
       "properties": {
         "schema": { "const": "paperclip.runtime_request.v1" },

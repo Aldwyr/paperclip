@@ -17,8 +17,10 @@ import { finalizeNativeRun, recordNativeFinalizationFailure } from "./native-run
 import {
   commitNativeStatusDecision,
   dispatchPendingNativeStatusEffects,
+  NativeStatusRaceError,
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { issueService } from "../issues.js";
 import { resumeNativeWorkspaceFinalization } from "./native-workspace-finalizer.js";
 import { classifyNativeEvidence } from "./evidence-classifier.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
@@ -93,6 +95,9 @@ export function resolveNativeReconciliationStatus(input: {
     return preserve("prior_status_terminal_preserved", [{ kind: "append_superseding_assessment" }]);
   }
   if (input.facts.policyVersionChanged) {
+    if (["done", "cancelled"].includes(input.priorIssueStatus)) {
+      return preserve("prior_status_terminal_preserved", [{ kind: "append_superseding_assessment" }]);
+    }
     return {
       policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
       statusAction: "in_review",
@@ -100,7 +105,7 @@ export function resolveNativeReconciliationStatus(input: {
       reasonCode: "completion_review_required",
       unblockDescriptor: null,
       effects: [
-        { kind: "bind_reviewer", prompt: "Review the superseding native policy assessment." },
+        { kind: "bind_reviewer", prompt: "Review the superseding native policy assessment.", ownerUserId: null },
         { kind: "append_superseding_assessment" },
       ],
     };
@@ -236,7 +241,7 @@ export async function claimNativeSessionResumptions(input: {
           leaseExpiresAt: null,
           failureCode,
           failureDetail: {
-            recoveryOwner: { kind: "agent", agentId: row.run.agentId },
+            recoveryOwner: { kind: "board" },
             nextAction: "Inspect the interrupted native session; opening a replacement provider session is forbidden.",
           },
           nextAttemptAt: null,
@@ -251,18 +256,25 @@ export async function claimNativeSessionResumptions(input: {
           error: "Persisted native session cannot be resumed without both its envelope and provider checkpoint",
           updatedAt: now,
         }).where(eq(heartbeatRuns.id, row.run.id));
+        await issueService(tx as unknown as Db).update(
+          row.coordinator.issueId,
+          { status: "in_review" },
+          tx,
+        );
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
           companyId: row.run.companyId,
           sourceIssueId: row.coordinator.issueId,
           kind: "active_run_watchdog",
-          ownerType: "agent",
-          ownerAgentId: row.run.agentId,
+          ownerType: "board",
+          ownerAgentId: null,
+          returnOwnerAgentId: row.run.agentId,
           cause: failureCode,
           fingerprint: createHash("sha256").update(`${row.run.id}:${failureCode}`).digest("hex"),
           evidence: { runId: row.run.id, hasEnvelope: !!persistedInput, hasCheckpoint: !!checkpoint },
           nextAction: "Inspect the interrupted native session and explicitly choose recovery; do not open a duplicate provider session.",
           wakePolicy: null,
           maxAttempts: 3,
+          supersedeOnIdentityChange: true,
         });
         return false;
       }
@@ -307,6 +319,7 @@ export async function reconcileNativeFinalizations(db: Db, runIds?: string[]) {
     issueStatus: issues.status,
     issueStatusVersion: issues.statusVersion,
     issueDecisionId: issues.lastStatusDecisionId,
+    coordinatorPhase: nativeRunFinalizations.phase,
     assessmentId: nativeRunFinalizations.assessmentId,
     decisionId: nativeRunFinalizations.decisionId,
   })
@@ -368,6 +381,7 @@ export async function reconcileNativeFinalizations(db: Db, runIds?: string[]) {
         policyVersion: workAssessments.policyVersion,
         priorIssueStatus: workAssessments.priorIssueStatus,
         priorStatusVersion: workAssessments.priorStatusVersion,
+        priorDecisionId: workAssessments.priorDecisionId,
         assessmentJson: workAssessments.assessmentJson,
         createdAt: workAssessments.createdAt,
       }).from(workAssessments).where(and(
@@ -399,8 +413,23 @@ export async function reconcileNativeFinalizations(db: Db, runIds?: string[]) {
           )).limit(1).then((entries) => entries[0] ?? null)
         : null;
       const currentDecisionJson = record(currentDecision?.decisionJson);
+      if (row.coordinatorPhase === "committed" && row.decisionId && !currentDecision) {
+        throw new Error("native_committed_decision_missing");
+      }
+      const supersededCommittedDecision = row.coordinatorPhase === "committed"
+        && row.decisionId !== null
+        && row.issueDecisionId !== null
+        && row.issueDecisionId !== row.decisionId
+        && !(
+          currentDecisionJson.statusAction === "preserve"
+          && assessment?.priorDecisionId === row.issueDecisionId
+        );
+      if (supersededCommittedDecision) continue;
+      const persistedProjectedVersion = Number(currentDecisionJson.projectedStatusVersion);
       const expectedProjectedVersion = currentDecision
-        ? Number(currentDecision.decisionVersion) - (currentDecisionJson.statusAction === "preserve" ? 1 : 0)
+        ? Number.isFinite(persistedProjectedVersion)
+          ? persistedProjectedVersion
+          : Number(currentDecision.decisionVersion) - (currentDecisionJson.statusAction === "preserve" ? 1 : 0)
         : null;
       const issueMatchesCurrentDecision = !!assessment
         && !!currentDecision
@@ -444,12 +473,12 @@ export async function reconcileNativeFinalizations(db: Db, runIds?: string[]) {
         && previousAssessment.allCriteriaSatisfied !== true
         && reassessment?.allCriteriaSatisfied === true
         && reassessment.verificationPassed === true;
-      const facts: NativeReconciliationFacts = policyVersionChanged
-        ? { policyVersionChanged: true }
-        : newEvidenceSatisfiesContract
-          ? { newEvidenceSatisfiesContract: true }
-          : authoritativeStatusChanged
-            ? { authoritativeStatusChanged: true }
+      const facts: NativeReconciliationFacts = authoritativeStatusChanged
+        ? { authoritativeStatusChanged: true }
+        : policyVersionChanged
+          ? { policyVersionChanged: true }
+          : newEvidenceSatisfiesContract
+            ? { newEvidenceSatisfiesContract: true }
             : {};
       if (Object.keys(facts).length > 0) {
         if (!assessment || !reassessment || !resultRow || !contractRow) {
@@ -477,18 +506,26 @@ export async function reconcileNativeFinalizations(db: Db, runIds?: string[]) {
           priorIssueStatus: row.issueStatus as NativeAuthoritativeIssueStatus,
           agentId: row.agentId,
         });
-        const committed = await commitNativeStatusDecision({
-          db,
-          companyId: row.companyId,
-          issueId: row.issueId,
-          runId: row.runId,
-          assessmentId: reassessmentRow.id,
-          priorStatus: row.issueStatus,
-          priorStatusVersion: Number(row.issueStatusVersion),
-          priorDecisionId: row.issueDecisionId,
-          decision,
-          allowSupersedingCommittedDecision: true,
-        });
+        let committed: Awaited<ReturnType<typeof commitNativeStatusDecision>>;
+        try {
+          committed = await commitNativeStatusDecision({
+            db,
+            companyId: row.companyId,
+            issueId: row.issueId,
+            runId: row.runId,
+            assessmentId: reassessmentRow.id,
+            priorStatus: row.issueStatus,
+            priorStatusVersion: Number(row.issueStatusVersion),
+            priorDecisionId: row.issueDecisionId,
+            decision,
+            supersedesCommittedDecisionId: row.coordinatorPhase === "committed"
+              ? row.decisionId ?? undefined
+              : undefined,
+          });
+        } catch (error) {
+          if (error instanceof NativeStatusRaceError) continue;
+          throw error;
+        }
         results.push({
           runId: row.runId,
           phase: "committed",

@@ -154,11 +154,13 @@ interface IssuePropertiesProps {
   onCheckMonitorNow?: () => void;
   checkingMonitorNow?: boolean;
   documentDeepLink?: IssuePropertiesDocumentDeepLink | null;
+  /** Render only the Properties body when a parent owns the side-panel tabs. */
+  sidePanelContentOnly?: boolean;
 }
 
 export interface IssuePropertiesDocumentDeepLink {
   requestId: number;
-  tab: "plans" | "artifacts";
+  tab: "plans" | "artifacts" | "document";
   documentKey: string;
 }
 
@@ -179,6 +181,7 @@ export function IssueProperties({
   onCheckMonitorNow,
   checkingMonitorNow = false,
   documentDeepLink,
+  sidePanelContentOnly = false,
 }: IssuePropertiesProps) {
   const { selectedCompanyId } = useCompany();
   const { isMobile } = useSidebar();
@@ -265,6 +268,7 @@ export function IssueProperties({
   }, [hasPlanTab]);
   useEffect(() => {
     if (!documentDeepLink) return;
+    if (documentDeepLink.tab === "document") return;
     paneTabUserChosenRef.current = true;
     setPaneTab(documentDeepLink.tab);
   }, [documentDeepLink]);
@@ -2601,7 +2605,7 @@ export function IssueProperties({
   );
 
   // Classic Task Interface ON: the legacy stacked pane, byte-for-byte.
-  if (!taskChatShellEnabled) return propertiesBody;
+  if (!taskChatShellEnabled || sidePanelContentOnly) return propertiesBody;
 
   // Chat-style with nothing to switch between: no tab strip — the header bar
   // shows a plain title and the pane body is just the properties stack.

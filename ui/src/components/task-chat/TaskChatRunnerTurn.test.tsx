@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { MemoryRouter } from "@/lib/router";
 import { TaskChatRunnerTurn } from "./TaskChatRunnerTurn";
+import type { IssueDocument } from "@paperclipai/shared";
 import type {
   TaskChatItem,
   TaskChatProviderActivityFamily,
@@ -34,10 +35,11 @@ describe("TaskChatRunnerTurn", () => {
     status = "running",
     runId = "run-1",
     onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void,
+    planDocument?: IssueDocument | null,
   ) => act(() => root.render(
     <MemoryRouter>
       <ThemeProvider>
-        <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} onRuntimeRequestDecision={onRuntimeRequestDecision} />
+        <TaskChatRunnerTurn runId={runId} agentName="Runner" items={items} status={status} startedAtMs={Date.now() - 2_000} planDocument={planDocument} onRuntimeRequestDecision={onRuntimeRequestDecision} />
       </ThemeProvider>
     </MemoryRouter>,
   ));
@@ -69,6 +71,109 @@ describe("TaskChatRunnerTurn", () => {
     const activity = container.querySelector('[data-testid="task-chat-current-activity"]');
     expect(identity?.compareDocumentPosition(activity!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(container.querySelector('[data-testid="task-chat-runner-identity-row"]')?.classList.contains("pt-2")).toBe(true);
+  });
+
+  it("shows whichever provider-authored commentary or reasoning block arrived latest", () => {
+    render([
+      { id: "commentary", kind: "message", author: "agent", text: "I’ll inspect the card.", interstitial: true, channel: "progress", transcriptIndex: 1 },
+      { id: "reasoning", kind: "thinking", lines: ["The saved preview can be reused."], streaming: true, channel: "summary", transcriptIndex: 2 },
+    ]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"]')?.textContent)
+      .toContain("The saved preview can be reused.");
+    expect(container.querySelector('[data-testid="task-chat-progress-update"]')).toBeNull();
+
+    render([
+      { id: "commentary", kind: "message", author: "agent", text: "I’ve found the rendering seam.", interstitial: true, channel: "progress", transcriptIndex: 3 },
+      { id: "reasoning", kind: "thinking", lines: ["The saved preview can be reused."], streaming: true, channel: "summary", transcriptIndex: 2 },
+    ]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-progress-update"]')?.textContent)
+      .toContain("I’ve found the rendering seam.");
+  });
+
+  it("appends reasoning fragments in place and animates only a new logical line", () => {
+    render([{ id: "reasoning", kind: "thinking", lines: ["Inspect"], streaming: true, transcriptIndex: 1 }]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"] .cot-line-enter')).toBeNull();
+
+    render([{ id: "reasoning", kind: "thinking", lines: ["Inspecting the runner"], streaming: true, transcriptIndex: 2 }]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"]')?.textContent).toContain("Inspecting the runner");
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"] .cot-line-enter')).toBeNull();
+
+    render([{ id: "reasoning", kind: "thinking", lines: ["Inspecting the runner", "Now testing the stream"], streaming: true, transcriptIndex: 3 }]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"] .cot-line-enter')?.textContent)
+      .toContain("Now testing the stream");
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"] .cot-line-exit')?.textContent)
+      .toContain("Inspecting the runner");
+  });
+
+  it("hides folded narration when expanded and retains every reasoning block in history", () => {
+    render([
+      { id: "summary", kind: "thinking", lines: ["Inspect the current card."], streaming: false, channel: "summary", transcriptIndex: 1 },
+      { id: "detail", kind: "thinking", lines: ["Keep the canonical revision atomic."], streaming: true, channel: "detail", transcriptIndex: 2 },
+    ]);
+    expect(container.querySelector('[data-testid="task-chat-reasoning-ticker"]')?.textContent)
+      .toContain("Keep the canonical revision atomic.");
+
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]')?.click());
+    expect(container.querySelector('[data-testid="task-chat-live-narration"]')).toBeNull();
+    const history = container.querySelector('[data-testid="task-chat-runner-activity-list"]');
+    expect(history?.textContent).toContain("Reasoning");
+    expect(history?.textContent).toContain("Reasoning detail");
+    expect(history?.querySelectorAll('[data-testid="task-chat-thinking"]')).toHaveLength(2);
+  });
+
+  it("lets a lifecycle-only reasoning event replace stale commentary without inventing reasoning text", () => {
+    render([
+      { id: "commentary", kind: "message", author: "agent", text: "Old commentary", interstitial: true, transcriptIndex: 1 },
+      { id: "reasoning", kind: "thinking", lines: [], lifecycleOnly: true, streaming: true, transcriptIndex: 2 },
+    ]);
+    const narration = container.querySelector('[data-testid="task-chat-live-narration"]');
+    expect(narration).not.toBeNull();
+    expect(narration?.textContent).toBe("");
+    expect(narration?.textContent).not.toContain("Old commentary");
+    expect(container.querySelector('[data-testid="task-chat-current-activity-label"]')?.textContent).toBe("Thinking");
+  });
+
+  it("streams a provider Plan card and hands off when a canonical revision arrives", () => {
+    const activity: TaskChatProviderActivityItem = {
+      id: "live-plan",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "plan",
+      eventType: "plan.updated",
+      status: "running",
+      title: "Plan",
+      details: [{ label: "Revision", value: "4" }],
+      steps: [{ id: "one", label: "Extract the shared preview", status: "in_progress" }],
+      links: [],
+      children: [],
+      transcriptIndex: 1,
+    };
+    render([activity]);
+    expect(container.querySelector('[data-testid="task-chat-live-plan-preview"]')?.textContent)
+      .toContain("Extract the shared preview");
+
+    render([{
+      ...activity,
+      steps: [
+        { id: "one", label: "Extract the shared preview", status: "completed" },
+        { id: "two", label: "Stream provider updates", status: "in_progress" },
+      ],
+      transcriptIndex: 2,
+    }]);
+    expect(container.querySelectorAll('[data-testid="task-chat-live-plan-preview"]')).toHaveLength(1);
+    expect(container.textContent).toContain("Stream provider updates");
+
+    const canonicalPlan = {
+      id: "document-plan",
+      issueId: "issue-1",
+      body: "# Canonical plan",
+      latestRevisionId: "revision-4",
+      latestRevisionNumber: 4,
+      updatedAt: new Date(),
+    } as IssueDocument;
+    render([activity], "running", "run-1", undefined, canonicalPlan);
+    expect(container.querySelector('[data-testid="task-chat-live-plan-preview"]')).toBeNull();
   });
 
   it("shows canonical web research as the current Codex-style activity", () => {
@@ -208,6 +313,15 @@ describe("TaskChatRunnerTurn", () => {
     expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.getAttribute("aria-expanded")).toBe("false");
   });
 
+  it("collapses terminal reasoning to the existing Worked summary", () => {
+    render([
+      { id: "reasoning", kind: "thinking", lines: ["Provider-authored trace"], channel: "summary", transcriptIndex: 1 },
+    ], "succeeded");
+    expect(container.querySelector('[data-testid="task-chat-live-narration"]')).toBeNull();
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.textContent).toContain("Worked for");
+    expect(container.querySelector('[data-testid="task-chat-current-activity"]')?.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("keeps final text mounted through a transient replay gap", () => {
     render([
       { id: "f1", kind: "message", author: "agent", authorName: "Runner", text: "Completed successfully.", channel: "final", streaming: true },
@@ -282,12 +396,14 @@ describe("TaskChatRunnerTurn", () => {
 
     const disclosure = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]');
     expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".tc-turn-fold")?.hasAttribute("inert")).toBe(true);
     expect(container.querySelector('[data-testid="task-chat-runner-disclosure-caret"]')).not.toBeNull();
     expect(container.querySelectorAll('[data-testid="task-chat-thinking"]')).toHaveLength(0);
 
     act(() => disclosure?.click());
 
     expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+    expect(container.querySelector(".tc-turn-fold")?.hasAttribute("inert")).toBe(false);
     expect(container.querySelector('[data-testid="task-chat-runner-activity-list"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="task-chat-progress-update"]')).toBeNull();
     expect(container.querySelector('[data-testid="task-chat-activity-commentary"]')?.textContent).toContain("Checking the current implementation.");

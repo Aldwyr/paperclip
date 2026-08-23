@@ -507,7 +507,7 @@ export const createToolMcpGatewayTokenSchema = z.object({
   subjectId: z.string().trim().min(1).max(240).optional().nullable(),
   clientLabel: z.string().trim().min(1).max(160),
   ownerNote: z.string().trim().min(1).max(1000),
-  allowedActions: z.array(toolMcpGatewayTokenActionSchema).min(1).max(TOOL_MCP_GATEWAY_TOKEN_ACTIONS.length).default(["tools/list", "tools/call"]).optional(),
+  allowedActions: z.array(toolMcpGatewayTokenActionSchema).min(1).max(TOOL_MCP_GATEWAY_TOKEN_ACTIONS.length).default([...TOOL_MCP_GATEWAY_TOKEN_ACTIONS]).optional(),
   expiresAt: z.coerce.date().optional().nullable(),
   expiryOverrideReason: z.string().trim().min(1).max(1000).optional().nullable(),
 }).superRefine((value, ctx) => {

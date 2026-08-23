@@ -3,6 +3,14 @@ import type {
   PrpStructuredRunResult,
 } from "../protocol/replay-contract.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "./types.js";
+import {
+  parsePaperclipQuestionResponse,
+  type PaperclipQuestionResponse,
+  type PaperclipQuestionSet,
+  type PaperclipRuntimeRequestOrigin,
+} from "./question-set.js";
+
+export * from "./question-set.js";
 
 export const HARNESS_DRIVER_CONTRACT_VERSION = 1 as const;
 
@@ -98,6 +106,10 @@ export interface HarnessRuntimeRequest {
   status: "pending";
   prompt: string;
   details: Record<string, unknown>;
+  /** Provider-neutral presentation model for structured input requests. */
+  input?: PaperclipQuestionSet;
+  /** Diagnostic origin only; provider response shapes never enter PRP. */
+  origin?: PaperclipRuntimeRequestOrigin;
 }
 
 export type HarnessRuntimeRequestResolution =
@@ -109,6 +121,10 @@ export type HarnessRuntimeRequestResolution =
   | {
       action: "submit";
       content: Record<string, unknown>;
+    }
+  | {
+      action: "submit";
+      response: PaperclipQuestionResponse;
     };
 
 export type HarnessRuntimeRequestAction = HarnessRuntimeRequestResolution["action"];
@@ -160,6 +176,7 @@ function parseAnswers(value: unknown): Record<string, { answers: string[] }> | n
 export function parseHarnessRuntimeRequestResolution(
   requestKind: HarnessRuntimeRequestKind,
   value: unknown,
+  questionSet?: PaperclipQuestionSet,
 ): HarnessRuntimeRequestResolution {
   const candidate = plainRecord(value) ?? {};
   const rawAction = candidate.action;
@@ -173,11 +190,43 @@ export function parseHarnessRuntimeRequestResolution(
     );
   }
   const action = rawAction as HarnessRuntimeRequestAction;
-  if (action !== "submit" && ("answers" in candidate || "content" in candidate)) {
+  if (action !== "submit" && ("answers" in candidate || "content" in candidate || "response" in candidate)) {
     throw new HarnessRuntimeRequestResolutionError(
       requestKind,
       `${action} does not carry submitted form data`,
     );
+  }
+
+  if (action === "submit" && "response" in candidate) {
+    if (requestKind !== "user_input" && requestKind !== "elicitation") {
+      throw new HarnessRuntimeRequestResolutionError(
+        requestKind,
+        "approval requests do not accept submitted question responses",
+      );
+    }
+    if ("answers" in candidate || "content" in candidate) {
+      throw new HarnessRuntimeRequestResolutionError(
+        requestKind,
+        "canonical submissions cannot also carry provider-specific answers or content",
+      );
+    }
+    if (questionSet === undefined) {
+      throw new HarnessRuntimeRequestResolutionError(
+        requestKind,
+        "canonical submission requires the persisted question set",
+      );
+    }
+    try {
+      return {
+        action,
+        response: parsePaperclipQuestionResponse(questionSet, candidate.response),
+      };
+    } catch (error) {
+      throw new HarnessRuntimeRequestResolutionError(
+        requestKind,
+        error instanceof Error ? error.message : "invalid question response",
+      );
+    }
   }
 
   if (requestKind === "user_input") {
@@ -336,6 +385,8 @@ export interface PersistedHarnessSession {
   lastSourceSequence?: number;
   /** Tagged provider identity used to reject cross-profile recovery. */
   providerIdentity?: PersistedHarnessProviderIdentity;
+  /** Narrow escape hatch for a durable response-wake when a provider cannot reload its prior native session. */
+  providerRecoveryPolicy?: "same_session_only" | "allow_replacement_after_governed_wait";
 }
 
 export interface HarnessSessionRecoveryResult {

@@ -1,4 +1,5 @@
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
+import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import {
   GENERATED_ACPX_SIDECAR_COMMANDS,
   GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
@@ -39,6 +40,8 @@ export interface AcpxSidecarOpenParams {
   workingDirectory: string;
   agent: QualifiedAcpxAgent;
   model: string;
+  systemInstructions: string;
+  runtimeContext: NativeRuntimeContextSnapshot | null;
   tools: readonly Readonly<Record<string, unknown>>[];
   expectedIdentity?: AcpxExpectedSessionIdentity;
 }

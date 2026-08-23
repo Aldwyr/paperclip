@@ -20,6 +20,18 @@ const result: PrpStructuredRunResult = {
   artifacts: [],
 };
 
+const providerIdentity = {
+  kind: "acpx" as const,
+  normalizedSessionId: "session-1",
+  acpxRecordId: "driver-1",
+  backendSessionId: "backend-1",
+  agentSessionId: "provider-1",
+  profileDigest: "sha256:profile",
+  workspaceDigest: "sha256:workspace",
+  requestedModel: "claude-sonnet-4-20250514",
+  effectiveModel: "claude-sonnet-4-20250514",
+};
+
 function prpEvent(sourceSeq: number, eventType: PrpEvent["eventType"], payload: Record<string, unknown>): PrpEvent {
   return {
     schema: "paperclip.prp.event.v1",
@@ -38,6 +50,8 @@ function prpEvent(sourceSeq: number, eventType: PrpEvent["eventType"], payload: 
   };
 }
 
+const runtimeResolutions: unknown[] = [];
+
 class FakeHarnessSession implements HarnessSession {
   ids() { return { driverSessionId: "driver-1", providerSessionId: "provider-1" }; }
   async *events() {
@@ -45,11 +59,16 @@ class FakeHarnessSession implements HarnessSession {
     yield prpEvent(2, "turn.completed", { status: "completed" });
   }
   async startTurn() { return { turnId: "turn-1" }; }
+  async resolveRuntimeRequest(input: unknown) {
+    runtimeResolutions.push(structuredClone(input));
+  }
   async snapshot(): Promise<PersistedHarnessSession> {
     return {
       driverKind: "fake",
       driverSessionId: "driver-1",
       providerSessionId: "provider-1",
+      providerIdentity,
+      providerRecoveryPolicy: "allow_replacement_after_governed_wait",
       semanticResult: { result, fingerprint: "fingerprint", turnId: "turn-1" },
       lastSourceSequence: 2,
     };
@@ -90,15 +109,19 @@ describe("HarnessDriverBackend", () => {
       driverKind: "fake",
       sessionId: "driver-1",
       providerSessionId: "provider-1",
+      providerIdentity,
+      providerRecoveryPolicy: "allow_replacement_after_governed_wait",
     });
   });
 
   it("passes the persisted harness driver kind through recovery", async () => {
     let recoveredDriverKind: string | null = null;
+    let recoveredProviderIdentity: PersistedHarnessSession["providerIdentity"];
     const recoveryDriver: HarnessDriver = {
       ...driver,
       async recoverSession(snapshot) {
         recoveredDriverKind = snapshot.driverKind;
+        recoveredProviderIdentity = snapshot.providerIdentity;
         return { recovered: true, session: new FakeHarnessSession() };
       },
     };
@@ -108,9 +131,41 @@ describe("HarnessDriverBackend", () => {
       driverKind: "fake",
       sessionId: "driver-1",
       providerSessionId: "provider-1",
+      providerIdentity,
+      providerRecoveryPolicy: "allow_replacement_after_governed_wait",
       identity: { runId: "run-2", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
     });
     expect(recovery.recovered).toBe(true);
     expect(recoveredDriverKind).toBe("fake");
+    expect(recoveredProviderIdentity).toEqual(providerIdentity);
+  });
+
+  it("delegates native runtime-request resolutions to the harness session", async () => {
+    runtimeResolutions.length = 0;
+    const backend = new HarnessDriverBackend(driver);
+    const session = await backend.openSession({
+      identity: {
+        runId: "run-1",
+        sessionId: "session-1",
+        companyId: "company-1",
+        issueId: "issue-1",
+        agentId: "agent-1",
+      },
+      workingDirectory: "/workspace",
+    });
+
+    await session.resolveRuntimeRequest?.({
+      requestId: "permission-1",
+      turnId: "turn-1",
+      resolution: { action: "accept_for_session" },
+    });
+
+    expect(runtimeResolutions).toEqual([
+      {
+        requestId: "permission-1",
+        turnId: "turn-1",
+        resolution: { action: "accept_for_session" },
+      },
+    ]);
   });
 });

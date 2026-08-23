@@ -237,6 +237,10 @@ impl SupervisedProcess {
             "PAPERCLIP_RUNNER_INSTANCE_ID",
             "PAPERCLIP_RUN_ID",
             "PAPERCLIP_NORMALIZED_SESSION_ID",
+            "PAPERCLIP_NATIVE_MCP_NAME",
+            "PAPERCLIP_NATIVE_MCP_URL",
+            "PAPERCLIP_NATIVE_MCP_TOKEN",
+            "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
         ] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);

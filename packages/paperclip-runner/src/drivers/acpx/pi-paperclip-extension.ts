@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -38,6 +38,7 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .map((value) => resolve(value));
   const rpc = createMcpClient(endpoint, token);
+  let sessionAllowsGovernedTools = false;
   await initializeMcpClient(rpc, "paperclip-pi-extension");
   await registerMcpTools(pi, rpc, { privatePermissionTool: true, prefix: "" });
   const assignedUrl = process.env.PAPERCLIP_NATIVE_MCP_URL?.trim();
@@ -62,12 +63,14 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
     if (command !== null && unsafeCommandPath(command, workspace, runtimeRoot)) {
       return { block: true, reason: "Paperclip denied a command that names a protected or outside-workspace path." };
     }
+    if (sessionAllowsGovernedTools) return undefined;
     const target = command === null ? pathTarget : `command-sha256:${createHash("sha256").update(command).digest("hex")}`;
     const response = await rpc("tools/call", {
       name: PRIVATE_PERMISSION_TOOL,
       arguments: { operation: event.toolName, target: target === null ? null : relative(workspace, resolve(workspace, target)), inputClass: event.toolName === "bash" ? "command" : "workspace_mutation" },
     }, `permission:${event.toolCallId}`);
     const decision = decodedResult(response).decision;
+    if (decision === "accept_for_session") sessionAllowsGovernedTools = true;
     return decision === "accept" || decision === "accept_for_session" ? undefined : { block: true, reason: decision === "cancel" ? "Paperclip cancelled this operation." : "Paperclip declined this operation." };
   });
 }
@@ -167,14 +170,42 @@ function inside(root: string, candidate: string): boolean {
   return result === "" || (!result.startsWith("..") && !isAbsolute(result));
 }
 
+function pathEntryExists(candidate: string): boolean {
+  try {
+    lstatSync(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function nearestExistingAncestor(candidate: string): string | null {
+  let current = candidate;
+  while (!pathEntryExists(current)) {
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return current;
+}
+
 function safeWorkspaceTarget(workspace: string, runtimeRoot: string, readOnlyRoots: string[], candidate: string, mayCreate: boolean): boolean {
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(workspace, candidate);
   const authorizedRoot = [workspace, ...readOnlyRoots].find((root) => inside(root, absolute));
   if (!authorizedRoot || (inside(runtimeRoot, absolute) && !readOnlyRoots.some((root) => inside(root, absolute)))) return false;
   try {
-    const existing = existsSync(absolute) ? absolute : mayCreate ? dirname(absolute) : absolute;
+    const existing = pathEntryExists(absolute)
+      ? absolute
+      : mayCreate
+        ? nearestExistingAncestor(dirname(absolute))
+        : absolute;
+    if (existing === null) return false;
     const physical = realpathSync(existing);
-    return inside(authorizedRoot, physical) && (!inside(runtimeRoot, physical) || readOnlyRoots.some((root) => inside(root, physical)));
+    const physicalAuthorizedRoot = realpathSync(authorizedRoot);
+    const physicalRuntimeRoot = realpathSync(runtimeRoot);
+    const physicalReadOnlyRoots = readOnlyRoots.map((root) => realpathSync(root));
+    return inside(physicalAuthorizedRoot, physical)
+      && (!inside(physicalRuntimeRoot, physical) || physicalReadOnlyRoots.some((root) => inside(root, physical)));
   } catch {
     return false;
   }
@@ -188,8 +219,14 @@ function commandText(input: unknown): string | null {
 }
 
 function unsafeCommandPath(command: string, workspace: string, runtimeRoot: string): boolean {
-  if (/(^|[\s'"`=])~(?:\/|\s|$)/.test(command) || /(^|[\s'"`=])\.\.(?:\/|\s|$)/.test(command)) return true;
-  const absolutePaths = command.match(/\/(?:[^\s'"`;&|()<>]|\\.)+/g) ?? [];
+  const shellBoundary = String.raw`[\s'"\x60=;&|()<>]`;
+  if (
+    new RegExp(`(^|${shellBoundary})~(?:/|${shellBoundary}|$)`).test(command)
+    || new RegExp(`(^|${shellBoundary}|/)\\.\\.(?:/|${shellBoundary}|$)`).test(command)
+  ) return true;
+  const absolutePaths = [...command.matchAll(new RegExp(`(?:^|${shellBoundary})(/(?:[^\\s'"\\x60;&|()<>]|\\\\.)+)`, "g"))]
+    .map((match) => match[1]!)
+    .filter((candidate) => candidate.length > 0);
   return absolutePaths.some((candidate) => !inside(workspace, candidate) || inside(runtimeRoot, candidate));
 }
 

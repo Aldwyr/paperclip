@@ -26,7 +26,12 @@ export interface StrictCompletionContractInput {
 
 export interface NativeInteractionResponseEnvelope {
   interactionId: string;
-  kind: "request_confirmation" | "ask_user_questions";
+  kind:
+    | "suggest_tasks"
+    | "ask_user_questions"
+    | "request_confirmation"
+    | "request_checkbox_confirmation"
+    | "request_item_verdicts";
   response: Record<string, unknown>;
 }
 
@@ -62,6 +67,9 @@ export interface NativeAwsAgentCoreProfileSnapshot {
   memoryArn: string;
   memoryId: string;
   invocationRoleArn: string;
+  contextBucket: string;
+  contextPrefix: string;
+  contextKmsKeyArn: string;
   qualificationRevision: string;
   eventExpiryDays: 90;
 }
@@ -153,7 +161,7 @@ export interface NativeExecutionInputV2 extends Omit<NativeExecutionInputV1, "sc
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V2;
   executionMode: NativeExecutionMode;
   task: Omit<NativeExecutionInputV1["task"], "workMode"> & {
-    workMode: "standard" | "planning";
+    workMode: "standard" | "planning" | "ask";
   };
   planningContext: NativePlanningContext | null;
 }
@@ -274,14 +282,14 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   const contract = record(completionContract.contract, "input.completionContract.contract");
   exactKeys(contract, ["revision", "objective", "criteria"], "input.completionContract.contract");
 
-  if (task.workMode !== "standard" && (!isV2 || task.workMode !== "planning")) {
-    throw new NativeExecutionInputError("input.task.workMode must be standard or planning");
+  if (task.workMode !== "standard" && (!isV2 || task.workMode !== "planning" && task.workMode !== "ask")) {
+    throw new NativeExecutionInputError("input.task.workMode must be standard, planning, or ask");
   }
   const executionMode: NativeExecutionMode = isV2 && input.executionMode === "plan" ? "plan" : "default";
   if (isV2 && input.executionMode !== "default" && input.executionMode !== "plan") {
     throw new NativeExecutionInputError("input.executionMode must be default or plan");
   }
-  if (isV2 && task.workMode === "standard" && executionMode === "plan") {
+  if (isV2 && task.workMode !== "planning" && executionMode === "plan") {
     throw new NativeExecutionInputError("plan execution mode requires planning work mode");
   }
   let planningContext: NativePlanningContext | null = null;
@@ -427,7 +435,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     exactKeys(profile, [
       "profileId", "region", "accountId", "harnessArn", "harnessVersion", "endpointArn",
       "endpointQualifier", "agentRuntimeArn", "memoryArn", "memoryId", "invocationRoleArn",
-      "qualificationRevision", "eventExpiryDays",
+      "contextBucket", "contextPrefix", "contextKmsKeyArn", "qualificationRevision", "eventExpiryDays",
     ], "input.provider.agentCoreProfile");
     if (profile.eventExpiryDays !== 90) {
       throw new NativeExecutionInputError("input.provider.agentCoreProfile.eventExpiryDays must be 90");
@@ -468,6 +476,9 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
         memoryArn: text(profile.memoryArn, "input.provider.agentCoreProfile.memoryArn"),
         memoryId: text(profile.memoryId, "input.provider.agentCoreProfile.memoryId"),
         invocationRoleArn: text(profile.invocationRoleArn, "input.provider.agentCoreProfile.invocationRoleArn"),
+        contextBucket: text(profile.contextBucket, "input.provider.agentCoreProfile.contextBucket"),
+        contextPrefix: text(profile.contextPrefix, "input.provider.agentCoreProfile.contextPrefix"),
+        contextKmsKeyArn: text(profile.contextKmsKeyArn, "input.provider.agentCoreProfile.contextKmsKeyArn"),
         qualificationRevision: text(profile.qualificationRevision, "input.provider.agentCoreProfile.qualificationRevision"),
         eventExpiryDays: 90,
       },
@@ -549,10 +560,16 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   const interactionResponses = input.interactionResponses.map((entry, index) => {
     const response = record(entry, `input.interactionResponses[${index}]`);
     exactKeys(response, ["interactionId", "kind", "response"], `input.interactionResponses[${index}]`);
-    if (response.kind !== "request_confirmation" && response.kind !== "ask_user_questions") {
+    if (![
+      "suggest_tasks",
+      "ask_user_questions",
+      "request_confirmation",
+      "request_checkbox_confirmation",
+      "request_item_verdicts",
+    ].includes(String(response.kind))) {
       throw new NativeExecutionInputError(`input.interactionResponses[${index}].kind is unsupported`);
     }
-    const kind: NativeInteractionResponseEnvelope["kind"] = response.kind;
+    const kind = response.kind as NativeInteractionResponseEnvelope["kind"];
     return {
       interactionId: text(response.interactionId, `input.interactionResponses[${index}].interactionId`),
       kind,
@@ -587,7 +604,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       // Recovery must retain those runs, so derive the same bounded model
       // prompt from their task fields instead of making them unrecoverable.
       prompt: text(task.prompt ?? task.description ?? task.title, "input.task.prompt"),
-      workMode: task.workMode as "standard" | "planning",
+      workMode: task.workMode as "standard" | "planning" | "ask",
     },
     workspace: {
       cwd: text(workspace.cwd, "input.workspace.cwd"),

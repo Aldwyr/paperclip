@@ -49,6 +49,9 @@ interface EvalSessionRequest {
     memoryArn: string;
     memoryId: string;
     invocationRoleArn: string;
+    contextBucket: string;
+    contextPrefix: string;
+    contextKmsKeyArn: string;
     qualificationRevision: string;
     eventExpiryDays: 90;
     maxEstimatedSessionCostUsd: number;

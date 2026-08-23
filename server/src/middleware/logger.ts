@@ -21,6 +21,11 @@ export const logger = isProduction
 
 export const httpLogger = pinoHttp({
   logger,
+  serializers: {
+    req(req) {
+      return { ...req, url: redactWorkspaceHandoffTicket(req.url ?? "") };
+    },
+  },
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
