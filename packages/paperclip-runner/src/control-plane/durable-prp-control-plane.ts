@@ -2418,6 +2418,9 @@ export async function runDurableEvalSession(
   const acpxSidecarPath =
     input.acpxSidecarPath ??
     fileURLToPath(new URL("../cli/acpx-runtime-sidecar.js", import.meta.url));
+  const codexUnixProxyPath = fileURLToPath(
+    new URL("../cli/codex-app-server-unix-proxy.js", import.meta.url),
+  );
   const acpxProfile =
     providerKind === "acpx"
       ? resolveQualifiedAcpxProfile(input.acpxAgent ?? "pi", input.model)
@@ -2429,13 +2432,7 @@ export async function runDurableEvalSession(
     input.providerArgs ??
     (input.nativeResume === undefined
       ? providerArgs
-      : [
-          ...codexConfigArgs,
-          "app-server",
-          "proxy",
-          "--sock",
-          sharedCodexSocket,
-        ]);
+      : [codexUnixProxyPath, "--socket", sharedCodexSocket]);
   let sharedCodexServer: ChildProcessWithoutNullStreams | null = null;
   let sharedCodexServerStderr = "";
   let sharedCodexServerError: Error | null = null;
@@ -2483,7 +2480,9 @@ export async function runDurableEvalSession(
                 kind: providerKind,
                 command:
                   input.providerCommand ??
-                  (providerKind === "opencode"
+                  (input.nativeResume !== undefined
+                    ? process.execPath
+                    : providerKind === "opencode"
                     ? process.execPath
                     : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex")),
                 args:
