@@ -2146,7 +2146,38 @@ async function readBody(req) {
       throw new BridgeBodyTooLargeError();
     }
   }
-  return Buffer.concat(chunks).toString("utf8");
+  // Return the raw request bytes. The duplex gateway base64-encodes these bytes
+  // unchanged, so a malformed body cannot expand during transport and cannot
+  // exceed the bytes that admission charged. The file gateway decodes a valid
+  // UTF-8 body with decodeUtf8Body and rejects an invalid one.
+  return Buffer.concat(chunks);
+}
+
+// Strict UTF-8 decoder for the file gateway. It throws on any invalid byte, so
+// the gateway rejects a malformed body instead of expanding it. A single decode
+// call does not stream, so the gateway reuses one decoder across requests.
+const bridgeUtf8Decoder = new TextDecoder("utf8", { fatal: true });
+
+// Typed marker for a request body that is not valid UTF-8. Only the file gateway
+// uses it. That gateway writes the body as a JSON string that the host reader
+// consumes. A valid JSON body is always valid UTF-8 and round-trips
+// byte-for-byte. An invalid body would expand, because each invalid byte becomes
+// the 3-byte U+FFFD replacement. The gateway must not retain or forward more
+// bytes than admission charged, so it answers a clean 400 instead.
+class BridgeInvalidBodyError extends Error {
+  constructor() {
+    super("invalid_utf8_body");
+    this.code = "invalid_utf8_body";
+  }
+}
+
+// Decode a request body Buffer to a UTF-8 string, or throw BridgeInvalidBodyError.
+function decodeUtf8Body(buffer) {
+  try {
+    return bridgeUtf8Decoder.decode(buffer);
+  } catch (error) {
+    throw new BridgeInvalidBodyError();
+  }
 }
 
 function tokensMatch(received) {
@@ -2215,7 +2246,7 @@ async function runFileGateway() {
         return;
       }
       try {
-      const requestBody = await readBody(req);
+      const requestBody = decodeUtf8Body(await readBody(req));
       const payload = {
         id: requestId,
         method: req.method || "GET",
@@ -2258,6 +2289,10 @@ async function runFileGateway() {
         writeJsonResponse(res, 413, { error: "request_too_large" });
         return;
       }
+      if (error && error.code === "invalid_utf8_body") {
+        writeJsonResponse(res, 400, { error: "invalid_utf8_body" });
+        return;
+      }
       writeJsonResponse(res, 502, { error: error instanceof Error ? error.message : String(error) });
     }
   });
@@ -2293,26 +2328,26 @@ async function runFileGateway() {
   });
 }
 
-// Split one whole body buffer into body_chunk frames. The gateway buffers the
-// whole source body once, then splits it here. Each frame carries one fixed raw
-// slice as base64 text, except the final frame, which carries the remaining
-// bytes. A zero-length body yields no frame. Send-side true streaming is a
-// separate goal; this whole-body split is acceptable for this gateway.
-function splitDuplexBodyIntoChunks(id, body) {
-  const frames = [];
+// Yield the body_chunk frames for one request body, one frame at a time. The
+// gateway encodes and writes each frame, then drops it before it builds the next
+// frame. So the gateway holds the raw body plus at most one base64 frame, not
+// the raw body plus every base64 frame. Each frame carries one fixed raw slice
+// as base64 text, except the final frame, which carries the remaining bytes. A
+// zero-length body yields no frame. See the retained-peak note at the duplex
+// send site.
+function* duplexBodyChunkFrames(id, body) {
   let seq = 0;
   for (let offset = 0; offset < body.length; offset += DUPLEX_BODY_CHUNK_RAW_BYTES) {
     const slice = body.subarray(offset, offset + DUPLEX_BODY_CHUNK_RAW_BYTES);
-    frames.push({
+    yield {
       version: DUPLEX_FRAME_VERSION,
       type: "body_chunk",
       id: id,
       seq: seq,
       data: slice.toString("base64"),
-    });
+    };
     seq += 1;
   }
-  return frames;
 }
 
 function runDuplexGateway() {
@@ -2524,7 +2559,7 @@ function runDuplexGateway() {
         return;
       }
       try {
-      const requestBodyBuffer = Buffer.from(await readBody(req), "utf8");
+      const requestBodyBuffer = await readBody(req);
       if (unavailable) {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
         return;
@@ -2547,26 +2582,35 @@ function runDuplexGateway() {
         writeJsonResponse(res, 413, { error: "request_too_large" });
         return;
       }
-      // Pre-encode every body_chunk frame and enforce the frame size bound on
-      // each. A fixed raw slice never exceeds the bound, so this guard is
-      // defensive. On a rejection, fail this one local request with a clean 413.
-      // The frames never leave the gateway, so no other in-flight request is
-      // affected and the channel stays open.
-      const chunkFrames = splitDuplexBodyIntoChunks(requestId, requestBodyBuffer);
-      const encodedChunks = [];
+      // Validate every body_chunk frame against the frame bound before the
+      // gateway emits the envelope. A fixed 256 KiB raw slice never exceeds the
+      // 1 MB frame bound, so this guard is defensive. On a rejection the gateway
+      // fails this one local request with a clean 413 and emits nothing, so no
+      // partial body reaches the host and the channel stays open.
       let chunkTooLarge = false;
-      for (const chunk of chunkFrames) {
-        const encodedChunk = encodeDuplexFrameChecked(chunk);
-        if (!encodedChunk.ok) {
+      for (const frame of duplexBodyChunkFrames(requestId, requestBodyBuffer)) {
+        if (!encodeDuplexFrameChecked(frame).ok) {
           chunkTooLarge = true;
           break;
         }
-        encodedChunks.push(encodedChunk.line);
       }
       if (chunkTooLarge) {
         writeJsonResponse(res, 413, { error: "request_too_large" });
         return;
       }
+      // Retained-peak note. The gateway preserves the raw request bytes end to
+      // end and streams the body as body_chunk frames, one frame at a time. It
+      // does not hold the raw body plus the full base64 frame array plus the
+      // full encoded-line array (about 3.7x the raw body). The retained peak per
+      // read is now the raw body plus one encoded frame:
+      //   raw body       <= maxBodyBytes (about 10 MiB)
+      //   one body_chunk <= DEFAULT_MAX_DUPLEX_FRAME_BYTES (1 MB)
+      // so the peak is about maxBodyBytes + 1 MB per read. Admission charges
+      // maxBodyBytes per read against the 64 MiB inflight bound. The bound admits
+      // at most floor(64 MiB / maxBodyBytes) = 6 reads, so the true retained peak
+      // stays near 6 * (10 MiB + 1 MB) ~= 66 MiB. That is a fixed small margin
+      // over the admission threshold, not a multiple of the body. A malformed
+      // body cannot expand, because its raw bytes ride base64 frames unchanged.
       const response = await new Promise((resolve) => {
         const timer = setTimeout(() => {
           responseAssembly.delete(requestId);
@@ -2580,7 +2624,11 @@ function runDuplexGateway() {
         }, responseTimeoutMs);
         pending.set(requestId, { resolve: resolve, timer: timer });
         process.stdout.write(encodedRequest.line);
-        for (const line of encodedChunks) process.stdout.write(line);
+        for (const frame of duplexBodyChunkFrames(requestId, requestBodyBuffer)) {
+          const encoded = encodeDuplexFrameChecked(frame);
+          // Pass 1 proved every frame fits, so encoded.ok is always true here.
+          process.stdout.write(encoded.line);
+        }
       });
       res.statusCode = typeof response.status === "number" ? response.status : 200;
       for (const [key, value] of Object.entries(response.headers || {})) {

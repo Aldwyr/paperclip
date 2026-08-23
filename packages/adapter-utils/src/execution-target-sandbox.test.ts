@@ -2557,6 +2557,78 @@ describe("sandbox adapter execution targets", () => {
     }
   });
 
+  it("rejects an invalid-UTF-8 request body with a clean 400 and never forwards it", async () => {
+    // The file gateway writes the request body as a JSON string that the host
+    // reader consumes. A valid JSON body is always valid UTF-8. An invalid body
+    // would expand during a lossy UTF-8 round trip, so the gateway would retain
+    // and forward more bytes than admission charged. The gateway rejects an
+    // invalid-UTF-8 body with a clean 400 before it writes the body, so no
+    // expanded body reaches the host and the host runs no mutation.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-invalid-utf8-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+
+    const requests: Array<{ method: string; url: string }> = [];
+    const apiServer = createServer((req, res) => {
+      requests.push({ method: req.method ?? "GET", url: req.url ?? "/" });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "e2b",
+      environmentId: "env-1",
+      leaseId: "lease-1",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+      timeoutMs: 30_000,
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-bridge-invalid-utf8",
+      target,
+      runtimeRootDir,
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${address.port}`,
+      maxBodyBytes: 4096,
+    });
+    try {
+      // 0xFF is never a valid UTF-8 byte, so this body is not valid UTF-8.
+      const malformed = new Uint8Array([0x7b, 0xff, 0xff, 0x7d]);
+      const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+          "content-type": "application/json",
+        },
+        body: malformed,
+      });
+      // The gateway answers a clean, non-retryable 400 and leaks no internal
+      // message.
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toEqual({ error: "invalid_utf8_body" });
+      // The gateway rejected the body before it wrote the request, so the host
+      // reader forwarded nothing and ran no mutation.
+      expect(requests).toEqual([]);
+    } finally {
+      await bridge?.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
   it("fails an oversized host response with a non-retryable 409 so a committed mutation never repeats", async () => {
     // The host receives the request and commits the mutation, then sends a
     // response body over the size limit. The forward reads the body after the

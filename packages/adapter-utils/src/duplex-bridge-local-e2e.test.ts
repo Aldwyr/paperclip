@@ -18,6 +18,7 @@ import {
   DUPLEX_BODY_CHUNK_RAW_BYTES,
   DUPLEX_FRAME_VERSION,
   encodeDuplexFrame,
+  type DuplexBodyChunkFrame,
   type DuplexFrame,
   type DuplexReadyFrame,
   type DuplexRequestFrame,
@@ -859,4 +860,122 @@ describe("duplex bridge local end-to-end harness", () => {
     const later = await post();
     expect(later.status).toBe(200);
   }, 20000);
+
+  it("forwards a cap-sized malformed-UTF-8 body byte-for-byte and emits no expanded frame", async () => {
+    // Regression test for the admission-bypass block. The gateway used to decode
+    // the raw body to a UTF-8 string, then re-encode it. Each invalid byte
+    // became the three-byte U+FFFD replacement, so a cap-sized malformed body
+    // expanded to about three times the bytes that admission charged. The gateway
+    // now preserves the raw bytes, so the body rides base64 frames unchanged and
+    // no frame carries more than the charged bytes.
+    const maxBodyBytes = 700 * 1024;
+    const harness = await createHarness({ maxBodyBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    // 0xFF is never a valid UTF-8 byte. A cap-sized body of 0xFF bytes is the
+    // worst case for the old expansion path.
+    const malformed = Buffer.alloc(maxBodyBytes, 0xff);
+    const response = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: new Uint8Array(malformed),
+    });
+    expect(response.status).toBe(200);
+
+    // The observed frames are the exact bytes the gateway sent to the host. The
+    // envelope reports the raw byte count, not an expanded count.
+    const requestFrame = harness.observedFrames.find(
+      (frame): frame is DuplexRequestFrame => frame.type === "request",
+    );
+    expect(requestFrame?.bodyByteCount).toBe(maxBodyBytes);
+
+    // The body_chunk frames decode to the exact source bytes. No frame carried an
+    // expanded body, so no body larger than the charged bytes reached the host.
+    const bodyChunks = harness.observedFrames.filter(
+      (frame): frame is DuplexBodyChunkFrame => frame.type === "body_chunk",
+    );
+    const reassembled = Buffer.concat(
+      bodyChunks.map((frame) => Buffer.from(frame.data, "base64")),
+    );
+    expect(reassembled.length).toBe(maxBodyBytes);
+    expect(reassembled.equals(malformed)).toBe(true);
+
+    // The route stays usable after the malformed body.
+    const later = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ok: true }),
+    });
+    expect(later.status).toBe(200);
+  }, 30000);
+
+  it("caps concurrent body reads at the retained-byte model, then releases the reserve", async () => {
+    // Production-size accounting. Admission charges maxBodyBytes per read against
+    // the inflight bound, so the bound admits floor(bound / maxBodyBytes) reads.
+    // With the production constants that is floor(64 MiB / (10 MiB + 1)) = 6. The
+    // reservation is the worst-case body per read, so a small body still charges
+    // the full maxBodyBytes. So the test drives the model with small bodies and
+    // asserts the admitted count matches the model.
+    const maxBodyBytes = 10 * 1024 * 1024 + 1;
+    const maxInflightBodyBytes = 64 * 1024 * 1024;
+    const admitCount = Math.floor(maxInflightBodyBytes / maxBodyBytes);
+    expect(admitCount).toBe(6);
+    const harness = await createHarness({
+      maxBodyBytes,
+      maxInflightBodyBytes,
+      // A short response deadline releases each hung read fast.
+      responseTimeoutMs: 800,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    // Each admitted read hangs on the forward until it times out, so all admitted
+    // reads hold their reserve at once and the next read cannot reserve.
+    harness.setForwardMode("hang");
+    const body = "a".repeat(1024);
+    const post = () =>
+      fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    const responses = await Promise.all(
+      Array.from({ length: admitCount + 1 }, () => post()),
+    );
+    const statuses = responses.map((response) => response.status);
+    // The model admits exactly admitCount reads. Each admitted read times out
+    // with a 502. The one read past the model is shed with a 503 before it
+    // buffers a body.
+    const shedCount = statuses.filter((status) => status === 503).length;
+    const admittedTimedOut = statuses.filter((status) => status === 502).length;
+    expect(shedCount).toBe(1);
+    expect(admittedTimedOut).toBe(admitCount);
+    const shed = responses.find((response) => response.status === 503);
+    await expect(shed?.json()).resolves.toEqual({ error: "bridge_busy" });
+
+    // The admitted reads released their reserve on timeout. A later request is
+    // admitted again and reaches the API.
+    harness.setForwardMode("proxy");
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const later = await post();
+    expect(later.status).toBe(200);
+  }, 30000);
 });
