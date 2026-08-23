@@ -90,6 +90,7 @@ import {
   hasCompanyAccess,
 } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
+import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -187,8 +188,11 @@ import {
 import {
   AdapterAuthSessionConflictError,
   createCodexDeviceLoginService,
+  createCodexWorkerBoundLoginPtyOpener,
   createDbAdapterAuthSessionStore,
   createProductionLoginSessionRuntime,
+  CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED,
+  CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE,
 } from "../services/codex-device-login-service.js";
 import type { AdapterAuthSessionOwnerResponse } from "@paperclipai/shared";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
@@ -572,7 +576,28 @@ export function agentRoutes(
   const adapterLoginStore = createDbAdapterAuthSessionStore(db);
   const adapterLoginService = createCodexDeviceLoginService({
     store: adapterLoginStore,
-    runtime: createProductionLoginSessionRuntime({ db, environmentRuntime }),
+    runtime: createProductionLoginSessionRuntime({
+      db,
+      environmentRuntime,
+      // Re-check the provider login pseudo-terminal capability from current
+      // runtime state immediately before the provider lease. The route gate ran
+      // earlier, so a managed reconciliation can rebind the environment to an
+      // unsupported provider between the gate and the acquire; this fails closed
+      // before the lease and the pseudo-terminal.
+      assertProviderSupportsLoginPty: (environmentId) =>
+        assertCodexLoginProviderCapability(environmentId),
+      // Wire the live Codex pseudo-terminal opener through the plugin worker
+      // manager route. The opener sets the sandbox `CODEX_HOME` to the same
+      // server-controlled session home the descriptor-bound credential read
+      // opens. When no worker manager is bound, the runtime keeps its fail-closed
+      // opener and the login fails closed.
+      openLivePtySession: options.pluginWorkerManager
+        ? createCodexWorkerBoundLoginPtyOpener({
+            workerManager: options.pluginWorkerManager,
+            log: (line) => logger.info(line),
+          })
+        : undefined,
+    }),
     // The mandatory credential promotion. A successful login authenticates only
     // after this promotion validates the exact staged credential, runs an
     // independent readiness check, confirms the session still holds the sole
@@ -1405,15 +1430,25 @@ export function agentRoutes(
     return findActiveServerAdapter(type)?.loginCapability ?? null;
   }
 
-  // The device-login route drives a login over the streamed exec channel. It
-  // serves any adapter whose registry login capability declares that transport.
-  // The guard reads the capability, not the adapter name, so a new adapter with
-  // the same transport passes with no code change. It rejects an adapter with no
-  // matching capability with a fixed 400.
-  function assertStreamedExecLoginAdapter(type: string): void {
-    if (
-      getRegistryLoginCapability(type)?.sandboxTransport !== "streamed_exec"
-    ) {
+  // The device-login route drives a login that shows a one-time code on a real
+  // pseudo-terminal. It serves an adapter whose registry login capability
+  // declares the displayed-code panel mode and whose trusted adapter type maps
+  // to a login command key. The guard reads the panel mode and the command map,
+  // not the adapter name, so a new adapter that satisfies both passes with no
+  // guard code change. It rejects an adapter with no matching capability, and an
+  // adapter with no mapped command key, with the same fixed 400.
+  //
+  // The command-map check keeps admission consistent with the closed command
+  // map. The login opener resolves the command key from the same map. An adapter
+  // that declares the displayed-code capability but has no mapped key would pass
+  // the panel-mode check, then fail at command resolution after the route
+  // creates session state. The guard rejects it before any session or lease side
+  // effect.
+  function assertDeviceLoginAdapter(type: string): void {
+    if (getRegistryLoginCapability(type)?.panelMode !== "displayed_code") {
+      throw badRequest(`Adapter "${type}" does not support a device login.`);
+    }
+    if (!isLoginCommandSupportedAdapterType(type)) {
       throw badRequest(`Adapter "${type}" does not support a device login.`);
     }
   }
@@ -1469,16 +1504,15 @@ export function agentRoutes(
   }
 
   /**
-   * Fails closed when the environment provider does not advertise the Claude
-   * setup-token login capability. It resolves the effective provider from the
-   * environment config, then reads the static capability from the provider
-   * plugin manifest. It never checks the provider by name. A missing plugin, a
-   * non-plugin provider, and a provider without the flag all fail closed with
-   * the fixed, typed error, so no session row, lease, or pseudo-terminal starts.
+   * Reports whether the environment provider advertises the login pseudo-terminal
+   * capability. It resolves the effective provider from the current environment
+   * config, then reads the static capability from the provider plugin manifest. It
+   * never checks the provider by name. A missing provider, a missing plugin, a
+   * non-plugin provider, and a provider without the flag all return false. Both
+   * login flows share this resolver, so both gates read the same current
+   * capability.
    */
-  async function assertSetupTokenLoginProviderCapability(
-    environmentId: string,
-  ): Promise<void> {
+  async function resolveProviderSupportsLoginPty(environmentId: string): Promise<boolean> {
     const environment = await environmentsSvc.getById(environmentId);
     const config =
       environment?.config && typeof environment.config === "object"
@@ -1491,9 +1525,35 @@ export function agentRoutes(
           driverKey: provider,
         })
       : null;
-    if (!resolved?.driver.supportsLoginPty) {
+    return resolved?.driver.supportsLoginPty === true;
+  }
+
+  /**
+   * Fails closed when the environment provider does not advertise the login
+   * pseudo-terminal capability that the Claude setup-token login needs. It reads
+   * the current provider capability. It fails closed with the fixed, typed error,
+   * so no session row, lease, or pseudo-terminal starts.
+   */
+  async function assertSetupTokenLoginProviderCapability(environmentId: string): Promise<void> {
+    if (!(await resolveProviderSupportsLoginPty(environmentId))) {
       throw unprocessable(SETUP_TOKEN_PROVIDER_UNSUPPORTED, {
         code: SETUP_TOKEN_PROVIDER_UNSUPPORTED_CODE,
+      });
+    }
+  }
+
+  /**
+   * Fails closed when the environment provider does not advertise the login
+   * pseudo-terminal capability that the Codex device login needs. It reads the
+   * current provider capability. The Codex route runs it before any session or
+   * lease state, and the lease-acquisition path runs it again from current runtime
+   * state before the provider lease. It fails closed with the fixed, typed error,
+   * so no session row, lease, or pseudo-terminal starts.
+   */
+  async function assertCodexLoginProviderCapability(environmentId: string): Promise<void> {
+    if (!(await resolveProviderSupportsLoginPty(environmentId))) {
+      throw unprocessable(CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED, {
+        code: CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE,
       });
     }
   }
@@ -3076,12 +3136,19 @@ export function agentRoutes(
         req,
         res,
         deriveOwner: () => assertCanManageAdapterLogin(req, companyId),
-        guardBeforeValidate: () => assertStreamedExecLoginAdapter(type),
+        guardBeforeValidate: () => assertDeviceLoginAdapter(type),
         requestSchema: startAdapterAuthSessionRequestSchema,
         invalidRequestError: "The device login start request is invalid.",
         requestOverrides: { adapterType: type },
-        assertSandbox: (data) =>
-          assertSandboxLoginEnvironment(companyId, data.environmentId),
+        assertSandbox: async (data) => {
+          // The device login runs on a real pseudo-terminal, so it needs a
+          // provider that advertises the login pseudo-terminal capability. Gate
+          // the route on the current provider capability before any session or
+          // lease state. The lease-acquisition path re-checks it from current
+          // runtime state before the provider lease.
+          await assertSandboxLoginEnvironment(companyId, data.environmentId);
+          await assertCodexLoginProviderCapability(data.environmentId);
+        },
       });
       if (!resolved) return;
       const { ownerUserId: startedByUserId, data } = resolved;
@@ -3130,7 +3197,7 @@ export function agentRoutes(
       const type = req.params.type as string;
       const sessionId = req.params.sessionId as string;
       const ownerUserId = await assertCanManageAdapterLogin(req, companyId);
-      assertStreamedExecLoginAdapter(type);
+      assertDeviceLoginAdapter(type);
 
       const owner = await readOwnerLoginSession(
         companyId,
@@ -3155,7 +3222,7 @@ export function agentRoutes(
       const type = req.params.type as string;
       const sessionId = req.params.sessionId as string;
       const ownerUserId = await assertCanManageAdapterLogin(req, companyId);
-      assertStreamedExecLoginAdapter(type);
+      assertDeviceLoginAdapter(type);
 
       // Scope the cancel to this company, adapter, and owner. A non-owner and a
       // cross-company caller both receive a 404 and cannot cancel a session.
@@ -5747,15 +5814,12 @@ export function agentRoutes(
         guardAfterValidate: (data) => {
           // The setup-token route drives a login on a pseudo-terminal and records a
           // stored session identifier on success. It serves any adapter whose
-          // registry login capability declares that transport and that claim. The
+          // registry login capability records that completion claim. The
           // guard reads the capability, not the adapter name, so a new adapter with
           // the same capability passes with no code change. It rejects an adapter
           // with no matching capability with a fixed 400.
           const capability = getRegistryLoginCapability(data.adapterType);
-          if (
-            capability?.sandboxTransport !== "pseudo_terminal" ||
-            capability.completionClaim !== "storedSessionId"
-          ) {
+          if (capability?.completionClaim !== "storedSessionId") {
             res.status(400).json({
               error: "This adapter does not support a setup-token login.",
             });

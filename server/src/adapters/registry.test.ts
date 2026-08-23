@@ -26,7 +26,6 @@ describe("built-in adapter login capabilities", () => {
     expect(capability).toBeDefined();
     if (!capability) return;
     expect(capability.panelMode).toBe("displayed_code");
-    expect(capability.sandboxTransport).toBe("streamed_exec");
     expect(capability.timeoutPolicy).toBe("caller_bounded");
     expect(capability.completionClaim).toBeUndefined();
     expect(typeof capability.getCommand).toBe("function");
@@ -39,7 +38,6 @@ describe("built-in adapter login capabilities", () => {
     expect(capability).toBeDefined();
     if (!capability) return;
     expect(capability.panelMode).toBe("submitted_browser_code");
-    expect(capability.sandboxTransport).toBe("pseudo_terminal");
     expect(capability.timeoutPolicy).toBe("fixed");
     expect(capability.completionClaim).toBe("storedSessionId");
     expect(typeof capability.getCommand).toBe("function");

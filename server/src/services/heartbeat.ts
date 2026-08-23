@@ -90,6 +90,7 @@ import {
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js";
 import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.js";
+import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
@@ -7741,6 +7742,14 @@ export interface HeartbeatServiceOptions {
   nativeSessionBackendFactory?: (
     execution: NativeExecutionInput,
   ) => NativeSessionBackend;
+  /**
+   * The process-owned aggregate byte ledger for the sandbox duplex channel. The
+   * server root creates one ledger per host process and injects the same object
+   * here. The heartbeat threads it into the environment run orchestrator, which
+   * stamps it onto the sandbox execution target. Absent keeps the bridge inert
+   * for this seam.
+   */
+  duplexAggregateByteLedger?: DuplexAggregateByteLedger | null;
 }
 
 type WorkspaceReadyCommentWriter = {
@@ -7887,6 +7896,7 @@ export function heartbeatService(
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
+    duplexAggregateByteLedger: options.duplexAggregateByteLedger,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
