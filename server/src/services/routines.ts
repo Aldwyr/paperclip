@@ -1679,6 +1679,9 @@ export function routineService(
         sql`, `,
       );
       const liveStatusValues = sql.join(OPEN_ISSUE_STATUSES.map((status) => sql`${status}`), sql`, `);
+      // Keep this as a statement after the candidate locks. Under READ
+      // COMMITTED, a child transaction that held KEY SHARE first must commit
+      // before those locks are granted, and this new snapshot sees that child.
       const liveDescendants = Array.from(await txDb.execute(sql`
           with recursive roots(root_id) as (
             values ${rootValues}

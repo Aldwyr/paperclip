@@ -7142,6 +7142,10 @@ export function issueService(db: Db) {
         }
 
         if (issueData.parentId) {
+          // This conflicts with the supersession sweep's FOR UPDATE lock. When
+          // creation wins the lock order, it commits before the sweep proceeds;
+          // the sweep's following descendant query then sees the new child in
+          // its fresh READ COMMITTED snapshot.
           const parent = await tx
             .select({
               id: issues.id,
