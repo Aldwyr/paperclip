@@ -1650,7 +1650,7 @@ export function routineService(
         .innerJoin(
           routineRuns,
           and(
-            eq(routineRuns.linkedIssueId, issues.id),
+            sql`${routineRuns.id}::text = ${issues.originRunId}`,
             eq(routineRuns.companyId, issues.companyId),
           ),
         )
@@ -1769,6 +1769,7 @@ export function routineService(
                 eq(routineRuns.companyId, input.companyId),
                 eq(routineRuns.routineId, input.routineId),
                 eq(routineRuns.linkedIssueId, candidate.supersededByIssueId),
+                eq(routineRuns.status, "completed"),
               ),
             )
             .then((rows) => rows[0] ?? null);

@@ -404,6 +404,73 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
+  it("preserves coalesced run history when the owning execution is superseded", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const owner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const coalescedRunId = randomUUID();
+    const coalescedAt = new Date("2026-08-23T10:15:00.000Z");
+    await db.insert(routineRuns).values({
+      id: coalescedRunId,
+      companyId,
+      routineId: optedInRoutine!.id,
+      routineRevisionId: revisionId,
+      source: "manual",
+      status: "coalesced",
+      triggeredAt: coalescedAt,
+      completedAt: coalescedAt,
+      linkedIssueId: owner.issue.id,
+      coalescedIntoRunId: owner.runId,
+    });
+    const winner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T11:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+
+    await issueSvc.update(winner.issue.id, { status: "done" });
+    await svc.syncRunStatusForIssue(winner.issue.id);
+
+    const runRows = await db
+      .select()
+      .from(routineRuns)
+      .where(inArray(routineRuns.id, [owner.runId, coalescedRunId]));
+    expect(runRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: owner.runId,
+        status: "superseded",
+        supersededByRunId: winner.runId,
+      }),
+      expect.objectContaining({
+        id: coalescedRunId,
+        status: "coalesced",
+        coalescedIntoRunId: owner.runId,
+        supersededByRunId: null,
+      }),
+    ]));
+    const supersededActivities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.superseded"));
+    expect(supersededActivities).toEqual([
+      expect.objectContaining({
+        entityId: owner.issue.id,
+        details: expect.objectContaining({ supersededRunId: owner.runId }),
+      }),
+    ]);
+  });
+
   it("preserves an older instance with a live grandchild while superseding instances without live descendants", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
