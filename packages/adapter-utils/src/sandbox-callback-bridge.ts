@@ -2365,15 +2365,32 @@ const DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES = DEFAULT_MAX_DUPLEX_FRAME_BY
 let reservedBodyBytes = 0;
 const noopRelease = () => {};
 
-// Reserve reserveBytes against the local admission bound for one active read.
-// Return a release function on success, or null when the bound is full. Each
-// caller releases on every terminal path: success, size rejection, other
-// error, timeout, and connection close.
+// reserveBodyRead returns this marker when reserveBytes alone -- with no
+// other read competing for the bound -- is larger than the whole inflight
+// bound. No amount of waiting admits that read, so a caller must answer a
+// non-retryable 413, not a retryable 503: the same reasoning that turned the
+// old retryable 502 on an oversize body into a clean 413. In-spec traffic
+// never reaches this branch once the reserve charge matches the true
+// retained peak; it exists as a backstop, so a future factor change that
+// breaks that property fails loudly instead of turning legal traffic into
+// an endless retry loop.
+const RESERVE_NEVER_FITS = Symbol("reserve_never_fits");
+
+// Reserve reserveBytes against the local admission bound for one active
+// read. Return a release function on success, RESERVE_NEVER_FITS when
+// reserveBytes alone can never fit the bound (see its comment), or null when
+// the bound is only transiently full -- other active reads hold it, and a
+// retry can succeed, so 503 is the right answer for that case. Each caller
+// releases the returned function on every terminal path: success, size
+// rejection, other error, timeout, and connection close.
 //
 // A caller passes the bytes the read will actually retain -- the declared
 // body size times the calling gateway's representation factor, plus that
 // gateway's fixed per-read term -- not a flat per-request charge.
 function reserveBodyRead(reserveBytes) {
+  if (reserveBytes > maxInflightBodyBytes) {
+    return RESERVE_NEVER_FITS;
+  }
   if (reservedBodyBytes + reserveBytes > maxInflightBodyBytes) {
     return null;
   }
@@ -2562,13 +2579,18 @@ async function runFileGateway() {
       // the same worst-case charge the old flat model always used -- but
       // readBody itself never preallocates that worst case; see its comment.
       const reserveCharge = hasRequestBody ? (declaredLength !== null ? declaredLength : maxBodyBytes) : 0;
-      const releaseBodyRead = hasRequestBody
+      const reserved = hasRequestBody
         ? reserveBodyRead(reserveCharge * FILE_GATEWAY_BODY_RESERVE_FACTOR + FILE_GATEWAY_BODY_RESERVE_EXTRA_BYTES)
         : noopRelease;
-      if (!releaseBodyRead) {
+      if (reserved === RESERVE_NEVER_FITS) {
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
+      if (!reserved) {
         writeJsonResponse(res, 503, { error: "bridge_busy" });
         return;
       }
+      const releaseBodyRead = reserved;
       try {
       const requestBody = decodeUtf8Body(await readBody(req, declaredLength, maxBodyBytes));
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);
@@ -2928,13 +2950,18 @@ function runDuplexGateway() {
       // the same worst-case charge as before -- but readBody itself never
       // preallocates that worst case; see its comment.
       const reserveCharge = hasRequestBody ? (declaredLength !== null ? declaredLength : maxBodyBytes) : 0;
-      const releaseBodyRead = hasRequestBody
+      const reserved = hasRequestBody
         ? reserveBodyRead(reserveCharge + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES)
         : noopRelease;
-      if (!releaseBodyRead) {
+      if (reserved === RESERVE_NEVER_FITS) {
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
+      if (!reserved) {
         writeJsonResponse(res, 503, { error: "bridge_busy" });
         return;
       }
+      const releaseBodyRead = reserved;
       // Once the send below starts, releaseReserveWhenBothDone owns the
       // reserve release. This flag stays false only while a return above the
       // send can still happen, so the outer finally releases directly for

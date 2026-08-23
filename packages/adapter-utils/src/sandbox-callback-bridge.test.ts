@@ -1244,6 +1244,183 @@ describe("sandbox callback bridge", () => {
     expect(receivedBody).toBe(body);
   }, 20000);
 
+  it("verifies the real no-declared-length request shapes are all admitted at production defaults: DELETE, chunked POST, and empty-body POST", async () => {
+    // Coverage note from the PAP-5041 scope amendment: verify the real
+    // header shapes a client sends, do not assume them. A DELETE with no
+    // body sends no Content-Length header at all. A POST with a streamed
+    // body sends chunked transfer encoding and no Content-Length (covered by
+    // the test above). A POST with an explicit empty body sends
+    // "Content-Length: 0" -- a known, zero, declared length, so it takes the
+    // exact-size readBody path rather than the unknown-length one. All three
+    // must reach the host worker, not a 503, at the production inflight
+    // default.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-header-shapes-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge header shapes test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const seenMethods: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        seenMethods.push(request.method);
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+      // maxInflightBodyBytes stays at the production default (64 MiB).
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const deleteResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1`, {
+      method: "DELETE",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+    });
+    expect(deleteResponse.status).not.toBe(503);
+
+    const emptyBodyResponse = await fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body: "",
+    });
+    expect(emptyBodyResponse.status).not.toBe(503);
+
+    const chunkedResponse = await postWithoutContentLength(
+      `${bridge.baseUrl}/api/issues/issue-1/comments`,
+      {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+      JSON.stringify({ body: "a chunked comment" }),
+    );
+    expect(chunkedResponse.status).not.toBe(503);
+
+    expect(seenMethods).toEqual(["DELETE", "POST", "POST"]);
+  }, 20000);
+
+  it("answers a non-retryable 413, not a retryable 503, when a single read's charge alone can never fit the inflight bound", async () => {
+    // Regression coverage for the PAP-5041 scope amendment's criterion 9:
+    // reserveBodyRead must not answer a retryable 503 for a read that can
+    // never fit the bound on its own -- no amount of waiting admits it, so a
+    // caller that retries loops forever. This pins maxInflightBodyBytes well
+    // under a single read's charge, on an otherwise idle gateway, so the
+    // bound is never transiently full -- the charge alone is the only reason
+    // admission fails.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-never-fits-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge never-fits test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const maxBodyBytes = 4096;
+    const bodySize = 1024;
+    // reserveCharge (1024) * FACTOR (4) + EXTRA_BYTES (393216) is about
+    // 397 KiB. Pin maxInflightBodyBytes far under that, so the charge alone
+    // -- not contention from another read -- is why admission fails.
+    const maxInflightBodyBytes = 1024;
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+      maxBodyBytes,
+      maxInflightBodyBytes,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const body = "a".repeat(bodySize);
+    const post = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+    const first = await post();
+    expect(first.status).toBe(413);
+    await expect(first.json()).resolves.toEqual({ error: "request_too_large" });
+
+    // A never-fits read takes no reserve, so a second, otherwise-identical
+    // request also gets an immediate 413, not a transient 503 from a
+    // phantom reservation the first request supposedly left behind.
+    const second = await post();
+    expect(second.status).toBe(413);
+  }, 20000);
+
   it("streams the escaped request body correctly across a write-slice boundary, including a split surrogate pair", async () => {
     // Regression coverage for the streamed write in runFileGateway: it must
     // reassemble a body that crosses FILE_GATEWAY_BODY_WRITE_SLICE_CHARS
