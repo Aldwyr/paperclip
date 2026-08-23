@@ -2269,11 +2269,12 @@ export async function runDurableEvalSession(
   const authorized = dispatcher.listTools(identity.runId);
   const loadedOperations = new Set<string>();
   const discoveryEvidence: Array<Record<string, unknown>> = [];
-  let nativeResumeCall: {
+  type NativeResumeCall = {
     callId: string;
     operationId: string;
     input: unknown;
-  } | null = null;
+  };
+  let nativeResumeCall: NativeResumeCall | null = null;
   let releaseNativeSemanticDispatch!: () => void;
   const nativeSemanticDispatchReleased = new Promise<void>((resolveDispatch) => {
     releaseNativeSemanticDispatch = resolveDispatch;
@@ -2544,7 +2545,8 @@ export async function runDurableEvalSession(
       handle = launchRunner();
       if (typeof handle.child.pid === "number")
         runnerProcessPids.push(handle.child.pid);
-      const pendingCall = nativeResumeCall;
+      // TypeScript cannot infer assignment performed in the async dispatch callback.
+      const pendingCall = nativeResumeCall as NativeResumeCall;
       const pendingCallWasReconciled = (): boolean =>
         core.store.state.committedEvents.some((event) => {
           if (event.eventType !== "semantic_tool.reconciled") return false;
@@ -2946,8 +2948,9 @@ export async function runDurableEvalSession(
     if (!assistantText)
       assistantText = "Provider completed the requested Paperclip operation.";
     const finalState = JSON.stringify(authority.snapshot());
+    const completedNativeResumeCall = nativeResumeCall as NativeResumeCall | null;
     const nativeResumeProof =
-      input.nativeResume === undefined || nativeResumeCall === null
+      input.nativeResume === undefined || completedNativeResumeCall === null
         ? undefined
         : (() => {
             const semanticEvents = records.flatMap((record) => {
@@ -2957,8 +2960,8 @@ export async function runDurableEvalSession(
               const semantic = payload?.semantic_tool as
                 | Record<string, unknown>
                 | undefined;
-              return semantic?.callId === nativeResumeCall.callId &&
-                semantic.operationId === nativeResumeCall.operationId
+              return semantic?.callId === completedNativeResumeCall.callId &&
+                semantic.operationId === completedNativeResumeCall.operationId
                 ? [{ eventType: record.eventType, semantic }]
                 : [];
             });
@@ -2978,8 +2981,8 @@ export async function runDurableEvalSession(
               providerThreadDigest: providerThreadIds[0]
                 ? `sha256:${createHash("sha256").update(providerThreadIds[0]).digest("hex")}`
                 : null,
-              callId: nativeResumeCall.callId,
-              operationId: nativeResumeCall.operationId,
+              callId: completedNativeResumeCall.callId,
+              operationId: completedNativeResumeCall.operationId,
               inputEventCount: semanticEvents.filter(
                 (event) => event.eventType === "semantic_tool.input",
               ).length,
