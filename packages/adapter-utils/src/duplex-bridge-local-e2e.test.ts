@@ -889,6 +889,39 @@ describe("duplex bridge local end-to-end harness", () => {
     expect(later.status).toBe(200);
   }, 20000);
 
+  it("charges a bodyless DELETE the zero-length reserve, not the worst-case maxBodyBytes charge", async () => {
+    // Regression coverage for PAP-5046. A DELETE with no body sends neither a
+    // Content-Length header nor a Transfer-Encoding header. Before the fix,
+    // declaredBodyBytes returned null for that shape and the gateway charged
+    // the worst-case maxBodyBytes reserve, the same charge as an unknown-size
+    // chunked body. This pins maxInflightBodyBytes to fit the zero-length
+    // charge (0 + DEFAULT_MAX_DUPLEX_FRAME_BYTES) but not the worst-case
+    // charge (maxBodyBytes + DEFAULT_MAX_DUPLEX_FRAME_BYTES), so only the
+    // fixed classification admits the request.
+    const maxBodyBytes = 4096;
+    const maxInflightBodyBytes = DEFAULT_MAX_DUPLEX_FRAME_BYTES;
+    const harness = await createHarness({ maxBodyBytes, maxInflightBodyBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    let apiWasCalled = false;
+    harness.api.setResponder((_req, res) => {
+      apiWasCalled = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    // /api/routine-triggers/{id} is the one DELETE route the host allowlist
+    // admits; a DELETE elsewhere gets a 403 before it reaches the API,
+    // regardless of this fix, so this path isolates the admission charge.
+    const response = await fetch(`${harness.baseUrl}/api/routine-triggers/t-1`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${harness.bridgeToken}`, "content-type": "application/json" },
+    });
+    expect(response.status).not.toBe(503);
+    expect(apiWasCalled).toBe(true);
+  }, 20000);
+
   it("admits many small concurrent requests that the old flat 10 MiB charge would have shed with 503", async () => {
     // Production constants. Under the old flat charge every active read
     // reserved maxBodyBytes (about 10 MiB) regardless of the real body size,

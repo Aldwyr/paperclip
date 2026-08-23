@@ -1344,6 +1344,164 @@ describe("sandbox callback bridge", () => {
     expect(seenMethods).toEqual(["DELETE", "POST", "POST"]);
   }, 20000);
 
+  it("admits two concurrent DELETE requests with no body at production admission defaults", async () => {
+    // Regression coverage for PAP-5046. A DELETE with no body sends neither a
+    // Content-Length header nor a Transfer-Encoding header, so before the fix
+    // declaredBodyBytes returned null for it and the gateway charged the
+    // worst-case maxBodyBytes reserve, the same charge as an actual 10 MiB
+    // body. Two such requests together exceeded the production inflight
+    // bound and the second one got a 503. This test sends two concurrent
+    // DELETE requests at the production maxBodyBytes and maxInflightBodyBytes
+    // defaults (no override) and asserts both reach the host worker.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-delete-concurrent-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge delete concurrent test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: { remoteCwd: remoteWorkspaceDir, timeoutMs: 30_000 },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const seenMethods: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        seenMethods.push(request.method);
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    // No maxBodyBytes or maxInflightBodyBytes override -- both stay at their
+    // production defaults (10,485,761 and 67,108,864 bytes).
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const del = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${bridgeToken}`, "content-type": "application/json" },
+      });
+    const [first, second] = await Promise.all([del(), del()]);
+    expect(first.status).not.toBe(503);
+    expect(second.status).not.toBe(503);
+    expect(seenMethods).toEqual(["DELETE", "DELETE"]);
+  }, 20000);
+
+  it("admits a DELETE concurrent with a file-gateway POST at the production max-body-bytes bound", async () => {
+    // Regression coverage for PAP-5046. Before the fix, a bodyless DELETE
+    // charged the same worst-case reserve as a POST at the body cap. Two such
+    // charges together exceeded the production inflight bound, so a legal
+    // DELETE competing with a legal large POST got shed with a 503. This test
+    // sends one DELETE concurrent with one POST at exactly one byte under the
+    // production body cap (10,485,760 bytes), with no maxBodyBytes or
+    // maxInflightBodyBytes override, and asserts both reach the host worker.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-delete-post-concurrent-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge delete+post concurrent test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: { remoteCwd: remoteWorkspaceDir, timeoutMs: 30_000 },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    const seenMethods: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        seenMethods.push(request.method);
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    // No maxBodyBytes or maxInflightBodyBytes override -- both stay at their
+    // production defaults (10,485,761 and 67,108,864 bytes).
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const del = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${bridgeToken}`, "content-type": "application/json" },
+      });
+    const largeBody = "a".repeat(10 * 1024 * 1024 - 1);
+    const post = () =>
+      fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${bridgeToken}`, "content-type": "application/json" },
+        body: largeBody,
+      });
+    const [delResponse, postResponse] = await Promise.all([del(), post()]);
+    expect(delResponse.status).not.toBe(503);
+    expect(postResponse.status).not.toBe(503);
+    expect(seenMethods.sort()).toEqual(["DELETE", "POST"]);
+  }, 30000);
+
   it("answers a non-retryable 413, not a retryable 503, when a single read's charge alone can never fit the inflight bound", async () => {
     // Regression coverage for the PAP-5041 scope amendment's criterion 9:
     // reserveBodyRead must not answer a retryable 503 for a read that can
@@ -1522,8 +1680,16 @@ describe("sandbox callback bridge", () => {
     };
     const embedded = factory();
 
-    expect(embedded.declaredBodyBytes({ headers: {} })).toBeNull();
+    // PAP-5046: a request with neither header has no body (RFC 9112 section
+    // 6.3), so it classifies as a declared zero, not an unknown length.
+    expect(embedded.declaredBodyBytes({ headers: {} })).toBe(0);
     expect(embedded.declaredBodyBytes({ headers: { "content-length": "42" } })).toBe(42);
+    // A Transfer-Encoding header always means an unknown length, even when a
+    // Content-Length header rides alongside it.
+    expect(embedded.declaredBodyBytes({ headers: { "transfer-encoding": "chunked" } })).toBeNull();
+    expect(
+      embedded.declaredBodyBytes({ headers: { "content-length": "42", "transfer-encoding": "chunked" } }),
+    ).toBeNull();
 
     const maxBodyBytes = 10 * 1024 * 1024 + 1;
     async function* fakeRequest(chunks: Buffer[]) {

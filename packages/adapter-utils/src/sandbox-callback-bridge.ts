@@ -2130,15 +2130,40 @@ class BridgeBodyTooLargeError extends Error {
   }
 }
 
-// Read the declared body size from the Content-Length request header. Node's
-// HTTP server validates the header's syntax before a request reaches a
-// handler, so this only needs to guard the two cases that leave the gateway
-// with no declared size: the header is absent, or its value is not a plain
-// non-negative integer (a chunked request carries no Content-Length header
-// at all). Both cases return null, so a caller can tell a declared length
-// from an unknown one and pick the right read strategy in readBody.
+// Classify a request's body framing into exactly three states, so a caller
+// charges the right admission reserve for each one instead of folding
+// "no body at all" into the same worst-case charge as "a body of unknown
+// size". This function applies RFC 9112 section 6.3's precedence:
+//
+// 1. A Transfer-Encoding header is present: the length is unknown, even
+//    when a Content-Length header rides alongside it. Chunked framing
+//    wins, and the worst-case charge is the safe answer, because the
+//    gateway cannot know a chunked body's size before it reads it.
+// 2. No Transfer-Encoding header, and a valid Content-Length header (a
+//    plain non-negative safe integer): the length is declared, and it is
+//    that value.
+// 3. Neither header is present: RFC 9112 section 6.3 says a request with
+//    no Content-Length header and no Transfer-Encoding header has no
+//    body, so the declared length is zero. A DELETE request commonly
+//    takes this form.
+//
+// Returns a non-negative integer for a declared length (0 for a bodyless
+// request), or null for an unknown length. A caller that sees null still
+// substitutes the worst-case maxBodyBytes charge, exactly as before; a
+// caller that sees 0 now charges the zero-length reserve instead. Node's
+// HTTP server validates each header's syntax before a request reaches a
+// handler, so a malformed Content-Length value only reaches this function
+// through Node's own escape hatch; this function treats that case as
+// unknown, the same safe answer Node's own rejection would have forced.
 function declaredBodyBytes(req) {
+  const transferEncoding = req.headers["transfer-encoding"];
+  if (typeof transferEncoding === "string" && transferEncoding.length > 0) {
+    return null;
+  }
   const raw = req.headers["content-length"];
+  if (raw === undefined) {
+    return 0;
+  }
   if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) {
     return null;
   }
@@ -2578,6 +2603,19 @@ async function runFileGateway() {
       // The charge substitutes maxBodyBytes for an unknown declared length --
       // the same worst-case charge the old flat model always used -- but
       // readBody itself never preallocates that worst case; see its comment.
+      // declaredBodyBytes now returns 0, not null, for a request with
+      // neither a Content-Length nor a Transfer-Encoding header, so a
+      // bodyless request (a DELETE, for example) charges the zero-length
+      // reserve here, not this worst-case fallback.
+      //
+      // A chunked request still declares no length (declaredBodyBytes
+      // returns null for it), so it still charges the whole cap here. At
+      // the production defaults (maxBodyBytes 10,485,761, factor 4, extra
+      // bytes 393,216) that charge is about 42.3 MB, and the 64 MiB
+      // inflight bound admits exactly one such request at a time. This is
+      // intentional: the gateway cannot know a chunked body's size before
+      // it reads it, so an honest worst-case charge is the correct, safe
+      // answer.
       const reserveCharge = hasRequestBody ? (declaredLength !== null ? declaredLength : maxBodyBytes) : 0;
       const reserved = hasRequestBody
         ? reserveBodyRead(reserveCharge * FILE_GATEWAY_BODY_RESERVE_FACTOR + FILE_GATEWAY_BODY_RESERVE_EXTRA_BYTES)
@@ -2948,7 +2986,20 @@ function runDuplexGateway() {
       }
       // The charge substitutes maxBodyBytes for an unknown declared length --
       // the same worst-case charge as before -- but readBody itself never
-      // preallocates that worst case; see its comment.
+      // preallocates that worst case; see its comment. declaredBodyBytes now
+      // returns 0, not null, for a request with neither a Content-Length nor
+      // a Transfer-Encoding header, so a bodyless request charges the
+      // zero-length reserve here, not this worst-case fallback. The charge
+      // for a declared length and for an unknown length is unchanged in
+      // value from before.
+      //
+      // A chunked request still declares no length (declaredBodyBytes
+      // returns null for it), so it still charges the whole cap here. At
+      // the production defaults (maxBodyBytes 10,485,761, extra bytes
+      // 1,048,576) that charge is about 11.5 MB, and the 64 MiB inflight
+      // bound admits up to 5 such requests at a time. This is intentional:
+      // the gateway cannot know a chunked body's size before it reads it,
+      // so an honest worst-case charge is the correct, safe answer.
       const reserveCharge = hasRequestBody ? (declaredLength !== null ? declaredLength : maxBodyBytes) : 0;
       const reserved = hasRequestBody
         ? reserveBodyRead(reserveCharge + DUPLEX_GATEWAY_BODY_READ_RESERVE_EXTRA_BYTES)
