@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -13,9 +13,11 @@ import {
   documents,
   executionWorkspaces,
   folders,
+  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
   issueInboxArchives,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -74,6 +76,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(documentRevisions);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
@@ -238,6 +241,452 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .returning()
       .then((rows) => rows[0]!);
   }
+
+  async function createExecutionInstance(input: {
+    companyId: string;
+    agentId: string;
+    routine: Awaited<ReturnType<ReturnType<typeof routineService>["create"]>>;
+    issueSvc: ReturnType<typeof issueService>;
+    triggeredAt: Date;
+    routineRevisionId: string;
+    status?: "todo" | "in_progress" | "blocked";
+    withLiveHeartbeat?: boolean;
+  }) {
+    const runId = randomUUID();
+    const issue = await input.issueSvc.create(input.companyId, {
+      projectId: input.routine.projectId,
+      title: input.routine.title,
+      description: input.routine.description,
+      status: input.status ?? "todo",
+      priority: input.routine.priority,
+      assigneeAgentId: input.routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: input.routine.id,
+      originRunId: runId,
+    });
+    await db.insert(routineRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      routineId: input.routine.id,
+      routineRevisionId: input.routineRevisionId,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: input.triggeredAt,
+      linkedIssueId: issue.id,
+    });
+
+    let heartbeatRunId: string | null = null;
+    if (input.withLiveHeartbeat) {
+      heartbeatRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: heartbeatRunId,
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "routine",
+        status: "running",
+        contextSnapshot: { issueId: issue.id },
+        startedAt: input.triggeredAt,
+      });
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: heartbeatRunId,
+          executionRunId: heartbeatRunId,
+          executionLockedAt: input.triggeredAt,
+        })
+        .where(eq(issues.id, issue.id));
+    }
+
+    return { issue, runId, heartbeatRunId };
+  }
+
+  it("supersedes and links every older unfinished instance after an opted-in newer success", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    expect(optedInRoutine?.latestRevisionId).toBeTruthy();
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const first = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const second = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:30:00.000Z"),
+      routineRevisionId: revisionId,
+      status: "in_progress",
+      withLiveHeartbeat: true,
+    });
+    const winner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T11:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+
+    await issueSvc.update(winner.issue.id, { status: "done" });
+    await svc.syncRunStatusForIssue(winner.issue.id);
+
+    const supersededIssues = await db
+      .select()
+      .from(issues)
+      .where(inArray(issues.id, [first.issue.id, second.issue.id]));
+    expect(supersededIssues).toHaveLength(2);
+    expect(supersededIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: first.issue.id,
+        status: "cancelled",
+        supersededByIssueId: winner.issue.id,
+        cancelledAt: expect.any(Date),
+      }),
+      expect.objectContaining({
+        id: second.issue.id,
+        status: "cancelled",
+        supersededByIssueId: winner.issue.id,
+        executionRunId: null,
+        checkoutRunId: null,
+        cancelledAt: expect.any(Date),
+      }),
+    ]));
+
+    const runRows = await db
+      .select()
+      .from(routineRuns)
+      .where(inArray(routineRuns.id, [first.runId, second.runId, winner.runId]));
+    expect(runRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: first.runId, status: "superseded", supersededByRunId: winner.runId }),
+      expect.objectContaining({ id: second.runId, status: "superseded", supersededByRunId: winner.runId }),
+      expect.objectContaining({ id: winner.runId, status: "completed", supersededByRunId: null }),
+    ]));
+
+    const heartbeat = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, second.heartbeatRunId!))
+      .then((rows) => rows[0]);
+    expect(heartbeat).toMatchObject({ status: "cancelled", errorCode: "routine_instance_superseded" });
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.superseded"));
+    expect(activities).toHaveLength(2);
+    expect(activities).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        companyId,
+        entityId: first.issue.id,
+        details: expect.objectContaining({
+          routineId: routine.id,
+          supersededRunId: first.runId,
+          supersedingIssueId: winner.issue.id,
+          supersedingRunId: winner.runId,
+        }),
+      }),
+      expect.objectContaining({ entityId: second.issue.id }),
+    ]));
+    await expect(
+      db.select().from(activityLog).where(eq(activityLog.action, "issue.supersession_deferred")),
+    ).resolves.toHaveLength(0);
+
+    const listed = await svc.listRuns(routine.id);
+    expect(listed.find((run) => run.id === first.runId)).toMatchObject({
+      status: "superseded",
+      supersededByRunId: winner.runId,
+    });
+  });
+
+  it("preserves an older instance with a live grandchild while superseding instances without live descendants", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const protectedInstance = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T09:00:00.000Z"),
+      routineRevisionId: revisionId,
+      status: "blocked",
+    });
+    const terminalChild = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: protectedInstance.issue.id,
+      title: "Delegated work container",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const liveGrandchild = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: terminalChild.id,
+      title: "In-review delegated work",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const terminalChildDepthThree = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: protectedInstance.issue.id,
+      title: "Deeper delegated work container",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const terminalGrandchildDepthThree = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: terminalChildDepthThree.id,
+      title: "Nested delegated work container",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const liveGreatGrandchild = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: terminalGrandchildDepthThree.id,
+      title: "In-progress deeply delegated work",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const terminalOnlyInstance = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T09:30:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const terminalOnlyChild = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      parentId: terminalOnlyInstance.issue.id,
+      title: "Completed delegated work",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const unprotectedInstance = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const winner = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T11:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+
+    // The fixture intentionally has no blocker edges or populated child projection.
+    // Only the parent_id chain connects the protected instance to its live work.
+    await expect(db.select().from(issueRelations)).resolves.toHaveLength(0);
+
+    await issueSvc.update(winner.issue.id, { status: "done" });
+    await svc.syncRunStatusForIssue(winner.issue.id);
+    await svc.syncRunStatusForIssue(winner.issue.id);
+
+    await expect(issueSvc.getById(protectedInstance.issue.id)).resolves.toMatchObject({
+      status: "blocked",
+      supersededByIssueId: null,
+    });
+    await expect(issueSvc.getById(terminalChild.id)).resolves.toMatchObject({ status: "done" });
+    await expect(issueSvc.getById(liveGrandchild.id)).resolves.toMatchObject({ status: "in_review" });
+    await expect(issueSvc.getById(terminalChildDepthThree.id)).resolves.toMatchObject({ status: "done" });
+    await expect(issueSvc.getById(terminalGrandchildDepthThree.id)).resolves.toMatchObject({ status: "done" });
+    await expect(issueSvc.getById(liveGreatGrandchild.id)).resolves.toMatchObject({ status: "in_progress" });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, protectedInstance.runId))).resolves.toEqual([
+      expect.objectContaining({ status: "issue_created", supersededByRunId: null }),
+    ]);
+
+    await expect(issueSvc.getById(terminalOnlyInstance.issue.id)).resolves.toMatchObject({
+      status: "cancelled",
+      supersededByIssueId: winner.issue.id,
+    });
+    await expect(issueSvc.getById(terminalOnlyChild.id)).resolves.toMatchObject({ status: "done" });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, terminalOnlyInstance.runId))).resolves.toEqual([
+      expect.objectContaining({ status: "superseded", supersededByRunId: winner.runId }),
+    ]);
+
+    await expect(issueSvc.getById(unprotectedInstance.issue.id)).resolves.toMatchObject({
+      status: "cancelled",
+      supersededByIssueId: winner.issue.id,
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, unprotectedInstance.runId))).resolves.toEqual([
+      expect.objectContaining({ status: "superseded", supersededByRunId: winner.runId }),
+    ]);
+
+    const deferredActivities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.supersession_deferred"));
+    expect(deferredActivities).toHaveLength(1);
+    expect(deferredActivities[0]).toMatchObject({
+      companyId,
+      entityId: protectedInstance.issue.id,
+      details: expect.objectContaining({
+        routineId: routine.id,
+        deferredRunId: protectedInstance.runId,
+        supersedingIssueId: winner.issue.id,
+        supersedingRunId: winner.runId,
+        descendantIssueIds: expect.arrayContaining([liveGrandchild.id, liveGreatGrandchild.id]),
+      }),
+    });
+    const deferredDetails = deferredActivities[0]!.details as { descendantIssueIds: string[] };
+    expect(deferredDetails.descendantIssueIds).toHaveLength(2);
+  });
+
+  it("does not supersede older work after blocked or cancelled newer executions", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const optedInRoutine = await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+    const revisionId = optedInRoutine!.latestRevisionId!;
+    const older = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine: optedInRoutine!,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+
+    for (const [index, status] of (["blocked", "cancelled"] as const).entries()) {
+      const newer = await createExecutionInstance({
+        companyId,
+        agentId,
+        routine: optedInRoutine!,
+        issueSvc,
+        triggeredAt: new Date(`2026-08-23T1${index + 1}:00:00.000Z`),
+        routineRevisionId: revisionId,
+      });
+      await issueSvc.update(newer.issue.id, { status });
+      await svc.syncRunStatusForIssue(newer.issue.id);
+      const newerRun = await db.select().from(routineRuns).where(eq(routineRuns.id, newer.runId)).then((rows) => rows[0]);
+      expect(newerRun.status).toBe("failed");
+    }
+
+    const olderIssue = await issueSvc.getById(older.issue.id);
+    const olderRun = await db.select().from(routineRuns).where(eq(routineRuns.id, older.runId)).then((rows) => rows[0]);
+    expect(olderIssue).toMatchObject({ status: "todo", supersededByIssueId: null });
+    expect(olderRun).toMatchObject({ status: "issue_created", supersededByRunId: null });
+    await expect(db.select().from(activityLog).where(eq(activityLog.action, "issue.superseded"))).resolves.toHaveLength(0);
+  });
+
+  it("keeps execution instances independent by default", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const revisionId = routine.latestRevisionId!;
+    const older = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+    const newer = await createExecutionInstance({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      triggeredAt: new Date("2026-08-23T11:00:00.000Z"),
+      routineRevisionId: revisionId,
+    });
+
+    await svc.update(routine.id, { lifecyclePolicy: "latest_success_wins" }, {});
+
+    await issueSvc.update(newer.issue.id, { status: "done" });
+    await svc.syncRunStatusForIssue(newer.issue.id);
+
+    await expect(issueSvc.getById(older.issue.id)).resolves.toMatchObject({
+      status: "todo",
+      supersededByIssueId: null,
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, older.runId))).resolves.toEqual([
+      expect.objectContaining({ status: "issue_created", supersededByRunId: null }),
+    ]);
+  });
+
+  it("converges concurrent successes on the newest trigger order without cross-company effects", async () => {
+    const firstCompany = await seedFixture();
+    const secondCompany = await seedFixture();
+    const firstRoutine = await firstCompany.svc.update(
+      firstCompany.routine.id,
+      { lifecyclePolicy: "latest_success_wins" },
+      {},
+    );
+    const secondRoutine = await secondCompany.svc.update(
+      secondCompany.routine.id,
+      { lifecyclePolicy: "latest_success_wins" },
+      {},
+    );
+    const firstRevisionId = firstRoutine!.latestRevisionId!;
+    const secondRevisionId = secondRoutine!.latestRevisionId!;
+    const oldest = await createExecutionInstance({
+      companyId: firstCompany.companyId,
+      agentId: firstCompany.agentId,
+      routine: firstRoutine!,
+      issueSvc: firstCompany.issueSvc,
+      triggeredAt: new Date("2026-08-23T10:00:00.000Z"),
+      routineRevisionId: firstRevisionId,
+    });
+    const middle = await createExecutionInstance({
+      companyId: firstCompany.companyId,
+      agentId: firstCompany.agentId,
+      routine: firstRoutine!,
+      issueSvc: firstCompany.issueSvc,
+      triggeredAt: new Date("2026-08-23T11:00:00.000Z"),
+      routineRevisionId: firstRevisionId,
+    });
+    const newest = await createExecutionInstance({
+      companyId: firstCompany.companyId,
+      agentId: firstCompany.agentId,
+      routine: firstRoutine!,
+      issueSvc: firstCompany.issueSvc,
+      triggeredAt: new Date("2026-08-23T12:00:00.000Z"),
+      routineRevisionId: firstRevisionId,
+    });
+    const otherCompanyOlder = await createExecutionInstance({
+      companyId: secondCompany.companyId,
+      agentId: secondCompany.agentId,
+      routine: secondRoutine!,
+      issueSvc: secondCompany.issueSvc,
+      triggeredAt: new Date("2026-08-23T09:00:00.000Z"),
+      routineRevisionId: secondRevisionId,
+    });
+
+    await Promise.all([
+      firstCompany.issueSvc.update(middle.issue.id, { status: "done" }),
+      firstCompany.issueSvc.update(newest.issue.id, { status: "done" }),
+    ]);
+    await Promise.all([
+      firstCompany.svc.syncRunStatusForIssue(middle.issue.id),
+      firstCompany.svc.syncRunStatusForIssue(newest.issue.id),
+    ]);
+    await firstCompany.svc.syncRunStatusForIssue(middle.issue.id);
+
+    await expect(firstCompany.issueSvc.getById(oldest.issue.id)).resolves.toMatchObject({
+      status: "cancelled",
+      supersededByIssueId: newest.issue.id,
+    });
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, oldest.runId))).resolves.toEqual([
+      expect.objectContaining({ status: "superseded", supersededByRunId: newest.runId }),
+    ]);
+    await expect(secondCompany.issueSvc.getById(otherCompanyOlder.issue.id)).resolves.toMatchObject({
+      status: "todo",
+      supersededByIssueId: null,
+    });
+  });
 
   it("clears transient routine run failures when execution issues resume", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();
