@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -13,6 +14,7 @@ import {
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
+  getSandboxCallbackBridgeBodyReadSource,
   getSandboxCallbackBridgeServerSource,
   sandboxCallbackBridgeDirectories,
   syncRemoteTextFileWithHashSkip,
@@ -104,6 +106,39 @@ describe("sandbox callback bridge", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throw new Error(`Timed out waiting for a JSON file in ${directory}.`);
+  }
+
+  // Post a body over node:http with no Content-Length header, so Node streams
+  // it with chunked transfer encoding instead. fetch always sets
+  // Content-Length for a string or Buffer body, so it cannot produce this
+  // request shape.
+  function postWithoutContentLength(
+    url: string,
+    headers: Record<string, string>,
+    body: string,
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const target = new URL(url);
+      const req = httpRequest(
+        {
+          hostname: target.hostname,
+          port: target.port,
+          path: target.pathname + target.search,
+          method: "POST",
+          headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () =>
+            resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }),
+          );
+        },
+      );
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
   }
 
   afterEach(async () => {
@@ -914,11 +949,13 @@ describe("sandbox callback bridge", () => {
 
     const maxBodyBytes = 4096;
     const bodySize = 1024;
-    // The file gateway charges 15x the declared body size for its reserve:
-    // 1x for the raw buffer, up to 2x for the decoded string, and up to 6x
-    // each for the JSON-escaped string and its UTF-8 write buffer. See the
-    // comment on FILE_GATEWAY_BODY_RESERVE_FACTOR in sandbox-callback-bridge.ts.
-    const reservePerRead = bodySize * 15;
+    // The file gateway charges bodySize * FACTOR + EXTRA_BYTES for its
+    // reserve: factor 4 covers up to 2x for the raw buffer and 2x for the
+    // decoded string, and EXTRA_BYTES is the fixed bound on one streamed
+    // write slice (65536 characters at up to 6x JSON-escape expansion). See
+    // the comments on FILE_GATEWAY_BODY_RESERVE_FACTOR and
+    // FILE_GATEWAY_BODY_RESERVE_EXTRA_BYTES in sandbox-callback-bridge.ts.
+    const reservePerRead = bodySize * 4 + 65536 * 6;
     const bridge = await startSandboxCallbackBridgeServer({
       runner,
       remoteCwd: remoteWorkspaceDir,
@@ -1044,6 +1081,301 @@ describe("sandbox callback bridge", () => {
       Array.from({ length: concurrency }, () => 200),
     );
   }, 20000);
+
+  it("admits a file-gateway body at the production max-body-bytes bound, unchanged, at production inflight defaults", async () => {
+    // Regression coverage for PAP-5041. The old file-gateway reserve charged
+    // declaredBytes * 15 against a 64 MiB inflight bound. At the production
+    // body cap (10 MiB + 1), that charge alone (about 150 MiB) exceeded the
+    // whole bound, so a body at the cap always got a 503 on an idle gateway.
+    // This test sends the largest body a real caller sends -- 10 MiB, one
+    // byte under the cap -- and asserts the bridge admits it and the host
+    // worker sees it unchanged. maxBodyBytes and maxInflightBodyBytes both
+    // stay at their production defaults.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-max-body-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge max body test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 60_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    let receivedBodyLength = -1;
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        receivedBodyLength = request.body.length;
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 60_000,
+      pollIntervalMs: 10,
+      // maxBodyBytes and maxInflightBodyBytes both stay at the production
+      // defaults (10 MiB + 1, and 64 MiB).
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const bodyLength = 10 * 1024 * 1024;
+    const body = "a".repeat(bodyLength);
+    const response = await fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    expect(response.status).not.toBe(503);
+    expect(response.status).toBe(200);
+    expect(receivedBodyLength).toBe(bodyLength);
+  }, 30000);
+
+  it("admits a file-gateway request with no Content-Length header at production inflight defaults", async () => {
+    // Regression coverage for PAP-5041. declaredBodyBytes falls back to the
+    // body cap for a request with no parseable Content-Length header (a
+    // chunked request, for example). The old reserve charged that fallback
+    // times 15 -- the same oversize charge as the max-body-bytes case above
+    // -- so a small chunked request always got a 503 too. maxInflightBodyBytes
+    // stays at the production default.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-no-content-length-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge no content-length test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    let receivedBody = "";
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        receivedBody = request.body;
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+      // maxInflightBodyBytes stays at the production default (64 MiB).
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const body = JSON.stringify({ body: "a small comment sent with no Content-Length header" });
+    const response = await postWithoutContentLength(
+      `${bridge.baseUrl}/api/issues/issue-1/comments`,
+      {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    );
+    expect(response.status).not.toBe(503);
+    expect(response.status).toBe(200);
+    expect(receivedBody).toBe(body);
+  }, 20000);
+
+  it("streams the escaped request body correctly across a write-slice boundary, including a split surrogate pair", async () => {
+    // Regression coverage for the streamed write in runFileGateway: it must
+    // reassemble a body that crosses FILE_GATEWAY_BODY_WRITE_SLICE_CHARS
+    // (65536 characters) into the same text a caller sent, even when a
+    // multi-character emoji (a UTF-16 surrogate pair) sits exactly on that
+    // boundary, and even when JSON-special characters (a quote, a backslash,
+    // a newline, a tab) appear right after it.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-slice-boundary-"));
+    cleanupDirs.push(rootDir);
+
+    const localWorkspaceDir = path.join(rootDir, "local-workspace");
+    const remoteWorkspaceDir = path.join(rootDir, "remote-workspace");
+    await mkdir(localWorkspaceDir, { recursive: true });
+    await mkdir(remoteWorkspaceDir, { recursive: true });
+    await writeFile(path.join(localWorkspaceDir, "README.md"), "bridge slice boundary test\n", "utf8");
+
+    const runner = createExecRunner();
+    const bridgeAsset = await createSandboxCallbackBridgeAsset();
+    cleanupFns.push(bridgeAsset.cleanup);
+    const prepared = await prepareCommandManagedRuntime({
+      runner,
+      spec: {
+        remoteCwd: remoteWorkspaceDir,
+        timeoutMs: 30_000,
+      },
+      adapterKey: "codex",
+      workspaceLocalDir: localWorkspaceDir,
+      assets: [{ key: "bridge", localDir: bridgeAsset.localDir }],
+    });
+
+    const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
+    const bridgeToken = createSandboxCallbackBridgeToken();
+
+    let receivedBody = "";
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      authorizeRequest: async () => null,
+      handleRequest: async (request) => {
+        receivedBody = request.body;
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true }),
+        };
+      },
+    });
+    cleanupFns.push(async () => {
+      await worker.stop();
+    });
+
+    const bridge = await startSandboxCallbackBridgeServer({
+      runner,
+      remoteCwd: remoteWorkspaceDir,
+      assetRemoteDir: prepared.assetDirs.bridge,
+      queueDir,
+      bridgeToken,
+      timeoutMs: 30_000,
+      pollIntervalMs: 10,
+    });
+    cleanupFns.push(async () => {
+      await bridge.stop();
+    });
+
+    const sliceChars = 65536;
+    const prefix = "x".repeat(sliceChars - 1);
+    const emoji = "\u{1F600}"; // two UTF-16 code units; the high surrogate lands
+    // exactly at the slice boundary.
+    const specials = '"quoted"\\backslash\nline\ttab';
+    const suffix = "y".repeat(100);
+    const body = prefix + emoji + specials + suffix;
+
+    const response = await fetch(`${bridge.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(receivedBody).toBe(body);
+  }, 20000);
+
+  it("readBody preallocates the exact declared length for a known length, and never the bridge cap for an unknown one", async () => {
+    // Regression coverage for PAP-5041: readBody must not preallocate
+    // maxBodyBytes for a request with no declared length. This evaluates the
+    // exact zero-dependency source the generated gateway embeds and spies on
+    // Buffer.allocUnsafe to prove the two read strategies it picks between.
+    const factory = new Function(
+      `${getSandboxCallbackBridgeBodyReadSource()}\nreturn { readBody, declaredBodyBytes };`,
+    ) as unknown as () => {
+      readBody: (
+        req: AsyncIterable<Buffer>,
+        declaredLength: number | null,
+        maxBodyBytes: number,
+      ) => Promise<Buffer>;
+      declaredBodyBytes: (req: { headers: Record<string, string> }) => number | null;
+    };
+    const embedded = factory();
+
+    expect(embedded.declaredBodyBytes({ headers: {} })).toBeNull();
+    expect(embedded.declaredBodyBytes({ headers: { "content-length": "42" } })).toBe(42);
+
+    const maxBodyBytes = 10 * 1024 * 1024 + 1;
+    async function* fakeRequest(chunks: Buffer[]) {
+      for (const chunk of chunks) yield chunk;
+    }
+
+    const allocSizes: number[] = [];
+    const allocSpy = vi.spyOn(Buffer, "allocUnsafe").mockImplementation((size: number) => {
+      allocSizes.push(size);
+      return Buffer.allocUnsafeSlow(size);
+    });
+    try {
+      const smallBody = Buffer.from("a small chunked body", "utf8");
+
+      const known = await embedded.readBody(fakeRequest([smallBody]), smallBody.length, maxBodyBytes);
+      expect(known.toString("utf8")).toBe(smallBody.toString("utf8"));
+      // A declared-length read preallocates exactly the declared size.
+      expect(allocSizes).toContain(smallBody.length);
+
+      allocSizes.length = 0;
+      const unknown = await embedded.readBody(fakeRequest([smallBody]), null, maxBodyBytes);
+      expect(unknown.toString("utf8")).toBe(smallBody.toString("utf8"));
+      // An unknown-length read for a small body never allocates anywhere
+      // near the 10 MiB body cap -- the defect PAP-5041 fixes.
+      expect(allocSizes.some((size) => size >= maxBodyBytes)).toBe(false);
+    } finally {
+      allocSpy.mockRestore();
+    }
+  });
 
   it("returns a 502 when the host response times out", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-timeout-"));
