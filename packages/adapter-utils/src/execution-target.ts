@@ -624,6 +624,13 @@ export function formatAdapterExecutionTimeoutStartLogLine(
   );
 }
 
+// The cap on the buffered output of one SSH command stream (stdout and stderr
+// each). This bound is separate from the sandbox bridge body cap and must not
+// move with it. An SSH command relays interactive shell output, not a bridge
+// request body, so a large bridge body cap must not enlarge this per-stream
+// buffer. 1 MiB is enough for the command output the SSH runner carries.
+export const SSH_COMMAND_OUTPUT_MAX_BUFFER_BYTES = 1024 * 1024;
+
 function requireSandboxRunner(target: AdapterSandboxExecutionTarget): CommandManagedRuntimeRunner {
   if (target.runner) return target.runner;
   throw new Error(
@@ -642,7 +649,7 @@ function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecut
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
-      maxBufferBytes: DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES * 4,
+      maxBufferBytes: SSH_COMMAND_OUTPUT_MAX_BUFFER_BYTES,
     });
   }
   return requireSandboxRunner(target);

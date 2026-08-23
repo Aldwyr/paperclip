@@ -5757,10 +5757,10 @@ describe("sandbox duplex gateway", () => {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: oversizeBody,
     });
-    expect(tooLarge.status).toBe(502);
-    await expect(tooLarge.json()).resolves.toEqual({
-      error: "Bridge request body exceeded the configured size limit.",
-    });
+    // The body-size overflow answers a clean 413 request_too_large, not a
+    // retryable 502 with the internal message.
+    expect(tooLarge.status).toBe(413);
+    await expect(tooLarge.json()).resolves.toEqual({ error: "request_too_large" });
 
     // The oversized request forwarded no frame. It never left the gateway.
     expect(gateway.frames.filter((frame) => frame.type === "request")).toHaveLength(0);
@@ -5819,10 +5819,8 @@ describe("sandbox duplex gateway", () => {
       headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: JSON.stringify({ body: "x".repeat(64) }),
     });
-    expect(oversizeBody.status).toBe(502);
-    await expect(oversizeBody.json()).resolves.toEqual({
-      error: "Bridge request body exceeded the configured size limit.",
-    });
+    expect(oversizeBody.status).toBe(413);
+    await expect(oversizeBody.json()).resolves.toEqual({ error: "request_too_large" });
 
     // No request frame forwarded so far: the guards rejected before forwarding.
     const framesBeforeDepth = gateway.frames.filter((frame) => frame.type === "request").length;

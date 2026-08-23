@@ -786,4 +786,36 @@ describe("plugin worker manager duplex channel route", () => {
       await handle.stop().catch(() => undefined);
     }
   });
+  it("keeps the route open while all 40 pre-bind body chunks of one maximum body arrive", async () => {
+    // The default pre-bind buffer cap is 16 MiB. One maximum bridge body rides 40
+    // body_chunk frames of 349,528 base64 characters each, which is 13,981,120
+    // characters. That total plus the request envelope must arrive before the
+    // route binds without ending the route. The old 8 MiB cap was below this
+    // total, so one in-spec body could terminate its own route. The default cap
+    // (no override) proves 16 MiB covers the 40-chunk maximum.
+    const chunkChars = 349_528;
+    const chunkCount = 40;
+    const perChunk = "a".repeat(chunkChars);
+    const handle = makeDuplexHandle();
+    try {
+      await handle.start();
+      const session = await handle.openDuplexChannel(
+        duplexOpenInput({
+          workerSessionId: "ws-A",
+          data: Array.from({ length: chunkCount }, () => ({ chunk: perChunk })),
+          exitCode: 0,
+        }),
+      );
+      let receivedChars = 0;
+      session.onData((chunk) => {
+        receivedChars += chunk.length;
+      });
+      // The route ends on the worker exit (exitCode 0), not on the pre-bind byte
+      // bound. A pre-bind bound trip would resolve exitCode null instead.
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      expect(receivedChars).toBe(chunkChars * chunkCount);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, 30000);
 });

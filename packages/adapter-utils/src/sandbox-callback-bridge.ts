@@ -18,7 +18,19 @@ const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
 const DEFAULT_BRIDGE_MAX_QUEUE_DEPTH = 64;
-const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
+// The cap on one whole request body the in-sandbox gateway buffers before it
+// forwards the body to the host. The value is the API JSON body limit (10 MiB)
+// plus one byte. The `+ 1` is load-bearing: the bridge must not reject a body
+// that the API itself accepts. At exactly the API limit the body must pass
+// through the bridge and reach the API, so the API issues its own 413. The
+// bridge cap is a buffering backstop, not a policy limit. Do not remove the
+// `+ 1`; without it the bridge rejects an in-spec body one byte early.
+//
+// `@paperclipai/adapter-utils` cannot import the API limit from `server`
+// (that creates a package cycle), so the literal lives here. A cross-package
+// agreement test asserts this value equals `DEFAULT_JSON_BODY_LIMIT_BYTES + 1`
+// so the two never drift.
+export const DEFAULT_BRIDGE_MAX_BODY_BYTES = 10 * 1024 * 1024 + 1;
 // The default cap on the aggregate raw bytes the in-sandbox duplex frame decoder
 // retains between chunks. The generated gateway runs in a separate operating-system
 // process, so it cannot share the host aggregate byte ledger. It enforces this
@@ -27,6 +39,17 @@ const DEFAULT_BRIDGE_MAX_BODY_BYTES = 256 * 1024;
 // PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES. The default is well above one maximum
 // frame, so a legitimate single frame never trips it.
 const DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES = 8 * 1024 * 1024;
+// The cap on the total request-body bytes the in-sandbox gateway may hold
+// across all concurrent reads at once. The generated gateway runs in a separate
+// operating-system process inside the sandbox, so it cannot share the host
+// aggregate byte ledger. At a 10 MiB body cap, the 64-deep pending queue could
+// let many concurrent reads each retain a full body and exhaust the sandbox
+// process memory before any host limit applies. The gateway reserves one
+// worst-case body per active read against this bound, and sheds a new read with
+// a 503 when the bound is full. The host passes the value through
+// PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES. This bound protects the sandbox
+// process; it is separate from the host aggregate byte ledger.
+const DEFAULT_BRIDGE_MAX_INFLIGHT_BODY_BYTES = 64 * 1024 * 1024;
 // Per-iteration timeout for one poll-loop client call. A healthy control-plane
 // round trip finishes in well under one second, so 10s is far above a normal
 // iteration and never false-fires on a slow-but-live call. It is also well
@@ -2031,6 +2054,13 @@ const maxBodyBytes = Number(process.env.PAPERCLIP_BRIDGE_MAX_BODY_BYTES || "${DE
 const maxDuplexDecoderBytes = Number(
   process.env.PAPERCLIP_BRIDGE_MAX_DUPLEX_DECODER_BYTES || "${DEFAULT_BRIDGE_MAX_DUPLEX_DECODER_BYTES}",
 );
+// The host passes the local in-sandbox body-read admission bound here. The
+// gateway reserves one worst-case body (maxBodyBytes) per active read and sheds
+// a new read with a 503 when the reserve is full. This bound protects the
+// sandbox process memory; it never shares the host aggregate byte ledger.
+const maxInflightBodyBytes = Number(
+  process.env.PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES || "${DEFAULT_BRIDGE_MAX_INFLIGHT_BODY_BYTES}",
+);
 const heartbeatIntervalMs = Number(
   process.env.PAPERCLIP_BRIDGE_HEARTBEAT_INTERVAL_MS || "${DEFAULT_DUPLEX_GATEWAY_HEARTBEAT_INTERVAL_MS}",
 );
@@ -2074,6 +2104,37 @@ function normalizeHeaders(headers) {
   return out;
 }
 
+// Typed marker for a request body that exceeds maxBodyBytes. readBody throws it,
+// so each gateway answers a clean 413 request_too_large instead of the generic
+// 502. A 502 is retryable by convention and would leak the internal message.
+class BridgeBodyTooLargeError extends Error {
+  constructor() {
+    super("request_too_large");
+    this.code = "request_too_large";
+  }
+}
+
+// The running total of reserved body-read bytes across all active reads.
+let reservedBodyBytes = 0;
+const noopRelease = () => {};
+
+// Reserve capacity for one body read against the local admission bound. Return a
+// release function on success, or null when the bound is full. Each caller
+// releases on every terminal path: success, size rejection, other error,
+// timeout, and connection close.
+function reserveBodyRead() {
+  if (reservedBodyBytes + maxBodyBytes > maxInflightBodyBytes) {
+    return null;
+  }
+  reservedBodyBytes += maxBodyBytes;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    reservedBodyBytes -= maxBodyBytes;
+  };
+}
+
 async function readBody(req) {
   const chunks = [];
   let totalBytes = 0;
@@ -2082,7 +2143,7 @@ async function readBody(req) {
     chunks.push(nextChunk);
     totalBytes += nextChunk.byteLength;
     if (totalBytes > maxBodyBytes) {
-      throw new Error("Bridge request body exceeded the configured size limit.");
+      throw new BridgeBodyTooLargeError();
     }
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -2147,6 +2208,13 @@ async function runFileGateway() {
         return;
       }
       const requestId = randomUUID();
+      const hasRequestBody = req.method && req.method !== "GET" && req.method !== "HEAD";
+      const releaseBodyRead = hasRequestBody ? reserveBodyRead() : noopRelease;
+      if (!releaseBodyRead) {
+        writeJsonResponse(res, 503, { error: "bridge_busy" });
+        return;
+      }
+      try {
       const requestBody = await readBody(req);
       const payload = {
         id: requestId,
@@ -2182,7 +2250,14 @@ async function runFileGateway() {
         res.setHeader(key, value);
       }
       res.end(typeof response.body === "string" ? response.body : "");
+      } finally {
+        releaseBodyRead();
+      }
     } catch (error) {
+      if (error && error.code === "request_too_large") {
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
       writeJsonResponse(res, 502, { error: error instanceof Error ? error.message : String(error) });
     }
   });
@@ -2442,6 +2517,13 @@ function runDuplexGateway() {
         return;
       }
       const requestId = randomUUID();
+      const hasRequestBody = req.method && req.method !== "GET" && req.method !== "HEAD";
+      const releaseBodyRead = hasRequestBody ? reserveBodyRead() : noopRelease;
+      if (!releaseBodyRead) {
+        writeJsonResponse(res, 503, { error: "bridge_busy" });
+        return;
+      }
+      try {
       const requestBodyBuffer = Buffer.from(await readBody(req), "utf8");
       if (unavailable) {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
@@ -2506,7 +2588,14 @@ function runDuplexGateway() {
         res.setHeader(key, value);
       }
       res.end(typeof response.body === "string" ? response.body : "");
+      } finally {
+        releaseBodyRead();
+      }
     } catch (error) {
+      if (error && error.code === "request_too_large") {
+        writeJsonResponse(res, 413, { error: "request_too_large" });
+        return;
+      }
       writeJsonResponse(res, 502, { error: error instanceof Error ? error.message : String(error) });
     }
   });

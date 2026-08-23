@@ -1,4 +1,9 @@
-export const DEFAULT_JSON_BODY_LIMIT = "10mb";
+// The default maximum size of one inline JSON request body the API accepts.
+// The byte form and the string form must agree: `express.json` parses the
+// string form, and other code (the sandbox bridge agreement test) compares the
+// byte form. Derive the string form from the byte form so the two cannot drift.
+export const DEFAULT_JSON_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_JSON_BODY_LIMIT = `${DEFAULT_JSON_BODY_LIMIT_BYTES / (1024 * 1024)}mb`;
 export const PORTABLE_JSON_BODY_LIMIT = "64mb";
 export const PORTABLE_JSON_BODY_LIMIT_BYTES = 64 * 1024 * 1024;
 

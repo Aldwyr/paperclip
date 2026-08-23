@@ -225,6 +225,8 @@ interface HarnessOptions {
   hostApiToken?: string;
   runId?: string;
   maxBodyBytes?: number;
+  maxInflightBodyBytes?: number;
+  responseTimeoutMs?: number;
   lossExitGraceMs?: number;
 }
 
@@ -294,6 +296,12 @@ async function createHarness(options: HarnessOptions = {}): Promise<DuplexE2EHar
       PAPERCLIP_BRIDGE_NONCE: nonce,
       PAPERCLIP_BRIDGE_TOKEN: bridgeToken,
       PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(maxBodyBytes),
+      ...(options.maxInflightBodyBytes != null
+        ? { PAPERCLIP_BRIDGE_MAX_INFLIGHT_BODY_BYTES: String(options.maxInflightBodyBytes) }
+        : {}),
+      ...(options.responseTimeoutMs != null
+        ? { PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS: String(options.responseTimeoutMs) }
+        : {}),
       ...(options.lossExitGraceMs != null
         ? { PAPERCLIP_BRIDGE_LOSS_EXIT_GRACE_MS: String(options.lossExitGraceMs) }
         : {}),
@@ -737,5 +745,118 @@ describe("duplex bridge local end-to-end harness", () => {
       expect(response.status).toBe(502);
       await expect(response.json()).resolves.toEqual({ error: testCase.error });
     }
+  }, 20000);
+  it("carries a request body of exactly the API limit through the bridge to the API", async () => {
+    // The bridge cap is the API JSON body limit plus one byte. A body of exactly
+    // the API limit must pass through the bridge and reach the API. The bridge is
+    // a buffering backstop, not the policy limit, so it must not reject an in-spec
+    // body one byte early.
+    const apiLimitBytes = 10 * 1024 * 1024;
+    const bridgeCapBytes = apiLimitBytes + 1;
+    const harness = await createHarness({ maxBodyBytes: bridgeCapBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    let receivedBodyLength = -1;
+    harness.api.setResponder((_req, res, body) => {
+      receivedBodyLength = Buffer.byteLength(body, "utf8");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    const body = "a".repeat(apiLimitBytes);
+    expect(Buffer.byteLength(body, "utf8")).toBe(apiLimitBytes);
+    const response = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    // The bridge did not reject the body. It reached the API unchanged.
+    expect(response.status).toBe(200);
+    expect(receivedBodyLength).toBe(apiLimitBytes);
+  }, 30000);
+
+  it("answers 413 request_too_large, not 502, when the body passes the bridge cap", async () => {
+    // Regression test: the body-size overflow path threw a generic Error that
+    // unwound to the 502 catch. A 502 is retryable and leaked the internal
+    // message. The overflow must answer a clean 413 request_too_large. Assert the
+    // status code specifically, because the wrong 502 stood for a long time.
+    const maxBodyBytes = 4096;
+    const harness = await createHarness({ maxBodyBytes });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    let apiWasCalled = false;
+    harness.api.setResponder((_req, res) => {
+      apiWasCalled = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    const body = "a".repeat(maxBodyBytes + 1024);
+    const response = await fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${harness.bridgeToken}`,
+        "content-type": "application/json",
+      },
+      body,
+    });
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({ error: "request_too_large" });
+    // The oversize body never reached the API, and the response leaked no
+    // internal message.
+    expect(apiWasCalled).toBe(false);
+  }, 20000);
+
+  it("sheds a concurrent body read past the admission bound, then releases the reserve", async () => {
+    // The gateway reserves one worst-case body per active read against the local
+    // admission bound. With the bound set to one body, the first read is admitted
+    // and the second read is shed with a 503. The gateway releases the reserve on
+    // the response timeout, so a later request is admitted again.
+    const maxBodyBytes = 4096;
+    const harness = await createHarness({
+      maxBodyBytes,
+      // The bound admits exactly one concurrent body read.
+      maxInflightBodyBytes: maxBodyBytes,
+      // A short response deadline releases the first (hung) read fast.
+      responseTimeoutMs: 700,
+    });
+    harnesses.push(harness);
+    await harness.waitFor(readyPredicate(harness), "the gateway to become ready");
+
+    // The first admitted request hangs on the forward until it times out. The
+    // second request cannot reserve, so the gateway sheds it with a 503.
+    harness.setForwardMode("hang");
+    const body = "a".repeat(1024);
+    const post = () =>
+      fetch(`${harness.baseUrl}/api/issues/issue-1/comments`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${harness.bridgeToken}`,
+          "content-type": "application/json",
+        },
+        body,
+      });
+    const [first, second] = await Promise.all([post(), post()]);
+    const statuses = [first.status, second.status].sort((a, b) => a - b);
+    // One request was admitted (it later times out with a 502). One request was
+    // shed with a 503 before it could buffer a second body.
+    expect(statuses).toEqual([502, 503]);
+    const shed = first.status === 503 ? first : second;
+    await expect(shed.json()).resolves.toEqual({ error: "bridge_busy" });
+
+    // The admitted read timed out and released its reserve. A later request is
+    // admitted again and reaches the API.
+    harness.setForwardMode("proxy");
+    harness.api.setResponder((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    const later = await post();
+    expect(later.status).toBe(200);
   }, 20000);
 });

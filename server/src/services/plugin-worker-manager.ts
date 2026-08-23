@@ -193,8 +193,16 @@ const MAX_DUPLEX_CHANNEL_CHUNK_CHARS = 1_000_000;
  * The default maximum cumulative characters the host buffers for one duplex
  * channel route before a data listener attaches. A worker that streams data
  * before the consumer binds cannot grow the host buffer without limit.
+ *
+ * The value derives from the bridge body cap `DEFAULT_BRIDGE_MAX_BODY_BYTES`
+ * (10 MiB + 1) and the base64 body-chunk expansion. One maximum body rides 40
+ * body_chunk frames of 349,528 base64 characters each, which is 13,981,120
+ * characters, plus the request envelope and per-frame overhead. 16 MiB covers
+ * that (about 2 MiB of headroom), so one in-spec request cannot terminate its
+ * own route before the data listener binds. Keep this cap coupled to the bridge
+ * body cap: if the body cap moves, re-size this value from the new cap.
  */
-const MAX_DUPLEX_CHANNEL_PRE_BIND_CHARS = 8 * 1024 * 1024;
+const MAX_DUPLEX_CHANNEL_PRE_BIND_CHARS = 16 * 1024 * 1024;
 /**
  * The default maximum number of data frames the host buffers for one duplex
  * channel route before a data listener attaches.
