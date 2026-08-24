@@ -11,12 +11,13 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
+import { isPlatformManagedEnvironment } from "../lib/managed-sandbox-environment";
 import { AgentStatusBadge, AgentStatusCapsule } from "../components/StatusBadge";
 import { AgentActionButtons } from "../components/AgentActionButtons";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
 import { EntityRow } from "../components/EntityRow";
-import { BuiltInAgentBadge, BuiltInLifecycleChip } from "../components/BuiltInAgentBadges";
+import { BuiltInLifecycleChip } from "../components/BuiltInAgentBadges";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { relativeTime, cn, agentRouteRef, agentUrl } from "../lib/utils";
@@ -31,6 +32,7 @@ import {
   useResourceMembershipMutation,
   useResourceMemberships,
 } from "../hooks/useResourceMemberships";
+import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 
 import { getAdapterLabel } from "../adapters/adapter-display-registry";
 
@@ -128,11 +130,13 @@ function describeEnvironment(
   environment: Environment,
   capabilities?: EnvironmentCapabilities | null,
 ): EnvironmentDescriptor {
-  const detail = environment.driver === "sandbox"
-    ? `${getSandboxProviderLabel(environment, capabilities)} sandbox provider`
-    : environment.driver === "local"
-      ? "Paperclip host"
-      : formatEnvironmentDriver(environment.driver);
+  const detail = isPlatformManagedEnvironment(environment)
+    ? "Managed by Paperclip"
+    : environment.driver === "sandbox"
+      ? `${getSandboxProviderLabel(environment, capabilities)} sandbox provider`
+      : environment.driver === "local"
+        ? "Paperclip host"
+        : formatEnvironmentDriver(environment.driver);
 
   return {
     label: environment.name,
@@ -251,12 +255,22 @@ export function Agents() {
     enabled: !!selectedCompanyId && environmentsEnabled,
   });
 
-  const { data: runs } = useQuery({
-    queryKey: [...queryKeys.liveRuns(selectedCompanyId!), "agents-page"],
-    queryFn: () => heartbeatsApi.liveRunsForCompany(selectedCompanyId!),
+  const runsQueryKey = [...queryKeys.liveRuns(selectedCompanyId!), "agents-page"] as const;
+  const sharedRuns = useSharedPollingQuery({
+    companyId: selectedCompanyId,
+    resourceKey: "live-runs:agents-page",
+    queryKey: runsQueryKey,
     enabled: !!selectedCompanyId,
     refetchInterval: 15_000,
+    leaderOnly: true,
   });
+  const { data: runs, dataUpdatedAt: runsUpdatedAt } = useQuery({
+    queryKey: runsQueryKey,
+    queryFn: () => heartbeatsApi.liveRunsForCompany(selectedCompanyId!),
+    enabled: sharedRuns.enabled,
+    refetchInterval: sharedRuns.refetchInterval,
+  });
+  usePublishSharedQueryData(sharedRuns, runs, runsUpdatedAt);
   const membershipsQuery = useResourceMemberships(selectedCompanyId);
   const membershipMutation = useResourceMembershipMutation(selectedCompanyId);
 
@@ -341,13 +355,13 @@ export function Agents() {
     const agentJoinLeavePending = agentPending && membershipMutation.variables?.starred === undefined;
     const agentStarred = isStarred(membershipsQuery.data, "agent", agent.id);
     const builtInState = builtInByAgentId.get(agent.id);
-    // Provenance badge + lifecycle chip + inline `Set up`. Rendered inline in
+    const showBuiltInLifecycle = builtInState?.status === "needs_setup" || builtInState?.status === "pending_approval";
+    // Lifecycle chip + inline `Set up`. Rendered inline in
     // `meta` at xl (where there's room and the meta columns align) and on a
     // dedicated full-width line beneath the name below xl, so the chips never
     // starve the name — the row's primary identifier — at narrow widths.
-    const builtInCluster = builtInState ? (
+    const builtInCluster = builtInState && showBuiltInLifecycle ? (
       <>
-        <BuiltInAgentBadge />
         <BuiltInLifecycleChip status={builtInState.status} />
         {builtInState.status === "needs_setup" && (
           <span
@@ -635,6 +649,7 @@ function OrgTreeNode({
 }) {
   const agent = agentMap.get(node.id);
   const builtInState = builtInByAgentId.get(node.id);
+  const showBuiltInLifecycle = builtInState?.status === "needs_setup" || builtInState?.status === "pending_approval";
   const hasInvalidOrgChain = Boolean(agent && agent.orgChainHealth?.status === "invalid_org_chain");
   const membershipState = resourceMembershipState(memberships, "agent", node.id);
   const pending = membershipMutation.isPending &&
@@ -670,9 +685,8 @@ function OrgTreeNode({
               {agent?.title ? ` - ${agent.title}` : ""}
             </span>
           </div>
-          {builtInState && (
+          {builtInState && showBuiltInLifecycle && (
             <div className="flex items-center gap-1.5 shrink-0">
-              <BuiltInAgentBadge />
               <BuiltInLifecycleChip status={builtInState.status} />
               {builtInState.status === "needs_setup" && (
                 <span
