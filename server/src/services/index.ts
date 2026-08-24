@@ -3,6 +3,7 @@ export { companyArtifactsService } from "./company-artifacts.js";
 export { companySearchService } from "./company-search.js";
 export { feedbackService } from "./feedback.js";
 export { companySkillService } from "./company-skills.js";
+export { briefsService } from "./briefs.js";
 export { agentService, deduplicateAgentName } from "./agents.js";
 export {
   builtInAgentService,

@@ -60,6 +60,9 @@ export const queryKeys = {
   builtInAgents: {
     list: (companyId: string) => ["built-in-agents", companyId] as const,
   },
+  briefs: {
+    overview: (companyId: string) => ["briefs", companyId, "overview"] as const,
+  },
   issues: {
     list: (companyId: string) => ["issues", companyId] as const,
     mentionPool: (companyId: string) => ["issues", companyId, "mention-pool"] as const,

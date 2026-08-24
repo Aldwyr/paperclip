@@ -5,6 +5,7 @@ import {
   LayoutDashboard,
   DollarSign,
   History,
+  FileText,
   Search,
   SquarePen,
   Network,
@@ -185,6 +186,7 @@ export function Sidebar() {
         <SidebarSection label="Work" collapsible={{ open: workOpen, onOpenChange: setWorkOpen }}>
           <SidebarNavItem to="/issues" label="Tasks" icon={CircleDot} />
           <SidebarNavItem to="/routines" label="Routines" icon={Repeat} />
+          <SidebarNavItem to="/briefs" label="Briefs" icon={FileText} />
           {showPipelines ? (
             <SidebarNavItem to="/pipelines" label="Pipelines" icon={GitBranch} />
           ) : null}
