@@ -1611,6 +1611,13 @@
       "when": 1787433588265,
       "tag": "0231_pretty_meteorite",
       "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "version": "7",
+      "when": 1787577505934,
+      "tag": "0232_material_dreaming_celestial",
+      "breakpoints": true
     }
   ]
 }
