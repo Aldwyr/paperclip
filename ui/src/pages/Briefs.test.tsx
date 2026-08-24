@@ -34,6 +34,10 @@ const builtInAgentsApiMock = vi.hoisted(() => ({
 
 const resumeMock = vi.hoisted(() => vi.fn());
 
+const instanceSettingsApiMock = vi.hoisted(() => ({
+  getExperimental: vi.fn(),
+}));
+
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => companyState,
 }));
@@ -56,6 +60,10 @@ vi.mock("@/api/builtInAgents", async (importOriginal) => {
 
 vi.mock("@/api/agents", () => ({
   agentsApi: { resume: resumeMock },
+}));
+
+vi.mock("@/api/instanceSettings", () => ({
+  instanceSettingsApi: instanceSettingsApiMock,
 }));
 
 vi.mock("@/components/ConfigureBuiltInAgentModal", () => ({
@@ -161,7 +169,9 @@ describe("Briefs page", () => {
     briefsApiMock.overview.mockReset();
     builtInAgentsApiMock.list.mockReset();
     resumeMock.mockReset();
+    instanceSettingsApiMock.getExperimental.mockReset();
     breadcrumbState.setBreadcrumbs.mockReset();
+    instanceSettingsApiMock.getExperimental.mockResolvedValue({ enableBuiltInAgents: true });
     builtInAgentsApiMock.list.mockResolvedValue([makeBuiltInState("ready")]);
     briefsApiMock.overview.mockResolvedValue(makeOverview());
   });

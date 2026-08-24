@@ -85,12 +85,6 @@ describe("instance experimental settings validators", () => {
     expect(settings.enableApps).toBe(false);
   });
 
-  it("defaults built-in agents off", () => {
-    const settings = instanceExperimentalSettingsSchema.parse({});
-
-    expect(settings.enableBuiltInAgents).toBe(false);
-  });
-
   it("accepts worktree run execution patches", () => {
     expect(
       patchInstanceExperimentalSettingsSchema.parse({

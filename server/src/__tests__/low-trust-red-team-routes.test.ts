@@ -111,6 +111,7 @@ async function deleteCompanySkillsAfterLateHeartbeatWritesDrain(db: Db) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
+  throw lastError;
 }
 
 function expectNoCanary(value: unknown, ...markers: string[]) {

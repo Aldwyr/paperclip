@@ -196,13 +196,6 @@ export function AgentActionButtons({
   /** Hide the Terminate action (e.g. built-in agents are undeletable). */
   hideTerminate?: boolean;
   /**
-   * When set, pausing prompts a confirmation dialog first (e.g. for built-in
-   * agents that power a feature). Omit for the immediate-pause default.
-   */
-  pauseConfirm?: { title: string; description: ReactNode };
-  /** Hide the Terminate action (e.g. built-in agents are undeletable). */
-  hideTerminate?: boolean;
-  /**
    * Optional inline error reporter. When provided it is used instead of a toast
    * for action failures (preserves the detail page's inline error banner). When
    * omitted, failures surface as toasts (used by the list view).

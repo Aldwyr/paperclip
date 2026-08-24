@@ -157,6 +157,9 @@ export const queryKeys = {
   builtInAgents: {
     list: (companyId: string) => ["built-in-agents", companyId] as const,
   },
+  briefs: {
+    overview: (companyId: string) => ["briefs", companyId, "overview"] as const,
+  },
   summarySlots: {
     detail: (companyId: string, scopeKind: string, slotKey: string, scopeId?: string | null) =>
       ["summary-slots", companyId, scopeKind, slotKey, scopeId ?? null] as const,

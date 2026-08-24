@@ -615,21 +615,6 @@ export function agentService(db: Db) {
     });
   }
 
-  function assertBuiltInAgentMetadataMutationAllowed(
-    beforeMetadata: unknown,
-    afterMetadata: unknown,
-    options?: { allowBuiltInAgentMetadata?: boolean },
-  ) {
-    if (options?.allowBuiltInAgentMetadata) return;
-    const beforeMarker = readBuiltInAgentMarker(beforeMetadata);
-    const afterMarker = readBuiltInAgentMarker(afterMetadata);
-    if (builtInAgentMarkersEqual(beforeMarker, afterMarker)) return;
-    throw conflict("Built-in agent marker is managed by Paperclip and cannot be edited directly", {
-      code: "built_in_agent_marker_readonly",
-      key: beforeMarker?.key ?? afterMarker?.key ?? null,
-    });
-  }
-
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
