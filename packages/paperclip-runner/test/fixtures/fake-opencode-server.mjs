@@ -16,7 +16,36 @@ const runtimeConfig = JSON.parse(await readFile(join(process.env.XDG_CONFIG_HOME
 const mcp = runtimeConfig.mcp?.paperclip;
 let mcpRequestId = 1;
 const mcpEvidence = { tools: [], calls: [] };
-let pendingQuestion = null;
+
+function nativeQuestion() {
+  return {
+    id: "question-native-1",
+    sessionID: session.id,
+    questions: [
+      {
+        id: "environment",
+        header: "Environment",
+        question: "Where should we deploy?",
+        options: [
+          { label: "Staging", description: "Deploy to staging first." },
+          { label: "Production", description: "Deploy directly to production." }
+        ],
+        custom: true
+      },
+      {
+        id: "regions",
+        header: "Regions",
+        question: "Which regions?",
+        options: [{ label: "US" }, { label: "EU" }],
+        multiple: true
+      }
+    ]
+  };
+}
+
+let pendingQuestion = await readFile(join(process.env.XDG_DATA_HOME, "fake-pending-question.json"), "utf8")
+  .then((value) => JSON.parse(value))
+  .catch(() => null);
 
 await mkdir(process.env.XDG_DATA_HOME, { recursive: true });
 await writeFile(join(process.env.XDG_DATA_HOME, "fake-environment.json"), JSON.stringify({
@@ -119,16 +148,24 @@ const server = createServer(async (request, response) => {
     request.on("end", async () => {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       await writeFile(join(process.env.XDG_DATA_HOME, "fake-question-reply.json"), JSON.stringify({ url: request.url, body }));
+      const repliedQuestion = pendingQuestion;
       pendingQuestion = null;
-      json(response, 200, true);
-      setTimeout(() => emit({ type: "session.idle", id: "event-question-idle", properties: { sessionID: session.id } }), 10);
+      emit({ type: "question.replied", id: "event-question-replied", properties: repliedQuestion });
+      setTimeout(() => {
+        json(response, 200, true);
+        emit({ type: "session.idle", id: "event-question-idle", properties: { sessionID: session.id } });
+      }, 10);
     });
     return;
   }
   if (request.method === "POST" && request.url?.startsWith("/question/question-native-1/reject?")) {
+    const rejectedQuestion = pendingQuestion;
     pendingQuestion = null;
-    json(response, 200, true);
-    setTimeout(() => emit({ type: "session.idle", id: "event-question-rejected-idle", properties: { sessionID: session.id } }), 10);
+    emit({ type: "question.rejected", id: "event-question-rejected", properties: rejectedQuestion });
+    setTimeout(() => {
+      json(response, 200, true);
+      emit({ type: "session.idle", id: "event-question-rejected-idle", properties: { sessionID: session.id } });
+    }, 10);
     return;
   }
   if (request.method === "POST" && request.url === `/session/${session.id}/abort`) return json(response, 200, true);
@@ -145,29 +182,8 @@ const server = createServer(async (request, response) => {
         await callFirstPaperclipTool();
         const parsedPrompt = JSON.parse(promptPayload.parts?.[0]?.text ?? "{}");
         if (String(parsedPrompt.message ?? "").includes("native-question")) {
-          pendingQuestion = {
-            id: "question-native-1",
-            sessionID: session.id,
-            questions: [
-              {
-                id: "environment",
-                header: "Environment",
-                question: "Where should we deploy?",
-                options: [
-                  { label: "Staging", description: "Deploy to staging first." },
-                  { label: "Production", description: "Deploy directly to production." }
-                ],
-                custom: true
-              },
-              {
-                id: "regions",
-                header: "Regions",
-                question: "Which regions?",
-                options: [{ label: "US" }, { label: "EU" }],
-                multiple: true
-              }
-            ]
-          };
+          pendingQuestion = nativeQuestion();
+          emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
           emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
           return;
         }

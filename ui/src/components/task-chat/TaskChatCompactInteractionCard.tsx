@@ -20,6 +20,7 @@ import {
   X,
 } from "lucide-react";
 import type { IssueDocument } from "@paperclipai/shared";
+import type { PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
 import { IssueThreadInteractionCard } from "@/components/IssueThreadInteractionCard";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { Button } from "@/components/ui/button";
@@ -33,7 +34,6 @@ import {
   collectSuggestedTaskClientKeys,
   getCheckboxConfirmationSelectedLabels,
   getItemVerdictProgress,
-  getQuestionAnswerLabels,
   normalizeRequestConfirmationTargetHref,
   type AskUserQuestionsAnswer,
   type AskUserQuestionsInteraction,
@@ -46,7 +46,7 @@ import {
   type SuggestedTaskTreeNode,
 } from "@/lib/issue-thread-interactions";
 import { cn } from "@/lib/utils";
-import { QuestionForm } from "./QuestionForm";
+import { QuestionForm, QuestionResponseSummary } from "./QuestionForm";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 
 type SharedInteractionProps = Omit<
@@ -220,19 +220,9 @@ function ResolvedInteraction({ interaction }: { interaction: IssueThreadInteract
   let detail: ReactNode = null;
 
   if (interaction.kind === "ask_user_questions" && interaction.result?.answers) {
-    detail = (
-      <ul className="mt-2 space-y-1.5">
-        {interaction.payload.questions.map((question) => {
-          const labels = getQuestionAnswerLabels({ question, answers: interaction.result?.answers ?? [] });
-          return (
-            <li key={question.id} className="text-xs text-muted-foreground">
-              <span className="text-foreground">{question.prompt}</span>
-              <span className="block truncate">{labels.length > 0 ? labels.join(", ") : "No answer"}</span>
-            </li>
-          );
-        })}
-      </ul>
-    );
+    const questionSet = questionSetForInteraction(interaction);
+    const response = questionResponseForInteraction(interaction, questionSet);
+    detail = response ? <div className="mt-2"><QuestionResponseSummary questionSet={questionSet} response={response} /></div> : null;
   } else if (interaction.kind === "request_checkbox_confirmation") {
     const labels = getCheckboxConfirmationSelectedLabels({ payload: interaction.payload, result: interaction.result });
     detail = labels.length > 0 ? <p className="mt-1 text-xs text-muted-foreground">{labels.join(", ")}</p> : null;
@@ -260,19 +250,10 @@ function ResolvedInteraction({ interaction }: { interaction: IssueThreadInteract
   );
 }
 
-function AskUserQuestionsCard({
-  interaction,
-  onSubmitInteractionAnswers,
-  onCancelInteraction,
-  errorMessage,
-}: {
-  interaction: AskUserQuestionsInteraction;
-  onSubmitInteractionAnswers?: SharedInteractionProps["onSubmitInteractionAnswers"];
-  onCancelInteraction?: SharedInteractionProps["onCancelInteraction"];
-  errorMessage: (error: unknown) => string;
-}) {
-  const questionSet = {
-    schema: "paperclip.question_set.v1" as const,
+function questionSetForInteraction(interaction: AskUserQuestionsInteraction): PaperclipQuestionSet {
+  if (interaction.payload.questionSet) return interaction.payload.questionSet;
+  return {
+    schema: "paperclip.question_set.v1",
     ...(interaction.title ? { title: interaction.title } : {}),
     ...(interaction.payload.submitLabel ? { submitLabel: interaction.payload.submitLabel } : {}),
     questions: interaction.payload.questions.map((question) => {
@@ -292,26 +273,57 @@ function AskUserQuestionsCard({
       };
     }),
   };
-  const initialResponse = interaction.result?.answers ? {
-    schema: "paperclip.question_response.v1" as const,
-    answers: Object.fromEntries(interaction.result.answers.map((answer) => [answer.questionId, {
-      selectedOptionIds: answer.optionIds,
-      ...(answer.otherText ? { customText: answer.otherText } : {}),
-    }])),
-  } : null;
+}
+
+function questionResponseForInteraction(
+  interaction: AskUserQuestionsInteraction,
+  questionSet: PaperclipQuestionSet,
+): PaperclipQuestionResponse | null {
+  if (!interaction.result?.answers) return null;
+  return {
+    schema: "paperclip.question_response.v1",
+    answers: Object.fromEntries(interaction.result.answers.map((answer) => {
+      const question = questionSet.questions.find((candidate) => candidate.id === answer.questionId);
+      return [answer.questionId, question?.answerMode === "text"
+        ? { ...(answer.otherText ? { text: answer.otherText } : {}) }
+        : {
+            selectedOptionIds: answer.optionIds,
+            ...(answer.otherText ? { customText: answer.otherText } : {}),
+          }];
+    })),
+  };
+}
+
+function AskUserQuestionsCard({
+  interaction,
+  onSubmitInteractionAnswers,
+  onCancelInteraction,
+  errorMessage,
+}: {
+  interaction: AskUserQuestionsInteraction;
+  onSubmitInteractionAnswers?: SharedInteractionProps["onSubmitInteractionAnswers"];
+  onCancelInteraction?: SharedInteractionProps["onCancelInteraction"];
+  errorMessage: (error: unknown) => string;
+}) {
+  const questionSet = questionSetForInteraction(interaction);
+  const initialResponse = questionResponseForInteraction(interaction, questionSet);
   return (
     <QuestionForm
       id={interaction.id}
       questionSet={questionSet}
       initialResponse={initialResponse}
-      implicitCustomAnswer
+      implicitCustomAnswer={interaction.payload.questionSet === undefined}
       disabled={!onSubmitInteractionAnswers}
       onSubmit={async (response) => {
-        const answers: AskUserQuestionsAnswer[] = questionSet.questions.map((question) => ({
-          questionId: question.id,
-          optionIds: response.answers[question.id]?.selectedOptionIds ?? [],
-          ...(response.answers[question.id]?.customText?.trim() ? { otherText: response.answers[question.id]?.customText?.trim() } : {}),
-        }));
+        const answers: AskUserQuestionsAnswer[] = questionSet.questions.map((question) => {
+          const answer = response.answers[question.id];
+          const otherText = question.answerMode === "text" ? answer?.text?.trim() : answer?.customText?.trim();
+          return {
+            questionId: question.id,
+            optionIds: question.answerMode === "text" ? [] : answer?.selectedOptionIds ?? [],
+            ...(otherText ? { otherText } : {}),
+          };
+        });
         try {
           await onSubmitInteractionAnswers?.(interaction, answers);
         } catch (error) {

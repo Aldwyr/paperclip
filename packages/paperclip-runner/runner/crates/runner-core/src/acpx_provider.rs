@@ -31,6 +31,7 @@ pub struct AcpxProvider {
     next_request_id: u64,
     inbox: VecDeque<ProviderEvent>,
     pending_tools: BTreeMap<String, PendingTool>,
+    pending_input_requests: BTreeMap<String, String>,
     config: AcpxProviderConfig,
     tools: Vec<AuthorizedTool>,
     catalog_revision: u64,
@@ -62,6 +63,7 @@ impl AcpxProvider {
             next_request_id: 1,
             inbox: VecDeque::new(),
             pending_tools: BTreeMap::new(),
+            pending_input_requests: BTreeMap::new(),
             config: config.clone(),
             tools,
             catalog_revision: 1,
@@ -213,6 +215,7 @@ impl AcpxProvider {
             event_type,
             GeneratedAcpxSidecarEventType::RuntimeToolCalled
                 | GeneratedAcpxSidecarEventType::RuntimePermissionRequested
+                | GeneratedAcpxSidecarEventType::RuntimeInputRequested
                 | GeneratedAcpxSidecarEventType::RuntimeTurnTerminal
                 | GeneratedAcpxSidecarEventType::RuntimeEvent
         ) {
@@ -283,6 +286,45 @@ impl AcpxProvider {
                     }),
                 }))
             }
+            GeneratedAcpxSidecarEventType::RuntimeInputRequested => {
+                let request_id = required_text(&payload, "requestId", "input request")?;
+                let question_set = payload.get("questionSet").cloned().ok_or_else(|| {
+                    LocalRunnerError::invalid("ACPX input request omitted its question set")
+                })?;
+                validate_question_set(&question_set)?;
+                let turn_id = message
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if self
+                    .pending_input_requests
+                    .insert(request_id.clone(), turn_id.clone())
+                    .is_some()
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "ACPX reused a pending input request id",
+                    ));
+                }
+                Ok(Some(ProviderEvent::RuntimeRequest {
+                    request: json!({
+                        "schema": "paperclip.runtime_request.v2",
+                        "requestKind": "runtime",
+                        "requestId": request_id,
+                        "type": "input",
+                        "status": "pending",
+                        "prompt": question_set.get("title").and_then(Value::as_str).unwrap_or("Additional information needed"),
+                        "input": question_set,
+                        "origin": payload.get("origin").cloned().unwrap_or_else(|| json!({
+                            "adapter": "acpx-runtime-sidecar",
+                            "provider": "acpx",
+                            "method": "elicitation/create",
+                        })),
+                        "turnId": turn_id,
+                        "itemId": request_id,
+                    }),
+                }))
+            }
             GeneratedAcpxSidecarEventType::RuntimeTurnTerminal => {
                 let turn_id = message
                     .get("turnId")
@@ -292,6 +334,8 @@ impl AcpxProvider {
                 if self.active_turn_id.as_deref() == Some(turn_id.as_str()) {
                     self.active_turn_id = None;
                 }
+                self.pending_input_requests
+                    .retain(|_, pending_turn_id| pending_turn_id != &turn_id);
                 let status = payload
                     .get("status")
                     .and_then(Value::as_str)
@@ -380,7 +424,10 @@ impl Provider for AcpxProvider {
         run_id: &str,
         tools: Vec<AuthorizedTool>,
     ) -> Result<(), LocalRunnerError> {
-        if self.active_turn_id.is_some() || !self.pending_tools.is_empty() {
+        if self.active_turn_id.is_some()
+            || !self.pending_tools.is_empty()
+            || !self.pending_input_requests.is_empty()
+        {
             return Err(LocalRunnerError::invalid(
                 "cannot attach an ACPX run while work is active",
             ));
@@ -503,6 +550,23 @@ impl Provider for AcpxProvider {
         turn_id: &str,
         resolution: &Value,
     ) -> Result<(), LocalRunnerError> {
+        if let Some(pending_turn_id) = self.pending_input_requests.get(request_id) {
+            if pending_turn_id != turn_id {
+                return Err(LocalRunnerError::invalid(
+                    "ACPX input resolution named a stale turn",
+                ));
+            }
+            self.request(
+                GeneratedAcpxSidecarCommand::InputResolve,
+                json!({
+                    "requestId": request_id,
+                    "turnId": turn_id,
+                    "resolution": resolution,
+                }),
+            )?;
+            self.pending_input_requests.remove(request_id);
+            return Ok(());
+        }
         let action = resolution
             .get("action")
             .and_then(Value::as_str)
@@ -613,6 +677,69 @@ fn required_text(value: &Value, key: &str, label: &str) -> Result<String, LocalR
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| LocalRunnerError::invalid(format!("ACPX sidecar omitted {label} identity")))
+}
+
+fn validate_question_set(value: &Value) -> Result<(), LocalRunnerError> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../../protocol/schemas/question-set.schema.json"
+    ))
+    .map_err(|_| LocalRunnerError::invalid("embedded question-set schema is invalid"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|_| LocalRunnerError::invalid("embedded question-set schema cannot compile"))?;
+    if !validator.is_valid(value) {
+        return Err(LocalRunnerError::invalid(
+            "ACPX input request failed the Paperclip question-set schema",
+        ));
+    }
+    if value.get("schema").and_then(Value::as_str) != Some("paperclip.question_set.v1") {
+        return Err(LocalRunnerError::invalid(
+            "ACPX input request used an unsupported question-set schema",
+        ));
+    }
+    let questions = value
+        .get("questions")
+        .and_then(Value::as_array)
+        .filter(|questions| !questions.is_empty() && questions.len() <= 64)
+        .ok_or_else(|| {
+            LocalRunnerError::invalid("ACPX input request must contain 1 through 64 questions")
+        })?;
+    let mut question_ids = std::collections::BTreeSet::new();
+    for question in questions {
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 160)
+            .ok_or_else(|| LocalRunnerError::invalid("ACPX input question omitted a valid id"))?;
+        if !question_ids.insert(id) {
+            return Err(LocalRunnerError::invalid(
+                "ACPX input question ids must be unique",
+            ));
+        }
+        if question.get("required").and_then(Value::as_bool).is_none()
+            || question.get("prompt").and_then(Value::as_str).is_none()
+        {
+            return Err(LocalRunnerError::invalid(
+                "ACPX input question omitted required presentation fields",
+            ));
+        }
+        let answer_mode = question.get("answerMode").and_then(Value::as_str);
+        if !matches!(answer_mode, Some("text" | "single_select" | "multi_select")) {
+            return Err(LocalRunnerError::invalid(
+                "ACPX input question used an unsupported answer mode",
+            ));
+        }
+        if matches!(answer_mode, Some("single_select" | "multi_select"))
+            && question
+                .get("options")
+                .and_then(Value::as_array)
+                .map_or(true, Vec::is_empty)
+        {
+            return Err(LocalRunnerError::invalid(
+                "ACPX select question omitted its options",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn permission_kind(value: Option<&str>) -> String {

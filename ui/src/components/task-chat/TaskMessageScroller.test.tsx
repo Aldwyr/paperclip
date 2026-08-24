@@ -91,6 +91,8 @@ describe("TaskMessageScroller", () => {
   afterEach(() => {
     flushSync(() => root.unmount());
     container.remove();
+    document.documentElement.style.removeProperty("--motion-scrollbar-idle-delay");
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -108,6 +110,26 @@ describe("TaskMessageScroller", () => {
     const frame = scroller().parentElement;
 
     expect(frame?.className).toBe("relative min-h-0 flex-1");
+  });
+
+  it("shows the scrollbar only while scroll activity is recent", () => {
+    vi.useFakeTimers();
+    document.documentElement.style.setProperty("--motion-scrollbar-idle-delay", "600ms");
+    render();
+    const el = scroller();
+    fakeGeometry(el);
+
+    expect(el.className).toContain("scrollbar-while-scrolling");
+    expect(el.getAttribute("data-scroll-active")).toBeNull();
+
+    el.scrollTop = 100;
+    el.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(el.getAttribute("data-scroll-active")).toBe("true");
+
+    vi.advanceTimersByTime(599);
+    expect(el.getAttribute("data-scroll-active")).toBe("true");
+    vi.advanceTimersByTime(1);
+    expect(el.getAttribute("data-scroll-active")).toBeNull();
   });
 
   it("auto-follows content instantly while pinned", async () => {

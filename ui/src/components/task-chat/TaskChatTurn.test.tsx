@@ -133,6 +133,35 @@ describe("TaskChatTurn", () => {
     expect(fold()?.getAttribute("data-folded")).toBe("true");
   });
 
+  it("keeps settled runtime question history outside the Worked fold", () => {
+    renderTurn({
+      ...SETTLED,
+      items: [
+        SETTLED.items[0]!,
+        {
+          id: "question-history",
+          kind: "protocol",
+          surface: "runtime_request",
+          runId: "run-1",
+          requestId: "question-1",
+          requestKind: "runtime",
+          turnId: "turn-1",
+          requestType: "input",
+          status: "resolved",
+          prompt: "Choose an environment",
+          choices: [],
+          fields: [],
+        },
+      ],
+    });
+
+    expect(fold()?.textContent).toContain("c1");
+    expect(fold()?.textContent).not.toContain("question-history");
+    const history = container.querySelector('[data-testid="task-chat-turn-persistent-history"]');
+    expect(history?.textContent).toContain("question-history");
+    expect(history?.closest(".tc-turn-fold")).toBeNull();
+  });
+
   it("toggles open on summary click", () => {
     renderTurn(SETTLED);
     flushSync(() => summaryBtn()!.click());

@@ -5,6 +5,8 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 const PRIVATE_PERMISSION_TOOL = "__paperclip_runtime_permission";
+const PRIVATE_INPUT_TOOL = "__paperclip_runtime_input";
+const MODEL_INPUT_TOOL = "request_user_input";
 const BUILTIN_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const BUILTIN_GOVERNED_TOOLS = new Set(["write", "edit", "bash"]);
 const MAX_RESPONSE_BYTES = 1_048_576;
@@ -40,6 +42,7 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
   const rpc = createMcpClient(endpoint, token);
   let sessionAllowsGovernedTools = false;
   await initializeMcpClient(rpc, "paperclip-pi-extension");
+  registerRuntimeInputTool(pi, rpc);
   await registerMcpTools(pi, rpc, { privatePermissionTool: true, prefix: "" });
   const assignedUrl = process.env.PAPERCLIP_NATIVE_MCP_URL?.trim();
   const assignedToken = process.env.PAPERCLIP_NATIVE_MCP_TOKEN?.trim();
@@ -75,6 +78,69 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
   });
 }
 
+function registerRuntimeInputTool(pi: ExtensionAPI, rpc: ReturnType<typeof createMcpClient>): void {
+  pi.registerTool({
+    name: MODEL_INPUT_TOOL,
+    label: "Ask · user input",
+    description: "Pause the current turn and ask the user one or more structured questions. Use text, single-select, multi-select, boolean, integer, or number fields as appropriate.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["title", "questions"],
+      properties: {
+        title: { type: "string", minLength: 1, maxLength: 1_000 },
+        description: { type: "string", maxLength: 4_000 },
+        questions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 32,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "prompt", "answerMode"],
+            properties: {
+              id: { type: "string", minLength: 1, maxLength: 160, pattern: "^[A-Za-z0-9_.:-]+$" },
+              header: { type: "string", maxLength: 1_000 },
+              prompt: { type: "string", minLength: 1, maxLength: 4_000 },
+              helpText: { type: "string", maxLength: 4_000 },
+              required: { type: "boolean" },
+              answerMode: { enum: ["text", "single_select", "multi_select", "boolean", "integer", "number"] },
+              options: {
+                type: "array",
+                minItems: 1,
+                maxItems: 128,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["id", "label"],
+                  properties: {
+                    id: { type: "string", minLength: 1, maxLength: 160 },
+                    label: { type: "string", minLength: 1, maxLength: 1_000 },
+                    description: { type: "string", maxLength: 4_000 },
+                  },
+                },
+              },
+              minLength: { type: "integer", minimum: 0, maximum: 1_000_000 },
+              maxLength: { type: "integer", minimum: 0, maximum: 1_000_000 },
+              minimum: { type: "number" },
+              maximum: { type: "number" },
+              pattern: { type: "string", maxLength: 1_000 },
+            },
+          },
+        },
+      },
+    } as ToolDefinition["parameters"],
+    async execute(toolCallId, input, signal) {
+      const response = await rpcWithCancellation(rpc, PRIVATE_INPUT_TOOL, toolCallId, input, signal);
+      if (response.result?.isError) throw new Error(safeResultText(response) || "Paperclip input request failed");
+      return {
+        content: [{ type: "text" as const, text: safeResultText(response) || JSON.stringify({ action: "cancel" }) }],
+        details: { operationId: PRIVATE_INPUT_TOOL, registeredName: MODEL_INPUT_TOOL, callId: toolCallId },
+      };
+    },
+  });
+}
+
 async function initializeMcpClient(rpc: ReturnType<typeof createMcpClient>, clientName: string): Promise<void> {
   await rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: clientName, version: "1" } }, `${clientName}-initialize`);
   await rpc("notifications/initialized", {}, null);
@@ -83,7 +149,11 @@ async function initializeMcpClient(rpc: ReturnType<typeof createMcpClient>, clie
 async function registerMcpTools(pi: ExtensionAPI, rpc: ReturnType<typeof createMcpClient>, options: { privatePermissionTool: boolean; prefix: string }): Promise<void> {
   const catalog = await rpc("tools/list", {}, "paperclip-pi-tools");
   for (const tool of catalog.result?.tools ?? []) {
-    if (!safeTool(tool) || (options.privatePermissionTool && tool.name === PRIVATE_PERMISSION_TOOL)) continue;
+    if (
+      !safeTool(tool) ||
+      (options.privatePermissionTool && tool.name === PRIVATE_PERMISSION_TOOL) ||
+      (options.prefix === "" && tool.name === MODEL_INPUT_TOOL)
+    ) continue;
     const registeredName = `${options.prefix}${tool.name}`;
     pi.registerTool({
       name: registeredName,

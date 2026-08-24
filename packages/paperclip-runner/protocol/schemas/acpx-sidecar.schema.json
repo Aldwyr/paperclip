@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://paperclip.dev/schemas/acpx-sidecar/v1/message.schema.json",
+  "$id": "https://paperclip.dev/schemas/acpx-sidecar/v2/message.schema.json",
   "title": "Paperclip ACPX sidecar message",
   "oneOf": [
     { "$ref": "#/$defs/request" },
@@ -11,13 +11,13 @@
     "command": {
       "enum": [
         "initialize", "session.open", "run.attach", "turn.start", "turn.cancel",
-        "permission.resolve", "tool.resolve", "session.read", "session.snapshot",
+        "permission.resolve", "input.resolve", "tool.resolve", "session.read", "session.snapshot",
         "session.suspend", "session.close"
       ]
     },
     "eventType": {
       "enum": [
-        "runtime.event", "runtime.permission_requested", "runtime.tool_called",
+        "runtime.event", "runtime.permission_requested", "runtime.input_requested", "runtime.tool_called",
         "runtime.turn_terminal", "runtime.process", "runtime.diagnostic"
       ]
     },
@@ -25,7 +25,7 @@
       "type": "object",
       "required": ["protocolVersion", "id", "command", "params"],
       "properties": {
-        "protocolVersion": { "const": 1 },
+        "protocolVersion": { "const": 2 },
         "id": { "type": "integer", "minimum": 1 },
         "command": { "$ref": "#/$defs/command" },
         "params": { "type": "object" }
@@ -36,7 +36,7 @@
       "type": "object",
       "required": ["protocolVersion", "id", "ok"],
       "properties": {
-        "protocolVersion": { "const": 1 },
+        "protocolVersion": { "const": 2 },
         "id": { "type": "integer", "minimum": 1 },
         "ok": { "type": "boolean" },
         "result": { "type": "object" },
@@ -57,7 +57,7 @@
       "type": "object",
       "required": ["protocolVersion", "sequence", "eventType", "runId", "turnId", "payload"],
       "properties": {
-        "protocolVersion": { "const": 1 },
+        "protocolVersion": { "const": 2 },
         "sequence": { "type": "integer", "minimum": 1 },
         "eventType": { "$ref": "#/$defs/eventType" },
         "runId": { "type": ["string", "null"], "maxLength": 160 },

@@ -4,6 +4,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { PropertiesPanel } from "./PropertiesPanel";
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
@@ -19,6 +20,7 @@ const mockPanelState = vi.hoisted(() => ({
   panelContentMode: "padded" as const,
   panelVisible: true,
 }));
+const mockSetPanelVisible = vi.hoisted(() => vi.fn());
 
 vi.mock("../context/PanelContext", () => ({
   usePanel: () => ({
@@ -27,7 +29,7 @@ vi.mock("../context/PanelContext", () => ({
     panelVisible: mockPanelState.panelVisible,
     openPanel: vi.fn(),
     closePanel: vi.fn(),
-    setPanelVisible: vi.fn(),
+    setPanelVisible: mockSetPanelVisible,
     togglePanelVisible: vi.fn(),
   }),
 }));
@@ -52,7 +54,9 @@ describe("PropertiesPanel", () => {
     flushSync(() => {
       root!.render(
         <QueryClientProvider client={queryClient}>
-          <PropertiesPanel />
+          <TooltipProvider>
+            <PropertiesPanel />
+          </TooltipProvider>
         </QueryClientProvider>,
       );
     });
@@ -63,6 +67,7 @@ describe("PropertiesPanel", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     window.localStorage.clear();
+    mockSetPanelVisible.mockClear();
   });
 
   afterEach(() => {
@@ -117,6 +122,18 @@ describe("PropertiesPanel", () => {
       const inner = aside!.querySelector<HTMLDivElement>(":scope > div:not([role])");
       expect(inner!.style.width).toBe("322px");
       expect(inner!.style.minWidth).toBe("322px");
+    });
+
+    it("uses the pressed side-panel toggle instead of an X to hide the open pane", async () => {
+      await renderPanel();
+      const toggle = container.querySelector<HTMLButtonElement>('[aria-label="Toggle side panel"]');
+      expect(toggle).not.toBeNull();
+      expect(toggle!.getAttribute("aria-pressed")).toBe("true");
+      expect(toggle!.querySelector(".lucide-panel-right-close")).not.toBeNull();
+      expect(container.querySelector('[aria-label="Hide side panel"]')).toBeNull();
+
+      toggle!.click();
+      expect(mockSetPanelVisible).toHaveBeenCalledWith(false);
     });
 
     it("restores a remembered width from localStorage (clamped to the minimum)", async () => {

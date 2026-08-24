@@ -120,7 +120,7 @@ export function SidePanelLauncher({
     return (
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>{trigger}</PopoverTrigger>
-        <PopoverContent align="start" className={cn("w-80 overflow-hidden p-0", className)}>
+        <PopoverContent align="start" className={cn("w-(--side-panel-launcher-width) overflow-hidden p-0", className)}>
           <div className="sr-only">
             <h2>{title}</h2>
             <p>{description}</p>

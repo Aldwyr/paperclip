@@ -18,6 +18,7 @@ import type {
   TaskChatProtocolItem,
   TaskChatProtocolStep,
 } from "./task-chat-model";
+import { latestRuntimeRequests } from "./task-chat-model";
 import { isGenericToolName, mcpToolSegment, toolTaxonomy } from "./tool-taxonomy";
 
 const TERMINAL_STATUSES = new Set([
@@ -589,6 +590,8 @@ export function transcriptToTaskChatItems(
           choices: entry.choices,
           fields: entry.fields,
           questionSet: entry.questionSet,
+          resolvedAction: entry.resolvedAction,
+          response: entry.response,
         };
         const existingIndex = protocolIndexByKey.get(key);
         if (existingIndex == null) {
@@ -736,7 +739,14 @@ export function transcriptToTaskChatItems(
  * run log / classic transcript.
  */
 export function settledRunChildren(parsed: readonly TaskChatItem[]): TaskChatTurnChildItem[] {
-  return buildActivityPhases(parsed, false);
+  const runtimeRequests = latestRuntimeRequests(parsed);
+  const activity = buildActivityPhases(parsed.filter((item) =>
+    item.kind !== "protocol" || item.surface !== "runtime_request"
+  ), false);
+  // Questions and their answers are issue-thread history, not diagnostic run
+  // activity. Keep them as direct turn children so TaskChatTurn can preserve
+  // them outside the collapsed Worked disclosure.
+  return [...activity, ...runtimeRequests];
 }
 
 /**

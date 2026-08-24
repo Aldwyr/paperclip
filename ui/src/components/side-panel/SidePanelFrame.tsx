@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
-import { Maximize2, Minimize2, PanelRightClose, PanelRightOpen, X } from "lucide-react";
+import { Maximize2, Minimize2, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -55,7 +55,7 @@ export function SidePanelFrame({
       style={style}
     >
       {(header || trailingControls) ? (
-        <header className="flex h-12 min-w-0 shrink-0 items-center gap-1 border-b border-border px-2">
+        <header className="flex h-(--side-panel-header-height) min-w-0 shrink-0 items-center gap-1 border-b border-border px-2">
           <div className="flex min-w-0 flex-1 self-stretch">{header}</div>
           {trailingControls ? (
             <div className="flex shrink-0 items-center gap-1">{trailingControls}</div>
@@ -115,11 +115,11 @@ export function SidePanelToggleButton({
 export function SidePanelWindowControls({
   maximized,
   onMaximizedChange,
-  onClose,
+  onToggle,
 }: {
   maximized: boolean;
   onMaximizedChange: (maximized: boolean) => void;
-  onClose: () => void;
+  onToggle: () => void;
 }) {
   return (
     <>
@@ -133,16 +133,7 @@ export function SidePanelWindowControls({
       >
         {maximized ? <Minimize2 aria-hidden /> : <Maximize2 aria-hidden />}
       </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        onClick={onClose}
-        aria-label="Hide side panel"
-        title="Hide side panel"
-      >
-        <X aria-hidden />
-      </Button>
+      <SidePanelToggleButton open onToggle={onToggle} />
     </>
   );
 }

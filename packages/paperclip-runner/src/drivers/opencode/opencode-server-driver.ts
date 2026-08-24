@@ -33,6 +33,7 @@ import {
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   harnessRuntimeRequestOutcome,
   parseHarnessRuntimeRequestResolution,
+  parsePaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "../../contracts/types.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
@@ -281,6 +282,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   readonly #pendingRuntimeRequests = new Map<string, {
     request: HarnessRuntimeRequest;
     nativeQuestions: Record<string, unknown>[];
+    submittedResponse?: PaperclipQuestionResponse;
   }>();
   #activeTraceFrameId: number | null = null;
   #activeTraceEmittedEventIds: string[] = [];
@@ -419,11 +421,9 @@ class OpenCodeHarnessSession implements HarnessSession {
         // at this HTTP boundary.
         providerID,
         modelID,
-        // Paperclip owns durable human-input governance. OpenCode's built-in
-        // `question` tool waits inside the provider process and cannot produce
-        // a PRP interaction card or an authorized response wake, so exposing
-        // it alongside Paperclip's canonical interaction tools creates a
-        // competing, invisible control plane.
+        // This exact OpenCode version passed the native-question conformance
+        // suite. question.asked is adapted into PRP v2 and its reply/reject API
+        // remains private to this driver.
         tools: { question: true },
         ...(this.#sendFullContext ? { system: this.#systemInstructions } : {}),
         parts: [{ type: "text", text: prompt }],
@@ -460,6 +460,10 @@ class OpenCodeHarnessSession implements HarnessSession {
     const base = `/question/${encodeURIComponent(input.requestId)}`;
     const workspace = `directory=${encodeURIComponent(this.#workingDirectory)}`;
     if (resolution.action === "submit" && "response" in resolution) {
+      // OpenCode can broadcast question.replied before the reply HTTP request
+      // returns. Retain the canonical response before crossing that boundary
+      // so the racing terminal event carries the same durable answer record.
+      pending.submittedResponse = structuredClone(resolution.response);
       await api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
         method: "POST",
         body: JSON.stringify({ answers: openCodeAnswers(pending, resolution.response) }),
@@ -468,15 +472,20 @@ class OpenCodeHarnessSession implements HarnessSession {
       await api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
         method: "POST",
         body: JSON.stringify({ answers: pending.nativeQuestions.map((question, index) =>
-          resolution.answers[text(question.id, `question-${index + 1}`)]?.answers ?? [],
+          resolution.answers[openCodeQuestionId(question, index)]?.answers ?? [],
         ) }),
       });
     } else {
       await api(this.#fetch, this.#runtime, `${base}/reject?${workspace}`, { method: "POST" });
     }
-    this.#pendingRuntimeRequests.delete(input.requestId);
+    // question.replied/question.rejected can race the HTTP response on the SSE
+    // stream. The first terminal fact wins; the echo must not emit a duplicate.
+    if (!this.#pendingRuntimeRequests.delete(input.requestId)) return;
     this.#emit("runtime_request.resolved", harnessRuntimeRequestOutcome(pending.request, {
       action: resolution.action,
+      ...(resolution.action === "submit" && "response" in resolution
+        ? { response: resolution.response }
+        : {}),
     }), { turnId: input.turnId, itemId: pending.request.itemId });
   }
 
@@ -610,8 +619,26 @@ class OpenCodeHarnessSession implements HarnessSession {
     if (!turnId) return;
     const requestId = text(properties.id, text(properties.requestID, text(properties.requestId)));
     const nativeQuestions = Array.isArray(properties.questions) ? properties.questions.map(record).slice(0, 64) : [];
-    if (!requestId || nativeQuestions.length === 0 || this.#pendingRuntimeRequests.has(requestId)) return;
-    const input = openCodeQuestionSet(nativeQuestions);
+    if (!requestId || nativeQuestions.length === 0) {
+      this.#emit("harness.diagnostic", {
+        code: "runtime_input_rejected",
+        adapter: "opencode-server",
+        reason: "OpenCode emitted a question event without a request id or supported questions.",
+      }, { turnId, ...(requestId ? { itemId: requestId } : {}) });
+      return;
+    }
+    if (this.#pendingRuntimeRequests.has(requestId)) return;
+    let input: PaperclipQuestionSet;
+    try {
+      input = normalizeOpenCodeQuestionSet(nativeQuestions, properties);
+    } catch {
+      this.#emit("harness.diagnostic", {
+        code: "runtime_input_rejected",
+        adapter: "opencode-server",
+        reason: "OpenCode emitted a malformed or ambiguous question set.",
+      }, { turnId, itemId: requestId });
+      return;
+    }
     const request: HarnessRuntimeRequest = {
       requestId,
       requestKind: "user_input",
@@ -774,6 +801,23 @@ class OpenCodeHarnessSession implements HarnessSession {
     const turnId = this.#activeTurnId;
     if (type === "question.asked" && turnId) {
       this.#acceptQuestion(properties);
+      return;
+    }
+    if ((type === "question.replied" || type === "question.rejected") && turnId) {
+      const requestId = text(properties.id, text(properties.requestID, text(properties.requestId)));
+      const pending = this.#pendingRuntimeRequests.get(requestId);
+      if (!pending) return;
+      this.#pendingRuntimeRequests.delete(requestId);
+      this.#emit(
+        type === "question.replied" ? "runtime_request.resolved" : "runtime_request.cancelled",
+        harnessRuntimeRequestOutcome(
+          pending.request,
+          type === "question.replied"
+            ? { action: "submit", response: pending.submittedResponse }
+            : { reason: "provider_rejected" },
+        ),
+        { turnId, itemId: pending.request.itemId },
+      );
       return;
     }
     if (type === "message.part.updated" && turnId) {
@@ -1161,8 +1205,11 @@ async function startRuntime(input: {
     const version = text(record(health).version);
     if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error("OpenCode health response omitted a semantic version");
     const qualifiedComparison = compareVersion(version, QUALIFIED_OPENCODE_VERSION);
-    if (qualifiedComparison < 0) throw new Error(`OpenCode ${version} is older than required ${QUALIFIED_OPENCODE_VERSION}`);
-    if (qualifiedComparison > 0) input.options.onDiagnostic?.(`OpenCode ${version} is newer than qualified ${QUALIFIED_OPENCODE_VERSION}.`);
+    if (qualifiedComparison !== 0) {
+      throw new Error(
+        `OpenCode ${version} is not the question-conformance-qualified ${QUALIFIED_OPENCODE_VERSION}`,
+      );
+    }
     return {
       baseUrl,
       authHeader,
@@ -1200,7 +1247,10 @@ async function startRuntime(input: {
   }
 }
 
-function openCodeQuestionSet(nativeQuestions: Record<string, unknown>[]): PaperclipQuestionSet {
+export function normalizeOpenCodeQuestionSet(
+  nativeQuestions: Record<string, unknown>[],
+  metadata: Record<string, unknown> = {},
+): PaperclipQuestionSet {
   const questions = nativeQuestions.map((question, index): PaperclipQuestion => {
     const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
       id: text(option.id, `option-${optionIndex + 1}`).slice(0, 160),
@@ -1208,7 +1258,7 @@ function openCodeQuestionSet(nativeQuestions: Record<string, unknown>[]): Paperc
       ...(text(option.description) ? { description: text(option.description).slice(0, 4_000) } : {}),
     }));
     return {
-      id: text(question.id, `question-${index + 1}`).slice(0, 160),
+      id: openCodeQuestionId(question, index),
       ...(text(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
       prompt: text(question.question, text(question.prompt, `Question ${index + 1}`)).slice(0, 4_000),
       ...(text(question.description) ? { helpText: text(question.description).slice(0, 4_000) } : {}),
@@ -1220,12 +1270,13 @@ function openCodeQuestionSet(nativeQuestions: Record<string, unknown>[]): Paperc
         : {}),
     };
   });
-  return {
+  return parsePaperclipQuestionSet({
     schema: PAPERCLIP_QUESTION_SET_SCHEMA,
-    title: "OpenCode needs your input",
-    submitLabel: "Submit answers",
+    title: text(metadata.title, "OpenCode needs your input").slice(0, 1_000),
+    ...(text(metadata.description) ? { description: text(metadata.description).slice(0, 4_000) } : {}),
+    submitLabel: text(metadata.submitLabel, "Submit answers").slice(0, 200),
     questions,
-  };
+  });
 }
 
 function openCodeAnswers(
@@ -1233,7 +1284,7 @@ function openCodeAnswers(
   response: PaperclipQuestionResponse,
 ): string[][] {
   return pending.nativeQuestions.map((nativeQuestion, index) => {
-    const questionId = text(nativeQuestion.id, `question-${index + 1}`);
+    const questionId = openCodeQuestionId(nativeQuestion, index);
     const question = pending.request.input?.questions.find((candidate) => candidate.id === questionId);
     const answer = response.answers[questionId];
     if (!question || !answer) return [];
@@ -1244,6 +1295,16 @@ function openCodeAnswers(
     if (answer.customText !== undefined) values.push(answer.customText);
     return values;
   });
+}
+
+function openCodeQuestionId(question: Record<string, unknown>, index: number): string {
+  const nativeId = text(question.id).trim();
+  if (nativeId) return nativeId.slice(0, 160);
+  const header = text(question.header).trim().toLowerCase()
+    .replace(/[^a-z0-9._:-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 160);
+  return header || `question-${index + 1}`;
 }
 
 async function api(fetcher: typeof globalThis.fetch, runtime: OpenCodeRuntime, path: string, init: RequestInit = {}): Promise<unknown> {

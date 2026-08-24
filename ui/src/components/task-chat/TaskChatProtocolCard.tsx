@@ -31,7 +31,7 @@ import type {
   TaskChatWorkspaceChangeItem,
   TaskChatWorkspaceFileItem,
 } from "./task-chat-model";
-import { QuestionForm } from "./QuestionForm";
+import { QuestionForm, QuestionResponseSummary } from "./QuestionForm";
 
 export interface TaskChatProtocolCardProps {
   item: TaskChatProtocolItem;
@@ -331,6 +331,26 @@ function RuntimeRequestCard({ item, onDecision }: { item: TaskChatRuntimeRequest
           onSubmit={(response) => submit({ action: "submit", response })}
           onCancel={() => submit({ action: "cancel" })}
         />
+      ) : item.requestType === "input" && item.status !== "pending" && item.questionSet ? (
+        <div className="flex flex-col gap-2" data-testid="task-chat-runtime-request-history">
+          {item.response ? (
+            <QuestionResponseSummary questionSet={item.questionSet} response={item.response} />
+          ) : (
+            <div className="flex flex-col gap-2 text-sm">
+              {item.questionSet.questions.map((question) => (
+                <div key={question.id}>
+                  {question.header ? <p className="text-xs font-medium text-muted-foreground">{question.header}</p> : null}
+                  <p className="text-foreground">{question.prompt}</p>
+                </div>
+              ))}
+              <p className="text-xs text-muted-foreground">
+                {item.status === "resolved"
+                  ? "Answer details were not recorded by this older runtime."
+                  : `No answers were submitted; this request was ${item.status}.`}
+              </p>
+            </div>
+          )}
+        </div>
       ) : item.requestType === "input" && item.status === "pending" ? (
         <form
           className="flex flex-col gap-3"

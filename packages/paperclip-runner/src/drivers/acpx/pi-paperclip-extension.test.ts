@@ -37,6 +37,13 @@ describe("paperclip Pi extension", () => {
         }), { status: 200 });
       }
       if (request.method === "tools/call") {
+        if ((request.params as Record<string, unknown>)?.name === "__paperclip_runtime_input") {
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { content: [{ type: "text", text: JSON.stringify({ action: "accept", content: { environment: "staging" } }) }] },
+          }), { status: 200 });
+        }
         return new Response(JSON.stringify({
           jsonrpc: "2.0",
           id: request.id,
@@ -57,8 +64,28 @@ describe("paperclip Pi extension", () => {
       },
     } as never);
 
-    expect(tools.map((tool) => tool.name)).toEqual(["paperclip_finish"]);
+    expect(tools.map((tool) => tool.name)).toEqual(["request_user_input", "paperclip_finish"]);
     expect(JSON.stringify(tools)).not.toContain("__paperclip_runtime_permission");
+    const inputResult = await (tools[0]!.execute as (
+      callId: string,
+      input: Record<string, unknown>,
+      signal: AbortSignal,
+    ) => Promise<Record<string, unknown>>)("input-1", {
+      title: "Deployment",
+      questions: [{
+        id: "environment",
+        prompt: "Where should we deploy?",
+        answerMode: "single_select",
+        options: [{ id: "staging", label: "Staging" }],
+      }],
+    }, new AbortController().signal);
+    expect(inputResult).toMatchObject({
+      content: [{ type: "text", text: expect.stringContaining("staging") }],
+    });
+    expect(requests).toContainEqual(expect.objectContaining({
+      method: "tools/call",
+      params: expect.objectContaining({ name: "__paperclip_runtime_input" }),
+    }));
     expect(await toolCallHandler!({ toolName: "read", toolCallId: "read-1", input: { path: "/etc/passwd" } })).toMatchObject({ block: true });
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-1", input: { command: "printf hello" } })).toBeUndefined();
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-relative", input: { command: "mkdir -p nested/dir && printf hello > nested/dir/file.txt" } })).toBeUndefined();

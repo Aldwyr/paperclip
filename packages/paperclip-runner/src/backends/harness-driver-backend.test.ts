@@ -168,4 +168,102 @@ describe("HarnessDriverBackend", () => {
       },
     ]);
   });
+
+  it("emits one non-replayable input expiration before propagating provider loss", async () => {
+    const questionSet = {
+      schema: "paperclip.question_set.v1" as const,
+      questions: [{ id: "target", prompt: "Which target?", required: true, answerMode: "text" as const }],
+    };
+    class LostProviderSession extends FakeHarnessSession {
+      override async *events() {
+        yield prpEvent(1, "runtime_request.created", { request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "input-1",
+          type: "input",
+          status: "pending",
+          prompt: "Which target?",
+          input: questionSet,
+          turnId: "turn-1",
+          itemId: "input-1",
+        } });
+        throw new Error("provider transport lost");
+      }
+      override async snapshot(): Promise<PersistedHarnessSession> {
+        return { driverKind: "fake", driverSessionId: "driver-1", lastSourceSequence: 1 };
+      }
+    }
+    const backend = new HarnessDriverBackend({ ...driver, async openSession() { return new LostProviderSession(); } });
+    const session = await backend.openSession({
+      identity: { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+      workingDirectory: "/workspace",
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ value: { eventType: "runtime_request.created" } });
+    await expect(iterator.next()).resolves.toMatchObject({ value: {
+      eventType: "runtime_request.expired",
+      sourceSeq: 2,
+      payload: {
+        requestId: "input-1",
+        reason: "provider_process_lost",
+        replayAllowed: false,
+        request: { input: questionSet },
+      },
+    } });
+    await expect(iterator.next()).rejects.toThrow("provider transport lost");
+  });
+
+  it("does not synthesize a fallback after the input was already resolved", async () => {
+    class ResolvedThenLostSession extends FakeHarnessSession {
+      override async *events() {
+        yield prpEvent(1, "runtime_request.created", { request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "input-1",
+          type: "input",
+          status: "pending",
+          prompt: "Which target?",
+          input: { schema: "paperclip.question_set.v1", questions: [{ id: "target", prompt: "Which target?", required: true, answerMode: "text" }] },
+        } });
+        yield prpEvent(2, "runtime_request.resolved", { requestId: "input-1", action: "submit" });
+        throw new Error("provider transport lost after resolution");
+      }
+    }
+    const backend = new HarnessDriverBackend({ ...driver, async openSession() { return new ResolvedThenLostSession(); } });
+    const session = await backend.openSession({
+      identity: { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+      workingDirectory: "/workspace",
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    await iterator.next();
+    await iterator.next();
+    await expect(iterator.next()).rejects.toThrow("provider transport lost after resolution");
+  });
+
+  it("does not synthesize a fallback after explicit run cancellation", async () => {
+    class CancelledProviderSession extends FakeHarnessSession {
+      override async *events() {
+        yield prpEvent(1, "runtime_request.created", { request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "input-1",
+          type: "input",
+          status: "pending",
+          prompt: "Which target?",
+          input: { schema: "paperclip.question_set.v1", questions: [{ id: "target", prompt: "Which target?", required: true, answerMode: "text" }] },
+        } });
+        throw new Error("provider stopped after cancellation");
+      }
+      async interrupt() {}
+    }
+    const backend = new HarnessDriverBackend({ ...driver, async openSession() { return new CancelledProviderSession(); } });
+    const session = await backend.openSession({
+      identity: { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" },
+      workingDirectory: "/workspace",
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ value: { eventType: "runtime_request.created" } });
+    await session.cancel({ reason: "operator cancelled the run" });
+    await expect(iterator.next()).rejects.toThrow("provider stopped after cancellation");
+  });
 });

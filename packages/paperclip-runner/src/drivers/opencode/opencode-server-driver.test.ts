@@ -375,6 +375,8 @@ describe("OpenCodeServerDriver", () => {
         },
       },
     });
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    expect(session.pendingRuntimeRequests?.()).toHaveLength(1);
     await session.resolveRuntimeRequest?.({
       requestId: "question-native-1",
       turnId,
@@ -383,7 +385,7 @@ describe("OpenCodeServerDriver", () => {
         response: {
           schema: "paperclip.question_response.v1",
           answers: {
-            environment: { selectedOptionIds: ["option-1"] },
+            environment: { customText: "Canary" },
             regions: { selectedOptionIds: ["option-1", "option-2"] },
           },
         },
@@ -392,9 +394,85 @@ describe("OpenCodeServerDriver", () => {
     const reply = JSON.parse(await readFile(join(root, "native-question", "data", "fake-question-reply.json"), "utf8"));
     expect(reply).toEqual({
       url: expect.stringContaining(`directory=${encodeURIComponent(workspace)}`),
-      body: { answers: [["Staging"], ["US", "EU"]] },
+      body: { answers: [["Canary"], ["US", "EU"]] },
+    });
+    const terminalQuestionEvents = (await session.transcript?.())?.events.filter((event) =>
+      event.payload.requestId === "question-native-1"
+      && ["runtime_request.resolved", "runtime_request.cancelled"].includes(event.eventType)
+    ) ?? [];
+    expect(terminalQuestionEvents).toHaveLength(1);
+    expect(terminalQuestionEvents[0]?.payload).toMatchObject({
+      action: "submit",
+      response: {
+        schema: "paperclip.question_response.v1",
+        answers: {
+          environment: { customText: "Canary" },
+          regions: { selectedOptionIds: ["option-1", "option-2"] },
+        },
+      },
     });
     await session.close({ reason: "test" });
+  });
+
+  it("recovers a missed pending question from the list endpoint and rejects it", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-recovery-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-recovery-workspace-"));
+    roots.push(root, workspace);
+    const normalizedSessionId = "question-recovery";
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const seed = await driver.openSession({
+      runId: "run-question-recovery",
+      normalizedSessionId,
+      workingDirectory: workspace,
+    });
+    const snapshot = await seed.snapshot();
+    await seed.close({ reason: "simulate reconnect" });
+    const dataRoot = join(root, normalizedSessionId, "data");
+    await mkdir(dataRoot, { recursive: true });
+    await writeFile(join(dataRoot, "fake-pending-question.json"), JSON.stringify({
+      id: "question-native-1",
+      sessionID: "ses_fake_1",
+      questions: [{
+        id: "environment",
+        header: "Environment",
+        question: "Where should we deploy?",
+        options: [{ label: "Staging" }, { label: "Production" }],
+        custom: true,
+      }],
+    }));
+
+    const recovered = await driver.recoverSession?.({
+      ...snapshot,
+      activeTurnId: "turn-recovered-question",
+    });
+    expect(recovered).toMatchObject({ recovered: true });
+    const session = recovered!.session!;
+    const iterator = session.events()[Symbol.asyncIterator]();
+    let created: Awaited<ReturnType<typeof iterator.next>>["value"] | null = null;
+    for (let count = 0; count < 20; count += 1) {
+      const next = await iterator.next();
+      if (next.done) break;
+      if (next.value.eventType === "runtime_request.created") {
+        created = next.value;
+        break;
+      }
+    }
+    expect(created).toMatchObject({
+      payload: { request: { requestId: "question-native-1", type: "input" } },
+    });
+    await session.resolveRuntimeRequest?.({
+      requestId: "question-native-1",
+      turnId: "turn-recovered-question",
+      resolution: { action: "decline" },
+    });
+    expect(session.pendingRuntimeRequests?.()).toEqual([]);
+    await session.close({ reason: "recovery test complete" });
   });
 
   it("clears a stale active turn that already has a persisted terminal fingerprint", async () => {

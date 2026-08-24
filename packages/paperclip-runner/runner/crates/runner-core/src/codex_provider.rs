@@ -663,6 +663,12 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                             .take(128)
                             .enumerate()
                             .map(|(option_index, option)| {
+                                let option_id = option
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .map(|value| bounded_string(value, 160))
+                                    .unwrap_or_else(|| format!("option-{}", option_index + 1));
                                 let label = option
                                     .get("label")
                                     .or_else(|| option.get("value"))
@@ -671,7 +677,7 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                                     .map(|value| bounded_string(value, 1_000))
                                     .unwrap_or_else(|| format!("Option {}", option_index + 1));
                                 let mut normalized = json!({
-                                    "id": format!("option-{}", option_index + 1),
+                                    "id": option_id,
                                     "label": label,
                                 });
                                 if let Some(description) =
@@ -712,6 +718,18 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                 }
                 if !options.is_empty() {
                     normalized["options"] = json!(options);
+                } else if question.get("minLength").is_some() || question.get("maxLength").is_some()
+                {
+                    let mut validation = serde_json::Map::new();
+                    if let Some(value) = question.get("minLength").and_then(Value::as_u64) {
+                        validation.insert("minLength".to_owned(), json!(value));
+                    }
+                    if let Some(value) = question.get("maxLength").and_then(Value::as_u64) {
+                        validation.insert("maxLength".to_owned(), json!(value));
+                    }
+                    if !validation.is_empty() {
+                        normalized["textValidation"] = Value::Object(validation);
+                    }
                 }
                 if question
                     .get("isOther")
@@ -769,12 +787,18 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                 } else {
                     option_values.iter().enumerate().map(|(index, value)| {
                         let one_of = select_schema.get("oneOf").and_then(Value::as_array).and_then(|items| items.get(index));
-                        json!({
+                        let mut option = json!({
                             "id": format!("option-{}", index + 1),
                             "label": one_of.and_then(|item| item.get("title")).and_then(Value::as_str)
                                 .map(str::to_owned).unwrap_or_else(|| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())),
-                            "description": one_of.and_then(|item| item.get("description")).and_then(Value::as_str),
-                        })
+                        });
+                        if let Some(description) = one_of
+                            .and_then(|item| item.get("description"))
+                            .and_then(Value::as_str)
+                        {
+                            option["description"] = json!(bounded_string(description, 4_000));
+                        }
+                        option
                     }).collect::<Vec<_>>()
                 };
                 let answer_mode = if property_type == "array" && !options.is_empty() {
@@ -786,36 +810,107 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                 };
                 let mut question = json!({
                     "id": name,
-                    "header": property.get("title").and_then(Value::as_str),
                     "prompt": property.get("title").and_then(Value::as_str).unwrap_or(name),
-                    "helpText": property.get("description").and_then(Value::as_str),
                     "required": required.iter().any(|entry| entry.as_str() == Some(name)),
                     "answerMode": answer_mode,
                 });
+                if let Some(title) = property.get("title").and_then(Value::as_str) {
+                    question["header"] = json!(bounded_string(title, 1_000));
+                }
+                if let Some(description) = property.get("description").and_then(Value::as_str) {
+                    question["helpText"] = json!(bounded_string(description, 4_000));
+                }
                 if !options.is_empty() {
                     question["options"] = json!(options);
                 } else {
-                    question["textValidation"] = json!({
-                        "inputType": match property_type { "number" => "number", "integer" => "integer", _ => "text" },
-                        "minLength": property.get("minLength"),
-                        "maxLength": property.get("maxLength"),
-                        "minimum": property.get("minimum"),
-                        "maximum": property.get("maximum"),
-                        "pattern": property.get("pattern"),
-                    });
+                    let mut validation = serde_json::Map::new();
+                    validation.insert("inputType".to_owned(), json!(match property_type { "number" => "number", "integer" => "integer", _ => "text" }));
+                    for key in ["minLength", "maxLength", "minimum", "maximum", "pattern"] {
+                        if let Some(value) = property.get(key) {
+                            validation.insert(key.to_owned(), value.clone());
+                        }
+                    }
+                    question["textValidation"] = Value::Object(validation);
                 }
                 question
             })
             .collect::<Vec<_>>();
-        return Some(json!({
+        let mut normalized = json!({
             "schema": "paperclip.question_set.v1",
             "title": "A tool needs your input",
-            "description": params.get("message").and_then(Value::as_str),
             "submitLabel": "Submit",
             "questions": questions,
-        }));
+        });
+        if let Some(description) = params.get("message").and_then(Value::as_str) {
+            normalized["description"] = json!(bounded_string(description, 4_000));
+        }
+        return Some(normalized);
     }
     None
+}
+
+fn has_codex_question_form(method: &str, params: &Value) -> bool {
+    match method {
+        "item/tool/requestUserInput" | "tool/requestUserInput" => params.get("questions").is_some(),
+        "mcpServer/elicitation/request" => {
+            params.get("requestedSchema").is_some() || params.get("schema").is_some()
+        }
+        _ => false,
+    }
+}
+
+fn validate_codex_question_set(value: &Value) -> Result<(), LocalRunnerError> {
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../../protocol/schemas/question-set.schema.json"
+    ))
+    .map_err(|_| LocalRunnerError::invalid("embedded question-set schema is invalid"))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|_| LocalRunnerError::invalid("embedded question-set schema cannot compile"))?;
+    if !validator.is_valid(value) {
+        return Err(LocalRunnerError::invalid(
+            "provider input request failed the Paperclip question-set schema",
+        ));
+    }
+    let mut question_ids = std::collections::BTreeSet::new();
+    for question in value
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let question_id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !question_ids.insert(question_id) {
+            return Err(LocalRunnerError::invalid(
+                "provider input question ids must be unique",
+            ));
+        }
+        let mut option_ids = std::collections::BTreeSet::new();
+        for option in question
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let option_id = option.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !option_ids.insert(option_id) {
+                return Err(LocalRunnerError::invalid(
+                    "provider input option ids must be unique within a question",
+                ));
+            }
+        }
+        if let Some(pattern) = question
+            .pointer("/textValidation/pattern")
+            .and_then(Value::as_str)
+        {
+            jsonschema::validator_for(&json!({"type": "string", "pattern": pattern})).map_err(
+                |_| LocalRunnerError::invalid("provider input contained an invalid text pattern"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn canonical_runtime_request(
@@ -1386,9 +1481,18 @@ impl CodexProvider {
                         "provider reused a pending runtime request id",
                     ));
                 }
-                let question_set = codex_question_set(method, &params)
+                let native_question_set = codex_question_set(method, &params);
+                if native_question_set.is_none() && has_codex_question_form(method, &params) {
+                    return Err(LocalRunnerError::invalid(
+                        "provider input request contained an unsupported question form",
+                    ));
+                }
+                let question_set = native_question_set
                     .or_else(|| params.pointer("/request/input").cloned())
                     .unwrap_or(Value::Null);
+                if !question_set.is_null() {
+                    validate_codex_question_set(&question_set)?;
+                }
                 let request = params.get("request").cloned().unwrap_or_else(|| {
                     if !question_set.is_null() {
                         canonical_runtime_request(self.kind, &request_id, method, &params, &question_set)
@@ -1678,6 +1782,67 @@ impl Provider for CodexProvider {
 #[cfg(test)]
 mod provider_trace_tests {
     use super::*;
+
+    #[test]
+    fn normalizes_and_answers_the_dot_185_three_question_frame() {
+        let question_set = codex_question_set(
+            "item/tool/requestUserInput",
+            &json!({
+                "title": "Implementation choices",
+                "questions": [
+                    {"id":"scope","header":"Scope","question":"Which scope?","options":[{"label":"Focused"},{"label":"Broad"}]},
+                    {"id":"compatibility","header":"Compatibility","question":"Keep v1?","options":[{"label":"Yes"},{"label":"No"}]},
+                    {"id":"notes","header":"Notes","question":"Anything else?"}
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(question_set["questions"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            question_set["questions"][0]["options"][0]["label"],
+            "Focused"
+        );
+
+        let response = json!({
+            "schema": "paperclip.question_response.v1",
+            "answers": {
+                "scope": {"selectedOptionIds":["option-1"]},
+                "compatibility": {"selectedOptionIds":["option-1"]},
+                "notes": {"text":"Preserve the shared UI."}
+            }
+        });
+        assert_eq!(
+            canonical_codex_answers(&question_set, &response),
+            json!({
+                "scope": {"answers":["Focused"]},
+                "compatibility": {"answers":["Yes"]},
+                "notes": {"answers":["Preserve the shared UI."]}
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_form_normalization_omits_absent_optional_values() {
+        let question_set = codex_question_set(
+            "mcpServer/elicitation/request",
+            &json!({
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"notes": {"type": "string"}}
+                }
+            }),
+        )
+        .unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/question-set.schema.json"
+        ))
+        .unwrap();
+        assert!(jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&question_set));
+        assert!(question_set["questions"][0].get("header").is_none());
+        assert!(question_set.get("description").is_none());
+    }
 
     #[test]
     fn recovers_the_latest_active_codex_turn_from_thread_read() {

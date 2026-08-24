@@ -804,7 +804,7 @@ fn process_command_and_provider(
             let resolution = command
                 .pointer("/payload/resolution")
                 .unwrap_or(&command["payload"]);
-            {
+            let (adapter, request_type) = {
                 let pending = state
                     .pending_provider_runtime_requests
                     .get(request_id)
@@ -819,7 +819,11 @@ fn process_command_and_provider(
                     ));
                 }
                 validate_runtime_request_resolution(&pending.request, resolution)?;
-            }
+                (
+                    pending.request.pointer("/origin/adapter").and_then(Value::as_str).map(str::to_owned),
+                    pending.request.get("type").and_then(Value::as_str).map(str::to_owned),
+                )
+            };
             provider
                 .as_mut()
                 .ok_or_else(|| DurableRunnerError::invalid("request.resolve requires a provider"))?
@@ -840,6 +844,9 @@ fn process_command_and_provider(
                     "requestId": request_id,
                     "turnId": turn_id,
                     "action": resolution.get("action"),
+                    "response": resolution.get("response"),
+                    "adapter": adapter,
+                    "requestType": request_type,
                 }),
                 Some(&state.item_id.clone()),
             )?;
@@ -1494,6 +1501,17 @@ fn validate_runtime_request_resolution(
     let response = resolution.get("response").ok_or_else(|| {
         DurableRunnerError::invalid("structured input submission requires response")
     })?;
+    let response_schema: Value = serde_json::from_str(include_str!(
+        "../../../../../protocol/schemas/question-response.schema.json"
+    ))
+    .map_err(|_| DurableRunnerError::invalid("embedded question-response schema is invalid"))?;
+    let response_validator = jsonschema::validator_for(&response_schema)
+        .map_err(|_| DurableRunnerError::invalid("embedded question-response schema cannot compile"))?;
+    if !response_validator.is_valid(response) {
+        return Err(DurableRunnerError::invalid(
+            "structured input response failed paperclip.question_response.v1 schema validation",
+        ));
+    }
     if response.get("schema").and_then(Value::as_str) != Some("paperclip.question_response.v1") {
         return Err(DurableRunnerError::invalid(
             "structured input response must use paperclip.question_response.v1",
@@ -1505,6 +1523,18 @@ fn validate_runtime_request_resolution(
     let questions = request.pointer("/input/questions").and_then(Value::as_array).ok_or_else(|| {
         DurableRunnerError::invalid("persisted runtime request has no question set")
     })?;
+    let question_set = request.get("input").unwrap_or(&Value::Null);
+    let question_set_schema: Value = serde_json::from_str(include_str!(
+        "../../../../../protocol/schemas/question-set.schema.json"
+    ))
+    .map_err(|_| DurableRunnerError::invalid("embedded question-set schema is invalid"))?;
+    let question_set_validator = jsonschema::validator_for(&question_set_schema)
+        .map_err(|_| DurableRunnerError::invalid("embedded question-set schema cannot compile"))?;
+    if !question_set_validator.is_valid(question_set) {
+        return Err(DurableRunnerError::invalid(
+            "persisted runtime question set failed schema validation",
+        ));
+    }
     for answer_id in answers.keys() {
         if !questions.iter().any(|question| question.get("id").and_then(Value::as_str) == Some(answer_id)) {
             return Err(DurableRunnerError::invalid(format!(
@@ -1528,10 +1558,32 @@ fn validate_runtime_request_resolution(
         let answer = answer.and_then(Value::as_object).ok_or_else(|| {
             DurableRunnerError::invalid(format!("answer {question_id} must be an object"))
         })?;
+        if answer.get("selectedOptionIds").is_some_and(|value| !value.is_array()) {
+            return Err(DurableRunnerError::invalid(format!(
+                "answer {question_id} selectedOptionIds must be an array"
+            )));
+        }
+        if answer.get("text").is_some_and(|value| !value.is_string())
+            || answer.get("customText").is_some_and(|value| !value.is_string())
+        {
+            return Err(DurableRunnerError::invalid(format!(
+                "answer {question_id} text values must be strings"
+            )));
+        }
         let selected = answer.get("selectedOptionIds").and_then(Value::as_array).cloned().unwrap_or_default();
         if selected.iter().any(|value| value.as_str().is_none()) {
             return Err(DurableRunnerError::invalid(format!(
                 "answer {question_id} selectedOptionIds must contain strings"
+            )));
+        }
+        let mut unique_selected = std::collections::BTreeSet::new();
+        if selected
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|option_id| !unique_selected.insert(option_id))
+        {
+            return Err(DurableRunnerError::invalid(format!(
+                "answer {question_id} selectedOptionIds cannot contain duplicates"
             )));
         }
         let mode = question.get("answerMode").and_then(Value::as_str).unwrap_or("");
@@ -1552,6 +1604,14 @@ fn validate_runtime_request_resolution(
             if mode == "single_select" && selected.len() > 1 {
                 return Err(DurableRunnerError::invalid(format!(
                     "single-select answer {question_id} selected multiple options"
+                )));
+            }
+            if mode == "single_select"
+                && !selected.is_empty()
+                && custom.is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(DurableRunnerError::invalid(format!(
+                    "single-select answer {question_id} cannot combine an option and custom text"
                 )));
             }
             let options = question.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -1578,6 +1638,11 @@ fn validate_runtime_request_resolution(
         }
         let bounded = if mode == "text" { text } else { custom };
         if let Some(value) = bounded {
+            if value.chars().count() > 100_000 {
+                return Err(DurableRunnerError::invalid(format!(
+                    "answer {question_id} exceeds the maximum text size"
+                )));
+            }
             let validation = question.get("textValidation").unwrap_or(&Value::Null);
             if let Some(minimum) = validation.get("minLength").and_then(Value::as_u64) {
                 if value.chars().count() < minimum as usize {
@@ -1589,11 +1654,29 @@ fn validate_runtime_request_resolution(
                     return Err(DurableRunnerError::invalid(format!("answer {question_id} is too long")));
                 }
             }
+            if let Some(pattern) = validation.get("pattern").and_then(Value::as_str) {
+                let pattern_schema = json!({"type": "string", "pattern": pattern});
+                let pattern_validator = jsonschema::validator_for(&pattern_schema).map_err(|_| {
+                    DurableRunnerError::invalid(format!(
+                        "question {question_id} contains an invalid text pattern"
+                    ))
+                })?;
+                if !pattern_validator.is_valid(&json!(value)) {
+                    return Err(DurableRunnerError::invalid(format!(
+                        "answer {question_id} does not match its required format"
+                    )));
+                }
+            }
             if let Some(input_type) = validation.get("inputType").and_then(Value::as_str) {
                 if matches!(input_type, "number" | "integer") {
                     let numeric = value.parse::<f64>().map_err(|_| DurableRunnerError::invalid(format!(
                         "answer {question_id} must be a valid {input_type}"
                     )))?;
+                    if !numeric.is_finite() {
+                        return Err(DurableRunnerError::invalid(format!(
+                            "answer {question_id} must be a finite {input_type}"
+                        )));
+                    }
                     if input_type == "integer" && numeric.fract() != 0.0 {
                         return Err(DurableRunnerError::invalid(format!("answer {question_id} must be an integer")));
                     }
@@ -1633,6 +1716,8 @@ fn expire_provider_runtime_requests_after_provider_loss(
                 "requestKind": request.request_kind,
                 "reason": "provider_process_lost",
                 "replayAllowed": false,
+                "adapter": request.request.pointer("/origin/adapter").and_then(Value::as_str),
+                "requestType": request.request.get("type").and_then(Value::as_str),
                 "request": request.request,
             }),
             Some(&state.item_id.clone()),
@@ -1676,6 +1761,8 @@ fn cancel_pending_runtime_requests_on_terminal(
                 "turnId": request.turn_id,
                 "requestKind": request.request_kind,
                 "reason": reason,
+                "adapter": request.request.pointer("/origin/adapter").and_then(Value::as_str),
+                "requestType": request.request.get("type").and_then(Value::as_str),
             }),
             Some(&state.item_id.clone()),
         )?;
@@ -1925,6 +2012,55 @@ mod tests {
     }
 
     #[test]
+    fn structured_input_revalidates_patterns_and_finite_numbers() {
+        let request = |validation: Value| {
+            json!({
+                "schema": "paperclip.runtime_request.v2",
+                "requestKind": "runtime",
+                "requestId": "input-1",
+                "type": "input",
+                "status": "pending",
+                "prompt": "Answer",
+                "input": {
+                    "schema": "paperclip.question_set.v1",
+                    "questions": [{
+                        "id": "value",
+                        "prompt": "Value?",
+                        "required": true,
+                        "answerMode": "text",
+                        "textValidation": validation
+                    }]
+                }
+            })
+        };
+        let response = |value: &str| {
+            json!({
+                "action": "submit",
+                "response": {
+                    "schema": "paperclip.question_response.v1",
+                    "answers": {"value": {"text": value}}
+                }
+            })
+        };
+
+        assert!(validate_runtime_request_resolution(
+            &request(json!({"pattern": "^[A-Z]{2}$"})),
+            &response("US"),
+        )
+        .is_ok());
+        assert!(validate_runtime_request_resolution(
+            &request(json!({"pattern": "^[A-Z]{2}$"})),
+            &response("us"),
+        )
+        .is_err());
+        assert!(validate_runtime_request_resolution(
+            &request(json!({"inputType": "number"})),
+            &response("NaN"),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn warm_idle_clock_expires_only_safe_inactive_states() {
         let root = temporary_root("warm-idle-clock");
         let mut runner_config = config(&root);
@@ -2028,6 +2164,63 @@ mod tests {
                 && event.envelope["payload"]["payload"]["error"]["code"]
                     == "acpx_permission_transport_lost"
         }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provider_loss_expires_a_canonical_input_once_with_the_complete_question_set() {
+        let root = temporary_root("canonical-input-loss");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        let request = json!({
+            "schema": "paperclip.runtime_request.v2",
+            "requestKind": "runtime",
+            "requestId": "input-1",
+            "type": "input",
+            "status": "pending",
+            "prompt": "Which target?",
+            "input": {
+                "schema": "paperclip.question_set.v1",
+                "questions": [{
+                    "id": "target",
+                    "prompt": "Which target?",
+                    "required": true,
+                    "answerMode": "single_select",
+                    "options": [{"id": "staging", "label": "Staging"}]
+                }]
+            },
+            "origin": {"adapter": "codex-app-server"}
+        });
+        state.pending_provider_runtime_requests.insert(
+            "input-1".to_owned(),
+            PendingProviderRuntimeRequest {
+                request_id: "input-1".to_owned(),
+                turn_id: state.turn_id.clone(),
+                request_kind: "runtime".to_owned(),
+                created_at_unix_ms: 1,
+                request: request.clone(),
+            },
+        );
+
+        expire_provider_runtime_requests_after_provider_loss(&mut state, &runner_config).unwrap();
+        expire_provider_runtime_requests_after_provider_loss(&mut state, &runner_config).unwrap();
+
+        let expirations = state
+            .outbox
+            .iter()
+            .filter(|event| event.envelope["payload"]["eventType"] == "runtime_request.expired")
+            .collect::<Vec<_>>();
+        assert_eq!(expirations.len(), 1);
+        assert_eq!(expirations[0].envelope["payload"]["payload"]["request"], request);
+        assert_eq!(
+            expirations[0].envelope["payload"]["payload"]["reason"],
+            "provider_process_lost"
+        );
+        assert_eq!(
+            expirations[0].envelope["payload"]["payload"]["replayAllowed"],
+            false
+        );
         let _ = fs::remove_dir_all(root);
     }
 

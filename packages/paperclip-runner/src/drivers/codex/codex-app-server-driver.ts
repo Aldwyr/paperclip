@@ -29,6 +29,7 @@ import {
   PAPERCLIP_QUESTION_SET_SCHEMA,
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   parseHarnessRuntimeRequestResolution,
+  parsePaperclipQuestionSet,
 } from "../../contracts/harness-driver.js";
 import {
   CODEX_BLOCK_RESULT_PROVIDER_INPUT_SCHEMA,
@@ -1344,11 +1345,19 @@ class CodexHarnessSession implements HarnessSession {
       pending.request.input,
     );
     const response = runtimeRequestResponse(pending.request, resolution);
+    await this.#transport.resolveRuntimeRequest?.({
+      requestId: input.requestId,
+      turnId: input.turnId,
+      resolution,
+    });
     this.#pendingRuntimeRequests.delete(input.requestId);
     this.#emit(
       "runtime_request.resolved",
       harnessRuntimeRequestOutcome(pending.request, {
         action: resolution.action,
+        ...(resolution.action === "submit" && "response" in resolution
+          ? { response: resolution.response }
+          : {}),
       }),
       { turnId: input.turnId, itemId: pending.request.itemId },
     );
@@ -1567,6 +1576,7 @@ class CodexHarnessSession implements HarnessSession {
         code: "notification_transport_failed",
         message: redactCodexDiagnostic(String(error)),
       });
+      this.#expirePendingInputRequestsAfterProviderLoss();
       this.#failProtocol(
         "notification_transport_failed",
         "Provider notification transport failed closed.",
@@ -2237,7 +2247,31 @@ class CodexHarnessSession implements HarnessSession {
       );
       return safeRequestResponse(request.method);
     }
-    const input = codexQuestionSet(request.method, request.params);
+    let input: PaperclipQuestionSet | null = null;
+    try {
+      input = normalizeCodexQuestionSet(request.method, request.params);
+    } catch {
+      this.#emit("harness.diagnostic", {
+        code: "runtime_input_rejected",
+        adapter: "codex-app-server",
+        method: request.method,
+        reason: "The provider input request contained an invalid question form.",
+      }, { turnId: requestTurnId, itemId: String(request.id) });
+      return safeRequestResponse(request.method);
+    }
+    if (
+      (requestKind === "user_input" || requestKind === "elicitation") &&
+      input === null &&
+      hasCodexQuestionForm(request.method, request.params)
+    ) {
+      this.#emit("harness.diagnostic", {
+        code: "runtime_input_rejected",
+        adapter: "codex-app-server",
+        method: request.method,
+        reason: "The provider input request did not contain a supported question form.",
+      }, { turnId: requestTurnId, itemId: String(request.id) });
+      return safeRequestResponse(request.method);
+    }
     const runtimeRequest: HarnessRuntimeRequest = {
       requestId,
       requestKind,
@@ -2510,6 +2544,28 @@ class CodexHarnessSession implements HarnessSession {
     this.#pendingRuntimeRequests.clear();
   }
 
+  #expirePendingInputRequestsAfterProviderLoss(): void {
+    for (const [requestId, pending] of this.#pendingRuntimeRequests) {
+      if (pending.request.input === undefined) continue;
+      this.#emit(
+        "runtime_request.expired",
+        {
+          requestId: pending.request.requestId,
+          turnId: pending.request.turnId,
+          requestKind: pending.request.requestKind,
+          reason: "provider_process_lost",
+          replayAllowed: false,
+          adapter: pending.request.origin?.adapter,
+          requestType: "input",
+          request: runtimeRequestProtocolPayload(pending.request),
+        },
+        { turnId: pending.request.turnId, itemId: pending.request.itemId },
+      );
+      pending.settle(safeRequestResponse(pending.request.method, "cancel"));
+      this.#pendingRuntimeRequests.delete(requestId);
+    }
+  }
+
   #notificationNamesActiveTurn(turnId: string, kind: string): boolean {
     if (
       this.#protocolFailed ||
@@ -2773,6 +2829,22 @@ function runtimeRequestKind(method: string): HarnessRuntimeRequestKind | null {
   return null;
 }
 
+/**
+ * During the v1 migration, input requests that predate structured form data
+ * remain opaque runtime requests. Once a provider supplies a native form,
+ * however, a malformed/unsupported form must fail closed instead of silently
+ * degrading back to the legacy textarea presentation.
+ */
+function hasCodexQuestionForm(method: string, params: Record<string, unknown>): boolean {
+  if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") {
+    return "questions" in params;
+  }
+  if (method === "mcpServer/elicitation/request") {
+    return "requestedSchema" in params || "schema" in params;
+  }
+  return false;
+}
+
 function runtimeRequestPrompt(
   kind: HarnessRuntimeRequestKind,
   params: Record<string, unknown>,
@@ -2828,7 +2900,7 @@ function jsonSchemaOptions(schema: Record<string, unknown>): NonNullable<Papercl
 }
 
 /** Codex-native requests are converted once, before they enter PRP. */
-function codexQuestionSet(method: string, params: Record<string, unknown>): PaperclipQuestionSet | null {
+export function normalizeCodexQuestionSet(method: string, params: Record<string, unknown>): PaperclipQuestionSet | null {
   if (method === "item/tool/requestUserInput" || method === "tool/requestUserInput") {
     if (!Array.isArray(params.questions) || params.questions.length === 0) return null;
     const questions = params.questions.slice(0, 64).map((rawQuestion, index): PaperclipQuestion => {
@@ -2855,13 +2927,13 @@ function codexQuestionSet(method: string, params: Record<string, unknown>): Pape
           : {}),
       };
     });
-    return {
+    return parsePaperclipQuestionSet({
       schema: PAPERCLIP_QUESTION_SET_SCHEMA,
       title: text(params.title, "Codex needs your input"),
       ...(text(params.description).length > 0 ? { description: boundedText(text(params.description)) } : {}),
       submitLabel: text(params.submitLabel, "Submit answers"),
       questions,
-    };
+    });
   }
   if (method !== "mcpServer/elicitation/request") return null;
   const requestedSchema = record(params.requestedSchema ?? params.schema);
@@ -2900,13 +2972,13 @@ function codexQuestionSet(method: string, params: Record<string, unknown>): Pape
     };
   });
   if (questions.length === 0) return null;
-  return {
+  return parsePaperclipQuestionSet({
     schema: PAPERCLIP_QUESTION_SET_SCHEMA,
     title: "A tool needs your input",
     ...(text(params.message).length > 0 ? { description: boundedText(text(params.message)) } : {}),
     submitLabel: "Submit",
     questions,
-  };
+  });
 }
 
 function runtimeRequestProtocolPayload(request: HarnessRuntimeRequest): Record<string, unknown> {

@@ -375,7 +375,7 @@ function ResizablePropertiesPanel({
                   if (next) handleMaximize();
                   else handleRestore();
                 }}
-                onClose={() => setPanelVisible(false)}
+                onToggle={() => setPanelVisible(false)}
               />
             )}
             footer={<div id={PROPERTIES_PANE_FOOTER_SLOT_ID} />}

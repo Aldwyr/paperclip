@@ -59,4 +59,29 @@ describe("sidePanelTabsReducer", () => {
       activeTabId: "missing",
     })).toEqual({ tabs: [tab("a"), tab("b")], activeTabId: "a" });
   });
+
+  it("closes other tabs and preserves the selected tab", () => {
+    expect(sidePanelTabsReducer(state(["a", "b", "c"], "a"), {
+      type: "close-others",
+      tabId: "b",
+    })).toEqual({ tabs: [tab("b")], activeTabId: "b" });
+  });
+
+  it("updates serializable metadata without allowing the stable id to change", () => {
+    expect(sidePanelTabsReducer(state(["a"]), {
+      type: "update",
+      tabId: "a",
+      patch: { id: "changed", label: "Renamed", payload: { value: "updated" } },
+    })).toEqual({
+      tabs: [{ ...tab("a"), label: "Renamed", payload: { value: "updated" } }],
+      activeTabId: "a",
+    });
+  });
+
+  it("normalizes reset state", () => {
+    expect(sidePanelTabsReducer(state(["a"]), {
+      type: "reset",
+      state: { tabs: [tab("b"), tab("b")], activeTabId: "missing" },
+    })).toEqual({ tabs: [tab("b")], activeTabId: "b" });
+  });
 });

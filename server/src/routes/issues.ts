@@ -139,6 +139,7 @@ import {
   logActivity,
   publishActivity,
   projectService,
+  questionResponseDeliveryService,
   routineService,
   workProductService,
 } from "../services/index.js";
@@ -2878,6 +2879,7 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const questionResponseDeliveries = questionResponseDeliveryService(db, { heartbeat });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
@@ -12226,13 +12228,13 @@ export function issueRoutes(
         },
       });
 
-      await queueResolvedInteractionContinuationWakeup({
-        db,
-        heartbeat,
-        issue,
-        interaction,
-        actor,
-        source: "issue.interaction.respond",
+      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
+        logger.warn({
+          err,
+          companyId: issue.companyId,
+          issueId: issue.id,
+          interactionId: interaction.id,
+        }, "synchronous question response delivery failed; durable outbox will retry");
       });
 
       res.json(interaction);

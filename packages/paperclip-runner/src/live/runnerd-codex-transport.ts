@@ -26,6 +26,7 @@ import {
   createIsolatedCodexAppServerArgs,
 } from "../drivers/codex/codex-app-server-driver.js";
 import type { DurableRecoveryIdentity } from "../contracts/durable-recovery.js";
+import type { HarnessRuntimeRequestResolution } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   durableRecoveryInternals,
@@ -88,6 +89,120 @@ function recoveredControlPlaneIdentity(
     );
   }
   return structuredClone(identity);
+}
+
+function bridgedCodexQuestionParams(
+  request: Record<string, unknown>,
+  method: string,
+  threadId: string,
+  turnId: string,
+): Record<string, unknown> | null {
+  const questionSet = record(request.input);
+  if (
+    questionSet.schema !== "paperclip.question_set.v1" ||
+    !Array.isArray(questionSet.questions) ||
+    questionSet.questions.length === 0
+  ) return null;
+  const common = {
+    threadId,
+    turnId,
+    itemId: typeof request.itemId === "string" ? request.itemId : String(request.requestId ?? "runtime-input"),
+  };
+  if (method === "mcpServer/elicitation/request") {
+    const required: string[] = [];
+    const properties = Object.fromEntries(questionSet.questions.map((candidate, index) => {
+      const question = record(candidate);
+      const id = typeof question.id === "string" ? question.id : `question-${index + 1}`;
+      if (question.required !== false) required.push(id);
+      const validation = record(question.textValidation);
+      const options = Array.isArray(question.options)
+        ? question.options.map((candidateOption) => {
+            const option = record(candidateOption);
+            return {
+              const: typeof option.id === "string" ? option.id : "option",
+              title: typeof option.label === "string" ? option.label : "Option",
+              ...(typeof option.description === "string" ? { description: option.description } : {}),
+            };
+          })
+        : [];
+      const isBoolean = question.answerMode === "single_select"
+        && options.length === 2
+        && options[0]?.const === "true"
+        && options[1]?.const === "false";
+      const inputType = validation.inputType === "integer" || validation.inputType === "number"
+        ? validation.inputType
+        : "string";
+      const scalarSchema = isBoolean
+        ? { type: "boolean" }
+        : options.length > 0
+        ? { type: "string", oneOf: options }
+        : {
+            type: inputType,
+            ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
+            ...(typeof validation.maxLength === "number" ? { maxLength: validation.maxLength } : {}),
+            ...(typeof validation.minimum === "number" ? { minimum: validation.minimum } : {}),
+            ...(typeof validation.maximum === "number" ? { maximum: validation.maximum } : {}),
+            ...(typeof validation.pattern === "string" ? { pattern: validation.pattern } : {}),
+          };
+      return [id, {
+        ...(question.answerMode === "multi_select"
+          ? { type: "array", items: scalarSchema }
+          : scalarSchema),
+        ...(typeof question.header === "string"
+          ? { title: question.header }
+          : typeof question.prompt === "string"
+            ? { title: question.prompt }
+            : {}),
+        ...(typeof question.helpText === "string" ? { description: question.helpText } : {}),
+      }];
+    }));
+    return {
+      ...common,
+      message: typeof questionSet.description === "string"
+        ? questionSet.description
+        : typeof questionSet.title === "string"
+          ? questionSet.title
+          : "A tool needs your input",
+      requestedSchema: {
+        type: "object",
+        properties,
+        ...(required.length > 0 ? { required } : {}),
+      },
+    };
+  }
+  return {
+    ...common,
+    ...(typeof questionSet.title === "string" ? { title: questionSet.title } : {}),
+    ...(typeof questionSet.description === "string" ? { description: questionSet.description } : {}),
+    ...(typeof questionSet.submitLabel === "string" ? { submitLabel: questionSet.submitLabel } : {}),
+    questions: questionSet.questions.map((candidate, index) => {
+      const question = record(candidate);
+      const validation = record(question.textValidation);
+      return {
+        id: typeof question.id === "string" ? question.id : `question-${index + 1}`,
+        ...(typeof question.header === "string" ? { header: question.header } : {}),
+        question: typeof question.prompt === "string" ? question.prompt : `Question ${index + 1}`,
+        ...(typeof question.helpText === "string" ? { description: question.helpText } : {}),
+        required: question.required !== false,
+        ...(question.answerMode === "multi_select" ? { multiSelect: true } : {}),
+        ...(Array.isArray(question.options)
+          ? {
+              options: question.options.map((candidateOption, optionIndex) => {
+                const option = record(candidateOption);
+                return {
+                  id: typeof option.id === "string" ? option.id : `option-${optionIndex + 1}`,
+                  label: typeof option.label === "string" ? option.label : `Option ${optionIndex + 1}`,
+                  ...(typeof option.description === "string" ? { description: option.description } : {}),
+                };
+              }),
+            }
+          : {}),
+        ...(record(question.customAnswer).enabled === true ? { isOther: true } : {}),
+        ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
+        ...(typeof validation.maxLength === "number" ? { maxLength: validation.maxLength } : {}),
+      };
+    }),
+  };
 }
 
 export interface CapabilityRunnerdProcessEvidence {
@@ -665,6 +780,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #traceRehydrationSpoolOverflow = false;
   #pendingTraceRehydrations: PendingTraceRehydration[] = [];
   #pendingDriverTraceInterpretations: PendingDriverTraceInterpretation[] = [];
+  readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
     this.#ownsRoot = options.stateDirectory === undefined;
@@ -817,6 +933,28 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   setServerRequestHandler(handler: CodexServerRequestHandler): void {
     this.#handler = handler;
+  }
+
+  async resolveRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    resolution: HarnessRuntimeRequestResolution;
+  }): Promise<void> {
+    const pending = this.#bridgedRuntimeInputs.get(input.requestId);
+    if (!pending) throw new Error(`PRP runtime request ${input.requestId} is no longer pending`);
+    const commandId = `command_runtime_input_${createHash("sha256")
+      .update(`${input.requestId}:${pending.durableTurnId}`)
+      .digest("hex")
+      .slice(0, 24)}`;
+    await this.#command(
+      "request.resolve",
+      {
+        requestId: input.requestId,
+        turnId: pending.durableTurnId,
+        resolution: input.resolution,
+      },
+      commandId,
+    );
   }
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
@@ -1591,6 +1729,51 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.#evidence.agentPid = diagnostic.pid;
           this.#publish();
         }
+      }
+      if (event.eventType === "runtime_request.created") {
+        const request = record(record(event.envelope.payload).payload).request;
+        const normalizedRequest = record(request);
+        const requestId = typeof normalizedRequest.requestId === "string"
+          ? normalizedRequest.requestId
+          : "";
+        const origin = record(normalizedRequest.origin);
+        const method = typeof origin.method === "string" ? origin.method : "";
+        const params = bridgedCodexQuestionParams(normalizedRequest, method, this.#threadId, this.#turnId);
+        if (
+          requestId &&
+          params &&
+          (method === "item/tool/requestUserInput" ||
+            method === "tool/requestUserInput" ||
+            method === "mcpServer/elicitation/request") &&
+          !this.#bridgedRuntimeInputs.has(requestId)
+        ) {
+          this.#bridgedRuntimeInputs.set(requestId, {
+            durableTurnId: typeof event.envelope.turnId === "string"
+              ? event.envelope.turnId
+              : this.#durableTurnId,
+          });
+          void this.#handler({
+            id: requestId,
+            method,
+            params,
+            paperclipTrace: {
+              sourceEventId: event.sourceEventId,
+              sourceEventType: event.eventType,
+            },
+          }).catch((error) => {
+            this.#failTransport(error instanceof Error ? error : new Error(String(error)));
+          });
+        }
+        continue;
+      }
+      if (
+        event.eventType === "runtime_request.resolved" ||
+        event.eventType === "runtime_request.cancelled" ||
+        event.eventType === "runtime_request.expired"
+      ) {
+        const requestId = record(record(event.envelope.payload).payload).requestId;
+        if (typeof requestId === "string") this.#bridgedRuntimeInputs.delete(requestId);
+        continue;
       }
       const eventPayload = record(event.envelope.payload).payload;
       const sessionUpdatePayload = record(eventPayload);

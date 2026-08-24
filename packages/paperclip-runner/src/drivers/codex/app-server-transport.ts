@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
 
 export interface CodexRpcNotification {
   method: string;
@@ -35,6 +36,15 @@ export interface CodexAppServerTransport {
   notify(method: string, params?: Record<string, unknown>): void;
   notifications(): AsyncIterable<CodexRpcNotification>;
   setServerRequestHandler(handler: CodexServerRequestHandler): void;
+  /**
+   * Optional provider-neutral resolution path used when a transport has
+   * already normalized a native server request behind another PRP boundary.
+   */
+  resolveRuntimeRequest?(input: {
+    requestId: string;
+    turnId: string;
+    resolution: HarnessRuntimeRequestResolution;
+  }): Promise<void>;
   close(): Promise<void>;
   processInfo?(): CodexTransportProcessInfo;
   attachRun?(input: {
@@ -224,7 +234,17 @@ export function redactCodexDiagnostic(message: string): string {
   return message
     .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
-    .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, "Basic [REDACTED]")
+    .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
+      try {
+        // Only redact an actual RFC 7617 credential. Treating every word after
+        // “Basic” as base64 corrupted ordinary question copy such as
+        // “Basic API” before it entered the Paperclip protocol.
+        const decoded = Buffer.from(encoded, "base64").toString("utf8");
+        return decoded.includes(":") ? "Basic [REDACTED]" : match;
+      } catch {
+        return match;
+      }
+    })
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
     .replace(
       /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,

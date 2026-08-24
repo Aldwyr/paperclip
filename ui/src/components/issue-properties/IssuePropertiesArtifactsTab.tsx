@@ -333,13 +333,13 @@ function DocumentRow({
   const location = useLocation();
   const Chevron = expanded ? ChevronDown : ChevronRight;
   useEffect(() => {
-    if (openRequestId === undefined) return;
+    if (onOpen || openRequestId === undefined) return;
     setExpanded(true);
-  }, [openRequestId]);
+  }, [onOpen, openRequestId]);
   useEffect(() => {
-    if (openRequestId === undefined || !expanded) return;
+    if (onOpen || openRequestId === undefined || !expanded) return;
     headerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [expanded, openRequestId]);
+  }, [expanded, onOpen, openRequestId]);
   if (onOpen) {
     return (
       <button

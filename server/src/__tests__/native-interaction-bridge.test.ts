@@ -222,7 +222,14 @@ describe("P6-19 native interaction bridge", () => {
         kind: "ask_user_questions",
         response: {
           status: "answered",
-          result: { version: 1, answers: [{ questionId: "choice", optionIds: ["safe"] }] },
+          result: {
+            version: 1,
+            answers: [{ questionId: "choice", optionIds: ["safe"] }],
+            summaryMarkdown: [
+              "Resolved questions and answers:",
+              "- Which path?: Safe",
+            ].join("\n"),
+          },
         },
       },
       {

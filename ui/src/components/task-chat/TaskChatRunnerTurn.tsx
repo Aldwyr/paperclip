@@ -15,6 +15,7 @@ import type {
   TaskChatThinkingItem,
   TaskChatToolItem,
 } from "./task-chat-model";
+import { latestPendingRuntimeRequest, latestRuntimeRequests } from "./task-chat-model";
 import { TaskChatAgentIdentity } from "./TaskChatBubble";
 import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
@@ -387,12 +388,8 @@ export function TaskChatRunnerTurn({
   const open = disclosure.runId === runId && disclosure.terminal === terminal ? disclosure.open : false;
   const controlsId = `task-chat-run-activity-${useId().replaceAll(":", "")}`;
   const activityItems = paperclipRunnerActivityItems(items);
-  const pendingRuntimeRequest = lastOf<TaskChatRuntimeRequestItem>(
-    items,
-    (item): item is TaskChatRuntimeRequestItem => item.kind === "protocol"
-      && item.surface === "runtime_request"
-      && item.status === "pending",
-  );
+  const pendingRuntimeRequest = latestPendingRuntimeRequest(items);
+  const resolvedRuntimeRequests = latestRuntimeRequests(items).filter((request) => request.status !== "pending");
   const narration = latestFoldedNarration(items);
   const livePlan = latestPlanActivity(activityItems);
   const livePlanRevision = livePlan ? providerPlanRevision(livePlan) : null;
@@ -457,6 +454,11 @@ export function TaskChatRunnerTurn({
           <TaskChatProtocolCard item={pendingRuntimeRequest} onRuntimeRequestDecision={onRuntimeRequestDecision} />
         </div>
       ) : null}
+      {resolvedRuntimeRequests.map((request) => (
+        <div className="py-1" key={request.id}>
+          <TaskChatProtocolCard item={request} />
+        </div>
+      ))}
       {final ? (
         <div className="tc-enter-bubble w-full" data-testid="task-chat-final-response">
           <div className="break-words px-1 py-2 text-sm text-foreground" data-testid="task-chat-agent-bubble">

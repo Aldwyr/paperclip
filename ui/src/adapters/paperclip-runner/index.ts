@@ -1,4 +1,4 @@
-import type { PaperclipQuestion, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
+import type { PaperclipQuestion, PaperclipQuestionResponse, PaperclipQuestionSet, TranscriptEntry } from "@paperclipai/adapter-utils";
 import type { UIAdapterModule } from "../types";
 import { parseCodexStdoutLine, buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { CodexLocalConfigFields } from "../codex-local/config-fields";
@@ -414,10 +414,14 @@ function runtimeRequestEntry(
   if (!requestId) return null;
   const previous = state.runtimeRequests.get(requestId);
   const suffix = eventType.split(".").at(-1);
+  const resolvedAction = nullableText(request.action) ?? nullableText(payload.action) ?? previous?.resolvedAction ?? null;
   const rawStatus = text(request.status, suffix);
-  const status = rawStatus === "resolved" || rawStatus === "expired" || rawStatus === "cancelled"
+  const lifecycleStatus = rawStatus === "resolved" || rawStatus === "expired" || rawStatus === "cancelled"
     ? rawStatus
     : "pending";
+  const status = lifecycleStatus === "resolved" && (resolvedAction === "cancel" || resolvedAction === "decline")
+    ? "cancelled"
+    : lifecycleStatus;
   const rawKind = text(request.requestKind, previous?.requestKind ?? undefined);
   const requestKind = rawKind === "runtime"
     ? "runtime"
@@ -474,6 +478,9 @@ function runtimeRequestEntry(
     .filter((field) => field.name && field.label)
     .slice(0, 16);
   const questionSet = parseQuestionSet(request.input) ?? previous?.questionSet ?? null;
+  const response = parseQuestionResponse(request.response ?? payload.response)
+    ?? previous?.response
+    ?? null;
   const entry: Extract<TranscriptEntry, { kind: "runtime_request" }> = {
     kind: "runtime_request",
     ts,
@@ -486,14 +493,45 @@ function runtimeRequestEntry(
     choices,
     fields,
     questionSet,
+    resolvedAction,
+    response,
   };
   state.runtimeRequests.set(requestId, entry);
   return entry;
 }
 
+function parseQuestionResponse(value: unknown): PaperclipQuestionResponse | null {
+  const response = record(value);
+  if (response.schema !== "paperclip.question_response.v1") return null;
+  const rawAnswers = record(response.answers);
+  const answers: PaperclipQuestionResponse["answers"] = {};
+  for (const [questionId, rawAnswer] of Object.entries(rawAnswers).slice(0, 64)) {
+    const answer = record(rawAnswer);
+    const selectedOptionIds = (Array.isArray(answer.selectedOptionIds) ? answer.selectedOptionIds : [])
+      .filter((optionId): optionId is string => typeof optionId === "string")
+      .slice(0, 128)
+      .map((optionId) => optionId.slice(0, 160));
+    const textAnswer = nullableText(answer.text)?.slice(0, 12_000);
+    const customText = nullableText(answer.customText)?.slice(0, 12_000);
+    answers[questionId.slice(0, 160)] = {
+      ...(selectedOptionIds.length > 0 ? { selectedOptionIds } : {}),
+      ...(textAnswer != null ? { text: textAnswer } : {}),
+      ...(customText != null ? { customText } : {}),
+    };
+  }
+  return { schema: "paperclip.question_response.v1", answers };
+}
+
 function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
   const input = record(value);
-  if (input.schema !== "paperclip.question_set.v1" || !Array.isArray(input.questions) || input.questions.length === 0) return null;
+  if (!Array.isArray(input.questions) || input.questions.length === 0) return null;
+  // Early v2 events passed through a broad JWT redactor that replaced the
+  // dotted schema discriminator while leaving the bounded question set
+  // intact. Recover those already-persisted requests on replay; reject other
+  // explicit schema families so this remains a narrow migration path.
+  if (input.schema !== undefined
+    && input.schema !== "paperclip.question_set.v1"
+    && input.schema !== "***REDACTED***") return null;
   const questions = input.questions.map(record).slice(0, 64).map((question, questionIndex): PaperclipQuestion => {
     const answerMode: PaperclipQuestion["answerMode"] = question.answerMode === "single_select" || question.answerMode === "multi_select" ? question.answerMode : "text";
     const options = (Array.isArray(question.options) ? question.options : []).map(record).slice(0, 128).map((option, optionIndex) => ({
@@ -503,7 +541,11 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
     }));
     const customAnswer = record(question.customAnswer);
     const validation = record(question.textValidation);
-    return {
+    const inputType: NonNullable<PaperclipQuestion["textValidation"]>["inputType"] =
+      validation.inputType === "number" || validation.inputType === "integer" || validation.inputType === "text"
+        ? validation.inputType
+        : undefined;
+    const parsedQuestion: PaperclipQuestion = {
       id: text(question.id, `question-${questionIndex + 1}`).slice(0, 160),
       ...(nullableText(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
       prompt: text(question.prompt, `Question ${questionIndex + 1}`).slice(0, 4_000),
@@ -520,11 +562,12 @@ function parseQuestionSet(value: unknown): PaperclipQuestionSet | null {
         ...(typeof validation.minLength === "number" ? { minLength: validation.minLength } : {}),
         ...(typeof validation.maxLength === "number" ? { maxLength: validation.maxLength } : {}),
         ...(typeof validation.pattern === "string" ? { pattern: validation.pattern.slice(0, 1_000) } : {}),
-        ...(validation.inputType === "number" || validation.inputType === "integer" || validation.inputType === "text" ? { inputType: validation.inputType } : {}),
+        ...(inputType ? { inputType } : {}),
         ...(typeof validation.minimum === "number" ? { minimum: validation.minimum } : {}),
         ...(typeof validation.maximum === "number" ? { maximum: validation.maximum } : {}),
       } } : {}),
     };
+    return parsedQuestion;
   });
   return {
     schema: "paperclip.question_set.v1",

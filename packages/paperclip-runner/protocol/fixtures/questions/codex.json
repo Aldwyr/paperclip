@@ -4,6 +4,7 @@
   "nativeRequest": {
     "method": "item/tool/requestUserInput",
     "params": {
+      "title": "Deployment input",
       "questions": [{
         "id": "environment",
         "header": "Environment",
@@ -11,8 +12,7 @@
         "options": [
           { "label": "Staging", "description": "Deploy to staging first." },
           { "label": "Production", "description": "Deploy directly to production." }
-        ],
-        "isOther": true
+        ]
       }]
     }
   },
@@ -29,8 +29,7 @@
       "options": [
         { "id": "option-1", "label": "Staging", "description": "Deploy to staging first." },
         { "id": "option-2", "label": "Production", "description": "Deploy directly to production." }
-      ],
-      "customAnswer": { "enabled": true, "label": "Other" }
+      ]
     }]
   },
   "canonicalResponse": {

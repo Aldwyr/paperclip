@@ -63,6 +63,13 @@ describe("Paperclip question-set contract", () => {
     expect(() => parsePaperclipQuestionResponse(questionSet, {
       answers: { environment: { answers: ["Staging"] } },
     })).toThrow(/paperclip.question_response.v1/);
+    expect(() => parsePaperclipQuestionResponse(questionSet, {
+      schema: PAPERCLIP_QUESTION_RESPONSE_SCHEMA,
+      answers: {
+        environment: { answers: ["Staging"] },
+        replicas: { text: "3" },
+      },
+    })).toThrow(/canonical response contract/);
   });
 
   it("applies typed numeric validation before an adapter sees the answer", () => {

@@ -387,6 +387,36 @@ describe("TaskChatRunnerTurn", () => {
     expect(onDecision).toHaveBeenCalledWith(expect.objectContaining({ requestId: "request-1" }), { action: "accept" });
   });
 
+  it("keeps a resolved question and answer visible outside folded activity", () => {
+    render([{
+      id: "resolved-request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-1",
+      requestKind: "runtime",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "resolved",
+      prompt: "Codex needs your input.",
+      choices: [],
+      fields: [],
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        questions: [{ id: "goal", prompt: "What should the server do?", required: true, answerMode: "text" }],
+      },
+      response: {
+        schema: "paperclip.question_response.v1",
+        answers: { goal: { text: "Serve a small JSON API." } },
+      },
+    }], "succeeded");
+
+    const history = container.querySelector('[data-testid="task-chat-runtime-request-history"]');
+    expect(history?.closest(".tc-turn-fold")).toBeNull();
+    expect(history?.textContent).toContain("What should the server do?");
+    expect(history?.textContent).toContain("Serve a small JSON API.");
+  });
+
   it("expands live semantic activity from the current activity row", () => {
     render([
       { id: "thinking-empty", kind: "thinking", lines: [], streaming: false, lifecycleOnly: true },

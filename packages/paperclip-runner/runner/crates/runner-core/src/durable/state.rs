@@ -1543,7 +1543,7 @@ fn execute_command_effect(
                 .or_else(|| payload.get("action"))
                 .and_then(Value::as_str)
                 .unwrap_or("cancel");
-            if !["accept", "accept_for_session", "decline", "cancel"].contains(&action) {
+            if !["accept", "accept_for_session", "decline", "cancel", "submit"].contains(&action) {
                 return Ok((
                     "rejected".to_owned(),
                     0,

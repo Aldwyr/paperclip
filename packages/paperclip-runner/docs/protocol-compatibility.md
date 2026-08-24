@@ -71,6 +71,40 @@ effect. Eval `trace_completeness` treats PRP wire receipts as authoritative when
 present and retains the pre-existing scalar fallback for live evidence that has
 not yet emitted them.
 
+## Provider-neutral structured input
+
+Harness-initiated forms cross PRP as `paperclip.runtime_request.v2` with
+`requestKind: "runtime"`, `type: "input"`, and an embedded
+`paperclip.question_set.v1`. A submission is always
+`{ "action": "submit", "response": paperclip.question_response.v1 }`.
+Codex answer objects, OpenCode answer arrays, and ACP typed content exist only
+inside their adapters; `origin` may retain the provider method and adapter name
+for diagnostics but never provider response data.
+
+Question and option order is significant, while answers are keyed by stable
+question IDs and selections reference stable option IDs. The canonical modes
+are `text`, `single_select`, and `multi_select`. Text validation is repeated at
+the untrusted server edge and again against the persisted question set before a
+provider receives the translated response.
+
+Every harness adapter must add a
+`paperclip.question_adapter_fixture.v1` fixture proving its native request
+normalizes to the canonical shape and its canonical response can be translated
+back. The shared fixture format deliberately contains both native and canonical
+objects so adding a provider does not change PRP or the UI contract.
+
+V1 runtime requests and their legacy resolutions remain accepted during the
+migration. A request that contains no structured form stays on the legacy path;
+once a provider supplies a form, malformed or unsupported fields fail closed
+instead of silently degrading. ACPX sidecars advertise only form elicitation
+and use sidecar protocol v2 `runtime.input_requested` / `input.resolve` frames.
+
+The live lifecycle pauses and resumes the same provider turn. If the provider
+process is lost first, Paperclip emits one non-replayable
+`runtime_request.expired` fact and materializes an idempotent durable
+`ask_user_questions` interaction using the identical question set. Explicit
+cancellation and already-resolved requests never create that fallback.
+
 Seven conformance fixtures cover artifact success, redacted denial without
 fallback, stale conflict plus duplicate retry, governed target and continuation
 causality, budget/cost stop, unknown optional fields, and rejection of an

@@ -11,6 +11,9 @@ import {
   createRuntimeStore,
   type AcpPermissionDecision,
   type AcpPermissionRequest,
+  type AcpElicitationHandler,
+  type AcpElicitationRequest,
+  type AcpElicitationResponse,
   type AcpRuntime,
   type AcpRuntimeEvent,
   type AcpRuntimeHandle,
@@ -37,6 +40,8 @@ import {
 } from "../../contracts/provider-trace-file-sink.js";
 
 const PI_PERMISSION_TOOL = "__paperclip_runtime_permission";
+const PI_INPUT_TOOL = "__paperclip_runtime_input";
+const HUMAN_RUNTIME_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 
 type DynamicToolHandler = (call: {
   tool: string;
@@ -62,6 +67,12 @@ export interface AcpxRuntimeUsage {
 
 export interface AcpxRuntimePermissionContext {
   request: AcpPermissionRequest;
+  signal: AbortSignal;
+}
+
+export interface AcpxRuntimeElicitationContext {
+  request: AcpElicitationRequest;
+  requestId: string | number | null;
   signal: AbortSignal;
 }
 
@@ -106,6 +117,9 @@ export interface AcpxRuntimeHostOptions {
   onPermissionRequest?: (
     context: AcpxRuntimePermissionContext,
   ) => Promise<AcpPermissionDecision | undefined>;
+  onElicitation?: (
+    context: AcpxRuntimeElicitationContext,
+  ) => Promise<AcpElicitationResponse>;
   onSpawn?: (meta: AcpxRuntimeProcessIdentity) => Promise<void>;
   onUsage?: (usage: AcpxRuntimeUsage) => void;
   onDiagnostic?: (message: string) => void;
@@ -153,6 +167,7 @@ export class AcpxRuntimeHost {
   readonly #agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
   readonly #trace: ProviderTraceFileSink | null;
   readonly #traceState: { latestInboundFrameId: number | null };
+  readonly #onElicitation?: AcpxRuntimeHostOptions["onElicitation"];
   #activeTurn: AcpRuntimeTurn | null = null;
   #closed = false;
 
@@ -166,6 +181,7 @@ export class AcpxRuntimeHost {
     agentProcessIdentity: AcpxRuntimeProcessIdentity | null;
     trace: ProviderTraceFileSink | null;
     traceState: { latestInboundFrameId: number | null };
+    onElicitation?: AcpxRuntimeHostOptions["onElicitation"];
   }) {
     this.#runtime = input.runtime;
     this.#handle = input.handle;
@@ -176,6 +192,7 @@ export class AcpxRuntimeHost {
     this.#agentProcessIdentity = input.agentProcessIdentity;
     this.#trace = input.trace;
     this.#traceState = input.traceState;
+    this.#onElicitation = input.onElicitation;
   }
 
   static async open(options: AcpxRuntimeHostOptions): Promise<AcpxRuntimeHost> {
@@ -234,11 +251,21 @@ export class AcpxRuntimeHost {
             inputClass: { enum: ["workspace_mutation", "command"] },
           },
         },
-      }] : [],
+      }, ...(options.onElicitation ? [{
+        name: PI_INPUT_TOOL,
+        description: "Runner-internal Pi structured input gate.",
+        inputSchema: piInputToolSchema(),
+      }] : [])] : [],
       handler: async (call) => {
-        if (call.tool !== PI_PERMISSION_TOOL) return options.dynamicToolHandler(call);
-        return requestPiPermission(options, call.callId, call.arguments, call.signal, piPermissionRules);
+        if (call.tool === PI_PERMISSION_TOOL) {
+          return requestPiPermission(options, call.callId, call.arguments, call.signal, piPermissionRules);
+        }
+        if (call.tool === PI_INPUT_TOOL) {
+          return requestPiInput(options, call.callId, call.arguments, call.signal);
+        }
+        return options.dynamicToolHandler(call);
       },
+      privateToolTimeoutMs: HUMAN_RUNTIME_REQUEST_TIMEOUT_MS,
     });
     const agentEnvironment = sanitizedAgentEnvironment(options.environment ?? process.env, {
       HOME: homeDir,
@@ -313,7 +340,7 @@ export class AcpxRuntimeHost {
       // With no generic elicitation capability advertised, Codex-ACP uses the
       // governed permission channel where the runner-owned server identity is
       // correlated and external tool calls remain subject to policy.
-      elicitationModes: options.agent === "codex" ? [] : ["form", "url"],
+      elicitationModes: options.agent === "codex" || !options.onElicitation ? [] : ["form"],
       onPermissionRequest: async (request, context) => {
         // Claude Code and Codex ask their ACP client to authorize MCP
         // invocations,
@@ -427,6 +454,7 @@ export class AcpxRuntimeHost {
         agentProcessIdentity,
         trace,
         traceState,
+        onElicitation: options.onElicitation,
       });
     } catch (error) {
       if (handle) {
@@ -476,6 +504,13 @@ export class AcpxRuntimeHost {
       mode: "prompt",
       requestId: input.requestId,
       signal: input.signal,
+      ...(this.#onElicitation ? {
+        onElicitation: ((request, context) => this.#onElicitation!({
+          request,
+          requestId: context.requestId,
+          signal: context.signal,
+        })) satisfies AcpElicitationHandler,
+      } : {}),
     });
     this.#activeTurn = turn;
     void turn.result.finally(() => {
@@ -757,6 +792,132 @@ function resolvePackageJsonFromEntrypoint(packageName: string): string {
   // a direct dependency of this package, so resolve its owned installation
   // relative to both source and built driver locations without consulting PATH.
   return fileURLToPath(new URL(`../../../node_modules/${packageName}/package.json`, import.meta.url));
+}
+
+function piInputToolSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["title", "questions"],
+    properties: {
+      title: { type: "string", minLength: 1, maxLength: 1_000 },
+      description: { type: "string", maxLength: 4_000 },
+      questions: {
+        type: "array",
+        minItems: 1,
+        maxItems: 32,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "prompt", "answerMode"],
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 160, pattern: "^[A-Za-z0-9_.:-]+$" },
+            header: { type: "string", maxLength: 1_000 },
+            prompt: { type: "string", minLength: 1, maxLength: 4_000 },
+            helpText: { type: "string", maxLength: 4_000 },
+            required: { type: "boolean" },
+            answerMode: { enum: ["text", "single_select", "multi_select", "boolean", "integer", "number"] },
+            options: {
+              type: "array",
+              minItems: 1,
+              maxItems: 128,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["id", "label"],
+                properties: {
+                  id: { type: "string", minLength: 1, maxLength: 160 },
+                  label: { type: "string", minLength: 1, maxLength: 1_000 },
+                  description: { type: "string", maxLength: 4_000 },
+                },
+              },
+            },
+            minLength: { type: "integer", minimum: 0, maximum: 1_000_000 },
+            maxLength: { type: "integer", minimum: 0, maximum: 1_000_000 },
+            minimum: { type: "number" },
+            maximum: { type: "number" },
+            pattern: { type: "string", maxLength: 1_000 },
+          },
+        },
+      },
+    },
+  };
+}
+
+async function requestPiInput(
+  options: AcpxRuntimeHostOptions,
+  callId: string,
+  input: unknown,
+  signal: AbortSignal,
+): Promise<AcpElicitationResponse> {
+  if (!options.onElicitation || signal.aborted) return { action: "cancel" };
+  const value = piRecord(input);
+  const rawQuestions = Array.isArray(value.questions) ? value.questions.slice(0, 32) : [];
+  if (rawQuestions.length === 0) return { action: "decline" };
+  const required: string[] = [];
+  const properties = Object.fromEntries(rawQuestions.map((candidate, index) => {
+    const question = piRecord(candidate);
+    const id = piText(question.id) || `question-${index + 1}`;
+    if (question.required !== false) required.push(id);
+    const answerMode = piText(question.answerMode);
+    const nativeOptions = Array.isArray(question.options) ? question.options.map(piRecord) : [];
+    const options = nativeOptions.map((option, optionIndex) => ({
+      const: piText(option.id) || `option-${optionIndex + 1}`,
+      title: piText(option.label) || `Option ${optionIndex + 1}`,
+      ...(piText(option.description) ? { description: piText(option.description) } : {}),
+    }));
+    let property: Record<string, unknown>;
+    if (answerMode === "single_select" || answerMode === "multi_select") {
+      if (options.length === 0) throw new Error(`Pi input question ${id} requires options`);
+      property = answerMode === "multi_select"
+        ? { type: "array", items: { type: "string", oneOf: options } }
+        : { type: "string", oneOf: options };
+    } else if (answerMode === "boolean") {
+      property = { type: "boolean" };
+    } else if (answerMode === "integer" || answerMode === "number") {
+      property = {
+        type: answerMode,
+        ...(typeof question.minimum === "number" ? { minimum: question.minimum } : {}),
+        ...(typeof question.maximum === "number" ? { maximum: question.maximum } : {}),
+      };
+    } else {
+      property = {
+        type: "string",
+        ...(typeof question.minLength === "number" ? { minLength: question.minLength } : {}),
+        ...(typeof question.maxLength === "number" ? { maxLength: question.maxLength } : {}),
+        ...(piText(question.pattern) ? { pattern: piText(question.pattern) } : {}),
+      };
+    }
+    return [id, {
+      ...property,
+      title: piText(question.header) || piText(question.prompt) || id,
+      ...(piText(question.helpText) || piText(question.prompt)
+        ? { description: piText(question.helpText) || piText(question.prompt) }
+        : {}),
+    }];
+  }));
+  const request = {
+    mode: "form",
+    sessionId: options.normalizedSessionId,
+    message: piText(value.description) || piText(value.title) || "Pi needs your input",
+    requestedSchema: {
+      type: "object",
+      title: piText(value.title) || "Pi needs your input",
+      properties,
+      ...(required.length > 0 ? { required } : {}),
+    },
+  } as AcpElicitationRequest;
+  return options.onElicitation({ request, requestId: callId, signal });
+}
+
+function piRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function piText(value: unknown): string {
+  return typeof value === "string" ? value.slice(0, 4_000) : "";
 }
 
 async function requestPiPermission(

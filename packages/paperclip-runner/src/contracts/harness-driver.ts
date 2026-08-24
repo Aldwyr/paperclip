@@ -299,14 +299,23 @@ export type HarnessRuntimeRequestOutcome = {
   itemId: string;
   action?: HarnessRuntimeRequestAction;
   reason?: string;
+  /** Enables content-free lifecycle counters partitioned by adapter. */
+  adapter?: string;
+  requestType?: "input" | "permission";
+  /** Canonical submitted answers retained for durable replay and audit UI. */
+  response?: PaperclipQuestionResponse;
 };
 
 export function harnessRuntimeRequestOutcome(
   request: Pick<
     HarnessRuntimeRequest,
-    "requestId" | "requestKind" | "turnId" | "itemId"
+    "requestId" | "requestKind" | "turnId" | "itemId" | "origin" | "input"
   >,
-  outcome: { action?: HarnessRuntimeRequestAction | null; reason?: string | null } = {},
+  outcome: {
+    action?: HarnessRuntimeRequestAction | null;
+    reason?: string | null;
+    response?: PaperclipQuestionResponse | null;
+  } = {},
 ): HarnessRuntimeRequestOutcome {
   return {
     requestId: request.requestId,
@@ -315,6 +324,13 @@ export function harnessRuntimeRequestOutcome(
     itemId: request.itemId,
     ...(outcome.action ? { action: outcome.action } : {}),
     ...(outcome.reason ? { reason: outcome.reason } : {}),
+    ...(outcome.response ? { response: structuredClone(outcome.response) } : {}),
+    ...(request.input
+      ? {
+          ...(request.origin?.adapter ? { adapter: request.origin.adapter } : {}),
+          requestType: "input" as const,
+        }
+      : {}),
   };
 }
 

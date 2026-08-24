@@ -92,6 +92,18 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function rejectUnknownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+): void {
+  const allowedKeys = new Set(allowed);
+  const unknown = Object.keys(value).find((key) => !allowedKeys.has(key));
+  if (unknown !== undefined) {
+    throw new PaperclipQuestionValidationError(`${path}/${unknown}`, "is not part of the canonical response contract");
+  }
+}
+
 function requiredText(value: unknown, path: string, maxLength = 4_000): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maxLength) {
     throw new PaperclipQuestionValidationError(path, `must be a non-empty string of at most ${maxLength} characters`);
@@ -138,6 +150,9 @@ export function parsePaperclipQuestionSet(value: unknown): PaperclipQuestionSet 
     }
     if (typeof question.required !== "boolean") {
       throw new PaperclipQuestionValidationError(`${path}/required`, "must be boolean");
+    }
+    if (Array.isArray(question.options) && question.options.length > 128) {
+      throw new PaperclipQuestionValidationError(`${path}/options`, "cannot contain more than 128 options");
     }
     const options: PaperclipQuestionOption[] | undefined = Array.isArray(question.options)
       ? question.options.map((rawOption, optionIndex) => {
@@ -266,6 +281,7 @@ export function parsePaperclipQuestionResponse(
   if (response === null || response.schema !== PAPERCLIP_QUESTION_RESPONSE_SCHEMA) {
     throw new PaperclipQuestionValidationError("/response", `must use ${PAPERCLIP_QUESTION_RESPONSE_SCHEMA}`);
   }
+  rejectUnknownKeys(response, ["schema", "answers"], "/response");
   const rawAnswers = record(response.answers);
   if (rawAnswers === null) throw new PaperclipQuestionValidationError("/response/answers", "must be an object keyed by question ID");
   const questions = new Map(questionSet.questions.map((question) => [question.id, question]));
@@ -282,6 +298,7 @@ export function parsePaperclipQuestionResponse(
     }
     const answer = record(raw);
     if (answer === null) throw new PaperclipQuestionValidationError(path, "must be an object");
+    rejectUnknownKeys(answer, ["selectedOptionIds", "text", "customText"], path);
     const selectedOptionIds = answer.selectedOptionIds === undefined
       ? undefined
       : Array.isArray(answer.selectedOptionIds) && answer.selectedOptionIds.every((entry) => typeof entry === "string")

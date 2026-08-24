@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { ArrowDown } from "lucide-react";
+import { parseCssTimeMs } from "./motion-tokens";
 
 const PIN_THRESHOLD_PX = 48;
 
@@ -44,7 +45,27 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
   const ref = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
   const easingRef = useRef(false);
+  const scrollbarIdleTimerRef = useRef<number | null>(null);
+  const scrollbarIdleDelayRef = useRef<number | null>(null);
   const [pillPhase, setPillPhase] = useState<PillPhase>("hidden");
+
+  const showScrollbarWhileScrolling = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.dataset.scrollActive = "true";
+    if (scrollbarIdleTimerRef.current !== null) {
+      window.clearTimeout(scrollbarIdleTimerRef.current);
+    }
+    const idleDelay = scrollbarIdleDelayRef.current ?? parseCssTimeMs(
+      getComputedStyle(document.documentElement).getPropertyValue("--motion-scrollbar-idle-delay"),
+    );
+    scrollbarIdleDelayRef.current = idleDelay;
+    scrollbarIdleTimerRef.current = window.setTimeout(() => {
+      delete el.dataset.scrollActive;
+      scrollbarIdleTimerRef.current = null;
+      scrollbarIdleDelayRef.current = null;
+    }, idleDelay);
+  }, []);
 
   const showPill = useCallback(() => {
     setPillPhase("in");
@@ -69,6 +90,7 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
   }, []);
 
   const handleScroll = useCallback(() => {
+    showScrollbarWhileScrolling();
     const pinned = isPinned();
     if (easingRef.current) {
       // Smooth re-follow in flight: intermediate scroll events must not
@@ -83,7 +105,7 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
     pinnedRef.current = pinned;
     if (pinned) hidePill();
     else showPill();
-  }, [isPinned, hidePill, showPill]);
+  }, [isPinned, hidePill, showPill, showScrollbarWhileScrolling]);
 
   const handleJumpToLatest = useCallback(() => {
     const el = ref.current;
@@ -125,6 +147,12 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
     };
   }, [showPill]);
 
+  useEffect(() => () => {
+    if (scrollbarIdleTimerRef.current !== null) {
+      window.clearTimeout(scrollbarIdleTimerRef.current);
+    }
+  }, []);
+
   // Follow new content only when already pinned; otherwise hold position.
   useLayoutEffect(() => {
     if (pinnedRef.current) scrollToBottom();
@@ -143,7 +171,7 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
         // absolute inset-0 (not h-full): the viewport must equal the flex-sized
         // wrapper exactly — percentage heights don't reliably resolve against
         // flex-determined block heights, which let the thread overflow the page.
-        className={cn("absolute inset-0 overflow-y-auto", className)}
+        className={cn("scrollbar-while-scrolling absolute inset-0 overflow-y-auto", className)}
         data-testid="task-chat-scroller"
       >
         {children}

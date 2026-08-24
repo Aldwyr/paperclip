@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TaskChatThread } from "./TaskChatThread";
 import type { IssueDocument, IssueQueuedCommentQueue, IssueThreadInteraction } from "@paperclipai/shared";
+import { heartbeatsApi } from "@/api/heartbeats";
 
 const transcriptState = vi.hoisted(() => ({ transcriptByRun: new Map() }));
 const sidebarState = vi.hoisted(() => ({ isMobile: false }));
@@ -55,6 +56,7 @@ afterEach(() => {
   root = null;
   container.remove();
   localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 function render(ui: ReactElement) {
@@ -1014,6 +1016,77 @@ describe("TaskChatThread live transcript", () => {
     for (const noise of ["INITMARKER", "SYSTEMNOISE", "STDOUTNOISE", "STDERRNOISE"]) {
       expect(container.textContent).not.toContain(noise);
     }
+  });
+
+  it("resolves a visible canonical input even while run adapter metadata is stale", async () => {
+    transcriptState.transcriptByRun.set("run-input", [{
+      kind: "runtime_request",
+      ts: "2026-08-23T20:00:00.000Z",
+      requestId: "question-1",
+      requestKind: "runtime",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "pending",
+      prompt: "Codex needs your input.",
+      choices: [],
+      fields: [],
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        questions: [{
+          id: "goal",
+          prompt: "What should the server do?",
+          required: true,
+          answerMode: "single_select",
+          options: [{ id: "api", label: "Starter API" }],
+        }],
+      },
+    }]);
+    const resolveRuntimeRequest = vi.spyOn(heartbeatsApi, "resolveRuntimeRequest").mockResolvedValue({} as never);
+
+    render(
+      <TaskChatThread
+        comments={[]}
+        onAdd={async () => {}}
+        issueStatus="in_progress"
+        activeRun={{
+          id: "run-input",
+          status: "running",
+          invocationSource: "issue",
+          triggerDetail: null,
+          startedAt: "2026-08-23T20:00:00.000Z",
+          finishedAt: null,
+          createdAt: "2026-08-23T20:00:00.000Z",
+          agentId: "agent-1",
+          agentName: "Runner",
+          // Reproduces the lag that caused DOT-202: the transcript already has
+          // a Paperclip request while the linked-run adapter classification is
+          // still stale.
+          adapterType: "codex_local",
+        }}
+      />,
+    );
+
+    const option = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.includes("Starter API"));
+    await act(async () => option?.click());
+    const submit = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Submit answers");
+    await act(async () => submit?.click());
+
+    expect(resolveRuntimeRequest).toHaveBeenCalledWith({
+      runId: "run-input",
+      requestId: "question-1",
+      turnId: "turn-1",
+      requestKind: "runtime",
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: { goal: { selectedOptionIds: ["api"] } },
+        },
+      },
+    });
+    expect(container.textContent).not.toContain("no longer attached");
   });
 
   it("keeps the transcript mounted through run settle until the settled turn renders (PAP-462 B4)", () => {

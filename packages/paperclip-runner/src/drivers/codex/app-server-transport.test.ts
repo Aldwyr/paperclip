@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ProcessCodexAppServerTransport } from "./app-server-transport.js";
+import { ProcessCodexAppServerTransport, redactCodexDiagnostic } from "./app-server-transport.js";
 
 function nodeTransport(
   source: string,
@@ -15,6 +15,13 @@ function nodeTransport(
 }
 
 describe("Codex app-server transport limits", () => {
+  it("redacts real Basic credentials without corrupting ordinary question copy", () => {
+    expect(redactCodexDiagnostic("Authorization: Basic dXNlcjpwYXNz"))
+      .toBe("Authorization: Basic [REDACTED]");
+    expect(redactCodexDiagnostic("Basic API foundation"))
+      .toBe("Basic API foundation");
+  });
+
   it("reports restart-safe process-group ownership", async () => {
     const transport = nodeTransport("process.stdin.resume()", { processGroup: true });
     const info = transport.processInfo();

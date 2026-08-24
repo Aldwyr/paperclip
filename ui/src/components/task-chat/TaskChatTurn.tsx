@@ -59,6 +59,13 @@ export function turnSummaryText(summary: TaskChatTurnItem["summary"]): string {
  */
 export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: TaskChatTurnProps) {
   const parentRow = !item.settled && item.liveStatus != null;
+  const persistentItems = item.settled
+    ? item.items.filter((child) => child.kind === "protocol" && child.surface === "runtime_request")
+    : [];
+  const persistentItemIds = new Set(persistentItems.map((child) => child.id));
+  const foldedItems = persistentItems.length > 0
+    ? item.items.filter((child) => !persistentItemIds.has(child.id))
+    : item.items;
   // Parent-row live turns and settled turns start as their one-line header;
   // only the headerless legacy live turn starts expanded.
   const [open, setOpen] = useState(() => !item.settled && item.liveStatus == null);
@@ -76,7 +83,7 @@ export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: Ta
     if (item.settled && !wasParentRow) setOpen(false);
   }
 
-  const expandable = item.items.length > 0;
+  const expandable = foldedItems.length > 0;
   const folded = (item.settled || parentRow) && !open;
   const SummaryIcon = item.summary.failed ? X : Check;
 
@@ -151,12 +158,19 @@ export function TaskChatTurn({ item, renderChild, timestampPrefix, leading }: Ta
       <div className="tc-turn-fold" data-folded={folded ? "true" : "false"} aria-hidden={folded}>
         <div>
           <div className="flex flex-col gap-2 pt-1">
-            {item.items.map((child) => (
+            {foldedItems.map((child) => (
               <div key={child.id}>{renderChild(child)}</div>
             ))}
           </div>
         </div>
       </div>
+      {persistentItems.length > 0 ? (
+        <div className="flex flex-col gap-2 pt-2" data-testid="task-chat-turn-persistent-history">
+          {persistentItems.map((child) => (
+            <div key={child.id}>{renderChild(child)}</div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

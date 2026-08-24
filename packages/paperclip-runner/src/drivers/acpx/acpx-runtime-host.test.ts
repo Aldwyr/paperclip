@@ -149,6 +149,7 @@ describe("AcpxRuntimeHost", () => {
     await mkdir(workspace);
     let captured: AcpRuntimeOptions | null = null;
     let ensureInput: Parameters<AcpRuntime["ensureSession"]>[0] | null = null;
+    let piElicitation: unknown = null;
     const usages: unknown[] = [];
     const handle: AcpRuntimeHandle = {
       sessionKey: "session-key",
@@ -196,6 +197,10 @@ describe("AcpxRuntimeHost", () => {
         DATABASE_URL: "database-must-not-pass",
       },
       dynamicToolHandler: async () => ({ ok: true }),
+      onElicitation: async (context) => {
+        piElicitation = context.request;
+        return { action: "accept", content: { environment: "staging", replicas: 3 } };
+      },
       onUsage: (usage) => usages.push(usage),
       runtimeFactory,
     });
@@ -224,6 +229,61 @@ describe("AcpxRuntimeHost", () => {
       });
       const catalog = await catalogResponse.json() as { result: { tools: Array<{ name: string }> } };
       expect(catalog.result.tools.map((tool) => tool.name)).toContain("get_task_context");
+      expect(catalog.result.tools.map((tool) => tool.name)).not.toContain("__paperclip_runtime_input");
+      const inputResponse = await fetch(childEnvironment.PAPERCLIP_RUNNER_BRIDGE_URL!, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${childEnvironment.PAPERCLIP_RUNNER_BRIDGE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "pi-input-1",
+          method: "tools/call",
+          params: {
+            name: "__paperclip_runtime_input",
+            arguments: {
+              title: "Deployment",
+              description: "Choose deployment settings.",
+              questions: [
+                {
+                  id: "environment",
+                  header: "Environment",
+                  prompt: "Where should we deploy?",
+                  answerMode: "single_select",
+                  options: [
+                    { id: "staging", label: "Staging" },
+                    { id: "production", label: "Production" },
+                  ],
+                },
+                {
+                  id: "replicas",
+                  prompt: "How many replicas?",
+                  answerMode: "integer",
+                  minimum: 1,
+                  maximum: 10,
+                },
+              ],
+            },
+          },
+        }),
+      });
+      expect(inputResponse.ok).toBe(true);
+      expect(await inputResponse.json()).toMatchObject({
+        result: { content: [{ type: "text", text: expect.stringContaining("staging") }] },
+      });
+      expect(piElicitation).toMatchObject({
+        mode: "form",
+        message: "Choose deployment settings.",
+        requestedSchema: {
+          title: "Deployment",
+          required: ["environment", "replicas"],
+          properties: {
+            environment: { type: "string", title: "Environment" },
+            replicas: { type: "integer", minimum: 1, maximum: 10 },
+          },
+        },
+      });
       expect(JSON.stringify(childEnvironment)).not.toContain("paperclip-must-not-pass");
       expect(JSON.stringify(childEnvironment)).not.toContain("database-must-not-pass");
       expect(JSON.stringify(ensureInput)).not.toContain("openrouter-canary-secret");
@@ -277,6 +337,7 @@ describe("AcpxRuntimeHost", () => {
         PAPERCLIP_PROVIDER_TRACE_PATH: tracePath,
       },
       dynamicToolHandler: async () => ({}),
+      onElicitation: async () => ({ action: "cancel" }),
       runtimeFactory: (options) => {
         capturedOptions = options;
         return {
@@ -328,7 +389,7 @@ describe("AcpxRuntimeHost", () => {
         "semantic_tool.paperclip_finish",
       );
       expect(environment.PAPERCLIP_ACPX_ISOLATED_CONTEXT).toBe("1");
-      expect(options.elicitationModes).toEqual(agent === "codex" ? [] : ["form", "url"]);
+      expect(options.elicitationModes).toEqual(agent === "codex" ? [] : ["form"]);
       expect(ensureInput).toMatchObject({
         sessionOptions: { systemPrompt: { append: systemInstructions } },
       });

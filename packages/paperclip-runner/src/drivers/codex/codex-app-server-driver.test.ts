@@ -47,19 +47,28 @@ import {
 
 class TestQueue<T> implements AsyncIterable<T> {
   values: T[] = [];
-  waiters: Array<(value: IteratorResult<T>) => void> = [];
+  waiters: Array<{
+    resolve: (value: IteratorResult<T>) => void;
+    reject: (error: Error) => void;
+  }> = [];
   closed = false;
+  error: Error | null = null;
 
   push(value: T): void {
     const waiter = this.waiters.shift();
-    if (waiter) waiter({ value, done: false });
+    if (waiter) waiter.resolve({ value, done: false });
     else this.values.push(value);
   }
 
   close(): void {
     this.closed = true;
     for (const waiter of this.waiters.splice(0))
-      waiter({ value: undefined, done: true });
+      waiter.resolve({ value: undefined, done: true });
+  }
+
+  fail(error: Error): void {
+    this.error = error;
+    for (const waiter of this.waiters.splice(0)) waiter.reject(error);
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
@@ -67,8 +76,9 @@ class TestQueue<T> implements AsyncIterable<T> {
       next: async () => {
         const value = this.values.shift();
         if (value) return { value, done: false };
+        if (this.error) throw this.error;
         if (this.closed) return { value: undefined, done: true };
-        return new Promise((resolve) => this.waiters.push(resolve));
+        return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
       },
     };
   }
@@ -1555,6 +1565,13 @@ describe("Codex app-server Codex driver", () => {
     const { turnId } = await session.startTurn({
       message: { role: "user", text: "Ask the deployment questions." },
     });
+    const resolvedEvent = (async () => {
+      for await (const event of session.events()) {
+        if (event.eventType === "runtime_request.resolved"
+          && event.payload.requestId === "dot-185-request") return event;
+      }
+      return null;
+    })();
     const nativeResponse = transport.invoke({
       id: "dot-185-request",
       method: "item/tool/requestUserInput",
@@ -1629,6 +1646,59 @@ describe("Codex app-server Codex driver", () => {
         notes: { answers: ["Ship during the maintenance window."] },
       },
     });
+    expect((await resolvedEvent)?.payload).toMatchObject({
+      action: "submit",
+      response: {
+        schema: "paperclip.question_response.v1",
+        answers: {
+          environment: { selectedOptionIds: ["option-1"] },
+          regions: { selectedOptionIds: ["option-1", "option-2"] },
+          notes: { text: "Ship during the maintenance window." },
+        },
+      },
+    });
+    await session.close({ reason: "fixture complete" });
+  });
+
+  it("rejects an explicit malformed Codex form without falling back to v1", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-malformed-input",
+      normalizedSessionId: "normalized-malformed-input",
+      workingDirectory: "/workspace",
+    });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask a malformed question." },
+    });
+    const diagnostic = (async () => {
+      for await (const event of session.events()) {
+        if (event.eventType === "harness.diagnostic" && event.payload.code === "runtime_input_rejected") {
+          return event;
+        }
+      }
+      return null;
+    })();
+    await expect(transport.invoke({
+      id: "malformed-input",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "malformed-item",
+        questions: [
+          { id: "duplicate", question: "First?" },
+          { id: "duplicate", question: "Second?" },
+        ],
+      },
+    })).resolves.toEqual({ answers: {} });
+    expect(session.pendingRuntimeRequests?.()).toEqual([]);
+    expect(await diagnostic).toEqual(expect.objectContaining({
+      eventType: "harness.diagnostic",
+      payload: expect.objectContaining({
+        code: "runtime_input_rejected",
+        adapter: "codex-app-server",
+      }),
+    }));
     await session.close({ reason: "fixture complete" });
   });
 
@@ -1716,6 +1786,65 @@ describe("Codex app-server Codex driver", () => {
       },
     ]);
     for (const event of terminal) expect(validatePrpEvent(event).ok).toBe(true);
+  });
+
+  it("expires a canonical input with its full question set when the provider transport is lost", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-provider-loss",
+      normalizedSessionId: "normalized-provider-loss",
+      workingDirectory: "/workspace",
+    });
+    const events: PrpEvent[] = [];
+    const consume = (async () => {
+      for await (const event of session.events()) events.push(event);
+    })();
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask before continuing." },
+    });
+    const pending = transport.invoke({
+      id: "lost-input",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "lost-input-item",
+        questions: [{
+          id: "environment",
+          header: "Environment",
+          question: "Where should we deploy?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        }],
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    transport.queue.fail(new Error("provider exited"));
+    expect(await pending).toEqual({ answers: {} });
+    await consume;
+
+    const expired = events.find((event) => event.eventType === "runtime_request.expired");
+    expect(expired).toMatchObject({
+      turnId,
+      itemId: "lost-input-item",
+      payload: {
+        requestId: "lost-input",
+        reason: "provider_process_lost",
+        replayAllowed: false,
+        requestType: "input",
+        request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "lost-input",
+          type: "input",
+          input: {
+            schema: "paperclip.question_set.v1",
+            questions: [expect.objectContaining({ id: "environment" })],
+          },
+        },
+      },
+    });
+    expect(events.filter((event) => event.eventType === "runtime_request.cancelled")).toHaveLength(0);
+    expect(validatePrpEvent(expired!)).toMatchObject({ ok: true });
   });
 
   it("redacts browser-visible request details and diagnostics from the fixture markers", async () => {

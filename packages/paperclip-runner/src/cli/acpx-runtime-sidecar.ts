@@ -4,13 +4,20 @@ import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { isAbsolute, relative, resolve } from "node:path";
 
-import type { AcpPermissionDecision, AcpRuntimeEvent, AcpRuntimeStatus } from "acpx/runtime";
+import type {
+  AcpElicitationRequest,
+  AcpElicitationResponse,
+  AcpPermissionDecision,
+  AcpRuntimeEvent,
+  AcpRuntimeStatus,
+} from "acpx/runtime";
 
 import {
   PRP_BLOCK_TOOL_NAME,
   PRP_COMPLETION_TOOL_NAME,
 } from "../contracts/completion-result.js";
 import { AcpxRuntimeHost } from "../drivers/acpx/acpx-runtime-host.js";
+import { normalizeAcpFormElicitation } from "../drivers/acpx/acp-question-adapter.js";
 import { resolveQualifiedAcpxProfile, type QualifiedAcpxAgent } from "../drivers/acpx/qualified-profiles.js";
 import {
   ACPX_SIDECAR_MAX_FRAME_BYTES,
@@ -40,6 +47,10 @@ let turnId: string | null = null;
 let sequence = 0;
 let closing = false;
 const permissions = new Map<string, PendingResolution<AcpPermissionDecision | undefined>>();
+const inputs = new Map<string, PendingResolution<AcpElicitationResponse> & {
+  request: AcpElicitationRequest;
+  questionSet: import("../contracts/question-set.js").PaperclipQuestionSet;
+}>();
 const tools = new Map<string, PendingResolution<unknown>>();
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
@@ -152,6 +163,30 @@ async function dispatch(request: AcpxSidecarRequest): Promise<Record<string, unk
     pending.settle(parsePermissionDecision(request.params.decision));
     return { resolved: true };
   }
+  if (request.command === "input.resolve") {
+    const requestId = requiredText(request.params.requestId, "requestId");
+    const pending = inputs.get(requestId);
+    if (!pending || pending.turnId !== requiredText(request.params.turnId, "turnId")) {
+      throw new Error("input request is stale or unknown");
+    }
+    const resolution = record(request.params.resolution);
+    const action = requiredText(resolution.action, "resolution.action");
+    let elicitationResponse: AcpElicitationResponse;
+    if (action === "submit") {
+      const normalized = normalizeAcpFormElicitation(pending.request);
+      if (!normalized) throw new Error("ACP input request is no longer a form elicitation");
+      elicitationResponse = normalized.accept(resolution.response);
+    } else if (action === "decline") {
+      elicitationResponse = { action: "decline" };
+    } else if (action === "cancel") {
+      elicitationResponse = { action: "cancel" };
+    } else {
+      throw new Error("unsupported ACP input resolution action");
+    }
+    inputs.delete(requestId);
+    pending.settle(elicitationResponse);
+    return { resolved: true };
+  }
   if (request.command === "tool.resolve") {
     const callId = requiredText(request.params.callId, "callId");
     const pending = tools.get(callId);
@@ -190,6 +225,7 @@ async function openRuntime(params: AcpxSidecarOpenParams): Promise<AcpxRuntimeHo
     dynamicTools: params.tools,
     dynamicToolHandler: (call) => waitForTool(call),
     onPermissionRequest: (context) => waitForPermission(context.request, context.signal),
+    onElicitation: (context) => waitForInput(context.request, context.requestId, context.signal),
     onSpawn: async (identity) => emit("runtime.process", {
       role: "acp_agent",
       ...identity,
@@ -270,6 +306,50 @@ function waitForPermission(request: import("acpx/runtime").AcpPermissionRequest,
     permissions.set(requestId, {
       turnId: turnId!,
       settle: (decision) => { signal.removeEventListener("abort", abort); settle(decision); },
+      reject,
+    });
+  });
+}
+
+function waitForInput(
+  request: AcpElicitationRequest,
+  nativeRequestId: string | number | null,
+  signal: AbortSignal,
+): Promise<AcpElicitationResponse> {
+  if (!turnId || signal.aborted) return Promise.resolve({ action: "cancel" });
+  let normalized: ReturnType<typeof normalizeAcpFormElicitation>;
+  try {
+    normalized = normalizeAcpFormElicitation(request);
+  } catch (error) {
+    diagnostic("runtime_input_rejected", safeMessage(error));
+    return Promise.resolve({ action: "decline" });
+  }
+  if (!normalized) return Promise.resolve({ action: "decline" });
+  const requestId = requiredText(String(nativeRequestId), "elicitation request id");
+  if (inputs.has(requestId)) return Promise.resolve({ action: "decline" });
+  emit("runtime.input_requested", {
+    requestId,
+    questionSet: normalized.questionSet,
+    origin: {
+      adapter: "acpx-runtime-sidecar",
+      provider: "acpx",
+      method: "elicitation/create",
+    },
+  });
+  return new Promise((settle, reject) => {
+    const abort = () => {
+      if (!inputs.delete(requestId)) return;
+      settle({ action: "cancel" });
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    inputs.set(requestId, {
+      turnId: turnId!,
+      request,
+      questionSet: normalized.questionSet,
+      settle: (response) => {
+        signal.removeEventListener("abort", abort);
+        settle(response);
+      },
       reject,
     });
   });
@@ -479,6 +559,10 @@ function rejectTurnWaiters(terminalTurnId: string, message: string): void {
   for (const [id, pending] of tools) if (pending.turnId === terminalTurnId) {
     tools.delete(id);
     pending.reject(new Error(message));
+  }
+  for (const [id, pending] of inputs) if (pending.turnId === terminalTurnId) {
+    inputs.delete(id);
+    pending.settle({ action: "cancel" });
   }
 }
 

@@ -28,6 +28,8 @@ export interface OpenCodeMcpBridgeOptions {
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler: (call: OpenCodeMcpCall) => Promise<unknown>;
   timeoutMs?: number;
+  /** Human-gated private operations may remain pending much longer than model tool calls. */
+  privateToolTimeoutMs?: number;
   maxBodyBytes?: number;
   secret?: string;
 }
@@ -70,6 +72,8 @@ export async function startOpenCodeMcpBridge(
       controllers,
       handler: options.handler,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      privateToolTimeoutMs: options.privateToolTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      privateToolNames: new Set(privateTools.map((tool) => tool.name)),
       maxBodyBytes: options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
     });
   });
@@ -138,6 +142,8 @@ async function handleRequest(
     controllers: Map<string, AbortController>;
     handler: OpenCodeMcpBridgeOptions["handler"];
     timeoutMs: number;
+    privateToolTimeoutMs: number;
+    privateToolNames: ReadonlySet<string>;
     maxBodyBytes: number;
   },
 ): Promise<void> {
@@ -236,7 +242,7 @@ async function handleRequest(
   const execution = existing?.promise ?? withCancellationAndTimeout(
     context.handler({ tool, callId, arguments: structuredClone(args), signal: controller!.signal }),
     controller!,
-    context.timeoutMs,
+    context.privateToolNames.has(tool) ? context.privateToolTimeoutMs : context.timeoutMs,
   );
   if (!existing) {
     if (context.calls.size >= 2_048) context.calls.delete(context.calls.keys().next().value!);

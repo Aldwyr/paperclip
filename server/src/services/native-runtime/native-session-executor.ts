@@ -9,13 +9,16 @@ import type {
   NativeExecutionInput,
   NativeSession,
   NativeSessionBackend,
+  PaperclipQuestionSet,
   PersistedNativeSession,
+  PrpEvent,
   PrpStructuredRunResult,
 } from "../../vendor/paperclip-runner/index.js";
 import {
   createNativeSessionBackend,
   createRunnerdCodexTransport,
   executeNativeSession,
+  parsePaperclipQuestionSet,
 } from "../../vendor/paperclip-runner/index.js";
 import type { Db } from "@paperclipai/db";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -116,6 +119,128 @@ type PlanSynchronization = {
   currentRevisionId: string | null;
   confirmationId: string | null;
 };
+
+type RuntimeQuestionFallback = {
+  kind: "ask_user_questions";
+  idempotencyKey: string;
+  sourceRunId: string;
+  title: string | null;
+  summary: string | null;
+  continuationPolicy: "wake_assignee";
+  payload: {
+    version: 1;
+    title?: string;
+    submitLabel?: string;
+    supersedeOnUserComment: false;
+    questionSet: PaperclipQuestionSet;
+    questions: Array<{
+      id: string;
+      prompt: string;
+      helpText?: string;
+      selectionMode: "single" | "multi";
+      required: boolean;
+      options: Array<{ id: string; label: string; description?: string; freeText?: boolean }>;
+    }>;
+  };
+};
+
+/** Translate only provider-loss expirations; cancellations and resolved inputs never fall back. */
+export function runtimeQuestionFallbackFromEvent(
+  event: Pick<PrpEvent, "eventType" | "payload" | "runId">,
+): RuntimeQuestionFallback | null {
+  if (event.eventType !== "runtime_request.expired") return null;
+  const payload = record(event.payload);
+  if (payload.reason !== "provider_process_lost" || payload.replayAllowed !== false) return null;
+  const request = record(payload.request);
+  if (
+    request.schema !== "paperclip.runtime_request.v2"
+    || request.requestKind !== "runtime"
+    || request.type !== "input"
+    || typeof request.requestId !== "string"
+  ) return null;
+  let questionSet: PaperclipQuestionSet;
+  try {
+    questionSet = parsePaperclipQuestionSet(request.input);
+  } catch {
+    return null;
+  }
+  const questions = questionSet.questions.map((question) => ({
+    id: question.id,
+    prompt: question.prompt,
+    ...(question.helpText ? { helpText: question.helpText } : {}),
+    selectionMode: question.answerMode === "multi_select" ? "multi" as const : "single" as const,
+    required: question.required,
+    options: question.answerMode === "text"
+      ? [{
+          id: "__paperclip_text__",
+          label: question.textValidation?.inputType === "integer"
+            ? "Enter an integer"
+            : question.textValidation?.inputType === "number"
+              ? "Enter a number"
+              : "Enter your answer",
+          freeText: true,
+        }]
+      : (question.options ?? []).map((option) => ({
+          id: option.id,
+          label: option.label,
+          ...(option.description ? { description: option.description } : {}),
+        })),
+  }));
+  return {
+    kind: "ask_user_questions",
+    idempotencyKey: `runtime-input-fallback:v1:${event.runId}:${request.requestId}`,
+    sourceRunId: event.runId,
+    title: questionSet.title?.slice(0, 240) ?? null,
+    summary: questionSet.description?.slice(0, 1000) ?? null,
+    continuationPolicy: "wake_assignee",
+    payload: {
+      version: 1,
+      ...(questionSet.title ? { title: questionSet.title.slice(0, 240) } : {}),
+      ...(questionSet.submitLabel ? { submitLabel: questionSet.submitLabel.slice(0, 120) } : {}),
+      supersedeOnUserComment: false,
+      questionSet,
+      questions,
+    },
+  };
+}
+
+export function runtimeInputLifecycleMetric(
+  event: Pick<PrpEvent, "eventType" | "payload">,
+): { outcome: "normalized" | "rejected" | "resolved" | "expired" | "cancelled"; adapter: string; requestId: string | null } | null {
+  const payload = record(event.payload);
+  const request = record(payload.request);
+  if (event.eventType === "runtime_request.created" && request.type === "input") {
+    const origin = record(request.origin);
+    return {
+      outcome: "normalized",
+      adapter: typeof origin.adapter === "string" ? origin.adapter : "unknown",
+      requestId: typeof request.requestId === "string" ? request.requestId : null,
+    };
+  }
+  if (event.eventType === "harness.diagnostic" && payload.code === "runtime_input_rejected") {
+    return {
+      outcome: "rejected",
+      adapter: typeof payload.adapter === "string" ? payload.adapter : "unknown",
+      requestId: null,
+    };
+  }
+  const terminalOutcome = event.eventType === "runtime_request.resolved" ? "resolved"
+    : event.eventType === "runtime_request.expired" ? "expired"
+      : event.eventType === "runtime_request.cancelled" ? "cancelled"
+        : null;
+  const requestType = payload.requestType ?? request.type;
+  if (!terminalOutcome || requestType !== "input") return null;
+  const origin = record(request.origin);
+  return {
+    outcome: terminalOutcome,
+    adapter: typeof payload.adapter === "string"
+      ? payload.adapter
+      : typeof origin.adapter === "string" ? origin.adapter : "unknown",
+    requestId: typeof payload.requestId === "string"
+      ? payload.requestId
+      : typeof request.requestId === "string" ? request.requestId : null,
+  };
+}
 
 export function providerPlanMarkdown(payload: Record<string, unknown>): string {
   const completedMarkdown = typeof payload.markdown === "string" ? payload.markdown.trim() : "";
@@ -1082,6 +1207,38 @@ export async function executePaperclipNativeSession(input: {
   }, {
     onCommittedEvent: async (event) => {
       if (input.onLog) await input.onLog("stdout", `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`);
+      const inputMetric = runtimeInputLifecycleMetric(event);
+      if (inputMetric && input.onLog) {
+        await input.onLog("stdout", `${JSON.stringify({
+          type: "paperclip.runtime_input.metric",
+          ...inputMetric,
+        })}\n`);
+      }
+      const questionFallback = runtimeQuestionFallbackFromEvent(event);
+      if (questionFallback) {
+        const interaction = await issueThreadInteractionService(input.db).create(
+          {
+            id: input.execution.binding.issueId,
+            companyId: input.execution.binding.companyId,
+          },
+          questionFallback as never,
+          {
+            agentId: input.execution.binding.agentId,
+            runId: input.execution.binding.runId,
+            systemId: "native-runtime-question-fallback",
+          },
+        );
+        if (input.onLog) {
+          const origin = record(record(record(event.payload).request).origin);
+          await input.onLog("stdout", `${JSON.stringify({
+            type: "paperclip.runtime_input.metric",
+            outcome: "fallback_materialized",
+            requestId: record(event.payload).requestId,
+            interactionId: interaction.id,
+            adapter: typeof origin.adapter === "string" ? origin.adapter : "unknown",
+          })}\n`);
+        }
+      }
       await recordPlanSynchronization(event as {
         sourceEventId: string;
         turnId?: string;

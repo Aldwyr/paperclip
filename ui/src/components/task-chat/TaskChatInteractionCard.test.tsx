@@ -200,6 +200,68 @@ describe("TaskChatInteractionCard", () => {
     ]);
   });
 
+  it("reuses the question form for a recovered harness text request", async () => {
+    const submit = vi.fn();
+    const recovered = structuredClone(pendingAskUserQuestionsInteraction);
+    recovered.id = "recovered-runtime-question";
+    recovered.title = "Configure deployment";
+    recovered.payload = {
+      version: 1,
+      supersedeOnUserComment: false,
+      submitLabel: "Continue",
+      questions: [{
+        id: "replicas",
+        prompt: "How many replicas?",
+        selectionMode: "single",
+        required: true,
+        options: [{ id: "__paperclip_text__", label: "Enter an integer", freeText: true }],
+      }],
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        title: "Configure deployment",
+        description: "The provider disconnected while waiting for this answer.",
+        submitLabel: "Continue",
+        questions: [{
+          id: "replicas",
+          header: "Replicas",
+          prompt: "How many replicas?",
+          required: true,
+          answerMode: "text",
+          textValidation: { inputType: "integer", minimum: 1, maximum: 10 },
+        }],
+      },
+    };
+    flushSync(() => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(recovered)}
+              onSubmitInteractionAnswers={submit}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    expect(container.textContent).toContain("The provider disconnected while waiting for this answer.");
+    expect(container.textContent).toContain("Write an answer · Required");
+    const textarea = container.querySelector("textarea")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(textarea, "3");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const send = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Continue");
+    await act(async () => send?.click());
+
+    expect(submit).toHaveBeenCalledWith(recovered, [{
+      questionId: "replicas",
+      optionIds: [],
+      otherText: "3",
+    }]);
+  });
+
   it("paginates item verdicts instead of expanding the whole review set", async () => {
     flushSync(() => {
       root.render(

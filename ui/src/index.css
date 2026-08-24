@@ -91,6 +91,10 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  --scrollbar-thumb: oklch(0.7 0 0);
+  --scrollbar-thumb-hover: oklch(0.6 0 0);
+  --scrollbar-size: 8px;
+  --scrollbar-radius: 999px;
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
@@ -250,10 +254,22 @@
   --motion-interstitial-dwell: 4000ms;  /* interstitial update hold: minimum before the next swaps in, and how long a finished update sits before sliding away */
   --motion-scroll-pill-enter: 200ms;    /* scroll-to-latest pill entry */
   --motion-scroll-pill-exit: 400ms;     /* scroll-to-latest pill exit */
+  --motion-scrollbar-idle-delay: 600ms; /* keep the task-thread thumb visible briefly after scrolling settles */
   --motion-ease-scroll-pill-in: cubic-bezier(0.23, 1, 0.32, 1);
   --motion-ease-scroll-pill-out: cubic-bezier(0.7, 0, 0.84, 0);
   --motion-pane-glide: 320ms;           /* properties-pane maximize/restore glide */
   --motion-side-panel-tab: var(--motion-duration-fast);
+
+  /* Portable side-panel geometry and hierarchy. These stay centralized so
+     task, project, agent, and future hosts render the same Codex-like chrome. */
+  --side-panel-header-height: var(--sz-48px);
+  --side-panel-tab-height: var(--sz-36px);
+  --side-panel-tab-label-max-width: var(--sz-100px);
+  --side-panel-tab-radius: var(--radius-xl);
+  --side-panel-control-radius: var(--radius-xl);
+  --side-panel-launcher-width: var(--sz-320px);
+  --side-panel-tab-active-bg: color-mix(in oklab, var(--accent) 88%, var(--background));
+  --side-panel-tab-hover-bg: color-mix(in oklab, var(--accent) 58%, transparent);
 
   /* Composer mode-chip hues (v5–v7 decisions): agent + plan reuse the task
      status hues; ask is the v5 blue. Consumed as `--sc` seeds through the
@@ -308,6 +324,8 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
+  --scrollbar-thumb: oklch(0.4 0 0);
+  --scrollbar-thumb-hover: oklch(0.5 0 0);
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
@@ -477,6 +495,32 @@
   background: transparent !important;
 }
 
+/* Task thread: keep the gutter available without painting a persistent rail.
+   Scroll events temporarily add data-scroll-active; hovering alone stays idle. */
+.scrollbar-while-scrolling {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.scrollbar-while-scrolling::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+  background: transparent;
+}
+.scrollbar-while-scrolling::-webkit-scrollbar-track,
+.scrollbar-while-scrolling::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.scrollbar-while-scrolling[data-scroll-active="true"] {
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.scrollbar-while-scrolling[data-scroll-active="true"]::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: var(--scrollbar-radius);
+}
+.scrollbar-while-scrolling[data-scroll-active="true"]::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
 /* The task-chat shell owns its desktop scroll viewport. Release Layout's
    otherwise-useful reserved main scrollbar gutter so that viewport can meet
    the properties-pane border instead of stopping one scrollbar-width early. */
@@ -569,6 +613,8 @@
     /* --motion-interstitial-dwell is deliberately NOT zeroed: it is a pacing
        hold, not a movement — zeroing it would make the interstitial line churn
        faster under reduced motion. Swaps themselves snap (line-scroll: 0). */
+    /* --motion-scrollbar-idle-delay is also a visibility hold, not movement;
+       keeping it lets reduced-motion users see the thumb while scrolling. */
     --motion-scroll-pill-enter: 0ms;
     --motion-scroll-pill-exit: 0ms;
     --motion-pane-glide: 0ms;
@@ -728,7 +774,8 @@
   .tc-turn-fold,
   .tc-turn-metrics,
   .tc-line-scroll-inner,
-  .tc-pane-glide { transition: none; }
+  .tc-pane-glide,
+  .side-panel-tab-motion { transition: none; }
   /* The pill keyframes carry the X-centering; with animation:none restore it. */
   .tc-scroll-pill-in,
   .tc-scroll-pill-out { transform: translate(-50%, 0); }

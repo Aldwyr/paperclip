@@ -118,7 +118,9 @@ export function SidePanelTabs({
   useEffect(() => {
     if (!activeTabId) return;
     const element = findTabElement(activeTabId, "wrapper");
-    element?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+    const reducedMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    element?.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest", inline: "nearest" });
     // `findTabElement` only reads the committed tab DOM for this active id.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTabId]);
@@ -226,7 +228,7 @@ export function SidePanelTabs({
           onClick={onAddTab}
           aria-label={addLabel}
           title={addLabel}
-          className="shrink-0 rounded-xl"
+          className="shrink-0 rounded-(--side-panel-control-radius)"
         >
           <Plus aria-hidden />
         </Button>

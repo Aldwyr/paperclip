@@ -133,6 +133,28 @@ describe("OpenCode MCP bridge", () => {
     expect(observed).toHaveBeenCalledOnce();
   });
 
+  it("allows human-gated private calls to outlive ordinary tool timeouts", async () => {
+    const bridge = await startOpenCodeMcpBridge({
+      tools: [{ name: "documents.read", inputSchema: { type: "object" } }],
+      privateTools: [{ name: "__paperclip_runtime_input", inputSchema: { type: "object" } }],
+      timeoutMs: 20,
+      privateToolTimeoutMs: 200,
+      handler: async ({ tool }) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { tool, resolved: true };
+      },
+    });
+    bridges.push(bridge);
+    const response = await rpc(bridge, {
+      id: "human-input",
+      method: "tools/call",
+      params: { name: "__paperclip_runtime_input", arguments: {} },
+    });
+    expect(await response.json()).toMatchObject({
+      result: { content: [{ text: expect.stringContaining("\"resolved\":true") }] },
+    });
+  });
+
   it("honors MCP cancellation notifications", async () => {
     const started = vi.fn();
     const bridge = await startOpenCodeMcpBridge({

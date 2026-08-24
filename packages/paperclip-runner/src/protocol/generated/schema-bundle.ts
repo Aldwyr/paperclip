@@ -2465,6 +2465,59 @@ export const questionSetSchema = {
           "$ref": "#/$defs/textValidation"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "answerMode": {
+                "const": "text"
+              }
+            },
+            "required": [
+              "answerMode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "options": {
+                "type": "array",
+                "maxItems": 0
+              }
+            },
+            "not": {
+              "required": [
+                "customAnswer"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "answerMode": {
+                "enum": [
+                  "single_select",
+                  "multi_select"
+                ]
+              }
+            },
+            "required": [
+              "answerMode"
+            ]
+          },
+          "then": {
+            "required": [
+              "options"
+            ],
+            "properties": {
+              "options": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
       "additionalProperties": false
     }
   },

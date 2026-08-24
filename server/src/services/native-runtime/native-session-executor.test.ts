@@ -27,6 +27,7 @@ vi.mock("@paperclipai/paperclip-runner", () => ({
   CAPABILITY_SEMANTIC_TOOL_CATALOG: [],
   createNativeSessionBackend: state.createBackend,
   executeNativeSession: state.execute,
+  parsePaperclipQuestionSet: (value: unknown) => value,
 }));
 
 import {
@@ -42,9 +43,112 @@ import {
   nativeSessionRecoveryProjection,
   nativeGovernedWaitResult,
   providerPlanMarkdown,
+  runtimeInputLifecycleMetric,
+  runtimeQuestionFallbackFromEvent,
   semanticProviderPlanMarkdown,
   steerNativeSession,
 } from "./native-session-executor.js";
+
+describe("runtime question fallback", () => {
+  const questionSet = {
+    schema: "paperclip.question_set.v1" as const,
+    title: "Configure deployment",
+    description: "These answers are required before work can continue.",
+    submitLabel: "Continue",
+    questions: [
+      {
+        id: "region",
+        prompt: "Which region?",
+        required: true,
+        answerMode: "single_select" as const,
+        options: [{ id: "us", label: "US" }, { id: "eu", label: "Europe" }],
+      },
+      {
+        id: "replicas",
+        prompt: "How many replicas?",
+        required: true,
+        answerMode: "text" as const,
+        textValidation: { inputType: "integer" as const, minimum: 1 },
+      },
+    ],
+  };
+
+  it("materializes one idempotent durable interaction only after provider loss", () => {
+    const fallback = runtimeQuestionFallbackFromEvent({
+      eventType: "runtime_request.expired",
+      runId: "00000000-0000-4000-8000-000000000001",
+      payload: {
+        requestId: "elicitation-1",
+        reason: "provider_process_lost",
+        replayAllowed: false,
+        request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "elicitation-1",
+          type: "input",
+          status: "pending",
+          prompt: "Configure deployment",
+          input: questionSet,
+        },
+      },
+    });
+    expect(fallback).toMatchObject({
+      kind: "ask_user_questions",
+      idempotencyKey: "runtime-input-fallback:v1:00000000-0000-4000-8000-000000000001:elicitation-1",
+      sourceRunId: "00000000-0000-4000-8000-000000000001",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        questionSet,
+        supersedeOnUserComment: false,
+        questions: [
+          { id: "region", selectionMode: "single", options: [{ id: "us", label: "US" }, { id: "eu", label: "Europe" }] },
+          { id: "replicas", selectionMode: "single", options: [{ id: "__paperclip_text__", freeText: true }] },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    ["runtime_request.resolved", "provider_process_lost", false],
+    ["runtime_request.cancelled", "provider_process_lost", false],
+    ["runtime_request.expired", "explicit_cancellation", false],
+    ["runtime_request.expired", "provider_process_lost", true],
+  ])("does not fall back for %s / %s / replay=%s", (eventType, reason, replayAllowed) => {
+    expect(runtimeQuestionFallbackFromEvent({
+      eventType: eventType as never,
+      runId: "00000000-0000-4000-8000-000000000001",
+      payload: {
+        reason,
+        replayAllowed,
+        request: {
+          schema: "paperclip.runtime_request.v2",
+          requestKind: "runtime",
+          requestId: "elicitation-1",
+          type: "input",
+          input: questionSet,
+        },
+      },
+    })).toBeNull();
+  });
+
+  it("emits content-free lifecycle metric dimensions", () => {
+    expect(runtimeInputLifecycleMetric({
+      eventType: "runtime_request.created",
+      payload: {
+        request: {
+          type: "input",
+          requestId: "input-1",
+          origin: { adapter: "codex-app-server" },
+          input: questionSet,
+        },
+      },
+    })).toEqual({
+      outcome: "normalized",
+      adapter: "codex-app-server",
+      requestId: "input-1",
+    });
+  });
+});
 
 describe("native provider bootstrap environment", () => {
   it("inherits the host executable and credential-home context", () => {

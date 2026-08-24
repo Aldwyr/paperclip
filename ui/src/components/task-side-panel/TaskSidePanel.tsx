@@ -30,6 +30,7 @@ import { IssuePropertiesArtifactsTab } from "@/components/issue-properties/Issue
 import { IssuePropertiesPlansTab } from "@/components/issue-properties/IssuePropertiesPlansTab";
 import {
   SidePanelLauncher,
+  SidePanelToggleButton,
   SidePanelTabs,
   useSidePanelTabs,
   type SidePanelLauncherItem,
@@ -38,12 +39,23 @@ import {
   type SidePanelTabRecord,
 } from "@/components/side-panel";
 import { Button } from "@/components/ui/button";
-import { useFileViewer } from "@/context/FileViewerContext";
+import {
+  FILE_VIEWER_NAVIGATE_OPTIONS,
+  getCurrentFileViewerSearch,
+  readBrowseStateFromSearch,
+  readFileViewerStateFromSearch,
+  shouldNavigateFileViewerSearch,
+  writeBrowseStateToSearch,
+  writeFileViewerStateToSearch,
+  type FileViewerBrowseState,
+  type FileViewerUrlState,
+} from "@/context/FileViewerContext";
 import { useIssueDocuments } from "@/hooks/useIssueDocuments";
 import type { IssueExternalObjectGroup } from "@/hooks/useIssueExternalObjects";
 import { useIssuePlanDocument } from "@/hooks/useIssuePlanDocument";
 import { documentDisplayTitle } from "@/lib/issue-artifacts";
 import { queryKeys } from "@/lib/queryKeys";
+import { useLocation, useNavigate } from "@/lib/router";
 import {
   readTaskSidePanelState,
   taskPanelArtifactsTab,
@@ -74,6 +86,7 @@ export interface TaskSidePanelProps {
   checkingMonitorNow?: boolean;
   fileTabsEnabled: boolean;
   documentDeepLink?: { requestId: number; documentKey: string } | null;
+  onRequestClose?: () => void;
 }
 
 function tabIcon(tab: SidePanelTabRecord<TaskSidePanelTabPayload>): ReactNode {
@@ -88,6 +101,86 @@ function tabIcon(tab: SidePanelTabRecord<TaskSidePanelTabPayload>): ReactNode {
 
 function selectorForWorkspaceKind(kind: "execution_workspace" | "project_workspace") {
   return kind === "execution_workspace" ? "execution" as const : "project" as const;
+}
+
+/**
+ * The desktop panel is rendered beside the route outlet, so task file routing
+ * deliberately lives in this adapter instead of depending on provider ancestry.
+ */
+function useTaskSidePanelFileRouting() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const state = useMemo(() => readFileViewerStateFromSearch(location.search), [location.search]);
+  const browseState = useMemo(() => readBrowseStateFromSearch(location.search), [location.search]);
+  const navigateSearch = useCallback((nextSearch: string, replace = false) => {
+    if (!shouldNavigateFileViewerSearch(nextSearch, location.search)) return;
+    navigate(
+      { pathname: location.pathname, hash: location.hash, search: nextSearch },
+      { ...FILE_VIEWER_NAVIGATE_OPTIONS, replace, state: location.state },
+    );
+  }, [location.hash, location.pathname, location.search, location.state, navigate]);
+
+  const open = useCallback((ref: FileViewerUrlState, options?: {
+    fromBrowse?: boolean;
+    browseState?: Partial<FileViewerBrowseState>;
+  }) => {
+    let nextSearch = writeFileViewerStateToSearch(location.search, ref);
+    if (options?.fromBrowse) {
+      const params = new URLSearchParams(nextSearch);
+      const previous = new URLSearchParams(location.search);
+      params.set("browse", "1");
+      const query = Object.prototype.hasOwnProperty.call(options.browseState ?? {}, "q")
+        ? options.browseState?.q
+        : previous.get("q");
+      const folder = Object.prototype.hasOwnProperty.call(options.browseState ?? {}, "folderPath")
+        ? options.browseState?.folderPath
+        : previous.get("folder");
+      if (query) params.set("q", query);
+      else params.delete("q");
+      if (folder) params.set("folder", folder);
+      else params.delete("folder");
+      nextSearch = params.toString() ? `?${params.toString()}` : "";
+    }
+    navigateSearch(nextSearch);
+  }, [location.search, navigateSearch]);
+
+  const openBrowse = useCallback((options?: { q?: string }) => {
+    const params = new URLSearchParams(location.search);
+    params.delete("file");
+    params.delete("line");
+    params.delete("column");
+    params.delete("folder");
+    params.set("browse", "1");
+    if (options?.q) params.set("q", options.q);
+    else params.delete("q");
+    navigateSearch(params.toString() ? `?${params.toString()}` : "");
+  }, [location.search, navigateSearch]);
+
+  const updateBrowseState = useCallback((next: Partial<FileViewerBrowseState>) => {
+    navigateSearch(writeBrowseStateToSearch(location.search, next), true);
+  }, [location.search, navigateSearch]);
+
+  const close = useCallback(() => {
+    const currentSearch = getCurrentFileViewerSearch(location.search);
+    const params = new URLSearchParams(writeFileViewerStateToSearch(currentSearch, null).replace(/^\?/, ""));
+    params.delete("browse");
+    params.delete("q");
+    params.delete("folder");
+    navigateSearch(params.toString() ? `?${params.toString()}` : "");
+  }, [location.search, navigateSearch]);
+
+  return {
+    state,
+    browse: browseState !== null,
+    query: browseState?.q ?? null,
+    folderPath: browseState?.folderPath ?? null,
+    browseProjectId: browseState?.projectId ?? null,
+    browseWorkspaceId: browseState?.workspaceId ?? null,
+    open,
+    openBrowse,
+    updateBrowseState,
+    close,
+  };
 }
 
 export function TaskSidePanel({
@@ -106,8 +199,9 @@ export function TaskSidePanel({
   checkingMonitorNow = false,
   fileTabsEnabled,
   documentDeepLink,
+  onRequestClose,
 }: TaskSidePanelProps) {
-  const viewer = useFileViewer();
+  const viewer = useTaskSidePanelFileRouting();
   const { data: documents = [] } = useIssueDocuments(issue.id);
   const { data: planDocument } = useIssuePlanDocument(issue.id);
   const restoredRef = useRef(
@@ -166,13 +260,32 @@ export function TaskSidePanel({
 
   // Existing URL-backed workspace links remain the external integration API.
   useEffect(() => {
-    if (!fileTabsEnabled || !viewer) return;
+    if (!fileTabsEnabled) return;
     if (viewer.state) {
       controller.openTab(taskPanelWorkspaceFileTab(viewer.state));
     } else if (viewer.browse) {
       controller.openTab(taskPanelFilesTab());
+      controller.updateTab("files", {
+        payload: {
+          kind: "files-browser",
+          query: viewer.query,
+          folderPath: viewer.folderPath,
+          projectId: viewer.browseProjectId,
+          workspaceId: viewer.browseWorkspaceId,
+        },
+      });
     }
-  }, [controller.openTab, fileTabsEnabled, viewer?.browse, viewer?.state]);
+  }, [
+    controller.openTab,
+    controller.updateTab,
+    fileTabsEnabled,
+    viewer.browse,
+    viewer.browseProjectId,
+    viewer.browseWorkspaceId,
+    viewer.folderPath,
+    viewer.query,
+    viewer.state,
+  ]);
 
   const recentFilesQuery = useQuery({
     queryKey: queryKeys.issues.fileResources(issue.id, {
@@ -202,7 +315,7 @@ export function TaskSidePanel({
     markInteracted();
     controller.selectTab(tabId);
     const tab = controller.tabs.find((candidate) => candidate.id === tabId);
-    if (!viewer || !tab) return;
+    if (!tab) return;
     if (tab.payload.kind === "workspace-file") {
       viewer.open(tab.payload);
     } else if (tab.payload.kind === "files-browser") {
@@ -228,7 +341,7 @@ export function TaskSidePanel({
     markInteracted();
     const tab = controller.tabs.find((candidate) => candidate.id === tabId);
     controller.closeTab(tabId);
-    if (tabId === controller.activeTabId && viewer && (tab?.payload.kind === "workspace-file" || tab?.payload.kind === "files-browser")) {
+    if (tabId === controller.activeTabId && (tab?.payload.kind === "workspace-file" || tab?.payload.kind === "files-browser")) {
       viewer.close();
     }
   }
@@ -330,7 +443,7 @@ export function TaskSidePanel({
     else if (item.id === "artifacts") controller.openTab(taskPanelArtifactsTab());
     else if (item.id === "files") {
       controller.openTab(taskPanelFilesTab());
-      viewer?.openBrowse();
+      viewer.openBrowse();
     } else if (item.id.startsWith("document:")) {
       const key = item.id.slice("document:".length);
       controller.openTab(taskPanelDocumentTab(key, item.label));
@@ -357,7 +470,7 @@ export function TaskSidePanel({
       open={launcherOpen}
       onOpenChange={setLauncherOpen}
       trigger={(
-        <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 rounded-xl" aria-label="Open a new tab">
+        <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 rounded-(--side-panel-control-radius)" aria-label="Open a new tab">
           <Plus aria-hidden />
         </Button>
       )}
@@ -416,15 +529,18 @@ export function TaskSidePanel({
         issueId={issue.id}
         companyId={issue.companyId}
         onOpen={openWorkspaceFile}
-        onBrowseStateChange={(next) => controller.updateTab(activeTab.id, {
-          payload: {
-            kind: "files-browser",
-            query: next.q,
-            folderPath: next.folderPath,
-            projectId: next.projectId,
-            workspaceId: next.workspaceId,
-          },
-        })}
+        onBrowseStateChange={(next) => {
+          controller.updateTab(activeTab.id, {
+            payload: {
+              kind: "files-browser",
+              query: next.q,
+              folderPath: next.folderPath,
+              projectId: next.projectId,
+              workspaceId: next.workspaceId,
+            },
+          });
+          viewer.updateBrowseState(next);
+        }}
         initialQuery={activeTab.payload.query}
         initialFolderPath={activeTab.payload.folderPath}
         initialProjectId={activeTab.payload.projectId}
@@ -434,14 +550,28 @@ export function TaskSidePanel({
       />
     );
   } else {
-    content = <TaskWorkspaceFilePanel issueId={issue.id} payload={activeTab.payload} />;
+    const filePayload = activeTab.payload;
+    content = (
+      <TaskWorkspaceFilePanel
+        issueId={issue.id}
+        payload={filePayload}
+        onFallbackToProject={filePayload.workspace !== "project" && !filePayload.projectId && !filePayload.workspaceId
+          ? () => openWorkspaceFile({ ...filePayload, workspace: "project" })
+          : undefined}
+      />
+    );
   }
 
   const contentMode = activeTab?.contentMode ?? "full-bleed";
   return (
     <div className="flex h-full min-h-0 flex-col">
       {paneHeaderSlot ? createPortal(tabStrip, paneHeaderSlot) : (
-        <div className="flex h-12 shrink-0 items-center border-b border-border px-2">{tabStrip}</div>
+        <div className="flex h-(--side-panel-header-height) shrink-0 items-center gap-1 border-b border-border px-2">
+          {tabStrip}
+          {onRequestClose ? (
+            <SidePanelToggleButton open onToggle={onRequestClose} />
+          ) : null}
+        </div>
       )}
       <div
         ref={bodyRef}

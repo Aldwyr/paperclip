@@ -168,4 +168,166 @@ describe("TaskChatProtocolCard", () => {
     expect(onDecision).toHaveBeenCalledWith({ action: "submit", values: { environment: "production" } });
     expect(container.textContent).toContain("Submitting…");
   });
+
+  it("submits the canonical response from a v2 harness question set", async () => {
+    const onDecision = vi.fn().mockResolvedValue(undefined);
+    renderCard(root, {
+      id: "canonical-input-request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-canonical-input",
+      requestKind: "runtime",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "pending",
+      prompt: "Codex needs your input.",
+      choices: [],
+      fields: [],
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        title: "Deployment input",
+        submitLabel: "Continue",
+        questions: [
+          {
+            id: "environment",
+            header: "Environment",
+            prompt: "Where should we deploy?",
+            required: true,
+            answerMode: "single_select",
+            options: [
+              { id: "staging", label: "Staging" },
+              { id: "production", label: "Production" },
+            ],
+          },
+          {
+            id: "regions",
+            header: "Regions",
+            prompt: "Which regions should receive the release?",
+            required: false,
+            answerMode: "multi_select",
+            options: [{ id: "us", label: "US" }, { id: "eu", label: "EU" }],
+          },
+          {
+            id: "notes",
+            header: "Notes",
+            prompt: "Anything else we should know?",
+            required: false,
+            answerMode: "text",
+          },
+        ],
+      },
+    }, onDecision);
+    expect(container.textContent).toContain("Deployment input");
+    expect(container.textContent).toContain("Question 1 of 3");
+    const production = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Production"));
+    await act(async () => production?.click());
+    let next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Next");
+    await act(async () => next?.click());
+    expect(container.textContent).toContain("Which regions should receive the release?");
+    next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Next");
+    await act(async () => next?.click());
+    expect(container.textContent).toContain("Anything else we should know?");
+    const submit = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Continue");
+    await act(async () => submit?.click());
+    expect(onDecision).toHaveBeenCalledWith({
+      action: "submit",
+      response: {
+        schema: "paperclip.question_response.v1",
+        answers: { environment: { selectedOptionIds: ["production"] } },
+      },
+    });
+  });
+
+  it("renders the original questions and canonical answers after resolution", () => {
+    renderCard(root, {
+      id: "resolved-input-request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-resolved-input",
+      requestKind: "runtime",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "resolved",
+      prompt: "Codex needs your input.",
+      choices: [],
+      fields: [],
+      resolvedAction: "submit",
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        title: "Server setup",
+        questions: [{
+          id: "style",
+          header: "Code style",
+          prompt: "Which module style should the server use?",
+          required: true,
+          answerMode: "single_select",
+          options: [{ id: "esm", label: "TypeScript ESM" }],
+        }],
+      },
+      response: {
+        schema: "paperclip.question_response.v1",
+        answers: { style: { selectedOptionIds: ["esm"] } },
+      },
+    });
+
+    expect(container.querySelector('[data-testid="task-chat-runtime-request-history"]')).not.toBeNull();
+    expect(container.textContent).toContain("Which module style should the server use?");
+    expect(container.textContent).toContain("TypeScript ESM");
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("requires text when an explicit custom multi-select answer is active", async () => {
+    renderCard(root, {
+      id: "custom-input-request",
+      kind: "protocol",
+      surface: "runtime_request",
+      runId: "run-1",
+      requestId: "request-custom-input",
+      requestKind: "runtime",
+      turnId: "turn-1",
+      requestType: "input",
+      status: "pending",
+      prompt: "Choose regions.",
+      choices: [],
+      fields: [],
+      questionSet: {
+        schema: "paperclip.question_set.v1",
+        questions: [
+          {
+            id: "regions",
+            prompt: "Which regions?",
+            required: true,
+            answerMode: "multi_select",
+            options: [{ id: "us", label: "US" }],
+            customAnswer: { enabled: true, label: "Another region" },
+          },
+          {
+            id: "notes",
+            prompt: "Notes?",
+            required: false,
+            answerMode: "text",
+          },
+        ],
+      },
+    }, vi.fn());
+
+    const us = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "US");
+    const custom = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Another region");
+    await act(async () => us?.click());
+    await act(async () => custom?.click());
+
+    const next = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.trim() === "Next");
+    expect(next?.disabled).toBe(true);
+    expect(container.textContent).toContain("Enter a custom answer.");
+
+    const textarea = container.querySelector("textarea")!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setter?.call(textarea, "ap-south");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(next?.disabled).toBe(false);
+  });
 });

@@ -40,6 +40,7 @@ import type {
   TaskChatRuntimeRequestItem,
   TaskChatTurnItem,
 } from "@/components/task-chat/task-chat-model";
+import { latestPendingRuntimeRequest } from "@/components/task-chat/task-chat-model";
 import { TaskChatInteractionCard } from "@/components/task-chat/TaskChatInteractionCard";
 import {
   interactionThreadAnchorMs,
@@ -1209,26 +1210,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tailRunId, tailContentKey, tailStreaming, tailAgentName],
   );
-  const pendingRuntimeRequest =
-    tailItems.find(
-      (item): item is TaskChatRuntimeRequestItem =>
-        item.kind === "protocol" &&
-        item.surface === "runtime_request" &&
-        item.status === "pending",
-    ) ?? null;
+  const pendingRuntimeRequest = latestPendingRuntimeRequest(tailItems);
   const handleRuntimeRequestDecision = useCallback(
     async (
       item: TaskChatRuntimeRequestItem,
       decision: TaskChatRuntimeRequestDecision,
     ) => {
-      if (
-        !paperclipRunnerTail ||
-        item.runId !== tailRunId ||
-        !item.turnId ||
-        !item.requestKind
-      ) {
+      if (!item.turnId || !item.requestKind) {
         throw new Error(
-          "This runtime request is no longer attached to the active Paperclip runner turn.",
+          "This runtime request is missing the provider turn identity needed to resolve it.",
         );
       }
       let resolution: RuntimeRequestResolution;
@@ -1261,11 +1251,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         resolution,
       });
     },
-    [paperclipRunnerTail, tailRunId],
+    [],
   );
   const runtimeComposerDisabledReason =
     composerDisabledReason ??
-    (paperclipRunnerTail && pendingRuntimeRequest
+    (pendingRuntimeRequest
       ? "Resolve the runtime request before sending another message."
       : undefined);
   const assigneeUsesPaperclipRunner = Boolean(
@@ -1446,7 +1436,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           <TaskChatThreadView
             items={items}
             header={threadHeaderWithBlockers}
-            onRuntimeRequestDecision={handleRuntimeRequestDecision}
             renderInteraction={renderInteraction}
             renderBrief={
               issueBrief
@@ -1460,7 +1449,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 <>
                   {tailRunId || optimisticRunnerStartup ? (
                     <div data-testid="task-chat-live-transcript">
-                      {paperclipRunnerTail || optimisticRunnerStartup ? (
+                      {paperclipRunnerTail || pendingRuntimeRequest || optimisticRunnerStartup ? (
                         <TaskChatRunnerTurn
                           runId={tailRunId}
                           agentName={visibleTailAgentName}

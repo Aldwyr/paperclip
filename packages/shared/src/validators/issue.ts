@@ -826,9 +826,9 @@ export const suggestTasksResultSchema = z.object({
 });
 
 export const askUserQuestionsQuestionOptionSchema = z.object({
-  id: z.string().trim().min(1).max(120),
-  label: z.string().trim().min(1).max(120),
-  description: z.string().trim().max(500).nullable().optional(),
+  id: z.string().trim().min(1).max(160),
+  label: z.string().trim().min(1).max(1000),
+  description: z.string().trim().max(4000).nullable().optional(),
   freeText: z
     .boolean()
     .optional()
@@ -838,12 +838,49 @@ export const askUserQuestionsQuestionOptionSchema = z.object({
 });
 
 export const askUserQuestionsQuestionSchema = z.object({
-  id: z.string().trim().min(1).max(120),
-  prompt: z.string().trim().min(1).max(500),
-  helpText: z.string().trim().max(1000).nullable().optional(),
+  id: z.string().trim().min(1).max(160),
+  prompt: z.string().trim().min(1).max(4000),
+  helpText: z.string().trim().max(4000).nullable().optional(),
   selectionMode: z.enum(["single", "multi"]),
   required: z.boolean().optional(),
-  options: z.array(askUserQuestionsQuestionOptionSchema).min(1).max(10),
+  options: z.array(askUserQuestionsQuestionOptionSchema).min(1).max(128),
+});
+
+const paperclipQuestionOptionSchema = z.object({
+  id: z.string().min(1).max(160),
+  label: z.string().min(1).max(1000),
+  description: z.string().max(4000).optional(),
+});
+
+const paperclipQuestionSchema = z.object({
+  id: z.string().min(1).max(160),
+  header: z.string().max(1000).optional(),
+  prompt: z.string().min(1).max(4000),
+  helpText: z.string().max(4000).optional(),
+  required: z.boolean(),
+  answerMode: z.enum(["single_select", "multi_select", "text"]),
+  options: z.array(paperclipQuestionOptionSchema).max(128).optional(),
+  customAnswer: z.object({
+    enabled: z.literal(true),
+    label: z.string().max(1000).optional(),
+    placeholder: z.string().max(1000).optional(),
+  }).optional(),
+  textValidation: z.object({
+    minLength: z.number().int().min(0).max(100000).optional(),
+    maxLength: z.number().int().min(0).max(100000).optional(),
+    pattern: z.string().max(1000).optional(),
+    inputType: z.enum(["text", "number", "integer"]).optional(),
+    minimum: z.number().finite().optional(),
+    maximum: z.number().finite().optional(),
+  }).optional(),
+});
+
+const paperclipQuestionSetSchema = z.object({
+  schema: z.literal("paperclip.question_set.v1"),
+  title: z.string().max(1000).optional(),
+  description: z.string().max(4000).optional(),
+  submitLabel: z.string().max(200).optional(),
+  questions: z.array(paperclipQuestionSchema).min(1).max(64),
 });
 
 export const askUserQuestionsPayloadSchema = z.object({
@@ -851,7 +888,9 @@ export const askUserQuestionsPayloadSchema = z.object({
   title: z.string().trim().max(240).nullable().optional(),
   submitLabel: z.string().trim().max(120).nullable().optional(),
   supersedeOnUserComment: z.boolean().optional(),
-  questions: z.array(askUserQuestionsQuestionSchema).min(1).max(10),
+  questions: z.array(askUserQuestionsQuestionSchema).min(1).max(64),
+  /** Exact canonical presentation retained for a recovered harness request. */
+  questionSet: paperclipQuestionSetSchema.optional(),
 }).superRefine((value, ctx) => {
   const seenQuestionIds = new Set<string>();
   for (const [questionIndex, question] of value.questions.entries()) {
@@ -890,8 +929,8 @@ export const askUserQuestionsPayloadSchema = z.object({
 });
 
 export const askUserQuestionsAnswerSchema = z.object({
-  questionId: z.string().trim().min(1).max(120),
-  optionIds: z.array(z.string().trim().min(1).max(120)).max(20),
+  questionId: z.string().trim().min(1).max(160),
+  optionIds: z.array(z.string().trim().min(1).max(160)).max(128),
   otherText: multilineTextSchema.pipe(z.string().trim().max(4000)).nullable().optional(),
 });
 
@@ -899,7 +938,7 @@ export const askUserQuestionsResultSchema = z.object({
   version: z.literal(1),
   outcome: z.enum(["withdrawn", "issue_closed", "addressee_deleted"]).optional(),
   reason: z.string().trim().max(4000).nullable().optional(),
-  answers: z.array(askUserQuestionsAnswerSchema).max(20),
+  answers: z.array(askUserQuestionsAnswerSchema).max(64),
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
   expirationReason: z.enum(["superseded_by_comment", "superseded_by_newer_interaction"]).optional(),

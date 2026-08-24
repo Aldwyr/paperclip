@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Check, Copy, Download, Loader2, RefreshCw } from "lucide-react";
+import { Check, Copy, Download } from "lucide-react";
 import { fileResourcesApi } from "@/api/file-resources";
-import { FileContentViewer, FileViewerMetadataRow } from "@/components/FileViewerSheet";
+import { FileViewerBody, FileViewerMetadataRow } from "@/components/FileViewerSheet";
 import { Button } from "@/components/ui/button";
 import type { FileViewerUrlState } from "@/context/FileViewerContext";
 import { copyTextToClipboard } from "@/lib/clipboard";
@@ -11,8 +11,17 @@ import type { TaskSidePanelTabPayload } from "@/lib/task-side-panel-state";
 
 type WorkspaceFilePayload = Extract<TaskSidePanelTabPayload, { kind: "workspace-file" }>;
 
-export function TaskWorkspaceFilePanel({ issueId, payload }: { issueId: string; payload: WorkspaceFilePayload }) {
+export function TaskWorkspaceFilePanel({
+  issueId,
+  payload,
+  onFallbackToProject,
+}: {
+  issueId: string;
+  payload: WorkspaceFilePayload;
+  onFallbackToProject?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
   const state: FileViewerUrlState = {
     path: payload.path,
     workspace: payload.workspace,
@@ -73,44 +82,20 @@ export function TaskWorkspaceFilePanel({ issueId, payload }: { issueId: string; 
         </div>
       </header>
       <div className="min-h-0 flex-1 overflow-hidden">
-        {resourceQuery.isLoading || (resource?.capabilities.preview && contentQuery.isLoading) ? (
-          <div className="flex items-center gap-2 p-6 text-sm text-muted-foreground" role="status">
-            <Loader2 className="size-4 animate-spin" aria-hidden />
-            Loading file preview…
-          </div>
-        ) : resourceQuery.isError || contentQuery.isError ? (
-          <div className="flex items-start gap-3 p-6 text-sm" role="alert">
-            <AlertTriangle className="mt-0.5 size-5 shrink-0 text-muted-foreground" aria-hidden />
-            <div className="space-y-3">
-              <div>
-                <p className="font-medium">File is unavailable</p>
-                <p className="text-muted-foreground">The workspace may have moved, expired, or no longer contain this path.</p>
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  void resourceQuery.refetch();
-                  if (resource?.capabilities.preview) void contentQuery.refetch();
-                }}
-              >
-                <RefreshCw aria-hidden />
-                Retry
-              </Button>
-            </div>
-          </div>
-        ) : contentQuery.data ? (
-          <FileContentViewer content={contentQuery.data} highlightedLine={payload.line} />
-        ) : (
-          <div className="flex items-start gap-3 p-6 text-sm">
-            <AlertTriangle className="mt-0.5 size-5 shrink-0 text-muted-foreground" aria-hidden />
-            <div>
-              <p className="font-medium">Preview not available</p>
-              <p className="text-muted-foreground">Use Download when this workspace permits it.</p>
-            </div>
-          </div>
-        )}
+        <div className="sr-only" aria-live="polite">{announcement}</div>
+        <FileViewerBody
+          resolveQuery={resourceQuery}
+          contentQuery={contentQuery}
+          elapsedMs={0}
+          canPreview={resource?.capabilities.preview ?? false}
+          highlightedLine={payload.line}
+          onRetry={() => {
+            void resourceQuery.refetch();
+            if (resource?.capabilities.preview) void contentQuery.refetch();
+          }}
+          onSetAnnouncement={setAnnouncement}
+          onFallbackToProject={onFallbackToProject ?? null}
+        />
       </div>
     </div>
   );

@@ -105,6 +105,7 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
     });
   }
   eventPump = pumpEvents(session);
+  void eventPump.catch((error) => failProxy(error));
   return threadResponse(session.ids().providerSessionId ?? session.ids().driverSessionId);
 }
 
@@ -184,14 +185,19 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
       if (!requestId || !turnId || !opened.resolveRuntimeRequest) {
         throw new Error("OpenCode runtime request is not resolvable");
       }
-      const controllerResponse = record(await requestController("paperclip/runtimeRequest", {
-        request,
-      }));
-      await opened.resolveRuntimeRequest({
-        requestId,
-        turnId,
-        resolution: record(controllerResponse.resolution) as HarnessRuntimeRequestResolution,
-      });
+      // Keep consuming OpenCode SSE while the controller waits for the user.
+      // If the underlying provider disappears, the stream can then fail the
+      // proxy and runnerd will expire the still-pending canonical request.
+      void (async () => {
+        const controllerResponse = record(await requestController("paperclip/runtimeRequest", {
+          request,
+        }));
+        await opened.resolveRuntimeRequest!({
+          requestId,
+          turnId,
+          resolution: record(controllerResponse.resolution) as HarnessRuntimeRequestResolution,
+        });
+      })().catch((error) => failProxy(error));
     } else if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
       const status = event.eventType.slice("turn.".length);
       send({ method: "turn/completed", params: { threadId: opened.ids().driverSessionId, turnId: event.turnId, turn: { id: event.turnId, status } } });
@@ -266,13 +272,18 @@ input.on("line", (line) => {
 });
 
 let shutdownPromise: Promise<void> | null = null;
-function shutdown(): Promise<void> {
+function failProxy(error: unknown): void {
+  process.stderr.write(`[opencode] fatal proxy error: ${error instanceof Error ? error.message : String(error)}\n`);
+  void shutdown(1);
+}
+
+function shutdown(exitCode = 0): Promise<void> {
   shutdownPromise ??= (async () => {
     for (const waiter of pending.values()) waiter.reject(new Error("OpenCode proxy is shutting down"));
     pending.clear();
     await session?.close({ reason: "proxy_shutdown", force: true }).catch(() => {});
     await eventPump?.catch(() => {});
-  })().finally(() => process.exit(0));
+  })().finally(() => process.exit(exitCode));
   return shutdownPromise;
 }
 

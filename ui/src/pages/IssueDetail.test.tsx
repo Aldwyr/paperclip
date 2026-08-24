@@ -1171,6 +1171,33 @@ describe("IssueDetail", () => {
     ).toBe(false);
   });
 
+  it("shows the main-pane side-panel toggle only while the panel is closed", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    expect(container.querySelector('button[aria-label="Toggle side panel"]')).toBeNull();
+
+    mockPanelState.panelVisible = false;
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    expect(
+      container.querySelector('button[aria-label="Toggle side panel"]')?.getAttribute("aria-pressed"),
+    ).toBe("false");
+  });
+
   it("opens a closed desktop pane and routes an ordinary document to its own tab on direct load", async () => {
     mockPanelState.panelVisible = false;
     mockLocation.hash = "#document-qa-evidence";
@@ -1360,7 +1387,7 @@ describe("IssueDetail", () => {
       }));
     });
 
-    const panel = document.querySelector('[data-slot="sheet-content"]');
+    const panel = document.querySelector('[data-testid="mobile-task-side-panel"]');
     expect(panel).not.toBeNull();
     expect(panel?.className).toContain("max-h-(--sz-85dvh)");
     expect(panel?.textContent).toContain("Task side panel");

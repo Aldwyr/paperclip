@@ -16,6 +16,7 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { nativeSha256 } from "./canonical.js";
 import { recordNativeAttentionAssessment } from "./work-assessments.js";
+import { formatDurableQuestionResponseSummary } from "../question-response-delivery.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -319,12 +320,16 @@ export async function materializeNativeInteractionResponses(input: {
       if (resolution.reasonCode !== "attention_resolved_from_context") {
         throw new NativeInteractionBridgeError("native_attention_resolution_invalid", "Answered interaction has no continuation policy");
       }
+      const result = structuredClone(interaction.result) as unknown as Record<string, unknown>;
+      const summaryMarkdown = formatDurableQuestionResponseSummary(interaction);
       responses.push({
         interactionId: interaction.id,
         kind: interaction.kind,
         response: {
           status: interaction.status,
-          result: structuredClone(interaction.result) as unknown as Record<string, unknown>,
+          result: summaryMarkdown
+            ? { ...result, summaryMarkdown }
+            : result,
         },
       });
       continue;

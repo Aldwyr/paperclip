@@ -44,11 +44,11 @@ export function SidePanelTab({
       data-side-panel-tab-wrapper={id}
       data-active={active ? "true" : "false"}
       className={cn(
-        "group/side-panel-tab relative flex h-9 min-w-0 shrink-0 items-center rounded-xl border border-transparent",
+        "group/side-panel-tab relative flex h-(--side-panel-tab-height) min-w-0 shrink-0 items-center rounded-(--side-panel-tab-radius) border border-transparent",
         "side-panel-tab-motion",
         active
-          ? "bg-accent text-accent-foreground"
-          : "text-muted-foreground hover:bg-accent/55 hover:text-foreground",
+          ? "bg-(--side-panel-tab-active-bg) text-accent-foreground"
+          : "text-muted-foreground hover:bg-(--side-panel-tab-hover-bg) hover:text-foreground",
         disabled && "opacity-50",
         className,
       )}
@@ -71,14 +71,14 @@ export function SidePanelTab({
             onAuxClick={onAuxClick}
             onKeyDown={onKeyDown}
             className={cn(
-              "flex h-full min-w-0 items-center gap-1.5 rounded-xl py-1.5 pl-2 text-sm font-medium outline-none",
+              "flex h-full min-w-0 items-center gap-1.5 rounded-(--side-panel-tab-radius) py-1.5 pl-2 text-sm font-medium outline-none",
               closable ? "pr-7" : "pr-2.5",
               "focus-visible:ring-2 focus-visible:ring-ring/60",
               dragHandleProps?.className,
             )}
           >
             {icon ? <span className="flex size-4 shrink-0 items-center justify-center [&_svg]:size-4">{icon}</span> : null}
-            <span className="max-w-40 truncate">{label}</span>
+            <span className="max-w-(--side-panel-tab-label-max-width) truncate">{label}</span>
             {status ? <span className="flex shrink-0 items-center">{status}</span> : null}
           </button>
         </TooltipTrigger>

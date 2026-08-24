@@ -59,6 +59,7 @@ import {
   issueThreadInteractionService,
   issueService,
   instanceSettingsService,
+  questionResponseDeliveryService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -1114,6 +1115,9 @@ export async function startServer(): Promise<StartedServer> {
   const ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS = 5 * 60 * 1000;
   const environmentLeaseCleanupHeartbeat =
     heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const questionResponseDeliveries = questionResponseDeliveryService(db as any, {
+    heartbeat: environmentLeaseCleanupHeartbeat,
+  });
   const runEnvironmentLeaseCleanupSweep = (backoffMs: number) =>
     environmentLeaseCleanupHeartbeat
       .sweepPendingCleanupLeases({ backoffMs })
@@ -1129,6 +1133,14 @@ export async function startServer(): Promise<StartedServer> {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
+
+  await questionResponseDeliveries.sweepPending().then((result) => {
+    if (result.scanned > 0) {
+      logger.info(result, "startup question-response delivery sweep completed");
+    }
+  }).catch((err) => {
+    logger.error({ err }, "startup question-response delivery sweep failed");
+  });
 
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
@@ -1538,6 +1550,14 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic secret proposal expiry sweep failed");
+          }));
+
+        trackHeartbeatSchedulerWork(questionResponseDeliveries.sweepPending()
+          .then((result) => {
+            if (result.scanned > 0) logger.info(result, "periodic question-response delivery sweep completed");
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic question-response delivery sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;

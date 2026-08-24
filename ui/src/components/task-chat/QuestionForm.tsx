@@ -27,6 +27,9 @@ function answerHasValue(answer: Answer | undefined): boolean {
 
 function answerError(question: Question, answer: Answer | undefined): string | null {
   if (question.required && !answerHasValue(answer)) return "This question is required.";
+  if (question.answerMode !== "text" && answer?.customText !== undefined && !answer.customText.trim()) {
+    return "Enter a custom answer.";
+  }
   const value = question.answerMode === "text" ? answer?.text : answer?.customText;
   if (value == null || value.length === 0) return null;
   const validation = question.textValidation;
@@ -115,7 +118,10 @@ export function QuestionResponseSummary({
         const values = [...selectedLabels, answer?.text, answer?.customText].filter((value): value is string => Boolean(value));
         return (
           <div key={question.id}>
-            <dt className="text-xs font-medium text-muted-foreground">{question.header ?? question.prompt}</dt>
+            <dt>
+              {question.header ? <span className="block text-xs font-medium text-muted-foreground">{question.header}</span> : null}
+              <span className="block text-sm text-foreground">{question.prompt}</span>
+            </dt>
             <dd className="mt-0.5 text-foreground">{values.length > 0 ? values.join(", ") : "No answer"}</dd>
           </div>
         );
@@ -175,7 +181,7 @@ export function QuestionForm({
     updateAnswer({
       ...answer,
       ...(!multiple && active ? { selectedOptionIds: [] } : {}),
-      ...(!active ? { customText: undefined } : {}),
+      ...(active ? { customText: answer.customText ?? "" } : { customText: undefined }),
     });
   }
 

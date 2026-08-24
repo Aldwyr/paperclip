@@ -174,6 +174,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { formatIssueActivityAction } from "@/lib/activity-format";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { buildIssuePropertiesPanelKey } from "../lib/issue-properties-panel-key";
+import { buildAnsweredQuestionsDeliveryText } from "../lib/issue-thread-interactions";
 import { resolveIssueDocumentDeepLink } from "../lib/issue-document-deep-link";
 import { buildIssueSiblingNavigation, shouldRenderRichSubIssuesSection } from "../lib/issue-detail-subissues";
 import { filterIssueDescendants } from "../lib/issue-tree";
@@ -1332,7 +1333,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       }
     }
 
-    return comments.map((comment) => {
+    const projectedComments = comments.map((comment) => {
       const meta = runMetaByCommentId.get(comment.id);
       const inputPlacement = inputPlacementByCommentId.get(comment.id);
       const nextComment: IssueDetailComment = {
@@ -1391,8 +1392,49 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       }
       return nextComment;
     });
+    const interactionById = new Map(interactions.map((interaction) => [interaction.id, interaction] as const));
+    const runById = new Map(resolvedLinkedRuns.map((run) => [run.runId, run] as const));
+    const deliveredInteractionIds = new Set<string>();
+    const deliveryComments = resolvedActivity.flatMap((event): IssueDetailComment[] => {
+      if (event.action !== "issue.question_response_delivered") return [];
+      const details = event.details ?? {};
+      const interactionId = typeof details["interactionId"] === "string" ? details["interactionId"] : null;
+      const targetRunId = typeof details["targetRunId"] === "string" ? details["targetRunId"] : null;
+      const deliveryMode = typeof details["deliveryMode"] === "string" ? details["deliveryMode"] : null;
+      if (!interactionId || !targetRunId || deliveredInteractionIds.has(interactionId)) return [];
+      const interaction = interactionById.get(interactionId);
+      if (!interaction || interaction.kind !== "ask_user_questions" || interaction.status !== "answered") return [];
+      deliveredInteractionIds.add(interactionId);
+      const targetRun = runById.get(targetRunId);
+      const eventAt = event.createdAt instanceof Date ? event.createdAt : new Date(event.createdAt);
+      const runAtValue = targetRun?.startedAt ?? targetRun?.createdAt ?? null;
+      const runAt = runAtValue ? new Date(runAtValue) : null;
+      const anchorAt = deliveryMode === "steered" || !runAt || Number.isNaN(runAt.getTime())
+        ? eventAt
+        : runAt;
+      return [{
+        id: `question-response:${interactionId}`,
+        companyId: interaction.companyId,
+        issueId: interaction.issueId,
+        authorType: interaction.resolvedByAgentId ? "agent" : "user",
+        authorAgentId: interaction.resolvedByAgentId ?? null,
+        authorUserId: interaction.resolvedByUserId ?? null,
+        createdByRunId: interaction.resolvedByRunId ?? null,
+        body: buildAnsweredQuestionsDeliveryText(interaction),
+        presentation: null,
+        metadata: null,
+        createdAt: anchorAt,
+        updatedAt: anchorAt,
+        consumedByRunId: targetRunId,
+        ...(deliveryMode === "steered" ? { steeredIntoRunId: targetRunId } : {}),
+        conversationAnchorAt: anchorAt,
+        conversationAnchorSequence: 0,
+      }];
+    });
+    return [...projectedComments, ...deliveryComments];
   }, [
     comments,
+    interactions,
     liveRunIds,
     locallyQueuedCommentRunIds,
     queuedCommentReason,
@@ -4982,17 +5024,21 @@ export function IssueDetail() {
             >
               {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
             </Button>
-            <SidePanelToggleButton
-              open={panelVisible && !suppressPanelForFirstTask}
-              onToggle={() => {
-                if (suppressPanelForFirstTask && issue?.id) {
-                  setFirstTaskPanelOverrideIssueId(issue.id);
-                }
-                setPanelVisible(!(panelVisible && !suppressPanelForFirstTask));
-              }}
-              shortcut="]"
-              className="shrink-0"
-            />
+            {panelVisible && !suppressPanelForFirstTask ? null : (
+              <TooltipProvider>
+                <SidePanelToggleButton
+                  open={false}
+                  onToggle={() => {
+                    if (suppressPanelForFirstTask && issue?.id) {
+                      setFirstTaskPanelOverrideIssueId(issue.id);
+                    }
+                    setPanelVisible(true);
+                  }}
+                  shortcut="]"
+                  className="shrink-0"
+                />
+              </TooltipProvider>
+            )}
 
             <Popover open={moreOpen} onOpenChange={setMoreOpen}>
               <PopoverTrigger asChild>
@@ -5866,6 +5912,7 @@ export function IssueDetail() {
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
         <SheetContent
           side={taskChatShellEnabled ? "bottom" : documentDeepLink?.documentKey === "plan" ? "right" : "bottom"}
+          showCloseButton={!taskChatShellEnabled}
           className={cn(
             taskChatShellEnabled
               ? "h-(--sz-85dvh) max-h-(--sz-85dvh) gap-0 p-0 pb-(--sz-safe-bottom)"
@@ -5873,7 +5920,11 @@ export function IssueDetail() {
               ? "inset-0 h-dvh w-screen max-w-none gap-0 border-0 p-0 sm:max-w-none"
               : "max-h-(--sz-85dvh) pb-(--sz-safe-bottom)",
           )}
-          data-testid={!taskChatShellEnabled && documentDeepLink?.documentKey === "plan" ? "mobile-plan-panel" : undefined}
+          data-testid={taskChatShellEnabled
+            ? "mobile-task-side-panel"
+            : documentDeepLink?.documentKey === "plan"
+              ? "mobile-plan-panel"
+              : undefined}
         >
           {taskChatShellEnabled ? (
             <>
@@ -5897,6 +5948,7 @@ export function IssueDetail() {
                 checkingMonitorNow={checkIssueMonitorNow.isPending}
                 fileTabsEnabled={fileViewerEnabled}
                 documentDeepLink={documentDeepLink?.issueId === issue.id ? documentDeepLink : null}
+                onRequestClose={() => setMobilePropsOpen(false)}
               />
             </>
           ) : (

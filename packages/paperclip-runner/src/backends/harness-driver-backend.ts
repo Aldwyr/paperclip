@@ -96,6 +96,7 @@ class HarnessNativeSession implements NativeSession {
   #input: OpenNativeSessionInput;
   readonly #session: HarnessSession;
   #terminal: PrpTerminalState | null = null;
+  #explicitlyCancelled = false;
 
   constructor(input: OpenNativeSessionInput, session: HarnessSession) {
     this.#input = structuredClone(input);
@@ -132,28 +133,96 @@ class HarnessNativeSession implements NativeSession {
     await this.#session.attachRun({ runId: input.identity.runId });
     this.#input = { ...this.#input, identity: structuredClone(input.identity) };
     this.#terminal = null;
+    this.#explicitlyCancelled = false;
   }
 
   async *events(): AsyncIterable<PrpEvent> {
-    for await (const event of this.#session.events()) {
-      if (event.eventType === "run.terminal") {
-        this.#terminal = structuredClone(event.payload as PrpTerminalState);
-      } else if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
-        const snapshot = await this.#session.snapshot();
-        const disposition = snapshot.semanticResult?.result.reportedWorkDisposition ?? "yielded";
-        this.#terminal = {
-          schema: "paperclip.prp.terminal.v1",
-          turnTerminalState:
-            event.eventType === "turn.completed" ? "completed"
-              : event.eventType === "turn.failed" ? "failed"
-                : event.eventType === "turn.interrupted" ? "interrupted"
-                  : "cancelled",
-          runTerminalState: event.eventType === "turn.completed" ? "succeeded" : event.eventType === "turn.failed" ? "failed" : "cancelled",
-          reportedWorkDisposition: disposition,
+    let sourceInstanceId: string | null = null;
+    let lastSourceSequence = 0;
+    let sawTerminal = false;
+    let streamFailure: unknown = null;
+    const observedPendingInputs = new Map<string, Record<string, unknown>>();
+    try {
+      for await (const event of this.#session.events()) {
+        sourceInstanceId = event.sourceInstanceId;
+        lastSourceSequence = Math.max(lastSourceSequence, event.sourceSeq);
+        if (event.eventType === "runtime_request.created") {
+          const request = plainRecord(event.payload.request);
+          if (
+            request?.schema === "paperclip.runtime_request.v2"
+            && request.type === "input"
+            && typeof request.requestId === "string"
+          ) observedPendingInputs.set(request.requestId, structuredClone(request));
+        } else if (["runtime_request.resolved", "runtime_request.cancelled", "runtime_request.expired"].includes(event.eventType)) {
+          const requestId = typeof event.payload.requestId === "string" ? event.payload.requestId : null;
+          if (requestId) observedPendingInputs.delete(requestId);
+        }
+        if (event.eventType === "run.terminal") {
+          sawTerminal = true;
+          this.#terminal = structuredClone(event.payload as PrpTerminalState);
+        } else if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
+          sawTerminal = true;
+          const snapshot = await this.#session.snapshot();
+          const disposition = snapshot.semanticResult?.result.reportedWorkDisposition ?? "yielded";
+          this.#terminal = {
+            schema: "paperclip.prp.terminal.v1",
+            turnTerminalState:
+              event.eventType === "turn.completed" ? "completed"
+                : event.eventType === "turn.failed" ? "failed"
+                  : event.eventType === "turn.interrupted" ? "interrupted"
+                    : "cancelled",
+            runTerminalState: event.eventType === "turn.completed" ? "succeeded" : event.eventType === "turn.failed" ? "failed" : "cancelled",
+            reportedWorkDisposition: disposition,
+          };
+        }
+        yield structuredClone(event);
+      }
+    } catch (error) {
+      streamFailure = error;
+    }
+
+    // The provider can disappear while its native RPC is awaiting the user.
+    // Emit one canonical terminal fact before propagating the stream failure;
+    // the control plane can then materialize the durable continuation without
+    // ever trying to replay the dead provider request.
+    if (!sawTerminal && !this.#explicitlyCancelled && sourceInstanceId) {
+      const snapshot = await this.#session.snapshot().catch(() => null);
+      for (const request of observedPendingInputs.values()) {
+        const sourceSeq = Math.max(lastSourceSequence, snapshot?.lastSourceSequence ?? 0) + 1;
+        lastSourceSequence = sourceSeq;
+        const requestId = String(request.requestId);
+        const turnId = typeof request.turnId === "string" ? request.turnId : undefined;
+        const itemId = typeof request.itemId === "string" ? request.itemId : requestId;
+        yield {
+          schema: "paperclip.prp.event.v1",
+          sourceEventId: `${sourceInstanceId}:${this.#input.identity.runId}:${sourceSeq}`,
+          sourceSeq,
+          sourceInstanceId,
+          sourceKind: "runner",
+          runId: this.#input.identity.runId,
+          normalizedSessionId: this.#input.identity.sessionId,
+          ...(turnId ? { turnId } : {}),
+          itemId,
+          eventType: "runtime_request.expired",
+          schemaVersion: 1,
+          priority: 0,
+          emittedAt: new Date().toISOString(),
+          payload: {
+            requestId,
+            ...(turnId ? { turnId } : {}),
+            requestKind: "runtime",
+            reason: "provider_process_lost",
+            replayAllowed: false,
+            requestType: "input",
+            ...(plainRecord(request.origin)?.adapter
+              ? { adapter: plainRecord(request.origin)?.adapter }
+              : {}),
+            request: structuredClone(request),
+          },
         };
       }
-      yield structuredClone(event);
     }
+    if (streamFailure) throw streamFailure;
   }
 
   startTurn(input: Parameters<HarnessSession["startTurn"]>[0]) {
@@ -171,6 +240,7 @@ class HarnessNativeSession implements NativeSession {
   }
 
   async cancel(input: { reason: string }) {
+    this.#explicitlyCancelled = true;
     if (this.#session.interrupt !== undefined) {
       await this.#session.interrupt({ reason: input.reason });
     }
@@ -236,6 +306,12 @@ class HarnessNativeSession implements NativeSession {
   close(input: { reason: string }) {
     return this.#session.close(input);
   }
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 export function createHarnessDriverBackend(driver: HarnessDriver): NativeSessionBackend {

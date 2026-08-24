@@ -366,6 +366,8 @@ export interface TaskChatRuntimeRequestItem {
   choices: Array<{ key: string; label: string }>;
   fields: Array<{ name: string; label: string; placeholder: string | null }>;
   questionSet?: PaperclipQuestionSet | null;
+  resolvedAction?: string | null;
+  response?: PaperclipQuestionResponse | null;
 }
 
 export type TaskChatRuntimeRequestDecision =
@@ -480,6 +482,38 @@ export type TaskChatItem =
   | TaskChatTurnItem
   | TaskChatBriefItem
   | TaskChatProtocolItem;
+
+/** Latest lifecycle state wins for each request; terminal entries suppress stale pending cards. */
+export function latestPendingRuntimeRequest(
+  items: readonly TaskChatItem[],
+): TaskChatRuntimeRequestItem | null {
+  const seen = new Set<string>();
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.kind !== "protocol" || item.surface !== "runtime_request") continue;
+    const key = `${item.runId}:${item.requestId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (item.status === "pending") return item;
+  }
+  return null;
+}
+
+/** One latest lifecycle entry per request, in the order each request began. */
+export function latestRuntimeRequests(
+  items: readonly TaskChatItem[],
+): TaskChatRuntimeRequestItem[] {
+  const latest = new Map<string, { order: number; item: TaskChatRuntimeRequestItem }>();
+  for (const [order, item] of items.entries()) {
+    if (item.kind !== "protocol" || item.surface !== "runtime_request") continue;
+    const key = `${item.runId}:${item.requestId}`;
+    const existing = latest.get(key);
+    latest.set(key, { order: existing?.order ?? order, item });
+  }
+  return [...latest.values()]
+    .sort((left, right) => left.order - right.order)
+    .map(({ item }) => item);
+}
 
 /** A structured plan entry (ACP PlanEntry) for the Plans tab. */
 export interface TaskChatPlanEntry {

@@ -8,6 +8,7 @@
       "message": "Deployment input",
       "requestedSchema": {
         "type": "object",
+        "title": "Deployment input",
         "required": ["environment"],
         "properties": {
           "environment": {
@@ -36,8 +37,7 @@
       "options": [
         { "id": "option-1", "label": "Staging", "description": "Deploy to staging first." },
         { "id": "option-2", "label": "Production", "description": "Deploy directly to production." }
-      ],
-      "customAnswer": { "enabled": true, "label": "Other" }
+      ]
     }]
   },
   "canonicalResponse": {

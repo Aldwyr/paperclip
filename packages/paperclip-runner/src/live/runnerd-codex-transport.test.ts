@@ -231,6 +231,141 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
   });
 }, 30_000);
 
+it("bridges a runnerd-native question into the server request handler and resolves it canonically", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: ["--runtime-question"],
+  });
+  let bridgedRequest: { method: string; params: Record<string, unknown> } | null = null;
+  bundle.transport.setServerRequestHandler(async (request) => {
+    if (request.method !== "item/tool/requestUserInput") {
+      return { success: true, contentItems: [] };
+    }
+    bridgedRequest = { method: request.method, params: request.params };
+    await bundle.transport.resolveRuntimeRequest?.({
+      requestId: String(request.id),
+      turnId: String(request.params.turnId),
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: {
+            environment: { selectedOptionIds: ["option-1"] },
+            regions: { selectedOptionIds: ["option-1", "option-2"] },
+            notes: { text: "Ship during the maintenance window." },
+          },
+        },
+      },
+    });
+    return { answers: {} };
+  });
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [
+        {
+          name: "get_task_context",
+          description: "Read the active task.",
+          inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        },
+      ],
+    });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "Ask the deployment questions." }],
+    });
+    const methods: string[] = [];
+    for await (const notification of bundle.transport.notifications()) {
+      methods.push(notification.method);
+      if (notification.method === "turn/completed") break;
+    }
+    expect(bridgedRequest).toMatchObject({
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "fake-thread",
+        questions: [
+          expect.objectContaining({ id: "environment", isOther: true }),
+          expect.objectContaining({ id: "regions", multiSelect: true }),
+          expect.objectContaining({ id: "notes", required: false }),
+        ],
+      },
+    });
+    expect(methods).toContain("turn/completed");
+  } finally {
+    await bundle.transport.close();
+  }
+}, 30_000);
+
+it("bridges a runnerd-native form elicitation and preserves typed provider content", async () => {
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: fakeCodex,
+    codexArgs: ["--runtime-elicitation"],
+  });
+  let bridgedRequest: { method: string; params: Record<string, unknown> } | null = null;
+  bundle.transport.setServerRequestHandler(async (request) => {
+    if (request.method !== "mcpServer/elicitation/request") {
+      return { success: true, contentItems: [] };
+    }
+    bridgedRequest = { method: request.method, params: request.params };
+    await bundle.transport.resolveRuntimeRequest?.({
+      requestId: String(request.id),
+      turnId: String(request.params.turnId),
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: {
+            environment: { selectedOptionIds: ["option-1"] },
+            regions: { selectedOptionIds: ["option-1", "option-2"] },
+            replicas: { text: "3" },
+            approved: { selectedOptionIds: ["true"] },
+          },
+        },
+      },
+    });
+    return { action: "accept", content: {}, _meta: null };
+  });
+  try {
+    await bundle.transport.request("initialize", {});
+    await bundle.transport.request("thread/start", {
+      cwd: tmpdir(),
+      dynamicTools: [{
+        name: "get_task_context",
+        description: "Read the active task.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      }],
+    });
+    await bundle.transport.request("turn/start", {
+      input: [{ type: "text", text: "Request typed deployment settings." }],
+    });
+    const methods: string[] = [];
+    for await (const notification of bundle.transport.notifications()) {
+      methods.push(notification.method);
+      if (notification.method === "turn/completed") break;
+    }
+    expect(bridgedRequest).toMatchObject({
+      method: "mcpServer/elicitation/request",
+      params: {
+        message: "Choose typed deployment settings.",
+        requestedSchema: {
+          required: ["approved", "environment", "regions", "replicas"],
+          properties: {
+            environment: expect.objectContaining({ type: "string" }),
+            regions: expect.objectContaining({ type: "array" }),
+            replicas: expect.objectContaining({ type: "integer", minimum: 1, maximum: 10 }),
+            approved: expect.objectContaining({ type: "boolean" }),
+          },
+        },
+      },
+    });
+    expect(methods).toContain("turn/completed");
+  } finally {
+    await bundle.transport.close();
+  }
+}, 30_000);
+
 it("captures exact provider frames and correlates Rust and TypeScript interpretation stages", async () => {
   const traceDirectory = await mkdtemp(
     join(tmpdir(), "runnerd-provider-trace-"),

@@ -10,6 +10,7 @@ struct Mode {
     oversized_event: bool,
     linger_after_turn_start: bool,
     runtime_question: bool,
+    runtime_elicitation: bool,
 }
 
 fn send(value: Value) -> io::Result<()> {
@@ -26,12 +27,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         oversized_event: args.iter().any(|arg| arg == "--oversized-event"),
         linger_after_turn_start: args.iter().any(|arg| arg == "--linger-after-turn-start"),
         runtime_question: args.iter().any(|arg| arg == "--runtime-question"),
+        runtime_elicitation: args.iter().any(|arg| arg == "--runtime-elicitation"),
     };
     let mut turn_count = 0_u64;
     let mut active_turn_id: Option<String> = None;
     let mut planning_thread = false;
     let mut pending_tool_turns = BTreeMap::<String, String>::new();
     let mut pending_question_turns = BTreeMap::<String, String>::new();
+    let mut pending_elicitation_turns = BTreeMap::<String, String>::new();
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let request: Value = serde_json::from_str(&line?)?;
@@ -191,6 +194,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }))?;
                     continue;
                 }
+                if mode.runtime_elicitation {
+                    let request_id = format!("rpc-elicitation-{turn_count}");
+                    pending_elicitation_turns.insert(request_id.clone(), turn_id.clone());
+                    send(json!({
+                        "id": request_id,
+                        "method": "mcpServer/elicitation/request",
+                        "params": {
+                            "threadId": "fake-thread",
+                            "turnId": turn_id,
+                            "itemId": "elicitation-item",
+                            "message": "Choose typed deployment settings.",
+                            "requestedSchema": {
+                                "type": "object",
+                                "required": ["environment", "regions", "replicas", "approved"],
+                                "properties": {
+                                    "environment": {
+                                        "type": "string",
+                                        "title": "Environment",
+                                        "oneOf": [
+                                            {"const": "staging", "title": "Staging", "description": "Deploy to staging first."},
+                                            {"const": "production", "title": "Production"}
+                                        ]
+                                    },
+                                    "regions": {
+                                        "type": "array",
+                                        "title": "Regions",
+                                        "items": {"enum": ["us", "eu"]}
+                                    },
+                                    "replicas": {
+                                        "type": "integer",
+                                        "title": "Replicas",
+                                        "minimum": 1,
+                                        "maximum": 10
+                                    },
+                                    "approved": {"type": "boolean", "title": "Approved"}
+                                }
+                            }
+                        }
+                    }))?;
+                    continue;
+                }
                 pending_tool_turns.insert(request_id.clone(), turn_id.clone());
                 send(json!({
                     "id": request_id, "method": "item/tool/call",
@@ -261,6 +305,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "schema": "paperclip.prp.result.v1",
                         "reportedWorkDisposition": "done",
                         "summary": "Fake provider completed after runtime input."
+                    }
+                }
+            }))?;
+            send(
+                json!({"method": "turn/completed", "params": {"threadId": "fake-thread", "turn": {"id": turn_id, "status": "completed"}}}),
+            )?;
+        }
+        let completed_elicitation = request
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|request_id| pending_elicitation_turns.remove(request_id));
+        if let Some(turn_id) = completed_elicitation.filter(|_| request.get("result").is_some()) {
+            if request.get("result")
+                != Some(&json!({
+                    "action": "accept",
+                    "content": {
+                        "environment": "staging",
+                        "regions": ["us", "eu"],
+                        "replicas": 3,
+                        "approved": true
+                    },
+                    "_meta": null
+                }))
+            {
+                return Err(
+                    format!("runtime elicitation received wrong response: {}", request).into(),
+                );
+            }
+            send(json!({
+                "method": "paperclip/runResult",
+                "params": {
+                    "threadId": "fake-thread",
+                    "turnId": turn_id,
+                    "itemId": "semantic-result",
+                    "result": {
+                        "schema": "paperclip.prp.result.v1",
+                        "reportedWorkDisposition": "done",
+                        "summary": "Fake provider completed after typed elicitation."
                     }
                 }
             }))?;
