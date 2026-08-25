@@ -37,6 +37,9 @@ test("smoke script keeps its load-bearing assertions", () => {
 
 test("release-smoke workflow runs the service leg against the input version", () => {
   assert.match(smokeWorkflow, /^  smoke_service:$/m);
+  // The job is parked with onboarding's stubbed-out service install (#12156);
+  // this pin forces the re-enable to be a conscious change.
+  assert.match(smokeWorkflow, /if: \$\{\{ false \}\}/);
   assert.match(smokeWorkflow, /scripts\/service-onboard-smoke\.sh/);
   const serviceJob = smokeWorkflow.split(/^  smoke:$/m)[0];
   assert.match(serviceJob, /PAPERCLIPAI_VERSION: \$\{\{ inputs\.paperclip_version \}\}/);

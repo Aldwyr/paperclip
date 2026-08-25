@@ -45,6 +45,10 @@ jobs:
   # on the runner VM's systemd and require the installed service to end up
   # serving.
   smoke_service:
+    # Disabled while onboarding's service install is stubbed out (#12156):
+    # the script drives `onboard --yes --install-service`, which is inert
+    # until the flow is reworked. Re-enable together with that rework.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

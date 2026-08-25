@@ -52,7 +52,8 @@ import {
   trackInstallStarted,
   trackInstallCompleted,
 } from "../telemetry.js";
-import { handleOnboardService, shouldOfferForegroundStart } from "../onboard-service.js";
+// handleOnboardService is parked with the disabled call sites below.
+import { shouldOfferForegroundStart } from "../onboard-service.js";
 import { readInstallManifest, isManagedExecutable } from "../install-store.js";
 
 type SetupMode = "quickstart" | "advanced";
@@ -456,7 +457,11 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     );
 
     printManagedInstallHint();
-    const serviceInstalled = await handleOnboardService(opts);
+    // Disabled while onboarding's service install is reworked: the step kept
+    // shipping broken first runs (#12148, #12153, #12155). The explicit path
+    // (`paperclipai install`, then `paperclipai service install`) still works.
+    // const serviceInstalled = await handleOnboardService(opts);
+    const serviceInstalled = false;
 
     let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
     if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
@@ -722,7 +727,11 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     await bootstrapCeoInvite({ config: configPath });
   }
 
-  const serviceInstalled = await handleOnboardService(opts);
+  // Disabled while onboarding's service install is reworked: the step kept
+  // shipping broken first runs (#12148, #12153, #12155). The explicit path
+  // (`paperclipai install`, then `paperclipai service install`) still works.
+  // const serviceInstalled = await handleOnboardService(opts);
+  const serviceInstalled = false;
 
   let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
   if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
