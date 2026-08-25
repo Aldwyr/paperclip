@@ -15,6 +15,13 @@
  * The decoder never throws on the read path. A malformed, oversized, or
  * version-mismatch frame becomes a protocol-error result, not an exception. This
  * keeps one bad frame from crashing the read loop.
+ *
+ * HTTP/2 is the preferred transport. `queue_v1` is the soft-deprecated fallback.
+ * The `http2_v1` host readiness gate imports {@link decodeDuplexLine} from this
+ * file to read the one READY line every gateway sends, so this file's READY
+ * frame path stays live for both transports. `duplex-body-spool.ts` still
+ * imports the request, response, and body-chunk frame types from this file, so
+ * this file keeps every frame type here.
  */
 
 import {
@@ -24,7 +31,15 @@ import {
 } from "./duplex-aggregate-byte-ledger.js";
 
 /** The wire version this codec reads and writes. */
-export const DUPLEX_FRAME_VERSION = 1;
+export const DUPLEX_FRAME_VERSION = 2;
+
+/**
+ * The fixed raw byte size of one body slice. The sender splits a body into
+ * `body_chunk` frames of this raw size, except the final chunk, which holds the
+ * remaining bytes. The base64 text of one full slice is about 349 KiB, so each
+ * encoded `body_chunk` frame stays well under {@link DEFAULT_MAX_DUPLEX_FRAME_BYTES}.
+ */
+export const DUPLEX_BODY_CHUNK_RAW_BYTES = 256 * 1024;
 
 /**
  * The default maximum size of one frame, in bytes. The decoder rejects a longer
@@ -54,6 +69,7 @@ const EMPTY = Buffer.alloc(0);
 export const DUPLEX_FRAME_TYPES = {
   request: "request",
   response: "response",
+  body_chunk: "body_chunk",
   ready: "ready",
   heartbeat: "heartbeat",
   close: "close",
@@ -63,7 +79,12 @@ export const DUPLEX_FRAME_TYPES = {
 /** The outcome of a response frame. A loss response carries a non-completed outcome. */
 export type DuplexResponseOutcome = "completed" | "indeterminate" | "unavailable";
 
-/** A request frame. The gateway forwards it to the host API path. */
+/**
+ * A request envelope frame. The gateway forwards it to the host API path. The
+ * envelope carries `bodyByteCount`, the raw byte length of the request body. The
+ * body itself rides one or more `body_chunk` frames that share the same `id`. A
+ * `bodyByteCount` of 0 means an empty body and no `body_chunk` frame follows.
+ */
 export interface DuplexRequestFrame {
   version: number;
   type: "request";
@@ -72,18 +93,41 @@ export interface DuplexRequestFrame {
   path: string;
   query: string;
   headers: Record<string, string>;
-  body: string;
+  bodyByteCount: number;
 }
 
-/** A response frame. The host returns it for one request id. */
+/**
+ * A response envelope frame. The host returns it for one request id. The
+ * envelope carries `bodyByteCount`, the raw byte length of the response body.
+ * The body itself rides one or more `body_chunk` frames that share the same
+ * `id`. A `bodyByteCount` of 0 means an empty body and no `body_chunk` frame
+ * follows.
+ */
 export interface DuplexResponseFrame {
   version: number;
   type: "response";
   id: string;
   status: number;
   headers: Record<string, string>;
-  body: string;
+  bodyByteCount: number;
   outcome: DuplexResponseOutcome;
+}
+
+/**
+ * A body-chunk frame. One frame carries one raw body slice as base64 text in
+ * `data`. The frames for one body share the `id` of the envelope. `seq` starts
+ * at 0 and increases by one for each next chunk, with no gap and no repeat. Each
+ * raw slice is {@link DUPLEX_BODY_CHUNK_RAW_BYTES} bytes, except the final slice,
+ * which holds the remaining bytes. The receiver reassembles the slices in `seq`
+ * order and stops when the total raw byte count equals the envelope
+ * `bodyByteCount`.
+ */
+export interface DuplexBodyChunkFrame {
+  version: number;
+  type: "body_chunk";
+  id: string;
+  seq: number;
+  data: string;
 }
 
 /**
@@ -129,6 +173,7 @@ export interface DuplexErrorFrame {
 export type DuplexFrame =
   | DuplexRequestFrame
   | DuplexResponseFrame
+  | DuplexBodyChunkFrame
   | DuplexReadyFrame
   | DuplexHeartbeatFrame
   | DuplexCloseFrame
@@ -192,6 +237,11 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 /** Return true when the id byte size is within {@link DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES}. */
 function idWithinLimit(id: string): boolean {
   return Buffer.byteLength(id, "utf8") <= DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES;
+}
+
+/** Return true when the value is a safe integer that is zero or positive. */
+function isSafeNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /**
@@ -261,6 +311,8 @@ function validateFrame(frame: Record<string, unknown>): DuplexDecodeResult {
       return validateRequest(frame);
     case "response":
       return validateResponse(frame);
+    case "body_chunk":
+      return validateBodyChunk(frame);
     case "ready":
       return validateReady(frame);
     case "heartbeat":
@@ -280,7 +332,7 @@ function validateRequest(frame: Record<string, unknown>): DuplexDecodeResult {
     typeof frame.method !== "string" ||
     typeof frame.path !== "string" ||
     typeof frame.query !== "string" ||
-    typeof frame.body !== "string" ||
+    !isSafeNonNegativeInteger(frame.bodyByteCount) ||
     !isStringRecord(frame.headers)
   ) {
     return fail("malformed_frame", "request frame has a missing or wrong-typed field");
@@ -298,7 +350,7 @@ function validateResponse(frame: Record<string, unknown>): DuplexDecodeResult {
   if (
     typeof frame.id !== "string" ||
     typeof frame.status !== "number" ||
-    typeof frame.body !== "string" ||
+    !isSafeNonNegativeInteger(frame.bodyByteCount) ||
     !isStringRecord(frame.headers) ||
     typeof frame.outcome !== "string" ||
     !RESPONSE_OUTCOMES.has(frame.outcome)
@@ -311,6 +363,29 @@ function validateResponse(frame: Record<string, unknown>): DuplexDecodeResult {
     return fail("id_too_large", "response frame id exceeds the maximum size");
   }
   return ok(frame as unknown as DuplexResponseFrame);
+}
+
+/**
+ * Validate a `body_chunk` frame at the structural level. The codec is stateless,
+ * so it checks only the per-frame shape here:
+ *   - `id` is a string within {@link DEFAULT_MAX_DUPLEX_REQUEST_ID_BYTES}.
+ *   - `seq` is a safe integer that is zero or positive.
+ *   - `data` is a string.
+ * The receive-side reassembler owns the stateful checks: the base64 canonical
+ * form, the fixed slice size, the `seq` order, and the total against
+ * `bodyByteCount`. The codec never decodes `data` here.
+ */
+function validateBodyChunk(frame: Record<string, unknown>): DuplexDecodeResult {
+  if (typeof frame.id !== "string" || typeof frame.data !== "string") {
+    return fail("malformed_frame", "body_chunk frame has a missing or wrong-typed field");
+  }
+  if (!isSafeNonNegativeInteger(frame.seq)) {
+    return fail("malformed_frame", "body_chunk frame has a missing or wrong-typed seq");
+  }
+  if (!idWithinLimit(frame.id)) {
+    return fail("id_too_large", "body_chunk frame id exceeds the maximum size");
+  }
+  return ok(frame as unknown as DuplexBodyChunkFrame);
 }
 
 function validateReady(frame: Record<string, unknown>): DuplexDecodeResult {
