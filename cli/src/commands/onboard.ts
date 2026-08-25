@@ -472,7 +472,7 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     // fall through to a blocking foreground start: configure and exit so
     // scripted installs fail fast instead of hanging.
     let shouldRunNow = !serviceInstalled && opts.installService !== true && (opts.run === true || opts.yes === true);
-    if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
+    if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow || opts.installService === true, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
       const answer = await p.confirm({
         message: "Start Paperclip now?",
         initialValue: true,
@@ -750,7 +750,7 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
   // fall through to a blocking foreground start: configure and exit so
   // scripted installs fail fast instead of hanging.
   let shouldRunNow = !serviceInstalled && opts.installService !== true && (opts.run === true || opts.yes === true);
-  if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
+  if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow || opts.installService === true, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
     const answer = await p.confirm({
       message: "Start Paperclip now?",
       initialValue: true,
