@@ -143,9 +143,14 @@ if (bindMode === "custom" && !bindHost) {
   process.exit(1);
 }
 
+// Managed HTTPS runtimes serve the built UI bundle: the Vite dev middleware's
+// unbundled module waterfall stalls behind the Tailscale HTTPS proxy and the
+// first page load in a fresh browser profile stays blank forever (PAP-18043).
+const explicitUiDevMiddleware = process.env.PAPERCLIP_UI_DEV_MIDDLEWARE;
+const serveBuiltUiForManagedRuntime = managedRuntimeExposure && explicitUiDevMiddleware === undefined;
 const env: NodeJS.ProcessEnv = {
   ...process.env,
-  PAPERCLIP_UI_DEV_MIDDLEWARE: "true",
+  PAPERCLIP_UI_DEV_MIDDLEWARE: explicitUiDevMiddleware ?? (serveBuiltUiForManagedRuntime ? "false" : "true"),
 };
 
 if (mode === "dev") {
@@ -496,6 +501,25 @@ async function buildPluginSdk() {
   }
 }
 
+async function buildUiBundleForManagedRuntime(): Promise<boolean> {
+  console.log("[paperclip] managed runtime: building the UI bundle for static serving...");
+  const result = await runPnpm(
+    ["--filter", "@paperclipai/ui", "build"],
+    { stdio: "inherit" },
+  );
+  if (result.signal) {
+    exitForSignal(result.signal);
+    return false;
+  }
+  if (result.code !== 0) {
+    console.error(
+      "[paperclip] UI bundle build failed; falling back to the Vite dev middleware (the page may load slowly or stay blank over HTTPS)",
+    );
+    return false;
+  }
+  return true;
+}
+
 async function markChildAsCurrent() {
   previousSnapshot = collectWatchedSnapshot();
   dirtyPaths = new Set();
@@ -694,6 +718,10 @@ process.on("SIGTERM", () => {
   void shutdown("SIGTERM");
 });
 
+if (serveBuiltUiForManagedRuntime) {
+  const uiBundleBuilt = await buildUiBundleForManagedRuntime();
+  env.PAPERCLIP_UI_DEV_MIDDLEWARE = uiBundleBuilt ? "false" : "true";
+}
 await maybePreflightMigrations();
 await startServerChild();
 installDevIntervals();
