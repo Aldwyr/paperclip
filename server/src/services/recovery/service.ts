@@ -1087,6 +1087,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     agentId: string,
     since: Date,
     interactionId?: string | null,
+    provenance?: ExecutionProvenance | null,
   ) {
     return db
       .select({ id: heartbeatRuns.id })
@@ -1100,6 +1101,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           interactionId
             ? sql`${heartbeatRuns.contextSnapshot} ->> 'interactionId' = ${interactionId}`
             : sql`true`,
+          provenance ? eq(heartbeatRuns.instanceNonce, provenance.instanceNonce) : undefined,
+          provenance ? eq(heartbeatRuns.seedEpoch, provenance.seedEpoch) : undefined,
           or(gte(heartbeatRuns.createdAt, since), gte(heartbeatRuns.finishedAt, since)),
         ),
       )
@@ -4332,6 +4335,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId,
           acceptedInteractionResolvedAt,
           acceptedContinuationInteraction.id,
+          opts?.executionProvenance,
         );
 
         if (!successfulRunSinceResolution) {

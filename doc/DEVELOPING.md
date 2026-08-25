@@ -629,7 +629,7 @@ For an already-created worktree where you want to keep the existing repo-local c
 | `--from-config <path>` | Source config.json to seed from |
 | `--from-data-dir <path>` | Source `PAPERCLIP_HOME` used when deriving the source config |
 | `--from-instance <id>` | Source instance id when deriving the source config |
-| `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `minimal`) |
+| `--seed-mode <mode>` | Seed profile: `minimal` or `full` (default: `full`) |
 | `--preserve-live-work` | Explicitly bypass seed quarantine for copied runs, wakeups, monitors, agent timers, and assigned open issues. The worktree run-execution toggle is still reset. |
 | `--yes` | Skip the destructive confirmation prompt |
 | `--allow-live-target` | Override the guard that requires the target worktree DB to be stopped first |
