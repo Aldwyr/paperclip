@@ -393,7 +393,7 @@ async function runPnpm(args: string[], options: {
 
 async function getMigrationStatusPayload() {
   const status = await runPnpm(
-    ["--filter", "@paperclipai/db", "exec", "tsx", "src/migration-status.ts", "--json"],
+    ["--silent", "--filter", "@paperclipai/db", "exec", "tsx", "src/migration-status.ts", "--json"],
     { env },
   );
   if (status.code !== 0) {
@@ -405,16 +405,26 @@ async function getMigrationStatusPayload() {
     process.exit(status.code);
   }
 
-  try {
-    return JSON.parse(status.stdout.trim()) as { status?: string; pendingMigrations?: string[] };
-  } catch (error) {
-    process.stderr.write(
-      status.stderr ||
-        status.stdout ||
-        "[paperclip] migration-status returned invalid JSON payload\n",
-    );
-    throw toError(error, "Unable to parse migration-status JSON output");
+  // pnpm can interleave its own reporter lines (e.g. "Unsupported engine"
+  // warnings) into stdout, so parse the last line that is a JSON object
+  // instead of trusting the whole stream.
+  const jsonLines = status.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("{"));
+  for (let index = jsonLines.length - 1; index >= 0; index -= 1) {
+    try {
+      return JSON.parse(jsonLines[index]) as { status?: string; pendingMigrations?: string[] };
+    } catch {
+      // keep scanning earlier JSON-looking lines
+    }
   }
+  process.stderr.write(
+    status.stderr ||
+      status.stdout ||
+      "[paperclip] migration-status returned invalid JSON payload\n",
+  );
+  throw new Error("Unable to parse migration-status JSON output");
 }
 
 async function refreshPendingMigrations() {
