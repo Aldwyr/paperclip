@@ -84,6 +84,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }) {
                     return Err("authorized tool was not registered".into());
                 }
+                if request
+                    .pointer("/params/permissions")
+                    .is_some_and(Value::is_string)
+                {
+                    send(json!({
+                        "id": id,
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid request: invalid type: string, expected internally tagged enum PermissionProfileSelectionParams"
+                        }
+                    }))?;
+                    continue;
+                }
                 let config = request.pointer("/params/config").and_then(Value::as_object);
                 planning_thread = request
                     .pointer("/params/permissions/id")

@@ -600,6 +600,7 @@ pub struct CodexProvider {
     pending_runtime_requests: BTreeMap<String, PendingCodexRuntimeRequest>,
     collaboration_mode: String,
     collaboration_mode_payload: Option<Value>,
+    structured_permission_profile: bool,
     trace: Option<ProviderTraceSink>,
     last_trace_frame_id: Option<u64>,
 }
@@ -610,6 +611,19 @@ struct PendingCodexRuntimeRequest {
     method: String,
     provider_params: Value,
     question_set: Value,
+}
+
+fn permission_profile_params(profile_id: &str, structured: bool) -> Value {
+    if structured {
+        json!({"type": "profile", "id": profile_id})
+    } else {
+        json!(profile_id)
+    }
+}
+
+fn requires_structured_permission_profile(error: &LocalRunnerError) -> bool {
+    let detail = error.to_string();
+    detail.contains("invalid type: string") && detail.contains("PermissionProfileSelectionParams")
 }
 
 fn latest_active_provider_turn_id(thread_read: &Value) -> Option<String> {
@@ -1180,6 +1194,7 @@ impl CodexProvider {
             pending_runtime_requests: BTreeMap::new(),
             collaboration_mode: config.collaboration_mode.clone(),
             collaboration_mode_payload: None,
+            structured_permission_profile: false,
             trace: ProviderTraceSink::from_environment(config.kind),
             last_trace_frame_id: None,
         };
@@ -1203,19 +1218,19 @@ impl CodexProvider {
             ));
         }
         let permission_profile = if config.collaboration_mode == "plan" {
-            json!({"type": "profile", "id": "paperclip-runner-workspace-read-only"})
+            "paperclip-runner-workspace-read-only"
         } else {
-            json!({"type": "profile", "id": "paperclip-runner-workspace-only"})
+            "paperclip-runner-workspace-only"
         };
-        let opened = if let Some(thread_id) = resume_thread_id {
-            provider.request(
+        let (open_method, mut open_params) = if let Some(thread_id) = resume_thread_id {
+            (
                 "thread/resume",
                 json!({
                     "threadId": thread_id,
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": config.approval_policy,
-                    "permissions": permission_profile,
+                    "permissions": permission_profile_params(permission_profile, false),
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
                         config.include_collaboration_mode_instructions,
@@ -1226,15 +1241,15 @@ impl CodexProvider {
                     "experimentalRawEvents": true,
                     "persistExtendedHistory": true,
                 }),
-            )?
+            )
         } else {
-            provider.request(
+            (
                 "thread/start",
                 json!({
                     "cwd": config.cwd,
                     "model": config.model,
                     "approvalPolicy": config.approval_policy,
-                    "permissions": permission_profile,
+                    "permissions": permission_profile_params(permission_profile, false),
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
                         config.include_collaboration_mode_instructions,
@@ -1245,7 +1260,16 @@ impl CodexProvider {
                     "experimentalRawEvents": true,
                     "persistExtendedHistory": true,
                 }),
-            )?
+            )
+        };
+        let opened = match provider.request(open_method, open_params.clone()) {
+            Ok(opened) => opened,
+            Err(error) if requires_structured_permission_profile(&error) => {
+                open_params["permissions"] = permission_profile_params(permission_profile, true);
+                provider.structured_permission_profile = true;
+                provider.request(open_method, open_params)?
+            }
+            Err(error) => return Err(error),
         };
         if config.collaboration_mode == "plan" {
             let presets = provider
@@ -1318,14 +1342,14 @@ impl CodexProvider {
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         let thread_id = self.thread_id.clone();
         let permission_profile = if self.collaboration_mode == "plan" {
-            json!({"type": "profile", "id": "paperclip-runner-workspace-read-only"})
+            "paperclip-runner-workspace-read-only"
         } else {
-            json!({"type": "profile", "id": "paperclip-runner-workspace-only"})
+            "paperclip-runner-workspace-only"
         };
         let mut params = json!({
             "threadId": thread_id,
             "cwd": cwd,
-            "permissions": permission_profile,
+            "permissions": permission_profile_params(permission_profile, self.structured_permission_profile),
             "runtimeWorkspaceRoots": [cwd],
             "input": [{"type": "text", "text": message, "text_elements": []}],
         });
