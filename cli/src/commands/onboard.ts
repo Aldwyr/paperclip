@@ -462,8 +462,16 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     // (`paperclipai install`, then `paperclipai service install`) still works.
     // const serviceInstalled = await handleOnboardService(opts);
     const serviceInstalled = false;
+    if (opts.installService === true) {
+      p.log.warn(
+        "The background service install during onboarding is temporarily disabled. Run `paperclipai install`, then `paperclipai service install`.",
+      );
+    }
 
-    let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
+    // With the service step stubbed, an explicit --install-service must not
+    // fall through to a blocking foreground start: configure and exit so
+    // scripted installs fail fast instead of hanging.
+    let shouldRunNow = !serviceInstalled && opts.installService !== true && (opts.run === true || opts.yes === true);
     if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
       const answer = await p.confirm({
         message: "Start Paperclip now?",
@@ -732,8 +740,16 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
   // (`paperclipai install`, then `paperclipai service install`) still works.
   // const serviceInstalled = await handleOnboardService(opts);
   const serviceInstalled = false;
+  if (opts.installService === true) {
+    p.log.warn(
+      "The background service install during onboarding is temporarily disabled. Run `paperclipai install`, then `paperclipai service install`.",
+    );
+  }
 
-  let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
+  // With the service step stubbed, an explicit --install-service must not
+  // fall through to a blocking foreground start: configure and exit so
+  // scripted installs fail fast instead of hanging.
+  let shouldRunNow = !serviceInstalled && opts.installService !== true && (opts.run === true || opts.yes === true);
   if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
     const answer = await p.confirm({
       message: "Start Paperclip now?",
