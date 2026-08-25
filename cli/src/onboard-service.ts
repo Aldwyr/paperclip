@@ -166,6 +166,72 @@ export async function handleOnboardService(
   return true;
 }
 
+export type ServiceReadyDependencies = {
+  probeHealth: (healthUrl: string) => Promise<boolean>;
+  openBrowser: (url: string) => Promise<void>;
+  sleep: (ms: number) => Promise<void>;
+  info: (message: string) => void;
+  success: (message: string) => void;
+  warn: (message: string) => void;
+};
+
+const defaultServiceReadyDependencies: ServiceReadyDependencies = {
+  probeHealth: async (healthUrl) => {
+    try {
+      const response = await fetch(healthUrl, { signal: AbortSignal.timeout(2_000) });
+      const body = (await response.json()) as { status?: unknown };
+      return response.ok && body.status === "ok";
+    } catch {
+      return false;
+    }
+  },
+  openBrowser: async (url) => {
+    const mod = await import("open");
+    await mod.default(url);
+  },
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  info: (message) => p.log.message(pc.dim(message)),
+  success: (message) => p.log.success(message),
+  warn: (message) => p.log.warn(message),
+};
+
+// A freshly installed service is what will serve the user's first session,
+// so onboarding stays on the hook until it can hand over a working address:
+// wait for health, print the URL, and open a browser for a human. The first
+// boot initializes the embedded database, so the default timeout is generous.
+export async function announceServiceReady(
+  options: { baseUrl: string; interactive: boolean; timeoutMs?: number; pollIntervalMs?: number },
+  dependencies: Partial<ServiceReadyDependencies> = {},
+): Promise<boolean> {
+  const deps = { ...defaultServiceReadyDependencies, ...dependencies };
+  const timeoutMs = options.timeoutMs ?? 180_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+  const healthUrl = `${options.baseUrl}/api/health`;
+  deps.info(`Waiting for the server at ${options.baseUrl} ...`);
+  const attempts = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (await deps.probeHealth(healthUrl)) {
+      deps.success(`Paperclip is running at ${options.baseUrl}`);
+      if (options.interactive) {
+        try {
+          await deps.openBrowser(options.baseUrl);
+          return true;
+        } catch {
+          // Fall through to printing the address.
+        }
+      }
+      deps.info(`Open ${options.baseUrl} in your browser to get started.`);
+      return true;
+    }
+    await deps.sleep(pollIntervalMs);
+  }
+  deps.warn(
+    `The background service has not answered at ${options.baseUrl} yet. ` +
+      "Check `paperclipai service status` and `paperclipai service logs`.",
+  );
+  return false;
+}
+
 // Onboarding falls back to offering a foreground start when nothing else
 // will serve. A just-installed service is already serving, so offering the
 // start would only run the user into the already-running instance guard.

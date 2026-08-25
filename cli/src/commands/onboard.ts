@@ -52,7 +52,8 @@ import {
   trackInstallStarted,
   trackInstallCompleted,
 } from "../telemetry.js";
-import { handleOnboardService, shouldOfferForegroundStart } from "../onboard-service.js";
+import { announceServiceReady, handleOnboardService, shouldOfferForegroundStart } from "../onboard-service.js";
+import { buildLocalBaseUrl } from "../utils/health-url.js";
 import { readInstallManifest, isManagedExecutable } from "../install-store.js";
 
 type SetupMode = "quickstart" | "advanced";
@@ -457,6 +458,12 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
 
     printManagedInstallHint();
     const serviceInstalled = await handleOnboardService(opts);
+    if (serviceInstalled) {
+      await announceServiceReady({
+        baseUrl: buildLocalBaseUrl(existingConfig.server.host, existingConfig.server.port),
+        interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      });
+    }
 
     let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
     if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
@@ -723,6 +730,12 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
   }
 
   const serviceInstalled = await handleOnboardService(opts);
+  if (serviceInstalled) {
+    await announceServiceReady({
+      baseUrl: buildLocalBaseUrl(server.host, server.port),
+      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    });
+  }
 
   let shouldRunNow = !serviceInstalled && (opts.run === true || opts.yes === true);
   if (shouldOfferForegroundStart({ serviceInstalled, startAlreadyDecided: shouldRunNow, invokedByRun: opts.invokedByRun === true, interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY) })) {
@@ -744,11 +757,17 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
 
   if (server.deploymentMode === "authenticated" && database.mode === "embedded-postgres") {
     p.log.info(
-      [
-        "Bootstrap CEO invite will be created after the server starts.",
-        `Next: ${pc.cyan("paperclipai run")}`,
-        `Then: ${pc.cyan("paperclipai auth bootstrap-ceo")}`,
-      ].join("\n"),
+      (serviceInstalled
+        ? [
+            "The background service is running the server.",
+            `Create your sign-in invite with: ${pc.cyan("paperclipai auth bootstrap-ceo")}`,
+          ]
+        : [
+            "Bootstrap CEO invite will be created after the server starts.",
+            `Next: ${pc.cyan("paperclipai run")}`,
+            `Then: ${pc.cyan("paperclipai auth bootstrap-ceo")}`,
+          ]
+      ).join("\n"),
     );
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { handleOnboardService, isInstallableReleaseVersion, shouldOfferForegroundStart } from "../onboard-service.js";
+import { announceServiceReady, handleOnboardService, isInstallableReleaseVersion, shouldOfferForegroundStart } from "../onboard-service.js";
 
 function supportedDetection() {
   return {
@@ -160,5 +160,61 @@ describe("shouldOfferForegroundStart", () => {
 
   it("never prompts without an interactive terminal", () => {
     expect(shouldOfferForegroundStart({ ...base, interactive: false })).toBe(false);
+  });
+});
+
+describe("announceServiceReady", () => {
+  function readyDeps(overrides: Record<string, unknown> = {}) {
+    return {
+      probeHealth: vi.fn(async () => true),
+      openBrowser: vi.fn(async () => undefined),
+      sleep: vi.fn(async () => undefined),
+      info: vi.fn(),
+      success: vi.fn(),
+      warn: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it("prints the URL and opens the browser once the service answers", async () => {
+    const deps = readyDeps();
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true }, deps);
+    expect(ready).toBe(true);
+    expect(deps.probeHealth).toHaveBeenCalledWith("http://127.0.0.1:3100/api/health");
+    expect(deps.success).toHaveBeenCalledWith("Paperclip is running at http://127.0.0.1:3100");
+    expect(deps.openBrowser).toHaveBeenCalledWith("http://127.0.0.1:3100");
+  });
+
+  it("polls until the service becomes healthy", async () => {
+    const probeHealth = vi.fn(async () => false).mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValue(true);
+    const deps = readyDeps({ probeHealth });
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 50, pollIntervalMs: 10 }, deps);
+    expect(ready).toBe(true);
+    expect(probeHealth).toHaveBeenCalledTimes(3);
+  });
+
+  it("prints the URL instead of opening a browser on non-interactive runs", async () => {
+    const deps = readyDeps();
+    await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: false }, deps);
+    expect(deps.openBrowser).not.toHaveBeenCalled();
+    expect(deps.info).toHaveBeenCalledWith("Open http://127.0.0.1:3100 in your browser to get started.");
+  });
+
+  it("falls back to printing the URL when the browser cannot open", async () => {
+    const deps = readyDeps({ openBrowser: vi.fn(async () => { throw new Error("no display"); }) });
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true }, deps);
+    expect(ready).toBe(true);
+    expect(deps.info).toHaveBeenCalledWith("Open http://127.0.0.1:3100 in your browser to get started.");
+  });
+
+  it("warns with service diagnostics when the service never answers", async () => {
+    const deps = readyDeps({ probeHealth: vi.fn(async () => false) });
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 30, pollIntervalMs: 10 }, deps);
+    expect(ready).toBe(false);
+    expect(deps.openBrowser).not.toHaveBeenCalled();
+    const warned = (deps.warn as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string;
+    expect(warned).toContain("has not answered at http://127.0.0.1:3100");
+    expect(warned).toContain("paperclipai service status");
+    expect(warned).toContain("paperclipai service logs");
   });
 });
