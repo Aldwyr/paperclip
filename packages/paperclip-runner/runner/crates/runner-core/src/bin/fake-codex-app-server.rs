@@ -86,9 +86,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let config = request.pointer("/params/config").and_then(Value::as_object);
                 planning_thread = request
-                    .pointer("/params/permissions")
+                    .pointer("/params/permissions/id")
                     .and_then(Value::as_str)
                     == Some("paperclip-runner-workspace-read-only");
+                if request
+                    .pointer("/params/permissions/type")
+                    .and_then(Value::as_str)
+                    != Some("profile")
+                {
+                    return Err(format!("{method} omitted a structured permission profile").into());
+                }
                 if config
                     .and_then(|value| value.get("skills.include_instructions"))
                     .and_then(Value::as_bool)
@@ -134,6 +141,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
             "turn/start" => {
+                if request
+                    .pointer("/params/permissions/type")
+                    .and_then(Value::as_str)
+                    != Some("profile")
+                {
+                    return Err("turn/start omitted a structured permission profile".into());
+                }
                 if planning_thread {
                     let collaboration_mode = request.pointer("/params/collaborationMode");
                     if collaboration_mode

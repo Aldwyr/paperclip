@@ -1203,9 +1203,9 @@ impl CodexProvider {
             ));
         }
         let permission_profile = if config.collaboration_mode == "plan" {
-            "paperclip-runner-workspace-read-only"
+            json!({"type": "profile", "id": "paperclip-runner-workspace-read-only"})
         } else {
-            "paperclip-runner-workspace-only"
+            json!({"type": "profile", "id": "paperclip-runner-workspace-only"})
         };
         let opened = if let Some(thread_id) = resume_thread_id {
             provider.request(
@@ -1318,9 +1318,9 @@ impl CodexProvider {
     pub fn start_turn(&mut self, message: &str, cwd: &str) -> Result<Value, LocalRunnerError> {
         let thread_id = self.thread_id.clone();
         let permission_profile = if self.collaboration_mode == "plan" {
-            "paperclip-runner-workspace-read-only"
+            json!({"type": "profile", "id": "paperclip-runner-workspace-read-only"})
         } else {
-            "paperclip-runner-workspace-only"
+            json!({"type": "profile", "id": "paperclip-runner-workspace-only"})
         };
         let mut params = json!({
             "threadId": thread_id,
