@@ -1,7 +1,7 @@
 #!/usr/bin/env -S node --import tsx
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -511,6 +511,34 @@ async function buildPluginSdk() {
   }
 }
 
+function newestMtimeMs(target: string): number {
+  const stat = statSync(target, { throwIfNoEntry: false });
+  if (!stat) return 0;
+  if (!stat.isDirectory()) return stat.mtimeMs;
+  let newest = stat.mtimeMs;
+  for (const entry of readdirSync(target)) {
+    if (entry === "node_modules" || entry === ".git" || entry === "dist") continue;
+    const childNewest = newestMtimeMs(path.join(target, entry));
+    if (childNewest > newest) newest = childNewest;
+  }
+  return newest;
+}
+
+function uiBundleIsFresh(): boolean {
+  const distIndex = path.join(repoRoot, "ui", "dist", "index.html");
+  const distStat = statSync(distIndex, { throwIfNoEntry: false });
+  if (!distStat) return false;
+  const sources = [
+    path.join(repoRoot, "ui", "src"),
+    path.join(repoRoot, "ui", "public"),
+    path.join(repoRoot, "ui", "index.html"),
+    path.join(repoRoot, "ui", "package.json"),
+    path.join(repoRoot, "ui", "vite.config.ts"),
+    path.join(repoRoot, "packages", "shared", "src"),
+  ];
+  return sources.every((source) => newestMtimeMs(source) <= distStat.mtimeMs);
+}
+
 async function buildUiBundleForManagedRuntime(): Promise<boolean> {
   console.log("[paperclip] managed runtime: building the UI bundle for static serving...");
   const result = await runPnpm(
@@ -728,11 +756,20 @@ process.on("SIGTERM", () => {
   void shutdown("SIGTERM");
 });
 
+// The managed runtime readiness window is tight, so reuse a fresh bundle
+// when possible and overlap a needed rebuild with the migration preflight.
+let uiBundleBuild: Promise<boolean> | null = null;
 if (serveBuiltUiForManagedRuntime) {
-  const uiBundleBuilt = await buildUiBundleForManagedRuntime();
-  env.PAPERCLIP_UI_DEV_MIDDLEWARE = uiBundleBuilt ? "false" : "true";
+  if (uiBundleIsFresh()) {
+    console.log("[paperclip] managed runtime: reusing the up-to-date UI bundle in ui/dist");
+  } else {
+    uiBundleBuild = buildUiBundleForManagedRuntime();
+  }
 }
 await maybePreflightMigrations();
+if (uiBundleBuild) {
+  env.PAPERCLIP_UI_DEV_MIDDLEWARE = (await uiBundleBuild) ? "false" : "true";
+}
 await startServerChild();
 installDevIntervals();
 
