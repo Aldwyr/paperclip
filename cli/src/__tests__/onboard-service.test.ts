@@ -165,10 +165,12 @@ describe("shouldOfferForegroundStart", () => {
 
 describe("announceServiceReady", () => {
   function readyDeps(overrides: Record<string, unknown> = {}) {
+    let clock = 0;
     return {
       probeHealth: vi.fn(async () => true),
       openBrowser: vi.fn(async () => undefined),
       sleep: vi.fn(async () => undefined),
+      now: vi.fn(() => { clock += 10; return clock; }),
       info: vi.fn(),
       success: vi.fn(),
       warn: vi.fn(),
@@ -188,9 +190,20 @@ describe("announceServiceReady", () => {
   it("polls until the service becomes healthy", async () => {
     const probeHealth = vi.fn(async () => false).mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValue(true);
     const deps = readyDeps({ probeHealth });
-    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 50, pollIntervalMs: 10 }, deps);
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 100, pollIntervalMs: 10 }, deps);
     expect(ready).toBe(true);
     expect(probeHealth).toHaveBeenCalledTimes(3);
+  });
+
+  it("counts probe time against the deadline instead of only sleeps", async () => {
+    let clock = 0;
+    const deps = readyDeps({
+      probeHealth: vi.fn(async () => { clock += 2_000; return false; }),
+      now: vi.fn(() => clock),
+    });
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 6_000, pollIntervalMs: 1_000 }, deps);
+    expect(ready).toBe(false);
+    expect(deps.probeHealth).toHaveBeenCalledTimes(3);
   });
 
   it("prints the URL instead of opening a browser on non-interactive runs", async () => {
@@ -209,7 +222,7 @@ describe("announceServiceReady", () => {
 
   it("warns with service diagnostics when the service never answers", async () => {
     const deps = readyDeps({ probeHealth: vi.fn(async () => false) });
-    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 30, pollIntervalMs: 10 }, deps);
+    const ready = await announceServiceReady({ baseUrl: "http://127.0.0.1:3100", interactive: true, timeoutMs: 25, pollIntervalMs: 10 }, deps);
     expect(ready).toBe(false);
     expect(deps.openBrowser).not.toHaveBeenCalled();
     const warned = (deps.warn as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as string;

@@ -170,6 +170,7 @@ export type ServiceReadyDependencies = {
   probeHealth: (healthUrl: string) => Promise<boolean>;
   openBrowser: (url: string) => Promise<void>;
   sleep: (ms: number) => Promise<void>;
+  now: () => number;
   info: (message: string) => void;
   success: (message: string) => void;
   warn: (message: string) => void;
@@ -185,11 +186,18 @@ const defaultServiceReadyDependencies: ServiceReadyDependencies = {
       return false;
     }
   },
+  // The platform opener keeps this dependency-free; a failure only means the
+  // caller prints the address instead.
   openBrowser: async (url) => {
-    const mod = await import("open");
-    await mod.default(url);
+    const { execFile } = await import("node:child_process");
+    const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+    await new Promise<void>((resolve, reject) => {
+      execFile(command, args, (error) => (error ? reject(error) : resolve()));
+    });
   },
   sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
   info: (message) => p.log.message(pc.dim(message)),
   success: (message) => p.log.success(message),
   warn: (message) => p.log.warn(message),
@@ -208,8 +216,10 @@ export async function announceServiceReady(
   const pollIntervalMs = options.pollIntervalMs ?? 1_000;
   const healthUrl = `${options.baseUrl}/api/health`;
   deps.info(`Waiting for the server at ${options.baseUrl} ...`);
-  const attempts = Math.max(1, Math.ceil(timeoutMs / pollIntervalMs));
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  // Probe time counts against the deadline: a slow probe must not stretch
+  // the configured timeout.
+  const deadline = deps.now() + timeoutMs;
+  for (;;) {
     if (await deps.probeHealth(healthUrl)) {
       deps.success(`Paperclip is running at ${options.baseUrl}`);
       if (options.interactive) {
@@ -223,6 +233,7 @@ export async function announceServiceReady(
       deps.info(`Open ${options.baseUrl} in your browser to get started.`);
       return true;
     }
+    if (deps.now() >= deadline) break;
     await deps.sleep(pollIntervalMs);
   }
   deps.warn(
