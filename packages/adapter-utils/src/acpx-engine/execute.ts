@@ -37,6 +37,11 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
+import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
+import {
+  classifyWorkspaceRestoreFailure,
+  describeWorkspaceRestoreFailure,
+} from "../workspace-restore-merge.js";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   applyPaperclipWorkspaceEnv,
@@ -218,7 +223,7 @@ export interface StagedRuntimeCacheEntry {
    * in-sandbox credential, not a stale snapshot. It never removes the staged
    * in-sandbox home, so re-running it on each reuse can't invalidate this entry.
    */
-  teardown: (() => Promise<void>) | null;
+  teardown: (() => Promise<WorkspaceRestoreOutcome>) | null;
   /**
    * The seam's one-time host-side staged-resource cleanup (e.g. remove the
    * staged home temp dir), or null. Fired ONLY when this entry is dropped —
@@ -315,7 +320,7 @@ export interface AcpxRemoteManagedHomeResult {
    * cached staged runtime across resumes never destroys resources a later run
    * still needs.
    */
-  teardown?: () => Promise<void>;
+  teardown?: () => Promise<WorkspaceRestoreOutcome>;
   /**
    * One-time cleanup of host-side staged resources (e.g. the curated staged
    * home temp dir). Split out from {@link teardown} so it fires ONLY when the
@@ -420,7 +425,7 @@ interface AcpxPreparedRuntime {
   // exit path by the settlement `syncBack` step; it never removes staged temp, so
   // it is safe on every compatible resume. Null for local runs, the runner-less
   // fallback, and adapters with no seam.
-  remoteManagedHomeTeardown: (() => Promise<void>) | null;
+  remoteManagedHomeTeardown: (() => Promise<WorkspaceRestoreOutcome>) | null;
   // One-time host-side staged-resource cleanup from the seam (remove staged temp
   // dirs). Fired ONLY when the staged runtime is dropped (failed/cancelled/timed
   // -out turn, incompatible re-stage, idle eviction), not on a clean turn that
@@ -2013,7 +2018,7 @@ async function buildRuntime(input: {
     remoteExecutionIdentity,
   });
   let stagedRuntime: PreparedAdapterExecutionTargetRuntime | null = null;
-  let remoteManagedHomeTeardown: (() => Promise<void>) | null = null;
+  let remoteManagedHomeTeardown: (() => Promise<WorkspaceRestoreOutcome>) | null = null;
   let remoteStagingDispose: (() => Promise<void>) | null = null;
   let remoteStagingEnvDelta: Record<string, string> | null = null;
   let sessionStagingLeaseRelease: (() => void) | null = null;
@@ -2364,14 +2369,22 @@ async function stopRunTransport(prepared: AcpxPreparedRuntime): Promise<void> {
 // dirs. The seam logs and swallows its own failures — an unclean-teardown
 // copy-back miss is the accepted, loud `refresh_token_reused` residual on the
 // next host Codex use, never silent HOST-credential corruption — so a teardown
-// fault never masks or fails the run result here.
-async function syncBackManagedHome(prepared: AcpxPreparedRuntime): Promise<void> {
-  if (prepared.remoteManagedHomeTeardown) {
-    await prepared.remoteManagedHomeTeardown().catch(() => {});
+// fault never masks or fails the run result here. It still returns the restore
+// outcome, so the caller can record a failure on the run record; the run's exit
+// code and status stay exactly what the turn produced.
+// The per-session staging lease does NOT release here. The settlement releases
+// it last, in its own `finally`, so a same-session second run cannot re-stage
+// until this run fully settles and the caller observes the result.
+async function syncBackManagedHome(prepared: AcpxPreparedRuntime): Promise<WorkspaceRestoreOutcome> {
+  if (!prepared.remoteManagedHomeTeardown) {
+    return { ok: true };
   }
-  // The per-session staging lease does NOT release here. The settlement releases
-  // it last, in its own `finally`, so a same-session second run cannot re-stage
-  // until this run fully settles and the caller observes the result.
+  // The teardown closure already catches and logs its own error (fail-soft);
+  // this `.catch` is defense in depth for the case where it rejects anyway, so
+  // a teardown fault can never propagate out of settlement.
+  return await prepared
+    .remoteManagedHomeTeardown()
+    .catch((): WorkspaceRestoreOutcome => ({ ok: false, code: "restore_failed" }));
 }
 
 /** How the settlement `endSession` step releases the runtime a run acquired. */
@@ -3442,8 +3455,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let referencedProjectStagingFailuresField:
         | { referencedProjectStagingFailures: Array<{ projectId: string; error: string }> }
         | Record<string, never> = {};
+      // Set only when the settlement sync-back reports a failed workspace
+      // restore. `reproduceResult` merges this into the returned result's
+      // `resultJson`, so a clean run adds no new key. The run's exit code and
+      // status stay exactly what the turn produced — this is a signal, not an
+      // outcome change.
+      let workspaceRestoreFailureField:
+        | { workspaceRestoreFailure: WorkspaceRestoreFailureCode }
+        | Record<string, never> = {};
+      // The one settlement step name whose error can be the same workspace-
+      // restore failure the adapter teardown closure already classifies (a
+      // caught error from `syncBackManagedHome`). The closure already
+      // sanitizes its own `onLog` line; this is a second, independent layer,
+      // so a defect in that closure (or a future call site that forgets to
+      // sanitize) still cannot put a raw `Error.message` — and the host path
+      // or process id it can carry — on the run log.
+      const SYNC_BACK_SETTLEMENT_STEP = "settlement-sync_back";
       const recordTeardownError = async (step: string, teardownErr: unknown) => {
-        const reason = teardownErr instanceof Error ? teardownErr.message : String(teardownErr);
+        const reason =
+          step === SYNC_BACK_SETTLEMENT_STEP
+            ? describeWorkspaceRestoreFailure(classifyWorkspaceRestoreFailure(teardownErr))
+            : teardownErr instanceof Error
+              ? teardownErr.message
+              : String(teardownErr);
         await ctx
           .onLog("stderr", `[paperclip] ACPX teardown step "${step}" failed: ${reason}\n`)
           .catch(() => {});
@@ -4445,7 +4479,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // per-task restore spans parent to `sandbox.syncBack`.
         syncBack: () => timedPhase("sync_back", async () => {
           await runRuntimeSpan("sandbox.syncBack", async () => {
-            await syncBackManagedHome(prepared);
+            const restoreOutcome = await syncBackManagedHome(prepared);
+            if (!restoreOutcome.ok) {
+              workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
+            }
           });
         }),
         // The staging lease releases as the run's final act, AFTER the coordinator
@@ -4490,7 +4527,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           if (!capturedResult) {
             throw new Error("run coordinator reproduced a result before the run recorded one");
           }
-          return capturedResult;
+          // The sync-back settlement step runs before this reproduces the result
+          // (settlement precedes reproduction), so a failed workspace restore is
+          // already recorded by the time we get here. Merge it into `resultJson`
+          // only on a failure — a clean restore adds no new key.
+          if (!("workspaceRestoreFailure" in workspaceRestoreFailureField)) {
+            return capturedResult;
+          }
+          return {
+            ...capturedResult,
+            resultJson: {
+              ...(capturedResult.resultJson ?? {}),
+              ...workspaceRestoreFailureField,
+            },
+          };
         },
       };
       return await runAttempt(plan);
