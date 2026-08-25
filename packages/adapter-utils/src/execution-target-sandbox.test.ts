@@ -34,6 +34,7 @@ import {
   startAdapterExecutionTargetProcessSessionBridge,
   startAdapterExecutionTargetPaperclipBridge,
   type AdapterSandboxExecutionTarget,
+  type EffectiveExecutionCapabilities,
   type EffectiveSandboxCapabilities,
 } from "./execution-target.js";
 import {
@@ -3102,7 +3103,7 @@ describe("sandbox adapter execution targets", () => {
 
   // The full effective-capability snapshot with one flag set. The two strict
   // gates read `duplexCommandStream`; the other flags stay false.
-  function duplexCapabilities(duplexCommandStream: boolean): EffectiveSandboxCapabilities {
+  function duplexCapabilities(duplexCommandStream: boolean): EffectiveExecutionCapabilities {
     return {
       reusableLeases: false,
       nativeSyncIn: false,
@@ -6898,5 +6899,25 @@ describe("duplex readiness gate replay-buffer reservation", () => {
     expect(ledger.bytesInUse).toBe(0);
     expect(gate.retainedReadinessBufferLength()).toBe(0);
     expect(counts.underflows).toBe(0);
+  });
+});
+
+describe("EffectiveSandboxCapabilities deprecated alias", () => {
+  it("still type-checks as EffectiveExecutionCapabilities", () => {
+    // A type-level check, not a runtime one: this assignment fails to compile
+    // if the alias drifts from the renamed interface. Keep it here so a later
+    // removal of the alias is a deliberate act, not an accident.
+    const snapshot: EffectiveExecutionCapabilities = {
+      reusableLeases: false,
+      nativeSyncIn: false,
+      nativeSyncOut: false,
+      persistentProcessSessions: false,
+      independentControlCommands: false,
+      incrementalSessionOutput: false,
+      concurrentSyncOperations: false,
+      duplexCommandStream: false,
+    };
+    const aliased: EffectiveSandboxCapabilities = snapshot;
+    expect(aliased).toEqual(snapshot);
   });
 });

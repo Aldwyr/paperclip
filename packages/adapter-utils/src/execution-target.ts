@@ -137,13 +137,14 @@ export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspa
 }
 
 /**
- * Read-only snapshot of the effective sandbox capabilities for one execution
- * target. Each flag is the resolved result of the provider's declaration, the
- * live worker's verified methods, and any narrowing from the config or lease.
- * The host computes it once and attaches it to the target; a consumer reads it
- * but never changes it, so every field is `readonly`.
+ * Read-only snapshot of the effective execution capabilities for one
+ * execution target — local, ssh, sandbox, or plugin. Each flag is the
+ * resolved result of the provider's declaration, the live worker's verified
+ * methods, and any narrowing from the config or lease. The host computes it
+ * once and attaches it to the target; a consumer reads it but never changes
+ * it, so every field is `readonly`.
  */
-export interface EffectiveSandboxCapabilities {
+export interface EffectiveExecutionCapabilities {
   readonly reusableLeases: boolean;
   readonly nativeSyncIn: boolean;
   readonly nativeSyncOut: boolean;
@@ -154,6 +155,12 @@ export interface EffectiveSandboxCapabilities {
   readonly duplexCommandStream: boolean;
 }
 
+/**
+ * @deprecated Renamed to `EffectiveExecutionCapabilities`. This alias will
+ * be removed in a later major release.
+ */
+export interface EffectiveSandboxCapabilities extends EffectiveExecutionCapabilities {}
+
 export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   kind: "remote";
   transport: "sandbox";
@@ -163,7 +170,7 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
    * resolves it from the provider declaration ∩ the verified worker methods ∩
    * narrowing, then attaches it here. Absent when no snapshot was resolved.
    */
-  readonly effectiveCapabilities?: EffectiveSandboxCapabilities | null;
+  readonly effectiveCapabilities?: EffectiveExecutionCapabilities | null;
   /**
    * Per-run duplex bridge kill switch. The host stamps it on the same seam as
    * `effectiveCapabilities`. `true` selects the duplex transport only when the
@@ -345,7 +352,7 @@ function readString(value: unknown): string | null {
 // missing or non-boolean field reads as `false`, so a round-tripped target
 // never grants a capability that the snapshot did not carry. Returns null when
 // there is no object to read.
-function parseEffectiveSandboxCapabilities(value: unknown): EffectiveSandboxCapabilities | null {
+function parseEffectiveExecutionCapabilities(value: unknown): EffectiveExecutionCapabilities | null {
   const parsed = parseObject(value);
   if (Object.keys(parsed).length === 0) return null;
   return {
@@ -1311,7 +1318,7 @@ export function parseAdapterExecutionTarget(value: unknown): AdapterExecutionTar
   if (kind === "remote" && readStringMeta(parsed, "transport") === "sandbox") {
     const remoteCwd = readStringMeta(parsed, "remoteCwd");
     if (!remoteCwd) return null;
-    const effectiveCapabilities = parseEffectiveSandboxCapabilities(parsed.effectiveCapabilities);
+    const effectiveCapabilities = parseEffectiveExecutionCapabilities(parsed.effectiveCapabilities);
     return {
       kind: "remote",
       transport: "sandbox",
