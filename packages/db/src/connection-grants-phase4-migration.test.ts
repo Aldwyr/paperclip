@@ -9,7 +9,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0229_sticky_nightcrawler.sql";
+const MIGRATION_FILE = "0230_sticky_nightcrawler.sql";
 const migrationSql = fs.readFileSync(
   path.join(import.meta.dirname, "migrations", MIGRATION_FILE),
   "utf8",
