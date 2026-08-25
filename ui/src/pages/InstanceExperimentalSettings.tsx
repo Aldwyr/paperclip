@@ -12,7 +12,7 @@ import type {
 import { experimentalSettingKey } from "@paperclipai/shared";
 import { instanceSettingsApi } from "@/api/instanceSettings";
 import { useHiddenSettings } from "@/hooks/useHiddenSettings";
-import { getWorktreeInstanceId, isWorktreeRuntime } from "../lib/worktree-branding";
+import { isWorktreeRuntime } from "../lib/worktree-branding";
 import { WorktreeRunEngineBanner } from "@/components/WorktreeRunEngineBanner";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -706,63 +706,6 @@ export function InstanceExperimentalSettings() {
         managed={managedKeys.enableManagedSandboxOnly}
         ariaLabel="Toggle managed environment only experimental setting"
       />
-
-      {inWorktree ? (
-        <Card className="block p-5">
-          <div className="flex flex-col gap-4">
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-sm font-semibold">Run tasks in this worktree</h2>
-                  {worktreeRunExecutionManaged ? <ManagedByCloudBadge /> : null}
-                </div>
-                <p className="max-w-2xl text-sm text-muted-foreground">
-                  This is an isolated git-worktree preview instance. Turn this on to let the scheduler execute runs
-                  here. Only tasks created after enabling will run automatically — copied/pre-existing tasks stay
-                  parked. Toggling off and on resets the cutoff.
-                </p>
-              </div>
-              <ToggleSwitch
-                checked={enableWorktreeRunExecution}
-                onCheckedChange={(checked) => {
-                  if (worktreeRunExecutionManaged) return;
-                  toggleMutation.mutate({ enableWorktreeRunExecution: checked });
-                }}
-                disabled={toggleMutation.isPending || worktreeRunExecutionManaged}
-                aria-label="Toggle worktree run execution setting"
-              />
-            </div>
-
-            {worktreeRunExecutionState.kind === "armed" ? (
-              <div className="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-sm text-foreground">
-                <Play className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span>
-                  Running tasks created after{" "}
-                  <span className="font-medium">
-                    {formatActivationTimestamp(worktreeRunExecutionState.activatedAt)}
-                  </span>
-                  .
-                </span>
-              </div>
-            ) : null}
-
-            {worktreeRunExecutionState.kind === "fail_closed" ? (
-              <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
-                <div className="space-y-0.5">
-                  <p className="font-medium text-foreground">Execution is suppressed — effectively off.</p>
-                  <p className="text-muted-foreground">
-                    {worktreeRunExecutionState.reason === "instance_mismatch"
-                      ? "This setting was armed in a different instance and copied here, so no tasks run automatically."
-                      : "This setting is missing its activation cutoff, so no tasks run automatically."}{" "}
-                    Toggle it off and back on to arm execution for tasks created here.
-                  </p>
-                </div>
-              </div>
-            ) : null}
-          </div>
-        </Card>
-      ) : null}
 
       <ExperimentalToggleCard
         title="Server Info Debug View"
