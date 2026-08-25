@@ -4,13 +4,16 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Mode {
     large_event: bool,
     oversized_event: bool,
     linger_after_turn_start: bool,
     runtime_question: bool,
     runtime_elicitation: bool,
+    structured_activity: bool,
+    include_skill_instructions: bool,
+    expected_approval_policy: Option<String>,
 }
 
 fn send(value: Value) -> io::Result<()> {
@@ -28,6 +31,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         linger_after_turn_start: args.iter().any(|arg| arg == "--linger-after-turn-start"),
         runtime_question: args.iter().any(|arg| arg == "--runtime-question"),
         runtime_elicitation: args.iter().any(|arg| arg == "--runtime-elicitation"),
+        structured_activity: args.iter().any(|arg| arg == "--structured-activity"),
+        include_skill_instructions: args.iter().any(|arg| arg == "--include-skill-instructions"),
+        expected_approval_policy: args
+            .windows(2)
+            .find(|pair| pair[0] == "--expected-approval-policy")
+            .map(|pair| pair[1].clone()),
     };
     let mut turn_count = 0_u64;
     let mut active_turn_id: Option<String> = None;
@@ -54,6 +63,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "result": {"data": [{"name": "Plan", "mode": "plan", "model": "gpt-test", "reasoning_effort": "high"}]}
             }))?,
             "thread/start" | "thread/resume" => {
+                if let Some(expected) = mode.expected_approval_policy.as_deref() {
+                    if request
+                        .pointer("/params/approvalPolicy")
+                        .and_then(Value::as_str)
+                        != Some(expected)
+                    {
+                        return Err(
+                            format!("{method} omitted expected approvalPolicy={expected}").into(),
+                        );
+                    }
+                }
                 let tools = request
                     .pointer("/params/dynamicTools")
                     .and_then(Value::as_array)
@@ -69,8 +89,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .pointer("/params/permissions")
                     .and_then(Value::as_str)
                     == Some("paperclip-runner-workspace-read-only");
+                if config
+                    .and_then(|value| value.get("skills.include_instructions"))
+                    .and_then(Value::as_bool)
+                    != Some(mode.include_skill_instructions)
+                {
+                    return Err(format!(
+                        "thread config omitted skills.include_instructions={}",
+                        mode.include_skill_instructions
+                    )
+                    .into());
+                }
                 for key in [
-                    "skills.include_instructions",
                     "include_apps_instructions",
                     "features.apps",
                     "features.plugins",
@@ -137,6 +167,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"threadId": "fake-thread", "turn": {"id": turn_id, "status": "inProgress"}}
                 }))?;
+                if mode.structured_activity {
+                    send(json!({
+                        "method": "turn/plan/updated",
+                        "params": {
+                            "threadId": "fake-thread",
+                            "turnId": turn_id,
+                            "revision": 1,
+                            "plan": [
+                                {"step": "Inspect the runner path", "status": "inProgress"},
+                                {"step": "Implement the status island", "status": "pending"},
+                                {"step": "Verify replay and UI behavior", "status": "pending"}
+                            ]
+                        }
+                    }))?;
+                    send(json!({
+                        "method": "turn/diff/updated",
+                        "params": {
+                            "threadId": "fake-thread",
+                            "turnId": turn_id,
+                            "revision": 1,
+                            "diff": "diff --git a/ui/src/status.tsx b/ui/src/status.tsx\nnew file mode 100644\n--- /dev/null\n+++ b/ui/src/status.tsx\n@@ -0,0 +1,2 @@\n+export const status = 'working';\n+export const steps = 3;\n"
+                        }
+                    }))?;
+                    send(json!({
+                        "method": "turn/plan/updated",
+                        "params": {
+                            "threadId": "fake-thread",
+                            "turnId": turn_id,
+                            "revision": 2,
+                            "plan": [
+                                {"step": "Inspect the runner path", "status": "completed"},
+                                {"step": "Implement the status island", "status": "inProgress"},
+                                {"step": "Verify replay and UI behavior", "status": "pending"}
+                            ]
+                        }
+                    }))?;
+                }
                 if mode.large_event || mode.oversized_event {
                     let bytes = if mode.oversized_event {
                         4 * 1024 * 1024 + 128
@@ -262,6 +329,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(Value::as_str)
             .and_then(|request_id| pending_tool_turns.remove(request_id));
         if let Some(turn_id) = completed_turn.filter(|_| request.get("result").is_some()) {
+            if mode.structured_activity {
+                send(json!({
+                    "method": "turn/plan/updated",
+                    "params": {
+                        "threadId": "fake-thread",
+                        "turnId": turn_id,
+                        "revision": 3,
+                        "plan": [
+                            {"step": "Inspect the runner path", "status": "completed"},
+                            {"step": "Implement the status island", "status": "completed"},
+                            {"step": "Verify replay and UI behavior", "status": "completed"}
+                        ]
+                    }
+                }))?;
+                send(json!({
+                    "method": "turn/diff/updated",
+                    "params": {
+                        "threadId": "fake-thread",
+                        "turnId": turn_id,
+                        "revision": 2,
+                        "diff": "diff --git a/ui/src/status.tsx b/ui/src/status.tsx\nnew file mode 100644\n--- /dev/null\n+++ b/ui/src/status.tsx\n@@ -0,0 +1,3 @@\n+export const status = 'complete';\n+export const steps = 3;\n+export const verified = true;\n"
+                    }
+                }))?;
+            }
             send(json!({
                 "method": "paperclip/runResult",
                 "params": {

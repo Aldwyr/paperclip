@@ -1,3 +1,17 @@
+fn sleep_for_reconnect(base: Duration, attempt: &mut u32) {
+    let multiplier = 1_u128 << (*attempt).min(5);
+    let uncapped = base.as_millis().saturating_mul(multiplier);
+    let capped = uncapped.min(5_000).max(1) as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| u64::from(duration.subsec_nanos()));
+    let jitter_percent = 75 + nanos % 51;
+    *attempt = attempt.saturating_add(1);
+    thread::sleep(Duration::from_millis(
+        capped.saturating_mul(jitter_percent) / 100,
+    ));
+}
+
 pub fn run_durable_runner(
     config: DurableRunnerConfig,
     bootstrap_ticket: BootstrapTicket,
@@ -23,6 +37,9 @@ pub fn run_durable_runner(
         state.lifecycle = "ready".to_owned();
         state.record_diagnostic("resuming an explicitly suspended durable runner");
     }
+    // Bind listener mode before starting the harness. A fixed-port collision is
+    // an unhealthy lease and must fail without launching provider work.
+    let endpoint = RunnerTransportEndpoint::new(&config.connect_url)?;
     let mut provider = match start_configured_provider(&mut state) {
         Ok(provider) => provider,
         Err(error) => {
@@ -50,9 +67,6 @@ pub fn run_durable_runner(
         }
     }
     store.save(&state)?;
-    // Resolve once before authentication. Reconnects use only this validated,
-    // concrete address set, so DNS cannot redirect a retry.
-    let target = ResolvedWsTarget::resolve(&config.connect_url)?;
     if recovered {
         state.reconnect_count += 1;
         state.record_diagnostic("runner process restored the same durable identity");
@@ -78,8 +92,11 @@ pub fn run_durable_runner(
     let mut connection_lease_expires_at_unix_ms: Option<u64> = None;
     let mut connection_lease_revocation_epoch: Option<u64> = None;
     let started = Instant::now();
+    let mut reconnect_attempt = 0_u32;
+    let mut authenticated_once = false;
+    let mut disconnected_since: Option<Instant> = None;
 
-    loop {
+    'transport: loop {
         if started.elapsed() >= config.max_runtime && !state.active_turn {
             state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
             state.lifecycle = "recoverable_failure".to_owned();
@@ -90,6 +107,23 @@ pub fn run_durable_runner(
             return Err(DurableRunnerError::invalid(
                 "transport reconnect deadline exceeded; durable state is preserved",
             ));
+        }
+        if authenticated_once {
+            let disconnected_at = disconnected_since.get_or_insert_with(Instant::now);
+            if config
+                .reconnect_grace
+                .is_some_and(|grace| disconnected_at.elapsed() >= grace)
+            {
+                state.recoverable_failure = Some("transport_reconnect_grace_exceeded".to_owned());
+                state.lifecycle = "recoverable_failure".to_owned();
+                state.record_diagnostic(
+                    "transport reconnect grace exceeded; durable state is preserved",
+                );
+                store.save(&state)?;
+                return Err(DurableRunnerError::invalid(
+                    "transport reconnect grace exceeded; durable state is preserved",
+                ));
+            }
         }
         if connection_lease_expires_at_unix_ms
             .is_some_and(|expires_at| current_unix_ms().is_ok_and(|now| now >= expires_at))
@@ -119,13 +153,20 @@ pub fn run_durable_runner(
                 )
             })?;
         let credential = CredentialMaterial::from_token(credential_token);
-        let mut client = match WsClient::connect(&target, config.max_frame_bytes) {
-            Ok(client) => client,
+        let mut client = match endpoint.open(
+            config.max_frame_bytes,
+            config.ca_bundle_path.as_deref(),
+        ) {
+            Ok(Some(client)) => client,
+            Ok(None) => {
+                thread::sleep(config.reconnect_delay);
+                continue;
+            }
             Err(error) => {
                 let text = error.to_string();
                 state.record_diagnostic(format!("transport reconnect scheduled: {text}"));
                 store.save(&state)?;
-                thread::sleep(config.reconnect_delay);
+                sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
                 continue;
             }
         };
@@ -143,7 +184,7 @@ pub fn run_durable_runner(
                 "transport peer authentication failed closed: {error}"
             ));
             store.save(&state)?;
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
             continue;
         }
         let mut welcome = loop {
@@ -156,12 +197,15 @@ pub fn run_durable_runner(
                 Err(error) => {
                     state.record_diagnostic(error.to_string());
                     store.save(&state)?;
-                    thread::sleep(config.reconnect_delay);
-                    continue;
+                    sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
+                    continue 'transport;
                 }
             }
         };
         let (_, connection) = validate_welcome(&welcome, &state)?;
+        authenticated_once = true;
+        disconnected_since = None;
+        reconnect_attempt = 0;
         let next_lease_token = match welcome.pointer_mut("/payload/connectionLeaseToken") {
             Some(Value::String(value)) => {
                 let token = std::mem::take(value);
@@ -226,7 +270,7 @@ pub fn run_durable_runner(
             state.record_diagnostic(error.to_string());
             state.reconnect_count += 1;
             store.save(&state)?;
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
             continue;
         }
 
@@ -480,7 +524,7 @@ pub fn run_durable_runner(
             }
         };
         if disconnected {
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
         }
     }
 }
@@ -636,12 +680,14 @@ fn provider_descriptor(
                 _ => None,
             },
             "agentProcessId": runtime.and_then(|item| item.agent_process_id()),
+            "permissionMode": value.permission_mode,
         }),
         Some(crate::codex_provider::ProviderConfig::Local(value)) => json!({
             "provider": provider_kind_name(value.kind),
             "driver": if value.kind == crate::codex_provider::ProviderKind::Opencode { "opencode_server" } else { "codex_app_server" },
             "model": value.model,
             "collaborationMode": value.collaboration_mode,
+            "approvalPolicy": value.approval_policy,
             "collaborationInstructions": value.include_collaboration_mode_instructions,
             "executionKind": "local_process",
             "providerVersion": if value.kind == crate::codex_provider::ProviderKind::Opencode { "1.18.17" } else { "unqualified" },
@@ -2094,7 +2140,8 @@ mod tests {
                 run_id: "run".to_owned(),
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
-                permission_policy: "interactive".to_owned(),
+                permission_mode: "approve-all".to_owned(),
+                permission_mode_pinned: true,
                 runtime_context: None,
             },
         ));
@@ -2134,7 +2181,8 @@ mod tests {
                 run_id: "run".to_owned(),
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
-                permission_policy: "interactive".to_owned(),
+                permission_mode: "approve-all".to_owned(),
+                permission_mode_pinned: true,
                 runtime_context: None,
             },
         ));
@@ -2253,6 +2301,7 @@ mod tests {
     fn config(root: &Path) -> DurableRunnerConfig {
         DurableRunnerConfig {
             connect_url: "ws://127.0.0.1:1/durable_runner/connect".to_owned(),
+            ca_bundle_path: None,
             state_dir: root.to_path_buf(),
             runner_instance_id: "runner_durable_runner_stable".to_owned(),
             environment_lease_id: "lease_durable_runner_stable".to_owned(),
@@ -2268,6 +2317,7 @@ mod tests {
             p0_reserve_bytes: 8 * 1024,
             max_frame_bytes: 1024 * 1024,
             reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
             max_runtime: Duration::from_millis(10),
             lifecycle_mode: "per_turn".to_owned(),
             idle_timeout: None,
@@ -2722,7 +2772,7 @@ mod tests {
             |_host, _port| Ok(vec![address]),
         )
         .unwrap();
-        let mut client = WsClient::connect(&target, config.max_frame_bytes).unwrap();
+        let mut client = WsClient::connect(&target, config.max_frame_bytes, None).unwrap();
         let error = authenticate_transport(
             &mut client,
             &state,
@@ -2733,7 +2783,8 @@ mod tests {
             None,
             None,
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(error
             .to_string()
             .contains("transport authentication proof is invalid"));
@@ -3068,9 +3119,7 @@ mod tests {
     #[test]
     fn destination_validation_rejects_malformed_userinfo_query_and_fragment_before_resolution() {
         for url in [
-            "wss://127.0.0.1:3100/durable_runner/connect",
             "WS://127.0.0.1:3100/durable_runner/connect",
-            "ws://127.0.0.1/durable_runner/connect",
             "ws://127.0.0.1:0/durable_runner/connect",
             "ws://[::1:3100/durable_runner/connect",
             "ws://user@127.0.0.1:3100/durable_runner/connect",
@@ -3089,6 +3138,31 @@ mod tests {
                 "malformed URL reached destination resolution: {url}"
             );
         }
+    }
+
+    #[test]
+    fn destination_validation_allows_verified_wss_remote_addresses_and_default_ports() {
+        let target = resolve_ws_target_with(
+            "wss://paperclip.example.test/api/runner/v1/connect/run",
+            |host, port| {
+                assert_eq!(host, "paperclip.example.test");
+                assert_eq!(port, 443);
+                Ok(vec!["192.0.2.10:443".parse().unwrap()])
+            },
+        )
+        .unwrap();
+        assert!(target.secure);
+        assert_eq!(target.host, "paperclip.example.test");
+
+        let loopback = resolve_ws_target_with(
+            "ws://127.0.0.1/api/runner/v1/connect/run",
+            |_host, port| {
+                assert_eq!(port, 80);
+                Ok(vec!["127.0.0.1:80".parse().unwrap()])
+            },
+        )
+        .unwrap();
+        assert!(!loopback.secure);
     }
 
     #[test]
@@ -3112,7 +3186,7 @@ mod tests {
 
     #[test]
     fn oversized_outbound_websocket_frame_is_rejected_before_write() {
-        let error = encode_masked_frame(0x1, b"ninebytes", [0; 4], 8).unwrap_err();
+        let error = encode_frame(0x1, b"ninebytes", Some([0; 4]), 8).unwrap_err();
         assert!(error
             .to_string()
             .contains("outbound WebSocket frame exceeds"));
@@ -3124,6 +3198,78 @@ mod tests {
         assert!(error
             .to_string()
             .contains("inbound WebSocket frame exceeds"));
+    }
+
+    fn listener_client(request: &str) -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn runner_listener_accepts_only_the_exact_websocket_path_without_compression() {
+        let (mut wrong_path_client, wrong_path_server) = listener_client(
+            "GET /unrelated HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let error = WsClient::accept(
+            wrong_path_server,
+            "/api/runner/v1/connect/run-1",
+            1024,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("unrelated HTTP path"));
+        let response = read_http_headers(&mut wrong_path_client, "test response").unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 "));
+
+        let (_compression_client, compression_server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+        );
+        let error = WsClient::accept(
+            compression_server,
+            "/api/runner/v1/connect/run-1",
+            1024,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("does not support WebSocket compression"));
+    }
+
+    #[test]
+    fn runner_listener_requires_masked_client_frames_and_enforces_control_limits() {
+        let (mut client, server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted = WsClient::accept(
+            server,
+            "/api/runner/v1/connect/run-1",
+            1024,
+        )
+        .unwrap();
+        let response = read_http_headers(&mut client, "test response").unwrap();
+        assert!(response.starts_with("HTTP/1.1 101 "));
+        client.write_all(&encode_frame(0x1, b"{}", None, 1024).unwrap()).unwrap();
+        let error = accepted.receive_plain_json().unwrap_err();
+        assert!(error.to_string().contains("masking direction is invalid"));
+
+        let (mut control_client, control_server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted = WsClient::accept(
+            control_server,
+            "/api/runner/v1/connect/run-1",
+            1024,
+        )
+        .unwrap();
+        let _ = read_http_headers(&mut control_client, "test response").unwrap();
+        control_client
+            .write_all(&[0x89, 0xFE, 0, 126])
+            .unwrap();
+        let error = accepted.receive_plain_json().unwrap_err();
+        assert!(error.to_string().contains("control frame exceeds 125 bytes"));
     }
 
     #[test]

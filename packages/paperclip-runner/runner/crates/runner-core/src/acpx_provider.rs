@@ -88,6 +88,8 @@ impl AcpxProvider {
                 "workingDirectory": config.cwd,
                 "agent": config.agent,
                 "model": config.model,
+                "permissionMode": config.permission_mode,
+                "permissionModePinned": config.permission_mode_pinned,
                 "systemInstructions": config.instructions,
                 "tools": provider.tools,
                 "expectedIdentity": expected_identity,
@@ -364,7 +366,15 @@ impl AcpxProvider {
                             .unwrap_or_default(),
                     );
                 }
-                Ok(Some(map_runtime_event(payload, self.provider_requests)))
+                let turn_id = message
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(Some(map_runtime_event(
+                    payload,
+                    self.provider_requests,
+                    turn_id,
+                )))
             }
             GeneratedAcpxSidecarEventType::RuntimeProcess => {
                 Ok(Some(ProviderEvent::Notification {
@@ -643,7 +653,10 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
         || config.agent_runtime_package.as_deref() != runtime_package
         || config.agent_runtime_version.as_deref() != runtime_version
         || config.model != model
-        || config.permission_policy != "interactive"
+        || !matches!(
+            config.permission_mode.as_str(),
+            "approve-all" | "approve-reads" | "deny-all"
+        )
         || config.command_digest != command_digest
         || config.normalized_session_id.is_empty()
         || config.run_id.is_empty()
@@ -757,7 +770,7 @@ fn permission_kind(value: Option<&str>) -> String {
     }
 }
 
-fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
+fn map_runtime_event(payload: Value, provider_requests: u64, turn_id: &str) -> ProviderEvent {
     match payload
         .get("type")
         .and_then(Value::as_str)
@@ -775,6 +788,32 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
             method: "item/started".to_owned(),
             params: json!({ "item": { "type": "reasoning", "status": "inProgress" } }),
         },
+        "plan" => {
+            let plan: Vec<Value> = payload
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .take(256)
+                        .filter_map(|entry| {
+                            let step = entry.get("content")?.as_str()?.trim();
+                            if step.is_empty() {
+                                return None;
+                            }
+                            Some(json!({
+                                "step": step.chars().take(4000).collect::<String>(),
+                                "status": entry.get("status").and_then(Value::as_str).unwrap_or("pending"),
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ProviderEvent::Notification {
+                method: "turn/plan/updated".to_owned(),
+                params: json!({ "turnId": turn_id, "plan": plan }),
+            }
+        }
         "semantic_result" => ProviderEvent::SemanticResult {
             result: payload.get("result").cloned().unwrap_or(Value::Null),
             item_id: payload
@@ -870,7 +909,8 @@ mod tests {
             run_id: "run".to_owned(),
             cwd: "/tmp/workspace".to_owned(),
             instructions: "safe".to_owned(),
-            permission_policy: "interactive".to_owned(),
+            permission_mode: "approve-all".to_owned(),
+            permission_mode_pinned: true,
             runtime_context: None,
         };
         assert!(validate_config(&config).is_err());
@@ -881,6 +921,7 @@ mod tests {
         let event = map_runtime_event(
             json!({ "type": "thinking", "text": "secret chain of thought" }),
             1,
+            "turn-1",
         );
         match event {
             ProviderEvent::Notification { params, .. } => {
@@ -899,6 +940,7 @@ mod tests {
         let event = map_runtime_event(
             json!({ "type": "semantic_result", "callId": "finish-1", "result": result }),
             1,
+            "turn-1",
         );
         match event {
             ProviderEvent::SemanticResult { result, item_id } => {
@@ -906,6 +948,33 @@ mod tests {
                 assert_eq!(item_id.as_deref(), Some("finish-1"));
             }
             _ => panic!("expected semantic result"),
+        }
+    }
+
+    #[test]
+    fn preserves_every_structured_plan_entry_for_the_active_turn() {
+        let event = map_runtime_event(
+            json!({
+                "type": "plan",
+                "entries": [
+                    {"content": "Inspect", "status": "completed", "priority": "high"},
+                    {"content": "Implement", "status": "in_progress", "priority": "medium"},
+                    {"content": "Verify", "status": "pending", "priority": "low"}
+                ]
+            }),
+            1,
+            "turn-acp",
+        );
+        match event {
+            ProviderEvent::Notification { method, params } => {
+                assert_eq!(method, "turn/plan/updated");
+                assert_eq!(params["turnId"], "turn-acp");
+                assert_eq!(params["plan"].as_array().unwrap().len(), 3);
+                assert_eq!(params["plan"][0]["step"], "Inspect");
+                assert_eq!(params["plan"][1]["status"], "in_progress");
+                assert_eq!(params["plan"][2]["step"], "Verify");
+            }
+            _ => panic!("expected plan notification"),
         }
     }
 }

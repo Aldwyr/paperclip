@@ -3,9 +3,10 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -17,6 +18,10 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use base64::Engine as _;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::codex_provider::ProviderConfig;
 use crate::process_supervisor::SupervisedProcess;
@@ -105,6 +110,7 @@ pub fn capture_bootstrap_ticket() -> Result<Option<BootstrapTicket>, DurableRunn
 #[derive(Clone, Debug)]
 pub struct DurableRunnerConfig {
     pub connect_url: String,
+    pub ca_bundle_path: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub runner_instance_id: String,
     pub environment_lease_id: String,
@@ -120,6 +126,7 @@ pub struct DurableRunnerConfig {
     pub p0_reserve_bytes: usize,
     pub max_frame_bytes: usize,
     pub reconnect_delay: Duration,
+    pub reconnect_grace: Option<Duration>,
     pub max_runtime: Duration,
     pub lifecycle_mode: String,
     pub idle_timeout: Option<Duration>,

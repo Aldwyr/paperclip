@@ -26,6 +26,7 @@ fn codex_plan_mode_is_qualified_and_selected_on_turn_start() {
             args: Vec::new(),
             cwd: "/tmp".to_owned(),
             model: None,
+            approval_policy: "never".to_owned(),
             instructions: "Author a plan without editing files.".to_owned(),
             collaboration_mode: "plan".to_owned(),
             include_collaboration_mode_instructions: true,
@@ -41,6 +42,33 @@ fn codex_plan_mode_is_qualified_and_selected_on_turn_start() {
 }
 
 #[test]
+fn codex_permission_policy_is_pinned_on_thread_start_and_resume() {
+    for policy in ["never", "on-request", "untrusted"] {
+        for resume_thread_id in [None, Some("existing-thread")] {
+            let mut provider = CodexProvider::start(
+                &LocalProviderConfig {
+                    kind: ProviderKind::Codex,
+                    command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
+                    args: vec!["--expected-approval-policy".to_owned(), policy.to_owned()],
+                    cwd: "/tmp".to_owned(),
+                    model: None,
+                    approval_policy: policy.to_owned(),
+                    instructions: "Use the configured approval policy.".to_owned(),
+                    collaboration_mode: "default".to_owned(),
+                    include_collaboration_mode_instructions: true,
+                    include_skill_instructions: false,
+                    runtime_context: None,
+                },
+                vec![test_tool()].into_iter(),
+                resume_thread_id,
+            )
+            .unwrap();
+            provider.shutdown().unwrap();
+        }
+    }
+}
+
+#[test]
 fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
     let mut provider = CodexProvider::start(
         &LocalProviderConfig {
@@ -49,6 +77,7 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
             args: Vec::new(),
             cwd: "/tmp".to_owned(),
             model: None,
+            approval_policy: "never".to_owned(),
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
@@ -120,6 +149,92 @@ fn codex_dynamic_tool_round_trips_through_the_rust_provider_boundary() {
 }
 
 #[test]
+fn deterministic_fixture_emits_replacing_plan_and_diff_snapshots() {
+    let mut provider = CodexProvider::start(
+        &LocalProviderConfig {
+            kind: ProviderKind::Codex,
+            command: PathBuf::from(env!("CARGO_BIN_EXE_fake-codex-app-server")),
+            args: vec!["--structured-activity".to_owned()],
+            cwd: "/tmp".to_owned(),
+            model: None,
+            approval_policy: "never".to_owned(),
+            instructions: "Emit deterministic structured activity.".to_owned(),
+            collaboration_mode: "default".to_owned(),
+            include_collaboration_mode_instructions: true,
+            include_skill_instructions: false,
+            runtime_context: None,
+        },
+        vec![test_tool()].into_iter(),
+        None,
+    )
+    .unwrap();
+    provider
+        .start_turn("Exercise the fixture.", "/tmp")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut plan_revisions = Vec::new();
+    let mut diff_revisions = Vec::new();
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not issue its tool call"
+        );
+        match provider.poll().unwrap() {
+            Some(ProviderEvent::Notification { method, params })
+                if method == "turn/plan/updated" =>
+            {
+                plan_revisions.push(params["revision"].as_u64().unwrap());
+                assert_eq!(params["turnId"], "fake-turn");
+            }
+            Some(ProviderEvent::Notification { method, params })
+                if method == "turn/diff/updated" =>
+            {
+                diff_revisions.push(params["revision"].as_u64().unwrap());
+            }
+            Some(ProviderEvent::ToolCall {
+                call_id,
+                operation_id,
+                ..
+            }) => {
+                provider
+                    .deliver_tool_result(&ToolResult {
+                        call_id,
+                        operation_id,
+                        result: json!({"ok": true}),
+                        is_error: false,
+                    })
+                    .unwrap();
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(Instant::now() < deadline, "fixture did not finish its turn");
+        match provider.poll().unwrap() {
+            Some(ProviderEvent::Notification { method, params })
+                if method == "turn/plan/updated" =>
+            {
+                plan_revisions.push(params["revision"].as_u64().unwrap());
+            }
+            Some(ProviderEvent::Notification { method, params })
+                if method == "turn/diff/updated" =>
+            {
+                diff_revisions.push(params["revision"].as_u64().unwrap());
+            }
+            Some(ProviderEvent::Notification { method, .. }) if method == "turn/completed" => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(plan_revisions, vec![1, 2, 3]);
+    assert_eq!(diff_revisions, vec![1, 2]);
+}
+
+#[test]
 fn dot_185_runtime_question_round_trips_through_the_rust_provider_boundary() {
     let mut provider = CodexProvider::start(
         &LocalProviderConfig {
@@ -128,6 +243,7 @@ fn dot_185_runtime_question_round_trips_through_the_rust_provider_boundary() {
             args: vec!["--runtime-question".to_owned()],
             cwd: "/tmp".to_owned(),
             model: None,
+            approval_policy: "never".to_owned(),
             instructions: "Ask for deployment input.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
@@ -196,6 +312,7 @@ fn provider_contract_preserves_the_opencode_tag() {
             args: Vec::new(),
             cwd: "/tmp".to_owned(),
             model: Some("openrouter/deepseek/deepseek-v4-flash-0731".to_owned()),
+            approval_policy: "never".to_owned(),
             instructions: "Use the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: false,
@@ -226,6 +343,7 @@ fn image_like_prompt_stays_skillless_and_accepts_a_valid_one_point_two_megabyte_
             args: vec!["--large-event".to_owned()],
             cwd: "/tmp".to_owned(),
             model: None,
+            approval_policy: "never".to_owned(),
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,
@@ -288,6 +406,7 @@ fn codex_provider_rejects_an_event_above_the_four_megabyte_hard_limit() {
             args: vec!["--oversized-event".to_owned()],
             cwd: "/tmp".to_owned(),
             model: None,
+            approval_policy: "never".to_owned(),
             instructions: "Use only the authorized Paperclip tools.".to_owned(),
             collaboration_mode: "default".to_owned(),
             include_collaboration_mode_instructions: true,

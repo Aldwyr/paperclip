@@ -259,6 +259,8 @@ pub struct LocalProviderConfig {
     pub args: Vec<String>,
     pub cwd: String,
     pub model: Option<String>,
+    #[serde(default = "default_codex_approval_policy")]
+    pub approval_policy: String,
     pub instructions: String,
     #[serde(default = "default_collaboration_mode")]
     pub collaboration_mode: String,
@@ -333,9 +335,20 @@ pub struct AcpxProviderConfig {
     pub run_id: String,
     pub cwd: String,
     pub instructions: String,
-    pub permission_policy: String,
+    #[serde(default = "default_legacy_acpx_permission_mode")]
+    pub permission_mode: String,
+    #[serde(default)]
+    pub permission_mode_pinned: bool,
     #[serde(default)]
     pub runtime_context: Option<Value>,
+}
+
+fn default_codex_approval_policy() -> String {
+    "never".to_owned()
+}
+
+fn default_legacy_acpx_permission_mode() -> String {
+    "approve-reads".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -700,7 +713,7 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                             .unwrap_or("Question"),
                         4_000,
                     ),
-                    "required": question.get("required").and_then(Value::as_bool).unwrap_or(true),
+                    "required": question.get("required").and_then(Value::as_bool).unwrap_or(false),
                     "answerMode": if options.is_empty() {
                         "text"
                     } else if question.get("multiSelect").and_then(Value::as_bool).unwrap_or(false)
@@ -1142,6 +1155,14 @@ impl CodexProvider {
         tools: impl Iterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
+        if !matches!(
+            config.approval_policy.as_str(),
+            "never" | "on-request" | "untrusted"
+        ) {
+            return Err(LocalRunnerError::invalid(
+                "unsupported Codex approval policy",
+            ));
+        }
         let mut provider = Self {
             kind: config.kind,
             process: SupervisedProcess::spawn(
@@ -1193,7 +1214,7 @@ impl CodexProvider {
                     "threadId": thread_id,
                     "cwd": config.cwd,
                     "model": config.model,
-                    "approvalPolicy": "never",
+                    "approvalPolicy": config.approval_policy,
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
@@ -1212,7 +1233,7 @@ impl CodexProvider {
                 json!({
                     "cwd": config.cwd,
                     "model": config.model,
-                    "approvalPolicy": "never",
+                    "approvalPolicy": config.approval_policy,
                     "permissions": permission_profile,
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
@@ -1798,6 +1819,7 @@ mod provider_trace_tests {
         )
         .unwrap();
         assert_eq!(question_set["questions"].as_array().unwrap().len(), 3);
+        assert_eq!(question_set["questions"][0]["required"], false);
         assert_eq!(
             question_set["questions"][0]["options"][0]["label"],
             "Focused"
@@ -1877,6 +1899,7 @@ mod provider_trace_tests {
             "collaborationMode": "default"
         }))
         .unwrap();
+        assert_eq!(default_config.approval_policy, "never");
         assert!(default_config.include_collaboration_mode_instructions);
         assert_eq!(
             isolated_thread_config(

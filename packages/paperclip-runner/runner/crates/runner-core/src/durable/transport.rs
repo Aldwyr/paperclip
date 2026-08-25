@@ -1,13 +1,20 @@
 struct ParsedWsUrl {
+    secure: bool,
     host: String,
     authority: String,
     port: u16,
     path: String,
 }
 fn parse_ws_url(input: &str) -> Result<ParsedWsUrl, DurableRunnerError> {
-    let remainder = input
-        .strip_prefix("ws://")
-        .ok_or_else(|| DurableRunnerError::invalid("runner core accepts exactly the ws:// scheme"))?;
+    let (secure, remainder, default_port) = if let Some(value) = input.strip_prefix("ws://") {
+        (false, value, 80)
+    } else if let Some(value) = input.strip_prefix("wss://") {
+        (true, value, 443)
+    } else {
+        return Err(DurableRunnerError::invalid(
+            "runner connect URL must use ws:// or wss://",
+        ));
+    };
     if remainder.is_empty()
         || remainder
             .chars()
@@ -33,16 +40,24 @@ fn parse_ws_url(input: &str) -> Result<ParsedWsUrl, DurableRunnerError> {
             .find(']')
             .ok_or_else(|| DurableRunnerError::invalid("bracketed IPv6 authority is malformed"))?;
         let host = &authority[1..closing];
-        let port = authority[closing + 1..]
-            .strip_prefix(':')
-            .ok_or_else(|| DurableRunnerError::invalid("bracketed IPv6 authority requires a port"))?;
+        let suffix = &authority[closing + 1..];
+        let port = if suffix.is_empty() {
+            default_port.to_string()
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| DurableRunnerError::invalid("bracketed IPv6 authority is malformed"))?
+                .to_owned()
+        };
         host.parse::<std::net::Ipv6Addr>()
             .map_err(|_| DurableRunnerError::invalid("bracketed WebSocket host must be IPv6"))?;
         (host, port)
     } else {
         let (host, port) = authority
             .rsplit_once(':')
-            .ok_or_else(|| DurableRunnerError::invalid("WebSocket URL must include an explicit port"))?;
+            .map_or((authority, default_port.to_string()), |(host, port)| {
+                (host, port.to_owned())
+            });
         if host.is_empty() || host.contains(':') {
             return Err(DurableRunnerError::invalid(
                 "WebSocket host is empty or an unbracketed IPv6 literal",
@@ -57,6 +72,7 @@ fn parse_ws_url(input: &str) -> Result<ParsedWsUrl, DurableRunnerError> {
         return Err(DurableRunnerError::invalid("WebSocket port must be non-zero"));
     }
     Ok(ParsedWsUrl {
+        secure,
         host: host.to_owned(),
         authority: authority.to_owned(),
         port,
@@ -65,6 +81,8 @@ fn parse_ws_url(input: &str) -> Result<ParsedWsUrl, DurableRunnerError> {
 }
 
 struct ResolvedWsTarget {
+    secure: bool,
+    host: String,
     authority: String,
     path: String,
     addresses: Vec<SocketAddr>,
@@ -77,6 +95,61 @@ impl ResolvedWsTarget {
                 .to_socket_addrs()
                 .map(|addresses| addresses.collect())
         })
+    }
+}
+
+enum RunnerTransportEndpoint {
+    Dial(String),
+    Listen { listener: TcpListener, path: String },
+}
+
+impl RunnerTransportEndpoint {
+    fn new(input: &str) -> Result<Self, DurableRunnerError> {
+        if let Some(remainder) = input.strip_prefix("listen://") {
+            let (authority, path) = remainder.split_once('/').ok_or_else(|| {
+                DurableRunnerError::invalid("runner_ingress_bind_conflict: listener path is required")
+            })?;
+            if authority != "0.0.0.0:43127" {
+                return Err(DurableRunnerError::invalid(
+                    "runner_ingress_bind_conflict: listener must bind 0.0.0.0:43127",
+                ));
+            }
+            let path = format!("/{path}");
+            let listener = TcpListener::bind(authority).map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "runner_ingress_bind_conflict: failed to bind fixed listener: {error}"
+                ))
+            })?;
+            listener.set_nonblocking(true).map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "runner_ingress_bind_conflict: failed to configure listener: {error}"
+                ))
+            })?;
+            return Ok(Self::Listen { listener, path });
+        }
+        Ok(Self::Dial(input.to_owned()))
+    }
+
+    fn open(
+        &self,
+        max_frame_bytes: usize,
+        ca_bundle_path: Option<&Path>,
+    ) -> Result<Option<WsClient>, DurableRunnerError> {
+        match self {
+            Self::Dial(url) => {
+                // Resolve on every reconnect. TLS authenticates the configured
+                // hostname, so a recovered connection is not pinned to a stale IP.
+                let target = ResolvedWsTarget::resolve(url)?;
+                WsClient::connect(&target, max_frame_bytes, ca_bundle_path).map(Some)
+            }
+            Self::Listen { listener, path } => match listener.accept() {
+                Ok((stream, _peer)) => WsClient::accept(stream, path, max_frame_bytes).map(Some),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                Err(error) => Err(DurableRunnerError::invalid(format!(
+                    "runner ingress listener accept failed: {error}"
+                ))),
+            },
+        }
     }
 }
 
@@ -95,21 +168,28 @@ where
             "WebSocket destination resolved to no addresses",
         ));
     }
-    if addresses.iter().any(|address| !address.ip().is_loopback()) {
+    if !parsed.secure && addresses.iter().any(|address| !address.ip().is_loopback()) {
         return Err(DurableRunnerError::invalid(
-            "every WebSocket destination must be loopback (127.0.0.0/8 or ::1)",
+            "plaintext WebSocket destinations must all be loopback (127.0.0.0/8 or ::1)",
         ));
     }
     Ok(ResolvedWsTarget {
+        secure: parsed.secure,
+        host: parsed.host,
         authority: parsed.authority,
         path: parsed.path,
         addresses,
     })
 }
 
+trait WsReadWrite: Read + Write {}
+impl<T: Read + Write> WsReadWrite for T {}
+
 struct WsClient {
-    stream: TcpStream,
+    stream: Box<dyn WsReadWrite + Send>,
     mask_counter: u32,
+    mask_outbound: bool,
+    require_inbound_mask: bool,
     max_frame_bytes: usize,
     secure_channel: Option<SecureChannel>,
 }
@@ -236,10 +316,10 @@ impl SecureChannel {
     }
 }
 
-fn encode_masked_frame(
+fn encode_frame(
     opcode: u8,
     payload: &[u8],
-    mask: [u8; 4],
+    mask: Option<[u8; 4]>,
     max_frame_bytes: usize,
 ) -> Result<Vec<u8>, DurableRunnerError> {
     if payload.len() > max_frame_bytes {
@@ -249,23 +329,27 @@ fn encode_masked_frame(
     }
     let mut frame = vec![0x80 | opcode];
     match payload.len() {
-        length if length <= 125 => frame.push(0x80 | length as u8),
+        length if length <= 125 => frame.push(mask.map_or(0, |_| 0x80) | length as u8),
         length if length <= u16::MAX as usize => {
-            frame.push(0x80 | 126);
+            frame.push(mask.map_or(0, |_| 0x80) | 126);
             frame.extend_from_slice(&(length as u16).to_be_bytes());
         }
         length => {
-            frame.push(0x80 | 127);
+            frame.push(mask.map_or(0, |_| 0x80) | 127);
             frame.extend_from_slice(&(length as u64).to_be_bytes());
         }
     }
-    frame.extend_from_slice(&mask);
-    frame.extend(
-        payload
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| byte ^ mask[index % 4]),
-    );
+    if let Some(mask) = mask {
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+    } else {
+        frame.extend_from_slice(payload);
+    }
     Ok(frame)
 }
 
@@ -280,9 +364,80 @@ fn checked_inbound_frame_length(length: u64, max_frame_bytes: usize) -> Result<u
     Ok(length)
 }
 
+fn read_http_headers(stream: &mut dyn Read, context: &str) -> Result<String, DurableRunnerError> {
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        if headers.len() >= MAX_HTTP_HEADER_BYTES {
+            return Err(DurableRunnerError::invalid(format!(
+                "WebSocket {context} headers are too large"
+            )));
+        }
+        stream.read_exact(&mut byte).map_err(|error| {
+            DurableRunnerError::invalid(format!("WebSocket {context} failed: {error}"))
+        })?;
+        headers.push(byte[0]);
+    }
+    String::from_utf8(headers)
+        .map_err(|error| DurableRunnerError::invalid(format!("invalid HTTP headers: {error}")))
+}
+
+fn tls_client_stream(
+    stream: TcpStream,
+    target: &ResolvedWsTarget,
+    ca_bundle_path: Option<&Path>,
+) -> Result<Box<dyn WsReadWrite + Send>, DurableRunnerError> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for certificate in native.certs {
+        roots.add(certificate).map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to load a platform trust root: {error}"))
+        })?;
+    }
+    if let Some(path) = ca_bundle_path {
+        let file = File::open(path).map_err(|error| {
+            DurableRunnerError::invalid(format!("failed to open runner CA bundle: {error}"))
+        })?;
+        let mut reader = io::BufReader::new(file);
+        let mut added = 0_usize;
+        for certificate in rustls_pemfile::certs(&mut reader) {
+            roots.add(certificate.map_err(|error| {
+                DurableRunnerError::invalid(format!("runner CA bundle is invalid: {error}"))
+            })?)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("runner CA certificate is invalid: {error}"))
+            })?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(DurableRunnerError::invalid(
+                "runner CA bundle contains no certificates",
+            ));
+        }
+    }
+    if roots.is_empty() {
+        return Err(DurableRunnerError::invalid(
+            "no TLS trust roots are available",
+        ));
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(target.host.clone()).map_err(|_| {
+        DurableRunnerError::invalid("runner WSS hostname is invalid for TLS verification")
+    })?;
+    let connection = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|error| DurableRunnerError::invalid(format!("TLS setup failed: {error}")))?;
+    Ok(Box::new(StreamOwned::new(connection, stream)))
+}
+
 impl WsClient {
-    fn connect(target: &ResolvedWsTarget, max_frame_bytes: usize) -> Result<Self, DurableRunnerError> {
-        let mut stream = TcpStream::connect(target.addresses.as_slice())
+    fn connect(
+        target: &ResolvedWsTarget,
+        max_frame_bytes: usize,
+        ca_bundle_path: Option<&Path>,
+    ) -> Result<Self, DurableRunnerError> {
+        let stream = TcpStream::connect(target.addresses.as_slice())
             .map_err(|error| DurableRunnerError::invalid(format!("WebSocket connect failed: {error}")))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -290,6 +445,11 @@ impl WsClient {
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let mut stream: Box<dyn WsReadWrite + Send> = if target.secure {
+            tls_client_stream(stream, target, ca_bundle_path)?
+        } else {
+            Box::new(stream)
+        };
         let mut request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
             target.path,
@@ -306,21 +466,7 @@ impl WsClient {
             DurableRunnerError::invalid(format!("WebSocket upgrade write failed: {error}"))
         })?;
 
-        let mut response = Vec::new();
-        let mut byte = [0_u8; 1];
-        while !response.ends_with(b"\r\n\r\n") {
-            if response.len() >= MAX_HTTP_HEADER_BYTES {
-                return Err(DurableRunnerError::invalid(
-                    "WebSocket response headers are too large",
-                ));
-            }
-            stream.read_exact(&mut byte).map_err(|error| {
-                DurableRunnerError::invalid(format!("WebSocket upgrade response failed: {error}"))
-            })?;
-            response.push(byte[0]);
-        }
-        let response = String::from_utf8(response)
-            .map_err(|error| DurableRunnerError::invalid(format!("invalid HTTP response: {error}")))?;
+        let response = read_http_headers(stream.as_mut(), "upgrade response")?;
         if !response.starts_with("HTTP/1.1 101 ") {
             let status = response
                 .lines()
@@ -341,12 +487,92 @@ impl WsClient {
                 "WebSocket server returned an invalid acceptance proof",
             ));
         }
+        Ok(Self {
+            stream,
+            mask_counter: 1,
+            mask_outbound: true,
+            require_inbound_mask: false,
+            max_frame_bytes,
+            secure_channel: None,
+        })
+    }
+
+    fn accept(
+        mut stream: TcpStream,
+        expected_path: &str,
+        max_frame_bytes: usize,
+    ) -> Result<Self, DurableRunnerError> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let request = read_http_headers(&mut stream, "upgrade request")?;
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().unwrap_or_default();
+        if request_line != format!("GET {expected_path} HTTP/1.1") {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            return Err(DurableRunnerError::invalid(
+                "runner listener rejected an unrelated HTTP path",
+            ));
+        }
+        let mut websocket_key: Option<&str> = None;
+        let mut upgrade = false;
+        let mut connection_upgrade = false;
+        let mut version = false;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("sec-websocket-key") {
+                websocket_key = Some(value);
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                upgrade = value.eq_ignore_ascii_case("websocket");
+            } else if name.eq_ignore_ascii_case("connection") {
+                connection_upgrade = value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"));
+            } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+                version = value == "13";
+            } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                return Err(DurableRunnerError::invalid(
+                    "runner listener does not support WebSocket compression",
+                ));
+            }
+        }
+        let websocket_key = websocket_key.filter(|value| !value.is_empty()).ok_or_else(|| {
+            DurableRunnerError::invalid("runner listener requires a WebSocket key")
+        })?;
+        if !upgrade || !connection_upgrade || !version {
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            return Err(DurableRunnerError::invalid(
+                "runner listener rejected an ordinary HTTP request",
+            ));
+        }
+        let mut hasher = Sha1::new();
+        hasher.update(websocket_key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .and_then(|_| stream.flush())
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("WebSocket upgrade response failed: {error}"))
+            })?;
         stream
             .set_read_timeout(Some(Duration::from_millis(250)))
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         Ok(Self {
-            stream,
+            stream: Box::new(stream),
             mask_counter: 1,
+            mask_outbound: false,
+            require_inbound_mask: true,
             max_frame_bytes,
             secure_channel: None,
         })
@@ -372,9 +598,12 @@ impl WsClient {
     }
 
     fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), DurableRunnerError> {
-        let mask = self.mask_counter.to_be_bytes();
-        self.mask_counter = self.mask_counter.wrapping_add(1);
-        let frame = encode_masked_frame(opcode, payload, mask, self.max_frame_bytes)?;
+        let mask = self.mask_outbound.then(|| {
+            let mask = self.mask_counter.to_be_bytes();
+            self.mask_counter = self.mask_counter.wrapping_add(1);
+            mask
+        });
+        let frame = encode_frame(opcode, payload, mask, self.max_frame_bytes)?;
         self.stream
             .write_all(&frame)
             .and_then(|_| self.stream.flush())
@@ -412,8 +641,18 @@ impl WsClient {
                     )))
                 }
             }
+            if header[0] & 0x80 == 0 || header[0] & 0x70 != 0 {
+                return Err(DurableRunnerError::invalid(
+                    "fragmented or extension WebSocket frames are not supported",
+                ));
+            }
             let opcode = header[0] & 0x0f;
             let masked = header[1] & 0x80 != 0;
+            if masked != self.require_inbound_mask {
+                return Err(DurableRunnerError::invalid(
+                    "WebSocket frame masking direction is invalid",
+                ));
+            }
             let mut length = u64::from(header[1] & 0x7f);
             if length == 126 {
                 let mut extended = [0_u8; 2];
@@ -429,6 +668,11 @@ impl WsClient {
                 length = u64::from_be_bytes(extended);
             }
             let length = checked_inbound_frame_length(length, self.max_frame_bytes)?;
+            if matches!(opcode, 0x8..=0xA) && length > 125 {
+                return Err(DurableRunnerError::invalid(
+                    "WebSocket control frame exceeds 125 bytes",
+                ));
+            }
             let mut mask = [0_u8; 4];
             if masked {
                 self.stream
