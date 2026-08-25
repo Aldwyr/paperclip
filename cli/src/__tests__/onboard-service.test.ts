@@ -44,6 +44,39 @@ describe("onboard service policy", () => {
     expect(info).toHaveBeenCalledWith(expect.stringContaining("--install-service"));
   });
 
+  it("declines a custom config path the service would never read", async () => {
+    const warn = vi.fn();
+    const detect = vi.fn();
+    const installed = await handleOnboardService(
+      { yes: true, installService: true, configPath: "/custom/paperclip.json" },
+      {
+        detect,
+        warn,
+        serviceConfigPath: () => "/home/user/.paperclip/instances/default/config.json",
+        ensureServiceShim: vi.fn(async () => ({ ok: true, installedNow: false })),
+      },
+    );
+    expect(installed).toBe(false);
+    expect(detect).not.toHaveBeenCalled();
+    const message = warn.mock.calls[0]?.[0] as string;
+    expect(message).toContain("/home/user/.paperclip/instances/default/config.json");
+    expect(message).toContain("/custom/paperclip.json");
+  });
+
+  it("installs when the config path is the one the service reads", async () => {
+    const detection = supportedDetection();
+    const installed = await handleOnboardService(
+      { yes: true, installService: true, configPath: "/home/user/.paperclip/instances/default/config.json" },
+      {
+        detect: vi.fn(async () => detection),
+        isInteractive: () => false,
+        serviceConfigPath: () => "/home/user/.paperclip/instances/default/config.json",
+        ensureServiceShim: vi.fn(async () => ({ ok: true, installedNow: false })),
+      },
+    );
+    expect(installed).toBe(true);
+  });
+
   it("installs when --yes explicitly opts in", async () => {
     const detection = supportedDetection();
 

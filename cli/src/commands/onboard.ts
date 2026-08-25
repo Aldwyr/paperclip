@@ -43,7 +43,6 @@ import {
   resolveDefaultBackupDir,
   resolveDefaultEmbeddedPostgresDir,
   resolveDefaultLogsDir,
-  resolveDefaultConfigPath,
   resolvePaperclipInstanceId,
 } from "../config/home.js";
 import { bootstrapCeoInvite } from "./auth-bootstrap-ceo.js";
@@ -128,23 +127,6 @@ function parseEnumFromEnv<T extends string>(rawValue: string | undefined, allowe
 function resolvePathFromEnv(rawValue: string | undefined): string | null {
   if (!rawValue || rawValue.trim().length === 0) return null;
   return path.resolve(expandHomePrefix(rawValue.trim()));
-}
-
-async function announceInstalledService(options: { configPath: string; baseUrl: string }): Promise<void> {
-  const serviceConfigPath = resolveDefaultConfigPath(resolvePaperclipInstanceId());
-  if (path.resolve(options.configPath) === path.resolve(serviceConfigPath)) {
-    await announceServiceReady({
-      baseUrl: options.baseUrl,
-      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
-    });
-    return;
-  }
-  p.log.info(
-    [
-      `The background service reads ${serviceConfigPath}, not ${options.configPath}.`,
-      `Check ${pc.cyan("paperclipai service status")} for the served address.`,
-    ].join("\n"),
-  );
 }
 
 function describeServerBinding(server: Pick<PaperclipConfig["server"], "bind" | "customBindHost" | "host" | "port">): string {
@@ -475,11 +457,11 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     );
 
     printManagedInstallHint();
-    const serviceInstalled = await handleOnboardService(opts);
+    const serviceInstalled = await handleOnboardService({ ...opts, configPath });
     if (serviceInstalled) {
-      await announceInstalledService({
-        configPath,
+      await announceServiceReady({
         baseUrl: buildLocalBaseUrl(existingConfig.server.host, existingConfig.server.port),
+        interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
       });
     }
 
@@ -747,11 +729,11 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     await bootstrapCeoInvite({ config: configPath });
   }
 
-  const serviceInstalled = await handleOnboardService(opts);
+  const serviceInstalled = await handleOnboardService({ ...opts, configPath });
   if (serviceInstalled) {
-    await announceInstalledService({
-      configPath,
+    await announceServiceReady({
       baseUrl: buildLocalBaseUrl(server.host, server.port),
+      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
     });
   }
 

@@ -2,7 +2,7 @@ import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { installCommand } from "./commands/install.js";
-import { resolvePaperclipInstanceId } from "./config/home.js";
+import { resolveDefaultConfigPath, resolvePaperclipInstanceId } from "./config/home.js";
 import {
   readInstallManifest,
   resolveInstallStorePaths,
@@ -19,6 +19,7 @@ import { packageVersion } from "./version.js";
 export type OnboardServiceOptions = {
   yes?: boolean;
   installService?: boolean;
+  configPath?: string;
 };
 
 type EnsureShimResult = { ok: boolean; installedNow: boolean; reason?: string };
@@ -36,6 +37,7 @@ type OnboardServiceDependencies = {
   confirm: () => Promise<boolean>;
   confirmLinger: () => Promise<boolean>;
   isInteractive: () => boolean;
+  serviceConfigPath: (instanceId: string) => string;
   info: (message: string) => void;
   success: (message: string) => void;
   warn: (message: string) => void;
@@ -112,6 +114,7 @@ const defaultDependencies: OnboardServiceDependencies = {
     return !p.isCancel(answer) && answer === true;
   },
   isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+  serviceConfigPath: (instanceId) => resolveDefaultConfigPath(instanceId),
   info: (message) => p.log.message(pc.dim(message)),
   success: (message) => p.log.success(message),
   warn: (message) => p.log.warn(message),
@@ -134,6 +137,19 @@ export async function handleOnboardService(
   }
 
   const instanceId = resolvePaperclipInstanceId();
+
+  // The supervisor starts `run --instance <id>` with only the home baked in,
+  // so the service always reads the instance's default config path. Installing
+  // it for a custom config would leave that config unserved.
+  const serviceConfigPath = deps.serviceConfigPath(instanceId);
+  if (options.configPath && path.resolve(options.configPath) !== path.resolve(serviceConfigPath)) {
+    const reason =
+      `the background service reads ${serviceConfigPath}, not ${options.configPath}. ` +
+      "Move the configuration to the default path, or run the server in the foreground with `paperclipai run`.";
+    if (explicitlyRequested) deps.warn(`Background service not installed: ${reason}`);
+    return false;
+  }
+
   const detection = await deps.detect(instanceId);
   if (!detection.supported) {
     if (explicitlyRequested) deps.warn(detection.reason);
