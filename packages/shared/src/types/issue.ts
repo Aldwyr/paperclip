@@ -1109,7 +1109,47 @@ export interface AskUserQuestionsQuestion {
   helpText?: string | null;
   selectionMode: "single" | "multi";
   required?: boolean;
+  /** False suppresses the legacy free-form fallback for closed select sets. */
+  allowOther?: boolean;
   options: AskUserQuestionsQuestionOption[];
+}
+
+/** Provider-neutral question presentation retained for a native runner request. */
+export interface PaperclipQuestionSetOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface PaperclipQuestionSetQuestion {
+  id: string;
+  header?: string;
+  prompt: string;
+  helpText?: string;
+  required: boolean;
+  answerMode: "single_select" | "multi_select" | "text";
+  options?: PaperclipQuestionSetOption[];
+  customAnswer?: {
+    enabled: true;
+    label?: string;
+    placeholder?: string;
+  };
+  textValidation?: {
+    minLength?: number;
+    maxLength?: number;
+    pattern?: string;
+    inputType?: "text" | "number" | "integer";
+    minimum?: number;
+    maximum?: number;
+  };
+}
+
+export interface PaperclipQuestionSetPayload {
+  schema: "paperclip.question_set.v1";
+  title?: string;
+  description?: string;
+  submitLabel?: string;
+  questions: PaperclipQuestionSetQuestion[];
 }
 
 export interface AskUserQuestionsPayload {
@@ -1118,6 +1158,8 @@ export interface AskUserQuestionsPayload {
   submitLabel?: string | null;
   supersedeOnUserComment?: boolean;
   questions: AskUserQuestionsQuestion[];
+  /** Exact canonical contract used to validate a native runner response. */
+  questionSet?: PaperclipQuestionSetPayload;
 }
 
 export interface AskUserQuestionsAnswer {
