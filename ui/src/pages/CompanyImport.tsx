@@ -52,7 +52,7 @@ import {
 } from "../components/FileTree";
 import { readZipArchive } from "../lib/zip";
 import { formatMegabytes } from "../lib/import-preflight";
-import type { CompanyImportTransferDeclaration } from "@paperclipai/shared/company-import-transfer";
+import { buildAlreadyImportedMessage, type CompanyImportTransferDeclaration } from "@paperclipai/shared/company-import-transfer";
 import {
   CHUNKED_IMPORT_THRESHOLD_BYTES,
   IMPORT_TRANSFER_PART_ATTEMPTS,
@@ -944,10 +944,10 @@ export function CompanyImport() {
     const created = await companiesApi.importTransferCreate(manifest);
     if (created.alreadyCompleted) {
       // The server keys transfers by content, and this exact zip already
-      // finished an apply — its parts are gone, so it cannot be re-run.
-      throw new Error(
-        "This exact package was already imported by a completed transfer. Re-export the package to import it again.",
-      );
+      // finished an apply — its parts are gone, so it cannot be re-run. Name
+      // the company that apply created so this reads as "your import exists
+      // over there", not as data loss.
+      throw new Error(buildAlreadyImportedMessage(created.company));
     }
     const missing = new Set(created.missingParts);
     let uploadedParts = manifest.parts.length - missing.size;
