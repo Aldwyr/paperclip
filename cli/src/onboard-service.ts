@@ -1,8 +1,11 @@
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
+import type { PaperclipConfig } from "./config/schema.js";
+import { openUrl } from "./client/board-auth.js";
 import { installCommand } from "./commands/install.js";
 import { resolvePaperclipInstanceId } from "./config/home.js";
+import { readRuntimeInfo, type PaperclipRuntimeInfo } from "./runtime-info.js";
 import {
   readInstallManifest,
   resolveInstallStorePaths,
@@ -14,6 +17,7 @@ import {
   resolveServiceShimPath,
   type ServiceManagerDetection,
 } from "./services/service-manager.js";
+import { buildLocalAppUrl, buildLocalHealthUrl } from "./utils/health-url.js";
 import { packageVersion } from "./version.js";
 
 export type OnboardServiceOptions = {
@@ -22,6 +26,94 @@ export type OnboardServiceOptions = {
 };
 
 type EnsureShimResult = { ok: boolean; installedNow: boolean; reason?: string };
+type OnboardServiceDashboardConfig = {
+  auth: Pick<PaperclipConfig["auth"], "baseUrlMode" | "publicBaseUrl">;
+  server: Pick<PaperclipConfig["server"], "host" | "port">;
+};
+
+type OnboardServiceDashboardDependencies = {
+  isInteractive: () => boolean;
+  waitUntilReady: () => Promise<PaperclipRuntimeInfo | null>;
+  openDashboard: (url: string) => Promise<boolean>;
+  info: (message: string) => void;
+  success: (message: string) => void;
+  warn: (message: string) => void;
+};
+
+function envDisablesBrowser(value = process.env.PAPERCLIP_NO_BROWSER): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+async function waitUntilDashboardReady(timeoutMs = 60_000): Promise<PaperclipRuntimeInfo | null> {
+  const instanceId = resolvePaperclipInstanceId();
+  const detection = await detectServiceManager({ instanceId });
+  if (!detection.supported) return null;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const info = readRuntimeInfo(instanceId);
+    if (info) {
+      const status = await detection.manager.status().catch(() => null);
+      if (status?.active && status.pid === info.pid) {
+        try {
+          const response = await fetch(buildLocalHealthUrl(info.host, info.port), {
+            signal: AbortSignal.timeout(2_000),
+          });
+          const body = await response.json() as { status?: unknown };
+          if (response.ok && body.status === "ok") return info;
+        } catch {}
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return null;
+}
+
+const defaultDashboardDependencies: OnboardServiceDashboardDependencies = {
+  isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+  waitUntilReady: waitUntilDashboardReady,
+  openDashboard: openUrl,
+  info: (message) => p.log.info(message),
+  success: (message) => p.log.success(message),
+  warn: (message) => p.log.warn(message),
+};
+
+export function resolveOnboardServiceDashboardUrl(
+  config: OnboardServiceDashboardConfig,
+  runtime?: Pick<PaperclipRuntimeInfo, "dashboardUrl"> | null,
+): string {
+  if (runtime?.dashboardUrl.trim()) return runtime.dashboardUrl.trim().replace(/\/+$/, "");
+  if (config.auth.baseUrlMode === "explicit" && config.auth.publicBaseUrl?.trim()) {
+    return config.auth.publicBaseUrl.trim().replace(/\/+$/, "");
+  }
+  return buildLocalAppUrl(config.server.host, config.server.port);
+}
+
+export async function handoffToOnboardedService(
+  config: OnboardServiceDashboardConfig,
+  dependencies: Partial<OnboardServiceDashboardDependencies> = {},
+): Promise<void> {
+  const deps = { ...defaultDashboardDependencies, ...dependencies };
+  const runtime = await deps.waitUntilReady();
+  const dashboardUrl = resolveOnboardServiceDashboardUrl(config, runtime);
+  deps.info(`Paperclip dashboard: ${pc.cyan(dashboardUrl)}`);
+
+  if (!runtime) {
+    deps.warn(
+      `The background service started, but the dashboard is not ready yet. ` +
+        `Open ${dashboardUrl} after checking \`paperclipai service logs\`.`,
+    );
+    return;
+  }
+
+  if (!deps.isInteractive() || envDisablesBrowser()) return;
+
+  if (await deps.openDashboard(dashboardUrl)) {
+    deps.success("Sent the Paperclip dashboard to your browser.");
+  } else {
+    deps.warn(`Could not open a browser automatically. Open ${dashboardUrl} manually.`);
+  }
+}
 
 // Source checkouts carry the repository placeholder version; installing
 // that as an npm spec would fetch an ancient release (or nothing) instead
