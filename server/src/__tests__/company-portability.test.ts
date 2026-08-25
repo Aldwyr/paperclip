@@ -2667,7 +2667,9 @@ describe("company portability", () => {
 
     expect(agentSvc.create).toHaveBeenCalledWith("company-imported", expect.objectContaining({
       status: "paused",
-      pauseReason: "system",
+      // The dedicated "import" reason lets the UI explain the pause and offer
+      // a scoped resume; "system" stays for platform-managed pauses.
+      pauseReason: "import",
       pausedAt: expect.any(Date),
     }));
     expect(routineSvc.create).toHaveBeenCalledWith("company-imported", expect.objectContaining({

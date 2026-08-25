@@ -5549,10 +5549,14 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             permissions: manifestAgent.permissions,
             metadata: manifestAgent.metadata,
           };
+          // "import", not "system": the UI reads this to explain that the
+          // agent was parked by the import safety default and to offer a
+          // scoped resume; "system" stays reserved for platform-managed
+          // pauses (plugins, built-ins).
           const automationPausePatch = pauseAutomations
             ? {
                 status: "paused",
-                pauseReason: "system",
+                pauseReason: "import",
                 pausedAt: importedAutomationPausedAt,
               }
             : {};
