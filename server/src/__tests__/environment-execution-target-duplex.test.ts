@@ -149,8 +149,9 @@ describe("sandbox driver duplex channel wiring", () => {
     });
 
     // write / stop / close map to write / kill / close on the host session.
-    channel.write("input-bytes");
-    expect(hostSession.write).toHaveBeenCalledWith("input-bytes");
+    const inputBytes = new TextEncoder().encode("input-bytes");
+    channel.write(inputBytes);
+    expect(hostSession.write).toHaveBeenCalledWith(inputBytes);
     channel.stop();
     expect(hostSession.kill).toHaveBeenCalledTimes(1);
     await channel.close();

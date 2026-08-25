@@ -577,6 +577,8 @@ export interface EnvironmentRuntimeDriver {
    * driver whose lease grants the `duplexCommandStream` capability. The driver
    * opens the host-owned duplex route on the plugin worker and adapts it to the
    * cross-layer {@link CommandManagedDuplexChannel}. Other drivers omit it.
+   *
+   * HTTP/2 is the preferred transport. `queue_v1` is the soft-deprecated fallback.
    */
   openDuplexChannel?(
     input: EnvironmentDriverOpenDuplexChannelInput,
@@ -1137,10 +1139,10 @@ function adaptDuplexChannelHostSession(
   session: DuplexChannelHostSession,
 ): CommandManagedDuplexChannel {
   return {
-    write(data: string): void {
+    write(data: Uint8Array): void {
       session.write(data);
     },
-    onData(listener: (chunk: string) => void): void {
+    onData(listener: (chunk: Uint8Array) => void): void {
       session.onData(listener);
     },
     onExit(listener: (exit: { exitCode: number | null; transportClosed?: boolean }) => void): void {
