@@ -3273,6 +3273,31 @@ mod tests {
     }
 
     #[test]
+    fn runner_listener_preserves_a_partially_received_frame_across_poll_timeouts() {
+        let (mut client, server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted = WsClient::accept(
+            server,
+            "/api/runner/v1/connect/run-1",
+            1024,
+        )
+        .unwrap();
+        let _ = read_http_headers(&mut client, "test response").unwrap();
+        let frame = encode_frame(0x1, br#"{"crosses":"timeout"}"#, Some([1, 2, 3, 4]), 1024)
+            .unwrap();
+        let split = frame.len() - 4;
+        let writer = thread::spawn(move || {
+            client.write_all(&frame[..split]).unwrap();
+            thread::sleep(Duration::from_millis(400));
+            client.write_all(&frame[split..]).unwrap();
+        });
+        let value = accepted.receive_plain_json().unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(value, json!({ "crosses": "timeout" }));
+    }
+
+    #[test]
     fn revoked_runner_rejects_turn_with_zero_effects_and_preserves_existing_outbox() {
         let root = temporary_root("revoked-command");
         let config = config(&root);

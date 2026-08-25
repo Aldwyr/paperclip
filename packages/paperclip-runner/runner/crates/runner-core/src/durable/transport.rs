@@ -194,6 +194,54 @@ struct WsClient {
     secure_channel: Option<SecureChannel>,
 }
 
+const IN_PROGRESS_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn read_frame_bytes(
+    stream: &mut dyn WsReadWrite,
+    bytes: &mut [u8],
+    label: &str,
+) -> Result<(), DurableRunnerError> {
+    let deadline = Instant::now()
+        .checked_add(IN_PROGRESS_FRAME_TIMEOUT)
+        .ok_or_else(|| DurableRunnerError::invalid("WebSocket frame deadline overflowed"))?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match stream.read(&mut bytes[offset..]) {
+            Ok(0) => {
+                return Err(DurableRunnerError::invalid(
+                    "WebSocket connection closed while receiving a frame",
+                ))
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(DurableRunnerError::invalid(format!(
+                    "WebSocket {label} timed out while the frame was in progress",
+                )))
+            }
+            Err(error) => {
+                return Err(DurableRunnerError::invalid(format!(
+                    "WebSocket connection closed while receiving {label}: {error}",
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 struct SecureChannel {
     send_cipher: Aes256Gcm,
     receive_cipher: Aes256Gcm,
@@ -625,8 +673,14 @@ impl WsClient {
     fn receive_plain_json(&mut self) -> Result<Option<Value>, DurableRunnerError> {
         loop {
             let mut header = [0_u8; 2];
-            match self.stream.read_exact(&mut header) {
-                Ok(()) => {}
+            match self.stream.read(&mut header[..1]) {
+                Ok(0) => {
+                    return Err(DurableRunnerError::invalid(
+                        "WebSocket connection closed while receiving a frame",
+                    ))
+                }
+                Ok(_) => read_frame_bytes(self.stream.as_mut(), &mut header[1..], "frame header")?,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -656,15 +710,11 @@ impl WsClient {
             let mut length = u64::from(header[1] & 0x7f);
             if length == 126 {
                 let mut extended = [0_u8; 2];
-                self.stream
-                    .read_exact(&mut extended)
-                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                read_frame_bytes(self.stream.as_mut(), &mut extended, "extended frame length")?;
                 length = u64::from(u16::from_be_bytes(extended));
             } else if length == 127 {
                 let mut extended = [0_u8; 8];
-                self.stream
-                    .read_exact(&mut extended)
-                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                read_frame_bytes(self.stream.as_mut(), &mut extended, "extended frame length")?;
                 length = u64::from_be_bytes(extended);
             }
             let length = checked_inbound_frame_length(length, self.max_frame_bytes)?;
@@ -675,14 +725,10 @@ impl WsClient {
             }
             let mut mask = [0_u8; 4];
             if masked {
-                self.stream
-                    .read_exact(&mut mask)
-                    .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+                read_frame_bytes(self.stream.as_mut(), &mut mask, "frame mask")?;
             }
             let mut payload = vec![0_u8; length];
-            self.stream
-                .read_exact(&mut payload)
-                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            read_frame_bytes(self.stream.as_mut(), &mut payload, "frame payload")?;
             if masked {
                 for (index, byte) in payload.iter_mut().enumerate() {
                     *byte ^= mask[index % 4];
