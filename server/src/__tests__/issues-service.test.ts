@@ -4582,6 +4582,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         status: "todo",
         priority: "medium",
         assigneeAgentId,
+        issueNumber: 1,
       },
       {
         id: childA,
@@ -4590,6 +4591,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child A",
         status: "done",
         priority: "medium",
+        issueNumber: 2,
       },
       {
         id: childB,
@@ -4598,6 +4600,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child B",
         status: "blocked",
         priority: "medium",
+        issueNumber: 3,
       },
     ]);
 
