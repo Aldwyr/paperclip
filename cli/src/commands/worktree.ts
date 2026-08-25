@@ -18,7 +18,6 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
@@ -1494,7 +1493,6 @@ export async function quarantineSeededWorktreeExecutionState(
         summary.stoppedExecutionWorkspaceRuntimes += 1;
       }
 
-      const now = new Date();
       const stoppedRuntimeServices = await tx
         .update(workspaceRuntimeServices)
         .set({
@@ -4370,7 +4368,7 @@ async function backupWorktreeReseedTarget(input: {
 }
 
 async function runWorktreeReseed(opts: WorktreeReseedOptions): Promise<void> {
-  const seedMode = opts.seedMode ?? "minimal";
+  const seedMode = opts.seedMode ?? "full";
   if (!isWorktreeSeedMode(seedMode)) {
     throw new Error(`Unsupported seed mode "${seedMode}". Expected one of: minimal, full.`);
   }

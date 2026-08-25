@@ -85,6 +85,9 @@ function mockVerifiedSeedResult() {
     migrationRevision: "0142_test.sql",
     pausedScheduledRoutines: 0,
     executionQuarantine: {
+      cancelledHeartbeatRuns: 0,
+      deletedPendingWakeups: 0,
+      clearedIssueMonitors: 0,
       disabledTimerHeartbeats: 0,
       resetRunningAgents: 0,
       quarantinedInProgressIssues: 0,
@@ -662,6 +665,9 @@ describe("worktree helpers", () => {
         ...mockVerifiedSeedResult(),
         pausedScheduledRoutines: 2,
         executionQuarantine: {
+          cancelledHeartbeatRuns: 1,
+          deletedPendingWakeups: 1,
+          clearedIssueMonitors: 1,
           disabledTimerHeartbeats: 1,
           resetRunningAgents: 1,
           quarantinedInProgressIssues: 1,
@@ -1490,6 +1496,7 @@ describe("worktree helpers", () => {
           experimental: {
             enableWorktreeRunExecution: true,
             worktreeRunExecutionInstanceNonce: "9ed115ac-9e93-4fe9-a4f1-eb4ea2b0fb24",
+            worktreeRunExecutionSeedEpoch: "cb1137c7-5630-44b9-a213-762203cc4a38",
             worktreeRunExecutionActivatedAt: "2026-07-16T12:00:00.000Z",
             worktreeRunExecutionActivationInstanceId: "source-instance",
             enableSmokeLab: true,
@@ -1503,6 +1510,7 @@ describe("worktree helpers", () => {
       expect(settings?.experimental).toMatchObject({
         enableWorktreeRunExecution: false,
         worktreeRunExecutionInstanceNonce: null,
+        worktreeRunExecutionSeedEpoch: expect.any(String),
         worktreeRunExecutionActivatedAt: null,
         worktreeRunExecutionActivationInstanceId: null,
         enableSmokeLab: true,
