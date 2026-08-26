@@ -825,13 +825,21 @@ impl CodexCommandExecutor {
         // Persist the completed result before crossing the provider boundary.
         // If delivery is interrupted, Codex reissues the same native call on
         // thread resume and poll_provider redelivers this stored result.
-        self.ensure_provider()?
-            .deliver_tool_result(call_id, &result, is_error)
-            .map_err(|error| {
-                DurableRunnerError::invalid(format!("Codex tool result delivery failed: {error}"))
-            })?;
+        let provider = self.ensure_provider()?;
+        let delivered = if provider.has_pending_tool_call(call_id) {
+            provider
+                .deliver_tool_result(call_id, &result, is_error)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "Codex tool result delivery failed: {error}"
+                    ))
+                })?;
+            true
+        } else {
+            false
+        };
         Ok(CommandExecution::result(json!({
-            "status": "delivered",
+            "status": if delivered { "delivered" } else { "deferred" },
             "callId": call_id,
         })))
     }

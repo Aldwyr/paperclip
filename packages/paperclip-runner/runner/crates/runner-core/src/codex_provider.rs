@@ -401,6 +401,10 @@ impl CodexProvider {
         Ok(())
     }
 
+    pub fn has_pending_tool_call(&self, call_id: &str) -> bool {
+        self.pending_tool_calls.contains_key(call_id)
+    }
+
     pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
         let message = if let Some(message) = self.pending_messages.pop_front() {
             message

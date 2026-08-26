@@ -247,11 +247,28 @@ fn durable_backend_resumes_one_pending_native_tool_call_with_the_same_identity()
     drop(first);
 
     let mut recovered = CodexCommandExecutor::new(&directory);
+    let result = recovered
+        .execute(&command(
+            "semantic-result",
+            4,
+            "semantic_tool.result",
+            json!({
+                "callId": "semantic-call-1",
+                "result": {"ok": true, "value": {"task": "NCV-1"}},
+                "isError": false,
+            }),
+        ))
+        .expect("persist semantic tool result before Codex reissues its request");
+    assert_eq!(result.result["status"], "deferred");
     let mut reconciled = None;
+    let mut completed = false;
     for _ in 0..32 {
         let events = recovered
             .poll_events()
             .expect("poll reconciled semantic call");
+        completed |= events
+            .iter()
+            .any(|event| event.event_type == "turn.completed");
         if let Some(event) = events
             .iter()
             .find(|event| event.event_type == "semantic_tool.reconciled")
@@ -268,30 +285,23 @@ fn durable_backend_resumes_one_pending_native_tool_call_with_the_same_identity()
     }
     let reconciled = reconciled.expect("observe native tool-call reconciliation");
     assert_eq!(reconciled.payload["callId"], first_input.payload["callId"]);
-    assert_eq!(reconciled.payload["outcome"], "pending_call_resumed");
+    assert_eq!(
+        reconciled.payload["outcome"],
+        "completed_result_redelivered"
+    );
     assert_eq!(call_count(&directory, "thread/resume"), 1);
     assert_eq!(call_count(&directory, "turn/start"), 1);
 
-    recovered
-        .execute(&command(
-            "semantic-result",
-            4,
-            "semantic_tool.result",
-            json!({
-                "callId": "semantic-call-1",
-                "result": {"ok": true, "value": {"task": "NCV-1"}},
-                "isError": false,
-            }),
-        ))
-        .expect("deliver semantic tool result to resumed Codex request");
-    let mut completed = false;
-    for _ in 0..32 {
-        let events = poll_and_ack(&mut recovered).expect("poll completed resumed turn");
-        completed |= events
-            .iter()
-            .any(|event| event.event_type == "turn.completed");
-        if completed {
-            break;
+    if !completed {
+        for _ in 0..256 {
+            let events = poll_and_ack(&mut recovered).expect("poll completed resumed turn");
+            completed |= events
+                .iter()
+                .any(|event| event.event_type == "turn.completed");
+            if completed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
     assert!(completed);
