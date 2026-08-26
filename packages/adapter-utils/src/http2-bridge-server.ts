@@ -657,23 +657,27 @@ export interface Http2BridgeBodyBounds {
 }
 
 /**
- * Read one request body, bounded on size and on two independent time
- * bounds: an idle bound and a total-lifetime ceiling. See
+ * Discard one denied request's body, bounded on size and on two independent
+ * time bounds: an idle bound and a total-lifetime ceiling. See
  * {@link DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_TIMEOUT_MS} and
  * {@link DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_LIFETIME_CEILING_MS} for why the
  * server enforces each one.
+ *
+ * A denial never reads its own body content, so this function keeps no
+ * chunk: it counts bytes to enforce `bounds.maxBodyBytes`, then drops each
+ * chunk at once. The host holds one running number per denied stream, not a
+ * copy of the body.
  *
  * The `close` listener is the settle-of-last-resort: it fires whenever the
  * stream ends for any reason at all — a normal end, an error, a timeout- or
  * shutdown-triggered `destroy()`, or a peer reset — so the promise always
  * settles and the caller never awaits a stream that already went away.
  */
-function readHttp2StreamBody(
+export function discardHttp2StreamBody(
   stream: http2.ServerHttp2Stream,
   bounds: Http2BridgeBodyBounds,
-): Promise<Buffer> {
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
     let totalBytes = 0;
     let settled = false;
     let idleTimer: ReturnType<typeof setTimeout>;
@@ -709,12 +713,13 @@ function readHttp2StreamBody(
         stream.destroy();
         return;
       }
-      chunks.push(chunk);
       // The chunk is real progress, so the peer is not stalled: reset the
       // idle bound. The lifetime ceiling timer above does not reset here.
+      // The chunk itself is dropped here: a denial keeps no request body
+      // byte in host memory.
       armIdleTimer();
     });
-    stream.once("end", () => settle(() => resolve(Buffer.concat(chunks))));
+    stream.once("end", () => settle(() => resolve()));
     stream.once("error", (error) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))));
     stream.once("aborted", () => settle(() => reject(new Error("Bridge request stream aborted."))));
     stream.once("close", () => settle(() => reject(new Error("Bridge request stream closed before it completed."))));
@@ -889,14 +894,17 @@ function respondJson(stream: http2.ServerHttp2Stream, status: number, body: unkn
 }
 
 /**
- * Answer a denied stream, then consume and discard its request body under
- * the same bounds ({@link Http2BridgeBodyBounds}) an authenticated request
- * gets. A denied request's body content never reaches the forward handler,
- * but the inbound half of the stream still needs a bound: without one, a
- * peer that leaves the body unfinished keeps the stream open, holding one
- * of the {@link HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS} slots for as long as
- * it chooses. Nothing awaits the discard; the caller has already answered
- * the request and moves on to the next stream.
+ * Answer a denied stream, then discard its request body under the same
+ * bounds ({@link Http2BridgeBodyBounds}) an authenticated request gets. A
+ * denied request's body content never reaches the forward handler, but the
+ * inbound half of the stream still needs a bound: without one, a peer that
+ * leaves the body unfinished keeps the stream open, holding one of the
+ * {@link HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS} slots for as long as it
+ * chooses. This one function is every denial branch's only path to a body
+ * read, so every denial — an invalid token, a malformed path, or a denied
+ * route — discards through the same non-retaining helper and takes no
+ * admission-gate slot. Nothing awaits the discard; the caller has already
+ * answered the request and moves on to the next stream.
  */
 function denyRequest(
   stream: http2.ServerHttp2Stream,
@@ -906,7 +914,7 @@ function denyRequest(
 ): void {
   respondJson(stream, status, body);
   if (stream.destroyed || stream.closed) return;
-  readHttp2StreamBody(stream, bounds).catch(() => {
+  discardHttp2StreamBody(stream, bounds).catch(() => {
     // The idle or lifetime bound above already destroyed the stream, or the
     // peer reset it first. Either way the slot is free; the discarded body
     // content is irrelevant to a denial.
@@ -933,7 +941,7 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
     options.readBackpressureStallMs ?? DEFAULT_HTTP2_BRIDGE_READ_BACKPRESSURE_STALL_MS;
   const admissionGate = options.admissionGate ?? getHttp2BridgeAdmissionGate();
   const responseDrainTimeoutMs = options.responseDrainTimeoutMs ?? DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS;
-  // Built one time and passed to every readHttp2StreamBody() and
+  // Built one time and passed to every discardHttp2StreamBody() and
   // denyRequest() call below, so every stream on this server enforces the
   // same bounds.
   const bodyBounds: Http2BridgeBodyBounds = {
@@ -1104,7 +1112,8 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
       // timeout has not yet fired) would hold this wait open forever. The
       // grace timer bounds it: past `closeGraceMs`, the server force-destroys
       // the session, which ends its streams at once and settles their body
-      // reads through the `close` backstop in `readHttp2StreamBody`.
+      // reads through the `close` backstop in `discardHttp2StreamBody` and
+      // `beginHttp2BridgeStreamBodyCapture`.
       await Promise.all(
         [...activeSessions].map(
           (session) =>

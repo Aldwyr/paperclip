@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { duplexPair } from "node:stream";
 import type { Duplex } from "node:stream";
 import http2 from "node:http2";
@@ -8,6 +9,7 @@ import {
   buildHttp2BridgeForwardUrl,
   classifyStreamAgainstGoaway,
   createHttp2BridgeServer,
+  discardHttp2StreamBody,
   parseCanonicalBridgeRequestPath,
   wrapDuplexChannelAsNodeDuplex,
   DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES,
@@ -26,6 +28,7 @@ import {
   HTTP2_BRIDGE_SERVER_OPTIONS,
   HTTP2_BRIDGE_STREAM_RESET_BURST,
   HTTP2_BRIDGE_STREAM_RESET_RATE,
+  type Http2BridgeBodyBounds,
   type Http2BridgeForwardRequest,
   type Http2BridgeForwardResult,
   type Http2BridgeGoawayRecord,
@@ -1736,6 +1739,62 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
       }
     });
 
+    it("denied streams never take an admission slot, even many at once across two server instances sharing a one-slot gate", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      const forwarderTracker = createForwarderCallTracker();
+      const forwardRequest = async (): Promise<Http2BridgeForwardResult> => {
+        forwarderTracker.markCalled();
+        return { status: 200 };
+      };
+      const serverA = bindTestServer({ admissionGate, forwardRequest });
+      const serverB = bindTestServer({ admissionGate, forwardRequest });
+      const rawClientA = connectRawClient(serverA.clientSide);
+      const rawClientB = connectRawClient(serverB.clientSide);
+      const denyOneStream = (rawClient: http2.ClientHttp2Session): Promise<number> =>
+        new Promise((resolve, reject) => {
+          // No `authorization` header: the token check denies every one of
+          // these streams before the admission gate ever runs.
+          const req = rawClient.request({ ":method": "POST", ":path": "/api/issues/abc/comments" });
+          let status = 0;
+          req.on("response", (headers) => {
+            status = Number(headers[":status"]) || 0;
+          });
+          req.on("error", reject);
+          req.on("close", () => resolve(status));
+          req.resume();
+          // A body on every one of six concurrent denied streams: if a
+          // denial ever took the one shared slot, five of the six would
+          // queue behind it instead of answering at once.
+          req.write(Buffer.alloc(200_000, "d"));
+          req.end();
+        });
+      try {
+        const startedAtMs = Date.now();
+        const statuses = await Promise.all([
+          denyOneStream(rawClientA),
+          denyOneStream(rawClientA),
+          denyOneStream(rawClientA),
+          denyOneStream(rawClientB),
+          denyOneStream(rawClientB),
+          denyOneStream(rawClientB),
+        ]);
+        // Every denied stream answered at once: none of them queued behind
+        // the one-slot gate.
+        expect(Date.now() - startedAtMs).toBeLessThan(2_000);
+        expect(statuses).toEqual([401, 401, 401, 401, 401, 401]);
+        expect(forwarderTracker.called).toBe(false);
+        // The gate count returns to its start value: a denial never moved
+        // it at all.
+        expect(admissionGate.activeCount).toBe(0);
+        expect(admissionGate.queuedCount).toBe(0);
+      } finally {
+        rawClientA.close();
+        rawClientB.close();
+        await serverA.handle.close();
+        await serverB.handle.close();
+      }
+    });
+
     it("the default caps keep the named byte total inside the reserved budget", () => {
       // 64 admitted streams x 868,351 bytes, plus 8 live sessions x
       // 16,777,216 bytes: 189,792,192 named bytes in total. This stays
@@ -1785,5 +1844,55 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
         rawClient.close();
       }
     });
+  });
+});
+
+describe("discardHttp2StreamBody", () => {
+  /** A minimal fake `ServerHttp2Stream`: only the surface
+   * `discardHttp2StreamBody` touches — `on`/`once` for `data`, `end`,
+   * `error`, `aborted`, and `close`, plus a `destroy` a test can observe. */
+  function fakeDeniedStream(): http2.ServerHttp2Stream & { destroyCallCount: number } {
+    const emitter = new EventEmitter() as unknown as http2.ServerHttp2Stream & { destroyCallCount: number };
+    emitter.destroyCallCount = 0;
+    (emitter as unknown as { destroy: () => void }).destroy = () => {
+      emitter.destroyCallCount += 1;
+      emitter.emit("close");
+    };
+    return emitter;
+  }
+
+  it("resolves with no buffer once the body ends, however many bytes the peer delivered", async () => {
+    const stream = fakeDeniedStream();
+    const bounds: Http2BridgeBodyBounds = { maxBodyBytes: 1_000_000, idleTimeoutMs: 5_000, lifetimeCeilingMs: 60_000 };
+    const discarded = discardHttp2StreamBody(stream, bounds);
+
+    let deliveredBytes = 0;
+    const chunk = Buffer.alloc(300_000, "x");
+    for (let i = 0; i < 3; i += 1) {
+      stream.emit("data", chunk);
+      deliveredBytes += chunk.byteLength;
+    }
+    stream.emit("end");
+
+    const outcome = await discarded;
+    // The helper hands back nothing: a buffer-returning helper would
+    // instead resolve here with a 900,000-byte `Buffer`, one copy of every
+    // chunk this denied stream ever delivered.
+    expect(outcome).toBeUndefined();
+    expect(deliveredBytes).toBe(900_000);
+    expect(stream.destroyCallCount).toBe(0);
+  });
+
+  it("still destroys the stream once the running byte count passes maxBodyBytes", async () => {
+    const stream = fakeDeniedStream();
+    const bounds: Http2BridgeBodyBounds = { maxBodyBytes: 10, idleTimeoutMs: 5_000, lifetimeCeilingMs: 60_000 };
+    const rejection = discardHttp2StreamBody(stream, bounds).catch((error: unknown) => error);
+
+    stream.emit("data", Buffer.alloc(20, "y"));
+
+    const error = await rejection;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/exceeded the configured size limit/i);
+    expect(stream.destroyCallCount).toBe(1);
   });
 });
