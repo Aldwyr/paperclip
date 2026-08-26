@@ -25,6 +25,7 @@ import {
   formatAdapterExecutionTimeoutStartLogLine,
   parseAdapterExecutionTarget,
   postedIssueCommentLogMarker,
+  POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES,
   resolveAdapterExecutionTargetTimeout,
   resolveAdapterExecutionTargetTimeoutSec,
   runAdapterExecutionTargetProcess,
@@ -119,10 +120,46 @@ describe("sandbox adapter execution targets", () => {
   const cleanupDirs: string[] = [];
 
   it("records successful issue comment ids for attribution recovery", () => {
-    expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 201, '{"id":"comment-1"}'))
-      .toBe("comment id: comment-1\n");
-    expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 401, '{"id":"comment-1"}'))
-      .toBeNull();
+    const uuid = "550e8400-e29b-41d4-a716-446655440000";
+    expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 201, `{"id":"${uuid}"}`)).toBe(
+      `comment id: ${uuid}\n`,
+    );
+    expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 401, `{"id":"${uuid}"}`)).toBeNull();
+    // The function accepts a `Buffer` body, matching the bytes the http2 path
+    // hands it after it drops the string round trip.
+    expect(
+      postedIssueCommentLogMarker(
+        "POST",
+        "/api/issues/issue-1/comments",
+        201,
+        Buffer.from(`{"id":"${uuid}"}`, "utf8"),
+      ),
+    ).toBe(`comment id: ${uuid}\n`);
+  });
+
+  it("the comment marker returns null for an identifier that is not a canonical UUID", () => {
+    expect(
+      postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 201, '{"id":"comment-1"}'),
+    ).toBeNull();
+    // Uppercase hex is a valid UUID, but not a canonical *lowercase* UUID.
+    expect(
+      postedIssueCommentLogMarker(
+        "POST",
+        "/api/issues/issue-1/comments",
+        201,
+        '{"id":"550E8400-E29B-41D4-A716-446655440000"}',
+      ),
+    ).toBeNull();
+  });
+
+  it("the comment marker returns null for a body past the decode limit", () => {
+    const uuid = "550e8400-e29b-41d4-a716-446655440000";
+    const oversized = Buffer.from(
+      JSON.stringify({ id: uuid, padding: "x".repeat(POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES) }),
+      "utf8",
+    );
+    expect(oversized.length).toBeGreaterThan(POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES);
+    expect(postedIssueCommentLogMarker("POST", "/api/issues/issue-1/comments", 201, oversized)).toBeNull();
   });
 
   afterEach(async () => {
@@ -3264,10 +3301,10 @@ describe("sandbox adapter execution targets", () => {
    */
   function http2TestRequest(
     session: http2.ClientHttp2Session,
-    request: { method: string; path: string; headers?: Record<string, string>; body?: string },
-  ): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+    request: { method: string; path: string; headers?: Record<string, string>; body?: string | Buffer },
+  ): Promise<{ status: number; headers: Record<string, string>; body: string; bodyBytes: Buffer }> {
     return new Promise((resolve, reject) => {
-      const body = Buffer.from(request.body ?? "", "utf8");
+      const body = Buffer.isBuffer(request.body) ? request.body : Buffer.from(request.body ?? "", "utf8");
       const stream = session.request(
         { ":method": request.method, ":path": request.path, ...request.headers },
         { endStream: body.length === 0 },
@@ -3284,7 +3321,10 @@ describe("sandbox adapter execution targets", () => {
         }
       });
       stream.on("data", (chunk: Buffer) => chunks.push(chunk));
-      stream.once("end", () => resolve({ status, headers, body: Buffer.concat(chunks).toString("utf8") }));
+      stream.once("end", () => {
+        const bodyBytes = Buffer.concat(chunks);
+        resolve({ status, headers, body: bodyBytes.toString("utf8"), bodyBytes });
+      });
       stream.once("error", (error) => reject(error));
       if (body.length > 0) stream.end(body);
       else if (!stream.writableEnded) stream.end();
@@ -3294,7 +3334,10 @@ describe("sandbox adapter execution targets", () => {
   // Start a host API server that records each forwarded request, so a test can
   // assert the real token and the run id reach the host, or that a rejected
   // request never forwards.
-  async function startRecordingApiServer(): Promise<{
+  async function startRecordingApiServer(options?: {
+    /** Overrides the default `{ ok: true }` JSON reply with these raw bytes. */
+    responseBody?: Buffer;
+  }): Promise<{
     origin: string;
     requests: Array<{
       method: string;
@@ -3302,6 +3345,7 @@ describe("sandbox adapter execution targets", () => {
       auth: string | null;
       runId: string | null;
       headers: Record<string, string>;
+      body: Buffer;
     }>;
     close: () => Promise<void>;
   }> {
@@ -3311,21 +3355,28 @@ describe("sandbox adapter execution targets", () => {
       auth: string | null;
       runId: string | null;
       headers: Record<string, string>;
+      body: Buffer;
     }> = [];
+    const responseBody = options?.responseBody ?? Buffer.from(JSON.stringify({ ok: true }), "utf8");
     const server = createServer((req, res) => {
-      const headers: Record<string, string> = {};
-      for (const [key, value] of Object.entries(req.headers)) {
-        if (typeof value === "string") headers[key] = value;
-      }
-      requests.push({
-        method: req.method ?? "GET",
-        url: req.url ?? "/",
-        auth: req.headers.authorization ?? null,
-        runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
-        headers,
+      const bodyChunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
+      req.on("end", () => {
+        const headers: Record<string, string> = {};
+        for (const [key, value] of Object.entries(req.headers)) {
+          if (typeof value === "string") headers[key] = value;
+        }
+        requests.push({
+          method: req.method ?? "GET",
+          url: req.url ?? "/",
+          auth: req.headers.authorization ?? null,
+          runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
+          headers,
+          body: Buffer.concat(bodyChunks),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(responseBody);
       });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -3458,6 +3509,109 @@ describe("sandbox adapter execution targets", () => {
     // Teardown closed the channel before lease release, then stopped the child.
     expect(control.closeCount).toBeGreaterThanOrEqual(1);
     expect(control.stopCount).toBeGreaterThanOrEqual(1);
+  }, 20000);
+
+  it("the HTTP/2 path forwards malformed UTF-8 request bytes to the host API unchanged", async () => {
+    // A lone continuation byte and a truncated multi-byte sequence: bytes no
+    // UTF-8 decode-then-encode round trip preserves.
+    const malformed = Buffer.from([0x80, 0xc3, 0x28, 0xff, 0xfe, 0x00]);
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-req-bytes-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const sessionRef: { current: http2.ClientHttp2Session | null } = { current: null };
+    let bridgeToken = "";
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      bridgeToken = ctx.bridgeToken;
+      ctx.emitReady();
+      sessionRef.current = ctx.connectHttp2();
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-req-bytes",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
+      await http2TestRequest(sessionRef.current!, {
+        method: "POST",
+        path: "/api/issues/issue-1/comments",
+        headers: { authorization: `Bearer ${bridgeToken}`, "content-type": "application/octet-stream" },
+        body: malformed,
+      });
+      await waitForCondition(() => api.requests.length >= 1, "the host to forward the http2 request", 4000);
+      expect(api.requests[0].body.equals(malformed)).toBe(true);
+    } finally {
+      sessionRef.current?.close();
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("the HTTP/2 path returns malformed UTF-8 host response bytes to the sandbox unchanged", async () => {
+    const malformed = Buffer.from([0xff, 0xfe, 0x80, 0x81, 0x00, 0x01]);
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-resp-bytes-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer({ responseBody: malformed });
+    const sessionRef: { current: http2.ClientHttp2Session | null } = { current: null };
+    let bridgeToken = "";
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      bridgeToken = ctx.bridgeToken;
+      ctx.emitReady();
+      sessionRef.current = ctx.connectHttp2();
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-resp-bytes",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
+      const response = await http2TestRequest(sessionRef.current!, {
+        method: "GET",
+        path: "/api/agents/me",
+        headers: { authorization: `Bearer ${bridgeToken}` },
+      });
+      expect(response.status).toBe(200);
+      expect(response.bodyBytes.equals(malformed)).toBe(true);
+    } finally {
+      sessionRef.current?.close();
+      await bridge?.stop();
+      await api.close();
+    }
   }, 20000);
 
   it("falls back to the file bridge when a post-READY pre-bind flood exceeds the aggregate ceiling", async () => {

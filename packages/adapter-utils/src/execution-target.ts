@@ -88,13 +88,36 @@ import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
-export function postedIssueCommentLogMarker(method: string, requestPath: string, status: number, body: string) {
+/**
+ * The decode limit for {@link postedIssueCommentLogMarker}. The response body
+ * is untrusted output, so the host never decodes more than this many bytes of
+ * it to build one log line, and it never allocates a second full-size string
+ * for a body over this limit.
+ */
+export const POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES = 4096;
+
+const CANONICAL_LOWERCASE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export function postedIssueCommentLogMarker(
+  method: string,
+  requestPath: string,
+  status: number,
+  body: Buffer | string,
+) {
   if (method !== "POST" || !/^\/api\/issues\/[^/]+\/comments$/.test(requestPath) || status < 200 || status >= 300) {
     return null;
   }
+  const bodyBytes = typeof body === "string" ? Buffer.byteLength(body, "utf8") : body.length;
+  if (bodyBytes > POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES) {
+    return null;
+  }
+  const decoded =
+    typeof body === "string" ? body : body.toString("utf8", 0, POSTED_COMMENT_MARKER_DECODE_LIMIT_BYTES);
   try {
-    const parsed = JSON.parse(body) as { id?: unknown };
-    return typeof parsed.id === "string" && parsed.id.length > 0 ? `comment id: ${parsed.id}\n` : null;
+    const parsed = JSON.parse(decoded) as { id?: unknown };
+    return typeof parsed.id === "string" && CANONICAL_LOWERCASE_UUID_PATTERN.test(parsed.id)
+      ? `comment id: ${parsed.id}\n`
+      : null;
   } catch {
     return null;
   }
@@ -1505,7 +1528,8 @@ function bridgeResponseBodyLimitError(maxBodyBytes: number): Error {
 }
 
 /**
- * Read the forward response body into a string. The reader bounds the body with
+ * Read the forward response body into one `Buffer`. The reader carries the raw
+ * bytes end to end and holds no separate string copy. It bounds the body with
  * two controls. The per-request `maxBodyBytes` limit rejects a body larger than
  * the configured per-request ceiling. The optional host aggregate byte ledger
  * bounds the retained bytes across all live routes.
@@ -1524,7 +1548,7 @@ async function readBridgeForwardResponseBody(
   response: Response,
   maxBodyBytes: number,
   ledger?: DuplexAggregateByteLedger | null,
-): Promise<string> {
+): Promise<Buffer> {
   const rawContentLength = response.headers.get("content-length");
   if (rawContentLength) {
     const contentLength = Number.parseInt(rawContentLength, 10);
@@ -1534,7 +1558,7 @@ async function readBridgeForwardResponseBody(
   }
 
   if (!response.body) {
-    return "";
+    return Buffer.alloc(0);
   }
 
   const reader = response.body.getReader();
@@ -1579,7 +1603,7 @@ async function readBridgeForwardResponseBody(
       }
       tokens.push(concatToken);
     }
-    return Buffer.concat(chunks, totalBytes).toString("utf8");
+    return Buffer.concat(chunks, totalBytes);
   } finally {
     if (ledger) {
       for (const token of tokens) {
@@ -4225,14 +4249,17 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       path: string;
       query: string;
       headers: Record<string, string>;
-      /** The file bridge passes the whole request body here as one string. */
-      body?: string;
+      /**
+       * The file bridge passes the whole request body here as one string. The
+       * http2 path passes the raw request bytes with no string round trip.
+       */
+      body?: string | Uint8Array;
     },
     signal?: AbortSignal,
     options?: {
       suppressDebugLog?: boolean;
     },
-  ): Promise<{ status: number; headers: Record<string, string>; body: string }> => {
+  ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
     const method = request.method.trim().toUpperCase() || "GET";
     // The per-request debug log prints the method, the path, and the query. The
     // duplex path suppresses it, so no route or query rides a log line there. The
@@ -4257,14 +4284,22 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
     const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     // Build the request-body init. A GET or a HEAD carries no body. The file
-    // bridge passes the whole body as one string.
+    // bridge passes the whole body as one string; the http2 path passes the
+    // raw request bytes.
     const forwardInit: RequestInit = {
       method,
       headers,
       signal: forwardSignal,
     };
-    if (method !== "GET" && method !== "HEAD" && typeof request.body === "string") {
-      forwardInit.body = request.body;
+    if (
+      method !== "GET" &&
+      method !== "HEAD" &&
+      (typeof request.body === "string" || request.body instanceof Uint8Array)
+    ) {
+      // `fetch` accepts a `Uint8Array` body at runtime. The DOM `BodyInit` type
+      // pins the typed-array generic to a concrete `ArrayBuffer`, so a
+      // `Buffer`'s wider `ArrayBufferLike` generic needs this assertion.
+      forwardInit.body = request.body as BodyInit;
     }
     const response = await fetch(buildBridgeForwardUrl(hostApiUrl, request), forwardInit);
     if (emitDebugLog) {
@@ -4285,7 +4320,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // non-retryable 504 and marks the outcome indeterminate, exactly like an
     // aborted in-flight forward. The in-sandbox server maps the indeterminate 504
     // to a non-retryable 409 for both the file bridge and the duplex broker.
-    let responseBody: string;
+    let responseBody: Buffer;
     try {
       responseBody = await readBridgeForwardResponseBody(
         response,
@@ -4300,9 +4335,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         return {
           status: 502,
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            error: error instanceof Error ? error.message : String(error),
-          }),
+          body: Buffer.from(
+            JSON.stringify({
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          ),
         };
       }
       return {
@@ -4311,11 +4348,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           "content-type": "application/json",
           "x-paperclip-bridge-outcome": "indeterminate",
         },
-        body: JSON.stringify({
-          error: error instanceof Error ? error.message : String(error),
-          outcome: "indeterminate",
-          retryable: false,
-        }),
+        body: Buffer.from(
+          JSON.stringify({
+            error: error instanceof Error ? error.message : String(error),
+            outcome: "indeterminate",
+            retryable: false,
+          }),
+        ),
       };
     }
     const commentMarker = postedIssueCommentLogMarker(method, request.path, response.status, responseBody);
@@ -4546,7 +4585,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
                   path: request.pathname,
                   query: request.query,
                   headers: request.headers,
-                  body: request.body.toString("utf8"),
+                  body: request.body,
                 },
                 undefined,
                 { suppressDebugLog: true },
@@ -4669,7 +4708,13 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
-      handleRequest: async (request, options) => forwardBridgeRequest(request, options?.signal),
+      // The file bridge response file holds the body as a JSON string field, so
+      // this call site converts the forwarded bytes to a string here. It is the
+      // one place on the file bridge path that creates a string copy.
+      handleRequest: async (request, options) => {
+        const result = await forwardBridgeRequest(request, options?.signal);
+        return { status: result.status, headers: result.headers, body: result.body.toString("utf8") };
+      },
     });
     server = await startSandboxCallbackBridgeServer({
       runner,
