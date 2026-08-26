@@ -9906,6 +9906,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function persistRunProviderProcessMetadata(
+    runId: string,
+    meta: { pid: number; processGroupId: number | null; startedAt: string },
+  ) {
+    const startedAt = new Date(meta.startedAt);
+    return db
+      .update(heartbeatRuns)
+      .set({
+        providerProcessPid: meta.pid,
+        providerProcessGroupId: meta.processGroupId,
+        providerProcessStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function clearRunProviderProcessMetadata(runId: string) {
+    return db
+      .update(heartbeatRuns)
+      .set({
+        providerProcessPid: null,
+        providerProcessGroupId: null,
+        providerProcessStartedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, runId))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function terminateRunProviderProcess(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "id" | "providerProcessPid" | "providerProcessGroupId"
+    >,
+  ): Promise<boolean> {
+    const pid = run.providerProcessPid;
+    const processGroupId = run.providerProcessGroupId;
+    const alive = isProcessAlive(pid) || isProcessGroupAlive(processGroupId);
+    if (alive) {
+      await terminateHeartbeatRunProcess({ pid, processGroupId });
+    }
+    if (pid || processGroupId) {
+      await clearRunProviderProcessMetadata(run.id);
+    }
+    return alive;
+  }
+
   async function clearDetachedRunWarning(runId: string) {
     const updated = await db
       .update(heartbeatRuns)
@@ -10812,6 +10862,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, agent } of activeRuns) {
       const running = runningProcesses.get(run.id);
       try {
+        await terminateRunProviderProcess(run);
         if (running) {
           await terminateHeartbeatRunProcess({
             pid: running.child.pid ?? run.processPid,
@@ -13730,6 +13781,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         continue;
       }
 
+      await terminateRunProviderProcess(run);
+
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
@@ -16260,6 +16313,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             environment,
             onLog,
             onSpawn,
+            onProviderSpawn: async (meta) => {
+              await persistRunProviderProcessMetadata(run.id, meta);
+            },
+            onProviderExit: async () => {
+              await clearRunProviderProcessMetadata(run.id);
+            },
           });
         } else {
           const adapterContext = { ...context };
@@ -19268,6 +19327,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const running = runningProcesses.get(run.id);
     try {
+      await terminateRunProviderProcess(run);
       if (running) {
         await terminateHeartbeatRunProcess({
           pid: running.child.pid ?? run.processPid,
@@ -19342,18 +19402,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const running = runningProcesses.get(run.id);
-      if (running) {
-        await terminateHeartbeatRunProcess({
-          pid: running.child.pid ?? run.processPid,
-          processGroupId: running.processGroupId ?? run.processGroupId,
-          graceMs: Math.max(1, running.graceSec) * 1000,
-        });
+      try {
+        await terminateRunProviderProcess(run);
+        if (running) {
+          await terminateHeartbeatRunProcess({
+            pid: running.child.pid ?? run.processPid,
+            processGroupId: running.processGroupId ?? run.processGroupId,
+            graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else if (run.processPid || run.processGroupId) {
+          await terminateHeartbeatRunProcess({
+            pid: run.processPid,
+            processGroupId: run.processGroupId,
+          });
+        }
+      } finally {
         runningProcesses.delete(run.id);
-      } else if (run.processPid || run.processGroupId) {
-        await terminateHeartbeatRunProcess({
-          pid: run.processPid,
-          processGroupId: run.processGroupId,
-        });
       }
       await releaseIssueExecutionAndPromote(run);
     }

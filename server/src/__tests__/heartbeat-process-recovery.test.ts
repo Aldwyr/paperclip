@@ -488,6 +488,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     runStatus?: "running" | "queued" | "failed";
     processPid?: number | null;
     processGroupId?: number | null;
+    providerProcessPid?: number | null;
+    providerProcessGroupId?: number | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -548,6 +550,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         : { ...(input?.contextSnapshot ?? {}), issueId },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
+      providerProcessPid: input?.providerProcessPid ?? null,
+      providerProcessGroupId: input?.providerProcessGroupId ?? null,
+      providerProcessStartedAt: input?.providerProcessPid ? now : null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -1204,13 +1209,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(agent).toEqual({ status: "error", errorReason: "Adapter failed" });
   });
 
-  it("keeps a local run active when the recorded pid is still alive", async () => {
+  it("keeps a local run and its provider active when the recorded runner pid is still alive", async () => {
     const child = spawnAliveProcess();
+    const provider = spawnAliveProcess();
     childProcesses.add(child);
+    childProcesses.add(provider);
     expect(child.pid).toBeTypeOf("number");
+    expect(provider.pid).toBeTypeOf("number");
 
     const { runId, wakeupRequestId } = await seedRunFixture({
       processPid: child.pid ?? null,
+      providerProcessPid: provider.pid ?? null,
       includeIssue: false,
     });
     const heartbeat = heartbeatService(db);
@@ -1222,6 +1231,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.status).toBe("running");
     expect(run?.errorCode).toBe("process_detached");
     expect(run?.error).toContain(String(child.pid));
+    expect(run?.providerProcessPid).toBe(provider.pid);
+    expect(isPidAlive(provider.pid)).toBe(true);
 
     const wakeup = await db
       .select()
@@ -1229,6 +1240,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(agentWakeupRequests.id, wakeupRequestId))
       .then((rows) => rows[0] ?? null);
     expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("terminates a detached provider when its owning runner is lost", async () => {
+    const provider = spawnAliveProcess();
+    childProcesses.add(provider);
+    expect(provider.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: provider.pid ?? null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(await waitForPidExit(provider.pid ?? 0)).toBe(true);
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+    });
   });
 
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {

@@ -191,7 +191,13 @@ export async function executeNativeCodexRunner(input: {
     startedAt: string;
   }) => Promise<void>;
   /** Internal qualification seam for recording the shared Codex server identity. */
-  onProviderSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
+  onProviderSpawn?: (meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+  }) => Promise<void>;
+  /** Clears durable provider ownership after the shared server has stopped. */
+  onProviderExit?: () => Promise<void>;
 }): Promise<AdapterExecutionResult> {
   const binary = input.runnerBinary ?? resolvePaperclipRunnerBinary();
   const runnerDigest = `sha256:${createHash("sha256").update(readFileSync(binary)).digest("hex")}`;
@@ -282,6 +288,7 @@ export async function executeNativeCodexRunner(input: {
       if (!sharedCodexServer.pid) throw new Error("codex_app_server_process_not_started");
       await input.onProviderSpawn?.({
         pid: sharedCodexServer.pid,
+        processGroupId: process.platform === "win32" ? null : sharedCodexServer.pid,
         startedAt: new Date().toISOString(),
       });
       const startupDeadline = Date.now() + 10_000;
@@ -409,6 +416,7 @@ export async function executeNativeCodexRunner(input: {
     if (sharedCodexServer && sharedCodexExit) {
       await stopChild(sharedCodexServer, sharedCodexExit).catch(() => undefined);
     }
+    await input.onProviderExit?.().catch(() => undefined);
     await prepared.release();
     if (sharedCodexSocketDirectory) {
       await rm(sharedCodexSocketDirectory, { recursive: true, force: true });
