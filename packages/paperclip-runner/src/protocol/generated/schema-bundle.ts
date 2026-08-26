@@ -3032,6 +3032,7 @@ export const eventSchema = {
         "usage.reported",
         "semantic_tool.input",
         "semantic_tool.result",
+        "semantic_tool.reconciled",
         "mcp_app.discovered",
         "mcp_app.resource.resolved",
         "mcp_app.initializing",

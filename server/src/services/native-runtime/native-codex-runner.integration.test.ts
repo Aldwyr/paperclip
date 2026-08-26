@@ -6,7 +6,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -15,6 +15,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -174,6 +175,11 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       environmentLeaseId: "lease-native-codex-e2e",
     });
     const logs: string[] = [];
+    const runnerPids: number[] = [];
+    let resolveRestart!: () => void;
+    const restarted = new Promise<void>((resolve) => {
+      resolveRestart = resolve;
+    });
     const execute = executeNativeCodexRunner({
       db,
       companyId,
@@ -201,13 +207,25 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           resolve(runtimeRoot, "fake-codex-state.json"),
           "--call-log",
           resolve(runtimeRoot, "fake-codex-calls.log"),
+          "--emit-semantic-tool",
         ],
         providerVersion: "fake-codex-v1",
       },
       onLog: async (_stream, chunk) => {
         logs.push(chunk);
       },
-      onSpawn: async () => undefined,
+      onSemanticToolInputCommitted: async ({ callId, operationId }) => {
+        expect(callId).toBe("semantic-call-1");
+        expect(operationId).toBe("report_progress");
+        const firstPid = runnerPids[0];
+        if (!firstPid) throw new Error("First Runner D process was not recorded");
+        process.kill(process.platform === "win32" ? firstPid : -firstPid, "SIGKILL");
+        await restarted;
+      },
+      onSpawn: async ({ pid }) => {
+        runnerPids.push(pid);
+        if (runnerPids.length === 2) resolveRestart();
+      },
     });
     const result = await execute.catch((error) => {
       throw new Error(
@@ -240,6 +258,8 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       },
     });
     expect(logs.join("\n")).not.toContain("PAPERCLIP_RUNNER_BOOTSTRAP_TICKET");
+    expect(runnerPids).toHaveLength(2);
+    expect(new Set(runnerPids).size).toBe(2);
 
     const [persistedResult] = await db
       .select()
@@ -251,15 +271,45 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       .from(nativeRunFinalizations)
       .where(eq(nativeRunFinalizations.runId, runId));
     expect(finalization).toMatchObject({ phase: "workspace_finalizing" });
-    const eventTypes = await db
-      .select({ eventType: heartbeatRunEvents.eventType })
+    const nativeEvents = await db
+      .select({
+        eventType: heartbeatRunEvents.eventType,
+        payload: heartbeatRunEvents.payload,
+      })
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
-    expect(eventTypes.map((event) => event.eventType)).toEqual(expect.arrayContaining([
+    expect(nativeEvents.map((event) => event.eventType)).toEqual(expect.arrayContaining([
       "turn.completed",
       "run.result.proposed",
       "run.terminal",
+      "semantic_tool.input",
+      "semantic_tool.reconciled",
     ]));
+    const semanticInputs = nativeEvents.filter(
+      (event) => event.eventType === "semantic_tool.input",
+    );
+    expect(semanticInputs).toHaveLength(1);
+    const semanticEvent = semanticInputs[0]?.payload?.prpEvent as
+      | Record<string, unknown>
+      | undefined;
+    const semanticPayload = semanticEvent?.payload as
+      | Record<string, unknown>
+      | undefined;
+    expect(
+      (semanticPayload?.semantic_tool as Record<string, unknown>)?.callId,
+    ).toBe("semantic-call-1");
+    const progressEffects = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.createdByRunId, runId),
+        ),
+      );
+    expect(progressEffects).toEqual([
+      { body: "Native resume completed one semantic effect." },
+    ]);
 
     const resumedRunId = randomUUID();
     const [resumedRun] = await db.insert(heartbeatRuns).values({
@@ -331,6 +381,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       "utf8",
     );
     expect(providerCalls.match(/^thread\/start$/gm)).toHaveLength(1);
-    expect(providerCalls.match(/^thread\/resume$/gm)).toHaveLength(1);
+    expect(providerCalls.match(/^thread\/resume$/gm)).toHaveLength(2);
+    expect(providerCalls.match(/^semantic_tool\/result$/gm)).toHaveLength(1);
   }, 60_000);
 });

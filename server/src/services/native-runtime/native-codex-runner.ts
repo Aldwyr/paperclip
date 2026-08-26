@@ -12,6 +12,7 @@ import { runnerPrpCoordinator } from "./runner-prp-coordinator.js";
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const RUNNER_VERSION = "paperclip-runner-v1";
+const MAX_RUNNER_RESTARTS = 3;
 
 function executableName(): string {
   return process.platform === "win32" ? "paperclip-runnerd.exe" : "paperclip-runnerd";
@@ -157,6 +158,11 @@ export async function executeNativeCodexRunner(input: {
     args: string[];
     providerVersion?: string;
   };
+  /** Internal restart-test seam. Production semantic dispatch does not pause. */
+  onSemanticToolInputCommitted?: (input: {
+    readonly callId: string;
+    readonly operationId: string;
+  }) => Promise<void>;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onSpawn: (meta: {
     pid: number;
@@ -177,6 +183,7 @@ export async function executeNativeCodexRunner(input: {
 
   const prepared = await runnerPrpCoordinator(input.db, {
     stateRoot: resolve(runtimeRoot, "control-plane"),
+    onSemanticToolInputCommitted: input.onSemanticToolInputCommitted,
   }).prepare({
     companyId: input.companyId,
     issueId: input.issueId,
@@ -206,60 +213,91 @@ export async function executeNativeCodexRunner(input: {
       instructions: "",
       approvalPolicy: "never",
     },
+    semanticTools: prepared.semanticTools,
     completionContract: input.completionContract,
   }, `prepare_${input.runId}`);
   prepared.queueCommand("session.open", {}, `open_${input.runId}`);
   prepared.queueCommand("turn.start", { text: input.prompt }, `turn_${input.runId}`);
 
-  const child = spawn(binary, buildNativeRunnerArguments({
-    connectUrl: prepared.connectUrl,
-    stateDirectory: runnerStateDirectory,
-    runnerInstanceId: input.runnerInstanceId,
-    environmentLeaseId: input.environmentLeaseId,
-    runId: input.runId,
-    normalizedSessionId: input.normalizedSessionId,
-    turnId: input.turnId,
-    itemId: input.itemId,
-    runnerDigest,
-    maxRuntimeMs: input.timeoutMs,
-  }), {
-    cwd: input.cwd,
-    detached: process.platform !== "win32",
-    env: {
-      ...process.env,
-      ...input.environment,
-      PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: prepared.bootstrapTicket,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const exit = waitForExit(child);
-  child.stdout?.on("data", (chunk: Buffer) => {
-    void input.onLog("stdout", chunk.toString("utf8"));
-  });
-  child.stderr?.on("data", (chunk: Buffer) => {
-    void input.onLog("stderr", chunk.toString("utf8"));
-  });
-
+  let activeChild: ChildProcess | null = null;
+  let activeExit: Promise<unknown> | null = null;
   try {
-    if (!child.pid) throw new Error("paperclip_runner_process_not_started");
-    await input.onSpawn({
-      pid: child.pid,
-      processGroupId: process.platform === "win32" ? null : child.pid,
-      startedAt: new Date().toISOString(),
-    });
-    const completed = await Promise.race([
-      prepared.waitForTerminal(input.timeoutMs),
-      exit.then(async ({ code, signal }) => {
-        const recovered = await prepared.waitForTerminal(2_000).catch(() => null);
-        if (recovered) return recovered;
+    const terminal = prepared.waitForTerminal(input.timeoutMs);
+    let bootstrapTicket = prepared.bootstrapTicket;
+    let restartCount = 0;
+    let completed: Awaited<typeof terminal> | null = null;
+    while (completed === null) {
+      const child = spawn(binary, buildNativeRunnerArguments({
+        connectUrl: prepared.connectUrl,
+        stateDirectory: runnerStateDirectory,
+        runnerInstanceId: input.runnerInstanceId,
+        environmentLeaseId: input.environmentLeaseId,
+        runId: input.runId,
+        normalizedSessionId: input.normalizedSessionId,
+        turnId: input.turnId,
+        itemId: input.itemId,
+        runnerDigest,
+        maxRuntimeMs: input.timeoutMs,
+      }), {
+        cwd: input.cwd,
+        detached: process.platform !== "win32",
+        env: {
+          ...process.env,
+          ...input.environment,
+          PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: bootstrapTicket,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const exit = waitForExit(child);
+      activeChild = child;
+      activeExit = exit;
+      child.stdout?.on("data", (chunk: Buffer) => {
+        void input.onLog("stdout", chunk.toString("utf8"));
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        void input.onLog("stderr", chunk.toString("utf8"));
+      });
+      if (!child.pid) throw new Error("paperclip_runner_process_not_started");
+      await input.onSpawn({
+        pid: child.pid,
+        processGroupId: process.platform === "win32" ? null : child.pid,
+        startedAt: new Date().toISOString(),
+      });
+      const outcome = await Promise.race([
+        terminal.then((value) => ({ kind: "terminal" as const, value })),
+        exit.then((value) => ({ kind: "exit" as const, value })),
+      ]);
+      if (outcome.kind === "terminal") {
+        completed = outcome.value;
+        break;
+      }
+      activeChild = null;
+      activeExit = null;
+      const afterExit = await Promise.race([
+        terminal.then((value) => ({ kind: "terminal" as const, value })),
+        new Promise<{ kind: "restart" }>((resolveRestart) => {
+          const timer = setTimeout(() => resolveRestart({ kind: "restart" }), 250);
+          timer.unref();
+        }),
+      ]);
+      if (afterExit.kind === "terminal") {
+        completed = afterExit.value;
+        break;
+      }
+      if (restartCount >= MAX_RUNNER_RESTARTS) {
         throw new Error(
-          `paperclip_runner_process_exited: code=${code ?? "null"} signal=${signal ?? "null"}`,
+          `paperclip_runner_process_exited: code=${outcome.value.code ?? "null"} signal=${outcome.value.signal ?? "null"}`,
         );
-      }),
-    ]);
+      }
+      restartCount += 1;
+      bootstrapTicket = prepared.issueBootstrapTicket();
+    }
+    if (completed === null) throw new Error("paperclip_runner_terminal_missing");
     prepared.queueCommand("session.close", {}, `close_${input.runId}`);
     prepared.queueCommand("runner.shutdown", {}, `shutdown_${input.runId}`);
-    await stopChild(child, exit, true);
+    if (activeChild && activeExit) {
+      await stopChild(activeChild, activeExit, true);
+    }
 
     const succeeded = completed.terminal.runTerminalState === "succeeded";
     return {
@@ -285,7 +323,9 @@ export async function executeNativeCodexRunner(input: {
       summary: completed.result.summary,
     };
   } finally {
-    await stopChild(child, exit).catch(() => undefined);
+    if (activeChild && activeExit) {
+      await stopChild(activeChild, activeExit).catch(() => undefined);
+    }
     await prepared.release();
   }
 }
