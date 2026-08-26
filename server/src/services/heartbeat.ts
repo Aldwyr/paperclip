@@ -9991,6 +9991,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const pidAlive = isProcessAlive(pid);
     const processGroupAlive = isProcessGroupAlive(processGroupId);
     let identity: "owned" | "foreign" | "inconclusive" | "empty" = "empty";
+    let ownedPid: number | null = null;
+    let ownedProcessGroupId: number | null = null;
     if (pidAlive && pid && run.providerProcessStartedAt) {
       const observedStartedAt = await readProcessStartedAt(pid).catch(() => null);
       identity = observedStartedAt === null
@@ -9998,8 +10000,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime()
           ? "owned"
           : "foreign";
-    } else if (
-      processGroupAlive
+      if (identity === "owned") {
+        ownedPid = pid;
+        ownedProcessGroupId = processGroupId;
+      }
+    } else if (pidAlive || processGroupAlive) {
+      identity = "inconclusive";
+    }
+    if (
+      identity !== "owned"
+      && processGroupAlive
       && processGroupId
       && run.providerProcessOwnerToken
     ) {
@@ -10007,11 +10017,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processGroupId,
         run.providerProcessOwnerToken,
       );
-    } else if (pidAlive || processGroupAlive) {
-      identity = "inconclusive";
+      if (identity === "owned") {
+        // A recycled guardian PID is not a safe direct signal target. The
+        // owner token proves the surviving provider group independently, so
+        // terminate only that authenticated group.
+        ownedPid = null;
+        ownedProcessGroupId = processGroupId;
+      }
     }
     if (identity === "owned") {
-      await terminateHeartbeatRunProcess({ pid, processGroupId });
+      await terminateHeartbeatRunProcess({
+        pid: ownedPid,
+        processGroupId: ownedProcessGroupId,
+      });
     }
     if (identity !== "inconclusive" && (pid || processGroupId)) {
       await clearRunProviderProcessMetadata(run.id);

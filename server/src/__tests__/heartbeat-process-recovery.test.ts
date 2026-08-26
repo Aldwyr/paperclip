@@ -1352,6 +1352,62 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("terminates owned provider descendants without signaling a reused guardian pid", async () => {
+    const ownerToken = randomUUID();
+    const guardian = spawn(
+      "/bin/sh",
+      ["-c", "sleep 3600 & echo $!; sleep 0.2"],
+      {
+        detached: true,
+        env: { ...process.env, PAPERCLIP_PROVIDER_OWNER_TOKEN: ownerToken },
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    childProcesses.add(guardian);
+    expect(guardian.pid).toBeTypeOf("number");
+    const descendantPid = await new Promise<number>((resolvePid, rejectPid) => {
+      guardian.stdout?.once("data", (chunk: Buffer) => {
+        const parsedPid = Number.parseInt(chunk.toString("utf8").trim(), 10);
+        if (Number.isInteger(parsedPid) && parsedPid > 0) resolvePid(parsedPid);
+        else rejectPid(new Error("Provider descendant pid was not emitted"));
+      });
+      guardian.once("error", rejectPid);
+    });
+    cleanupPids.add(descendantPid);
+    await new Promise<void>((resolveExit) => guardian.once("exit", () => resolveExit()));
+    expect(isPidAlive(descendantPid)).toBe(true);
+
+    // This unrelated process represents the live process now occupying the
+    // persisted guardian PID after reuse. Its different start identity must
+    // not hide the still-owned provider group or become a cleanup target.
+    const reusedPidOwner = spawnAliveProcess();
+    childProcesses.add(reusedPidOwner);
+    expect(reusedPidOwner.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: reusedPidOwner.pid ?? null,
+      providerProcessGroupId: guardian.pid ?? null,
+      providerProcessStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      providerProcessOwnerToken: ownerToken,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(await waitForPidExit(descendantPid)).toBe(true);
+    expect(isPidAlive(reusedPidOwner.pid)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
+    });
+  });
+
   it("does not signal a reused provider group with a different owner token", async () => {
     const replacementToken = randomUUID();
     const replacementLeader = spawn(
@@ -1452,6 +1508,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(await waitForPidExit(descendantPid)).toBe(true);
     expect(await heartbeat.getRun(runId)).toMatchObject({
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
+    });
+  });
+
+  it("keeps repeated terminal provider cleanup idempotent", async () => {
+    const provider = spawnAliveProcess();
+    childProcesses.add(provider);
+    expect(provider.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      runStatus: "failed",
+      providerProcessPid: provider.pid ?? null,
+      providerProcessStartedAt: new Date(await readProcessStartedAt(provider.pid ?? 0) ?? 0),
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.reapOrphanedRuns()).reaped).toBe(0);
+    expect(await waitForPidExit(provider.pid ?? 0)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
+    });
+
+    expect((await heartbeat.reapOrphanedRuns()).reaped).toBe(0);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
       providerProcessPid: null,
       providerProcessGroupId: null,
       providerProcessStartedAt: null,
