@@ -60,7 +60,8 @@ const fakeCodexBinary = resolve(
 );
 
 function ensureRunnerTestBinaries(): void {
-  if (existsSync(runnerBinary) && existsSync(fakeCodexBinary)) return;
+  const liveCodex = process.env.PAPERCLIP_LIVE_CODEX_NATIVE_RESUME === "1";
+  if (!liveCodex && existsSync(runnerBinary) && existsSync(fakeCodexBinary)) return;
   execFileSync("cargo", [
     "build",
     "--release",
@@ -182,6 +183,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     const runnerPids: number[] = [];
     const providerPids: number[] = [];
     const liveCodex = process.env.PAPERCLIP_LIVE_CODEX_NATIVE_RESUME === "1";
+    const requestedModel = liveCodex ? "gpt-5.6-sol" : "test-model";
     let semanticCallId: string | null = null;
     let resolveRestart!: () => void;
     const restarted = new Promise<void>((resolve) => {
@@ -202,7 +204,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       prompt: liveCodex
         ? "Call report_progress exactly once with body 'Native resume completed one semantic effect.' and idempotencyKey 'native-resume-proof-1'. Then briefly state that the progress update is complete. Do not call any other tool."
         : "Complete the fake native Codex turn.",
-      model: liveCodex ? "gpt-5.6-sol" : "test-model",
+      model: requestedModel,
       resumeProviderSessionId: null,
       completionContract: native.completionContract,
       timeoutMs: liveCodex ? 180_000 : 30_000,
@@ -282,6 +284,10 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     expect(logs.join("\n")).not.toContain("PAPERCLIP_RUNNER_BOOTSTRAP_TICKET");
     expect(runnerPids).toHaveLength(2);
     expect(new Set(runnerPids).size).toBe(2);
+    if (liveCodex) {
+      expect(providerPids).toHaveLength(1);
+      expect(new Set(providerPids).size).toBe(1);
+    }
 
     const [persistedResult] = await db
       .select()
@@ -343,7 +349,19 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     const finalCumulative = finalUsagePayload?.cumulative as
       | Record<string, unknown>
       | undefined;
+    const providerTurnIds = nativeEvents
+      .filter((event) => event.eventType === "turn.started")
+      .map((event) => event.payload?.prpEvent)
+      .filter((event): event is Record<string, unknown> => Boolean(event))
+      .map((event) => event.payload as Record<string, unknown> | undefined)
+      .map((payload) => payload?.providerTurnId)
+      .filter((providerTurnId): providerTurnId is string => (
+        typeof providerTurnId === "string" && providerTurnId.length > 0
+      ));
+    const providerCalls = new Set(providerTurnIds).size;
     expect(finalUsagePayload?.providerTurnId).toEqual(expect.any(String));
+    expect(providerCalls).toBe(1);
+    expect(result.model).toBe(requestedModel);
     expect(finalCumulative?.requests).toBeGreaterThanOrEqual(1);
     expect(finalCumulative?.providerCostStatus).toBe("unpriced");
     expect(finalCumulative?.providerCostUnavailableReason).toBe(
@@ -354,7 +372,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       console.log("NATIVE_CODEX_RESUME_PROOF", JSON.stringify({
         schema: "paperclip-runner/native-resume-live-gate/v1",
         appCommit: process.env.PAPERCLIP_LIVE_CODEX_APP_COMMIT ?? null,
-        model: "gpt-5.6-sol",
+        model: result.model,
         runId,
         providerSessionId: result.sessionParams?.sessionId ?? null,
         semanticCallId,
@@ -369,7 +387,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
         ).length,
         controlPlaneEffectCount: progressEffects.length,
         accounting: {
-          providerCalls: 1,
+          providerCalls,
           providerRequests: finalCumulative?.requests ?? null,
           requestCountSource: finalCumulative?.requestCountSource ?? null,
           requestCountExact: finalCumulative?.requestCountExact ?? null,
@@ -452,12 +470,12 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       exitCode: 0,
       sessionParams: { sessionId: "codex-thread-1" },
     });
-    const providerCalls = await readFile(
+    const providerCallLog = await readFile(
       resolve(runtimeRoot, "fake-codex-calls.log"),
       "utf8",
     );
-    expect(providerCalls.match(/^thread\/start$/gm)).toHaveLength(1);
-    expect(providerCalls.match(/^thread\/resume$/gm)).toHaveLength(2);
-    expect(providerCalls.match(/^semantic_tool\/result$/gm)).toHaveLength(1);
+    expect(providerCallLog.match(/^thread\/start$/gm)).toHaveLength(1);
+    expect(providerCallLog.match(/^thread\/resume$/gm)).toHaveLength(2);
+    expect(providerCallLog.match(/^semantic_tool\/result$/gm)).toHaveLength(1);
   }, 240_000);
 });

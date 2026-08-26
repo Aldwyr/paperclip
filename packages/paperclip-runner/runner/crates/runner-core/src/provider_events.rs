@@ -20,6 +20,49 @@ fn string(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
+fn notice_summary(method: &str, params: &Value) -> String {
+    let message = params
+        .get("message")
+        .or_else(|| params.pointer("/error/message"))
+        .or_else(|| params.pointer("/error/detail"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let code = params
+        .get("code")
+        .or_else(|| params.pointer("/error/code"))
+        .or_else(|| params.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+
+    let summary = match (code, message) {
+        (Some(code), Some(message)) if !message.contains(code) => format!(
+            "{}: {}",
+            bounded_text(code, 240),
+            bounded_text(message, MAX_TEXT_CHARS)
+        ),
+        (_, Some(message)) => bounded_text(message, MAX_TEXT_CHARS),
+        (Some(code), None) => bounded_text(code, 240),
+        (None, None) => match params {
+            Value::Null => String::new(),
+            Value::Object(values) if values.is_empty() => String::new(),
+            Value::Array(values) if values.is_empty() => String::new(),
+            _ => bounded_text(
+                &serde_json::to_string(params).unwrap_or_default(),
+                MAX_TEXT_CHARS,
+            ),
+        },
+    };
+
+    if summary.trim().is_empty() {
+        bounded_text(
+            &format!("Codex {method} notification contained no details"),
+            MAX_TEXT_CHARS,
+        )
+    } else {
+        summary.chars().take(MAX_TEXT_CHARS).collect()
+    }
+}
+
 fn stable_id(value: &str, fallback: &str) -> String {
     let value: String = value
         .chars()
@@ -277,7 +320,7 @@ pub fn normalize_codex_notification(method: &str, params: &Value) -> Vec<Normali
                 "scope": if method.contains("config") { "environment" } else { "turn" },
                 "recoverable": method != "error",
                 "userActionable": true,
-                "summary": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                "summary": notice_summary(method, params),
             }),
         ),
         "item/agentMessage/delta" => push(
@@ -403,6 +446,33 @@ mod tests {
         assert_eq!(events[0].payload["outputTruncated"], true);
         assert_eq!(events[0].payload["outputBytes"], 32);
         assert!(!events[0].payload.to_string().contains("top-secret"));
+    }
+
+    #[test]
+    fn describes_error_notices_from_nested_fields_without_leaking_secrets() {
+        let events = normalize_codex_notification(
+            "error",
+            &json!({
+                "error": {
+                    "code": "authentication_failed",
+                    "message": "Authorization: Bearer top-secret"
+                }
+            }),
+        );
+        let summary = events[0].payload["summary"]
+            .as_str()
+            .expect("notice summary is text");
+        assert!(summary.contains("authentication_failed"));
+        assert!(!summary.contains("top-secret"));
+    }
+
+    #[test]
+    fn gives_detail_free_fatal_notices_an_actionable_summary() {
+        let events = normalize_codex_notification("error", &json!({}));
+        assert_eq!(
+            events[0].payload["summary"],
+            "Codex error notification contained no details"
+        );
     }
 
     #[test]
