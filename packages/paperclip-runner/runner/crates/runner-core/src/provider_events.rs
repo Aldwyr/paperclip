@@ -133,6 +133,7 @@ fn measurement(value: &Value) -> Value {
     let has_token_usage =
         input_tokens > 0 || output_tokens > 0 || cache_read_tokens > 0 || cache_write_tokens > 0;
     let (requests, request_count_source, request_count_exact) = match reported_requests {
+        Some(0) if has_token_usage => (1, "token_bearing_turn_minimum", false),
         Some(requests) => (requests, "provider_reported", true),
         None if has_token_usage => (1, "token_bearing_turn_minimum", false),
         None => (0, "unavailable", false),
@@ -508,10 +509,43 @@ mod tests {
     }
 
     #[test]
+    fn treats_zero_requests_with_positive_tokens_as_an_inexact_lower_bound() {
+        let usage = normalize_codex_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "turnId": "provider-turn-with-usage",
+                "tokenUsage": {
+                    "total": {"inputTokens": 12, "outputTokens": 3, "requests": 0}
+                }
+            }),
+        );
+
+        assert_eq!(
+            usage[0].payload["providerTurnId"],
+            "provider-turn-with-usage"
+        );
+        assert_eq!(usage[0].payload["cumulative"]["requests"], 1);
+        assert_eq!(
+            usage[0].payload["cumulative"]["requestCountSource"],
+            "token_bearing_turn_minimum"
+        );
+        assert_eq!(usage[0].payload["cumulative"]["requestCountExact"], false);
+        assert_eq!(
+            usage[0].payload["cumulative"]["providerCostStatus"],
+            "unpriced"
+        );
+        assert_eq!(
+            usage[0].payload["cumulative"]["providerCostUnavailableReason"],
+            "codex_app_server_does_not_report_per_turn_cost"
+        );
+    }
+
+    #[test]
     fn preserves_provider_reported_request_and_cost_receipts() {
         let usage = normalize_codex_notification(
             "thread/tokenUsage/updated",
             &json!({
+                "turnId": "provider-turn-with-two-requests",
                 "responseId": "resp_123",
                 "tokenUsage": {
                     "total": {"inputTokens": 12, "outputTokens": 3, "requests": 2, "providerCostUsd": 0.04},
@@ -519,6 +553,16 @@ mod tests {
                 }
             }),
         );
+        assert_eq!(
+            usage[0].payload["providerTurnId"],
+            "provider-turn-with-two-requests"
+        );
+        assert_eq!(usage[0].payload["cumulative"]["requests"], 2);
+        assert_eq!(
+            usage[0].payload["cumulative"]["requestCountSource"],
+            "provider_reported"
+        );
+        assert_eq!(usage[0].payload["cumulative"]["requestCountExact"], true);
         assert_eq!(usage[0].payload["providerRequestId"], "resp_123");
         assert_eq!(
             usage[0].payload["providerRequestIdUnavailableReason"],

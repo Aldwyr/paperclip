@@ -399,6 +399,10 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           providerCostStatus: finalCumulative?.providerCostStatus ?? null,
           providerCostUnavailableReason:
             finalCumulative?.providerCostUnavailableReason ?? null,
+          inputTokens: finalCumulative?.inputTokens ?? null,
+          outputTokens: finalCumulative?.outputTokens ?? null,
+          cacheReadTokens: finalCumulative?.cacheReadTokens ?? null,
+          cacheWriteTokens: finalCumulative?.cacheWriteTokens ?? null,
         },
         usageReports,
       }));
