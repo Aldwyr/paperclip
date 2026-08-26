@@ -176,6 +176,8 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     });
     const logs: string[] = [];
     const runnerPids: number[] = [];
+    const liveCodex = process.env.PAPERCLIP_LIVE_CODEX_NATIVE_RESUME === "1";
+    let semanticCallId: string | null = null;
     let resolveRestart!: () => void;
     const restarted = new Promise<void>((resolve) => {
       resolveRestart = resolve;
@@ -192,30 +194,35 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       turnId: native.turnId,
       itemId: native.itemId,
       cwd: tmpdir(),
-      prompt: "Complete the fake native Codex turn.",
-      model: "test-model",
+      prompt: liveCodex
+        ? "Call report_progress exactly once with body 'Native resume completed one semantic effect.' and idempotencyKey 'native-resume-proof-1'. Then briefly state that the progress update is complete. Do not call any other tool."
+        : "Complete the fake native Codex turn.",
+      model: liveCodex ? "gpt-5.6-sol" : "test-model",
       resumeProviderSessionId: null,
       completionContract: native.completionContract,
-      timeoutMs: 30_000,
+      timeoutMs: liveCodex ? 180_000 : 30_000,
       environment: {},
       runnerBinary,
       runtimeRoot,
-      providerLaunch: {
-        command: fakeCodexBinary,
-        args: [
-          "--state-file",
-          resolve(runtimeRoot, "fake-codex-state.json"),
-          "--call-log",
-          resolve(runtimeRoot, "fake-codex-calls.log"),
-          "--emit-semantic-tool",
-        ],
-        providerVersion: "fake-codex-v1",
-      },
+      ...(liveCodex ? {} : {
+        providerLaunch: {
+          command: fakeCodexBinary,
+          args: [
+            "--state-file",
+            resolve(runtimeRoot, "fake-codex-state.json"),
+            "--call-log",
+            resolve(runtimeRoot, "fake-codex-calls.log"),
+            "--emit-semantic-tool",
+          ],
+          providerVersion: "fake-codex-v1",
+        },
+      }),
       onLog: async (_stream, chunk) => {
         logs.push(chunk);
       },
       onSemanticToolInputCommitted: async ({ callId, operationId }) => {
-        expect(callId).toBe("semantic-call-1");
+        semanticCallId = callId;
+        if (!liveCodex) expect(callId).toBe("semantic-call-1");
         expect(operationId).toBe("report_progress");
         const firstPid = runnerPids[0];
         if (!firstPid) throw new Error("First Runner D process was not recorded");
@@ -238,8 +245,6 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       signal: null,
       timedOut: false,
       provider: "codex",
-      sessionParams: { sessionId: "codex-thread-1" },
-      summary: "Codex completed the fake turn.",
       resultJson: {
         nativeRunner: {
           result: {
@@ -257,6 +262,12 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
         },
       },
     });
+    if (!liveCodex) {
+      expect(result).toMatchObject({
+        sessionParams: { sessionId: "codex-thread-1" },
+        summary: "Codex completed the fake turn.",
+      });
+    }
     expect(logs.join("\n")).not.toContain("PAPERCLIP_RUNNER_BOOTSTRAP_TICKET");
     expect(runnerPids).toHaveLength(2);
     expect(new Set(runnerPids).size).toBe(2);
@@ -297,7 +308,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       | undefined;
     expect(
       (semanticPayload?.semantic_tool as Record<string, unknown>)?.callId,
-    ).toBe("semantic-call-1");
+    ).toBe(semanticCallId);
     const progressEffects = await db
       .select({ body: issueComments.body })
       .from(issueComments)
@@ -310,6 +321,26 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     expect(progressEffects).toEqual([
       { body: "Native resume completed one semantic effect." },
     ]);
+
+    if (liveCodex) {
+      console.log("NATIVE_CODEX_RESUME_PROOF", JSON.stringify({
+        appCommit: process.env.PAPERCLIP_LIVE_CODEX_APP_COMMIT ?? null,
+        runId,
+        providerSessionId: result.sessionParams?.sessionId ?? null,
+        semanticCallId,
+        runnerPids,
+        semanticInputCount: semanticInputs.length,
+        semanticReconciledCount: nativeEvents.filter(
+          (event) => event.eventType === "semantic_tool.reconciled",
+        ).length,
+        semanticResultCount: nativeEvents.filter(
+          (event) => event.eventType === "semantic_tool.result",
+        ).length,
+        controlPlaneEffectCount: progressEffects.length,
+        usage: result.usage ?? null,
+      }));
+      return;
+    }
 
     const resumedRunId = randomUUID();
     const [resumedRun] = await db.insert(heartbeatRuns).values({

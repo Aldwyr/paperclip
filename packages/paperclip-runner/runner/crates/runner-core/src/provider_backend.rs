@@ -929,8 +929,16 @@ impl CodexCommandExecutor {
                         }
                     }
                     if method == "turn/completed" {
+                        if !state.pending_semantic_calls.is_empty() {
+                            return Err(DurableRunnerError::invalid(
+                                "Codex completed a turn with pending semantic tool calls",
+                            ));
+                        }
                         state.active_provider_turn_id = None;
                         state.lifecycle = "session_open".to_owned();
+                        // A completed turn cannot reissue its tool requests. Keep results
+                        // only through that boundary so long-lived sessions stay bounded.
+                        state.completed_semantic_calls.clear();
                     }
                     state.extend_events(normalized)?;
                     if let Some(event_type) = terminal_event_type {
