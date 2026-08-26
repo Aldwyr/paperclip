@@ -180,6 +180,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     });
     const logs: string[] = [];
     const runnerPids: number[] = [];
+    const providerPids: number[] = [];
     const liveCodex = process.env.PAPERCLIP_LIVE_CODEX_NATIVE_RESUME === "1";
     let semanticCallId: string | null = null;
     let resolveRestart!: () => void;
@@ -238,6 +239,10 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
         runnerPids.push(pid);
         if (liveCodex) console.log("NATIVE_CODEX_RESUME_RUNNER", pid);
         if (runnerPids.length === 2) resolveRestart();
+      },
+      onProviderSpawn: async ({ pid }) => {
+        providerPids.push(pid);
+        if (liveCodex) console.log("NATIVE_CODEX_RESUME_PROVIDER", pid);
       },
     });
     const result = await execute.catch((error) => {
@@ -335,6 +340,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
         providerSessionId: result.sessionParams?.sessionId ?? null,
         semanticCallId,
         runnerPids,
+        providerPids,
         semanticInputCount: semanticInputs.length,
         semanticReconciledCount: nativeEvents.filter(
           (event) => event.eventType === "semantic_tool.reconciled",

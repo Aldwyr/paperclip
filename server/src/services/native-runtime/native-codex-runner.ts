@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -45,6 +45,25 @@ export function resolvePaperclipRunnerBinary(
   throw new Error(
     "paperclip_runner_binary_missing: build @paperclipai/paperclip-runner or set PAPERCLIP_RUNNER_BINARY",
   );
+}
+
+function resolveCodexUnixProxy(): string {
+  const candidates = [
+    resolve(moduleDirectory, "../../vendor/paperclip-runner/cli/codex-app-server-unix-proxy.js"),
+    resolve(
+      moduleDirectory,
+      "../../../../packages/paperclip-runner/dist/cli/codex-app-server-unix-proxy.js",
+    ),
+  ];
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.R_OK);
+      return candidate;
+    } catch {
+      // Continue through packaged and workspace locations.
+    }
+  }
+  throw new Error("paperclip_runner_codex_proxy_missing: build @paperclipai/paperclip-runner");
 }
 
 export function buildNativeRunnerArguments(input: {
@@ -169,6 +188,8 @@ export async function executeNativeCodexRunner(input: {
     processGroupId: number | null;
     startedAt: string;
   }) => Promise<void>;
+  /** Internal qualification seam for recording the shared Codex server identity. */
+  onProviderSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
 }): Promise<AdapterExecutionResult> {
   const binary = input.runnerBinary ?? resolvePaperclipRunnerBinary();
   const runnerDigest = `sha256:${createHash("sha256").update(readFileSync(binary)).digest("hex")}`;
@@ -180,6 +201,11 @@ export async function executeNativeCodexRunner(input: {
   privateDirectory(resolve(runtimeRoot, "control-plane"));
   privateDirectory(resolve(runtimeRoot, "runner"));
   privateDirectory(runnerStateDirectory);
+  const sharedCodexSocket = resolve(runnerStateDirectory, "codex-app-server.sock");
+  const useSharedCodexServer = input.providerLaunch === undefined;
+  const providerCommand = input.providerLaunch?.command ?? process.execPath;
+  const providerArgs = input.providerLaunch?.args
+    ?? [resolveCodexUnixProxy(), "--socket", sharedCodexSocket];
 
   const prepared = await runnerPrpCoordinator(input.db, {
     stateRoot: resolve(runtimeRoot, "control-plane"),
@@ -203,8 +229,8 @@ export async function executeNativeCodexRunner(input: {
       provider: "codex",
       driver: "codex_app_server",
       providerVersion: input.providerLaunch?.providerVersion ?? "codex-app-server-v1",
-      command: input.providerLaunch?.command ?? "codex",
-      args: input.providerLaunch?.args ?? ["app-server"],
+      command: providerCommand,
+      args: providerArgs,
       cwd: input.cwd,
       ...(input.model ? { model: input.model } : {}),
       ...(input.resumeProviderSessionId
@@ -221,7 +247,52 @@ export async function executeNativeCodexRunner(input: {
 
   let activeChild: ChildProcess | null = null;
   let activeExit: Promise<unknown> | null = null;
+  let sharedCodexServer: ChildProcess | null = null;
+  let sharedCodexExit: Promise<unknown> | null = null;
   try {
+    if (useSharedCodexServer) {
+      let startupError: Error | null = null;
+      let stderr = "";
+      sharedCodexServer = spawn(
+        "codex",
+        ["app-server", "--listen", `unix://${sharedCodexSocket}`],
+        {
+          cwd: input.cwd,
+          detached: process.platform !== "win32",
+          env: { ...process.env, ...input.environment },
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
+      sharedCodexExit = waitForExit(sharedCodexServer);
+      sharedCodexServer.once("error", (error) => {
+        startupError = error;
+      });
+      sharedCodexServer.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+        stderr = `${stderr}${chunk}`.slice(-16_384);
+      });
+      if (!sharedCodexServer.pid) throw new Error("codex_app_server_process_not_started");
+      await input.onProviderSpawn?.({
+        pid: sharedCodexServer.pid,
+        startedAt: new Date().toISOString(),
+      });
+      const startupDeadline = Date.now() + 10_000;
+      while (
+        !existsSync(sharedCodexSocket)
+        && startupError === null
+        && sharedCodexServer.exitCode === null
+        && Date.now() < startupDeadline
+      ) {
+        await new Promise<void>((resolveWait) => {
+          const timer = setTimeout(resolveWait, 20);
+          timer.unref();
+        });
+      }
+      if (!existsSync(sharedCodexSocket)) {
+        throw new Error(
+          `codex_app_server_socket_missing: ${(startupError as Error | null)?.message ?? stderr.trim()}`,
+        );
+      }
+    }
     const terminal = prepared.waitForTerminal(input.timeoutMs);
     let bootstrapTicket = prepared.bootstrapTicket;
     let restartCount = 0;
@@ -325,6 +396,9 @@ export async function executeNativeCodexRunner(input: {
   } finally {
     if (activeChild && activeExit) {
       await stopChild(activeChild, activeExit).catch(() => undefined);
+    }
+    if (sharedCodexServer && sharedCodexExit) {
+      await stopChild(sharedCodexServer, sharedCodexExit).catch(() => undefined);
     }
     await prepared.release();
   }
