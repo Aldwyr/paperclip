@@ -229,7 +229,7 @@ impl CodexProvider {
             "cwd": config.cwd,
             "model": config.model,
             "approvalPolicy": config.approval_policy,
-            "permissions": "paperclip-runner-workspace-only",
+            "permissions": ":workspace",
             "runtimeWorkspaceRoots": [config.cwd],
             "baseInstructions": config.instructions,
         });
@@ -303,7 +303,7 @@ impl CodexProvider {
             json!({
                 "threadId": self.thread_id,
                 "cwd": cwd,
-                "permissions": "paperclip-runner-workspace-only",
+                "permissions": ":workspace",
                 "runtimeWorkspaceRoots": [cwd],
                 "input": [{"type": "text", "text": message, "text_elements": []}],
             }),
