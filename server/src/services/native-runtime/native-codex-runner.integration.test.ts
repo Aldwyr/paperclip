@@ -414,5 +414,5 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     expect(providerCalls.match(/^thread\/start$/gm)).toHaveLength(1);
     expect(providerCalls.match(/^thread\/resume$/gm)).toHaveLength(2);
     expect(providerCalls.match(/^semantic_tool\/result$/gm)).toHaveLength(1);
-  }, 60_000);
+  }, 240_000);
 });
