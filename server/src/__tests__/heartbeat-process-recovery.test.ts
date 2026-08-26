@@ -1401,6 +1401,64 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("retains inconclusive provider ownership for terminal cleanup retry", async () => {
+    const ownerToken = randomUUID();
+    const guardian = spawn(
+      "/bin/sh",
+      ["-c", "sleep 3600 & echo $!; sleep 0.2"],
+      {
+        detached: true,
+        env: { ...process.env, PAPERCLIP_PROVIDER_OWNER_TOKEN: ownerToken },
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    childProcesses.add(guardian);
+    expect(guardian.pid).toBeTypeOf("number");
+    const descendantPid = await new Promise<number>((resolvePid, rejectPid) => {
+      guardian.stdout?.once("data", (chunk: Buffer) => {
+        const parsedPid = Number.parseInt(chunk.toString("utf8").trim(), 10);
+        if (Number.isInteger(parsedPid) && parsedPid > 0) resolvePid(parsedPid);
+        else rejectPid(new Error("Retry descendant pid was not emitted"));
+      });
+      guardian.once("error", rejectPid);
+    });
+    cleanupPids.add(descendantPid);
+    await new Promise<void>((resolveExit) => guardian.once("exit", () => resolveExit()));
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: guardian.pid ?? null,
+      providerProcessGroupId: guardian.pid ?? null,
+      providerProcessStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      providerProcessOwnerToken: null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    expect((await heartbeat.reapOrphanedRuns()).reaped).toBe(1);
+    expect(isPidAlive(descendantPid)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      status: "failed",
+      providerProcessPid: guardian.pid,
+      providerProcessGroupId: guardian.pid,
+      providerProcessOwnerToken: null,
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({ providerProcessOwnerToken: ownerToken })
+      .where(eq(heartbeatRuns.id, runId));
+    await heartbeat.reapOrphanedRuns();
+
+    expect(await waitForPidExit(descendantPid)).toBe(true);
+    expect(await heartbeat.getRun(runId)).toMatchObject({
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
+    });
+  });
+
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
     const { companyId, agentId } = await seedIdleTimerAgentFixture();
     const heartbeat = heartbeatService(db);

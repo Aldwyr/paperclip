@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6397,9 +6397,10 @@ function isProcessAlive(pid: number | null | undefined) {
 async function isOwnedProviderProcessGroup(
   processGroupId: number,
   ownerToken: string,
-): Promise<boolean> {
-  if (process.platform !== "linux" || !ownerToken) return false;
-  const entries = await fs.readdir("/proc", { withFileTypes: true }).catch(() => []);
+): Promise<"owned" | "foreign" | "inconclusive" | "empty"> {
+  if (process.platform !== "linux" || !ownerToken) return "inconclusive";
+  const entries = await fs.readdir("/proc", { withFileTypes: true }).catch(() => null);
+  if (!entries) return "inconclusive";
   const memberPids: number[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
@@ -6412,13 +6413,15 @@ async function isOwnedProviderProcessGroup(
     const observedGroupId = Number.parseInt(fields[2] ?? "", 10);
     if (observedGroupId === processGroupId) memberPids.push(pid);
   }
-  if (memberPids.length === 0) return false;
+  if (memberPids.length === 0) return "empty";
   const expectedEntry = `PAPERCLIP_PROVIDER_OWNER_TOKEN=${ownerToken}`;
   const ownership = await Promise.all(memberPids.map(async (pid) => {
     const environ = await fs.readFile(`/proc/${pid}/environ`).catch(() => null);
-    return environ?.toString("utf8").split("\0").includes(expectedEntry) ?? false;
+    if (!environ) return null;
+    return environ.toString("utf8").split("\0").includes(expectedEntry);
   }));
-  return ownership.every(Boolean);
+  if (ownership.some((owned) => owned === null)) return "inconclusive";
+  return ownership.every(Boolean) ? "owned" : "foreign";
 }
 
 async function terminateHeartbeatRunProcess(input: {
@@ -9987,28 +9990,58 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const processGroupId = run.providerProcessGroupId;
     const pidAlive = isProcessAlive(pid);
     const processGroupAlive = isProcessGroupAlive(processGroupId);
-    let ownsLiveProcess = false;
+    let identity: "owned" | "foreign" | "inconclusive" | "empty" = "empty";
     if (pidAlive && pid && run.providerProcessStartedAt) {
       const observedStartedAt = await readProcessStartedAt(pid).catch(() => null);
-      ownsLiveProcess = observedStartedAt !== null
-        && Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime();
+      identity = observedStartedAt === null
+        ? "inconclusive"
+        : Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime()
+          ? "owned"
+          : "foreign";
     } else if (
       processGroupAlive
       && processGroupId
       && run.providerProcessOwnerToken
     ) {
-      ownsLiveProcess = await isOwnedProviderProcessGroup(
+      identity = await isOwnedProviderProcessGroup(
         processGroupId,
         run.providerProcessOwnerToken,
       );
+    } else if (pidAlive || processGroupAlive) {
+      identity = "inconclusive";
     }
-    if (ownsLiveProcess) {
+    if (identity === "owned") {
       await terminateHeartbeatRunProcess({ pid, processGroupId });
     }
-    if (pid || processGroupId) {
+    if (identity !== "inconclusive" && (pid || processGroupId)) {
       await clearRunProviderProcessMetadata(run.id);
     }
-    return ownsLiveProcess;
+    return identity === "owned";
+  }
+
+  async function reapTerminalProviderProcesses() {
+    const terminalProviderRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        notInArray(heartbeatRuns.status, ["queued", "running"]),
+        or(
+          isNotNull(heartbeatRuns.providerProcessPid),
+          isNotNull(heartbeatRuns.providerProcessGroupId),
+        ),
+      ));
+    let reaped = 0;
+    for (const run of terminalProviderRuns) {
+      try {
+        if (await terminateRunProviderProcess(run)) reaped += 1;
+      } catch (error) {
+        logger.warn(
+          { runId: run.id, errorKind: "provider_process_reap_failed" },
+          "provider process recovery will retry after an inconclusive cleanup",
+        );
+      }
+    }
+    return reaped;
   }
 
   async function clearDetachedRunWarning(runId: string) {
@@ -13757,6 +13790,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+    await reapTerminalProviderProcesses();
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
