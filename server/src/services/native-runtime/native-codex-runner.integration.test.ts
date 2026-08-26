@@ -333,13 +333,28 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       { body: "Native resume completed one semantic effect." },
     ]);
 
+    const usageReports = nativeEvents
+      .filter((event) => event.eventType === "usage.reported")
+      .map((event) => event.payload?.prpEvent)
+      .filter((event): event is Record<string, unknown> => Boolean(event));
+    const finalUsagePayload = usageReports.at(-1)?.payload as
+      | Record<string, unknown>
+      | undefined;
+    const finalCumulative = finalUsagePayload?.cumulative as
+      | Record<string, unknown>
+      | undefined;
+    expect(finalUsagePayload?.providerTurnId).toEqual(expect.any(String));
+    expect(finalCumulative?.requests).toBeGreaterThanOrEqual(1);
+    expect(finalCumulative?.providerCostStatus).toBe("unpriced");
+    expect(finalCumulative?.providerCostUnavailableReason).toBe(
+      "codex_app_server_does_not_report_per_turn_cost",
+    );
+
     if (liveCodex) {
-      const usageReports = nativeEvents
-        .filter((event) => event.eventType === "usage.reported")
-        .map((event) => event.payload?.prpEvent)
-        .filter((event): event is Record<string, unknown> => Boolean(event));
       console.log("NATIVE_CODEX_RESUME_PROOF", JSON.stringify({
+        schema: "paperclip-runner/native-resume-live-gate/v1",
         appCommit: process.env.PAPERCLIP_LIVE_CODEX_APP_COMMIT ?? null,
+        model: "gpt-5.6-sol",
         runId,
         providerSessionId: result.sessionParams?.sessionId ?? null,
         semanticCallId,
@@ -353,6 +368,20 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           (event) => event.eventType === "semantic_tool.result",
         ).length,
         controlPlaneEffectCount: progressEffects.length,
+        accounting: {
+          providerCalls: 1,
+          providerRequests: finalCumulative?.requests ?? null,
+          requestCountSource: finalCumulative?.requestCountSource ?? null,
+          requestCountExact: finalCumulative?.requestCountExact ?? null,
+          providerTurnId: finalUsagePayload?.providerTurnId ?? null,
+          providerRequestId: finalUsagePayload?.providerRequestId ?? null,
+          providerRequestIdUnavailableReason:
+            finalUsagePayload?.providerRequestIdUnavailableReason ?? null,
+          providerCostUsd: finalCumulative?.providerCostUsd ?? null,
+          providerCostStatus: finalCumulative?.providerCostStatus ?? null,
+          providerCostUnavailableReason:
+            finalCumulative?.providerCostUnavailableReason ?? null,
+        },
         usageReports,
       }));
       return;

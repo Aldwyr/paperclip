@@ -1883,7 +1883,21 @@ export const usageSchema = {
       ],
       "maxLength": 240
     },
+    "providerTurnId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
     "providerRequestId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 240
+    },
+    "providerRequestIdUnavailableReason": {
       "type": [
         "string",
         "null"
@@ -1935,9 +1949,32 @@ export const usageSchema = {
           "type": "integer",
           "minimum": 0
         },
+        "requestCountSource": {
+          "enum": [
+            "provider_reported",
+            "token_bearing_turn_minimum",
+            "unavailable"
+          ]
+        },
+        "requestCountExact": {
+          "type": "boolean"
+        },
         "providerCostUsd": {
           "type": "number",
           "minimum": 0
+        },
+        "providerCostStatus": {
+          "enum": [
+            "reported",
+            "unpriced"
+          ]
+        },
+        "providerCostUnavailableReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 240
         }
       },
       "additionalProperties": false

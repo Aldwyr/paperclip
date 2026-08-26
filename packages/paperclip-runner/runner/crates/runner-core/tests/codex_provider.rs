@@ -116,15 +116,18 @@ fn codex_transport_buffers_notifications_while_waiting_for_responses() {
         .start_turn("Complete the fake task.", &config.cwd)
         .expect("start provider turn");
     let mut event_types = Vec::new();
+    let mut usage_provider_turn_id = None;
     for _ in 0..16 {
         if let Some(CodexProviderEvent::Notification { method, params }) =
             provider.poll().expect("poll provider event")
         {
-            event_types.extend(
-                normalize_codex_notification(&method, &params)
-                    .into_iter()
-                    .map(|event| event.event_type),
-            );
+            for event in normalize_codex_notification(&method, &params) {
+                if event.event_type == "usage.reported" {
+                    usage_provider_turn_id =
+                        event.payload["providerTurnId"].as_str().map(str::to_owned);
+                }
+                event_types.push(event.event_type);
+            }
         }
         if event_types.iter().any(|event| event == "turn.completed") {
             break;
@@ -134,6 +137,7 @@ fn codex_transport_buffers_notifications_while_waiting_for_responses() {
     assert!(event_types.iter().any(|event| event == "item.completed"));
     assert!(event_types.iter().any(|event| event == "usage.reported"));
     assert!(event_types.iter().any(|event| event == "turn.completed"));
+    assert_eq!(usage_provider_turn_id.as_deref(), Some("provider-turn-1"));
     provider.shutdown().expect("stop provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }

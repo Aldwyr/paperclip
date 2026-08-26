@@ -539,7 +539,17 @@ impl CodexProvider {
         }
 
         if let Some(method) = message.get("method").and_then(Value::as_str) {
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let mut params = message.get("params").cloned().unwrap_or(Value::Null);
+            if method == "thread/tokenUsage/updated" {
+                if let (Some(object), Some(turn_id)) = (
+                    params.as_object_mut(),
+                    self.active_provider_turn_id.as_deref(),
+                ) {
+                    object
+                        .entry("turnId".to_owned())
+                        .or_insert_with(|| json!(turn_id));
+                }
+            }
             validate_notification_binding(
                 &self.thread_id,
                 self.active_provider_turn_id.as_deref(),
