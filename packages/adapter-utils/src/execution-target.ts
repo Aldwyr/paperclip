@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { Duplex } from "node:stream";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
@@ -43,7 +44,9 @@ import {
 import {
   createHttp2BridgeServer,
   type Http2BridgeForwardHandler,
+  type Http2BridgeServerHandle,
 } from "./http2-bridge-server.js";
+import { getHttp2BridgeAdmissionGate, type Http2BridgeAdmissionGate } from "./http2-bridge-admission.js";
 import {
   createSandboxRunLogTailFactory,
   type SandboxRunLogTailFactory,
@@ -3541,6 +3544,45 @@ export const __http2PrefaceScanTesting = {
 };
 
 /**
+ * Reserve one live-session admission slot, then bind the channel to the
+ * HTTP/2 server. Returns `null` at once when the cap is already full; the
+ * caller must never bind the channel in that case. `bindChannel` is
+ * synchronous, so a bind failure releases the reserved slot before it
+ * re-throws the original error — the reservation never outlives a channel
+ * that never bound. On success, the returned `boundDuplex` carries a
+ * `close` listener that releases the same slot; `release` is idempotent,
+ * so a caller may also call it again on a later teardown path with no
+ * second slot freed.
+ */
+function bindHttp2BridgeSessionWithAdmission(
+  gate: Http2BridgeAdmissionGate,
+  http2Server: Http2BridgeServerHandle,
+  channel: CommandManagedDuplexChannel,
+): { boundDuplex: Duplex; release: () => void } | null {
+  const release = gate.tryAcquireSession();
+  if (!release) return null;
+  let boundDuplex: Duplex;
+  try {
+    boundDuplex = http2Server.bindChannel(channel);
+  } catch (error) {
+    release();
+    throw error;
+  }
+  boundDuplex.on("close", release);
+  return { boundDuplex, release };
+}
+
+/**
+ * Test-only surface for {@link bindHttp2BridgeSessionWithAdmission}. A test
+ * drives the reserve-then-bind-then-release cycle, including a forced bind
+ * failure, with a fake gate and a fake server handle, without the whole
+ * bridge. Production code never reads this export.
+ */
+export const __http2BridgeSessionAdmissionTesting = {
+  bindHttp2BridgeSessionWithAdmission,
+};
+
+/**
  * The terminal run disposition for the `http2_v1` path, in the same shape as
  * {@link DuplexBrokerRunDisposition}. A `failed` disposition means a terminal
  * loss ordered before an orderly completion, so the run must not report
@@ -4629,60 +4671,89 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             stop: () => prefaceScan.scanned.stop(),
             close: () => prefaceScan.scanned.close(),
           };
-          const boundDuplex = http2Server.bindChannel(channelForHttp2Server);
-          // Also catches the `Duplex` this wrapper destroys when the bounded
-          // read backpressure queue overflows post-bind, so that loss still
-          // reaches `recordHttp2Loss` the same way any other write fault does.
-          boundDuplex.on("error", () => recordHttp2Loss("write_error"));
-
-          duplexChannelOpen.ready();
-          await onLog(
-            "stdout",
-            "[paperclip] Sandbox HTTP/2 transport ready; serving the host-assigned origin.\n",
+          // Reserve one live-session slot before the bind, not after: the
+          // host must hold the full wrapper budget for the whole session
+          // before the wrapper exists. `tryAcquireSession` never waits; a
+          // caller that waited here would hold a partly-open channel for an
+          // unbounded time.
+          const admittedSession = bindHttp2BridgeSessionWithAdmission(
+            getHttp2BridgeAdmissionGate(),
+            http2Server,
+            channelForHttp2Server,
           );
-          // Stream run logs on the http2 path with the same gate and the same
-          // log line as the file path. The http2 path starts no file-bridge
-          // worker, so create the log directory before the tail starts.
-          let duplexRunLogTail: SandboxRunLogTailFactory | null = null;
-          if (target.transport === "sandbox" && target.streamRunLogs !== false) {
-            const duplexLogsDir = sandboxCallbackBridgeDirectories(queueDir).logsDir;
-            await ensureSandboxRunLogDirectory({
-              runner,
-              remoteCwd: target.remoteCwd,
-              logsDir: duplexLogsDir,
-              shellCommand,
-              timeoutMs: bridgeTimeoutMs,
-            });
-            duplexRunLogTail = createSandboxRunLogTailFactory({
-              runner,
-              remoteCwd: target.remoteCwd,
-              logsDir: duplexLogsDir,
-              shellCommand,
-            });
-            await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
+          if (!admittedSession) {
+            // Fail closed, the same shape as a missing preface: close the
+            // partial channel inside the cleanup budget, then select the
+            // file bridge. The host never bound this channel to an HTTP/2
+            // session, so no request reached it or any endpoint.
+            gate.disposePendingReplay();
+            await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+            duplexChannelOpen.fallback("host_session_capacity");
+            await onLog(
+              "stderr",
+              "[paperclip] The host HTTP/2 bridge live session cap is full (host_session_capacity). Using the file bridge.\n",
+            );
+          } else {
+            const { boundDuplex, release: releaseSessionSlot } = admittedSession;
+            // Also catches the `Duplex` this wrapper destroys when the bounded
+            // read backpressure queue overflows post-bind, so that loss still
+            // reaches `recordHttp2Loss` the same way any other write fault does.
+            boundDuplex.on("error", () => recordHttp2Loss("write_error"));
+
+            duplexChannelOpen.ready();
+            await onLog(
+              "stdout",
+              "[paperclip] Sandbox HTTP/2 transport ready; serving the host-assigned origin.\n",
+            );
+            // Stream run logs on the http2 path with the same gate and the same
+            // log line as the file path. The http2 path starts no file-bridge
+            // worker, so create the log directory before the tail starts.
+            let duplexRunLogTail: SandboxRunLogTailFactory | null = null;
+            if (target.transport === "sandbox" && target.streamRunLogs !== false) {
+              const duplexLogsDir = sandboxCallbackBridgeDirectories(queueDir).logsDir;
+              await ensureSandboxRunLogDirectory({
+                runner,
+                remoteCwd: target.remoteCwd,
+                logsDir: duplexLogsDir,
+                shellCommand,
+                timeoutMs: bridgeTimeoutMs,
+              });
+              duplexRunLogTail = createSandboxRunLogTailFactory({
+                runner,
+                remoteCwd: target.remoteCwd,
+                logsDir: duplexLogsDir,
+                shellCommand,
+              });
+              await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
+            }
+            return {
+              env: {
+                PAPERCLIP_API_URL: sandboxOrigin,
+                PAPERCLIP_API_KEY: bridgeToken,
+                PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+              },
+              runLogTail: duplexRunLogTail,
+              readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
+              // Atomically read the latch and mark the orderly completion for the
+              // ACP success-eligible terminal, so no await separates the read from
+              // the mark and a teardown loss cannot slip in between.
+              settleRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.settleRunDisposition(),
+              markOrderlyCompletion: (): void => dispositionLatch.markOrderlyCompletion(),
+              stop: async () => {
+                // Close the HTTP/2 server's sessions, then the channel, before
+                // lease release, so no live provider session remains when the
+                // caller releases the lease.
+                await http2Server.close();
+                await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
+                // Idempotent: releases the session slot here too, in case the
+                // bound `Duplex` never emits `close` on this exact teardown
+                // path. A second call from the `close` listener above frees
+                // no second slot.
+                releaseSessionSlot();
+                await bridgeAsset.cleanup();
+              },
+            };
           }
-          return {
-            env: {
-              PAPERCLIP_API_URL: sandboxOrigin,
-              PAPERCLIP_API_KEY: bridgeToken,
-              PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
-            },
-            runLogTail: duplexRunLogTail,
-            readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
-            // Atomically read the latch and mark the orderly completion for the
-            // ACP success-eligible terminal, so no await separates the read from
-            // the mark and a teardown loss cannot slip in between.
-            settleRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.settleRunDisposition(),
-            markOrderlyCompletion: (): void => dispositionLatch.markOrderlyCompletion(),
-            stop: async () => {
-              // Close the HTTP/2 server's sessions, then the channel, before
-              // lease release, so no live provider session remains when the
-              // caller releases the lease.
-              await http2Server.close();
-              await closeDuplexChannelWithinBudget(openedChannel, DEFAULT_DUPLEX_CLEANUP_BUDGET_MS);
-              await bridgeAsset.cleanup();
-            },
-          };
         }
       }
     }

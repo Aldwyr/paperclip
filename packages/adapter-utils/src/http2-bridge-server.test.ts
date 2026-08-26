@@ -33,7 +33,12 @@ import {
 import { createSandboxHttp2BridgeGateway } from "./sandbox-callback-bridge.js";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
+  DEFAULT_MAX_LIVE_HTTP2_BRIDGE_SESSIONS,
+  DEFAULT_MAX_PARALLEL_HTTP2_BRIDGE_REQUESTS,
+  http2BridgeAdmissionBudgetBytes,
   Http2BridgeAdmissionGate,
+  HTTP2_BRIDGE_ADMISSION_MEMORY_TARGET_BYTES,
+  HTTP2_BRIDGE_ADMISSION_RESERVED_BUDGET_BYTES,
   HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES,
 } from "./http2-bridge-admission.js";
 
@@ -1726,6 +1731,56 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
 
         await handle.close();
         expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        rawClient.close();
+      }
+    });
+
+    it("the default caps keep the named byte total inside the reserved budget", () => {
+      // 64 admitted streams x 868,351 bytes, plus 8 live sessions x
+      // 16,777,216 bytes: 189,792,192 named bytes in total. This stays
+      // inside the 201,326,592-byte reserved budget and below the
+      // 268,435,456-byte target.
+      const total = http2BridgeAdmissionBudgetBytes(
+        DEFAULT_MAX_PARALLEL_HTTP2_BRIDGE_REQUESTS,
+        DEFAULT_MAX_LIVE_HTTP2_BRIDGE_SESSIONS,
+      );
+      expect(total).toBe(189_792_192);
+      expect(total).toBeLessThanOrEqual(HTTP2_BRIDGE_ADMISSION_RESERVED_BUDGET_BYTES);
+      expect(total).toBeLessThan(HTTP2_BRIDGE_ADMISSION_MEMORY_TARGET_BYTES);
+    });
+
+    it("one more live session than the default cap would pass the reserved budget", () => {
+      // 64 admitted streams x 868,351 bytes, plus 9 live sessions x
+      // 16,777,216 bytes: 206,569,408 named bytes. This passes the
+      // 201,326,592-byte reserved budget.
+      const total = http2BridgeAdmissionBudgetBytes(
+        DEFAULT_MAX_PARALLEL_HTTP2_BRIDGE_REQUESTS,
+        DEFAULT_MAX_LIVE_HTTP2_BRIDGE_SESSIONS + 1,
+      );
+      expect(total).toBe(206_569_408);
+      expect(total).toBeGreaterThan(HTTP2_BRIDGE_ADMISSION_RESERVED_BUDGET_BYTES);
+    });
+
+    it("bindChannel's Duplex emits close once the handle closes the session it belongs to", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      const [serverSide, clientSide] = duplexPair();
+      const channel = fakeChannelFromDuplex(serverSide);
+      const handle = createHttp2BridgeServer({
+        bridgeToken: BRIDGE_TOKEN,
+        forwardRequest: async () => ({ status: 200 }),
+        admissionGate,
+      });
+      const boundDuplex = handle.bindChannel(channel);
+      const rawClient = connectRawClient(clientSide);
+      try {
+        // Wait for the session to actually establish, the same way a real
+        // sandbox client would, before the close-teardown path runs.
+        await new Promise<void>((resolve) => rawClient.once("connect", resolve));
+        const closed = new Promise<void>((resolve) => boundDuplex.once("close", resolve));
+        await handle.close();
+        await closed;
+        expect(boundDuplex.destroyed).toBe(true);
       } finally {
         rawClient.close();
       }
