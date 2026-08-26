@@ -9947,12 +9947,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ): Promise<boolean> {
     const pid = run.providerProcessPid;
     const processGroupId = run.providerProcessGroupId;
-    const alive = isProcessAlive(pid) || isProcessGroupAlive(processGroupId);
+    const pidAlive = isProcessAlive(pid);
+    const processGroupAlive = isProcessGroupAlive(processGroupId);
     let ownsLiveProcess = false;
-    if (alive && pid && run.providerProcessStartedAt) {
+    if (pidAlive && pid && run.providerProcessStartedAt) {
       const observedStartedAt = await readProcessStartedAt(pid).catch(() => null);
       ownsLiveProcess = observedStartedAt !== null
         && Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime();
+    } else if (processGroupAlive && pid && processGroupId === pid) {
+      // The persisted guardian is the process-group leader. POSIX keeps that
+      // group id allocated while any original descendant remains. If the id
+      // has been reused by a new live leader, the branch above validates its
+      // start identity instead.
+      ownsLiveProcess = true;
     }
     if (ownsLiveProcess) {
       await terminateHeartbeatRunProcess({ pid, processGroupId });
@@ -16320,7 +16327,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             environment,
             onLog,
             onSpawn,
-            onProviderSpawn: async (meta) => {
+            onProviderOwnerSpawn: async (meta) => {
               await persistRunProviderProcessMetadata(run.id, meta);
             },
             onProviderExit: async () => {

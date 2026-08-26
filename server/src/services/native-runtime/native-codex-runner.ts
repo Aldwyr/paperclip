@@ -16,6 +16,15 @@ import { runnerPrpCoordinator } from "./runner-prp-coordinator.js";
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 const RUNNER_VERSION = "paperclip-runner-v1";
 const MAX_RUNNER_RESTARTS = 3;
+const PROVIDER_GUARDIAN_SCRIPT = [
+  "IFS= read -r ready || exit 0",
+  '[ "$ready" = "start" ] || exit 0',
+  '"$@" >/dev/null &',
+  "provider_pid=$!",
+  "printf '%s\\n' \"$provider_pid\"",
+  'wait "$provider_pid" || true',
+  "while :; do sleep 3600; done",
+].join("\n");
 
 function executableName(): string {
   return process.platform === "win32" ? "paperclip-runnerd.exe" : "paperclip-runnerd";
@@ -126,6 +135,85 @@ async function waitForChildExit(exit: Promise<unknown>, timeoutMs: number): Prom
   }
 }
 
+async function startGuardedProvider(input: {
+  command: string;
+  args: string[];
+  cwd: string;
+  environment: Record<string, string>;
+  onOwnerSpawn?: (meta: {
+    pid: number;
+    processGroupId: number;
+    startedAt: string;
+  }) => Promise<void>;
+}): Promise<{
+  guardian: ChildProcess;
+  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  providerPid: number;
+}> {
+  if (process.platform === "win32") {
+    throw new Error("codex_app_server_guardian_unsupported_platform");
+  }
+  const guardian = spawn(
+    "/bin/sh",
+    ["-c", PROVIDER_GUARDIAN_SCRIPT, "paperclip-codex-provider", input.command, ...input.args],
+    {
+      cwd: input.cwd,
+      detached: true,
+      env: { ...process.env, ...input.environment },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  const exit = waitForExit(guardian);
+  try {
+    if (!guardian.pid) throw new Error("codex_app_server_guardian_not_started");
+    const ownerStartedAt = await readProcessStartedAt(guardian.pid);
+    if (!ownerStartedAt) throw new Error("codex_app_server_guardian_identity_unavailable");
+    await input.onOwnerSpawn?.({
+      pid: guardian.pid,
+      processGroupId: guardian.pid,
+      startedAt: ownerStartedAt,
+    });
+
+    let buffer = "";
+    const providerPid = await new Promise<number>((resolvePid, rejectPid) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        rejectPid(new Error("codex_app_server_guardian_start_timeout"));
+      }, 10_000);
+      timeout.unref();
+      const cleanup = () => {
+        clearTimeout(timeout);
+        guardian.stdout?.off("data", onData);
+      };
+      const onData = (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) return;
+        const parsedPid = Number.parseInt(buffer.slice(0, newline).trim(), 10);
+        cleanup();
+        if (!Number.isInteger(parsedPid) || parsedPid <= 0) {
+          rejectPid(new Error("codex_app_server_guardian_invalid_provider_pid"));
+          return;
+        }
+        resolvePid(parsedPid);
+      };
+      guardian.stdout?.on("data", onData);
+      void exit.then(({ code, signal }) => {
+        cleanup();
+        rejectPid(
+          new Error(`codex_app_server_guardian_exited: code=${code ?? "null"} signal=${signal ?? "null"}`),
+        );
+      }, rejectPid);
+      guardian.stdin?.end("start\n");
+    });
+    return { guardian, exit, providerPid };
+  } catch (error) {
+    guardian.stdin?.destroy();
+    await stopChild(guardian, exit).catch(() => undefined);
+    throw error;
+  }
+}
+
 function signalRunnerProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   if (process.platform !== "win32" && child.pid) {
     try {
@@ -195,6 +283,12 @@ export async function executeNativeCodexRunner(input: {
   onProviderSpawn?: (meta: {
     pid: number;
     processGroupId: number | null;
+    startedAt: string;
+  }) => Promise<void>;
+  /** Persists the provider guardian before it is allowed to launch Codex. */
+  onProviderOwnerSpawn?: (meta: {
+    pid: number;
+    processGroupId: number;
     startedAt: string;
   }) => Promise<void>;
   /** Clears durable provider ownership after the shared server has stopped. */
@@ -269,31 +363,28 @@ export async function executeNativeCodexRunner(input: {
     if (useSharedCodexServer) {
       let startupError: Error | null = null;
       let stderr = "";
-      sharedCodexServer = spawn(
-        "codex",
-        ["app-server", "--listen", `unix://${sharedCodexSocket}`],
-        {
-          cwd: input.cwd,
-          detached: process.platform !== "win32",
-          env: { ...process.env, ...input.environment },
-          stdio: ["ignore", "ignore", "pipe"],
-        },
-      );
-      sharedCodexExit = waitForExit(sharedCodexServer);
+      const guardedProvider = await startGuardedProvider({
+        command: "codex",
+        args: ["app-server", "--listen", `unix://${sharedCodexSocket}`],
+        cwd: input.cwd,
+        environment: input.environment,
+        onOwnerSpawn: input.onProviderOwnerSpawn,
+      });
+      sharedCodexServer = guardedProvider.guardian;
+      sharedCodexExit = guardedProvider.exit;
       sharedCodexServer.once("error", (error) => {
         startupError = error;
       });
       sharedCodexServer.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
         stderr = `${stderr}${chunk}`.slice(-16_384);
       });
-      if (!sharedCodexServer.pid) throw new Error("codex_app_server_process_not_started");
-      const providerStartedAt = await readProcessStartedAt(sharedCodexServer.pid);
+      const providerStartedAt = await readProcessStartedAt(guardedProvider.providerPid);
       if (!providerStartedAt) {
         throw new Error("codex_app_server_process_identity_unavailable");
       }
       await input.onProviderSpawn?.({
-        pid: sharedCodexServer.pid,
-        processGroupId: process.platform === "win32" ? null : sharedCodexServer.pid,
+        pid: guardedProvider.providerPid,
+        processGroupId: sharedCodexServer.pid ?? null,
         startedAt: providerStartedAt,
       });
       const startupDeadline = Date.now() + 10_000;

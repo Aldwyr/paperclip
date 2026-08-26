@@ -1297,6 +1297,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("terminates provider-group descendants after the guardian exits", async () => {
+    const guardian = spawn(
+      "/bin/sh",
+      ["-c", "sleep 3600 & echo $!; sleep 0.2"],
+      { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    childProcesses.add(guardian);
+    expect(guardian.pid).toBeTypeOf("number");
+    const guardianStartedAt = await readProcessStartedAt(guardian.pid ?? 0);
+    const descendantPid = await new Promise<number>((resolvePid, rejectPid) => {
+      guardian.stdout?.once("data", (chunk: Buffer) => {
+        const parsedPid = Number.parseInt(chunk.toString("utf8").trim(), 10);
+        if (Number.isInteger(parsedPid) && parsedPid > 0) resolvePid(parsedPid);
+        else rejectPid(new Error("Provider descendant pid was not emitted"));
+      });
+      guardian.once("error", rejectPid);
+    });
+    cleanupPids.add(descendantPid);
+    await new Promise<void>((resolveExit) => guardian.once("exit", () => resolveExit()));
+    expect(isPidAlive(guardian.pid)).toBe(false);
+    expect(isPidAlive(descendantPid)).toBe(true);
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: guardian.pid ?? null,
+      providerProcessGroupId: guardian.pid ?? null,
+      providerProcessStartedAt: new Date(guardianStartedAt ?? 0),
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(await waitForPidExit(descendantPid)).toBe(true);
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+    });
+  });
+
   it("skips generic timer wakes without invoking an adapter when no assigned work is actionable", async () => {
     const { companyId, agentId } = await seedIdleTimerAgentFixture();
     const heartbeat = heartbeatService(db);
