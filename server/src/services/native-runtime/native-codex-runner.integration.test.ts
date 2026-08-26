@@ -109,7 +109,11 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     runnerPrpWebSocketInternals.resetForTests();
     await closeServer(server);
     await temporary?.cleanup();
-    if (runtimeRoot) await rm(runtimeRoot, { recursive: true, force: true });
+    if (runtimeRoot && process.env.PAPERCLIP_LIVE_CODEX_NATIVE_RESUME !== "1") {
+      await rm(runtimeRoot, { recursive: true, force: true });
+    } else if (runtimeRoot) {
+      console.log("NATIVE_CODEX_RESUME_RUNTIME", runtimeRoot);
+    }
   });
 
   it("returns a durable result and resumes the provider session on the next run", async () => {
@@ -222,6 +226,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       },
       onSemanticToolInputCommitted: async ({ callId, operationId }) => {
         semanticCallId = callId;
+        if (liveCodex) console.log("NATIVE_CODEX_RESUME_SEMANTIC_INPUT", callId);
         if (!liveCodex) expect(callId).toBe("semantic-call-1");
         expect(operationId).toBe("report_progress");
         const firstPid = runnerPids[0];
@@ -231,6 +236,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
       },
       onSpawn: async ({ pid }) => {
         runnerPids.push(pid);
+        if (liveCodex) console.log("NATIVE_CODEX_RESUME_RUNNER", pid);
         if (runnerPids.length === 2) resolveRestart();
       },
     });
