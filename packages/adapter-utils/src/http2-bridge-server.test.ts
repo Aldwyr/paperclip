@@ -1210,6 +1210,162 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
       }
     });
 
+    it("a queued stream reads no request body bytes until the gate admits it", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      let releaseFirstStream: (() => void) | undefined;
+      const firstStreamHeld = new Promise<void>((resolve) => {
+        releaseFirstStream = resolve;
+      });
+      const secondForwardTracker = createForwarderCallTracker();
+      // Count the `data` events the second stream's underlying transport
+      // delivers. A session-level listener sees the same stream object the
+      // request handler holds, so this counts real transport delivery, not
+      // a private field inside the handler.
+      let secondStreamDataEvents = 0;
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        forwardRequest: async (request) => {
+          if (request.pathname === "/api/agents/me") {
+            // Hold the only slot until the test explicitly releases it.
+            await firstStreamHeld;
+            return { status: 200 };
+          }
+          secondForwardTracker.markCalled();
+          return { status: 200, body: JSON.stringify({ bodyLength: request.body.byteLength }) };
+        },
+        onSession: (session) => {
+          session.on("stream", (stream, headers) => {
+            if (headers[":path"] === "/api/issues/abc/comments") {
+              stream.on("data", () => {
+                secondStreamDataEvents += 1;
+              });
+            }
+          });
+        },
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const firstReq = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        firstReq.resume();
+        firstReq.end();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(admissionGate.activeCount).toBe(1);
+        expect(admissionGate.queuedCount).toBe(0);
+
+        const secondReq = rawClient.request({
+          ":method": "POST",
+          ":path": "/api/issues/abc/comments",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        let status = 0;
+        let responseBody = "";
+        secondReq.setEncoding("utf8");
+        secondReq.on("response", (headers) => {
+          status = Number(headers[":status"]) || 0;
+        });
+        secondReq.on("data", (chunk) => (responseBody += chunk));
+        const secondDone = new Promise<void>((resolve, reject) => {
+          secondReq.on("end", () => resolve());
+          secondReq.on("error", reject);
+        });
+        // Send the full body and end the stream while it still queues
+        // behind the first stream's held slot.
+        secondReq.write(Buffer.alloc(4096, "b"));
+        secondReq.end();
+
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.queuedCount).toBe(1);
+        // The second stream's body reached the transport, but the gate has
+        // not admitted it: the handler must hold none of those bytes yet.
+        expect(secondForwardTracker.called).toBe(false);
+        expect(secondStreamDataEvents).toBe(0);
+
+        releaseFirstStream?.();
+        await secondDone;
+
+        expect(status).toBe(200);
+        expect(JSON.parse(responseBody)).toEqual({ bodyLength: 4096 });
+        expect(secondForwardTracker.called).toBe(true);
+        expect(secondStreamDataEvents).toBeGreaterThan(0);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("a body that arrives during the queue wait completes after admission", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      let releaseFirstStream: (() => void) | undefined;
+      const firstStreamHeld = new Promise<void>((resolve) => {
+        releaseFirstStream = resolve;
+      });
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        forwardRequest: async (request) => {
+          if (request.pathname === "/api/agents/me") {
+            await firstStreamHeld;
+            return { status: 200 };
+          }
+          return { status: 200, body: JSON.stringify({ bodyLength: request.body.byteLength }) };
+        },
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const firstReq = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        firstReq.resume();
+        firstReq.end();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(admissionGate.activeCount).toBe(1);
+
+        const secondReq = rawClient.request({
+          ":method": "POST",
+          ":path": "/api/issues/abc/comments",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        let status = 0;
+        let responseBody = "";
+        secondReq.setEncoding("utf8");
+        secondReq.on("response", (headers) => {
+          status = Number(headers[":status"]) || 0;
+        });
+        secondReq.on("data", (chunk) => (responseBody += chunk));
+        const secondDone = new Promise<void>((resolve, reject) => {
+          secondReq.on("end", () => resolve());
+          secondReq.on("error", reject);
+        });
+
+        // Stream the body over several writes while the stream still
+        // queues, and end it before the gate admits it.
+        const bodyParts = ["first-chunk-", "second-chunk-", "third-chunk"];
+        for (const part of bodyParts) {
+          secondReq.write(part);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        secondReq.end();
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(admissionGate.queuedCount).toBe(1);
+
+        releaseFirstStream?.();
+        await secondDone;
+
+        const expectedBody = bodyParts.join("");
+        expect(status).toBe(200);
+        expect(JSON.parse(responseBody)).toEqual({ bodyLength: expectedBody.length });
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
     it("a token, path, or route denial takes no gate slot", async () => {
       const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
       const { handle, bridgeToken, clientSide } = bindTestServer({ admissionGate });

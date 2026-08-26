@@ -727,11 +727,22 @@ type Http2BridgeBodyCaptureOutcome = { ok: true; body: Buffer } | { ok: false; e
  * peer's `end` (Node does not replay a body the JS layer was not yet
  * listening for), stalling a request that already fully arrived.
  *
- * `awaitBody` arms the idle and lifetime timers and returns the promise the
- * caller awaits. Call it once, when the caller is ready to enforce the
- * bounds (after the admission wait, in this server). If the body already
- * finished, or the stream already errored, closed, or aborted, before
- * `awaitBody` runs, it delivers that outcome at once and arms no timer.
+ * The function pauses the stream right after it attaches the listeners, in
+ * that same synchronous turn. A queued stream must hold no request body
+ * bytes in host memory while it waits for admission: the pause stops the
+ * peer's flow-control window from advancing, so the peer itself stalls at
+ * the wire and the queue applies real back pressure instead of buffering
+ * the body early. `awaitBody` resumes the stream once the caller is ready
+ * to read it. Both halves are needed together: the synchronous listener
+ * attach keeps the `end` event, and the pause keeps the body out of memory
+ * until admission.
+ *
+ * `awaitBody` resumes the stream, then arms the idle and lifetime timers,
+ * and returns the promise the caller awaits. Call it once, when the caller
+ * is ready to enforce the bounds (after the admission wait, in this
+ * server). If the body already finished, or the stream already errored,
+ * closed, or aborted, before `awaitBody` runs, it delivers that outcome at
+ * once, resumes no stream, and arms no timer.
  */
 function beginHttp2BridgeStreamBodyCapture(
   stream: http2.ServerHttp2Stream,
@@ -786,6 +797,11 @@ function beginHttp2BridgeStreamBodyCapture(
   stream.once("close", () =>
     settle({ ok: false, error: new Error("Bridge request stream closed before it completed.") }),
   );
+  // Pause at once, in the same synchronous turn as the listener attach
+  // above: a queued stream then holds no request body bytes in host
+  // memory, because the peer's own flow-control window stalls it at the
+  // wire instead of the JS layer buffering the body early.
+  stream.pause();
 
   return {
     awaitBody(idleTimeoutMs: number, lifetimeCeilingMs: number): Promise<Buffer> {
@@ -803,6 +819,10 @@ function beginHttp2BridgeStreamBodyCapture(
         }
         onSettled = deliver;
         armedIdleTimeoutMs = idleTimeoutMs;
+        // The stream stayed paused for the whole admission wait: resume it
+        // here, now that the caller is ready to enforce the idle and
+        // lifetime bounds below.
+        stream.resume();
         armIdleTimer();
         // Arms one time, from here, and never rearms on a chunk: see
         // DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_LIFETIME_CEILING_MS for why the
