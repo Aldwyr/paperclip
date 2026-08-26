@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -201,8 +203,15 @@ export async function executeNativeCodexRunner(input: {
   privateDirectory(resolve(runtimeRoot, "control-plane"));
   privateDirectory(resolve(runtimeRoot, "runner"));
   privateDirectory(runnerStateDirectory);
-  const sharedCodexSocket = resolve(runnerStateDirectory, "codex-app-server.sock");
   const useSharedCodexServer = input.providerLaunch === undefined;
+  const socketBase = process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? tmpdir();
+  const sharedCodexSocketDirectory = useSharedCodexServer
+    ? await mkdtemp(resolve(socketBase, "pc-codex-"))
+    : null;
+  if (sharedCodexSocketDirectory) privateDirectory(sharedCodexSocketDirectory);
+  const sharedCodexSocket = sharedCodexSocketDirectory
+    ? resolve(sharedCodexSocketDirectory, "c.sock")
+    : "";
   const providerCommand = input.providerLaunch?.command ?? process.execPath;
   const providerArgs = input.providerLaunch?.args
     ?? [resolveCodexUnixProxy(), "--socket", sharedCodexSocket];
@@ -401,5 +410,8 @@ export async function executeNativeCodexRunner(input: {
       await stopChild(sharedCodexServer, sharedCodexExit).catch(() => undefined);
     }
     await prepared.release();
+    if (sharedCodexSocketDirectory) {
+      await rm(sharedCodexSocketDirectory, { recursive: true, force: true });
+    }
   }
 }
