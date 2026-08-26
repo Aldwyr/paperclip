@@ -108,6 +108,7 @@ import {
 } from "../services/heartbeat.ts";
 import {
   readHotRestartIntent,
+  readProcessStartedAt,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
@@ -490,6 +491,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     processGroupId?: number | null;
     providerProcessPid?: number | null;
     providerProcessGroupId?: number | null;
+    providerProcessStartedAt?: Date | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -552,7 +554,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processGroupId: input?.processGroupId ?? null,
       providerProcessPid: input?.providerProcessPid ?? null,
       providerProcessGroupId: input?.providerProcessGroupId ?? null,
-      providerProcessStartedAt: input?.providerProcessPid ? now : null,
+      providerProcessStartedAt: input?.providerProcessStartedAt
+        ?? (input?.providerProcessPid ? now : null),
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -1250,6 +1253,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { runId } = await seedRunFixture({
       processPid: 999_999_999,
       providerProcessPid: provider.pid ?? null,
+      providerProcessStartedAt: new Date(await readProcessStartedAt(provider.pid ?? 0) ?? 0),
       includeIssue: false,
     });
     const heartbeat = heartbeatService(db);
@@ -1258,6 +1262,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(result.reaped).toBe(1);
     expect(await waitForPidExit(provider.pid ?? 0)).toBe(true);
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+    });
+  });
+
+  it("does not signal a reused provider pid with a different start time", async () => {
+    const replacement = spawnAliveProcess();
+    childProcesses.add(replacement);
+    expect(replacement.pid).toBeTypeOf("number");
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: replacement.pid ?? null,
+      providerProcessStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(isPidAlive(replacement.pid)).toBe(true);
     const run = await heartbeat.getRun(runId);
     expect(run).toMatchObject({
       status: "failed",

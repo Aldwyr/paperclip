@@ -10,6 +10,7 @@ import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
+import { readProcessStartedAt } from "../hot-restart.js";
 import { runnerPrpCoordinator } from "./runner-prp-coordinator.js";
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url));
@@ -286,10 +287,14 @@ export async function executeNativeCodexRunner(input: {
         stderr = `${stderr}${chunk}`.slice(-16_384);
       });
       if (!sharedCodexServer.pid) throw new Error("codex_app_server_process_not_started");
+      const providerStartedAt = await readProcessStartedAt(sharedCodexServer.pid);
+      if (!providerStartedAt) {
+        throw new Error("codex_app_server_process_identity_unavailable");
+      }
       await input.onProviderSpawn?.({
         pid: sharedCodexServer.pid,
         processGroupId: process.platform === "win32" ? null : sharedCodexServer.pid,
-        startedAt: new Date().toISOString(),
+        startedAt: providerStartedAt,
       });
       const startupDeadline = Date.now() + 10_000;
       while (

@@ -313,6 +313,7 @@ import {
 import {
   findMissingHotRestartSnapshotRunIds,
   readHotRestartIntent,
+  readProcessStartedAt,
   removeHotRestartIntent,
   shouldHonorHotRestartIntentForProcess,
   writeHotRestartReport,
@@ -9941,19 +9942,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function terminateRunProviderProcess(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "providerProcessPid" | "providerProcessGroupId"
+      "id" | "providerProcessPid" | "providerProcessGroupId" | "providerProcessStartedAt"
     >,
   ): Promise<boolean> {
     const pid = run.providerProcessPid;
     const processGroupId = run.providerProcessGroupId;
     const alive = isProcessAlive(pid) || isProcessGroupAlive(processGroupId);
-    if (alive) {
+    let ownsLiveProcess = false;
+    if (alive && pid && run.providerProcessStartedAt) {
+      const observedStartedAt = await readProcessStartedAt(pid).catch(() => null);
+      ownsLiveProcess = observedStartedAt !== null
+        && Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime();
+    }
+    if (ownsLiveProcess) {
       await terminateHeartbeatRunProcess({ pid, processGroupId });
     }
     if (pid || processGroupId) {
       await clearRunProviderProcessMetadata(run.id);
     }
-    return alive;
+    return ownsLiveProcess;
   }
 
   async function clearDetachedRunWarning(runId: string) {
