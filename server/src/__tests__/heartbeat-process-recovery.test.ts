@@ -492,6 +492,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     providerProcessPid?: number | null;
     providerProcessGroupId?: number | null;
     providerProcessStartedAt?: Date | null;
+    providerProcessOwnerToken?: string | null;
     processLossRetryCount?: number;
     includeIssue?: boolean;
     runErrorCode?: string | null;
@@ -556,6 +557,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       providerProcessGroupId: input?.providerProcessGroupId ?? null,
       providerProcessStartedAt: input?.providerProcessStartedAt
         ?? (input?.providerProcessPid ? now : null),
+      providerProcessOwnerToken: input?.providerProcessOwnerToken ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
       errorCode: input?.runErrorCode ?? null,
       error: input?.runError ?? null,
@@ -1268,6 +1270,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       providerProcessPid: null,
       providerProcessGroupId: null,
       providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
     });
   });
 
@@ -1294,14 +1297,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       providerProcessPid: null,
       providerProcessGroupId: null,
       providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
     });
   });
 
   it("terminates provider-group descendants after the guardian exits", async () => {
+    const ownerToken = randomUUID();
     const guardian = spawn(
       "/bin/sh",
       ["-c", "sleep 3600 & echo $!; sleep 0.2"],
-      { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+      {
+        detached: true,
+        env: { ...process.env, PAPERCLIP_PROVIDER_OWNER_TOKEN: ownerToken },
+        stdio: ["ignore", "pipe", "ignore"],
+      },
     );
     childProcesses.add(guardian);
     expect(guardian.pid).toBeTypeOf("number");
@@ -1324,6 +1333,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       providerProcessPid: guardian.pid ?? null,
       providerProcessGroupId: guardian.pid ?? null,
       providerProcessStartedAt: new Date(guardianStartedAt ?? 0),
+      providerProcessOwnerToken: ownerToken,
       includeIssue: false,
     });
     const heartbeat = heartbeatService(db);
@@ -1338,6 +1348,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       providerProcessPid: null,
       providerProcessGroupId: null,
       providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
+    });
+  });
+
+  it("does not signal a reused provider group with a different owner token", async () => {
+    const replacementToken = randomUUID();
+    const replacementLeader = spawn(
+      "/bin/sh",
+      ["-c", "sleep 3600 & echo $!; sleep 0.2"],
+      {
+        detached: true,
+        env: { ...process.env, PAPERCLIP_PROVIDER_OWNER_TOKEN: replacementToken },
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    );
+    childProcesses.add(replacementLeader);
+    expect(replacementLeader.pid).toBeTypeOf("number");
+    const descendantPid = await new Promise<number>((resolvePid, rejectPid) => {
+      replacementLeader.stdout?.once("data", (chunk: Buffer) => {
+        const parsedPid = Number.parseInt(chunk.toString("utf8").trim(), 10);
+        if (Number.isInteger(parsedPid) && parsedPid > 0) resolvePid(parsedPid);
+        else rejectPid(new Error("Replacement descendant pid was not emitted"));
+      });
+      replacementLeader.once("error", rejectPid);
+    });
+    cleanupPids.add(descendantPid);
+    await new Promise<void>((resolveExit) => replacementLeader.once("exit", () => resolveExit()));
+    expect(isPidAlive(descendantPid)).toBe(true);
+
+    const { runId } = await seedRunFixture({
+      processPid: 999_999_999,
+      providerProcessPid: replacementLeader.pid ?? null,
+      providerProcessGroupId: replacementLeader.pid ?? null,
+      providerProcessStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      providerProcessOwnerToken: randomUUID(),
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+
+    expect(result.reaped).toBe(1);
+    expect(isPidAlive(descendantPid)).toBe(true);
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "failed",
+      providerProcessPid: null,
+      providerProcessGroupId: null,
+      providerProcessStartedAt: null,
+      providerProcessOwnerToken: null,
     });
   });
 

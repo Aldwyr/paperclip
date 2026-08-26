@@ -6394,6 +6394,33 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+async function isOwnedProviderProcessGroup(
+  processGroupId: number,
+  ownerToken: string,
+): Promise<boolean> {
+  if (process.platform !== "linux" || !ownerToken) return false;
+  const entries = await fs.readdir("/proc", { withFileTypes: true }).catch(() => []);
+  const memberPids: number[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number.parseInt(entry.name, 10);
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => null);
+    if (!stat) continue;
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) continue;
+    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+    const observedGroupId = Number.parseInt(fields[2] ?? "", 10);
+    if (observedGroupId === processGroupId) memberPids.push(pid);
+  }
+  if (memberPids.length === 0) return false;
+  const expectedEntry = `PAPERCLIP_PROVIDER_OWNER_TOKEN=${ownerToken}`;
+  const ownership = await Promise.all(memberPids.map(async (pid) => {
+    const environ = await fs.readFile(`/proc/${pid}/environ`).catch(() => null);
+    return environ?.toString("utf8").split("\0").includes(expectedEntry) ?? false;
+  }));
+  return ownership.every(Boolean);
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -9909,7 +9936,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function persistRunProviderProcessMetadata(
     runId: string,
-    meta: { pid: number; processGroupId: number | null; startedAt: string },
+    meta: {
+      pid: number;
+      processGroupId: number | null;
+      startedAt: string;
+      ownerToken: string;
+    },
   ) {
     const startedAt = new Date(meta.startedAt);
     return db
@@ -9918,6 +9950,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         providerProcessPid: meta.pid,
         providerProcessGroupId: meta.processGroupId,
         providerProcessStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+        providerProcessOwnerToken: meta.ownerToken,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, runId))
@@ -9932,6 +9965,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         providerProcessPid: null,
         providerProcessGroupId: null,
         providerProcessStartedAt: null,
+        providerProcessOwnerToken: null,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, runId))
@@ -9942,7 +9976,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function terminateRunProviderProcess(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "providerProcessPid" | "providerProcessGroupId" | "providerProcessStartedAt"
+      | "id"
+      | "providerProcessPid"
+      | "providerProcessGroupId"
+      | "providerProcessStartedAt"
+      | "providerProcessOwnerToken"
     >,
   ): Promise<boolean> {
     const pid = run.providerProcessPid;
@@ -9954,12 +9992,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const observedStartedAt = await readProcessStartedAt(pid).catch(() => null);
       ownsLiveProcess = observedStartedAt !== null
         && Date.parse(observedStartedAt) === run.providerProcessStartedAt.getTime();
-    } else if (processGroupAlive && pid && processGroupId === pid) {
-      // The persisted guardian is the process-group leader. POSIX keeps that
-      // group id allocated while any original descendant remains. If the id
-      // has been reused by a new live leader, the branch above validates its
-      // start identity instead.
-      ownsLiveProcess = true;
+    } else if (
+      processGroupAlive
+      && processGroupId
+      && run.providerProcessOwnerToken
+    ) {
+      ownsLiveProcess = await isOwnedProviderProcessGroup(
+        processGroupId,
+        run.providerProcessOwnerToken,
+      );
     }
     if (ownsLiveProcess) {
       await terminateHeartbeatRunProcess({ pid, processGroupId });

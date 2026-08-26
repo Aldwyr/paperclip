@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -144,6 +144,7 @@ async function startGuardedProvider(input: {
     pid: number;
     processGroupId: number;
     startedAt: string;
+    ownerToken: string;
   }) => Promise<void>;
 }): Promise<{
   guardian: ChildProcess;
@@ -153,13 +154,18 @@ async function startGuardedProvider(input: {
   if (process.platform === "win32") {
     throw new Error("codex_app_server_guardian_unsupported_platform");
   }
+  const ownerToken = randomUUID();
   const guardian = spawn(
     "/bin/sh",
     ["-c", PROVIDER_GUARDIAN_SCRIPT, "paperclip-codex-provider", input.command, ...input.args],
     {
       cwd: input.cwd,
       detached: true,
-      env: { ...process.env, ...input.environment },
+      env: {
+        ...process.env,
+        ...input.environment,
+        PAPERCLIP_PROVIDER_OWNER_TOKEN: ownerToken,
+      },
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
@@ -172,6 +178,7 @@ async function startGuardedProvider(input: {
       pid: guardian.pid,
       processGroupId: guardian.pid,
       startedAt: ownerStartedAt,
+      ownerToken,
     });
 
     let buffer = "";
@@ -290,6 +297,7 @@ export async function executeNativeCodexRunner(input: {
     pid: number;
     processGroupId: number;
     startedAt: string;
+    ownerToken: string;
   }) => Promise<void>;
   /** Clears durable provider ownership after the shared server has stopped. */
   onProviderExit?: () => Promise<void>;

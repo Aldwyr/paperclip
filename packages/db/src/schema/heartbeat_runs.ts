@@ -66,6 +66,7 @@ export const heartbeatRuns = pgTable(
     providerProcessPid: integer("provider_process_pid"),
     providerProcessGroupId: integer("provider_process_group_id"),
     providerProcessStartedAt: timestamp("provider_process_started_at", { withTimezone: true }),
+    providerProcessOwnerToken: text("provider_process_owner_token"),
     lastOutputAt: timestamp("last_output_at", { withTimezone: true }),
     lastOutputSeq: integer("last_output_seq").notNull().default(0),
     lastOutputStream: text("last_output_stream"),

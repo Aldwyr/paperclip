@@ -1597,6 +1597,13 @@
       "when": 1787775574417,
       "tag": "0229_wise_amphibian",
       "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "version": "7",
+      "when": 1787776668722,
+      "tag": "0230_lowly_stranger",
+      "breakpoints": true
     }
   ]
 }
