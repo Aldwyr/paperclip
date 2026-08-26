@@ -254,7 +254,34 @@ fn durable_backend_resumes_one_pending_native_tool_call_with_the_same_identity()
             "semantic_tool.result",
             json!({
                 "callId": "semantic-call-1",
-                "result": {"ok": true, "value": {"task": "NCV-1"}},
+                "result": {
+                    "ok": true,
+                    "value": {"task": "NCV-1"},
+                    "resultReceipt": {
+                        "schema": "paperclip.prp.semantic_tool.v1",
+                        "schemaVersion": 1,
+                        "phase": "result",
+                        "operationId": "report_progress",
+                        "callId": "semantic-call-1",
+                        "correlation": {
+                            "runId": "run-1",
+                            "normalizedSessionId": "session-1",
+                            "turnId": "turn-1",
+                            "itemId": "item-1"
+                        },
+                        "idempotencyKey": "native-resume-proof-1",
+                        "content": {
+                            "digest": format!("sha256:{}", "a".repeat(64)),
+                            "redactionDisposition": "digest_only",
+                            "references": []
+                        },
+                        "outcome": "succeeded",
+                        "code": "ok",
+                        "retryable": false,
+                        "authorizationBoundary": "active_task",
+                        "operationReceiptId": "receipt-1"
+                    }
+                },
                 "isError": false,
             }),
         ))

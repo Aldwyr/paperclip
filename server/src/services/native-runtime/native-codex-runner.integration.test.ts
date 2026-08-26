@@ -334,6 +334,10 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
     ]);
 
     if (liveCodex) {
+      const usageReports = nativeEvents
+        .filter((event) => event.eventType === "usage.reported")
+        .map((event) => event.payload?.prpEvent)
+        .filter((event): event is Record<string, unknown> => Boolean(event));
       console.log("NATIVE_CODEX_RESUME_PROOF", JSON.stringify({
         appCommit: process.env.PAPERCLIP_LIVE_CODEX_APP_COMMIT ?? null,
         runId,
@@ -349,7 +353,7 @@ describeEmbeddedPostgres("native Codex server vertical slice", () => {
           (event) => event.eventType === "semantic_tool.result",
         ).length,
         controlPlaneEffectCount: progressEffects.length,
-        usage: result.usage ?? null,
+        usageReports,
       }));
       return;
     }

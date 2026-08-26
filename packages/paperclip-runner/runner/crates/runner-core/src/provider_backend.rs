@@ -807,6 +807,22 @@ impl CodexCommandExecutor {
             .ok_or_else(|| {
                 DurableRunnerError::invalid("semantic_tool.result has no pending call")
             })?;
+        let result_receipt = result
+            .get("resultReceipt")
+            .filter(|receipt| {
+                receipt.get("schema").and_then(Value::as_str)
+                    == Some("paperclip.prp.semantic_tool.v1")
+                    && receipt.get("phase").and_then(Value::as_str) == Some("result")
+                    && receipt.get("callId").and_then(Value::as_str) == Some(call_id)
+                    && receipt.get("operationId").and_then(Value::as_str)
+                        == Some(pending.operation_id.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "semantic_tool.result requires its matching canonical resultReceipt",
+                )
+            })?;
         let state = self
             .state
             .as_mut()
@@ -838,10 +854,17 @@ impl CodexCommandExecutor {
         } else {
             false
         };
-        Ok(CommandExecution::result(json!({
-            "status": if delivered { "delivered" } else { "deferred" },
-            "callId": call_id,
-        })))
+        Ok(CommandExecution {
+            result: json!({
+                "status": if delivered { "delivered" } else { "deferred" },
+                "callId": call_id,
+            }),
+            events: vec![(
+                "semantic_tool.result".to_owned(),
+                EventPriority::P0,
+                json!({"semantic_tool": result_receipt}),
+            )],
+        })
     }
 
     fn close_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
