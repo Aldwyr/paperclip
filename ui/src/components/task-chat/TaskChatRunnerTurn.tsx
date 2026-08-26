@@ -209,14 +209,19 @@ function RunnerActivityTimeline({ items }: { items: readonly TaskChatItem[] }) {
     <div className="relative ml-4 min-w-0 pl-3">
       <span className="absolute inset-y-1 left-0 w-px bg-border/70" aria-hidden data-testid="task-chat-runner-activity-rail" />
       <ol className="flex min-w-0 flex-col gap-2 py-1" aria-label="Run activity" data-testid="task-chat-runner-activity-list">
-        {items.map((item) => (
+        {items.map((item, index) => (
           <li className="min-w-0" key={item.id} data-activity-item-id={item.id}>
             {item.kind === "message" ? (
               <div className="tc-enter-cot-line min-w-0 px-1 text-sm text-foreground/90" data-testid="task-chat-activity-commentary">
                 <MarkdownBody softBreaks linkIssueReferences>{item.text}</MarkdownBody>
               </div>
             ) : item.kind === "thinking" ? (
-              <TaskChatThinking item={item} defaultOpen={false} rowClassName="px-0" />
+              <TaskChatThinking
+                item={item}
+                active={Boolean(item.streaming) && index === items.length - 1}
+                defaultOpen={false}
+                rowClassName="px-0"
+              />
             ) : item.kind === "tool" ? (
               <TaskChatToolCard item={item} />
             ) : item.kind === "marker" ? (

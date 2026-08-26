@@ -589,6 +589,19 @@ describe("paperclip runner semantic channels", () => {
     });
   });
 
+  it("settles a reasoning block as soon as later activity takes over", () => {
+    const parsed = transcriptToTaskChatItems([
+      { kind: "thinking", ts: TS, text: "Inspect the runner", delta: true, channel: "summary" },
+      toolCall("Read", { file_path: "runner.ts" }),
+      { kind: "thinking", ts: TS, text: "Verify the change", delta: true, channel: "summary" },
+    ], { runId: "run-reasoning-handoff", running: true });
+
+    const reasoning = parsed.filter((item) => item.kind === "thinking");
+    expect(reasoning).toHaveLength(2);
+    expect(reasoning[0]).toMatchObject({ lines: ["Inspect the runner"], streaming: false });
+    expect(reasoning[1]).toMatchObject({ lines: ["Verify the change"], streaming: true });
+  });
+
   it("turns empty reasoning lifecycle frames into a visible thinking item", () => {
     const parsed = transcriptToTaskChatItems([
       { kind: "thinking", ts: "2026-08-21T12:00:00.000Z", text: "", lifecycle: "started", channel: "summary" },
@@ -613,8 +626,8 @@ describe("paperclip runner semantic channels", () => {
     ], { runId: "run-channels", running: true });
     expect(parsed.map((item) => item.kind)).toEqual(["message", "thinking", "thinking", "message"]);
     expect(parsed[0]).toMatchObject({ interstitial: true, channel: "progress" });
-    expect(parsed[1]).toMatchObject({ channel: "summary" });
-    expect(parsed[2]).toMatchObject({ channel: "detail" });
+    expect(parsed[1]).toMatchObject({ channel: "summary", streaming: false });
+    expect(parsed[2]).toMatchObject({ channel: "detail", streaming: false });
     expect(parsed[3]).toMatchObject({ interstitial: false, channel: "final" });
     const history = settledRunChildren(parsed);
     expect(JSON.stringify(history)).not.toContain("Done.");

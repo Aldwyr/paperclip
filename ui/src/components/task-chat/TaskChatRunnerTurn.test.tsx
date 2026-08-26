@@ -122,6 +122,31 @@ describe("TaskChatRunnerTurn", () => {
     expect(history?.querySelectorAll('[data-testid="task-chat-thinking"]')).toHaveLength(2);
   });
 
+  it("renders only the current reasoning block as active", () => {
+    render([
+      { id: "old-reasoning", kind: "thinking", lines: ["Inspect the current card."], streaming: true, transcriptIndex: 1 },
+      { id: "read", kind: "tool", name: "Read files", rawName: "Read", status: "completed" },
+      { id: "current-reasoning", kind: "thinking", lines: ["Verify the updated state."], streaming: true, transcriptIndex: 3 },
+    ]);
+
+    act(() => container.querySelector<HTMLButtonElement>('[data-testid="task-chat-current-activity"]')?.click());
+
+    const oldReasoning = container.querySelector('[data-activity-item-id="old-reasoning"]');
+    expect(oldReasoning?.textContent).toBe("Inspect the current card.");
+    expect(oldReasoning?.textContent).not.toContain("Reasoning");
+    expect(oldReasoning?.querySelector('[data-testid="task-chat-thinking-text"]')).not.toBeNull();
+    expect(oldReasoning?.querySelector('[data-testid="task-chat-thinking-icon"]')?.classList)
+      .toContain("text-muted-foreground/50");
+    expect(oldReasoning?.querySelector('[data-testid="task-chat-thinking-icon"]')?.classList)
+      .not.toContain("text-(--status-agent-running)");
+    expect(oldReasoning?.querySelector(".shimmer-text")).toBeNull();
+
+    const currentReasoning = container.querySelector('[data-activity-item-id="current-reasoning"]');
+    expect(currentReasoning?.textContent).toBe("Reasoning…");
+    expect(currentReasoning?.querySelector('[data-testid="task-chat-thinking-icon"]')?.classList)
+      .toContain("text-(--status-agent-running)");
+  });
+
   it("lets a lifecycle-only reasoning event replace stale commentary without inventing reasoning text", () => {
     render([
       { id: "commentary", kind: "message", author: "agent", text: "Old commentary", interstitial: true, transcriptIndex: 1 },

@@ -213,15 +213,10 @@ export function TaskSidePanel({
   const scrollPositionsRef = useRef(new Map<string, number>());
   const userInteractedRef = useRef(restoredRef.current?.userInteracted ?? false);
   const autoPlanHandledRef = useRef(restoredRef.current?.autoPlanHandled ?? false);
-  const initialState = useMemo(() => {
-    if (restoredRef.current) return restoredRef.current.state;
-    const tabs = [taskPanelPropertiesTab()];
-    if (issue.workMode === "planning") tabs.push(taskPanelDocumentTab("plan", "Plan"));
-    return {
-      tabs,
-      activeTabId: issue.workMode === "planning" ? "document:plan" : "properties",
-    };
-  }, [issue.workMode]);
+  const initialState = useMemo(() => restoredRef.current?.state ?? ({
+    tabs: [taskPanelPropertiesTab()],
+    activeTabId: "properties",
+  }), []);
 
   const persist = useCallback((state: { tabs: SidePanelTabRecord<TaskSidePanelTabPayload>[]; activeTabId: string | null }) => {
     writeTaskSidePanelState(accountScope, issue.companyId, issue.id, {
@@ -243,6 +238,16 @@ export function TaskSidePanel({
     setPaneHeaderSlot(document.getElementById(PROPERTIES_PANE_HEADER_SLOT_ID));
   }, [inline]);
 
+  // Older clients persisted an empty Plan tab merely because the task was in
+  // planning mode. Remove that stale tab once the plan lookup confirms there
+  // is no document; a real plan will be opened by the materialization effect
+  // below when it arrives.
+  useEffect(() => {
+    if (planDocument !== null || !controller.tabs.some((tab) => tab.id === "document:plan")) return;
+    autoPlanHandledRef.current = false;
+    controller.closeTab("document:plan");
+  }, [controller.closeTab, controller.tabs, planDocument]);
+
   // Surface a newly materialized plan exactly once until the user takes manual
   // control of the tab set. Persisted empty/custom states therefore stay put.
   useEffect(() => {
@@ -253,10 +258,11 @@ export function TaskSidePanel({
 
   useEffect(() => {
     if (!documentDeepLink) return;
+    if (documentDeepLink.documentKey === "plan" && !planDocument) return;
     const document = documents.find((candidate) => candidate.key === documentDeepLink.documentKey);
     const label = document ? documentDisplayTitle(document) : documentDeepLink.documentKey === "plan" ? "Plan" : documentDeepLink.documentKey;
     controller.openTab(taskPanelDocumentTab(documentDeepLink.documentKey, label));
-  }, [controller.openTab, documentDeepLink, documents]);
+  }, [controller.openTab, documentDeepLink, documents, planDocument]);
 
   // Existing URL-backed workspace links remain the external integration API.
   useEffect(() => {
@@ -394,13 +400,13 @@ export function TaskSidePanel({
       primary.push({ id: "files", label: "Files", icon: <FolderOpen />, shortcut: "G F", alreadyOpen: controller.tabs.some((tab) => tab.id === "files") });
     }
     const documentItems: SidePanelLauncherItem[] = [
-      {
+      ...(planDocument ? [{
         id: "document:plan",
-        label: planDocument ? documentDisplayTitle(planDocument) : "Plan",
-        description: planDocument ? `Revision ${planDocument.latestRevisionNumber ?? 1}` : "No plan document yet",
+        label: documentDisplayTitle(planDocument),
+        description: `Revision ${planDocument.latestRevisionNumber ?? 1}`,
         icon: <Lightbulb />,
         alreadyOpen: controller.tabs.some((tab) => tab.id === "document:plan"),
-      },
+      }] : []),
       ...documents
         .filter((document) => document.key !== "plan" && !isArtifactReviewDocumentKey(document.key))
         .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())
@@ -414,8 +420,10 @@ export function TaskSidePanel({
     ];
     const sections: SidePanelLauncherSection[] = [
       { id: "open", label: "Open", items: primary },
-      { id: "documents", label: "Task documents", items: documentItems },
     ];
+    if (documentItems.length > 0) {
+      sections.push({ id: "documents", label: "Task documents", items: documentItems });
+    }
     if (fileTabsEnabled) {
       const recentItems = recentFilesQuery.data?.state === "available"
         ? recentFilesQuery.data.items.filter((item) => item.kind === "file").slice(0, 5).map((item) => ({

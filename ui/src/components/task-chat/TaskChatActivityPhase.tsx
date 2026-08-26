@@ -7,12 +7,15 @@ import type { TaskChatActivityPhaseItem } from "./task-chat-model";
 export function TaskChatActivityPhase({
   item,
   renderChild,
+  defaultOpen = false,
 }: {
   item: TaskChatActivityPhaseItem;
   renderChild: (child: TaskChatActivityPhaseItem["items"][number]) => ReactNode;
+  /** Keep useful historical content visible in an in-flight transcript. */
+  defaultOpen?: boolean;
 }) {
   const shouldAutoOpen =
-    item.active || item.items.some((child) =>
+    defaultOpen || item.active || item.items.some((child) =>
       (child.kind === "thinking" && child.streaming) ||
       (child.kind === "tool" && child.status === "in_progress") ||
       (child.kind === "protocol" && child.surface === "provider_activity" && child.status === "running") ||

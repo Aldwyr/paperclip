@@ -20,6 +20,9 @@ import type { TaskChatMessageItem } from "./task-chat-model";
 
 interface TaskChatBubbleProps {
   item: TaskChatMessageItem;
+  /** Requeues a blocked task after a no-live-execution-path recovery notice. */
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   /** Disable the entrance animation when replacing an already-visible live response. */
   animateEntry?: boolean;
   /** Action shown beside the queued state for an interruptible message. */
@@ -105,6 +108,8 @@ export function TaskChatBubble({
   attachedTurn,
   beforeTurn,
   actions,
+  onTryAgainNoLiveExecutionPath,
+  tryAgainNoLiveExecutionPathPending,
 }: TaskChatBubbleProps) {
   // Clicking an embedded image opens the full-screen lightbox (with download);
   // arrow keys walk across the other images in the same bubble.
@@ -119,7 +124,13 @@ export function TaskChatBubble({
 
   if (item.author === "system") {
     // Collapsed humanized one-liner, expandable to the full detail (PAP-443).
-    return <TaskChatSystemNotice item={item} />;
+    return (
+      <TaskChatSystemNotice
+        item={item}
+        onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
+        tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
+      />
+    );
   }
 
   const isHuman = item.author === "human";

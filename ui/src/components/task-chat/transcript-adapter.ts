@@ -333,9 +333,17 @@ export function transcriptToTaskChatItems(
   let messageIndex = -1;
   let messageChannel: "progress" | "final" | "unknown" | undefined;
 
-  const resetInline = () => {
+  const settleThinking = () => {
+    if (thinkingIndex >= 0) {
+      const item = items[thinkingIndex];
+      if (item?.kind === "thinking") item.streaming = false;
+    }
     thinkingIndex = -1;
     thinkingChannel = undefined;
+  };
+
+  const resetInline = () => {
+    settleThinking();
     messageIndex = -1;
     messageChannel = undefined;
   };
@@ -358,6 +366,10 @@ export function transcriptToTaskChatItems(
             if (entry.lifecycle === "completed") it.streaming = false;
           }
         } else {
+          // A different reasoning channel is a new logical activity. The
+          // previous block is historical even while the overall run remains
+          // live, so it must stop presenting as actively streaming.
+          settleThinking();
           items.push({
             id: `${runId}:think:${i}`,
             kind: "thinking",
@@ -386,6 +398,7 @@ export function transcriptToTaskChatItems(
       }
       case "assistant": {
         if (!entry.text) break;
+        settleThinking();
         const channel = entry.channel;
         if (messageIndex >= 0 && messageChannel === channel) {
           const it = items[messageIndex];
@@ -412,7 +425,6 @@ export function transcriptToTaskChatItems(
           });
           messageIndex = items.length - 1;
           messageChannel = channel;
-          thinkingIndex = -1;
         }
         break;
       }

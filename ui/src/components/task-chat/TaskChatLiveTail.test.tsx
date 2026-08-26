@@ -135,6 +135,7 @@ describe("TaskChatLiveTail", () => {
       { kind: "thinking", ts: TS, text: "Provider reasoning summary" },
       { kind: "assistant", ts: TS, text: "Visible answer." },
     ]);
+    expect(items[0]).toMatchObject({ kind: "thinking", streaming: false });
     render(items);
 
     expect(container.textContent).toContain("Visible answer.");

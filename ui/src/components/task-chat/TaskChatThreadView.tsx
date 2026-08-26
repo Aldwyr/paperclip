@@ -49,6 +49,9 @@ interface TaskChatThreadViewProps {
   renderMessageActions?: (item: TaskChatMessageItem) => ReactNode;
   /** Renders an interrupt action beside a queued human message. */
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode;
+  /** Requeues a blocked task from its no-live-execution-path system notice. */
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   /** Content appended inside the transcript scroller after the settled thread. */
   tail?: ReactNode;
   /** Optional streaming-aware key when `tail` changes without changing `items`. */
@@ -66,6 +69,8 @@ function renderItem(
   renderMessageActions?: (item: TaskChatMessageItem) => ReactNode,
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode,
   onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void | Promise<void>,
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void,
+  tryAgainNoLiveExecutionPathPending?: boolean,
 ) {
   switch (item.kind) {
     case "message": {
@@ -95,6 +100,8 @@ function renderItem(
           queuedAction={renderQueuedAction?.(item)}
           beforeTurn={item.attachedTurn?.standaloneHeader ? turn : undefined}
           attachedTurn={item.attachedTurn?.standaloneHeader ? undefined : turn}
+          onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
+          tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
         />
       );
     }
@@ -153,6 +160,8 @@ export function TaskChatThreadView({
   renderBrief,
   renderMessageActions,
   renderQueuedAction,
+  onTryAgainNoLiveExecutionPath,
+  tryAgainNoLiveExecutionPathPending,
   tail,
   contentKey,
   className,
@@ -175,6 +184,8 @@ export function TaskChatThreadView({
             renderMessageActions,
             renderQueuedAction,
             onRuntimeRequestDecision,
+            onTryAgainNoLiveExecutionPath,
+            tryAgainNoLiveExecutionPathPending,
           )}
         </div>
       ))}

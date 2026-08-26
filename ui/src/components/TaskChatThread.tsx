@@ -277,6 +277,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     draftKey,
     onInterruptQueued,
     interruptingQueuedRunId,
+    onTryAgainNoLiveExecutionPath,
+    tryAgainNoLiveExecutionPathPending,
     queuedCommentQueue,
     onEditQueuedComment,
     onReorderQueuedComments,
@@ -1444,6 +1446,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             }
             renderMessageActions={renderMessageActions}
             renderQueuedAction={renderQueuedAction}
+            onTryAgainNoLiveExecutionPath={
+              issueStatus === "blocked" ? onTryAgainNoLiveExecutionPath : undefined
+            }
+            tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
             tail={
               tailRunId || optimisticRunnerStartup || bottomBlockerLinks ? (
                 <>

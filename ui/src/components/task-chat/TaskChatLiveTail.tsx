@@ -104,6 +104,9 @@ function renderTailRow(
         <TaskChatActivityPhase
           key={item.id}
           item={item}
+          defaultOpen={item.items.some((child) =>
+            child.kind === "thinking" && child.lines.some((line) => line.trim().length > 0)
+          )}
           renderChild={(child) => child.kind === "tool"
             ? <TaskChatToolCard item={child} />
             : child.kind === "thinking"

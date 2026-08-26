@@ -483,6 +483,9 @@ interface IssueChatThreadProps {
   issueAssigneeAgentId?: string | null;
   onResumeFromBacklog?: () => Promise<void> | void;
   resumeFromBacklogPending?: boolean;
+  /** Chat-style task view only: move a blocked no-live-execution-path task back to todo. */
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   companyId?: string | null;
   projectId?: string | null;
   issueStatus?: string;

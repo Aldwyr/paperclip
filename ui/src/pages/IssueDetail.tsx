@@ -1060,6 +1060,8 @@ type IssueDetailChatTabProps = {
   assigneeUserId: string | null;
   onResumeFromBacklog?: () => Promise<void> | void;
   resumeFromBacklogPending?: boolean;
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   externalReferences?: MarkdownExternalReferenceMap;
   linkCaseReferences?: boolean;
 };
@@ -1141,6 +1143,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   assigneeUserId,
   onResumeFromBacklog,
   resumeFromBacklogPending,
+  onTryAgainNoLiveExecutionPath,
+  tryAgainNoLiveExecutionPathPending,
   externalReferences,
   linkCaseReferences,
 }: IssueDetailChatTabProps) {
@@ -1706,6 +1710,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         assigneeUserId={assigneeUserId}
         onResumeFromBacklog={onResumeFromBacklog}
         resumeFromBacklogPending={resumeFromBacklogPending}
+        onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
+        tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
         footer={footer}
         externalReferences={externalReferences}
         linkCaseReferences={linkCaseReferences}
@@ -2423,27 +2429,30 @@ export function IssueDetail() {
     () => childIssues,
     [issuePanelKey],
   );
-  // Onboarding first task only: hide the Properties sidebar until a plan exists,
-  // then reveal it already on the Plan tab. We gate the panel *mount* (withhold
+  // Planning tasks start as chat-only until a plan exists, then reveal the
+  // sidebar already on the Plan tab. The onboarding first task keeps the same
+  // behavior even if its work mode changes. We gate the panel *mount* (withhold
   // the panel content) rather than flipping the global `panelVisible` preference
   // — that preference persists to localStorage and would leak "hidden" into every
-  // other task. Every non-first task has originKind !== onboarding_first_task, so
-  // `suppressPanelForFirstTask` stays false and behavior is unchanged. The user
-  // can still opt in early via the "Show properties" header button, which sets a
-  // per-issue override (keyed on the issue id so it resets across navigations).
+  // other task. The user can still opt in early via the "Show properties" header
+  // button, which sets a per-issue override (keyed on the issue id so it resets
+  // across navigations).
   const isOnboardingFirstTask =
     taskChatShellEnabled &&
     issue?.originKind === ONBOARDING_FIRST_TASK_ORIGIN_KIND;
-  const { data: firstTaskPlanDoc } = useIssuePlanDocument(
-    isOnboardingFirstTask ? issue?.id : null,
+  const shouldDeferPanelUntilPlan =
+    taskChatShellEnabled &&
+    (isOnboardingFirstTask || issue?.workMode === "planning");
+  const { data: deferredPanelPlanDoc } = useIssuePlanDocument(
+    shouldDeferPanelUntilPlan ? issue?.id : null,
   );
-  const [firstTaskPanelOverrideIssueId, setFirstTaskPanelOverrideIssueId] = useState<
+  const [panelBeforePlanOverrideIssueId, setPanelBeforePlanOverrideIssueId] = useState<
     string | null
   >(null);
-  const firstTaskPanelOverride =
-    firstTaskPanelOverrideIssueId !== null && firstTaskPanelOverrideIssueId === issue?.id;
-  const suppressPanelForFirstTask =
-    isOnboardingFirstTask && !firstTaskPlanDoc && !firstTaskPanelOverride;
+  const panelBeforePlanOverride =
+    panelBeforePlanOverrideIssueId !== null && panelBeforePlanOverrideIssueId === issue?.id;
+  const suppressPanelUntilPlan =
+    shouldDeferPanelUntilPlan && !deferredPanelPlanDoc && !panelBeforePlanOverride;
   const showRichSubIssuesSection = shouldRenderRichSubIssuesSection(childIssuesLoading, childIssues.length);
   const siblingNavigation = useMemo(
     () => issue && !childIssuesLoading && !siblingIssuesLoading && !siblingIssuesError
@@ -3819,7 +3828,7 @@ export function IssueDetail() {
   }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!panelIssue || suppressPanelForFirstTask) {
+    if (!panelIssue || suppressPanelUntilPlan) {
       closePanel();
       return;
     }
@@ -3859,7 +3868,7 @@ export function IssueDetail() {
     openPanel,
     panelChildIssues,
     panelIssue,
-    suppressPanelForFirstTask,
+    suppressPanelUntilPlan,
     resolvedHasActiveRun,
     checkIssueMonitorNow.isPending,
     checkIssueMonitorNow.mutate,
@@ -4017,8 +4026,8 @@ export function IssueDetail() {
     if (isMobile) {
       setMobilePropsOpen(true);
     } else {
-      if (suppressPanelForFirstTask && issue?.id) {
-        setFirstTaskPanelOverrideIssueId(issue.id);
+      if (suppressPanelUntilPlan && issue?.id) {
+        setPanelBeforePlanOverrideIssueId(issue.id);
       }
       setPanelVisible(true);
     }
@@ -4036,7 +4045,7 @@ export function IssueDetail() {
     issue?.id,
     issueId,
     setPanelVisible,
-    suppressPanelForFirstTask,
+    suppressPanelUntilPlan,
     taskChatShellEnabled,
   ]);
 
@@ -4423,6 +4432,9 @@ export function IssueDetail() {
     },
     [activeRecoveryActionId, resolveRecoveryAction.mutateAsync],
   );
+  const handleTryAgainNoLiveExecutionPath = useCallback(() => {
+    handleResolveRecoveryAction("todo");
+  }, [handleResolveRecoveryAction]);
 
   // Action 3 (workspace_validation): one-click re-issue of the stalled task on a fresh isolated
   // git worktree based on the live (diverged) branch. Composes the existing safe issue-creation
@@ -5024,13 +5036,13 @@ export function IssueDetail() {
             >
               {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
             </Button>
-            {panelVisible && !suppressPanelForFirstTask ? null : (
+            {panelVisible && !suppressPanelUntilPlan ? null : (
               <TooltipProvider>
                 <SidePanelToggleButton
                   open={false}
                   onToggle={() => {
-                    if (suppressPanelForFirstTask && issue?.id) {
-                      setFirstTaskPanelOverrideIssueId(issue.id);
+                    if (suppressPanelUntilPlan && issue?.id) {
+                      setPanelBeforePlanOverrideIssueId(issue.id);
                     }
                     setPanelVisible(true);
                   }}
@@ -5698,6 +5710,15 @@ export function IssueDetail() {
               onResumeFromBacklog={canResumeFromBacklog ? handleResumeFromBacklog : undefined}
               resumeFromBacklogPending={
                 updateIssue.isPending && updateIssue.variables?.status === "todo"
+              }
+              onTryAgainNoLiveExecutionPath={
+                issue.status === "blocked" && issue.activeRecoveryAction
+                  ? handleTryAgainNoLiveExecutionPath
+                  : undefined
+              }
+              tryAgainNoLiveExecutionPathPending={
+                resolveRecoveryAction.isPending &&
+                resolveRecoveryAction.variables?.sourceIssueStatus === "todo"
               }
               externalReferences={externalObjectsState.isEnabled ? externalObjectsState.markdownReferences : undefined}
               linkCaseReferences={casesChipsEnabled}
