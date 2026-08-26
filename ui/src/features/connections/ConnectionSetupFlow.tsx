@@ -66,7 +66,11 @@ import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
 import { AppLogo } from "@/pages/apps/AppLogo";
 import { UnverifiedServerBadge } from "@/pages/apps/UnverifiedServerBadge";
-import { appSourceConnectHref, isMcpDirectOAuthConnectSlug } from "@/pages/apps/app-connect-policy";
+import {
+  appSourceConnectHref,
+  isMcpDirectOAuthConnectSlug,
+  resolveAppsConnectRouteKey,
+} from "@/pages/apps/app-connect-policy";
 import { parseGoogleSheetIds } from "@/pages/apps/google-sheets";
 import { connectionNameForGrantKind } from "@/pages/apps/connection-identity";
 import {
@@ -283,7 +287,7 @@ export function ConnectionSetupFlow({
   // `source` is the generic curated-app route contract, not an OAuth-only
   // shortcut. Manual OAuth, API-key, no-auth, and configured MCP definitions
   // must all enter the same branded setup flow when Browse links to them.
-  const routeAppKey = serviceSlug ?? appKey ?? sourceSlug ?? undefined;
+  const routeAppKey = resolveAppsConnectRouteKey({ serviceSlug, appKey, sourceSlug });
   const zapierSource = (serviceSlug ?? sourceSlug ?? appKey) === "zapier";
   const requestedAppKey = zapierSource ? undefined : routeAppKey;
   const byo = host === "page" && (byoOnly || searchParams.get("byo") === "1");

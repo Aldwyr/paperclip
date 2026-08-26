@@ -1,9 +1,11 @@
+import { CONNECTABLE_APP_DEFINITIONS, appSupportsCatalogSetup } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
 import {
   MCP_DIRECT_OAUTH_CONNECT_SLUGS,
   appSourceConnectHref,
   canEnterAppsConnect,
   isMcpDirectOAuthConnectSlug,
+  resolveAppsConnectRouteKey,
 } from "./app-connect-policy";
 
 describe("app connect policy", () => {
@@ -30,5 +32,27 @@ describe("app connect policy", () => {
 
   it("builds a generic source deep link", () => {
     expect(appSourceConnectHref("notion")).toBe("/apps/connect?source=notion");
+  });
+
+  it("routes every capability-backed catalog definition through its source deep link", () => {
+    const connectableApps = CONNECTABLE_APP_DEFINITIONS.filter(appSupportsCatalogSetup);
+
+    expect(connectableApps.length).toBeGreaterThan(0);
+    for (const app of connectableApps) {
+      const href = appSourceConnectHref(app.slug);
+      const searchParams = new URL(href, "http://paperclip.test").searchParams;
+
+      expect(canEnterAppsConnect(searchParams), app.slug).toBe(true);
+      expect(resolveAppsConnectRouteKey({ sourceSlug: searchParams.get("source") }), app.slug).toBe(app.slug);
+    }
+  });
+
+  it("preserves explicit route precedence while accepting every authentication mode", () => {
+    expect(resolveAppsConnectRouteKey({ serviceSlug: "jira", appKey: "asana", sourceSlug: "mem0" })).toBe("jira");
+    expect(resolveAppsConnectRouteKey({ appKey: "asana", sourceSlug: "mem0" })).toBe("asana");
+    expect(resolveAppsConnectRouteKey({ sourceSlug: "mem0" })).toBe("mem0");
+    expect(resolveAppsConnectRouteKey({ sourceSlug: "context7" })).toBe("context7");
+    expect(resolveAppsConnectRouteKey({ sourceSlug: "supabase" })).toBe("supabase");
+    expect(resolveAppsConnectRouteKey({})).toBeUndefined();
   });
 });
