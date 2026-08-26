@@ -1898,14 +1898,15 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       // O_CREAT|O_EXCL: it fails on an existing file and on a symbolic
       // link, so it can neither follow a link nor truncate a peer's file.
       "set -C",
-      `: > ${shellQuote(tempPath)}`,
-      // `mv` replaces the lease path by rename. A rename does not follow a
-      // symbolic link at the target, so a peer that pre-creates a link at
-      // the fixed lease path cannot redirect this write. This command
-      // contains no `mkdir`: when `stop()` already removed `sessionDir`,
-      // the create above fails, this refresh fails, and the wrapper
-      // expires -- the wanted outcome, not a defect.
-      `mv ${shellQuote(tempPath)} ${shellQuote(leasePath)}`,
+      // The `&&` runs the rename only when the exclusive create above it
+      // succeeds. `mv` replaces the lease path by rename. A rename does not
+      // follow a symbolic link at the target, so a peer that pre-creates a
+      // link at the fixed lease path cannot redirect this write. This
+      // command contains no `mkdir`: when `stop()` already removed
+      // `sessionDir`, the create fails, the `&&` skips the rename, this
+      // refresh fails, and the wrapper expires -- the wanted outcome, not a
+      // defect.
+      `: > ${shellQuote(tempPath)} && mv ${shellQuote(tempPath)} ${shellQuote(leasePath)}`,
     ].join("\n");
     try {
       await runner.execute({
@@ -2977,12 +2978,15 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
   process.exit(1);
 }
 
-// Hardening (I3, not containment): the wrapper's own launch env carries the
-// session dir and the command payload. Scrub both keys before they reach the
-// spawned child, so the child never inherits a path to its own control files.
+// Hardening (I3, not containment): the wrapper's own launch env carries its
+// own session control state. Remove every one of the wrapper's own session
+// variables before they reach the spawned child, so the child never inherits
+// the wrapper's own control state.
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+delete childEnv.PAPERCLIP_PROCESS_SESSION_LEASE_REFRESH_MS;
+delete childEnv.PAPERCLIP_PROCESS_SESSION_LEASE_TTL_MS;
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.
@@ -3068,12 +3072,15 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
   process.exit(1);
 }
 
-// Hardening (I3, not containment): the wrapper's own launch env carries the
-// session dir and the command payload. Scrub both keys before they reach the
-// spawned child, so the child never inherits a path to its own control files.
+// Hardening (I3, not containment): the wrapper's own launch env carries its
+// own session control state. Remove every one of the wrapper's own session
+// variables before they reach the spawned child, so the child never inherits
+// the wrapper's own control state.
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+delete childEnv.PAPERCLIP_PROCESS_SESSION_LEASE_REFRESH_MS;
+delete childEnv.PAPERCLIP_PROCESS_SESSION_LEASE_TTL_MS;
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.

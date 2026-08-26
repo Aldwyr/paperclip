@@ -1321,21 +1321,33 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
   });
 
   it("T10 the emitted wrapper strips its own session env vars from the child", async () => {
-    const wrapper = await startWrapperProcess({
-      outputToStdout: true,
-      command: process.execPath,
-      args: [
-        "-e",
-        "process.stdout.write(JSON.stringify(Object.keys(process.env).filter((k) => k.startsWith('PAPERCLIP_PROCESS_SESSION'))));process.exit(0)",
-      ],
-    });
-    await waitFor(() => wrapper.frames.some((frame) => frame.type === "exit"), 4_000);
-    const text = wrapper.frames
-      .filter((frame) => frame.type === "data" && frame.stream === "stdout" && typeof frame.data === "string")
-      .map((frame) => Buffer.from(frame.data as string, "base64").toString("utf8"))
-      .join("");
-    const leakedKeys = JSON.parse(text || "[]") as string[];
-    expect(leakedKeys).toEqual([]);
+    for (const outputToStdout of [true, false]) {
+      const wrapper = await startWrapperProcess({
+        outputToStdout,
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(JSON.stringify(Object.keys(process.env).filter((k) => k.startsWith('PAPERCLIP_PROCESS_SESSION'))));process.exit(0)",
+        ],
+        // Drive all four of the wrapper's own session variables through the
+        // harness, so the assertion below proves the child sees none of
+        // them -- not just the two the harness happens to set by default.
+        env: {
+          PAPERCLIP_PROCESS_SESSION_LEASE_REFRESH_MS: "5000",
+          PAPERCLIP_PROCESS_SESSION_LEASE_TTL_MS: "15000",
+        },
+      });
+      // The stdout variant reports its frames on `wrapper.frames`; the
+      // event-file variant writes them under `eventsDir` instead.
+      const getFrames = async (): Promise<WrapperFrame[]> => (outputToStdout ? wrapper.frames : wrapper.readEventFiles());
+      await waitFor(async () => (await getFrames()).some((frame) => frame.type === "exit"), 4_000);
+      const text = (await getFrames())
+        .filter((frame) => frame.type === "data" && frame.stream === "stdout" && typeof frame.data === "string")
+        .map((frame) => Buffer.from(frame.data as string, "base64").toString("utf8"))
+        .join("");
+      const leakedKeys = JSON.parse(text || "[]") as string[];
+      expect(leakedKeys).toEqual([]);
+    }
   });
 
   it("T11 each wrapper source has exactly one spawn call site and every kill call is child.kill()", () => {
@@ -2216,6 +2228,11 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
       expect(call.bypassSession).toBe(true);
       expect(call.script).not.toContain("mkdir");
       expect(call.script).toContain("mv ");
+      // The rename must run only when the exclusive create succeeds: the
+      // create and the `mv` sit on the same line, joined by `&&`, not as
+      // two separate unconditional statements.
+      const createAndRenameLine = call.script.split("\n").find((line) => line.includes("mv "));
+      expect(createAndRenameLine).toMatch(/^: > .+&&\s*mv /);
     }
   }, 10_000);
 
