@@ -1085,6 +1085,84 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     expect(duplex.destroyed).toBe(false);
   });
 
+  it("the wrapper holds no more than the byte cap across the readable buffer and the pending queue", async () => {
+    let dataListener: ((chunk: Uint8Array) => void) | undefined;
+    let stopped = false;
+    const channel: CommandManagedDuplexChannel = {
+      write: () => undefined,
+      onData: (listener) => {
+        dataListener = listener;
+      },
+      onExit: () => undefined,
+      stop: () => {
+        stopped = true;
+      },
+      close: async () => undefined,
+    };
+    const cap = 100_000;
+    const duplex = wrapDuplexChannelAsNodeDuplex(channel, { maxBufferedReadBytes: cap });
+    const errored = new Promise<Error>((resolve) => duplex.on("error", resolve));
+
+    // Fill the readable side: this chunk passes the default 65,536-byte high
+    // water mark, so `push()` reports the readable side full, and every later
+    // chunk queues in the wrapper's own pending queue instead.
+    dataListener?.(Buffer.alloc(70_000, "a"));
+    expect(duplex.readableLength).toBe(70_000);
+
+    // Queue a chunk that brings the combined total to 99,000 of the
+    // 100,000-byte cap. The readable buffer and the pending queue are two
+    // separate buffers, so this proves their sum, not each one alone, stays
+    // under the cap.
+    dataListener?.(Buffer.alloc(29_000, "b"));
+    expect(duplex.destroyed).toBe(false);
+    expect(duplex.readableLength + 29_000).toBeLessThanOrEqual(cap);
+
+    // One more chunk brings the combined total to 100,001 bytes, one byte
+    // past the cap: the wrapper must fail closed here, not let the sum grow
+    // past what the cap allows.
+    dataListener?.(Buffer.alloc(1_001, "c"));
+    const error = await errored;
+    expect(error.message).toMatch(/backpressure/i);
+    expect(stopped).toBe(true);
+  });
+
+  it("a chunk that fits alone but passes the cap with the readable buffer fails closed", async () => {
+    let dataListener: ((chunk: Uint8Array) => void) | undefined;
+    let stopped = false;
+    const channel: CommandManagedDuplexChannel = {
+      write: () => undefined,
+      onData: (listener) => {
+        dataListener = listener;
+      },
+      onExit: () => undefined,
+      stop: () => {
+        stopped = true;
+      },
+      close: async () => undefined,
+    };
+    const cap = 80_000;
+    const duplex = wrapDuplexChannelAsNodeDuplex(channel, { maxBufferedReadBytes: cap });
+    const errored = new Promise<Error>((resolve) => duplex.on("error", resolve));
+
+    // This chunk is under the cap on its own, and it passes the default
+    // high-water mark, so it pushes directly and fills the readable side.
+    dataListener?.(Buffer.alloc(70_000, "a"));
+    expect(duplex.readableLength).toBe(70_000);
+
+    // This chunk is also under the cap on its own (20,000 < 80,000), so a
+    // check that only bounds one chunk's own size, or only the queue's own
+    // total, would let it through. Combined with the 70,000 bytes the
+    // readable side already holds, the total is 90,000 bytes: over the cap.
+    // The wrapper must fail closed with the reader message, not the
+    // oversized-chunk message, because no single chunk here passes the cap
+    // on its own.
+    dataListener?.(Buffer.alloc(20_000, "b"));
+    const error = await errored;
+    expect(error.message).toMatch(/reader could not keep up/i);
+    expect(error.message).not.toMatch(/delivered one chunk larger/i);
+    expect(stopped).toBe(true);
+  });
+
   describe("the admission gate", () => {
     it("the response drain timeout defaults to thirty seconds, and the buffered-read byte cap shares one home with the admission module's session budget", () => {
       expect(DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS).toBe(30_000);
