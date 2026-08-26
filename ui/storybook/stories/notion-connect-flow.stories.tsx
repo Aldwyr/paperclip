@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   CONNECTABLE_APP_DEFINITIONS,
   type AppDefinition,
+  type ConnectionGrant,
+  type ConnectionGrantsResponse,
   type ToolConnection,
 } from "@paperclipai/shared";
 import { queryKeys } from "@/lib/queryKeys";
@@ -14,7 +16,8 @@ import {
   type OAuthConnectPhase,
 } from "@/pages/apps/AppsConnect";
 import { SetupPanel } from "@/pages/apps/app-detail/SetupPanel";
-import { ReconnectCard } from "@/pages/apps/app-detail/AdvancedPanel";
+import { AdvancedPanel, ReconnectCard } from "@/pages/apps/app-detail/AdvancedPanel";
+import { IdentitiesSection } from "@/pages/apps/app-detail/IdentitiesSection";
 
 const COMPANY_ID = "company-storybook";
 const NOTION = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "notion") as AppDefinition;
@@ -90,25 +93,119 @@ function notionConnection(overrides: Partial<ToolConnection> = {}): ToolConnecti
   };
 }
 
+function personalGrant(): ConnectionGrant {
+  return {
+    id: "grant-notion-personal",
+    companyId: COMPANY_ID,
+    connectionId: "connection-notion",
+    kind: "user",
+    subjectUserId: "board-user",
+    providerTenant: { name: "Dotta" },
+    credentialSecretRefs: [],
+    status: "active",
+    isDefault: true,
+    createdByAgentId: null,
+    createdByUserId: "board-user",
+    revokedAt: null,
+    revokedByAgentId: null,
+    revokedByUserId: null,
+    lastUsedAt: new Date("2026-08-06T19:00:00.000Z"),
+    createdAt: new Date("2026-08-06T18:55:00.000Z"),
+    updatedAt: new Date("2026-08-06T19:00:00.000Z"),
+    delegations: [{
+      id: "delegation-1",
+      companyId: COMPANY_ID,
+      grantId: "grant-notion-personal",
+      agentId: "agent-1",
+      createdByUserId: "board-user",
+      createdAt: new Date("2026-08-06T19:00:00.000Z"),
+    }],
+    capabilities: { canRevoke: true, canEditAudience: false },
+  };
+}
+
+function personalGrantsResponse(grant: ConnectionGrant): ConnectionGrantsResponse {
+  return {
+    connection: { id: "connection-notion", uid: "notion-storybook" },
+    grants: [grant],
+    capabilities: {
+      canConfigure: true,
+      canCreateOrganizationGrant: false,
+      canSetCompanyInstall: true,
+      canConnectAsCurrentUser: true,
+      canManageAgentInstalls: true,
+      canViewOtherPersonalIdentities: false,
+      editableAgentIds: ["agent-1"],
+    },
+    currentUserId: "board-user",
+    members: [{ userId: "board-user", name: "Dotta", email: "dotta@example.com" }],
+  };
+}
+
 function ConnectedHost() {
+  const client = useMemo(() => seededClient(), []);
+  const connection = notionConnection();
+  const grant = personalGrant();
   return (
-    <div className="mx-auto max-w-3xl p-6">
-      <header className="mb-6 flex items-center gap-3">
-        <AppLogo name={NOTION.name} logoUrl={NOTION.branding.logoUrl} size={44} />
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Notion</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Connected app setup</p>
+    <QueryClientProvider client={client}>
+      <div className="mx-auto w-screen max-w-3xl p-6">
+        <header className="mb-6 flex items-center gap-3">
+          <AppLogo name={NOTION.name} logoUrl={NOTION.branding.logoUrl} size={44} />
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight">Notion</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Connected app setup</p>
+          </div>
+        </header>
+        <div className="space-y-8">
+          <SetupPanel
+            connection={connection}
+            galleryEntry={NOTION}
+            onUpdateConfig={() => undefined}
+            configUpdateDisabled={false}
+            agentsSummary="1 agent"
+            permissionsSummary="Allowed for 28 · Ask first for 0 · Off for 0"
+            permissionsLoading={false}
+            onOpenPermissions={() => undefined}
+            identities={(
+              <IdentitiesSection
+                appName="Notion"
+                credentialPolicy="per_user"
+                ownerUserId="board-user"
+                connectedUser={{ label: "Dotta", image: null }}
+                grantsQuery={personalGrantsResponse(grant)}
+                loading={false}
+                error={false}
+                onConnectAsMe={() => undefined}
+                onConnectOrganization={() => undefined}
+                onReplaceAudience={() => undefined}
+                connectPending={false}
+                audiencePending={false}
+                audienceError={null}
+                audienceGrantId={null}
+                onOpenAudience={() => undefined}
+                onCloseAudience={() => undefined}
+              />
+            )}
+          />
+          <AdvancedPanel
+            connection={connection}
+            appName="Notion"
+            galleryEntry={NOTION}
+            removing={false}
+            onRemove={() => undefined}
+            onReplaced={() => undefined}
+            appToggleDisabled={false}
+            onToggleApp={() => undefined}
+            identityGrant={grant}
+            identityCurrentUserId="board-user"
+            identityProviderName="Notion"
+            credentialPolicy="per_user"
+            onReconnectIdentity={() => undefined}
+            onRevokeIdentity={() => undefined}
+          />
         </div>
-      </header>
-      <SetupPanel
-        connection={notionConnection()}
-        galleryEntry={NOTION}
-        onToggleApp={() => undefined}
-        appToggleDisabled={false}
-        onUpdateConfig={() => undefined}
-        configUpdateDisabled={false}
-      />
-    </div>
+      </div>
+    </QueryClientProvider>
   );
 }
 

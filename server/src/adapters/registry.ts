@@ -236,6 +236,7 @@ const codexLoginCapability: AdapterLoginCapability = {
 
 const claudeLocalAdapter: ServerAdapterModule = {
   type: "claude_local",
+  runtimeToolDelivery: "native_mcp",
   execute: stampClaudeAgentIdHeader(claudeExecute),
   testEnvironment: claudeTestEnvironment,
   acp: {
@@ -268,6 +269,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
 
 const acpxLocalAdapter: ServerAdapterModule = {
   type: "acpx_local",
+  runtimeToolDelivery: "environment",
   async execute(ctx) {
     await ctx.onLog("stderr", `${retiredAcpxMessage}\n`);
     await ctx.onMeta?.({
@@ -310,6 +312,7 @@ const acpxLocalAdapter: ServerAdapterModule = {
 
 const codexLocalAdapter: ServerAdapterModule = {
   type: "codex_local",
+  runtimeToolDelivery: "native_mcp",
   execute: codexExecute,
   testEnvironment: codexTestEnvironment,
   acp: {
@@ -341,6 +344,7 @@ const codexLocalAdapter: ServerAdapterModule = {
 
 const cursorLocalAdapter: ServerAdapterModule = {
   type: "cursor",
+  runtimeToolDelivery: "environment",
   execute: cursorExecute,
   testEnvironment: cursorTestEnvironment,
   listSkills: listCursorSkills,
@@ -360,6 +364,7 @@ const cursorLocalAdapter: ServerAdapterModule = {
 
 const cursorCloudAdapter: ServerAdapterModule = {
   type: "cursor_cloud",
+  runtimeToolDelivery: "invocation_context",
   execute: cursorCloudExecute,
   testEnvironment: cursorCloudTestEnvironment,
   sessionCodec: cursorCloudSessionCodec,
@@ -375,6 +380,7 @@ const cursorCloudAdapter: ServerAdapterModule = {
 
 const geminiLocalAdapter: ServerAdapterModule = {
   type: "gemini_local",
+  runtimeToolDelivery: "environment",
   execute: geminiExecute,
   testEnvironment: geminiTestEnvironment,
   acp: {
@@ -403,6 +409,7 @@ const geminiLocalAdapter: ServerAdapterModule = {
 
 const grokLocalAdapter: ServerAdapterModule = {
   type: "grok_local",
+  runtimeToolDelivery: "environment",
   execute: grokExecute,
   testEnvironment: grokTestEnvironment,
   listSkills: listGrokSkills,
@@ -424,6 +431,7 @@ const grokLocalAdapter: ServerAdapterModule = {
 
 const kimiLocalAdapter: ServerAdapterModule = {
   type: "kimi_local",
+  runtimeToolDelivery: "environment",
   execute: kimiExecute,
   testEnvironment: kimiTestEnvironment,
   acp: {
@@ -448,12 +456,19 @@ const kimiLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: kimiAgentConfigurationDoc,
 };
 
-const hermesGatewayAdapter = createHermesGatewayServerAdapter();
+const hermesGatewayAdapter: ServerAdapterModule = {
+  ...createHermesGatewayServerAdapter(),
+  runtimeToolDelivery: "invocation_context",
+};
 
-const hermesLocalAdapter = createHermesLocalServerAdapter();
+const hermesLocalAdapter: ServerAdapterModule = {
+  ...createHermesLocalServerAdapter(),
+  runtimeToolDelivery: "environment",
+};
 
 const openclawGatewayAdapter: ServerAdapterModule = {
   type: "openclaw_gateway",
+  runtimeToolDelivery: "invocation_context",
   execute: openclawGatewayExecute,
   testEnvironment: openclawGatewayTestEnvironment,
   models: openclawGatewayModels,
@@ -465,6 +480,7 @@ const openclawGatewayAdapter: ServerAdapterModule = {
 
 const openCodeLocalAdapter: ServerAdapterModule = {
   type: "opencode_local",
+  runtimeToolDelivery: "environment",
   execute: openCodeExecute,
   testEnvironment: openCodeTestEnvironment,
   listSkills: listOpenCodeSkills,
@@ -484,6 +500,7 @@ const openCodeLocalAdapter: ServerAdapterModule = {
 
 const piLocalAdapter: ServerAdapterModule = {
   type: "pi_local",
+  runtimeToolDelivery: "environment",
   execute: piExecute,
   testEnvironment: piTestEnvironment,
   listSkills: listPiSkills,

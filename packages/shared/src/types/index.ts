@@ -8,6 +8,15 @@ export {
   type NativeRunTerminalState,
 } from "./native-finalization.js";
 export type {
+  ConnectionAvailabilityState,
+  ConnectionSearchResultItem,
+  ConnectionsSearchResult,
+  ConnectionRequestResult,
+  ConnectionIntentSetupOptions,
+  CompleteConnectionIntentInput,
+  DeclineConnectionIntentInput,
+} from "./connection-intent.js";
+export type {
   Company,
   InteractionResolverGovernance,
   InteractionResolverKindGovernance,
@@ -450,6 +459,8 @@ export type {
   ToolAccessSelector,
   ConnectToolAppAuthChallenge,
   ConnectToolAppResult,
+  ToolAppMetadataPreflightAttempt,
+  ToolAppMetadataPreflightResult,
   FinishToolAppResult,
   ToolOAuthClientRegistrationSource,
   ToolOAuthStartResult,
@@ -716,6 +727,9 @@ export type {
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,
   RequestConfirmationConnectionAuthorizationPayload,
+  ConnectionIntentPhase,
+  ConnectionIntentPayload,
+  ConnectionIntentResult,
   RequestConfirmationSecretProposalPayload,
   RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
@@ -738,6 +752,7 @@ export type {
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
   RequestItemVerdictsInteraction,
+  ConnectionIntentInteraction,
   IssueThreadInteraction,
   IssueThreadInteractionPayload,
   IssueThreadInteractionResult,

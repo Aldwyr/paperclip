@@ -11,6 +11,7 @@ import type {
   ToolConnectionInstallSnapshot,
   ToolConnectionRemovalSummary,
   ConnectToolAppResult,
+  ConnectToolApp,
   FinishToolAppResult,
   ToolCatalogEntry,
   ToolRuntimeSlot,
@@ -60,9 +61,11 @@ import type {
   CreateToolTrustRuleFromActionRequest,
   ToolRedactedValueSummary,
   ConnectionGrant,
+  ConnectionGrantKind,
   ConnectionGrantDelegation,
   ConnectionGrantsResponse,
   ToolConnectionCreateCapabilities,
+  ToolAppMetadataPreflightResult,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -267,17 +270,31 @@ export const toolsApi = {
   // --- Applications ---
   listGallery: (companyId: string) =>
     api.get<ToolGalleryResponse>(`/companies/${companyId}/tools/gallery`),
-  connectApp: (companyId: string, input: {
-    galleryKey?: string;
-    link?: string;
-    name?: string;
-    credentialValues?: Record<string, string>;
-    configValues?: Record<string, unknown>;
-    applicationId?: string;
-  }) =>
+  preflightAppMetadata: (companyId: string, galleryKey: string, methodKey?: string | null) => {
+    const query = methodKey ? `?methodKey=${encodeURIComponent(methodKey)}` : "";
+    return api.get<ToolAppMetadataPreflightResult>(
+      `/companies/${companyId}/tools/apps/${encodeURIComponent(galleryKey)}/preflight${query}`,
+    );
+  },
+  connectApp: (companyId: string, input: ConnectToolApp) =>
     api.post<ConnectToolAppResult>(`/companies/${companyId}/tools/apps/connect`, input),
-  startOAuth: (connectionId: string) =>
-    api.post<ToolOAuthStartResult>(`/tools/oauth/${connectionId}/start`, {}),
+  startOAuth: (
+    connectionId: string,
+    input: {
+      asCurrentUser?: boolean;
+      interactionId?: string;
+    } = {},
+  ) =>
+    api.post<ToolOAuthStartResult>(`/tools/oauth/${connectionId}/start`, input),
+  finalizeOAuthAccess: (
+    companyId: string,
+    connectionId: string,
+    input: { grantKind: ConnectionGrantKind },
+  ) =>
+    api.post<FinishToolAppResult>(
+      `/companies/${companyId}/tools/apps/${connectionId}/finalize-oauth-access`,
+      input,
+    ),
   finishApp: (companyId: string, connectionId: string, input: {
     enabledCatalogEntryIds: string[];
     askFirstCatalogEntryIds: string[];

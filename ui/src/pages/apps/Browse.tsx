@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, Link2, Search } from "lucide-react";
+import { appSupportsCatalogSetup, getConnectableAppDefinition } from "@paperclipai/shared";
 import { useNavigate } from "@/lib/router";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
@@ -13,6 +14,7 @@ import { buildCompanyUserProfileMap } from "@/lib/company-members";
 import { AppLogo } from "./AppLogo";
 import {
   appApplicationSourceSlug,
+  appDefinitionDarkLogoUrl,
   appDefinitionDescription,
   appDefinitionLogoUrl,
   appDefinitionName,
@@ -23,10 +25,9 @@ import {
   AdvancedToolsLink,
   BYO_CONNECT_HREF,
   ByoConnectCard,
-  NOTION_CONNECT_HREF,
   POPULAR_KEYS,
-  ZAPIER_CONNECT_HREF,
 } from "./store-cards";
+import { appSourceConnectHref } from "./app-connect-policy";
 import {
   ConnectionOwnerIdentity,
   connectionDisplayNameForOwner,
@@ -36,12 +37,8 @@ import {
 
 function connectHrefFor(entry: AppGalleryDisplayEntry): string | null {
   const slug = appDefinitionSlug(entry);
-  if (slug === "notion") return NOTION_CONNECT_HREF;
-  if (slug === "zapier") return ZAPIER_CONNECT_HREF;
-  if (slug === "posthog") return "/apps/connect?byo=1&appKey=posthog&stage=setup";
-  if (slug === "composio") return "/apps/connect?byo=1&appKey=composio&stage=setup";
-  if (slug === "gmail") return "/apps/connect?byo=1&appKey=gmail&stage=access";
-  return null;
+  const definition = getConnectableAppDefinition(slug);
+  return appSupportsCatalogSetup(definition) ? appSourceConnectHref(slug) : null;
 }
 
 function additionalConnectionHref(
@@ -63,8 +60,8 @@ function additionalConnectionHref(
  *
  * A persistent, browsable storefront: search + a Popular grid + the full
  * gallery + a first-class bring-your-own card + a labelled Developer link.
- * Browse remains the single discoverability surface. Notion uses MCP-direct
- * OAuth, while Zapier and bring-your-own MCP servers use the URL flow.
+ * Browse remains the single discoverability surface. Capability-backed apps
+ * share the curated setup route; Zapier branches to its generated-URL screen.
  */
 export function Browse() {
   const navigate = useNavigate();
@@ -296,11 +293,14 @@ function AppTile({
   compact?: boolean;
 }) {
   const disabled = !onPrimary;
+  const unavailableReason = entry.availability?.available === false
+    ? entry.availability.reason ?? "This app is disabled on this instance."
+    : null;
   const connected = connectedCount > 0;
   const appName = appDefinitionName(entry);
   const actionLabel = connected
     ? connectedCount > 1 ? "Edit connections" : "Edit connection"
-    : disabled ? "Coming soon" : "Connect";
+    : disabled ? "Unavailable" : "Connect";
   const connectedActionClass = connected
     ? "border-emerald-500/50 text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-300"
     : undefined;
@@ -311,8 +311,11 @@ function AppTile({
           ? "flex cursor-not-allowed flex-col items-center gap-2 rounded-xl border border-border bg-background px-3 py-4 text-center opacity-60"
           : "flex flex-col items-center gap-2 rounded-xl border border-border bg-background px-3 py-4 text-center"}
       >
-        <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(entry)} size={36} />
+        <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(entry)} darkLogoUrl={appDefinitionDarkLogoUrl(entry)} size={36} />
         <span className="text-xs font-medium text-foreground">{appName}</span>
+        {unavailableReason ? (
+          <span className="line-clamp-3 text-xs text-muted-foreground">{unavailableReason}</span>
+        ) : null}
         {connected && (
           <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">
             <Check className="h-3 w-3" /> {connectedCount} connected
@@ -348,10 +351,13 @@ function AppTile({
         ? "flex h-full cursor-not-allowed items-start gap-3 rounded-xl border border-border bg-card px-4 py-4 text-left opacity-60"
         : "flex h-full items-start gap-3 rounded-xl border border-border bg-card px-4 py-4 text-left"}
     >
-      <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(entry)} size={36} />
+      <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(entry)} darkLogoUrl={appDefinitionDarkLogoUrl(entry)} size={36} />
       <div className="min-w-0 flex-1">
         <div className="text-sm font-semibold text-foreground">{appName}</div>
         <div className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{appDefinitionDescription(entry)}</div>
+        {unavailableReason ? (
+          <div className="mt-2 text-xs text-muted-foreground">{unavailableReason}</div>
+        ) : null}
         {connected && owner && (
           <div className="mt-2">
             <ConnectionOwnerIdentity owner={owner} />

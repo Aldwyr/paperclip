@@ -8,7 +8,8 @@
   ],
   "featured": true,
   "branding": {
-    "logoUrl": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128"
+    "logoUrl": "/brands/apps/posthog.svg",
+    "darkLogoUrl": "/brands/apps/posthog-dark.svg"
   },
   "urlPatterns": [
     "https://mcp.posthog.com/*"
@@ -239,5 +240,7 @@
         "docs": "https://posthog.com/docs/model-context-protocol/faq"
       }
     }
-  ]
+  ],
+  "docsUrl": "https://posthog.com/docs/model-context-protocol",
+  "redirectConstraints": "https-or-loopback-http"
 }

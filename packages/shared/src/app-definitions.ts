@@ -1,8 +1,10 @@
 import { APP_DEFINITIONS } from "./app-definitions.generated.js";
+import { SELF_SERVE_MCP_CANDIDATES } from "./self-serve-mcp-research.js";
 import type { AppDefinition, ConnectionMethodDef, FieldDef } from "./types/app-definition.js";
 import type { ToolConnectionOwnership } from "./types/tool-access.js";
 
-const CONNECTABLE_APP_SLUGS = new Set([
+export const CONNECTABLE_APP_SLUGS = new Set([
+  ...SELF_SERVE_MCP_CANDIDATES.map((entry) => entry.slug),
   "zapier",
   "github",
   "slack",
@@ -65,6 +67,53 @@ export function getAvailableConnectionMethod(
   return methodKey ? methods.find((method) => method.key === methodKey) ?? null : methods[0] ?? null;
 }
 
+export function connectionMethodSupportsAutomaticOAuth(method: ConnectionMethodDef | null | undefined): boolean {
+  return method?.auth === "oauth" && (
+    method.oauthStrategy === "paperclip_id_connector"
+    || method.ownershipModes.includes("dcr")
+  );
+}
+
+export function connectionMethodAcceptsCustomerOAuthClient(method: ConnectionMethodDef | null | undefined): boolean {
+  return method?.auth === "oauth"
+    && !method.oauthStrategy
+    && method.ownershipModes.includes("customer");
+}
+
+export function connectionMethodSupportsCatalogSetup(method: ConnectionMethodDef | null | undefined): boolean {
+  if (!method) return false;
+  if (method.auth === "none" || method.auth === "api_key") return true;
+  return connectionMethodSupportsAutomaticOAuth(method)
+    || connectionMethodAcceptsCustomerOAuthClient(method);
+}
+
+export function connectionMethodRequiresConfiguration(method: ConnectionMethodDef | null | undefined): boolean {
+  if (!method) return false;
+  return Boolean(
+    method.credentialFields?.length
+    || method.tenantFields?.length
+    || method.extensionFields?.length
+    || method.configRequirements?.atLeastOneOf?.length
+    || connectionMethodAcceptsCustomerOAuthClient(method),
+  );
+}
+
+export function appSupportsCatalogSetup(app: AppDefinition | null | undefined): boolean {
+  return Boolean(app && getAvailableConnectionMethods(app).some(connectionMethodSupportsCatalogSetup));
+}
+
+export function isConnectableAppSlug(slug: string | null | undefined): boolean {
+  return Boolean(slug && CONNECTABLE_APP_SLUGS.has(slug));
+}
+
+export function appSupportsAutomaticOAuth(app: AppDefinition | null | undefined): boolean {
+  return Boolean(app && getAvailableConnectionMethods(app).some(connectionMethodSupportsAutomaticOAuth));
+}
+
+export function appAcceptsCustomerOAuthClient(app: AppDefinition | null | undefined): boolean {
+  return Boolean(app && getAvailableConnectionMethods(app).some(connectionMethodAcceptsCustomerOAuthClient));
+}
+
 export function credentialConfigPath(field: FieldDef): string {
   return `credentials.${field.key}`;
 }
@@ -73,6 +122,6 @@ export function recommendedDefaultsForApp(app: AppDefinition, methodKey?: string
   const method = getAvailableConnectionMethod(app, methodKey);
   return {
     access: "all_agents",
-    askFirstRiskLevels: method?.riskTier === "S1" ? [] : ["write", "destructive"],
+    askFirstRiskLevels: method?.riskTier === "S4" ? ["write", "destructive"] : [],
   };
 }

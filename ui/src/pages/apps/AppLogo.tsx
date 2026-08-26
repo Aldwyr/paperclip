@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 
 const TILE_COLORS = [
@@ -21,19 +21,22 @@ function colorFor(seed: string): string {
 interface AppLogoProps {
   name: string;
   logoUrl?: string | null;
+  darkLogoUrl?: string | null;
   size?: number;
   className?: string;
 }
 
 /**
  * App icon for the gallery and connected-apps surfaces. Renders the manifest
- * favicon when available, falling back to a coloured letter tile (deterministic
- * colour per app name) when the image is missing or fails to load.
+ * official local provider mark when available, including a dark-mode variant.
+ * The deterministic letter tile is reserved for runtime image failures.
  */
-export function AppLogo({ name, logoUrl, size = 36, className }: AppLogoProps) {
+export function AppLogo({ name, logoUrl, darkLogoUrl, size = 36, className }: AppLogoProps) {
   const [failed, setFailed] = useState(false);
   const letter = (name.trim()[0] ?? "?").toUpperCase();
   const dimension = { width: size, height: size };
+
+  useEffect(() => setFailed(false), [darkLogoUrl, logoUrl]);
 
   if (logoUrl && !failed) {
     return (
@@ -46,9 +49,19 @@ export function AppLogo({ name, logoUrl, size = 36, className }: AppLogoProps) {
           alt=""
           width={size}
           height={size}
-          className="h-full w-full object-contain"
+          className={cn("h-full w-full object-contain p-1.5", darkLogoUrl && "dark:hidden")}
           onError={() => setFailed(true)}
         />
+        {darkLogoUrl ? (
+          <img
+            src={darkLogoUrl}
+            alt=""
+            width={size}
+            height={size}
+            className="hidden h-full w-full object-contain p-1.5 dark:block"
+            onError={() => setFailed(true)}
+          />
+        ) : null}
       </span>
     );
   }
@@ -56,11 +69,11 @@ export function AppLogo({ name, logoUrl, size = 36, className }: AppLogoProps) {
   return (
     <span
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-lg font-bold text-white",
+        "inline-flex shrink-0 items-center justify-center rounded-lg text-sm font-bold text-white",
         colorFor(name),
         className,
       )}
-      style={{ ...dimension, fontSize: Math.round(size * 0.42) }}
+      style={dimension}
       aria-hidden="true"
     >
       {letter}

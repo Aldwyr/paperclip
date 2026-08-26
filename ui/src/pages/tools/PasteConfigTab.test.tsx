@@ -123,7 +123,7 @@ function connectResult(overrides: Partial<ConnectToolAppResult> = {}): ConnectTo
       }],
       canMakeChanges: [],
     },
-    suggestedDefaults: { access: "all_agents", askFirstRiskLevels: ["write", "destructive"] },
+    suggestedDefaults: { access: "all_agents", askFirstRiskLevels: [] },
     ...overrides,
   };
 }

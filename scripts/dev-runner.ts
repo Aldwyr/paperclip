@@ -8,6 +8,7 @@ import { stdin, stdout } from "node:process";
 import { createCapturedOutputBuffer, parseJsonResponseWithLimit } from "./dev-runner-output.ts";
 import { collectWatchedSnapshot as collectDevServerWatchedSnapshot, diffSnapshots } from "./dev-runner-snapshot.mjs";
 import { createDevServiceIdentity, repoRoot } from "./dev-service-profile.ts";
+import { applyDevRunnerOptions } from "../server/src/dev-runner-options.ts";
 import { bootstrapDevRunnerWorktreeEnv, isWorktreeSeedPending } from "../server/src/dev-runner-worktree.ts";
 import {
   findAdoptableLocalService,
@@ -20,6 +21,18 @@ import {
 // tsx context without requiring workspace package resolution first.
 const BIND_MODES = ["loopback", "lan", "tailnet", "custom"] as const;
 type BindMode = (typeof BIND_MODES)[number];
+
+const mode = process.argv[2] === "watch" ? "watch" : "dev";
+let cliArgs: string[];
+let dataDir: string | null;
+try {
+  const appliedOptions = applyDevRunnerOptions(process.argv.slice(3));
+  cliArgs = appliedOptions.forwardedArgs;
+  dataDir = appliedOptions.dataDir;
+} catch (error) {
+  console.error(`[paperclip] ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
 
 const worktreeEnvBootstrap = bootstrapDevRunnerWorktreeEnv(repoRoot, process.env);
 if (worktreeEnvBootstrap.missingEnv) {
@@ -35,8 +48,6 @@ if (isWorktreeSeedPending(repoRoot)) {
   process.exit(1);
 }
 
-const mode = process.argv[2] === "watch" ? "watch" : "dev";
-const cliArgs = process.argv.slice(3);
 const scanIntervalMs = 1500;
 const autoRestartPollIntervalMs = 2500;
 const gracefulShutdownTimeoutMs = 10_000;
@@ -196,7 +207,7 @@ if (tailscaleAuth || bindMode) {
 const serverPort = Number.parseInt(env.PORT ?? process.env.PORT ?? "3100", 10) || 3100;
 const devService = createDevServiceIdentity({
   mode,
-  forwardedArgs,
+  forwardedArgs: dataDir ? [...forwardedArgs, `--data-dir=${dataDir}`] : forwardedArgs,
   networkProfile: tailscaleAuth ? `legacy:${bindMode ?? "lan"}` : (bindMode ?? "default"),
   port: serverPort,
 });

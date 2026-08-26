@@ -90,6 +90,15 @@ describe("Browse store door (PAP-13254 door 1)", () => {
         galleryEntry({ key: "notion", name: "Notion", tagline: "Read and update workspace content." }),
         galleryEntry({ key: "composio", name: "Composio", tagline: "Connect hosted toolkits." }),
         galleryEntry({ key: "gmail", name: "Gmail", tagline: "Search and draft email." }),
+        galleryEntry({
+          key: "google-sheets",
+          name: "Google Sheets",
+          tagline: "Read shared spreadsheets.",
+          availability: {
+            available: false,
+            reason: "Configure the Google Sheets robot identity in Instance settings.",
+          },
+        }),
         galleryEntry({ key: "acme", name: "Acme CRM", tagline: "Sync deals and contacts." }),
       ],
     });
@@ -138,7 +147,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(text).not.toContain("review its actions before enabling it");
   });
 
-  it("enables Notion, Zapier, Gmail, and custom URLs while fading unfinished integrations", async () => {
+  it("routes every capability-backed app and explains instance-disabled apps", async () => {
     await renderBrowse();
 
     const zapierTiles = Array.from(
@@ -156,8 +165,11 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     const gmailTiles = Array.from(
       container.querySelectorAll<HTMLButtonElement>('button[aria-label="Connect for Gmail"]'),
     );
+    const sheetsTile = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Unavailable for Google Sheets"]',
+    );
     const tile = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Coming soon for Acme CRM"]',
+      'button[aria-label="Unavailable for Acme CRM"]',
     );
     const byoCard = Array.from(container.querySelectorAll("button")).find((button) =>
       button.textContent?.includes("Connect your own tool"),
@@ -171,16 +183,19 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     expect(composioTiles[0]?.disabled).toBe(false);
     expect(gmailTiles).toHaveLength(1);
     expect(gmailTiles[0]?.disabled).toBe(false);
-    expect(githubTiles.every((button) => button.disabled)).toBe(true);
+    expect(githubTiles.every((button) => !button.disabled)).toBe(true);
     expect(tile?.disabled).toBe(true);
+    expect(sheetsTile?.disabled).toBe(true);
     expect(byoCard?.disabled).toBe(false);
-    expect(tile?.textContent).toContain("Coming soon");
+    expect(tile?.textContent).toContain("Unavailable");
+    expect(container.textContent).toContain("Configure the Google Sheets robot identity in Instance settings.");
+    expect(container.textContent).not.toContain("Coming soon");
     expect(zapierTiles[0]?.textContent).toContain("Connect");
 
     await act(async () => {
       zapierTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?byo=1&source=zapier");
+    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=zapier");
 
     await act(async () => {
       notionTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -190,12 +205,12 @@ describe("Browse store door (PAP-13254 door 1)", () => {
     await act(async () => {
       composioTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=composio&stage=setup");
+    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=composio");
 
     await act(async () => {
       gmailTiles[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?byo=1&appKey=gmail&stage=access");
+    expect(navigateMock).toHaveBeenCalledWith("/apps/connect?source=gmail");
 
     await act(async () => {
       byoCard?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

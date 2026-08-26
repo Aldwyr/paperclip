@@ -1,5 +1,16 @@
-/** OAuth apps that are safe to connect directly through the MCP OAuth broker. */
-export const MCP_DIRECT_OAUTH_CONNECT_SLUGS = ["notion"] as const;
+import {
+  CONNECTABLE_APP_DEFINITIONS,
+  appSupportsCatalogSetup,
+  connectionMethodSupportsAutomaticOAuth,
+  getAvailableConnectionMethods,
+  getConnectableAppDefinition,
+} from "@paperclipai/shared";
+
+export const MCP_DIRECT_OAUTH_CONNECT_SLUGS = CONNECTABLE_APP_DEFINITIONS
+  .filter((app) => getAvailableConnectionMethods(app).some((method) =>
+    connectionMethodSupportsAutomaticOAuth(method)
+  ))
+  .map((app) => app.slug);
 
 export function isMcpDirectOAuthConnectSlug(slug: string | null | undefined): boolean {
   return MCP_DIRECT_OAUTH_CONNECT_SLUGS.some((allowedSlug) => allowedSlug === slug);
@@ -10,5 +21,7 @@ export function appSourceConnectHref(slug: string): string {
 }
 
 export function canEnterAppsConnect(searchParams: URLSearchParams): boolean {
-  return searchParams.get("byo") === "1" || isMcpDirectOAuthConnectSlug(searchParams.get("source"));
+  if (searchParams.get("byo") === "1") return true;
+  const entry = getConnectableAppDefinition(searchParams.get("source") ?? "");
+  return appSupportsCatalogSetup(entry);
 }

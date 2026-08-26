@@ -3,12 +3,17 @@
   "slug": "gmail",
   "name": "Gmail",
   "description": "Search and read Gmail messages and create drafts without enabling mail sending.",
-  "categories": ["communication", "productivity"],
+  "categories": [
+    "communication",
+    "productivity"
+  ],
   "featured": true,
   "branding": {
-    "logoUrl": "https://www.google.com/s2/favicons?domain=gmail.com&sz=128"
+    "logoUrl": "/brands/apps/gmail.svg"
   },
-  "urlPatterns": ["https://gmailmcp.googleapis.com/*"],
+  "urlPatterns": [
+    "https://gmailmcp.googleapis.com/*"
+  ],
   "docsUrl": "https://developers.google.com/workspace/guides/configure-mcp-servers",
   "redirectConstraints": "https-or-loopback-http",
   "methods": [
@@ -18,8 +23,12 @@
       "transport": "mcp_remote",
       "auth": "oauth",
       "oauthStrategy": "paperclip_id_connector",
-      "grantKinds": ["user"],
-      "ownershipModes": ["customer"],
+      "grantKinds": [
+        "user"
+      ],
+      "ownershipModes": [
+        "customer"
+      ],
       "whenToUse": "Use Paperclip ID for a personal Gmail connection with centrally registered Google OAuth.",
       "defaults": {
         "serverUrl": "https://gmailmcp.googleapis.com/mcp/v1",

@@ -18,6 +18,7 @@ import {
 import { isComposioBrokerConnection } from "@/pages/apps/composio-services";
 import { AppLogo } from "@/pages/apps/AppLogo";
 import {
+  appDefinitionDarkLogoUrl,
   appDefinitionLogoUrl,
   appDefinitionName,
   appDefinitionSlug,
@@ -97,7 +98,7 @@ export function AppDetailSidebar(props: AppDetailSidebarProps) {
           <span className="truncate">All apps</span>
         </Link>
         <div className="flex min-w-0 items-center gap-2 px-2 py-1">
-          <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(logoEntry)} size={28} />
+          <AppLogo name={appName} logoUrl={appDefinitionLogoUrl(logoEntry)} darkLogoUrl={appDefinitionDarkLogoUrl(logoEntry)} size={28} />
           <span className="flex-1 truncate text-sm font-bold text-foreground">{appName}</span>
         </div>
       </div>

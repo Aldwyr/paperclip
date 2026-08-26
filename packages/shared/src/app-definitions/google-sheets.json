@@ -8,7 +8,7 @@
   ],
   "featured": false,
   "branding": {
-    "logoUrl": "https://www.google.com/s2/favicons?domain=sheets.google.com&sz=128"
+    "logoUrl": "/brands/apps/google-sheets.svg"
   },
   "urlPatterns": [
     "https://docs.google.com/spreadsheets/*",
