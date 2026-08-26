@@ -31,6 +31,11 @@ import http2 from "node:http2";
 
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
+  getHttp2BridgeAdmissionGate,
+  HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES,
+  type Http2BridgeAdmissionGate,
+} from "./http2-bridge-admission.js";
+import {
   authorizeSandboxCallbackBridgeRequestWithRoutes,
   compareBridgeTokensConstantTime,
   sanitizeSandboxCallbackBridgeHeaders,
@@ -105,8 +110,12 @@ export const HTTP2_BRIDGE_SERVER_OPTIONS: http2.ServerOptions = {
  * bound. This cap also bounds one single chunk: the wrapper checks a chunk's
  * own size against it before `push()` ever runs, so one oversized chunk
  * cannot cross the cap on its first delivery, before the queue holds
- * anything to compare it against. */
-export const DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES = HTTP2_BRIDGE_MAX_SESSION_MEMORY * 1024 * 1024;
+ * anything to compare it against.
+ *
+ * This value reads {@link HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES} from the
+ * admission module, so the wrapper cap and the admission gate's live-session
+ * reservation resolve through one shared constant and cannot drift apart. */
+export const DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES = HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES;
 /** The default bound, in milliseconds, on how long the read-side queue
  * {@link wrapDuplexChannelAsNodeDuplex} holds can stay non-empty with no
  * chunk draining from it. The byte cap above bounds how much memory a stuck
@@ -438,6 +447,13 @@ export const DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_LIFETIME_CEILING_MS = 480_000;
  * session that carries a stalled stream would otherwise hold `close()` open
  * forever, because `session.close()` waits for every open stream to end. */
 export const DEFAULT_HTTP2_BRIDGE_CLOSE_GRACE_MS = 5_000;
+/** The default bound {@link waitForStreamDrain} waits for a response stream
+ * to reach its `close` event before the server frees the admission slot the
+ * stream holds. `stream.end()` returns before the peer has read the
+ * response, so a wait with no bound would let a peer that never reads a
+ * response hold the slot open forever. Set to the same value as
+ * {@link DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_TIMEOUT_MS}. */
+export const DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS = 30_000;
 
 function startHttp2BridgePingWatchdog(
   session: http2.ServerHttp2Session,
@@ -565,6 +581,16 @@ export interface CreateHttp2BridgeServerOptions {
    * chunk draining from it. The default is
    * {@link DEFAULT_HTTP2_BRIDGE_READ_BACKPRESSURE_STALL_MS}. */
   readBackpressureStallMs?: number;
+  /** The process-wide admission gate. The server takes one slot from this
+   * gate for each admitted stream, after the route check and before the
+   * request body read, and holds the slot until the stream closes (or the
+   * response drain bound fires). The default is the process-wide instance
+   * from {@link getHttp2BridgeAdmissionGate}. A test injects its own gate. */
+  admissionGate?: Http2BridgeAdmissionGate;
+  /** The bound {@link waitForStreamDrain} waits for a response stream to
+   * close before the server frees its admission slot. The default is
+   * {@link DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS}. */
+  responseDrainTimeoutMs?: number;
   /** The sink for a GOAWAY the server observed on a session (one the sandbox
    * side sent to the host). */
   onGoaway?: (record: Http2BridgeGoawayRecord) => void;
@@ -688,6 +714,141 @@ function readHttp2StreamBody(
   });
 }
 
+/** One settled body-capture result: either the concatenated body, or the
+ * error the capture settled with. */
+type Http2BridgeBodyCaptureOutcome = { ok: true; body: Buffer } | { ok: false; error: Error };
+
+/**
+ * Begin capturing one request body, ahead of the idle and lifetime timers
+ * that bound how long the capture can run. A caller that waits on the
+ * admission gate before it is ready to enforce those timers must still
+ * attach the underlying stream listeners at once, in the same synchronous
+ * turn as the `stream` event: attaching them one turn later can lose the
+ * peer's `end` (Node does not replay a body the JS layer was not yet
+ * listening for), stalling a request that already fully arrived.
+ *
+ * `awaitBody` arms the idle and lifetime timers and returns the promise the
+ * caller awaits. Call it once, when the caller is ready to enforce the
+ * bounds (after the admission wait, in this server). If the body already
+ * finished, or the stream already errored, closed, or aborted, before
+ * `awaitBody` runs, it delivers that outcome at once and arms no timer.
+ */
+function beginHttp2BridgeStreamBodyCapture(
+  stream: http2.ServerHttp2Stream,
+  maxBodyBytes: number,
+): { awaitBody(idleTimeoutMs: number, lifetimeCeilingMs: number): Promise<Buffer> } {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  let settled = false;
+  let outcome: Http2BridgeBodyCaptureOutcome | undefined;
+  let onSettled: ((outcome: Http2BridgeBodyCaptureOutcome) => void) | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lifetimeCeilingTimer: ReturnType<typeof setTimeout> | undefined;
+  let armedIdleTimeoutMs: number | undefined;
+
+  const settle = (result: Http2BridgeBodyCaptureOutcome) => {
+    if (settled) return;
+    settled = true;
+    if (idleTimer) clearTimeout(idleTimer);
+    if (lifetimeCeilingTimer) clearTimeout(lifetimeCeilingTimer);
+    outcome = result;
+    onSettled?.(result);
+  };
+
+  const armIdleTimer = () => {
+    // Before `awaitBody` runs, `armedIdleTimeoutMs` is unset: a chunk that
+    // arrives while the caller still waits on admission must not start (or
+    // restart) the idle bound, so a queue wait alone can never trip it.
+    if (armedIdleTimeoutMs === undefined) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      settle({ ok: false, error: new Error("Bridge request body stalled before it completed.") });
+      stream.destroy();
+    }, armedIdleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
+  stream.on("data", (chunk: Buffer) => {
+    totalBytes += chunk.byteLength;
+    if (totalBytes > maxBodyBytes) {
+      settle({ ok: false, error: new Error("Bridge request body exceeded the configured size limit.") });
+      stream.destroy();
+      return;
+    }
+    chunks.push(chunk);
+    armIdleTimer();
+  });
+  stream.once("end", () => settle({ ok: true, body: Buffer.concat(chunks) }));
+  stream.once("error", (error) =>
+    settle({ ok: false, error: error instanceof Error ? error : new Error(String(error)) }),
+  );
+  stream.once("aborted", () => settle({ ok: false, error: new Error("Bridge request stream aborted.") }));
+  stream.once("close", () =>
+    settle({ ok: false, error: new Error("Bridge request stream closed before it completed.") }),
+  );
+
+  return {
+    awaitBody(idleTimeoutMs: number, lifetimeCeilingMs: number): Promise<Buffer> {
+      return new Promise((resolve, reject) => {
+        const deliver = (result: Http2BridgeBodyCaptureOutcome) => {
+          if (result.ok) resolve(result.body);
+          else reject(result.error);
+        };
+        if (outcome) {
+          // The body already finished (or the stream already went away)
+          // while this capture waited on admission: deliver it at once, and
+          // arm no timer for a wait that is already over.
+          deliver(outcome);
+          return;
+        }
+        onSettled = deliver;
+        armedIdleTimeoutMs = idleTimeoutMs;
+        armIdleTimer();
+        // Arms one time, from here, and never rearms on a chunk: see
+        // DEFAULT_HTTP2_BRIDGE_REQUEST_BODY_LIFETIME_CEILING_MS for why the
+        // ceiling must stay independent of progress.
+        lifetimeCeilingTimer = setTimeout(() => {
+          settle({ ok: false, error: new Error("Bridge request body passed the total lifetime ceiling.") });
+          stream.destroy();
+        }, lifetimeCeilingMs);
+        lifetimeCeilingTimer.unref?.();
+      });
+    },
+  };
+}
+
+/**
+ * Wait for `stream` to reach its `close` event, or destroy it once
+ * `timeoutMs` passes with no close. `stream.end()` returns before the peer
+ * has read the response: the response bytes, and the admission slot the
+ * stream holds, stay in host memory until the peer actually drains them.
+ * This bounds that wait, so a peer that never reads a response cannot hold
+ * the slot open forever.
+ */
+function waitForStreamDrain(stream: http2.ServerHttp2Stream, timeoutMs: number): Promise<void> {
+  if (stream.closed || stream.destroyed) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const onClose = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      stream.removeListener("close", onClose);
+      if (!stream.destroyed) stream.destroy();
+      resolve();
+    }, timeoutMs);
+    timer.unref?.();
+    stream.once("close", onClose);
+  });
+}
+
 function respondJson(stream: http2.ServerHttp2Stream, status: number, body: unknown): void {
   if (stream.destroyed || stream.closed) return;
   try {
@@ -743,6 +904,8 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
   const maxBufferedReadBytes = options.maxBufferedReadBytes ?? DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES;
   const readBackpressureStallMs =
     options.readBackpressureStallMs ?? DEFAULT_HTTP2_BRIDGE_READ_BACKPRESSURE_STALL_MS;
+  const admissionGate = options.admissionGate ?? getHttp2BridgeAdmissionGate();
+  const responseDrainTimeoutMs = options.responseDrainTimeoutMs ?? DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS;
   // Built one time and passed to every readHttp2StreamBody() and
   // denyRequest() call below, so every stream on this server enforces the
   // same bounds.
@@ -790,40 +953,78 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
       headerAllowlist,
     );
 
-    let body: Buffer;
-    try {
-      body = await readHttp2StreamBody(stream, bodyBounds);
-    } catch (error) {
-      respondJson(stream, 413, { error: error instanceof Error ? error.message : String(error) });
-      return;
-    }
+    // Begin capturing the request body at once, in this same synchronous
+    // turn: the admission wait below can take an arbitrary time, and Node
+    // does not replay a body this handler was not yet listening for. The
+    // capture arms no timer until `awaitBody` runs, after admission.
+    const bodyCapture = beginHttp2BridgeStreamBodyCapture(stream, maxBodyBytes);
 
-    let result: Http2BridgeForwardResult;
+    // The admission gate bounds host memory across every bridge server and
+    // every session: take one slot before the body read completes, and hold
+    // it until the response leaves the host. A denial above takes no slot;
+    // only a routed, authenticated request reaches this point.
+    //
+    // Abort the queue wait if the stream closes while it still waits, so a
+    // cancelled request leaves the queue instead of taking a later slot.
+    const admissionAbortController = new AbortController();
+    const abortAdmissionWaitOnClose = () => admissionAbortController.abort();
+    stream.once("close", abortAdmissionWaitOnClose);
+    let releaseAdmissionSlot: () => void;
     try {
-      result = await options.forwardRequest({
-        method,
-        pathname: parsedPath.value.pathname,
-        query: parsedPath.value.query,
-        headers: sanitizedHeaders,
-        body,
-      });
-    } catch (error) {
-      respondJson(stream, 502, { error: error instanceof Error ? error.message : String(error) });
-      return;
-    }
-
-    if (stream.destroyed || stream.closed) return;
-    const responseHeaders: http2.OutgoingHttpHeaders = { ":status": result.status };
-    for (const [key, value] of Object.entries(result.headers ?? {})) {
-      if (key.toLowerCase() === "content-length") continue;
-      responseHeaders[key] = value;
-    }
-    try {
-      stream.respond(responseHeaders);
-      stream.end(result.body);
+      releaseAdmissionSlot = await admissionGate.acquire(admissionAbortController.signal);
     } catch {
-      // The peer reset the stream (RST_STREAM) between dispatch and response.
-      // One stream's write fault stays local to that stream.
+      // The stream closed while it waited in the queue: there is nothing
+      // left to answer.
+      stream.removeListener("close", abortAdmissionWaitOnClose);
+      return;
+    }
+    stream.removeListener("close", abortAdmissionWaitOnClose);
+
+    try {
+      let body: Buffer;
+      try {
+        body = await bodyCapture.awaitBody(requestBodyTimeoutMs, requestBodyLifetimeCeilingMs);
+      } catch (error) {
+        respondJson(stream, 413, { error: error instanceof Error ? error.message : String(error) });
+        await waitForStreamDrain(stream, responseDrainTimeoutMs);
+        return;
+      }
+
+      let result: Http2BridgeForwardResult;
+      try {
+        result = await options.forwardRequest({
+          method,
+          pathname: parsedPath.value.pathname,
+          query: parsedPath.value.query,
+          headers: sanitizedHeaders,
+          body,
+        });
+      } catch (error) {
+        respondJson(stream, 502, { error: error instanceof Error ? error.message : String(error) });
+        await waitForStreamDrain(stream, responseDrainTimeoutMs);
+        return;
+      }
+
+      if (stream.destroyed || stream.closed) return;
+      const responseHeaders: http2.OutgoingHttpHeaders = { ":status": result.status };
+      for (const [key, value] of Object.entries(result.headers ?? {})) {
+        if (key.toLowerCase() === "content-length") continue;
+        responseHeaders[key] = value;
+      }
+      try {
+        stream.respond(responseHeaders);
+        stream.end(result.body);
+        // `stream.end()` returns before the peer has read the response: wait
+        // for the stream to actually close before the outer `finally` frees
+        // the slot, so the response bytes stay accounted for in host memory
+        // until they truly leave the host.
+        await waitForStreamDrain(stream, responseDrainTimeoutMs);
+      } catch {
+        // The peer reset the stream (RST_STREAM) between dispatch and response.
+        // One stream's write fault stays local to that stream.
+      }
+    } finally {
+      releaseAdmissionSlot();
     }
   }
 

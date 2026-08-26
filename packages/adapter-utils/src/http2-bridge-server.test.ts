@@ -10,8 +10,10 @@ import {
   createHttp2BridgeServer,
   parseCanonicalBridgeRequestPath,
   wrapDuplexChannelAsNodeDuplex,
+  DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES,
   DEFAULT_HTTP2_BRIDGE_PING_INTERVAL_MS,
   DEFAULT_HTTP2_BRIDGE_PING_STALL_MS,
+  DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS,
   HTTP2_BRIDGE_ENABLE_PUSH,
   HTTP2_BRIDGE_HEADER_TABLE_SIZE,
   HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS,
@@ -30,6 +32,10 @@ import {
 } from "./http2-bridge-server.js";
 import { createSandboxHttp2BridgeGateway } from "./sandbox-callback-bridge.js";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
+import {
+  Http2BridgeAdmissionGate,
+  HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES,
+} from "./http2-bridge-admission.js";
 
 /**
  * Unit harness for the host HTTP/2 server and the sandbox HTTP/2 client
@@ -78,6 +84,9 @@ interface TestPairOptions {
   requestBodyTimeoutMs?: number;
   requestBodyLifetimeCeilingMs?: number;
   closeGraceMs?: number;
+  maxBodyBytes?: number;
+  admissionGate?: Http2BridgeAdmissionGate;
+  responseDrainTimeoutMs?: number;
   onGoaway?: (record: Http2BridgeGoawayRecord) => void;
   onSessionError?: (error: Error) => void;
   onSession?: (session: http2.ServerHttp2Session) => void;
@@ -103,6 +112,9 @@ function bindTestServer(options: TestPairOptions = {}) {
     requestBodyTimeoutMs: options.requestBodyTimeoutMs,
     requestBodyLifetimeCeilingMs: options.requestBodyLifetimeCeilingMs,
     closeGraceMs: options.closeGraceMs,
+    maxBodyBytes: options.maxBodyBytes,
+    admissionGate: options.admissionGate,
+    responseDrainTimeoutMs: options.responseDrainTimeoutMs,
     onGoaway: options.onGoaway,
     onSessionError: options.onSessionError,
     onSession: options.onSession,
@@ -1071,5 +1083,418 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     // empty. A timer the full drain above did not clear would fire here.
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(duplex.destroyed).toBe(false);
+  });
+
+  describe("the admission gate", () => {
+    it("the response drain timeout defaults to thirty seconds, and the buffered-read byte cap shares one home with the admission module's session budget", () => {
+      expect(DEFAULT_HTTP2_BRIDGE_RESPONSE_DRAIN_TIMEOUT_MS).toBe(30_000);
+      expect(DEFAULT_HTTP2_BRIDGE_MAX_BUFFERED_READ_BYTES).toBe(HTTP2_BRIDGE_LIVE_SESSION_BUDGET_BYTES);
+    });
+
+    it("one gate caps parallel streams across two bridge server instances", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 2, maxSessions: 4 });
+      let concurrent = 0;
+      let peakConcurrent = 0;
+      const forwardRequest = async (): Promise<Http2BridgeForwardResult> => {
+        concurrent += 1;
+        peakConcurrent = Math.max(peakConcurrent, concurrent);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        concurrent -= 1;
+        return { status: 200 };
+      };
+      const serverA = bindTestServer({ admissionGate, forwardRequest });
+      const serverB = bindTestServer({ admissionGate, forwardRequest });
+      const rawClientA = connectRawClient(serverA.clientSide);
+      const rawClientB = connectRawClient(serverB.clientSide);
+      try {
+        await Promise.all([
+          expectSessionStillServesARequest(rawClientA, {
+            method: "GET",
+            path: "/api/agents/me",
+            token: serverA.bridgeToken,
+          }),
+          expectSessionStillServesARequest(rawClientA, {
+            method: "GET",
+            path: "/api/companies/co1",
+            token: serverA.bridgeToken,
+          }),
+          expectSessionStillServesARequest(rawClientB, {
+            method: "GET",
+            path: "/api/agents/me",
+            token: serverB.bridgeToken,
+          }),
+          expectSessionStillServesARequest(rawClientB, {
+            method: "GET",
+            path: "/api/companies/co1",
+            token: serverB.bridgeToken,
+          }),
+        ]);
+        // The one shared gate never let more than two streams run at once,
+        // across both server instances.
+        expect(peakConcurrent).toBeLessThanOrEqual(2);
+        // Two of the four streams did run at the same time: this proves the
+        // cap is real overlap, not accidental full serialization to one.
+        expect(peakConcurrent).toBe(2);
+      } finally {
+        rawClientA.close();
+        rawClientB.close();
+        await serverA.handle.close();
+        await serverB.handle.close();
+      }
+    });
+
+    it("a queued stream starts its body read only after an earlier stream releases", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      const HOLD_MS = 150;
+      const IDLE_MS = 80;
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        requestBodyTimeoutMs: IDLE_MS,
+        forwardRequest: async (request) => {
+          if (request.pathname === "/api/agents/me") {
+            // Hold the only slot for HOLD_MS, so the second stream below
+            // stays queued for that whole span.
+            await new Promise((resolve) => setTimeout(resolve, HOLD_MS));
+          }
+          return { status: 200, body: JSON.stringify({ bodyLength: request.body.byteLength }) };
+        },
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const firstReq = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        firstReq.resume();
+        firstReq.end();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(admissionGate.activeCount).toBe(1);
+        expect(admissionGate.queuedCount).toBe(0);
+
+        const secondResponse = new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const secondReq = rawClient.request({
+            ":method": "POST",
+            ":path": "/api/issues/abc/comments",
+            authorization: `Bearer ${bridgeToken}`,
+          });
+          let status = 0;
+          let body = "";
+          secondReq.setEncoding("utf8");
+          secondReq.on("response", (headers) => {
+            status = Number(headers[":status"]) || 0;
+          });
+          secondReq.on("data", (chunk) => (body += chunk));
+          secondReq.on("end", () => resolve({ status, body }));
+          secondReq.on("error", reject);
+          // Wait almost the full hold span, sending no data, before this
+          // stream's one chunk. If the idle bound had started counting
+          // while this stream still waited in the queue, this silence alone
+          // would already exceed IDLE_MS and stall the stream.
+          setTimeout(() => {
+            secondReq.write("chunk");
+            secondReq.end();
+          }, HOLD_MS - 10);
+        });
+
+        // The second stream queues while the first holds the only slot.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(admissionGate.queuedCount).toBe(1);
+
+        const response = await secondResponse;
+        expect(response.status).toBe(200);
+        expect(JSON.parse(response.body)).toEqual({ bodyLength: "chunk".length });
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("a token, path, or route denial takes no gate slot", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      const { handle, bridgeToken, clientSide } = bindTestServer({ admissionGate });
+      const rawClient = connectRawClient(clientSide);
+
+      function requestAndAwaitStatus(input: { method: string; path: string; token?: string }): Promise<number> {
+        return new Promise((resolve, reject) => {
+          const headers: http2.OutgoingHttpHeaders = { ":method": input.method, ":path": input.path };
+          if (input.token !== undefined) headers.authorization = `Bearer ${input.token}`;
+          const req = rawClient.request(headers);
+          let status = 0;
+          req.on("response", (responseHeaders) => {
+            status = Number(responseHeaders[":status"]) || 0;
+          });
+          req.on("end", () => resolve(status));
+          req.on("error", reject);
+          req.resume();
+          req.end();
+        });
+      }
+
+      try {
+        // An invalid token is denied before route or body processing.
+        expect(await requestAndAwaitStatus({ method: "GET", path: "/api/agents/me" })).toBe(401);
+        expect(admissionGate.activeCount).toBe(0);
+        expect(admissionGate.queuedCount).toBe(0);
+
+        // An invalid path is denied before route processing.
+        expect(
+          await requestAndAwaitStatus({ method: "GET", path: "/api/../secrets", token: bridgeToken }),
+        ).toBe(400);
+        expect(admissionGate.activeCount).toBe(0);
+        expect(admissionGate.queuedCount).toBe(0);
+
+        // A route the allowlist does not carry is denied.
+        expect(
+          await requestAndAwaitStatus({ method: "DELETE", path: "/api/agents/me", token: bridgeToken }),
+        ).toBe(403);
+        expect(admissionGate.activeCount).toBe(0);
+        expect(admissionGate.queuedCount).toBe(0);
+
+        // None of the three denials above spent the one available slot: a
+        // legitimate request right after them still succeeds at once.
+        const survivingResponse = await expectSessionStillServesARequest(rawClient, {
+          method: "GET",
+          path: "/api/agents/me",
+          token: bridgeToken,
+        });
+        expect(survivingResponse.status).toBe(200);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("the slot stays held until the response stream closes", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      // A body past the default HTTP/2 flow-control window, so the server
+      // cannot finish sending it, and the stream cannot close, until the
+      // client actually reads it.
+      const bigBody = Buffer.alloc(200_000, "a");
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        forwardRequest: async () => ({ status: 200, body: bigBody }),
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const req = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        req.on("error", () => undefined);
+        req.end();
+        await new Promise<void>((resolve) => req.once("response", () => resolve()));
+        // The response headers arrived, but this test reads no body: the
+        // slot must still be held.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(admissionGate.activeCount).toBe(1);
+
+        const drained = new Promise<void>((resolve) => req.once("end", resolve));
+        req.resume();
+        await drained;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("a peer that never reads the response releases the slot at the drain bound", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      const bigBody = Buffer.alloc(200_000, "a");
+      // Long enough that the client reliably observes the response headers
+      // before the server's own drain bound destroys the stream; short
+      // enough to keep the test fast.
+      const RESPONSE_DRAIN_TIMEOUT_MS = 150;
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        responseDrainTimeoutMs: RESPONSE_DRAIN_TIMEOUT_MS,
+        // The drain bound below force-destroys the stream while the peer
+        // never read it: a short grace bound keeps this test's own
+        // `handle.close()` call from waiting on the default five-second one.
+        closeGraceMs: 30,
+        forwardRequest: async () => ({ status: 200, body: bigBody }),
+      });
+      const rawClient = connectRawClient(clientSide);
+      const req = rawClient.request({
+        ":method": "GET",
+        ":path": "/api/agents/me",
+        authorization: `Bearer ${bridgeToken}`,
+      });
+      try {
+        req.on("error", () => undefined);
+        req.end();
+        await new Promise<void>((resolve) => req.once("response", () => resolve()));
+        // Never read the response body: the drain bound must still free the
+        // slot, instead of holding it forever.
+        await new Promise((resolve) => setTimeout(resolve, RESPONSE_DRAIN_TIMEOUT_MS + 200));
+        expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        // The server destroyed its side already, at the drain bound; drop
+        // the client's own unread stream too, so the still-buffered (and
+        // now pointless) response bytes do not sit in the transport and
+        // block the session-level close below.
+        req.destroy();
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("the gate slot returns after a forward-handler error", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        forwardRequest: async () => {
+          throw new Error("forward handler failed");
+        },
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const status = await new Promise<number>((resolve, reject) => {
+          const req = rawClient.request({
+            ":method": "GET",
+            ":path": "/api/agents/me",
+            authorization: `Bearer ${bridgeToken}`,
+          });
+          req.on("response", (headers) => resolve(Number(headers[":status"]) || 0));
+          req.on("error", reject);
+          req.resume();
+          req.end();
+        });
+        expect(status).toBe(502);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("the gate slot returns after a body size rejection", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        maxBodyBytes: 10,
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        // A body past the size limit destroys the stream at once, so the
+        // client sees an `error` or a `close`, not a clean response — the
+        // same settling pattern the idle- and lifetime-bound tests above
+        // exercise. This test's own concern is the admission slot below.
+        await new Promise<void>((resolve) => {
+          const req = rawClient.request({
+            ":method": "POST",
+            ":path": "/api/issues/abc/comments",
+            authorization: `Bearer ${bridgeToken}`,
+          });
+          req.on("error", () => resolve());
+          req.on("close", () => resolve());
+          req.resume();
+          req.write(Buffer.alloc(1_000, "a"));
+          req.end();
+        });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("a stream that closes while it waits leaves the queue", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 1, maxSessions: 4 });
+      let releaseFirst: (() => void) | undefined;
+      const firstHeld = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let forwarderCallCount = 0;
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        forwardRequest: async () => {
+          forwarderCallCount += 1;
+          if (forwarderCallCount === 1) {
+            await firstHeld;
+          }
+          return { status: 200 };
+        },
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const firstReq = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        firstReq.on("error", () => undefined);
+        firstReq.resume();
+        firstReq.end();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.activeCount).toBe(1);
+
+        const secondReq = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/companies/co1",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        secondReq.on("error", () => undefined);
+        secondReq.end();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.queuedCount).toBe(1);
+
+        const secondClosed = new Promise<void>((resolve) => secondReq.once("close", resolve));
+        secondReq.close(http2.constants.NGHTTP2_CANCEL);
+        await secondClosed;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        // The cancelled stream left the queue, and never took the slot: the
+        // first stream still holds the only one.
+        expect(admissionGate.queuedCount).toBe(0);
+        expect(admissionGate.activeCount).toBe(1);
+
+        const firstClosed = new Promise<void>((resolve) => firstReq.once("close", resolve));
+        releaseFirst?.();
+        await firstClosed;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(admissionGate.activeCount).toBe(0);
+        // The cancelled stream never reached the forward handler.
+        expect(forwarderCallCount).toBe(1);
+      } finally {
+        rawClient.close();
+        await handle.close();
+      }
+    });
+
+    it("server close returns every held gate slot", async () => {
+      const admissionGate = new Http2BridgeAdmissionGate({ maxParallel: 4, maxSessions: 4 });
+      const bigBody = Buffer.alloc(200_000, "a");
+      const { handle, bridgeToken, clientSide } = bindTestServer({
+        admissionGate,
+        // Long enough that only the server close below bounds this wait.
+        responseDrainTimeoutMs: 60_000,
+        closeGraceMs: 30,
+        forwardRequest: async () => ({ status: 200, body: bigBody }),
+      });
+      const rawClient = connectRawClient(clientSide);
+      try {
+        const req = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+        });
+        req.on("error", () => undefined);
+        req.end();
+        await new Promise<void>((resolve) => req.once("response", () => resolve()));
+        // Never read the response: the stream cannot close on its own.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(admissionGate.activeCount).toBe(1);
+
+        await handle.close();
+        expect(admissionGate.activeCount).toBe(0);
+      } finally {
+        rawClient.close();
+      }
+    });
   });
 });
