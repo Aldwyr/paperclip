@@ -278,7 +278,7 @@ export function CodexLocalConfigFields({
           </Field>
         </>
       )}
-      {!hideInstructionsFile && (
+      {!runnerManaged && !hideInstructionsFile && (
         <Field label="Agent instructions file" hint={instructionsFileHint}>
           <div className="flex items-center gap-2">
             <DraftInput

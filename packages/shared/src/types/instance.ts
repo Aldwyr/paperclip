@@ -49,6 +49,11 @@ export interface InstanceExperimentalSettings {
   enableNativeRunner: boolean;
   enableEnvironments: boolean;
   /**
+   * Exposes the experimental Paperclip Runner adapter for new selections.
+   * Existing native runs ignore later flag changes so they remain recoverable.
+   */
+  enableNativeRunner: boolean;
+  /**
    * Hide the local environment and run all agents in the platform-managed
    * sandbox environment. Run selection refuses local while this is on.
    */

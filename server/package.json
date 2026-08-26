@@ -43,7 +43,7 @@
     "typecheck": "pnpm --filter @paperclipai/paperclip-eval-kernel build && pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1111.0",
+    "@aws-sdk/client-s3": "^3.1115.0",
     "@opentelemetry/api": "^1.9.0",
     "@paperclipai/adapter-claude-local": "workspace:*",
     "@paperclipai/adapter-codex-local": "workspace:*",
@@ -63,7 +63,7 @@
     "@paperclipai/hermes-paperclip-adapter": "workspace:*",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
-    "better-auth": "1.6.28",
+    "better-auth": "1.7.0",
     "chokidar": "^5.0.0",
     "detect-port": "^2.1.0",
     "dompurify": "^3.4.13",
@@ -90,13 +90,13 @@
     "@types/multer": "^2.2.0",
     "@types/node": "^24.0.0",
     "@types/sharp": "^0.32.0",
-    "@types/supertest": "^6.0.2",
+    "@types/supertest": "^7.2.1",
     "@types/ws": "^8.18.1",
     "cross-env": "^10.1.0",
     "supertest": "^7.0.0",
     "tsx": "^4.23.12",
-    "typescript": "^5.7.3",
-    "vite": "^6.4.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
     "vitest": "^4.1.10"
   },
   "engines": {

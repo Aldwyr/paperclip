@@ -89,7 +89,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
 import { getStartupTraceContext, getStartupTracer } from "../instrumentation.js";
-import { createHostDuplexTelemetryRecorder } from "./duplex-telemetry-recorder.js";
+import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import type { DuplexAggregateByteLedger } from "@paperclipai/adapter-utils/duplex-aggregate-byte-ledger";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
@@ -421,11 +421,23 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import { executeNativeCodexRunner } from "./native-runtime/native-codex-runner.js";
+import { prepareNativeHeartbeatRun } from "./native-runtime/prepare-native-run.js";
+import {
+  NativeRunnerSelectionError,
+  resolveHeartbeatRuntimeMode,
+} from "./native-runtime/runtime-mode.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+
+function nativeRunnerErrorCode(error: unknown): string | null {
+  if (error instanceof NativeRunnerSelectionError) return error.code;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.match(/^(paperclip_runner_[a-z0-9_]+)/)?.[1] ?? null;
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,

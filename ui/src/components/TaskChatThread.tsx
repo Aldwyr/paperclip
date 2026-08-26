@@ -285,6 +285,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     blockedBy = [],
     blockerAttention,
     liveIssueIds,
+    onResumeAssignee,
+    resumeAssigneePending = false,
   } = props;
 
   const paperclipQueue =
@@ -1394,6 +1396,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
+  const assignedAgentForNotice = useMemo(() => {
+    if (!currentAssigneeValue?.startsWith("agent:")) return null;
+    const assigneeAgentId = currentAssigneeValue.slice("agent:".length);
+    return agentMap?.get(assigneeAgentId) ?? null;
+  }, [agentMap, currentAssigneeValue]);
+
   // Mobile (PAP-360): the app shell scrolls the DOCUMENT (Layout's main is
   // overflow-visible with auto height), so the desktop bounded h-dvh chain
   // collapses the absolute-inset transcript viewport to 0px. Render the thread
@@ -1496,6 +1504,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           />
         )}
       </div>
+      {assignedAgentForNotice?.status === "paused" ? (
+        <div className="mx-auto w-full max-w-(--tc-shell-max-w) px-4 pt-2">
+          <IssueAssigneePausedNotice
+            agent={assignedAgentForNotice}
+            onResume={onResumeAssignee}
+            resuming={resumeAssigneePending}
+          />
+        </div>
+      ) : null}
       {showComposer ? (
         <div
           data-testid="task-chat-composer-dock"

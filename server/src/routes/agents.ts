@@ -170,6 +170,7 @@ import {
   type SetupTokenSessionScope,
   type SetupTokenSessionState,
   type SetupTokenSessionDescriptor,
+  SETUP_TOKEN_ADAPTER_TYPE,
 } from "../services/setup-token-session.js";
 import type {
   DeploymentMode,
@@ -1821,6 +1822,15 @@ export function agentRoutes(
     type: string | null | undefined,
   ): string {
     const adapterType = assertKnownAdapterType(type);
+    if (adapterType === "paperclip_runner") {
+      const experimental = await instanceSettings.getExperimental();
+      if (experimental.enableNativeRunner !== true) {
+        throw unprocessable(
+          "Paperclip Runner is experimental and disabled on this instance.",
+          { code: "paperclip_runner_rollout_disabled" },
+        );
+      }
+    }
     const disabled = new Set(getDisabledAdapterTypes());
     if (!disabled.has(adapterType)) return adapterType;
     const available = listServerAdapters()
@@ -2512,6 +2522,22 @@ export function agentRoutes(
     ]);
   }
 
+  async function assertCanResumeAgent(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+  ) {
+    if (req.actor.type !== "agent") return;
+
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: { requiresChangeGrant: true },
+    });
+    if (decision.allowed) return;
+    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
@@ -2578,6 +2604,34 @@ export function agentRoutes(
       entries: [],
       warnings: ["This adapter does not implement skill sync yet."],
     };
+  }
+
+  // The default CEO instructions assume the core paperclip skills (board
+  // coordination, planning, hiring, memory). Union them into every
+  // skills-capable CEO hire/create so a fresh CEO never starts with an empty
+  // desired-skill set that contradicts its own instructions. Optional role
+  // skills remain removable afterwards. Legacy adapters separately guarantee
+  // the Paperclip operational skill as a runtime invariant.
+  function defaultRoleSkillSelections(
+    role: string | null | undefined,
+    adapterType: string,
+  ): AgentDesiredSkillEntry[] | undefined {
+    if (role !== "ceo") return undefined;
+    const adapter = findActiveServerAdapter(adapterType);
+    if (!adapter?.listSkills && !adapter?.syncSkills) return undefined;
+    return PAPERCLIP_CORE_SKILL_KEYS.map((key) => ({ key, versionId: null }));
+  }
+
+  function withDefaultRoleSkillSelections(
+    requested: AgentDesiredSkillEntry[] | undefined,
+    defaults: AgentDesiredSkillEntry[] | undefined,
+  ): AgentDesiredSkillEntry[] | undefined {
+    if (!defaults) return requested;
+    if (!requested) return defaults;
+    const merged = new Map(defaults.map((entry) => [entry.key, entry]));
+    // An explicit request wins over a default for the same key (version pins).
+    for (const entry of requested) merged.set(entry.key, entry);
+    return Array.from(merged.values());
   }
 
   function normalizeDesiredSkillSelections(
@@ -4750,6 +4804,9 @@ export function agentRoutes(
             : assertSelectableAdapterType(next);
         })()
       : existing.adapterType;
+    const requestedAdapterType = nextAdapterType === existing.adapterType
+      ? nextAdapterType
+      : await assertSelectableAdapterType(nextAdapterType);
     let requestedRuntimeConfig: Record<string, unknown> | null = null;
     if (hasOwn(patchData, "runtimeConfig")) {
       const runtimeConfig = asRecord(patchData.runtimeConfig);
@@ -4953,12 +5010,12 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    await assertCanResumeAgent(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error:
@@ -4973,10 +5030,14 @@ export function agentRoutes(
       return;
     }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
@@ -5695,9 +5756,6 @@ export function agentRoutes(
   // Each route writes its full path as a plain string literal, so the static
   // OpenAPI coverage test can read the path from the source text.
 
-  // The company-and-environment login serves only the Claude adapter.
-  const CLAUDE_SETUP_TOKEN_ADAPTER_TYPE = "claude_local";
-
   // Maps the internal session state to the public login status. The public union
   // carries no server-only state, so the route never returns the internal
   // `submitting` or `stored` state to a client.
@@ -5757,7 +5815,7 @@ export function agentRoutes(
   const companySetupTokenKey = (companyId: string, ownerUserId: string) => ({
     companyId,
     ownerUserId,
-    adapterType: CLAUDE_SETUP_TOKEN_ADAPTER_TYPE,
+    adapterType: SETUP_TOKEN_ADAPTER_TYPE,
   });
 
   // The stored Claude OAuth token status read. It returns

@@ -10,6 +10,7 @@ describe("instance settings service", () => {
   it("ignores retired experimental flags without resetting current settings", () => {
     expect(normalizeExperimentalSettings({
       enableEnvironments: true,
+      enableNativeRunner: false,
       enableManagedSandboxOnly: false,
       enableIsolatedWorkspaces: true,
       enableIssuePlanDecompositions: true,

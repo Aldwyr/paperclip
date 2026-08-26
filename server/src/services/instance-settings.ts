@@ -220,6 +220,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     return {
       enableNativeRunner: parsed.data.enableNativeRunner ?? false,
       enableEnvironments: parsed.data.enableEnvironments ?? false,
+      enableNativeRunner: parsed.data.enableNativeRunner ?? false,
       enableManagedSandboxOnly: parsed.data.enableManagedSandboxOnly ?? false,
       enableIsolatedWorkspaces: parsed.data.enableIsolatedWorkspaces ?? false,
       enableStreamlinedLeftNavigation: parsed.data.enableStreamlinedLeftNavigation ?? true,
@@ -259,6 +260,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
   return {
     enableNativeRunner: false,
     enableEnvironments: false,
+    enableNativeRunner: false,
     enableManagedSandboxOnly: false,
     enableIsolatedWorkspaces: false,
     enableStreamlinedLeftNavigation: true,
