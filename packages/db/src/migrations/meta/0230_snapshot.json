@@ -1,5 +1,5 @@
 {
-  "id": "4f8714a4-6c05-4529-bc3b-3e9b9a7d9a7a",
+  "id": "95421132-c60b-4998-836a-ce2f877487e6",
   "prevId": "a67f8798-79bc-4628-8245-3b2b632233ce",
   "version": "7",
   "dialect": "postgresql",
@@ -9453,13 +9453,6 @@
         },
         "attempt_count": {
           "name": "attempt_count",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "error_count": {
-          "name": "error_count",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
@@ -21175,6 +21168,13 @@
         },
         "attempt_count": {
           "name": "attempt_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "error_count": {
+          "name": "error_count",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
