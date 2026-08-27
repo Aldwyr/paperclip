@@ -44,6 +44,28 @@ export async function revokeRunScopedCredential(
     .onConflictDoNothing();
 }
 
+// The context-snapshot marker a caller sets on a `heartbeat_runs` row when a
+// duplex-channel-loss teardown could not durably revoke the run's credential.
+// A run that carries this marker must not reach a terminal status until a
+// later attempt clears it by durably writing the revocation row: see
+// `isRunCredentialRevocationPending` and its callers in the heartbeat and
+// recovery services.
+export const RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY = "runCredentialRevocationPending";
+
+/**
+ * True when a run's context snapshot carries the pending-revocation marker.
+ * A caller that is about to force a terminal status on a "running" or
+ * "queued" run must check this first, and must retry the durable write
+ * before it lets the terminal status land.
+ */
+export function isRunCredentialRevocationPending(contextSnapshot: unknown): boolean {
+  return (
+    typeof contextSnapshot === "object" &&
+    contextSnapshot !== null &&
+    (contextSnapshot as Record<string, unknown>)[RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY] === true
+  );
+}
+
 /**
  * True when the run-scoped credential for `companyId`/`runId` was durably
  * revoked. Fails closed: a lookup fault is reported as revoked, so a caller

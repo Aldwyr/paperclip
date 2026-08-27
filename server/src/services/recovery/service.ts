@@ -43,6 +43,11 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
+  isRunCredentialRevocationPending,
+  revokeRunScopedCredential,
+  RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY,
+} from "../run-credential-revocation.js";
+import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -5601,6 +5606,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // Neither authority applies. The run is still live, so leave it alone.
     if (!issueTerminalStatus && !processGone) {
       return { terminalized: false, status: run.status };
+    }
+
+    // A run whose duplex-loss teardown could not durably revoke its credential
+    // carries the pending marker. This sweep runs on a recurring timer, so it
+    // is the host-owned retry path for a database fault that outlasts the
+    // lease-release backstop's single retry: it retries the same durable
+    // write here, before it forces a terminal status. A write fault here
+    // still must not let the terminal status land: leave the run running and
+    // let the next sweep retry again.
+    if (isRunCredentialRevocationPending(run.contextSnapshot)) {
+      try {
+        await revokeRunScopedCredential(db, { companyId: run.companyId, runId: run.id });
+      } catch (revocationErr) {
+        logger.error(
+          { err: revocationErr, runId: run.id, companyId: run.companyId },
+          "run-scoped credential revocation write still fails in the stale-run sweep; leaving the run open for the next sweep instead of finalizing without a durable revocation",
+        );
+        return { terminalized: false, status: run.status };
+      }
+      const clearedContext = {
+        ...parseObject(run.contextSnapshot),
+        [RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY]: false,
+      };
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: clearedContext, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id))
+        .catch((markErr) => {
+          logger.error(
+            { err: markErr, runId: run.id },
+            "failed to clear the pending run-credential revocation marker after a durable write landed",
+          );
+        });
+      run = { ...run, contextSnapshot: clearedContext };
     }
 
     const authority = issueTerminalStatus ? "issue_terminal" : "process_gone";
