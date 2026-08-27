@@ -1666,7 +1666,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const desiredIdentity = this.options.prpIdentity;
     if (
       desiredIdentity === undefined ||
-      !existsSync(resolve(this.#root, "runner", "runner-state.json"))
+      (this.options.readRunnerState === undefined &&
+        !existsSync(resolve(this.#root, "runner", "runner-state.json")))
     ) {
       throw new Error("PRP provider resume state is unavailable");
     }

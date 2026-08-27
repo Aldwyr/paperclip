@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -993,8 +993,27 @@ it("cold-restores a suspended provider session under a new run binding", async (
     await first.transport.close();
   }
 
+  // A remote process owner keeps runner-state outside the controller's local
+  // session root. Resume must defer to its explicit state reader instead of
+  // rejecting recovery before the remote checkpoint can be made available.
+  const externallyOwnedRunnerStateDirectory = join(
+    stateDirectory,
+    "externally-owned-runner",
+  );
+  await rename(
+    join(stateDirectory, "runner"),
+    externallyOwnedRunnerStateDirectory,
+  );
   const restored = createCapabilityRunnerdCodexTransport({
     ...options,
+    runnerStateDirectory: externallyOwnedRunnerStateDirectory,
+    readRunnerState: async () =>
+      JSON.parse(
+        await readFile(
+          join(externallyOwnedRunnerStateDirectory, "runner-state.json"),
+          "utf8",
+        ),
+      ) as Record<string, unknown>,
     resumeDynamicTools: dynamicTools,
     prpIdentity: {
       ...baseIdentity,
@@ -1014,7 +1033,7 @@ it("cold-restores a suspended provider session under a new run binding", async (
     expect((await stat(join(stateDirectory, "codex-home", "skills", "assigned", "SKILL.md"))).mode & 0o222).toBe(0);
     const durable = JSON.parse(
       await readFile(
-        join(stateDirectory, "runner", "runner-state.json"),
+        join(externallyOwnedRunnerStateDirectory, "runner-state.json"),
         "utf8",
       ),
     ) as { providerToolBridge?: { authorized?: Record<string, unknown> } };
