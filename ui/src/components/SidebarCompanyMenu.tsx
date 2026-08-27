@@ -60,7 +60,6 @@ function WorkspaceIcon({ company }: { company: Company }) {
     <CompanyPatternIcon
       companyName={company.name}
       logoUrl={company.logoUrl}
-      brandColor={company.brandColor}
       className={WORKSPACE_ICON_CLASS}
     />
   );
@@ -92,7 +91,6 @@ function CurrentStackIcon({
     <CompanyPatternIcon
       companyName={displayName}
       logoUrl={company?.logoUrl}
-      brandColor={company?.brandColor}
       className={WORKSPACE_ICON_CLASS}
     />
   );
