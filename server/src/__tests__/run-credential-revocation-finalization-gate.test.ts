@@ -115,7 +115,7 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
     return app;
   }
 
-  async function seedPendingRevocationRun() {
+  async function seedRunningRun(prefix: string) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -123,7 +123,7 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
-      issuePrefix: `G${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      issuePrefix: `${prefix}${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
@@ -137,10 +137,6 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
       runtimeConfig: {},
       permissions: {},
     });
-    // The run stands in for one whose duplex control channel was lost: its
-    // teardown already tried and failed to durably revoke the run-scoped
-    // credential, so its context snapshot carries the pending marker the
-    // finalization gate checks before it lets a terminal status land.
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
@@ -148,7 +144,7 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
       status: "running",
       invocationSource: "assignment",
       startedAt: new Date(),
-      contextSnapshot: { runCredentialRevocationPending: true },
+      contextSnapshot: {},
     });
 
     const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-1");
@@ -169,12 +165,13 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
     releaseRunLeases: async () => [],
   } as unknown as HeartbeatEnvironmentRuntime;
 
-  it("holds the run open through a revocation-write failure, then finalizes once a retry lands the row and rejects the live token", async () => {
-    const { companyId, runId, token } = await seedPendingRevocationRun();
+  it("holds a running run open through a revocation-write failure, then finalizes once a retry lands the row and rejects the live token", async () => {
+    const { companyId, runId, token } = await seedRunningRun("G");
 
-    // The first durable revocation insert fails, the way a transient database
-    // fault would. The finalization gate must not let a terminal status land
-    // without the revocation row.
+    // Drive the real finalization backstop, not a seeded marker. The first
+    // durable revocation insert fails, the way a transient database fault
+    // would. The gate must not let a terminal status land without the
+    // revocation row.
     const faultyDb = withFailingRevocationInsert(db, 1);
     const heartbeatWithFaultyDb = heartbeatService(faultyDb, { environmentRuntime: fakeEnvironmentRuntime });
 
@@ -216,43 +213,21 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
     expect(rejectedAfterRecovery.body.error).toContain("revoked");
   });
 
-  it("does not touch the revocation table for a run with no pending marker", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const runId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "running",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId,
-      status: "running",
-      invocationSource: "assignment",
-      startedAt: new Date(),
-      contextSnapshot: {},
-    });
+  it("does not write a revocation row for a run that already reached a terminal status on the normal path", async () => {
+    // A healthy run finalizes through the primary path and never reaches this
+    // backstop while still "running" or "queued". Seed the row already
+    // terminal, the way the normal path leaves it, and prove the backstop
+    // makes no revocation write for it.
+    const { companyId, runId } = await seedRunningRun("H");
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
 
     const heartbeat = heartbeatService(db, { environmentRuntime: fakeEnvironmentRuntime });
     const result = await heartbeat.terminalizeRunOnLeaseRelease(await runRow(runId));
 
-    // A run that never lost its duplex channel finalizes exactly as before:
-    // the gate is a no-op when the pending marker is absent.
-    expect(result.status).toBe("interrupted");
+    expect(result.status).toBe("succeeded");
     expect(await isRunScopedCredentialRevoked(db, { companyId, runId })).toBe(false);
   });
 });

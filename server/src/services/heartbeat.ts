@@ -122,9 +122,8 @@ import {
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
-  isRunCredentialRevocationPending,
+  confirmRunScopedCredentialRevoked,
   revokeRunScopedCredential,
-  RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY,
 } from "./run-credential-revocation.js";
 import {
   classifyRunLiveness,
@@ -9101,38 +9100,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (isHeartbeatRunTerminalStatus(run.status)) return run;
     if (run.status !== "running" && run.status !== "queued") return run;
 
-    // A run whose duplex-loss teardown could not durably revoke its credential
-    // carries the pending marker set above. This backstop is the last point
-    // before a terminal status lands, so it retries the same durable write
-    // here. A write fault here still must not let the terminal status land:
-    // leave the run running and let a later pass (the next environment-lease
-    // release, or the stale-run recovery sweep) retry again.
-    if (isRunCredentialRevocationPending(run.contextSnapshot)) {
-      try {
-        await revokeRunScopedCredential(db, { companyId: run.companyId, runId: run.id });
-      } catch (revocationErr) {
-        logger.error(
-          { err: revocationErr, runId: run.id, companyId: run.companyId },
-          "run-scoped credential revocation write still fails at lease release; leaving the run open for a later retry instead of finalizing without a durable revocation",
-        );
-        return run;
-      }
-      const clearedContext = {
-        ...parseObject(run.contextSnapshot),
-        [RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY]: false,
-      };
-      await db
-        .update(heartbeatRuns)
-        .set({ contextSnapshot: clearedContext, updatedAt: new Date() })
-        .where(eq(heartbeatRuns.id, run.id))
-        .catch((markErr) => {
-          logger.error(
-            { err: markErr, runId: run.id },
-            "failed to clear the pending run-credential revocation marker after a durable write landed",
-          );
-        });
-      run = { ...run, contextSnapshot: clearedContext };
-    }
+    // A run reaches this backstop only when the primary finalization path
+    // never ran to completion for it. If its teardown lost the duplex control
+    // channel, that path already tried to durably revoke the run-scoped
+    // credential. Confirm it here before the terminal status lands: the
+    // insert is idempotent (unique index on company_id/run_id), so a repeat
+    // call for an already-revoked run is a safe no-op, and this call durably
+    // revokes a run that never got the chance. A write fault here still must
+    // not let the terminal status land: leave the run running and let a
+    // later pass (the next environment-lease release, or the stale-run
+    // recovery sweep) retry again.
+    const revoked = await confirmRunScopedCredentialRevoked(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      context: "at lease release",
+    });
+    if (!revoked) return run;
 
     // Choose the terminal status that reflects the true outcome. When the issue
     // already reached a terminal status, the run reached its goal, so use the
@@ -16608,32 +16591,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // here, before the run can reach a terminal status. The insert is
       // idempotent (unique index on company_id/run_id), so retrying an
       // already-durable write is a safe no-op. A write fault here must not
-      // let a terminal state land without the revocation row: mark the run
-      // pending and return without finalizing. The environment-lease-release
-      // backstop below retries the same write before it forces a terminal
-      // status, so a later pass still closes this run out once the database
-      // recovers.
+      // let a terminal state land without the revocation row: return without
+      // finalizing. This run then stays "running" or "queued", so the
+      // environment-lease-release backstop and the stale-run recovery sweep
+      // each retry the same write, unconditionally, before they force a
+      // terminal status. A later pass still closes this run out once the
+      // database recovers.
       if (adapterResult.errorCode === DUPLEX_CHANNEL_LOST_ERROR_CODE) {
-        try {
-          await revokeRunScopedCredential(db, { companyId: agent.companyId, runId: run.id });
-        } catch (revocationErr) {
-          logger.error(
-            { err: revocationErr, runId: run.id, companyId: agent.companyId },
-            "run-scoped credential revocation write failed while finalizing a duplex-channel-lost run; holding the run open for a retry instead of finalizing without a durable revocation",
-          );
-          context[RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY] = true;
-          await db
-            .update(heartbeatRuns)
-            .set({ contextSnapshot: context, updatedAt: new Date() })
-            .where(eq(heartbeatRuns.id, run.id))
-            .catch((markErr) => {
-              logger.error(
-                { err: markErr, runId: run.id },
-                "failed to record the pending run-credential revocation marker",
-              );
-            });
-          return;
-        }
+        const revoked = await confirmRunScopedCredentialRevoked(db, {
+          companyId: agent.companyId,
+          runId: run.id,
+          context: "while finalizing a duplex-channel-lost run",
+        });
+        if (!revoked) return;
       }
 
       const persistedRunWrite = await setRunStatusIfRunning(run.id, status, {

@@ -44,26 +44,28 @@ export async function revokeRunScopedCredential(
     .onConflictDoNothing();
 }
 
-// The context-snapshot marker a caller sets on a `heartbeat_runs` row when a
-// duplex-channel-loss teardown could not durably revoke the run's credential.
-// A run that carries this marker must not reach a terminal status until a
-// later attempt clears it by durably writing the revocation row: see
-// `isRunCredentialRevocationPending` and its callers in the heartbeat and
-// recovery services.
-export const RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY = "runCredentialRevocationPending";
-
 /**
- * True when a run's context snapshot carries the pending-revocation marker.
- * A caller that is about to force a terminal status on a "running" or
- * "queued" run must check this first, and must retry the durable write
- * before it lets the terminal status land.
+ * The shared gate every caller uses before it forces a terminal status on a
+ * "running" or "queued" run. It attempts the durable revocation write and
+ * reports whether the row landed. Returns `true` on success, including when
+ * the row already existed (the insert is idempotent). Returns `false` on a
+ * write fault and logs it; the caller must then leave the run open instead
+ * of finalizing without a durable revocation row.
  */
-export function isRunCredentialRevocationPending(contextSnapshot: unknown): boolean {
-  return (
-    typeof contextSnapshot === "object" &&
-    contextSnapshot !== null &&
-    (contextSnapshot as Record<string, unknown>)[RUN_CREDENTIAL_REVOCATION_PENDING_CONTEXT_KEY] === true
-  );
+export async function confirmRunScopedCredentialRevoked(
+  db: Db,
+  input: { companyId: string; runId: string; context: string },
+): Promise<boolean> {
+  try {
+    await revokeRunScopedCredential(db, input);
+    return true;
+  } catch (err) {
+    logger.error(
+      { err, companyId: input.companyId, runId: input.runId },
+      `run-scoped credential revocation write failed ${input.context}; the run must stay open for a retry instead of finalizing without a durable revocation`,
+    );
+    return false;
+  }
 }
 
 /**
