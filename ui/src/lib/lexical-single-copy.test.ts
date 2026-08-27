@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, parse } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -25,7 +26,7 @@ describe("lexical single copy", () => {
   const requireFromMdxEditor = createRequire(mdxEditorEntry);
 
   /** These packages block "./package.json" in exports, so read it off disk. */
-  function manifestOf(specifier: string, from: NodeJS.Require): { version: string; dependencies?: Record<string, string> } {
+  function manifestOf(specifier: string, from: NodeJS.Require): { version: string } {
     let dir = dirname(from.resolve(specifier));
     const { root } = parse(dir);
     while (true) {
@@ -42,6 +43,38 @@ describe("lexical single copy", () => {
     return manifestOf(specifier, from).version;
   }
 
+  /** Walks up from this file to the pnpm workspace root. */
+  function workspaceRoot(): string {
+    let dir = dirname(fileURLToPath(import.meta.url));
+    const { root } = parse(dir);
+    while (!existsSync(join(dir, "pnpm-workspace.yaml"))) {
+      if (dir === root) throw new Error("could not find the pnpm workspace root");
+      dir = dirname(dir);
+    }
+    return dir;
+  }
+
+  it("keeps the Lexical family out of pnpm.overrides", () => {
+    // An override outranks the range `@mdxeditor/editor` declares, so pnpm
+    // stops guaranteeing that the editor gets a version it supports. It also
+    // pins only the packages it names: `@lexical/extension` was reached
+    // transitively, never appeared in the list, and stayed a minor behind
+    // while the listed packages moved forward. That is what split the graph.
+    //
+    // With no override, pnpm honours every declared range, and the copy
+    // checks below confirm the app and the editor landed on the same one.
+    const manifest = JSON.parse(readFileSync(join(workspaceRoot(), "package.json"), "utf8"));
+    const overrides: Record<string, string> = manifest.pnpm?.overrides ?? {};
+    const forced = Object.keys(overrides).filter(
+      (name) => name === "lexical" || name.startsWith("@lexical/"),
+    );
+    expect(
+      forced,
+      "Pin Lexical through ui/package.json instead. An override cannot cover the "
+        + "packages it does not name, and it hides the range @mdxeditor/editor declares.",
+    ).toEqual([]);
+  });
+
   it("resolves the same lexical copy for the app and the editor", () => {
     expect(requireFromMdxEditor.resolve("lexical")).toBe(requireFromUi.resolve("lexical"));
   });
@@ -51,16 +84,13 @@ describe("lexical single copy", () => {
     // @lexical/link carries the mention-aware LinkNode the app subclasses, so
     // a version split here breaks node identity even with one core copy.
     expect(versionOf("@lexical/link", requireFromUi)).toBe(core);
+    // pnpm resolved this copy from the range @mdxeditor/editor declares, and
+    // the assertion above rules out an override bypassing that range. So an
+    // equal version here also proves the app sits on a line the editor
+    // supports, without this test having to parse a semver range itself.
     expect(versionOf("lexical", requireFromMdxEditor)).toBe(core);
     // @lexical/extension owns the LexicalBuilder invariant that throws on a
     // mixed graph, and it is reached transitively rather than declared.
     expect(versionOf("@lexical/extension", requireFromMdxEditor)).toBe(core);
-  });
-
-  it("satisfies the editor's declared lexical range", () => {
-    const declared = manifestOf("@mdxeditor/editor", requireFromUi).dependencies?.lexical;
-    const [major, minor] = versionOf("lexical", requireFromUi).split(".");
-    // A caret range on a 0.x version pins the minor: ^0.48.0 means <0.49.0.
-    expect(declared).toBe(`^${major}.${minor}.0`);
   });
 });
