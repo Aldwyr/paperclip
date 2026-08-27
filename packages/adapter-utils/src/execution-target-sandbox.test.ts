@@ -58,7 +58,7 @@ import {
   decodeDuplexLine,
   encodeDuplexFrame,
 } from "./duplex-frame-codec.js";
-import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "./bridge-transport-contract.js";
+import { DEFAULT_DUPLEX_BROKER_BUDGETS, DUPLEX_CHANNEL_LOST_ERROR_CODE } from "./bridge-transport-contract.js";
 import {
   configureHttp2BridgeAdmissionGate,
   getHttp2BridgeAdmissionGate,
@@ -5382,10 +5382,11 @@ describe("sandbox adapter execution targets", () => {
       effectiveCapabilities: duplexCapabilities(true),
     };
 
-    // A forward budget past the default response budget (32 s). The http2 path
-    // holds no nested-budget derivation (that budget set belonged to the retired
-    // duplex_v1 broker only), so a large forward budget must still select and
-    // serve normally.
+    // A forward budget past the default response budget (32 s). The host's
+    // own forward call may run for up to this whole budget, so the gateway's
+    // own response wait must carry headroom above it — otherwise the gateway
+    // gives up on a still-valid host response before it arrives.
+    const forwardTimeoutMs = 60_000;
     const bridge = await startAdapterExecutionTargetPaperclipBridge({
       runId: "run-budget",
       target,
@@ -5394,10 +5395,17 @@ describe("sandbox adapter execution targets", () => {
       hostApiToken: "real-run-jwt",
       hostApiUrl: api.origin,
       enableSandboxDuplexBridge: true,
-      forwardTimeoutMs: 60_000,
+      forwardTimeoutMs,
     });
     try {
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      // The gateway response wait carries the same headroom over the forward
+      // budget that `DEFAULT_DUPLEX_BROKER_BUDGETS` reserves between
+      // `forwardTimeoutMs` and `gatewayWaitMs`, so it scales with a custom
+      // forward budget instead of staying pinned at the 30 s default.
+      const expectedHeadroomMs =
+        DEFAULT_DUPLEX_BROKER_BUDGETS.gatewayWaitMs - DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
+      expect(bridge?.env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS).toBe(String(forwardTimeoutMs + expectedHeadroomMs));
       await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
       const response = await http2TestRequest(sessionRef.current!, {
         method: "GET",
@@ -5409,6 +5417,118 @@ describe("sandbox adapter execution targets", () => {
       sessionRef.current?.close();
       await bridge?.stop();
       await api.close();
+    }
+  }, 20000);
+
+  it("gives the in-sandbox http2 gateway response wait headroom over the default forward budget", async () => {
+    // With no forward-budget override, the gateway wait must still carry
+    // headroom above the default 30 s forward budget, not collapse to the
+    // same value. A response that lands right at the forward deadline needs
+    // this gap to cross back over the stream before the gateway gives up.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-default-budget-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      ctx.emitReady();
+      ctx.connectHttp2();
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-default-budget",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      const responseTimeoutMs = Number(bridge?.env.PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS);
+      expect(Number.isFinite(responseTimeoutMs)).toBe(true);
+      expect(responseTimeoutMs).toBeGreaterThan(DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs);
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
+  it("delivers a host response that lands right before the forward deadline", async () => {
+    // The host response completes near, but under, the forward deadline. The
+    // gateway must still deliver it: the headroom on its own wait, not the
+    // forward budget itself, is what this test proves.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-near-deadline-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const forwardTimeoutMs = 300;
+    const nearDeadlineDelayMs = forwardTimeoutMs - 50;
+    const api = createServer((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      }, nearDeadlineDelayMs);
+    });
+    await new Promise<void>((resolve, reject) => {
+      api.once("error", reject);
+      api.listen(0, "127.0.0.1", () => resolve());
+    });
+    const apiAddress = api.address();
+    if (!apiAddress || typeof apiAddress === "string") {
+      throw new Error("Expected the near-deadline API server to listen on a TCP port.");
+    }
+    const sessionRef: { current: http2.ClientHttp2Session | null } = { current: null };
+    let bridgeToken = "";
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      bridgeToken = ctx.bridgeToken;
+      ctx.emitReady();
+      sessionRef.current = ctx.connectHttp2();
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-near-deadline",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: `http://127.0.0.1:${apiAddress.port}`,
+      enableSandboxDuplexBridge: true,
+      forwardTimeoutMs,
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
+      const response = await http2TestRequest(sessionRef.current!, {
+        method: "GET",
+        path: "/api/agents/me",
+        headers: { authorization: `Bearer ${bridgeToken}` },
+      });
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({ ok: true });
+    } finally {
+      sessionRef.current?.close();
+      await bridge?.stop();
+      await new Promise<void>((resolve) => api.close(() => resolve()));
     }
   }, 20000);
 

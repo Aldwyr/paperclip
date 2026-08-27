@@ -4219,6 +4219,18 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // forward budget (30 s) when the caller sets no option, so current behavior
   // does not change.
   const forwardTimeoutMs = input.forwardTimeoutMs ?? DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs;
+  // The in-sandbox HTTP/2 gateway's own wait for one response frame, passed
+  // through `PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS` below. It must stay above
+  // `forwardTimeoutMs`: the host bounds its own forward call at that budget,
+  // so a host response that lands right at that deadline still needs time to
+  // cross back over the stream before the gateway gives up. This mirrors the
+  // gap `DEFAULT_DUPLEX_BROKER_BUDGETS` already reserves between its
+  // `forwardTimeoutMs` (30 s) and `gatewayWaitMs` (35 s) entries. The result
+  // stays finite; the gateway never waits forever after the settings
+  // handshake.
+  const http2GatewayResponseTimeoutMs =
+    forwardTimeoutMs +
+    (DEFAULT_DUPLEX_BROKER_BUDGETS.gatewayWaitMs - DEFAULT_DUPLEX_BROKER_BUDGETS.forwardTimeoutMs);
 
   const runtimeRootDir =
     input.runtimeRootDir?.trim().length
@@ -4731,6 +4743,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
                 PAPERCLIP_API_URL: sandboxOrigin,
                 PAPERCLIP_API_KEY: bridgeToken,
                 PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+                // Without this, the generated gateway falls back to its own
+                // default wait, which equals the host's default forward
+                // budget and gives a near-deadline response no headroom to
+                // cross back over the stream before the gateway gives up.
+                PAPERCLIP_BRIDGE_RESPONSE_TIMEOUT_MS: String(http2GatewayResponseTimeoutMs),
               },
               runLogTail: duplexRunLogTail,
               readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
