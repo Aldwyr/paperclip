@@ -2479,31 +2479,104 @@ function nextProbeFileName() {
 // change-time copy. Creating and removing a file inside a directory changes
 // that directory's OWN change time but never its true creation time, so a
 // birthtimeMs that moves across the probe is a change-time copy. Returns
-// false both on a detected copy and on a probe that cannot run at all (for
-// example a permission error): either way the caller must not trust the
-// value.
+// null when the value is proven real. Returns a stderr-ready reason string
+// on any failure (a detected copy, or a probe that cannot run at all, for
+// example a permission error or a pre-created probe path): either way the
+// caller must not trust the value.
+//
+// The open uses the "wx" flag: exclusive create, fail if the path exists.
+// A sandbox peer cannot pre-create the probe path as a symbolic link and
+// have this call follow it, because "wx" fails closed on an existing path
+// instead of following a link to it.
+//
+// Cleanup checks identity, not only ownership of the initial create. This
+// wrapper reads the probe file's identity, (dev, ino, ctimeMs), off the open
+// file descriptor itself (fstat), not off the path, so a peer that swaps the
+// path in the short gap after create cannot poison the identity this
+// wrapper trusts as its own. Right before removal, this wrapper reads the
+// path's identity again and removes it only when that identity still
+// matches. A same-sandbox peer that deletes the probe file and creates its
+// own entry at the same path in between leaves a different identity behind,
+// so this wrapper leaves that entry untouched instead of removing it. This
+// covers a peer's replacement file, a peer's replacement directory, and a
+// peer's replacement symbolic link alike, because all three change the
+// identity this wrapper reads back. The identity check includes ctimeMs,
+// not only (dev, ino): a filesystem can hand this call's freed inode number
+// straight back out to a peer's very next create at the same path, so
+// (dev, ino) alone can match a path this call no longer owns; ctimeMs resets
+// on every create, so a peer's replacement carries a different one even when
+// the inode number repeats. Node's filesystem API has no call that removes a
+// path only when its identity still matches an earlier read as one atomic
+// step, so a gap remains between this wrapper's final identity read and the
+// removal call itself. A peer that wins this gap can put any entry at the
+// probe path before the removal call runs. This can include a pre-existing
+// file the peer renames into place, not only a file the peer creates fresh.
+// The removal call then removes whatever entry sits at the probe path at
+// that moment. Two bounds still hold on that removal. The path always
+// stays under dirPath. If the entry is a symbolic link, the removal call
+// removes the link itself instead of following it to a different target.
+// A non-recursive removal call also fails if the entry is a directory.
 async function birthtimeSurvivesProbe(dirPath) {
   let before;
   try {
     before = (await fs.lstat(dirPath)).birthtimeMs;
   } catch {
-    return false;
+    return "its reported creation time could not be read";
   }
   const probePath = path.posix.join(dirPath, nextProbeFileName());
+  let handle;
   try {
-    await fs.writeFile(probePath, "");
+    handle = await fs.open(probePath, "wx");
   } catch {
-    return false;
+    return "its probe file could not be created exclusively (the path may already exist)";
+  }
+  // fstat on the open handle names the exact inode this call just created.
+  // A path-based lstat here instead would be racy against a peer that swaps
+  // the path in the gap between the create above and the stat: fstat has no
+  // such gap, because a file descriptor keeps naming the inode it opened no
+  // matter what a later swap does to the path.
+  let ownedIdentity = null;
+  try {
+    const createdStats = await handle.stat();
+    // ctimeMs guards against inode reuse; see the function comment above.
+    ownedIdentity = { dev: createdStats.dev, ino: createdStats.ino, ctimeMs: createdStats.ctimeMs };
+  } catch {
+    ownedIdentity = null;
   } finally {
+    await handle.close().catch(() => undefined);
+  }
+  if (!ownedIdentity) {
+    // fstat on this call's own just-opened descriptor failed. This call then
+    // has no verified identity for the probe file it created, so it must not
+    // check or remove that file by path: a peer could already own the entry
+    // at that path, and a path-based removal here could delete the peer's
+    // entry instead of this call's own file. Fail closed right here instead
+    // of falling through to the birthtime comparison below, so a failed
+    // identity read can never let this probe report success.
+    return "its own probe file's identity could not be read from the open file descriptor";
+  }
+  // The one gap the fs API cannot close: this lstat and the removal below
+  // are two separate calls, not one atomic "remove if identity still
+  // matches" step. A peer that wins this narrow gap can put any entry at
+  // the probe path, including a pre-existing file it renames into place,
+  // and the removal call below removes whatever entry is there when it
+  // runs.
+  const currentStats = await fs.lstat(probePath).catch(() => null);
+  const stillOwned =
+    currentStats !== null &&
+    currentStats.dev === ownedIdentity.dev &&
+    currentStats.ino === ownedIdentity.ino &&
+    currentStats.ctimeMs === ownedIdentity.ctimeMs;
+  if (stillOwned) {
     await fs.rm(probePath, { force: true }).catch(() => undefined);
   }
   let after;
   try {
     after = (await fs.lstat(dirPath)).birthtimeMs;
   } catch {
-    return false;
+    return "its reported creation time could not be read";
   }
-  return before === after;
+  return before === after ? null : "its reported creation time changed after a probe write";
 }
 
 async function refuseUnusableCreationTime(label, dirPath, reason) {
@@ -2530,12 +2603,14 @@ async function refuseUnusableCreationTime(label, dirPath, reason) {
 // it, run once here, before either directory's identity is captured.
 async function captureSessionIdentity() {
   try {
-    if (!(await birthtimeSurvivesProbe(sessionDir))) {
-      await refuseUnusableCreationTime("sessionDir", sessionDir, "its reported creation time changed after a probe write");
+    const sessionProbeFailure = await birthtimeSurvivesProbe(sessionDir);
+    if (sessionProbeFailure) {
+      await refuseUnusableCreationTime("sessionDir", sessionDir, sessionProbeFailure);
       return;
     }
-    if (!(await birthtimeSurvivesProbe(stdinDir))) {
-      await refuseUnusableCreationTime("stdinDir", stdinDir, "its reported creation time changed after a probe write");
+    const stdinProbeFailure = await birthtimeSurvivesProbe(stdinDir);
+    if (stdinProbeFailure) {
+      await refuseUnusableCreationTime("stdinDir", stdinDir, stdinProbeFailure);
       return;
     }
     const session = await statPathIdentity(sessionDir);
