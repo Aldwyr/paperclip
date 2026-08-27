@@ -42,9 +42,18 @@ export type RetentionClass = keyof typeof RETENTION_DAYS;
  *   counts (rotations detected). No token material and no PII.
  *   External-system event (Codex CLI) — not yet in PaperclipEventName.
  *   Class: operational_enum_count — 90-day window.
+ *
+ * process.fatal_error
+ *   Emits fatal-crash observability fields: enums (crash source, error
+ *   class), a boolean (matches the known Postgres driver null-socket write
+ *   defect), and the installed Postgres driver version. No error message, no
+ *   stack, no query text, no connection URL, no host name, no database name.
+ *   Not yet in PaperclipEventName.
+ *   Class: operational_enum_count — 90-day window.
  */
 export const EVENT_RETENTION_CLASS: Partial<Record<string, RetentionClass>> = {
   "codex.credential_health": "operational_enum_count",
   "interaction.created": "operational_enum_count",
   "interaction.resolved": "operational_enum_count",
+  "process.fatal_error": "operational_enum_count",
 };

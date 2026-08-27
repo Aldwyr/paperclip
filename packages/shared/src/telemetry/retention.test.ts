@@ -23,4 +23,14 @@ describe("telemetry retention contract", () => {
     expect(EVENT_RETENTION_CLASS["interaction.created"]).toBe("operational_enum_count");
     expect(EVENT_RETENTION_CLASS["interaction.resolved"]).toBe("operational_enum_count");
   });
+
+  it("process.fatal_error is assigned the operational_enum_count class", () => {
+    expect(EVENT_RETENTION_CLASS["process.fatal_error"]).toBe("operational_enum_count");
+  });
+
+  it("process.fatal_error resolves to 90 days", () => {
+    const cls = EVENT_RETENTION_CLASS["process.fatal_error"];
+    expect(cls).toBeDefined();
+    expect(RETENTION_DAYS[cls!]).toBe(90);
+  });
 });

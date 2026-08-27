@@ -5,6 +5,7 @@
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
 import { sentryReady, shutdownSentry, captureException } from "./sentry.js";
+import { registerFatalErrorHandlers } from "./fatal-error-handler.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -166,6 +167,11 @@ export async function startServer(): Promise<StartedServer> {
   ensureDecisionSigningSecret();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
+  // Registered after Sentry and telemetry are ready, so the handler's own
+  // reporting calls have a live client on their first possible invocation.
+  // See fatal-error-handler.ts for why this handler must call
+  // `process.exit(1)` on every path.
+  registerFatalErrorHandlers();
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
   }
