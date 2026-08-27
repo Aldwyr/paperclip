@@ -4829,23 +4829,36 @@ describeEmbeddedPostgres("tool access service", () => {
       toolProfileEntries.profileId,
       callbackProfile!.id,
     ))).resolves.toHaveLength(2);
+    const searchMessagesEntry = completed.catalog.find((entry) => entry.toolName === "search_messages")!;
+    const sendMessageEntry = completed.catalog.find((entry) => entry.toolName === "send_message")!;
     await expect(db.select().from(toolPolicies).where(and(
       eq(toolPolicies.companyId, company.id),
       eq(toolPolicies.enabled, true),
-    ))).resolves.toEqual([]);
+    ))).resolves.toEqual([
+      expect.objectContaining({
+        policyType: "require_approval",
+        selectors: expect.objectContaining({ catalogEntryId: sendMessageEntry.id }),
+      }),
+    ]);
     const callbackPolicy = toolAccessPolicyService(db);
-    for (const entry of completed.catalog) {
-      await expect(callbackPolicy.decide({
-        companyId: company.id,
-        actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
-        request: {
-          connectionId: connected.connectionId,
-          catalogEntryId: entry.id,
-          toolName: entry.toolName,
-          arguments: {},
-        },
-      })).resolves.toMatchObject({ decision: "allow", reasonCode: "allow_profile" });
-    }
+    const decide = (entry: (typeof completed.catalog)[number]) => callbackPolicy.decide({
+      companyId: company.id,
+      actor: { actorType: "agent", actorId: agent.id, agentId: agent.id },
+      request: {
+        connectionId: connected.connectionId,
+        catalogEntryId: entry.id,
+        toolName: entry.toolName,
+        arguments: {},
+      },
+    });
+    await expect(decide(searchMessagesEntry)).resolves.toMatchObject({
+      decision: "allow",
+      reasonCode: "allow_profile",
+    });
+    await expect(decide(sendMessageEntry)).resolves.toMatchObject({
+      decision: "require_approval",
+      reasonCode: "requires_approval_policy",
+    });
     const [personalGrant] = await db.select().from(connectionGrants).where(and(
       eq(connectionGrants.connectionId, connected.connectionId),
       eq(connectionGrants.subjectUserId, userId),
