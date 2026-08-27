@@ -87,6 +87,7 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS } from "./heartbeat.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -1053,6 +1054,45 @@ export async function listUnfinalizedExecutionWorkspaceIds(
   return unfinalized;
 }
 
+/**
+ * Whether a heartbeat run is still live enough to justify holding the
+ * workspace-finalize barrier open for a `done` blocker.
+ *
+ * A run counts as live only when both of these hold:
+ * - It has not reached a terminal state, and its row still exists
+ *   (`heartbeatRunIsTerminalOrMissing` says no on both counts).
+ * - It has been heard from within `WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS`.
+ *   A run that died before it reached `workspace_finalize` leaves its row
+ *   at `status: "running"` forever; without this bound, that stale row
+ *   would hold every dependent issue in `blocked` forever too.
+ */
+async function heartbeatRunIsLive(dbOrTx: Pick<Db, "select">, runId: string): Promise<boolean> {
+  if (await heartbeatRunIsTerminalOrMissing(dbOrTx, runId)) return false;
+  const run = await dbOrTx
+    .select({
+      lastOutputAt: heartbeatRuns.lastOutputAt,
+      startedAt: heartbeatRuns.startedAt,
+      createdAt: heartbeatRuns.createdAt,
+    })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows: Array<{ lastOutputAt: Date | null; startedAt: Date | null; createdAt: Date }>) => rows[0] ?? null);
+  if (!run) return false;
+  const lastActivity = run.lastOutputAt ?? run.startedAt ?? run.createdAt;
+  return Date.now() - lastActivity.getTime() < WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS;
+}
+
+/**
+ * Which `done` blockers still hold their dependent behind the
+ * workspace-finalize barrier.
+ *
+ * A blocker enters the result only when its latest workspace operation is
+ * not a succeeded `workspace_finalize` (and the workspace has recorded no
+ * later successful finalize either) AND the heartbeat run that owns that
+ * operation is still live per `heartbeatRunIsLive`. A blocker whose owning
+ * run ended, vanished, or went stale no longer holds its dependent — the
+ * sync-back it was waiting for can never land.
+ */
 async function listPendingFinalizeBlockerIssueIds(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -1073,6 +1113,7 @@ async function listPendingFinalizeBlockerIssueIds(
       phase: workspaceOperations.phase,
       status: workspaceOperations.status,
       startedAt: workspaceOperations.startedAt,
+      heartbeatRunId: workspaceOperations.heartbeatRunId,
     })
     .from(workspaceOperations)
     .where(
@@ -1082,8 +1123,9 @@ async function listPendingFinalizeBlockerIssueIds(
       ),
     );
 
-  const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
-  const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
+  type LatestOp = { phase: string; status: string; startedAt: Date; heartbeatRunId: string | null };
+  const latestAttributedByBlockerWorkspace = new Map<string, LatestOp>();
+  const latestUnattributedByWorkspace = new Map<string, LatestOp>();
   const latestSuccessfulFinalizeByWorkspace = new Map<string, Date>();
   for (const row of rows) {
     if (!row.executionWorkspaceId) continue;
@@ -1102,6 +1144,7 @@ async function listPendingFinalizeBlockerIssueIds(
           phase: row.phase,
           status: row.status,
           startedAt: row.startedAt,
+          heartbeatRunId: row.heartbeatRunId,
         });
       }
       continue;
@@ -1113,10 +1156,16 @@ async function listPendingFinalizeBlockerIssueIds(
         phase: row.phase,
         status: row.status,
         startedAt: row.startedAt,
+        heartbeatRunId: row.heartbeatRunId,
       });
     }
   }
 
+  // Blockers whose latest workspace op is not a succeeded workspace_finalize,
+  // and whose workspace recorded no later successful finalize either. These
+  // are candidates for the barrier; the loop below decides which ones still
+  // have a live run backing that unfinished op.
+  const candidatesByBlocker = new Map<string, LatestOp>();
   for (const pair of blockerWorkspacePairs) {
     const latest = latestAttributedByBlockerWorkspace.get(`${pair.blockerIssueId}:${pair.executionWorkspaceId}`)
       ?? latestUnattributedByWorkspace.get(pair.executionWorkspaceId);
@@ -1124,7 +1173,31 @@ async function listPendingFinalizeBlockerIssueIds(
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
     const laterSuccessfulFinalize = latestSuccessfulFinalizeByWorkspace.get(pair.executionWorkspaceId);
     if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt) continue;
-    pending.add(pair.blockerIssueId);
+    candidatesByBlocker.set(pair.blockerIssueId, latest);
+  }
+  if (candidatesByBlocker.size === 0) return pending;
+
+  const runLivenessCache = new Map<string, Promise<boolean>>();
+  const cachedHeartbeatRunIsLive = (runId: string): Promise<boolean> => {
+    let cached = runLivenessCache.get(runId);
+    if (!cached) {
+      cached = heartbeatRunIsLive(dbOrTx, runId);
+      runLivenessCache.set(runId, cached);
+    }
+    return cached;
+  };
+
+  for (const [blockerIssueId, latest] of candidatesByBlocker) {
+    if (!latest.heartbeatRunId) {
+      // No run attributed to the unfinished op: there is nothing to check
+      // liveness against, so keep the barrier — over-serializing is the
+      // safe direction here, same as the shared-workspace holder check.
+      pending.add(blockerIssueId);
+      continue;
+    }
+    if (await cachedHeartbeatRunIsLive(latest.heartbeatRunId)) {
+      pending.add(blockerIssueId);
+    }
   }
 
   return pending;

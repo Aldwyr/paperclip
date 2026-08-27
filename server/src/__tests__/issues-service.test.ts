@@ -42,6 +42,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../services/execution-workspace-policy.ts";
+import { WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS } from "../services/heartbeat.ts";
 import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH, type IssueWorkMode } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -3753,6 +3754,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(workspaceOperations);
+    await db.delete(heartbeatRuns);
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
@@ -4360,6 +4362,103 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       isDependencyReady: true,
       pendingFinalizeBlockerIssueIds: [],
     });
+  });
+
+  it("lifts the workspace-finalize barrier once the blocker's run has gone stale past the liveness threshold", async () => {
+    const {
+      companyId,
+      assigneeAgentId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+    } = await seedSharedWorkspaceDependency();
+
+    const staleRunId = randomUUID();
+    const staleActivityAt = new Date(Date.now() - WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS - 60_000);
+    await db.insert(heartbeatRuns).values({
+      id: staleRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      startedAt: staleActivityAt,
+      finishedAt: null,
+      exitCode: null,
+      errorCode: null,
+      livenessState: null,
+      lastOutputAt: null,
+      createdAt: staleActivityAt,
+      updatedAt: staleActivityAt,
+    });
+
+    // The run died before it recorded a workspace_finalize. Its row is stuck
+    // at status "running" with no further activity past the liveness bar.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      heartbeatRunId: staleRunId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: staleActivityAt,
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
+  it("keeps the workspace-finalize barrier while the blocker's run is live and recently active", async () => {
+    const {
+      companyId,
+      assigneeAgentId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+    } = await seedSharedWorkspaceDependency();
+
+    const liveRunId = randomUUID();
+    const recentActivityAt = new Date(Date.now() - 60_000);
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+      startedAt: recentActivityAt,
+      finishedAt: null,
+      exitCode: null,
+      errorCode: null,
+      livenessState: null,
+      lastOutputAt: recentActivityAt,
+      createdAt: recentActivityAt,
+      updatedAt: recentActivityAt,
+    });
+
+    // The run is still live and has not yet recorded a workspace_finalize —
+    // the dependent must stay blocked while sync-back is still possible.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      heartbeatRunId: liveRunId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt: recentActivityAt,
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+      unresolvedBlockerIssueIds: [blockerId],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([]);
   });
 
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
