@@ -182,15 +182,29 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE_TAG@$digest" >/dev/null
           immutable="${IMAGE_TAG%:*}@$digest"
+          # The Daytona base image is large. The build cache plus a second full
+          # anonymous pull can exhaust a standard GitHub-hosted runner before
+          # Docker creates the tiny metadata-probe container. The pushed digest
+          # is already immutable, so release the local builder/cache first.
+          docker buildx prune --all --force >/dev/null
+          docker system prune --all --force >/dev/null
           anonymous_config="$(mktemp -d)"
           docker --config "$anonymous_config" pull "$immutable"
-          metadata="$(docker run --rm --platform linux/amd64 --entrypoint paperclip-runnerd "$immutable" --build-metadata)"
-          grep -q '"binaryContractVersion":2' <<< "$metadata"
-          grep -q '"dial_ws_loopback"' <<< "$metadata"
-          grep -q '"dial_wss"' <<< "$metadata"
-          grep -q '"listen_ws"' <<< "$metadata"
+          if ! metadata="$(docker run --rm --platform linux/amd64 \
+            --entrypoint /usr/local/bin/paperclip-runnerd \
+            "$immutable" --build-metadata 2>&1)"; then
+            echo "Runner metadata probe failed: $metadata" >&2
+            docker system df >&2 || true
+            exit 1
+          fi
+          jq -e \
+            '.binaryContractVersion == 2 and
+             (.prpTransportModes | index("dial_ws_loopback")) != null and
+             (.prpTransportModes | index("dial_wss")) != null and
+             (.prpTransportModes | index("listen_ws")) != null' \
+            <<< "$metadata" >/dev/null
           provider_metadata="$(docker run --rm --platform linux/amd64 \
-            --entrypoint cat "$immutable" \
+            --entrypoint /bin/cat "$immutable" \
             /opt/paperclip-runner/provider-pack/provider-pack.json)"
           jq -e --arg revision "$GITHUB_SHA" \
             '.runnerSourceRevision == $revision and (.artifacts | type == "object") and (.pins | type == "object")' \
