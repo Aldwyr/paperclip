@@ -31,10 +31,12 @@ import {
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
+  reapAbandonedSessionCloses,
   referencedSourceContentSignature,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
+  type PendingSessionClose,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
@@ -6339,5 +6341,166 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(typeof progressEvent?.payload?.durationMs).toBe("number");
     expect(teardownEvent).toBeDefined();
     expect(typeof teardownEvent?.payload?.durationMs).toBe("number");
+  });
+});
+
+describe("ACPX engine healthy teardown close deadline", () => {
+  it("records a timed_out end_session outcome and still runs the later teardown steps when a healthy direct close passes its deadline", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    let closeCalls = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      healthyEndSessionDeadlineMs: 20,
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          setConfigOption: async () => {},
+          // A healthy peer that never answers the remote close — the same
+          // shape of hang the incident hit, but on a live channel.
+          close: async () => {
+            closeCalls += 1;
+            await new Promise(() => {});
+          },
+        }) as never,
+    });
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    const result = await execute({
+      runId: "healthy-close-timeout-direct",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
+      },
+    } as never);
+
+    // The turn itself completed cleanly; a teardown-step timeout must never
+    // flip that outcome.
+    expect(result.exitCode).toBe(0);
+    expect(closeCalls).toBe(1);
+    const endSessionTiming = events.find(
+      (event) => event.eventType === "run.phase.timing" && event.payload?.phase === "end_session",
+    );
+    expect(endSessionTiming?.payload?.outcome).toBe("timed_out");
+    // Teardown continued past the abandoned close: the later settlement steps
+    // still ran and reported their own timing.
+    const stopTransportTiming = events.find(
+      (event) => event.eventType === "run.phase.timing" && event.payload?.phase === "stop_transport",
+    );
+    expect(stopTransportTiming?.payload?.outcome).toBe("ok");
+  });
+
+  it("records a timed_out end_session outcome when a healthy warm-handle close passes its deadline", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const warmHandles = new Map();
+    let closeCalls = 0;
+    const fixedHandle = {
+      backendSessionId: "backend-session",
+      agentSessionId: "agent-session",
+      runtimeSessionName: "runtime-session",
+    };
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      healthyEndSessionDeadlineMs: 20,
+      createRuntime: () => {
+        const runtime = {
+          ensureSession: async (input: { sessionKey: string }) => {
+            // Seed a matching warm handle for this run's own runtime/handle
+            // identity, so `endSession` takes the warm-handle close branch
+            // directly, the same way a real warm reuse would.
+            warmHandles.set(input.sessionKey, {
+              runtime,
+              handle: fixedHandle,
+              childStderrState: { logPath: null, pendingLiveLine: "" },
+              processIdentitySink: { current: async () => {}, latest: null },
+              fingerprint: "fingerprint",
+              lastUsedAt: 0,
+            });
+            return fixedHandle;
+          },
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          setConfigOption: async () => {},
+          close: async () => {
+            closeCalls += 1;
+            await new Promise(() => {});
+          },
+        };
+        return runtime as never;
+      },
+    });
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    const result = await execute({
+      runId: "healthy-close-timeout-warm",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
+      },
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(closeCalls).toBe(1);
+    const endSessionTiming = events.find(
+      (event) => event.eventType === "run.phase.timing" && event.payload?.phase === "end_session",
+    );
+    expect(endSessionTiming?.payload?.outcome).toBe("timed_out");
+    // `closeWarmHandle` drops the entry synchronously before it ever awaits
+    // the close, so the map does not keep a zombie entry around.
+    expect(warmHandles.size).toBe(0);
+  });
+});
+
+describe("reapAbandonedSessionCloses", () => {
+  it("removes an entry once its abandoned close settles, and is safe to run twice", async () => {
+    const pending = new Map<string, PendingSessionClose>();
+    let resolveClose!: () => void;
+    const settle = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const entry: PendingSessionClose = { sessionKey: "session-1", settle, settled: false };
+    pending.set("session-1", entry);
+    settle.then(() => {
+      entry.settled = true;
+    });
+
+    // The original close is still in flight: the sweep must not remove it,
+    // and it must not wait on it either.
+    reapAbandonedSessionCloses(pending);
+    expect(pending.has("session-1")).toBe(true);
+
+    resolveClose();
+    await settle;
+    // The original close settled in the background: the next sweep reconciles it.
+    reapAbandonedSessionCloses(pending);
+    expect(pending.has("session-1")).toBe(false);
+
+    // Running the sweep again for the same (already-removed) key is a no-op,
+    // not an error and not a second removal of anything.
+    expect(() => reapAbandonedSessionCloses(pending)).not.toThrow();
+    expect(pending.size).toBe(0);
   });
 });

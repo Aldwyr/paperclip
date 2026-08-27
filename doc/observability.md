@@ -681,12 +681,24 @@ never carries a command, a path, an environment value, or a raw identifier. A
 negative or a non-finite duration clamps to `0`.
 
 `outcome` is one of `ok`, `failed`, or `timed_out`. `timed_out` marks a step a
-host-owned deadline cut off before it settled on its own — today this applies
-only to the `sync_back` step (the sandbox workspace copy-back) on a run whose
-duplex control channel already latched a loss, where the copy-back has no
-cancellation hook and the deadline bounds the wait without abandoning it (the
-run's own staging lease stays held until the copy-back genuinely settles). A
-`timed_out` step outcome is independent of `resultJson.timeoutFired` on the
+host-owned deadline cut off before it settled on its own. Two settlement steps
+carry their own deadline today:
+
+- `sync_back` (the sandbox workspace copy-back), on a run whose duplex control
+  channel already latched a loss, where the copy-back has no cancellation hook
+  and the deadline bounds the wait without abandoning it (the run's own
+  staging lease stays held until the copy-back genuinely settles).
+- `end_session` (the remote session close), on a run whose duplex control
+  channel is still live. The vendored runtime's own internal bound for this
+  call reuses the adapter's full execution timeout, so a slow or stuck peer on
+  an otherwise healthy channel can still hold the close open for hours. This
+  step's own deadline is separate from, and much shorter than, that execution
+  timeout. The close call itself is never cancelled on a timeout: it keeps
+  running in the background, and the engine tracks it in an in-process pending
+  map so a later run's startup sweep can reconcile the bookkeeping once the
+  close actually settles. The sweep never waits on a still-running close.
+
+A `timed_out` step outcome is independent of `resultJson.timeoutFired` on the
 run record: that flag reflects only a trusted, typed host signal that the
 run's own overall adapter execution timeout fired, never a single settlement
 step's deadline.

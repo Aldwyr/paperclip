@@ -347,6 +347,20 @@ export interface AcpxEngineExecutorOptions {
    * timeout path without a real wait.
    */
   channelLostSyncBackDeadlineMs?: number;
+  /**
+   * The host-enforced deadline for a healthy teardown's remote session close
+   * (a live duplex channel, not a latched loss). Defaults to
+   * `HEALTHY_END_SESSION_DEADLINE_MS`; a test shortens it to observe the
+   * timeout path without a real wait.
+   */
+  healthyEndSessionDeadlineMs?: number;
+  /**
+   * The healthy remote closes a deadline abandoned mid-flight, keyed by
+   * `sessionKey`. `reapAbandonedSessionCloses` reconciles an entry once its
+   * original close call actually settles. Defaults to a shared module-level
+   * map; tests pass an isolated map.
+   */
+  pendingSessionCloses?: Map<string, PendingSessionClose>;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -2436,6 +2450,71 @@ async function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promi
   }
 }
 
+// The host-enforced deadline for a HEALTHY teardown's remote session close (a
+// live duplex channel, not a latched loss). The vendored runtime's own
+// internal bound for this call reuses the adapter's full execution timeout
+// (see `RuntimeSettlementPlan.skipRemoteClose` above), so a slow or stuck peer
+// on an otherwise live channel can still hold the close open for hours. This
+// deadline gives the healthy close its own, much shorter bound, separate from
+// the execution timeout. A close that passes this deadline is never cancelled
+// — it keeps running in the background — and `recordAbandonedSessionClose`
+// tracks it so `reapAbandonedSessionCloses` can reconcile it once it actually
+// settles.
+const HEALTHY_END_SESSION_DEADLINE_MS = 30_000;
+
+/**
+ * One session's healthy remote close that a deadline abandoned mid-flight.
+ * `settle` is the ORIGINAL close call, still running in the background: it has
+ * no cancellation hook, so this only tracks it, never re-issues it.
+ */
+export interface PendingSessionClose {
+  readonly sessionKey: string;
+  readonly settle: Promise<unknown>;
+  settled: boolean;
+}
+
+const defaultPendingSessionCloses = new Map<string, PendingSessionClose>();
+
+/**
+ * Record a healthy close a deadline abandoned, so a later sweep can finish the
+ * bookkeeping once the real close settles. A second abandoned close for the
+ * same session key (a later run) replaces the earlier entry — this engine
+ * process holds at most one runtime per session key at a time, so only the
+ * newest abandoned close is worth tracking.
+ */
+function recordAbandonedSessionClose(
+  pending: Map<string, PendingSessionClose>,
+  sessionKey: string,
+  settle: Promise<unknown>,
+): void {
+  const entry: PendingSessionClose = { sessionKey, settle, settled: false };
+  pending.set(sessionKey, entry);
+  settle.then(
+    () => {
+      entry.settled = true;
+    },
+    () => {
+      entry.settled = true;
+    },
+  );
+}
+
+/**
+ * Reconcile the pending-close map: drop every entry whose original close call
+ * has actually settled by now. This never waits on a still-running close — it
+ * only reads the `settled` flag `recordAbandonedSessionClose` arms, so it never
+ * reintroduces the unbounded wait the deadline exists to avoid. Idempotent: a
+ * second call for the same key finds either an unsettled entry (no-op, left in
+ * place) or no entry at all (the first call already removed it), so it never
+ * double-removes or double-reports.
+ */
+export function reapAbandonedSessionCloses(pending: Map<string, PendingSessionClose>): void {
+  for (const [key, entry] of pending.entries()) {
+    if (!entry.settled) continue;
+    if (pending.get(key) === entry) pending.delete(key);
+  }
+}
+
 /** How the settlement `endSession` step releases the runtime a run acquired. */
 interface RuntimeSettlementPlan {
   // "direct" closes the runtime itself and swallows or records the close error;
@@ -3360,6 +3439,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const now = deps.now ?? (() => Date.now());
   const channelLostSyncBackDeadlineMs =
     deps.channelLostSyncBackDeadlineMs ?? CHANNEL_LOST_SYNC_BACK_DEADLINE_MS;
+  const healthyEndSessionDeadlineMs =
+    deps.healthyEndSessionDeadlineMs ?? HEALTHY_END_SESSION_DEADLINE_MS;
+  const pendingSessionCloses = deps.pendingSessionCloses ?? defaultPendingSessionCloses;
   const warmHandles = deps.warmHandles ?? defaultWarmHandles;
   const stagedRuntimes = deps.stagedRuntimes ?? defaultStagedRuntimes;
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
@@ -3484,6 +3566,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         now,
         idleMs: warmIdleMs,
       });
+      // Reconcile any healthy close a prior run's deadline abandoned. This never
+      // waits on a still-running close (see `reapAbandonedSessionCloses`), so it
+      // adds no wait to this run's own startup.
+      reapAbandonedSessionCloses(pendingSessionCloses);
       // The sum of the step wall times. The root span records it as `root.work_ms`
       // and the difference from its own wall time as `root.diff_ms` (the overlap
       // the parallel steps saved). Every step reports its wall time through
@@ -4556,9 +4642,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         },
         // Close every runtime the decision did not transfer, and drop the warm entry
         // on close.
-        endSession: (slots, decision) => timedPhase("end_session", async () => {
-          if (!slots.has("acp_runtime")) return;
-          if (decision.kind === "save" && decision.savedId === "acp_runtime") return;
+        endSession: (slots, decision) => timedPhaseWithOutcome("end_session", async (): Promise<RunPhaseOutcome> => {
+          if (!slots.has("acp_runtime")) return "ok";
+          if (decision.kind === "save" && decision.savedId === "acp_runtime") return "ok";
           const settlement: RuntimeSettlementPlan = runtimeSettlement ?? {
             mode: "direct",
             handle: syntheticCloseHandle(),
@@ -4585,8 +4671,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               warmHandles.delete(prepared.sessionKey);
               flushChildStderr(existing.childStderrState);
             }
-            return;
+            return "ok";
           }
+          // A live channel is presumed reachable, but a stuck or overloaded
+          // peer can still leave the remote close unanswered. Bound the wait
+          // on this engine's own short deadline, separate from the adapter
+          // execution timeout the vendored runtime's internal bound reuses
+          // (see `HEALTHY_END_SESSION_DEADLINE_MS`). The close itself is never
+          // cancelled on a timeout — only this wait is bounded — so a later
+          // sweep can still reconcile it once it actually settles.
           if (
             settlement.mode === "warm_or_close" &&
             warmHandleMatches(existing, runtime, settlement.handle) &&
@@ -4594,29 +4687,45 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ) {
             // A matching warm entry closes through the warm store, which also
             // clears its idle timer and flushes its child stderr.
-            await closeWarmHandle({
-              handles: warmHandles,
-              key: prepared.sessionKey,
-              entry: existing,
-              reason: settlement.reason,
-              discardPersistentState: settlement.discardPersistentState,
-            });
-            return;
+            const raced = await withDeadline(
+              () =>
+                closeWarmHandle({
+                  handles: warmHandles,
+                  key: prepared.sessionKey,
+                  entry: existing,
+                  reason: settlement.reason,
+                  discardPersistentState: settlement.discardPersistentState,
+                }),
+              healthyEndSessionDeadlineMs,
+            );
+            if (raced.kind === "timed_out") {
+              recordAbandonedSessionClose(pendingSessionCloses, prepared.sessionKey, raced.settle);
+              return "timed_out";
+            }
+            return "ok";
           }
           const onCloseError = settlement.recordCloseError
             ? (closeErr: unknown) => recordTeardownError("runtime-close", closeErr)
             : () => {};
-          await runtime
-            .close({
-              handle: settlement.handle,
-              reason: settlement.reason,
-              discardPersistentState: settlement.discardPersistentState,
-            })
-            .catch(onCloseError);
+          const raced = await withDeadline(
+            () =>
+              runtime
+                .close({
+                  handle: settlement.handle,
+                  reason: settlement.reason,
+                  discardPersistentState: settlement.discardPersistentState,
+                })
+                .catch(onCloseError),
+            healthyEndSessionDeadlineMs,
+          );
+          if (raced.kind === "timed_out") {
+            recordAbandonedSessionClose(pendingSessionCloses, prepared.sessionKey, raced.settle);
+          }
           if (settlement.dropWarmEntry && warmHandleMatches(existing, runtime, settlement.handle) && existing) {
             clearWarmHandleTimer(existing);
             warmHandles.delete(prepared.sessionKey);
           }
+          return raced.kind === "timed_out" ? "timed_out" : "ok";
         }),
         // Perform the reuse decision. A save transfers the staged files to the site
         // store (which arms the idle policy); every other case discards the staged
