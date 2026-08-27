@@ -287,6 +287,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Download cell evidence
+        id: download_evidence
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: runner-e2e-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: downloaded-runner-e2e
+          merge-multiple: true
+
+      - name: Retry cell evidence download after transport failure
+        if: steps.download_evidence.outcome == 'failure'
         uses: actions/download-artifact@v8
         with:
           pattern: runner-e2e-${{ github.run_id }}-${{ github.run_attempt }}-*
