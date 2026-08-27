@@ -1043,6 +1043,60 @@ function providerSessionIdentityIsPresent(value: unknown): boolean {
   );
 }
 
+export function providerSessionIdentityTransitionIsAllowed(input: {
+  execution: NativeExecutionInput;
+  previous: unknown;
+  current: unknown;
+}): boolean {
+  if (canonicalJson(input.previous) === canonicalJson(input.current)) {
+    return true;
+  }
+  if (
+    input.execution.provider.kind !== "acpx" ||
+    input.execution.interactionResponses.length === 0
+  ) {
+    return false;
+  }
+
+  const previousOuter = record(input.previous);
+  const currentOuter = record(input.current);
+  const previous = record(previousOuter.providerSessionIdentity);
+  const current = record(currentOuter.providerSessionIdentity);
+  if (previous.kind !== "acpx" || current.kind !== "acpx") return false;
+
+  const stableFields = [
+    "normalizedSessionId",
+    "profileDigest",
+    "workspaceDigest",
+    "requestedModel",
+    "effectiveModel",
+    "permissionMode",
+  ] as const;
+  if (
+    current.normalizedSessionId !== nativeSessionKey(input.execution) ||
+    stableFields.some(
+      (field) =>
+        typeof previous[field] !== "string" ||
+        previous[field] !== current[field],
+    )
+  ) {
+    return false;
+  }
+
+  return (
+    typeof previous.acpxRecordId === "string" &&
+    typeof previous.backendSessionId === "string" &&
+    typeof previous.agentSessionId === "string" &&
+    typeof current.acpxRecordId === "string" &&
+    typeof current.backendSessionId === "string" &&
+    typeof current.agentSessionId === "string" &&
+    previousOuter.providerSessionId === previous.acpxRecordId &&
+    previousOuter.providerBackendSessionId === previous.backendSessionId &&
+    currentOuter.providerSessionId === current.acpxRecordId &&
+    currentOuter.providerBackendSessionId === current.backendSessionId
+  );
+}
+
 function digestBackupDirectory(directory: string): {
   sha256: string;
   bytes: number;
@@ -1330,8 +1384,9 @@ export function nativeSessionFailureDisposition(
   now = new Date(),
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
-  const permanentFailure = sourceFailureCode === "native_event_replay_conflict"
-    || sourceFailureCode === "runner_remote_provider_artifact_incompatible";
+  const permanentFailure =
+    sourceFailureCode === "native_event_replay_conflict" ||
+    sourceFailureCode === "runner_remote_provider_artifact_incompatible";
   const exhausted = permanentFailure || attempt >= 3;
   return {
     phase: exhausted
@@ -1448,9 +1503,7 @@ const PROVIDER_DURABLE_EVENT_TYPES = new Set([
 ]);
 
 type NativeRecoveryMode =
-  | "bootstrap_retry"
-  | "exact_checkpoint_resume"
-  | "ambiguous_state";
+  "bootstrap_retry" | "exact_checkpoint_resume" | "ambiguous_state";
 
 export async function nativeProviderRecoveryEvidence(input: {
   db: Db;
@@ -1472,9 +1525,9 @@ export async function nativeProviderRecoveryEvidence(input: {
   const checkpointRecord = record(checkpoint);
   const checkpointExists = Object.keys(checkpointRecord).length > 0;
   const providerSessionEstablished =
-    (typeof checkpointRecord.providerSessionId === "string"
-      && checkpointRecord.providerSessionId.length > 0)
-    || Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
+    (typeof checkpointRecord.providerSessionId === "string" &&
+      checkpointRecord.providerSessionId.length > 0) ||
+    Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
   const durableEvents = await input.db
     .select({ eventType: heartbeatRunEvents.eventType })
     .from(heartbeatRunEvents)
@@ -2681,15 +2734,18 @@ export async function executePaperclipNativeSession(input: {
       now,
       sourceFailureCode,
     );
-    const phase = recoveryEvidence.recoveryMode === "ambiguous_state"
-      ? ("terminal_failure" as const)
-      : disposition.phase;
-    const failureCode = recoveryEvidence.recoveryMode === "ambiguous_state"
-      ? sourceFailureCode
-      : disposition.failureCode;
-    const nextAttemptAt = recoveryEvidence.recoveryMode === "ambiguous_state"
-      ? null
-      : disposition.nextAttemptAt;
+    const phase =
+      recoveryEvidence.recoveryMode === "ambiguous_state"
+        ? ("terminal_failure" as const)
+        : disposition.phase;
+    const failureCode =
+      recoveryEvidence.recoveryMode === "ambiguous_state"
+        ? sourceFailureCode
+        : disposition.failureCode;
+    const nextAttemptAt =
+      recoveryEvidence.recoveryMode === "ambiguous_state"
+        ? null
+        : disposition.nextAttemptAt;
     const recoveryProjection = nativeSessionRecoveryProjection({
       phase,
       failureCode,
@@ -2719,15 +2775,16 @@ export async function executePaperclipNativeSession(input: {
             providerEventsExist: recoveryEvidence.providerEventsExist,
             checkpointExists: recoveryEvidence.checkpointExists,
             recoveryOwner: recoveryProjection.recoveryOwner,
-            nextAction: recoveryEvidence.recoveryMode === "ambiguous_state"
-              ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
-              : integrityFailure
-              ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
-              : exhausted
-                ? "Inspect the persisted native session after its bounded resume budget was exhausted."
-                : recoveryEvidence.recoveryMode === "bootstrap_retry"
-                  ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
-                  : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
+            nextAction:
+              recoveryEvidence.recoveryMode === "ambiguous_state"
+                ? "Inspect the original provider failure and durable events; state is ambiguous and a replacement provider session is forbidden."
+                : integrityFailure
+                  ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
+                  : exhausted
+                    ? "Inspect the persisted native session after its bounded resume budget was exhausted."
+                    : recoveryEvidence.recoveryMode === "bootstrap_retry"
+                      ? "Retry provider bootstrap on this same run; durable evidence proves no provider session or provider event was created."
+                      : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
           },
           nextAttemptAt,
           updatedAt: now,
@@ -2778,15 +2835,16 @@ export async function executePaperclipNativeSession(input: {
           providerSessionEstablished:
             recoveryEvidence.providerSessionEstablished,
         },
-        nextAction: recoveryEvidence.recoveryMode === "ambiguous_state"
-          ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
-          : integrityFailure
-            ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
-            : exhausted
-              ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
-              : recoveryEvidence.recoveryMode === "bootstrap_retry"
-                ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
-                : "Resume the exact persisted native session on the same heartbeat run.",
+        nextAction:
+          recoveryEvidence.recoveryMode === "ambiguous_state"
+            ? "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session."
+            : integrityFailure
+              ? "Inspect the persisted runner event collision and explicitly repair or replace the run; automatic retries are disabled."
+              : exhausted
+                ? "Inspect the provider trace and explicitly choose a replacement run or provider configuration; automatic provider work is stopped."
+                : recoveryEvidence.recoveryMode === "bootstrap_retry"
+                  ? "Retry bootstrap on the same run without manufacturing a provider checkpoint."
+                  : "Resume the exact persisted native session on the same heartbeat run.",
         wakePolicy: nextAttemptAt
           ? {
               kind: "resume_native_run",
@@ -2990,8 +3048,7 @@ const RUNNERD_BUILD_METADATA_SCHEMA =
   "paperclip-runner/runnerd-build-metadata/v1";
 const RUNNERD_BINARY_CONTRACT_VERSION = 2;
 
-const REMOTE_PROVIDER_PACK_SCHEMA =
-  "paperclip-runner/remote-provider-pack/v1";
+const REMOTE_PROVIDER_PACK_SCHEMA = "paperclip-runner/remote-provider-pack/v1";
 const REMOTE_PROVIDER_PACK_PINS = {
   nodeMinimum: "24.11.0",
   codex: "0.148.0",
@@ -3038,8 +3095,9 @@ function sha256File(path: string): string {
 export function sha256DirectoryTree(root: string): string {
   const hash = createHash("sha256");
   const visit = (directory: string, prefix = "") => {
-    const entries = readdirSync(directory, { withFileTypes: true })
-      .sort((left, right) => left.name.localeCompare(right.name));
+    const entries = readdirSync(directory, { withFileTypes: true }).sort(
+      (left, right) => left.name.localeCompare(right.name),
+    );
     for (const entry of entries) {
       const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
       const absolutePath = join(directory, entry.name);
@@ -3049,7 +3107,9 @@ export function sha256DirectoryTree(root: string): string {
       } else if (entry.isFile()) {
         hash.update(`file\0${relativePath}\0${sha256File(absolutePath)}\n`);
       } else if (entry.isSymbolicLink()) {
-        hash.update(`symlink\0${relativePath}\0${readlinkSync(absolutePath)}\n`);
+        hash.update(
+          `symlink\0${relativePath}\0${readlinkSync(absolutePath)}\n`,
+        );
       } else {
         throw new Error(
           `runner_remote_provider_artifact_incompatible: unsupported dist entry ${relativePath}`,
@@ -3063,12 +3123,12 @@ export function sha256DirectoryTree(root: string): string {
 
 function providerPackRelativePath(value: unknown, field: string): string {
   if (
-    typeof value !== "string"
-    || value.length === 0
-    || value.startsWith("/")
-    || value.includes("\\")
-    || posix.normalize(value) !== value
-    || value.split("/").includes("..")
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    posix.normalize(value) !== value ||
+    value.split("/").includes("..")
   ) {
     throw new Error(
       `runner_remote_provider_artifact_incompatible: invalid ${field}`,
@@ -3093,15 +3153,15 @@ export function readRemoteProviderPackManifest(
   }
   const payload = manifest?.payload;
   if (
-    manifest.schema !== REMOTE_PROVIDER_PACK_SCHEMA
-    || !payload
-    || canonicalJson(payload.pins) !== canonicalJson(REMOTE_PROVIDER_PACK_PINS)
-    || canonicalJson(payload.acpxProfileDigests)
-      !== canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS)
-    || typeof payload.target?.platform !== "string"
-    || typeof payload.target?.architecture !== "string"
-    || !/^[0-9a-f]{40}(?:-dirty)?$/.test(payload.runnerSourceRevision)
-    || !/^sha256:[0-9a-f]{64}$/.test(payload.distDigest)
+    manifest.schema !== REMOTE_PROVIDER_PACK_SCHEMA ||
+    !payload ||
+    canonicalJson(payload.pins) !== canonicalJson(REMOTE_PROVIDER_PACK_PINS) ||
+    canonicalJson(payload.acpxProfileDigests) !==
+      canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS) ||
+    typeof payload.target?.platform !== "string" ||
+    typeof payload.target?.architecture !== "string" ||
+    !/^[0-9a-f]{40}(?:-dirty)?$/.test(payload.runnerSourceRevision) ||
+    !/^sha256:[0-9a-f]{64}$/.test(payload.distDigest)
   ) {
     throw new Error(
       "runner_remote_provider_artifact_incompatible: provider pack pins or source revision do not match",
@@ -3129,8 +3189,8 @@ export function readRemoteProviderPackManifest(
       `${label} path`,
     );
     if (
-      typeof artifact?.sha256 !== "string"
-      || sha256File(resolve(packRoot, artifactPath)) !== artifact.sha256
+      typeof artifact?.sha256 !== "string" ||
+      sha256File(resolve(packRoot, artifactPath)) !== artifact.sha256
     ) {
       throw new Error(
         `runner_remote_provider_artifact_incompatible: ${label} digest mismatch`,
@@ -3612,17 +3672,17 @@ export function createRunnerdBackend(input: {
       )
     : null;
   const requiresRemoteProviderPack =
-    remoteTarget !== null
-    && (input.execution.provider.kind === "opencode"
-      || input.execution.provider.kind === "acpx");
+    remoteTarget !== null &&
+    (input.execution.provider.kind === "opencode" ||
+      input.execution.provider.kind === "acpx");
   const configuredProviderPackRoot =
     input.runnerRemoteProviderPackPath?.trim() || null;
   let expectedProviderPackManifest: RemoteProviderPackManifest | null = null;
   if (requiresRemoteProviderPack) {
     if (
-      !configuredProviderPackRoot
-      || !existsSync(configuredProviderPackRoot)
-      || !lstatSync(configuredProviderPackRoot).isDirectory()
+      !configuredProviderPackRoot ||
+      !existsSync(configuredProviderPackRoot) ||
+      !lstatSync(configuredProviderPackRoot).isDirectory()
     ) {
       throw new Error(
         "runner_remote_provider_artifact_incompatible: configure PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH with the build-owned provider pack",
@@ -3774,11 +3834,8 @@ export function createRunnerdBackend(input: {
   };
 
   const verifyRemoteProviderPack = async (packRoot: string) => {
-    if (
-      !remoteTarget
-      || !remoteCommandRunner
-      || !expectedProviderPackManifest
-    ) return;
+    if (!remoteTarget || !remoteCommandRunner || !expectedProviderPackManifest)
+      return;
     const expected = Buffer.from(
       canonicalJson(expectedProviderPackManifest),
       "utf8",
@@ -3833,9 +3890,9 @@ export function createRunnerdBackend(input: {
       timeoutMs: 30_000,
     });
     if (
-      opencodeVersion.exitCode !== 0
-      || opencodeVersion.timedOut
-      || opencodeVersion.stdout.trim() !== REMOTE_PROVIDER_PACK_PINS.opencode
+      opencodeVersion.exitCode !== 0 ||
+      opencodeVersion.timedOut ||
+      opencodeVersion.stdout.trim() !== REMOTE_PROVIDER_PACK_PINS.opencode
     ) {
       throw new Error(
         "runner_remote_provider_artifact_incompatible: OpenCode version mismatch",
@@ -3849,7 +3906,7 @@ export function createRunnerdBackend(input: {
       command: "sh",
       args: [
         "-c",
-        "for candidate in /opt/paperclip-runner/provider-pack \"$HOME/.local/share/paperclip-runner/provider-pack\"; do if [ -f \"$candidate/provider-pack.json\" ]; then printf '%s\\n' \"$candidate\"; break; fi; done",
+        'for candidate in /opt/paperclip-runner/provider-pack "$HOME/.local/share/paperclip-runner/provider-pack"; do if [ -f "$candidate/provider-pack.json" ]; then printf \'%s\\n\' "$candidate"; break; fi; done',
       ],
       cwd: remoteTarget.remoteCwd,
       bypassSession: true,
@@ -3929,8 +3986,10 @@ export function createRunnerdBackend(input: {
             "runner.artifact.verify_preinstalled",
             () => verifyRemoteRunner(requiredMode, preinstalledRunner),
           );
-          await measureNativeRunnerSpan(input.trace, "runner.artifact.link", () =>
-            linkPreinstalledExecutable(preinstalledRunner, remoteBinary),
+          await measureNativeRunnerSpan(
+            input.trace,
+            "runner.artifact.link",
+            () => linkPreinstalledExecutable(preinstalledRunner, remoteBinary),
           );
           usedPreinstalledRunner = true;
           await input.onLog?.(
@@ -4098,12 +4157,11 @@ export function createRunnerdBackend(input: {
       );
     }
     if (
-      requiresRemoteProviderPack
-      && configuredProviderPackRoot
-      && stagedRemoteProviderPackRoot
+      requiresRemoteProviderPack &&
+      configuredProviderPackRoot &&
+      stagedRemoteProviderPackRoot
     ) {
-      let preinstalledProviderPack =
-        await discoverPreinstalledProviderPack();
+      let preinstalledProviderPack = await discoverPreinstalledProviderPack();
       if (preinstalledProviderPack) {
         try {
           await measureNativeRunnerSpan(
@@ -4175,10 +4233,8 @@ export function createRunnerdBackend(input: {
           targetPath: stagedRemoteProviderPackRoot,
           mode: 0o700,
         });
-        await measureNativeRunnerSpan(
-          input.trace,
-          "provider_pack.verify",
-          () => verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
+        await measureNativeRunnerSpan(input.trace, "provider_pack.verify", () =>
+          verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
         );
         activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
       }
@@ -4246,8 +4302,11 @@ export function createRunnerdBackend(input: {
     })[0]?.manifest;
     if (
       previousManifest &&
-      canonicalJson(previousManifest.providerSessionIdentity) !==
-        canonicalJson(providerSessionIdentity)
+      !providerSessionIdentityTransitionIsAllowed({
+        execution: input.execution,
+        previous: previousManifest.providerSessionIdentity,
+        current: providerSessionIdentity,
+      })
     ) {
       throw new Error("runner_harness_state_mismatch");
     }
@@ -4444,7 +4503,8 @@ export function createRunnerdBackend(input: {
               ) {
                 const acquisitionRecordedAtMs = Date.now();
                 const backupAvailable = harnessBackupCandidates(root).some(
-                  (candidate) => existsSync(resolve(candidate, "manifest.json")),
+                  (candidate) =>
+                    existsSync(resolve(candidate, "manifest.json")),
                 );
                 const restoreIntoCreatedSandbox =
                   shouldRestoreNativeHarnessBackupIntoSandbox({
@@ -4944,11 +5004,13 @@ export function createRunnerdBackend(input: {
               ),
               opencodeCommand: posix.join(
                 stagedRemoteProviderPackRoot,
-                expectedProviderPackManifest.payload.artifacts.opencodeExecutable.path,
+                expectedProviderPackManifest.payload.artifacts
+                  .opencodeExecutable.path,
               ),
               opencodeProxyPath: posix.join(
                 stagedRemoteProviderPackRoot,
-                expectedProviderPackManifest.payload.artifacts.opencodeProxy.path,
+                expectedProviderPackManifest.payload.artifacts.opencodeProxy
+                  .path,
               ),
               acpxSidecarPath: posix.join(
                 stagedRemoteProviderPackRoot,

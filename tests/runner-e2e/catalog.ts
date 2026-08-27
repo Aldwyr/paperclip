@@ -397,7 +397,7 @@ export const runnerTasks: readonly RunnerTaskFixture[] = [
         "Change the plan from two steps to exactly three numbered steps, with verification as step 3.",
         "Publish the revised canonical Plan revision and request confirmation for that new revision.",
         "In a native runner, call write_document for key `plan`, then call request_human_input exactly once with interactionKind `confirmation`, targetRevisionId set to the returned latest Plan revision, and continuationPolicy `wake_assignee`; do not call paperclip_finish while waiting.",
-        "In a legacy runner, update the Plan and create the equivalent revision-bound request_confirmation through the public Paperclip API.",
+        "In a legacy runner, first GET the current `plan` issue document, then PUT the revised Plan with `baseRevisionId` set to that response's `latestRevisionId`; after the update succeeds, create the equivalent request_confirmation targeting the newly returned `latestRevisionId` through the public Paperclip API.",
       ].join(" "),
     buildPrompt: (nonce) =>
       [
@@ -409,7 +409,7 @@ export const runnerTasks: readonly RunnerTaskFixture[] = [
           `PAPERCLIP_E2E_PLAN_DONE_${nonce}` +
           " and mark the task Done.",
         "For a native runner, remain in the requested planning collaboration mode. Call write_document for key `plan`, then call request_human_input exactly once with interactionKind `confirmation`, targetRevisionId set to the returned latest Plan revision, and continuationPolicy `wake_assignee`. Do not call paperclip_finish while waiting for either Plan confirmation.",
-        "For a legacy runner, use the public Paperclip API: PUT the `plan` issue document, create a `request_confirmation` targeting its latest revision with `continuationPolicy: wake_assignee`, and move the issue to `in_review` while waiting.",
+        "For a legacy runner, use the public Paperclip API. The first PUT of the `plan` issue document creates it. For every later PUT, first GET the current document and set `baseRevisionId` to its `latestRevisionId`; a 409 means you must GET again and retry with the new latest revision. Create a `request_confirmation` targeting the successful PUT response's `latestRevisionId` with `continuationPolicy: wake_assignee`, and move the issue to `in_review` while waiting.",
         "Do not create files, child tasks, or unrelated work, and do not expose credentials.",
       ].join("\n"),
     buildMatchers(nonce, execution) {

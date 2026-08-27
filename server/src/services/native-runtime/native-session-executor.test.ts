@@ -55,6 +55,7 @@ import {
   parseRemoteExecutableCandidate,
   mayUsePreinstalledRunnerArtifact,
   readRemoteProviderPackManifest,
+  providerSessionIdentityTransitionIsAllowed,
   providerPlanMarkdown,
   runtimeInputLifecycleMetric,
   runtimeQuestionFallbackFromEvent,
@@ -73,7 +74,10 @@ describe("remote provider pack manifest", () => {
     if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
     if (value && typeof value === "object") {
       const object = value as Record<string, unknown>;
-      return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
+      return `{${Object.keys(object)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`)
+        .join(",")}}`;
     }
     return JSON.stringify(value);
   };
@@ -83,20 +87,35 @@ describe("remote provider pack manifest", () => {
     await mkdir(join(root, "dist", "cli"), { recursive: true });
     await mkdir(join(root, "node_modules", "node", "bin"), { recursive: true });
     await mkdir(join(root, "node_modules", ".bin"), { recursive: true });
-    await mkdir(join(root, "node_modules", "opencode-ai", "bin"), { recursive: true });
+    await mkdir(join(root, "node_modules", "opencode-ai", "bin"), {
+      recursive: true,
+    });
     const proxy = "export const proxy = true;\n";
     const sidecar = "export const sidecar = true;\n";
     const node = "provider-node\n";
     const lockfile = "lockfileVersion: '9.0'\n";
     const opencodeCommand = "#!/bin/sh\n";
     const opencodeExecutable = "opencode-binary\n";
-    await writeFile(join(root, "dist", "cli", "opencode-app-server-proxy.js"), proxy);
-    await writeFile(join(root, "dist", "cli", "acpx-runtime-sidecar.js"), sidecar);
+    await writeFile(
+      join(root, "dist", "cli", "opencode-app-server-proxy.js"),
+      proxy,
+    );
+    await writeFile(
+      join(root, "dist", "cli", "acpx-runtime-sidecar.js"),
+      sidecar,
+    );
     await writeFile(join(root, "node_modules", "node", "bin", "node"), node);
     await writeFile(join(root, "pnpm-lock.yaml"), lockfile);
-    await writeFile(join(root, "node_modules", ".bin", "opencode"), opencodeCommand);
-    await writeFile(join(root, "node_modules", "opencode-ai", "bin", "opencode.exe"), opencodeExecutable);
-    const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+    await writeFile(
+      join(root, "node_modules", ".bin", "opencode"),
+      opencodeCommand,
+    );
+    await writeFile(
+      join(root, "node_modules", "opencode-ai", "bin", "opencode.exe"),
+      opencodeExecutable,
+    );
+    const digest = (value: string) =>
+      `sha256:${createHash("sha256").update(value).digest("hex")}`;
     const proxySha = `sha256:${createHash("sha256").update(proxy).digest("hex")}`;
     const sidecarSha = `sha256:${createHash("sha256").update(sidecar).digest("hex")}`;
     const payload = {
@@ -116,11 +135,16 @@ describe("remote provider pack manifest", () => {
       bridgeDigest: "",
       acpxProfileDigests: {
         pi: "sha256:8c696f38296d53d0061fa11534570c5ddd951b63532aed30e0f1fcc676dc169f",
-        claude: "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
-        codex: "sha256:94049b3e3c3aee87de62703786e4fa81d031d7bd979f99bdf516d84f28791a79",
+        claude:
+          "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
+        codex:
+          "sha256:94049b3e3c3aee87de62703786e4fa81d031d7bd979f99bdf516d84f28791a79",
       },
       artifacts: {
-        nodeCommand: { path: "node_modules/node/bin/node", sha256: digest(node) },
+        nodeCommand: {
+          path: "node_modules/node/bin/node",
+          sha256: digest(node),
+        },
         productionLock: { path: "pnpm-lock.yaml", sha256: digest(lockfile) },
         opencodeCommand: {
           path: "node_modules/.bin/opencode",
@@ -155,8 +179,9 @@ describe("remote provider pack manifest", () => {
         payload,
       }),
     );
-    expect(readRemoteProviderPackManifest(root).payload.pins.opencode)
-      .toBe("1.18.17");
+    expect(readRemoteProviderPackManifest(root).payload.pins.opencode).toBe(
+      "1.18.17",
+    );
     await writeFile(
       join(root, "dist", "cli", "opencode-app-server-proxy.js"),
       "tampered\n",
@@ -193,23 +218,61 @@ describe("native harness persistence profiles", () => {
 
   it.each([
     ["codex", { kind: "codex" }, "codex_app_server", ["runner", "codex-home"]],
-    ["opencode", { kind: "opencode" }, "opencode_server", ["runner", "opencode"]],
-    ["acpx pi", { kind: "acpx", agent: "pi" }, "acpx_runtime", ["runner", "acpx"]],
-    ["acpx claude", { kind: "acpx", agent: "claude" }, "acpx_runtime", ["runner", "acpx"]],
-    ["acpx codex", { kind: "acpx", agent: "codex" }, "acpx_runtime", ["runner", "acpx"]],
-    ["claude managed", { kind: "claude_managed" }, "claude_managed_agents_api", ["runner"]],
-    ["aws agentcore", { kind: "aws_agentcore" }, "aws_agentcore_harness_api", ["runner"]],
-  ])("declares the complete %s recovery state", (_name, provider, driver, directories) => {
-    expect(profile(provider as Record<string, unknown>, driver as string).directories
-      .map((directory) => directory.name)).toEqual(directories);
-  });
+    [
+      "opencode",
+      { kind: "opencode" },
+      "opencode_server",
+      ["runner", "opencode"],
+    ],
+    [
+      "acpx pi",
+      { kind: "acpx", agent: "pi" },
+      "acpx_runtime",
+      ["runner", "acpx"],
+    ],
+    [
+      "acpx claude",
+      { kind: "acpx", agent: "claude" },
+      "acpx_runtime",
+      ["runner", "acpx"],
+    ],
+    [
+      "acpx codex",
+      { kind: "acpx", agent: "codex" },
+      "acpx_runtime",
+      ["runner", "acpx"],
+    ],
+    [
+      "claude managed",
+      { kind: "claude_managed" },
+      "claude_managed_agents_api",
+      ["runner"],
+    ],
+    [
+      "aws agentcore",
+      { kind: "aws_agentcore" },
+      "aws_agentcore_harness_api",
+      ["runner"],
+    ],
+  ])(
+    "declares the complete %s recovery state",
+    (_name, provider, driver, directories) => {
+      expect(
+        profile(
+          provider as Record<string, unknown>,
+          driver as string,
+        ).directories.map((directory) => directory.name),
+      ).toEqual(directories);
+    },
+  );
 
   it("excludes disposable Codex scratch trees and launch-time credentials", () => {
     const codex = profile({ kind: "codex" }, "codex_app_server");
-    expect(codex.directories.find((directory) => directory.name === "codex-home"))
-      .toMatchObject({
-        excludeTopLevelEntries: ["tmp", ".tmp", "auth.json", "config.toml"],
-      });
+    expect(
+      codex.directories.find((directory) => directory.name === "codex-home"),
+    ).toMatchObject({
+      excludeTopLevelEntries: ["tmp", ".tmp", "auth.json", "config.toml"],
+    });
   });
 });
 
@@ -236,6 +299,82 @@ describe("verified native harness backups", () => {
       lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
     },
   } as unknown as NativeExecutionInputV1;
+
+  const acpxIdentity = (suffix: string) => ({
+    providerSessionId: `record-${suffix}`,
+    providerBackendSessionId: `backend-${suffix}`,
+    providerSessionIdentity: {
+      kind: "acpx",
+      normalizedSessionId: "native-session",
+      acpxRecordId: `record-${suffix}`,
+      backendSessionId: `backend-${suffix}`,
+      agentSessionId: `agent-session-${suffix}`,
+      profileDigest: "sha256:profile",
+      workspaceDigest: "sha256:workspace",
+      requestedModel: "claude-sonnet-5",
+      effectiveModel: "claude-sonnet-5",
+      permissionMode: "approve-all",
+    },
+  });
+
+  it("allows only identity-stable ACPX rotation after a governed interaction", () => {
+    const execution = {
+      ...backupExecution,
+      provider: {
+        kind: "acpx",
+        agent: "claude",
+        model: "claude-sonnet-5",
+      },
+      session: {
+        ...backupExecution.session,
+        driverKind: "acpx_runtime",
+      },
+      interactionResponses: [{ interactionId: "interaction-1" }],
+    } as unknown as NativeExecutionInputV1;
+    const previous = acpxIdentity("previous");
+    const current = acpxIdentity("current");
+
+    expect(
+      providerSessionIdentityTransitionIsAllowed({
+        execution,
+        previous,
+        current,
+      }),
+    ).toBe(true);
+    expect(
+      providerSessionIdentityTransitionIsAllowed({
+        execution: {
+          ...execution,
+          interactionResponses: [],
+        } as unknown as NativeExecutionInputV1,
+        previous,
+        current,
+      }),
+    ).toBe(false);
+    expect(
+      providerSessionIdentityTransitionIsAllowed({
+        execution,
+        previous,
+        current: {
+          ...current,
+          providerSessionIdentity: {
+            ...current.providerSessionIdentity,
+            workspaceDigest: "sha256:different-workspace",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      providerSessionIdentityTransitionIsAllowed({
+        execution,
+        previous,
+        current: {
+          ...current,
+          providerBackendSessionId: "unbound-backend",
+        },
+      }),
+    ).toBe(false);
+  });
 
   it("restores a verified continuation into an intentionally fresh non-reusable sandbox", () => {
     expect(
@@ -267,8 +406,14 @@ describe("verified native harness backups", () => {
       const current = join(root, "failover-backups", "current");
       await mkdir(join(current, "runner"), { recursive: true });
       await mkdir(join(current, "codex-home", "sessions"), { recursive: true });
-      await writeFile(join(current, "runner", "runner-state.json"), "runner-state");
-      await writeFile(join(current, "codex-home", "sessions", "thread.jsonl"), "thread-state");
+      await writeFile(
+        join(current, "runner", "runner-state.json"),
+        "runner-state",
+      );
+      await writeFile(
+        join(current, "codex-home", "sessions", "thread.jsonl"),
+        "thread-state",
+      );
       const manifest = buildNativeHarnessBackupManifest({
         backupRoot: current,
         execution: backupExecution,
@@ -283,11 +428,13 @@ describe("verified native harness backups", () => {
       });
       await writeFile(join(current, "manifest.json"), JSON.stringify(manifest));
 
-      expect(verifyNativeHarnessBackup({
-        root,
-        execution: backupExecution,
-        runnerInstanceId: "runner-1",
-      })).toMatchObject({
+      expect(
+        verifyNativeHarnessBackup({
+          root,
+          execution: backupExecution,
+          runnerInstanceId: "runner-1",
+        }),
+      ).toMatchObject({
         root: current,
         manifest: {
           sourceProviderLeaseId: "sandbox-1",
@@ -306,41 +453,55 @@ describe("verified native harness backups", () => {
           executionWorkspaceId: "run-2",
         },
       } as NativeExecutionInputV1;
-      expect(verifyNativeHarnessBackup({
-        root,
-        execution: continuationExecution,
-        runnerInstanceId: "runner-1",
-      })).not.toBeNull();
+      expect(
+        verifyNativeHarnessBackup({
+          root,
+          execution: continuationExecution,
+          runnerInstanceId: "runner-1",
+        }),
+      ).not.toBeNull();
 
-      await writeFile(join(current, "codex-home", "sessions", "thread.jsonl"), "corrupt");
-      expect(verifyNativeHarnessBackup({
-        root,
-        execution: backupExecution,
-        runnerInstanceId: "runner-1",
-      })).toBeNull();
+      await writeFile(
+        join(current, "codex-home", "sessions", "thread.jsonl"),
+        "corrupt",
+      );
+      expect(
+        verifyNativeHarnessBackup({
+          root,
+          execution: backupExecution,
+          runnerInstanceId: "runner-1",
+        }),
+      ).toBeNull();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
   it("rejects a backup whose provider identity or harness contract changed", async () => {
-    const root = await mkdtemp(join(tmpdir(), "paperclip-harness-backup-identity-"));
+    const root = await mkdtemp(
+      join(tmpdir(), "paperclip-harness-backup-identity-"),
+    );
     try {
       const current = join(root, "failover-backups", "current");
       await mkdir(join(current, "runner"), { recursive: true });
       await mkdir(join(current, "codex-home"), { recursive: true });
-      await writeFile(join(current, "runner", "runner-state.json"), "runner-state");
-      expect(() => buildNativeHarnessBackupManifest({
-        backupRoot: current,
-        execution: backupExecution,
-        runnerInstanceId: "runner-1",
-        providerSessionIdentity: {
-          providerSessionId: null,
-          providerBackendSessionId: null,
-          providerSessionIdentity: null,
-        },
-        sourceProviderLeaseId: "sandbox-1",
-      })).toThrow("runner_harness_state_mismatch");
+      await writeFile(
+        join(current, "runner", "runner-state.json"),
+        "runner-state",
+      );
+      expect(() =>
+        buildNativeHarnessBackupManifest({
+          backupRoot: current,
+          execution: backupExecution,
+          runnerInstanceId: "runner-1",
+          providerSessionIdentity: {
+            providerSessionId: null,
+            providerBackendSessionId: null,
+            providerSessionIdentity: null,
+          },
+          sourceProviderLeaseId: "sandbox-1",
+        }),
+      ).toThrow("runner_harness_state_mismatch");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -358,8 +519,14 @@ describe("verified native harness backups", () => {
       const current = join(sessionRoot, "failover-backups", "current");
       await mkdir(join(current, "runner"), { recursive: true });
       await mkdir(join(current, "codex-home", "sessions"), { recursive: true });
-      await writeFile(join(current, "runner", "runner-state.json"), "runner-state");
-      await writeFile(join(current, "codex-home", "sessions", "thread.jsonl"), "thread-state");
+      await writeFile(
+        join(current, "runner", "runner-state.json"),
+        "runner-state",
+      );
+      await writeFile(
+        join(current, "codex-home", "sessions", "thread.jsonl"),
+        "thread-state",
+      );
       const manifest = buildNativeHarnessBackupManifest({
         backupRoot: current,
         execution: backupExecution,
@@ -396,18 +563,38 @@ describe("verified native harness backups", () => {
 
 describe("remote provider checkpoint snapshots", () => {
   it("excludes Codex scratch and credential state without mutating the live provider home", async () => {
-    const execute = vi.fn()
-      .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })
-      .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })
-      .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "", stderr: "" });
-    const syncOut = vi.fn(async (_operations: Array<{
-      files: Array<{
-        sourcePath: string;
-        targetPath: string;
-        kind: "file" | "directory";
-        mode?: number;
-      }>;
-    }>) => undefined);
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+      });
+    const syncOut = vi.fn(
+      async (
+        _operations: Array<{
+          files: Array<{
+            sourcePath: string;
+            targetPath: string;
+            kind: "file" | "directory";
+            mode?: number;
+          }>;
+        }>,
+      ) => undefined,
+    );
 
     await syncRemoteRunnerDirectoryOut({
       runner: { execute, syncOut } as never,
@@ -417,16 +604,23 @@ describe("remote provider checkpoint snapshots", () => {
       excludeTopLevelEntries: ["tmp", ".tmp", "auth.json", "config.toml"],
     });
 
-    expect(execute).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      args: ["-c", "test -d '/remote/session/filesystem/codex-home'"],
-    }));
+    expect(execute).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        args: ["-c", "test -d '/remote/session/filesystem/codex-home'"],
+      }),
+    );
     const snapshotCommand = String(execute.mock.calls[1]?.[0]?.args?.[1]);
     expect(snapshotCommand).toContain("'--exclude=./tmp'");
     expect(snapshotCommand).toContain("'--exclude=./.tmp'");
     expect(snapshotCommand).toContain("'--exclude=./auth.json'");
     expect(snapshotCommand).toContain("'--exclude=./config.toml'");
-    expect(snapshotCommand).toContain("-C '/remote/session/filesystem/codex-home'");
-    expect(snapshotCommand).not.toContain("rm -rf -- '/remote/session/filesystem/codex-home'");
+    expect(snapshotCommand).toContain(
+      "-C '/remote/session/filesystem/codex-home'",
+    );
+    expect(snapshotCommand).not.toContain(
+      "rm -rf -- '/remote/session/filesystem/codex-home'",
+    );
 
     const batch = syncOut.mock.calls[0]?.[0]?.[0];
     expect(batch?.files[0]).toMatchObject({
@@ -449,36 +643,56 @@ describe("remote provider checkpoint snapshots", () => {
       stdout: "",
       stderr: "",
     });
-    await expect(syncRemoteRunnerDirectoryOut({
-      runner: { execute, syncOut: vi.fn() } as never,
-      sourcePath: "/remote/codex-home",
-      targetPath: "/tmp/paperclip-checkpoint-invalid-codex-home",
-      mode: 0o700,
-      excludeTopLevelEntries: ["../outside"],
-    })).rejects.toThrow("runner_remote_checkpoint_exclusion_invalid");
+    await expect(
+      syncRemoteRunnerDirectoryOut({
+        runner: { execute, syncOut: vi.fn() } as never,
+        sourcePath: "/remote/codex-home",
+        targetPath: "/tmp/paperclip-checkpoint-invalid-codex-home",
+        mode: 0o700,
+        excludeTopLevelEntries: ["../outside"],
+      }),
+    ).rejects.toThrow("runner_remote_checkpoint_exclusion_invalid");
   });
 });
 
 describe("remote provider checkpoint restores", () => {
   it("does not upload excluded Codex scratch trees or credentials", async () => {
-    const sourcePath = await mkdtemp(join(tmpdir(), "paperclip-codex-restore-source-"));
+    const sourcePath = await mkdtemp(
+      join(tmpdir(), "paperclip-codex-restore-source-"),
+    );
     try {
       await mkdir(join(sourcePath, "sessions"), { recursive: true });
       await mkdir(join(sourcePath, ".tmp"), { recursive: true });
-      await writeFile(join(sourcePath, "sessions", "thread.jsonl"), "durable session");
-      await writeFile(join(sourcePath, ".tmp", "scratch.bin"), "disposable scratch");
+      await writeFile(
+        join(sourcePath, "sessions", "thread.jsonl"),
+        "durable session",
+      );
+      await writeFile(
+        join(sourcePath, ".tmp", "scratch.bin"),
+        "disposable scratch",
+      );
       await writeFile(join(sourcePath, "auth.json"), "credential");
       await writeFile(join(sourcePath, "config.toml"), "bearer token");
-      const syncIn = vi.fn(async (operations: Array<{
-        files: Array<{ sourcePath: string }>;
-      }>) => {
-        const stagedPath = operations[0]!.files[0]!.sourcePath;
-        expect(stagedPath).not.toBe(sourcePath);
-        await expect(access(join(stagedPath, "sessions", "thread.jsonl"))).resolves.toBeUndefined();
-        await expect(access(join(stagedPath, ".tmp", "scratch.bin"))).rejects.toThrow();
-        await expect(access(join(stagedPath, "auth.json"))).rejects.toThrow();
-        await expect(access(join(stagedPath, "config.toml"))).rejects.toThrow();
-      });
+      const syncIn = vi.fn(
+        async (
+          operations: Array<{
+            files: Array<{ sourcePath: string }>;
+          }>,
+        ) => {
+          const stagedPath = operations[0]!.files[0]!.sourcePath;
+          expect(stagedPath).not.toBe(sourcePath);
+          await expect(
+            access(join(stagedPath, "sessions", "thread.jsonl")),
+          ).resolves.toBeUndefined();
+          await expect(
+            access(join(stagedPath, ".tmp", "scratch.bin")),
+          ).rejects.toThrow();
+          await expect(access(join(stagedPath, "auth.json"))).rejects.toThrow();
+          await expect(
+            access(join(stagedPath, "config.toml")),
+          ).rejects.toThrow();
+        },
+      );
 
       await stageRemoteRunnerDirectory({
         target: {
@@ -503,8 +717,11 @@ describe("remote provider checkpoint restores", () => {
 
 describe("remote preinstalled executable discovery", () => {
   it("accepts one normalized absolute executable path", () => {
-    expect(parseRemoteExecutableCandidate("/home/daytona/.local/bin/paperclip-runnerd\n"))
-      .toBe("/home/daytona/.local/bin/paperclip-runnerd");
+    expect(
+      parseRemoteExecutableCandidate(
+        "/home/daytona/.local/bin/paperclip-runnerd\n",
+      ),
+    ).toBe("/home/daytona/.local/bin/paperclip-runnerd");
   });
 
   it.each([
@@ -517,7 +734,9 @@ describe("remote preinstalled executable discovery", () => {
   });
 
   it("does not accept a merely contract-compatible runnerd when a build-owned artifact is configured", () => {
-    expect(mayUsePreinstalledRunnerArtifact("/artifacts/paperclip-runnerd")).toBe(false);
+    expect(
+      mayUsePreinstalledRunnerArtifact("/artifacts/paperclip-runnerd"),
+    ).toBe(false);
     expect(mayUsePreinstalledRunnerArtifact("  ")).toBe(true);
     expect(mayUsePreinstalledRunnerArtifact(undefined)).toBe(true);
   });
@@ -533,21 +752,33 @@ describe("remote runner build metadata", () => {
   };
 
   it("accepts the current contract with the required transport", () => {
-    expect(() => assertRemoteRunnerBuildMetadata(current, "listen_ws")).not.toThrow();
+    expect(() =>
+      assertRemoteRunnerBuildMetadata(current, "listen_ws"),
+    ).not.toThrow();
   });
 
   it("fails before dispatch when a preinstalled runner uses the stale contract", () => {
-    expect(() => assertRemoteRunnerBuildMetadata({
-      ...current,
-      binaryContractVersion: 1,
-    }, "listen_ws")).toThrow("runner_remote_artifact_contract_incompatible");
+    expect(() =>
+      assertRemoteRunnerBuildMetadata(
+        {
+          ...current,
+          binaryContractVersion: 1,
+        },
+        "listen_ws",
+      ),
+    ).toThrow("runner_remote_artifact_contract_incompatible");
   });
 
   it("requires the selected transport without falling through", () => {
-    expect(() => assertRemoteRunnerBuildMetadata({
-      ...current,
-      prpTransportModes: ["dial_wss"],
-    }, "listen_ws")).toThrow("runner_remote_transport_capability_missing:listen_ws");
+    expect(() =>
+      assertRemoteRunnerBuildMetadata(
+        {
+          ...current,
+          prpTransportModes: ["dial_wss"],
+        },
+        "listen_ws",
+      ),
+    ).toThrow("runner_remote_transport_capability_missing:listen_ws");
   });
 });
 
@@ -563,7 +794,10 @@ describe("runtime question fallback", () => {
         prompt: "Which region?",
         required: true,
         answerMode: "single_select" as const,
-        options: [{ id: "us", label: "US" }, { id: "eu", label: "Europe" }],
+        options: [
+          { id: "us", label: "US" },
+          { id: "eu", label: "Europe" },
+        ],
       },
       {
         id: "replicas",
@@ -578,43 +812,55 @@ describe("runtime question fallback", () => {
   it.each(["provider_process_lost", "durable_handoff"])(
     "materializes one idempotent durable interaction after %s",
     (reason) => {
-    const fallback = runtimeQuestionFallbackFromEvent({
-      eventType: "runtime_request.expired",
-      runId: "00000000-0000-4000-8000-000000000001",
-      payload: {
-        requestId: "elicitation-1",
-        requestKind: "runtime",
-        requestType: "input",
-        reason,
-        replayAllowed: false,
-        request: {
-          schema: "paperclip.runtime_request.v2",
-          requestKind: "runtime",
+      const fallback = runtimeQuestionFallbackFromEvent({
+        eventType: "runtime_request.expired",
+        runId: "00000000-0000-4000-8000-000000000001",
+        payload: {
           requestId: "elicitation-1",
-          type: "input",
-          status: "pending",
-          prompt: "Configure deployment",
-          turnId: "turn-1",
-          itemId: "item-1",
-          input: questionSet,
+          requestKind: "runtime",
+          requestType: "input",
+          reason,
+          replayAllowed: false,
+          request: {
+            schema: "paperclip.runtime_request.v2",
+            requestKind: "runtime",
+            requestId: "elicitation-1",
+            type: "input",
+            status: "pending",
+            prompt: "Configure deployment",
+            turnId: "turn-1",
+            itemId: "item-1",
+            input: questionSet,
+          },
         },
-      },
-    });
-    expect(fallback).toMatchObject({
-      kind: "ask_user_questions",
-      idempotencyKey: "runtime-input-durable:v1:00000000-0000-4000-8000-000000000001:elicitation-1",
-      sourceRunId: "00000000-0000-4000-8000-000000000001",
-      continuationPolicy: "wake_assignee",
-      payload: {
-        runtimeRequestId: "elicitation-1",
-        questionSet,
-        supersedeOnUserComment: false,
-        questions: [
-          { id: "region", selectionMode: "single", options: [{ id: "us", label: "US" }, { id: "eu", label: "Europe" }] },
-          { id: "replicas", selectionMode: "single", options: [{ id: "__paperclip_text__", freeText: true }] },
-        ],
-      },
-    });
+      });
+      expect(fallback).toMatchObject({
+        kind: "ask_user_questions",
+        idempotencyKey:
+          "runtime-input-durable:v1:00000000-0000-4000-8000-000000000001:elicitation-1",
+        sourceRunId: "00000000-0000-4000-8000-000000000001",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          runtimeRequestId: "elicitation-1",
+          questionSet,
+          supersedeOnUserComment: false,
+          questions: [
+            {
+              id: "region",
+              selectionMode: "single",
+              options: [
+                { id: "us", label: "US" },
+                { id: "eu", label: "Europe" },
+              ],
+            },
+            {
+              id: "replicas",
+              selectionMode: "single",
+              options: [{ id: "__paperclip_text__", freeText: true }],
+            },
+          ],
+        },
+      });
     },
   );
 
@@ -623,65 +869,76 @@ describe("runtime question fallback", () => {
     ["runtime_request.cancelled", "provider_process_lost", false],
     ["runtime_request.expired", "explicit_cancellation", false],
     ["runtime_request.expired", "provider_process_lost", true],
-  ])("does not fall back for %s / %s / replay=%s", (eventType, reason, replayAllowed) => {
-    expect(runtimeQuestionFallbackFromEvent({
-      eventType: eventType as never,
-      runId: "00000000-0000-4000-8000-000000000001",
-      payload: {
-        reason,
-        replayAllowed,
-        request: {
-          schema: "paperclip.runtime_request.v2",
-          requestKind: "runtime",
-          requestId: "elicitation-1",
-          type: "input",
-          status: "pending",
-          turnId: "turn-1",
-          itemId: "item-1",
-          input: questionSet,
-        },
-      },
-    })).toBeNull();
-  });
+  ])(
+    "does not fall back for %s / %s / replay=%s",
+    (eventType, reason, replayAllowed) => {
+      expect(
+        runtimeQuestionFallbackFromEvent({
+          eventType: eventType as never,
+          runId: "00000000-0000-4000-8000-000000000001",
+          payload: {
+            reason,
+            replayAllowed,
+            request: {
+              schema: "paperclip.runtime_request.v2",
+              requestKind: "runtime",
+              requestId: "elicitation-1",
+              type: "input",
+              status: "pending",
+              turnId: "turn-1",
+              itemId: "item-1",
+              input: questionSet,
+            },
+          },
+        }),
+      ).toBeNull();
+    },
+  );
 
   it("emits content-free lifecycle metric dimensions", () => {
-    expect(runtimeInputLifecycleMetric({
-      eventType: "runtime_request.created",
-      payload: {
-        request: {
-          type: "input",
-          requestId: "input-1",
-          origin: { adapter: "codex-app-server" },
-          input: questionSet,
+    expect(
+      runtimeInputLifecycleMetric({
+        eventType: "runtime_request.created",
+        payload: {
+          request: {
+            type: "input",
+            requestId: "input-1",
+            origin: { adapter: "codex-app-server" },
+            input: questionSet,
+          },
         },
-      },
-    })).toEqual({
+      }),
+    ).toEqual({
       outcome: "normalized",
       adapter: "codex-app-server",
       requestId: "input-1",
     });
-    expect(runtimeInputLifecycleMetric({
-      eventType: "runtime_request.expired",
-      payload: {
-        requestId: "input-1",
-        requestType: "input",
-        reason: "durable_handoff",
-        adapter: "codex-app-server",
-      },
-    })).toEqual({
+    expect(
+      runtimeInputLifecycleMetric({
+        eventType: "runtime_request.expired",
+        payload: {
+          requestId: "input-1",
+          requestType: "input",
+          reason: "durable_handoff",
+          adapter: "codex-app-server",
+        },
+      }),
+    ).toEqual({
       outcome: "durable_handoff",
       adapter: "codex-app-server",
       requestId: "input-1",
     });
-    expect(runtimeInputLifecycleMetric({
-      eventType: "runtime_request.expired",
-      payload: {
-        requestId: "input-1",
-        requestType: "input",
-        reason: "provider_process_lost",
-        adapter: "codex-app-server",
-      },
-    })).toEqual({
+    expect(
+      runtimeInputLifecycleMetric({
+        eventType: "runtime_request.expired",
+        payload: {
+          requestId: "input-1",
+          requestType: "input",
+          reason: "provider_process_lost",
+          adapter: "codex-app-server",
+        },
+      }),
+    ).toEqual({
       outcome: "provider_loss_handoff",
       adapter: "codex-app-server",
       requestId: "input-1",
@@ -691,12 +948,17 @@ describe("runtime question fallback", () => {
 
 describe("native provider bootstrap environment", () => {
   it("inherits the host executable and credential-home context", () => {
-    expect(buildNativeProviderEnvironment({}, {
-      PATH: "/opt/homebrew/bin:/usr/bin",
-      HOME: "/Users/runner",
-      CODEX_HOME: "/Users/runner/.codex",
-      PAPERCLIP_INTERNAL_SECRET: "must-not-leak",
-    })).toEqual({
+    expect(
+      buildNativeProviderEnvironment(
+        {},
+        {
+          PATH: "/opt/homebrew/bin:/usr/bin",
+          HOME: "/Users/runner",
+          CODEX_HOME: "/Users/runner/.codex",
+          PAPERCLIP_INTERNAL_SECRET: "must-not-leak",
+        },
+      ),
+    ).toEqual({
       PATH: "/opt/homebrew/bin:/usr/bin",
       HOME: "/Users/runner",
       CODEX_HOME: "/Users/runner/.codex",
@@ -704,13 +966,18 @@ describe("native provider bootstrap environment", () => {
   });
 
   it("lets explicitly configured agent env override host defaults", () => {
-    expect(buildNativeProviderEnvironment({
-      PATH: "/agent/bin",
-      OPENAI_API_KEY: "configured-provider-key",
-    }, {
-      PATH: "/host/bin",
-      HOME: "/Users/runner",
-    })).toEqual({
+    expect(
+      buildNativeProviderEnvironment(
+        {
+          PATH: "/agent/bin",
+          OPENAI_API_KEY: "configured-provider-key",
+        },
+        {
+          PATH: "/host/bin",
+          HOME: "/Users/runner",
+        },
+      ),
+    ).toEqual({
       PATH: "/agent/bin",
       HOME: "/Users/runner",
       OPENAI_API_KEY: "configured-provider-key",
@@ -731,77 +998,113 @@ const execution = {
 
 describe("provider plan synchronization", () => {
   it("prefers the provider's completed Markdown when it is available", () => {
-    expect(providerPlanMarkdown({
-      markdown: "# Release plan\n\n1. Prepare\n2. Deploy",
-      explanation: "This fallback must not replace the completed plan.",
-      steps: [{ body: "Fallback", status: "pending" }],
-    })).toBe("# Release plan\n\n1. Prepare\n2. Deploy");
+    expect(
+      providerPlanMarkdown({
+        markdown: "# Release plan\n\n1. Prepare\n2. Deploy",
+        explanation: "This fallback must not replace the completed plan.",
+        steps: [{ body: "Fallback", status: "pending" }],
+      }),
+    ).toBe("# Release plan\n\n1. Prepare\n2. Deploy");
   });
 
   it("extracts a completed plan from the semantic result artifact", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "<proposed_plan>\n# Health check\n\n1. Add endpoint\n2. Verify it\n</proposed_plan>",
-      }],
-    })).toBe("# Health check\n\n1. Add endpoint\n2. Verify it");
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "<proposed_plan>\n# Health check\n\n1. Add endpoint\n2. Verify it\n</proposed_plan>",
+          },
+        ],
+      }),
+    ).toBe("# Health check\n\n1. Add endpoint\n2. Verify it");
   });
 
   it("decodes the native provider's compact plan reference into readable Markdown", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "native-provider-plan:health-check-endpoint-v1#1-register-GET-health-return-200-json-status-ok;2-add-API-tests",
-      }],
-    })).toBe([
-      "# Health check endpoint",
-      "",
-      "1. Register GET /health return 200 JSON status ok",
-      "2. Add API tests",
-    ].join("\n"));
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "native-provider-plan:health-check-endpoint-v1#1-register-GET-health-return-200-json-status-ok;2-add-API-tests",
+          },
+        ],
+      }),
+    ).toBe(
+      [
+        "# Health check endpoint",
+        "",
+        "1. Register GET /health return 200 JSON status ok",
+        "2. Add API tests",
+      ].join("\n"),
+    );
   });
 
   it("decodes a task-scoped native plan URI", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "native-plan://DOT-13/health-check#1-add-GET-health;2-add-tests",
-      }],
-    })).toBe("# Health check\n\n1. Add GET /health\n2. Add tests");
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "native-plan://DOT-13/health-check#1-add-GET-health;2-add-tests",
+          },
+        ],
+      }),
+    ).toBe("# Health check\n\n1. Add GET /health\n2. Add tests");
   });
 
   it("retains readable Markdown embedded after a native provider plan reference", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "native-provider-plan:DOT-14-health-check-v1\n1. Add `GET /health`.\n2. Add tests.",
-      }],
-    })).toBe("# Health check\n\n1. Add `GET /health`.\n2. Add tests.");
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "native-provider-plan:DOT-14-health-check-v1\n1. Add `GET /health`.\n2. Add tests.",
+          },
+        ],
+      }),
+    ).toBe("# Health check\n\n1. Add `GET /health`.\n2. Add tests.");
   });
 
   it("normalizes a plain numbered native provider plan", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "1. Add GET /health. | 2. Add tests. | 3. Document it.",
-      }],
-    })).toBe("# Plan\n\n1. Add GET /health.\n2. Add tests.\n3. Document it.");
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "1. Add GET /health. | 2. Add tests. | 3. Document it.",
+          },
+        ],
+      }),
+    ).toBe("# Plan\n\n1. Add GET /health.\n2. Add tests.\n3. Document it.");
   });
 
   it("normalizes a task-labelled inline numbered plan", () => {
-    expect(semanticProviderPlanMarkdown({
-      artifacts: [{
-        kind: "native_provider_plan",
-        ref: "DOT-16 plan: (1) add GET /health; (2) add tests; (3) document it.",
-      }],
-    })).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
+    expect(
+      semanticProviderPlanMarkdown({
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "DOT-16 plan: (1) add GET /health; (2) add tests; (3) document it.",
+          },
+        ],
+      }),
+    ).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
   });
 
   it("uses an explicitly numbered semantic summary when the artifact is opaque", () => {
-    expect(semanticProviderPlanMarkdown({
-      summary: "Native provider plan completed: 1) add GET /health; 2) add tests; 3) document it.",
-      artifacts: [{ kind: "native_provider_plan", ref: "native-provider-plan:DOT-18:health-check" }],
-    })).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
+    expect(
+      semanticProviderPlanMarkdown({
+        summary:
+          "Native provider plan completed: 1) add GET /health; 2) add tests; 3) document it.",
+        artifacts: [
+          {
+            kind: "native_provider_plan",
+            ref: "native-provider-plan:DOT-18:health-check",
+          },
+        ],
+      }),
+    ).toBe("# Plan\n\n1. add GET /health\n2. add tests\n3. document it.");
   });
 
   it("renders a bounded Markdown checklist without embedding provenance", () => {
@@ -815,13 +1118,15 @@ describe("provider plan synchronization", () => {
       runId: "must-not-appear",
       providerThreadId: "native-secret",
     });
-    expect(markdown).toBe([
-      "Release safely",
-      "",
-      "- [x] Prepare",
-      "- [ ] Deploy _(in progress)_",
-      "- [ ] Verify _(blocked)_",
-    ].join("\n"));
+    expect(markdown).toBe(
+      [
+        "Release safely",
+        "",
+        "- [x] Prepare",
+        "- [ ] Deploy _(in progress)_",
+        "- [ ] Verify _(blocked)_",
+      ].join("\n"),
+    );
     expect(markdown).not.toContain("must-not-appear");
     expect(markdown).not.toContain("native-secret");
   });
@@ -829,51 +1134,66 @@ describe("provider plan synchronization", () => {
 
 describe("native governed waits", () => {
   it("turns a durable pending interaction into a response-wake result", () => {
-    expect(nativeGovernedWaitResult({
-      interaction: {
-        id: "interaction-1",
-        title: "Choose an output format",
-        summary: null,
-      },
-      completionContract: {
-        revision: "contract-v3",
-        objective: "Create the requested output",
-        criteria: [{ id: "objective", requirement: "The output is created" }],
-      },
-    })).toEqual(expect.objectContaining({
-      schema: "paperclip.run_result.v1",
-      reportedWorkDisposition: "yielded",
-      summary: "Waiting for Choose an output format.",
-      completionClaim: expect.objectContaining({
-        contractRevision: "contract-v3",
-        objectiveSatisfied: false,
-        criteria: [{
-          criterionId: "objective",
-          status: "unknown",
-          evidenceRefs: ["interaction:interaction-1"],
-        }],
+    expect(
+      nativeGovernedWaitResult({
+        interaction: {
+          id: "interaction-1",
+          title: "Choose an output format",
+          summary: null,
+        },
+        completionContract: {
+          revision: "contract-v3",
+          objective: "Create the requested output",
+          criteria: [{ id: "objective", requirement: "The output is created" }],
+        },
       }),
-      evidence: [{ ref: "interaction:interaction-1" }],
-      attentionRequests: [],
-      continuation: {
-        kind: "response_wake",
-        summary: "Resume from the resolved interaction response without repeating prior work.",
-        idempotencyKey: "interaction-response:interaction-1",
-      },
-    }));
+    ).toEqual(
+      expect.objectContaining({
+        schema: "paperclip.run_result.v1",
+        reportedWorkDisposition: "yielded",
+        summary: "Waiting for Choose an output format.",
+        completionClaim: expect.objectContaining({
+          contractRevision: "contract-v3",
+          objectiveSatisfied: false,
+          criteria: [
+            {
+              criterionId: "objective",
+              status: "unknown",
+              evidenceRefs: ["interaction:interaction-1"],
+            },
+          ],
+        }),
+        evidence: [{ ref: "interaction:interaction-1" }],
+        attentionRequests: [],
+        continuation: {
+          kind: "response_wake",
+          summary:
+            "Resume from the resolved interaction response without repeating prior work.",
+          idempotencyKey: "interaction-response:interaction-1",
+        },
+      }),
+    );
   });
 
   it("keeps an authority-checked partial item-verdict interaction as the wait target", () => {
     const partial = structuredClone(execution);
-    partial.interactionResponses = [{
-      interactionId: "interaction-partial",
-      kind: "request_item_verdicts",
-      response: {
-        status: "pending",
-        result: { version: 1, complete: false, items: [{ id: "alpha", verdict: "approve" }] },
+    partial.interactionResponses = [
+      {
+        interactionId: "interaction-partial",
+        kind: "request_item_verdicts",
+        response: {
+          status: "pending",
+          result: {
+            version: 1,
+            complete: false,
+            items: [{ id: "alpha", verdict: "approve" }],
+          },
+        },
       },
-    }];
-    expect(continuingPendingInteractionIds(partial)).toEqual(["interaction-partial"]);
+    ];
+    expect(continuingPendingInteractionIds(partial)).toEqual([
+      "interaction-partial",
+    ]);
 
     partial.interactionResponses[0]!.response.status = "answered";
     expect(continuingPendingInteractionIds(partial)).toEqual([]);
@@ -907,7 +1227,8 @@ function leaseDb(boundExecution: NativeExecutionInputV1 = execution): Db {
     update,
   };
   return {
-    transaction: async (operation: (transaction: Db) => Promise<unknown>) => operation(tx as unknown as Db),
+    transaction: async (operation: (transaction: Db) => Promise<unknown>) =>
+      operation(tx as unknown as Db),
     update,
   } as unknown as Db;
 }
@@ -918,7 +1239,9 @@ describe("native session cancellation", () => {
     state.release = null;
     state.execute.mockReset().mockImplementation(async (options) => {
       options.onSession?.({ cancel: state.cancel });
-      await new Promise<void>((resolve) => { state.release = resolve; });
+      await new Promise<void>((resolve) => {
+        state.release = resolve;
+      });
       options.onSession?.(null);
       return {
         result: { summary: "cancelled" },
@@ -942,14 +1265,20 @@ describe("native session cancellation", () => {
     });
     await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
 
-    await expect(cancelNativeSession(execution.binding.runId, "budget hard stop")).resolves.toBe(true);
-    await expect(cancelNativeSession(execution.binding.runId, "duplicate budget stop")).resolves.toBe(true);
+    await expect(
+      cancelNativeSession(execution.binding.runId, "budget hard stop"),
+    ).resolves.toBe(true);
+    await expect(
+      cancelNativeSession(execution.binding.runId, "duplicate budget stop"),
+    ).resolves.toBe(true);
     expect(state.cancel).toHaveBeenCalledWith({ reason: "budget hard stop" });
     expect(state.cancel).toHaveBeenCalledTimes(1);
 
     state.release?.();
     await running;
-    await expect(cancelNativeSession(execution.binding.runId, "late cancel")).resolves.toBe(false);
+    await expect(
+      cancelNativeSession(execution.binding.runId, "late cancel"),
+    ).resolves.toBe(false);
   });
 
   it("allows cancellation to be retried when the session dispatch fails", async () => {
@@ -961,11 +1290,15 @@ describe("native session cancellation", () => {
     });
     await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
 
-    await expect(cancelNativeSession(execution.binding.runId, "budget hard stop"))
-      .rejects.toThrow("transport unavailable");
-    await expect(cancelNativeSession(execution.binding.runId, "retry budget stop"))
-      .resolves.toBe(true);
-    expect(state.cancel).toHaveBeenNthCalledWith(2, { reason: "retry budget stop" });
+    await expect(
+      cancelNativeSession(execution.binding.runId, "budget hard stop"),
+    ).rejects.toThrow("transport unavailable");
+    await expect(
+      cancelNativeSession(execution.binding.runId, "retry budget stop"),
+    ).resolves.toBe(true);
+    expect(state.cancel).toHaveBeenNthCalledWith(2, {
+      reason: "retry budget stop",
+    });
 
     state.release?.();
     await running;
@@ -984,7 +1317,9 @@ describe("native session same-turn steering", () => {
     steer.mockReset().mockResolvedValue(undefined);
     state.execute.mockReset().mockImplementation(async (options) => {
       options.onSession?.({ capabilities, snapshot, steer, cancel: vi.fn() });
-      await new Promise<void>((resolve) => { state.release = resolve; });
+      await new Promise<void>((resolve) => {
+        state.release = resolve;
+      });
       options.onSession?.(null);
       return {
         result: { summary: "completed" },
@@ -1013,15 +1348,19 @@ describe("native session same-turn steering", () => {
   it("correlates the queued comment with the active provider turn acknowledgement", async () => {
     const { running } = await startActiveSession();
 
-    await expect(getNativeSessionSteeringState(execution.binding.runId)).resolves.toEqual({
+    await expect(
+      getNativeSessionSteeringState(execution.binding.runId),
+    ).resolves.toEqual({
       disposition: "available",
       activeTurnId: "provider-turn-1",
     });
-    await expect(steerNativeSession({
-      runId: execution.binding.runId,
-      message: "Check mobile overflow first.",
-      correlationId: "queued-comment-1",
-    })).resolves.toEqual({ turnId: "provider-turn-1" });
+    await expect(
+      steerNativeSession({
+        runId: execution.binding.runId,
+        message: "Check mobile overflow first.",
+        correlationId: "queued-comment-1",
+      }),
+    ).resolves.toEqual({ turnId: "provider-turn-1" });
     expect(steer).toHaveBeenCalledWith({
       turnId: "provider-turn-1",
       message: { role: "user", text: "Check mobile overflow first." },
@@ -1092,7 +1431,12 @@ describe("native warm session supervision", () => {
         ...execution.binding,
         executionWorkspaceId: "workspace",
       },
-      workspace: { cwd: "/tmp/warm-native", repoUrl: null, repoRef: null, branchName: null },
+      workspace: {
+        cwd: "/tmp/warm-native",
+        repoUrl: null,
+        repoRef: null,
+        branchName: null,
+      },
       session: {
         normalizedSessionId: "session-warm-native",
         driverKind: "codex_app_server" as const,
@@ -1116,7 +1460,8 @@ describe("native warm session supervision", () => {
       highestContiguousSourceSeq: 1,
       usage: null,
     };
-    state.execute.mockReset()
+    state.execute
+      .mockReset()
       .mockImplementationOnce(async (options) => {
         expect(options.existingSession).toBeUndefined();
         options.onSession?.(sharedSession);
@@ -1127,12 +1472,24 @@ describe("native warm session supervision", () => {
         return result;
       });
 
-    await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner" });
-    await executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: "runner" });
+    await executePaperclipNativeSession({
+      db: leaseDb(base),
+      execution: base,
+      runnerInstanceId: "runner",
+    });
+    await executePaperclipNativeSession({
+      db: leaseDb(second),
+      execution: second,
+      runnerInstanceId: "runner",
+    });
     expect(close).not.toHaveBeenCalled();
-    await vi.waitFor(() => expect(close).toHaveBeenCalledWith({
-      reason: "warm native session idle timeout",
-    }), { timeout: 500 });
+    await vi.waitFor(
+      () =>
+        expect(close).toHaveBeenCalledWith({
+          reason: "warm native session idle timeout",
+        }),
+      { timeout: 500 },
+    );
   });
 
   it("replaces an idle warm provider session when its pinned permission mode changes", async () => {
@@ -1144,8 +1501,17 @@ describe("native warm session supervision", () => {
       ...execution,
       schema: "paperclip.native-execution-input.v4",
       provider: { kind: "codex", model: null, approvalPolicy: "never" },
-      binding: { ...execution.binding, runId: "run-permission-never", executionWorkspaceId: "workspace" },
-      workspace: { cwd: "/tmp/warm-native-permission", repoUrl: null, repoRef: null, branchName: null },
+      binding: {
+        ...execution.binding,
+        runId: "run-permission-never",
+        executionWorkspaceId: "workspace",
+      },
+      workspace: {
+        cwd: "/tmp/warm-native-permission",
+        repoUrl: null,
+        repoRef: null,
+        branchName: null,
+      },
       session: {
         normalizedSessionId: "session-warm-permission",
         driverKind: "codex_app_server" as const,
@@ -1171,7 +1537,8 @@ describe("native warm session supervision", () => {
       highestContiguousSourceSeq: 1,
       usage: null,
     };
-    state.execute.mockReset()
+    state.execute
+      .mockReset()
       .mockImplementationOnce(async (options) => {
         expect(options.existingSession).toBeUndefined();
         options.onSession?.(firstSession);
@@ -1183,53 +1550,109 @@ describe("native warm session supervision", () => {
         return result;
       });
 
-    await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner" });
-    await executePaperclipNativeSession({ db: leaseDb(lowered), execution: lowered, runnerInstanceId: "runner" });
-    expect(firstClose).toHaveBeenCalledWith({ reason: "warm native session configuration changed" });
-    await vi.waitFor(() => expect(secondClose).toHaveBeenCalledWith({
-      reason: "warm native session idle timeout",
-    }), { timeout: 500 });
+    await executePaperclipNativeSession({
+      db: leaseDb(base),
+      execution: base,
+      runnerInstanceId: "runner",
+    });
+    await executePaperclipNativeSession({
+      db: leaseDb(lowered),
+      execution: lowered,
+      runnerInstanceId: "runner",
+    });
+    expect(firstClose).toHaveBeenCalledWith({
+      reason: "warm native session configuration changed",
+    });
+    await vi.waitFor(
+      () =>
+        expect(secondClose).toHaveBeenCalledWith({
+          reason: "warm native session idle timeout",
+        }),
+      { timeout: 500 },
+    );
   });
 });
 
 describe("native session bounded recovery", () => {
   it("preserves stable provider and runner failure causes", () => {
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_frame_too_large: harness stdout frame exceeded 4194304 bytes",
-    ))).toBe("provider_frame_too_large");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "native_runner_process_exited: runnerd exited unexpectedly with code 1",
-    ))).toBe("native_runner_process_exited");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_transport_failed: invalid JSON-RPC",
-    ))).toBe("provider_transport_failed");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "planning_mode_unsupported: installed Codex app-server did not confirm plan mode",
-    ))).toBe("planning_mode_unsupported");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "native_event_replay_conflict: source sequence 41 contained different bytes",
-    ))).toBe("native_event_replay_conflict");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_process_exited: provider=acpx stage=initialize exitCode=1",
-    ))).toBe("provider_process_exited");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_stdout_closed: provider=codex stage=initialize",
-    ))).toBe("provider_stdout_closed");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_process_status_failed: provider=acpx stage=session.open",
-    ))).toBe("provider_process_status_failed");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_initialize_timeout: provider=opencode stage=health",
-    ))).toBe("provider_initialize_timeout");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_initialize_protocol_error: provider=codex stage=initialize",
-    ))).toBe("provider_initialize_protocol_error");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "provider_request_timeout: provider=acpx stage=run.attach",
-    ))).toBe("provider_request_timeout");
-    expect(nativeSessionFailureSourceCode(new Error(
-      "runner_remote_provider_artifact_incompatible: OpenCode version mismatch",
-    ))).toBe("runner_remote_provider_artifact_incompatible");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "provider_frame_too_large: harness stdout frame exceeded 4194304 bytes",
+        ),
+      ),
+    ).toBe("provider_frame_too_large");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "native_runner_process_exited: runnerd exited unexpectedly with code 1",
+        ),
+      ),
+    ).toBe("native_runner_process_exited");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error("provider_transport_failed: invalid JSON-RPC"),
+      ),
+    ).toBe("provider_transport_failed");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "planning_mode_unsupported: installed Codex app-server did not confirm plan mode",
+        ),
+      ),
+    ).toBe("planning_mode_unsupported");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "native_event_replay_conflict: source sequence 41 contained different bytes",
+        ),
+      ),
+    ).toBe("native_event_replay_conflict");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "provider_process_exited: provider=acpx stage=initialize exitCode=1",
+        ),
+      ),
+    ).toBe("provider_process_exited");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error("provider_stdout_closed: provider=codex stage=initialize"),
+      ),
+    ).toBe("provider_stdout_closed");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "provider_process_status_failed: provider=acpx stage=session.open",
+        ),
+      ),
+    ).toBe("provider_process_status_failed");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "provider_initialize_timeout: provider=opencode stage=health",
+        ),
+      ),
+    ).toBe("provider_initialize_timeout");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "provider_initialize_protocol_error: provider=codex stage=initialize",
+        ),
+      ),
+    ).toBe("provider_initialize_protocol_error");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error("provider_request_timeout: provider=acpx stage=run.attach"),
+      ),
+    ).toBe("provider_request_timeout");
+    expect(
+      nativeSessionFailureSourceCode(
+        new Error(
+          "runner_remote_provider_artifact_incompatible: OpenCode version mismatch",
+        ),
+      ),
+    ).toBe("runner_remote_provider_artifact_incompatible");
   });
 
   it("retries the same run twice and stops at the third failed attempt", () => {
@@ -1249,16 +1672,20 @@ describe("native session bounded recovery", () => {
       failureCode: "native_session_retry_exhausted",
       nextAttemptAt: null,
     });
-    expect(nativeSessionFailureDisposition(1, now, "native_event_replay_conflict")).toEqual({
+    expect(
+      nativeSessionFailureDisposition(1, now, "native_event_replay_conflict"),
+    ).toEqual({
       phase: "terminal_failure",
       failureCode: "native_event_replay_conflict",
       nextAttemptAt: null,
     });
-    expect(nativeSessionFailureDisposition(
-      1,
-      now,
-      "runner_remote_provider_artifact_incompatible",
-    )).toEqual({
+    expect(
+      nativeSessionFailureDisposition(
+        1,
+        now,
+        "runner_remote_provider_artifact_incompatible",
+      ),
+    ).toEqual({
       phase: "terminal_failure",
       failureCode: "runner_remote_provider_artifact_incompatible",
       nextAttemptAt: null,
@@ -1266,11 +1693,13 @@ describe("native session bounded recovery", () => {
   });
 
   it("escalates exhausted result-less sessions to board review instead of leaving the provider as its own owner", () => {
-    expect(nativeSessionRecoveryProjection({
-      phase: "retryable_failure",
-      failureCode: "native_session_interrupted",
-      agentId: "agent-low-capability",
-    })).toEqual({
+    expect(
+      nativeSessionRecoveryProjection({
+        phase: "retryable_failure",
+        failureCode: "native_session_interrupted",
+        agentId: "agent-low-capability",
+      }),
+    ).toEqual({
       exhausted: false,
       issueStatus: null,
       recoveryOwner: { kind: "agent", agentId: "agent-low-capability" },
@@ -1279,11 +1708,13 @@ describe("native session bounded recovery", () => {
       recoveryActionCause: "native_session_interrupted",
       supersedeOnIdentityChange: true,
     });
-    expect(nativeSessionRecoveryProjection({
-      phase: "terminal_failure",
-      failureCode: "native_session_retry_exhausted",
-      agentId: "agent-low-capability",
-    })).toEqual({
+    expect(
+      nativeSessionRecoveryProjection({
+        phase: "terminal_failure",
+        failureCode: "native_session_retry_exhausted",
+        agentId: "agent-low-capability",
+      }),
+    ).toEqual({
       exhausted: true,
       issueStatus: "in_review",
       recoveryOwner: { kind: "board" },
@@ -1330,10 +1761,13 @@ describe("native process ownership", () => {
       onSpawn,
     });
 
-    expect(state.createBackend).toHaveBeenCalledWith(execution, expect.objectContaining({
-      runnerInstanceId: "runner",
-      onSpawn,
-    }));
+    expect(state.createBackend).toHaveBeenCalledWith(
+      execution,
+      expect.objectContaining({
+        runnerInstanceId: "runner",
+        onSpawn,
+      }),
+    );
     expect(onSpawn).toHaveBeenCalledWith(processMetadata);
   });
 });
@@ -1410,7 +1844,9 @@ describe("runnerd provider runtime wiring", () => {
     });
 
     expect(state.createBackend).toHaveBeenCalledWith(
-      expect.objectContaining({ workspace: expect.objectContaining({ cwd: remoteCwd }) }),
+      expect.objectContaining({
+        workspace: expect.objectContaining({ cwd: remoteCwd }),
+      }),
       expect.any(Object),
     );
     expect(state.execute).toHaveBeenCalledWith(
@@ -1433,7 +1869,12 @@ describe("runnerd provider runtime wiring", () => {
         prompt: "Complete the ACPX task.",
         workMode: "standard",
       },
-      workspace: { cwd: "/tmp/acpx-native", repoUrl: null, repoRef: null, branchName: null },
+      workspace: {
+        cwd: "/tmp/acpx-native",
+        repoUrl: null,
+        repoRef: null,
+        branchName: null,
+      },
       session: {
         normalizedSessionId: "acpx-session",
         driverKind: "acpx_runtime",
@@ -1471,8 +1912,13 @@ describe("runnerd provider runtime wiring", () => {
       runnerInstanceId: "runner",
     });
 
-    expect(state.createBackend).toHaveBeenCalledWith(acpxExecution, expect.objectContaining({
-      acpxRuntimeDirectory: expect.stringContaining("/runtime/paperclip-runner/acpx"),
-    }));
+    expect(state.createBackend).toHaveBeenCalledWith(
+      acpxExecution,
+      expect.objectContaining({
+        acpxRuntimeDirectory: expect.stringContaining(
+          "/runtime/paperclip-runner/acpx",
+        ),
+      }),
+    );
   });
 });

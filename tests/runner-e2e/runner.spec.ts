@@ -55,6 +55,7 @@ interface RunRecord {
   retryOfRunId?: string | null;
   runnerInstanceId?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
+  runnerProfileJson?: Record<string, unknown> | null;
   usageJson?: Record<string, unknown> | null;
   resultJson?: Record<string, unknown> | null;
   error?: string | null;
@@ -314,7 +315,7 @@ for (const execution of executions) {
 
     const captureFailureApiState = async () => {
       if (!fixtures || !issue) return;
-      const capture = async <T,>(operation: () => Promise<T>) =>
+      const capture = async <T>(operation: () => Promise<T>) =>
         operation().catch((error) => ({
           evidenceCaptureError:
             error instanceof Error ? error.message : String(error),
@@ -339,10 +340,7 @@ for (const execution of executions) {
           ),
         ]);
       const taskRuns = Array.isArray(listedRuns)
-        ? matchingRuns(
-            listedRuns,
-            "id" in currentIssue ? currentIssue : issue,
-          )
+        ? matchingRuns(listedRuns, "id" in currentIssue ? currentIssue : issue)
         : [];
       const detailedRuns = await Promise.all(
         taskRuns.map((candidate) =>
@@ -754,8 +752,22 @@ for (const execution of executions) {
             (candidate) => comment.createdByRunId === candidate.id,
           ),
       );
+      // A native run can reach its terminal status just before the accepted
+      // semantic result is projected into the issue comment list. The task UI
+      // already renders that accepted result immediately, so include its
+      // public run-detail summary in the message matcher input and retain the
+      // separate browser assertion below as the visible-source-of-truth check.
+      const semanticSummaries = selectedRuns.flatMap((candidate) => {
+        const profile = record(candidate.runnerProfileJson);
+        const checkpoint = record(profile.sessionCheckpoint);
+        const semanticResult = record(checkpoint.semanticResult);
+        return typeof semanticResult.summary === "string"
+          ? [semanticResult.summary]
+          : [];
+      });
       const message = agentComments
         .map((comment) => comment.body ?? "")
+        .concat(semanticSummaries)
         .join("\n");
       const pendingInteractions = terminal.interactions.filter(
         (interaction) => interaction.status === "pending",
