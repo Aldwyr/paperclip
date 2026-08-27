@@ -65,6 +65,7 @@ import {
   steerNativeSession,
   syncRemoteRunnerDirectoryOut,
   verifyNativeHarnessBackup,
+  shouldRestoreNativeHarnessBackupIntoSandbox,
 } from "./native-session-executor.js";
 
 describe("remote provider pack manifest", () => {
@@ -235,6 +236,30 @@ describe("verified native harness backups", () => {
       lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
     },
   } as unknown as NativeExecutionInputV1;
+
+  it("restores a verified continuation into an intentionally fresh non-reusable sandbox", () => {
+    expect(
+      shouldRestoreNativeHarnessBackupIntoSandbox({
+        acquisitionOutcome: "created",
+        reusableLeaseConfigured: false,
+        backupAvailable: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRestoreNativeHarnessBackupIntoSandbox({
+        acquisitionOutcome: "created",
+        reusableLeaseConfigured: true,
+        backupAvailable: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRestoreNativeHarnessBackupIntoSandbox({
+        acquisitionOutcome: "created",
+        reusableLeaseConfigured: false,
+        backupAvailable: false,
+      }),
+    ).toBe(false);
+  });
 
   it("accepts a complete digest-matched backup and rejects corruption", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-harness-backup-"));

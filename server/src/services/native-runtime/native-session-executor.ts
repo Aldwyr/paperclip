@@ -1095,6 +1095,18 @@ type VerifiedHarnessBackup = {
   bytes: number;
 };
 
+export function shouldRestoreNativeHarnessBackupIntoSandbox(input: {
+  acquisitionOutcome: "created" | "resumed" | "replacement" | null;
+  reusableLeaseConfigured: boolean | null | undefined;
+  backupAvailable: boolean;
+}): boolean {
+  return (
+    input.acquisitionOutcome === "created" &&
+    input.reusableLeaseConfigured === false &&
+    input.backupAvailable
+  );
+}
+
 function compatibleNativeHarnessBackupManifests(input: {
   root: string;
   execution: NativeExecutionInput;
@@ -4273,6 +4285,40 @@ export function createRunnerdBackend(input: {
     });
   };
 
+  const recordHarnessBackupStampForCurrentLease = async (
+    backup: VerifiedHarnessBackup,
+  ) => {
+    if (remoteTarget?.transport !== "sandbox" || !remoteTarget.leaseId) {
+      return;
+    }
+    const leaseRow = await input.db
+      .select({ metadata: environmentLeases.metadata })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, remoteTarget.leaseId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!leaseRow) throw new Error("runner_harness_backup_lease_missing");
+    const stamp = createNativeHarnessBackupStamp({
+      manifestPath: resolve(backup.root, "manifest.json"),
+      normalizedSessionId: backup.manifest.normalizedSessionId,
+      runnerInstanceId: backup.manifest.runnerInstanceId,
+      completedAt: backup.manifest.completedAt,
+    });
+    const updated = await input.db
+      .update(environmentLeases)
+      .set({
+        metadata: {
+          ...(leaseRow.metadata ?? {}),
+          nativeHarnessBackup: stamp,
+        },
+        updatedAt: new Date(),
+      })
+      .where(eq(environmentLeases.id, remoteTarget.leaseId))
+      .returning({ id: environmentLeases.id })
+      .then((rows) => rows[0] ?? null);
+    if (!updated) throw new Error("runner_harness_backup_lease_missing");
+  };
+
   const restoreVerifiedHarnessBackup = async () => {
     if (!remoteTarget || !remoteCommandRunner) {
       throw new Error("runner_harness_backup_unavailable");
@@ -4319,6 +4365,12 @@ export function createRunnerdBackend(input: {
     ) {
       throw new Error("runner_harness_state_mismatch");
     }
+    // A deliberately non-reusable environment receives a fresh provider lease
+    // for every turn. Stamp that new lease as soon as the verified host backup
+    // has been restored so a later provider/bootstrap failure can still clean
+    // the ephemeral sandbox up without discarding the only durable copy.
+    await recordHarnessBackupStampForCurrentLease(backup);
+    return backup;
   };
 
   const materializeRemoteHarnessLaunchState = async () => {
@@ -4390,6 +4442,17 @@ export function createRunnerdBackend(input: {
                 remoteCommandRunner
               ) {
                 const acquisitionRecordedAtMs = Date.now();
+                const backupAvailable = harnessBackupCandidates(root).some(
+                  (candidate) => existsSync(resolve(candidate, "manifest.json")),
+                );
+                const restoreIntoCreatedSandbox =
+                  shouldRestoreNativeHarnessBackupIntoSandbox({
+                    acquisitionOutcome:
+                      sandboxLeaseAcquisition?.outcome ?? null,
+                    reusableLeaseConfigured:
+                      remoteTarget.reusableLeaseConfigured,
+                    backupAvailable,
+                  });
                 await input.trace?.record({
                   name: "sandbox.lease.acquisition",
                   startedAtMs: acquisitionRecordedAtMs,
@@ -4400,7 +4463,8 @@ export function createRunnerdBackend(input: {
                     lifecycleMode: input.execution.session.lifecyclePolicy.mode,
                     outcome: sandboxLeaseAcquisition?.outcome ?? "unknown",
                     stateSource:
-                      sandboxLeaseAcquisition?.outcome === "replacement"
+                      sandboxLeaseAcquisition?.outcome === "replacement" ||
+                      restoreIntoCreatedSandbox
                         ? "verified_failover_backup"
                         : sandboxLeaseAcquisition?.outcome === "resumed"
                           ? "sandbox_filesystem"
@@ -4447,6 +4511,22 @@ export function createRunnerdBackend(input: {
                       },
                     },
                   );
+                } else if (restoreIntoCreatedSandbox) {
+                  await measureNativeRunnerSpan(
+                    input.trace,
+                    "sandbox.lease.replacement",
+                    restoreVerifiedHarnessBackup,
+                    {
+                      attributes: {
+                        provider: remoteTarget.providerKey ?? "sandbox",
+                        harness: input.execution.session.driverKind,
+                        lifecycleMode:
+                          input.execution.session.lifecyclePolicy.mode,
+                        outcome: "created",
+                        reason: "reuse_disabled",
+                      },
+                    },
+                  );
                 } else {
                   const reuseStartedAtMs = Date.now();
                   const state = await inspectRemoteHarnessState();
@@ -4457,11 +4537,7 @@ export function createRunnerdBackend(input: {
                       state.runnerState,
                       reuseStartedAtMs,
                     );
-                  } else if (
-                    harnessBackupCandidates(root).some((candidate) =>
-                      existsSync(resolve(candidate, "manifest.json")),
-                    )
-                  ) {
+                  } else if (backupAvailable) {
                     // A continuation that has a durable backup but no recorded reusable
                     // lease was not provider-confirmed lost. Never silently create a new
                     // provider session from that ambiguous state.
@@ -4689,34 +4765,11 @@ export function createRunnerdBackend(input: {
                   remoteTarget?.transport === "sandbox" &&
                   remoteTarget.leaseId
                 ) {
-                  const leaseRow = await input.db
-                    .select({ metadata: environmentLeases.metadata })
-                    .from(environmentLeases)
-                    .where(eq(environmentLeases.id, remoteTarget.leaseId))
-                    .limit(1)
-                    .then((rows) => rows[0] ?? null);
-                  if (!leaseRow)
-                    throw new Error("runner_harness_backup_lease_missing");
-                  const stamp = createNativeHarnessBackupStamp({
-                    manifestPath: resolve(currentRoot, "manifest.json"),
-                    normalizedSessionId: manifest.normalizedSessionId,
-                    runnerInstanceId: manifest.runnerInstanceId,
-                    completedAt: manifest.completedAt,
+                  await recordHarnessBackupStampForCurrentLease({
+                    root: currentRoot,
+                    manifest,
+                    bytes: backupSpanAttributes.bytesTransferred,
                   });
-                  const updated = await input.db
-                    .update(environmentLeases)
-                    .set({
-                      metadata: {
-                        ...(leaseRow.metadata ?? {}),
-                        nativeHarnessBackup: stamp,
-                      },
-                      updatedAt: new Date(),
-                    })
-                    .where(eq(environmentLeases.id, remoteTarget.leaseId))
-                    .returning({ id: environmentLeases.id })
-                    .then((rows) => rows[0] ?? null);
-                  if (!updated)
-                    throw new Error("runner_harness_backup_lease_missing");
                 }
               } catch (error) {
                 if (existsSync(currentRoot)) {
