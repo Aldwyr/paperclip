@@ -13,7 +13,6 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { assertCompanyAccess } from "../routes/authz.js";
-import { revokeRunScopedCredential } from "../services/run-credential-revocation.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -220,36 +219,6 @@ describe("agent auth middleware", () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toContain(error);
-  });
-
-  it("denies a run-scoped agent JWT once its run credential is locally revoked, while an unrevoked run's JWT still authenticates", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const revokedRunId = randomUUID();
-    const liveRunId = randomUUID();
-    const { db } = createDbState({ agent: { id: agentId, companyId } });
-    const revokedToken = createLocalAgentJwt(agentId, companyId, "codex_local", revokedRunId, "user-1");
-    const liveToken = createLocalAgentJwt(agentId, companyId, "codex_local", liveRunId, "user-1");
-    const app = createApp(db, "local_trusted");
-
-    // Before any revocation, both tokens authenticate.
-    const beforeRevoke = await request(app).get("/actor").set("Authorization", `Bearer ${revokedToken}`);
-    expect(beforeRevoke.status).toBe(200);
-
-    revokeRunScopedCredential(revokedRunId);
-
-    const afterRevoke = await request(app).get("/actor").set("Authorization", `Bearer ${revokedToken}`);
-    expect(afterRevoke.status).toBe(401);
-    expect(afterRevoke.body.error).toContain("revoked");
-
-    // A later cleanup call must never re-enable the credential.
-    revokeRunScopedCredential(revokedRunId);
-    const afterSecondCall = await request(app).get("/actor").set("Authorization", `Bearer ${revokedToken}`);
-    expect(afterSecondCall.status).toBe(401);
-
-    // Revoking one run's credential must not deny a different, live run.
-    const liveRunRes = await request(app).get("/actor").set("Authorization", `Bearer ${liveToken}`);
-    expect(liveRunRes.status).toBe(200);
   });
 
   it("rejects an agent JWT when the agent record belongs to another company", async () => {

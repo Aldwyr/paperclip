@@ -24,10 +24,22 @@ export interface LocalAgentJwtClaims {
 
 const JWT_ALGORITHM = "HS256";
 
+// 48h default, matching DEFAULT_AGENT_JWT_TTL_SECONDS in cli/src/commands/env.ts.
+const DEFAULT_AGENT_JWT_TTL_SECONDS = 60 * 60 * 48;
+
 function parseNumber(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.floor(parsed);
+}
+
+/**
+ * Read the configured local-agent JWT lifetime, in seconds. A revocation
+ * record uses this value to bound its own lifetime: a token cannot outlive
+ * its signed `exp`, so a revocation record needs to live no longer than that.
+ */
+export function resolveAgentJwtTtlSeconds(): number {
+  return parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, DEFAULT_AGENT_JWT_TTL_SECONDS);
 }
 
 function parseBooleanEnv(value: string | undefined): boolean {
@@ -48,7 +60,7 @@ function jwtConfig() {
     // including host-suspension gaps: heartbeats scheduled while a laptop lid is
     // closed fire during ~2s dark wakes, and the spawned session can then sit
     // frozen for over an hour before it first executes.
-    ttlSeconds: parseNumber(process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS, 60 * 60 * 48),
+    ttlSeconds: resolveAgentJwtTtlSeconds(),
     issuer: process.env.PAPERCLIP_AGENT_JWT_ISSUER ?? "paperclip",
     audience: process.env.PAPERCLIP_AGENT_JWT_AUDIENCE ?? "paperclip-api",
     // The control-plane instance this process belongs to. The live plane runs as

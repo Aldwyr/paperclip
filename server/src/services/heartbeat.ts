@@ -16307,7 +16307,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             onSpawn,
             authToken: authToken ?? undefined,
             onInvalidateRunCredential: async () => {
-              revokeRunScopedCredential(run.id);
+              // Await the durable write here, before the adapter returns and
+              // the run finalizes. A write fault must propagate: it fails
+              // the run closed instead of letting an unrevoked credential
+              // stay live past the point the engine decided to revoke it.
+              await revokeRunScopedCredential(db, {
+                companyId: agent.companyId,
+                runId: run.id,
+              });
             },
           });
         }

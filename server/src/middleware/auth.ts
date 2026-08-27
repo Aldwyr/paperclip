@@ -325,7 +325,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      if (isRunScopedCredentialRevoked(claims.run_id)) {
+      if (await isRunScopedCredentialRevoked(db, { companyId: claims.company_id, runId: claims.run_id })) {
         next(unauthorized("Run-scoped agent token was revoked; obtain fresh credentials and retry"));
         return;
       }
