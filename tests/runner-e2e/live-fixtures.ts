@@ -1,3 +1,4 @@
+import path from "node:path";
 import { FixtureRegistry } from "./fixture-registry.js";
 import type { RunnerApi } from "./api.js";
 import type {
@@ -15,6 +16,11 @@ interface CompanyRecord {
 
 interface SecretRecord {
   id: string;
+}
+interface PluginRecord {
+  id: string;
+  pluginKey: string;
+  status: string;
 }
 interface EnvironmentRecord {
   id: string;
@@ -74,6 +80,26 @@ export async function setupLiveFixtures(input: {
   const { api, execution } = input;
   const registry = new FixtureRegistry();
 
+  if (execution.environment.id === "daytona") {
+    registry.register<PluginRecord>({
+      id: "sandbox-provider",
+      async setup() {
+        return api.post<PluginRecord>("/api/plugins/install", {
+          packageName: path.resolve(
+            import.meta.dirname,
+            "../../packages/plugins/sandbox-providers/daytona",
+          ),
+          isLocalPath: true,
+        });
+      },
+      async teardown() {
+        // The plugin is installed only in the isolated instance/database. The
+        // launcher removes that complete instance after the environment lease
+        // has been destroyed, so no global uninstall mutation is necessary.
+      },
+    });
+  }
+
   registry.register<CompanyRecord>({
     id: "company",
     async setup() {
@@ -120,7 +146,13 @@ export async function setupLiveFixtures(input: {
 
   registry.register<EnvironmentRecord>({
     id: "environment",
-    dependencies: ["company", "secrets"],
+    dependencies: [
+      "company",
+      "secrets",
+      ...(execution.environment.id === "daytona"
+        ? ["sandbox-provider"]
+        : []),
+    ],
     async setup(resolved) {
       const company = value<CompanyRecord>(resolved, "company");
       const secretRefs = value<SecretReferenceMap>(resolved, "secrets");

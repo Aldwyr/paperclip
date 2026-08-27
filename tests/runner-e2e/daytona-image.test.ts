@@ -32,12 +32,14 @@ describe("runner E2E Daytona image contract", () => {
     }
     for (const transport of ["dial_ws_loopback", "dial_wss", "listen_ws"]) {
       expect(dockerfile).toContain(transport);
-      expect(workflow).toContain(transport);
     }
-    expect(workflow).toContain('"binaryContractVersion":2');
+    expect(dockerfile).toContain('metadata="$(paperclip-runnerd --build-metadata)"');
+    expect(dockerfile).toContain("provider-pack.json");
     expect(workflow).toContain("--platform linux/amd64");
     expect(workflow).toContain("cosign sign --yes");
-    expect(workflow).toContain(".runnerSourceRevision == $revision");
+    expect(workflow).toContain("docker image inspect");
+    expect(workflow).toContain('.Config.User == "daytona"');
+    expect(workflow).toContain("PAPERCLIP_RUNNER_PROVIDER_PACK_ROOT=");
     expect(workflow).toContain("anonymous_config");
   });
 });
