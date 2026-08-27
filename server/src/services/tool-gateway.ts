@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   approvals,
   companies,
   companyMemberships,
+  companySecrets,
   connectionGrantMembers,
   connectionGrantDelegations,
   connectionGrants,
@@ -203,6 +204,8 @@ export interface ToolGatewaySession {
   gatewayTokenAllowedActions?: ToolMcpGatewayTokenAction[];
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string | null;
+  /** Human whose personal connection grant applies to this execution. */
+  responsibleUserId?: string | null;
   createdAt: Date;
   expiresAt: Date;
 }
@@ -917,7 +920,15 @@ export function createToolGatewayService(
         inArray(toolConnections.transport, ["mcp_remote", "local_stdio"]),
         eq(toolConnections.status, "active"),
         eq(toolConnections.enabled, true),
-        inArray(toolConnections.healthStatus, ["ok", "healthy"]),
+        // A personal connection has no company-level credential to probe. A
+        // credential-less health sweep can therefore mark it as errored even
+        // while the responsible user's grant is valid. Keep its cached active
+        // catalog discoverable; execution resolves and validates that user's
+        // grant, and a successful call restores the shared health indicator.
+        or(
+          inArray(toolConnections.healthStatus, ["ok", "healthy"]),
+          eq(toolConnections.credentialPolicy, "per_user"),
+        ),
         eq(toolApplications.companyId, companyId),
         inArray(toolApplications.type, ["mcp_http", "mcp_stdio"]),
         eq(toolApplications.status, "active"),
@@ -2441,6 +2452,73 @@ export function createToolGatewayService(
     );
   }
 
+  async function resolveGrantSecretValue(
+    session: ToolGatewaySession,
+    connection: typeof toolConnections.$inferSelect,
+    grant: typeof connectionGrants.$inferSelect,
+    ref: ToolCredentialSecretRef,
+    configPath = ref.configPath,
+  ): Promise<string> {
+    const accessContext = {
+      consumerType: "tool_connection" as const,
+      consumerId: connection.id,
+      configPath,
+      actorType: "system" as const,
+      actorId: session.agentId,
+      responsibleUserId: grant.subjectUserId,
+      issueId: session.issueId,
+      heartbeatRunId: session.runId,
+    };
+    if (grant.kind !== "user") {
+      return secrets.resolveSecretValue(
+        connection.companyId,
+        ref.secretId,
+        ref.versionSelector ?? "latest",
+        { accessContext },
+      );
+    }
+    if (!grant.subjectUserId) {
+      throw new ToolGatewayHttpError(422, "Personal authorization has no owner", "grant_owner_missing", {
+        connectionId: connection.id,
+        grantId: grant.id,
+      });
+    }
+    const [secret] = await db.select({
+      scope: companySecrets.scope,
+      ownerUserId: companySecrets.ownerUserId,
+      userSecretDefinitionId: companySecrets.userSecretDefinitionId,
+    }).from(companySecrets).where(and(
+      eq(companySecrets.id, ref.secretId),
+      eq(companySecrets.companyId, connection.companyId),
+    )).limit(1);
+    if (
+      !secret
+      || secret.scope !== "user"
+      || secret.ownerUserId !== grant.subjectUserId
+      || !secret.userSecretDefinitionId
+    ) {
+      throw new ToolGatewayHttpError(422, "Personal authorization has an invalid credential", "grant_credential_invalid", {
+        connectionId: connection.id,
+        grantId: grant.id,
+        credential: configPath,
+      });
+    }
+    const resolved = await secrets.resolveUserSecretValue(connection.companyId, {
+      definitionId: secret.userSecretDefinitionId,
+      responsibleUserId: grant.subjectUserId,
+      version: ref.versionSelector ?? "latest",
+      required: ref.required ?? true,
+    }, accessContext);
+    if (!resolved) {
+      throw new ToolGatewayHttpError(422, "Personal credential is not configured", "user_secret_missing", {
+        connectionId: connection.id,
+        grantId: grant.id,
+        credential: configPath,
+      });
+    }
+    return resolved.value;
+  }
+
   async function maybeRefreshPaperclipIdGmailGrant(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
@@ -2475,22 +2553,7 @@ export function createToolGatewayService(
           grantId: grant.id,
         });
       }
-      const refreshToken = await secrets.resolveSecretValue(
-        connection.companyId,
-        refreshRef.secretId,
-        refreshRef.versionSelector ?? "latest",
-        {
-          accessContext: {
-            consumerType: "tool_connection",
-            consumerId: connection.id,
-            configPath: refreshRef.configPath,
-            actorType: "system",
-            actorId: session.agentId,
-            issueId: session.issueId,
-            heartbeatRunId: session.runId,
-          },
-        },
-      );
+      const refreshToken = await resolveGrantSecretValue(session, connection, grant, refreshRef);
       try {
         const credentials = await gmailConnector.refresh({
           subject: grant.subjectUserId,
@@ -2557,17 +2620,13 @@ export function createToolGatewayService(
       const grantRef = grantRefForHeader(grant, ref);
       if (!grantRef) continue;
       try {
-        const value = await secrets.resolveSecretValue(connection.companyId, grantRef.secretId, grantRef.versionSelector ?? "latest", {
-          accessContext: {
-            consumerType: "tool_connection",
-            consumerId: connection.id,
-            configPath: `credentials.${ref.name}`,
-            actorType: "system",
-            actorId: session.agentId,
-            issueId: session.issueId,
-            heartbeatRunId: session.runId,
-          },
-        });
+        const value = await resolveGrantSecretValue(
+          session,
+          connection,
+          grant,
+          grantRef,
+          `credentials.${ref.name}`,
+        );
         headers[ref.key] = `${ref.prefix ?? ""}${value}`;
       } catch {
         await markRemoteConnectionHealth(connection, "missing_secret", "A configured credential secret could not be resolved.");
@@ -2582,22 +2641,7 @@ export function createToolGatewayService(
     const oauthAccessRef = grant.credentialSecretRefs.find((ref) => ref.configPath === "oauth.access_token");
     if (oauthAccessRef && headers.Authorization === undefined) {
       try {
-        const value = await secrets.resolveSecretValue(
-          connection.companyId,
-          oauthAccessRef.secretId,
-          oauthAccessRef.versionSelector ?? "latest",
-          {
-            accessContext: {
-              consumerType: "tool_connection",
-              consumerId: connection.id,
-              configPath: oauthAccessRef.configPath,
-              actorType: "system",
-              actorId: session.agentId,
-              issueId: session.issueId,
-              heartbeatRunId: session.runId,
-            },
-          },
-        );
+        const value = await resolveGrantSecretValue(session, connection, grant, oauthAccessRef);
         headers.Authorization = `Bearer ${value}`;
       } catch {
         await markRemoteConnectionHealth(connection, "missing_secret", "A configured credential secret could not be resolved.");
@@ -2847,7 +2891,7 @@ export function createToolGatewayService(
           eq(heartbeatRuns.companyId, session.companyId),
         )).limit(1)
       : [];
-    const actingUserId = run?.responsibleUserId ?? null;
+    const actingUserId = run?.responsibleUserId ?? session.responsibleUserId ?? null;
     const autonomous = run?.invocationSource === "automation" || run?.invocationSource === "timer";
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
@@ -3062,22 +3106,7 @@ export function createToolGatewayService(
       const grantRef = grant.credentialSecretRefs.find((ref) => ref.configPath === `env.${key}`);
       if (!grantRef) continue;
       try {
-        env[key] = await secrets.resolveSecretValue(
-          connection.companyId,
-          grantRef.secretId,
-          grantRef.versionSelector ?? "latest",
-          {
-            accessContext: {
-              consumerType: "tool_connection",
-              consumerId: connection.id,
-              configPath: grantRef.configPath,
-              actorType: "system",
-              actorId: session.agentId,
-              issueId: session.issueId,
-              heartbeatRunId: session.runId,
-            },
-          },
-        );
+        env[key] = await resolveGrantSecretValue(session, connection, grant, grantRef);
       } catch {
         await markRemoteConnectionHealth(connection, "missing_secret", "A configured local stdio credential could not be resolved.");
         throw new ToolGatewayHttpError(
@@ -4156,6 +4185,7 @@ export function createToolGatewayService(
     }
     let agentId = row.gateway.agentId;
     let runId: string | null = null;
+    let responsibleUserId: string | null = null;
     let issueId = row.gateway.issueId;
     let projectId = row.gateway.projectId;
     if (row.token.subjectType === "heartbeat_run") {
@@ -4174,6 +4204,7 @@ export function createToolGatewayService(
           companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           status: heartbeatRuns.status,
+          responsibleUserId: heartbeatRuns.responsibleUserId,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, tokenRunId))
@@ -4215,6 +4246,7 @@ export function createToolGatewayService(
         });
         agentId = run.agentId;
         runId = tokenRunId;
+        responsibleUserId = run.responsibleUserId;
         issueId = runContext.issueId;
         projectId = runContext.projectId;
       } catch {
@@ -4247,6 +4279,7 @@ export function createToolGatewayService(
       gatewayTokenAllowedActions: normalizeGatewayTokenActions(row.token.allowedActions),
       actorType: runId ? "agent" : "system",
       actorId: runId ? agentId : row.token.id,
+      responsibleUserId,
       createdAt: row.token.createdAt,
       expiresAt: row.token.expiresAt ?? new Date(Date.now() + 3650 * 24 * 60 * 60 * 1000),
     };
@@ -4489,6 +4522,7 @@ export function createToolGatewayService(
       projectId: null,
       actorType: "user",
       actorId: userId,
+      responsibleUserId: userId,
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
     };
@@ -5521,6 +5555,7 @@ export function createToolGatewayService(
         projectId: null,
         actorType: "user",
         actorId: input.userId,
+        responsibleUserId: input.userId,
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
