@@ -231,6 +231,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: Build runner TypeScript prerequisites
+        run: pnpm --filter @paperclipai/paperclip-eval-kernel build
+
       - name: Install pinned legacy Claude CLI
         if: matrix.profileId == 'legacy-claude'
         run: npm install --global --omit=dev @anthropic-ai/claude-code@2.1.19
