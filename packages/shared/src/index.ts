@@ -988,6 +988,8 @@ export type {
   Issue,
   IssueChangeReceiptEntry,
   IssueChanges,
+  IssueUserRecencyKind,
+  RecentIssue,
   IssueAssigneeAdapterOverrides,
   IssueBlockerDiagnosticFlag,
   IssueBlockerDiagnosticIssueSummary,
