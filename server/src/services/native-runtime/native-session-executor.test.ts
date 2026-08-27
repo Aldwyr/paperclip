@@ -54,6 +54,8 @@ import {
   nativeGovernedWaitResult,
   parseRemoteExecutableCandidate,
   mayUsePreinstalledRunnerArtifact,
+  nativeUsageCostUsd,
+  normalizeNativeUsage,
   readRemoteProviderPackManifest,
   providerSessionIdentityTransitionIsAllowed,
   providerPlanMarkdown,
@@ -68,6 +70,54 @@ import {
   verifyNativeHarnessBackup,
   shouldRestoreNativeHarnessBackupIntoSandbox,
 } from "./native-session-executor.js";
+
+describe("native provider usage normalization", () => {
+  it("reads remote runner run-delta tokens and provider cost", () => {
+    const usage = {
+      total: {
+        inputTokens: 20_000,
+        outputTokens: 500,
+        cacheReadTokens: 8_000,
+        providerCostUsd: 0.12,
+      },
+      runDelta: {
+        inputTokens: 4_200,
+        outputTokens: 180,
+        cacheReadTokens: 1_500,
+        providerCostUsd: 0.031,
+      },
+    };
+    expect(normalizeNativeUsage(usage)).toEqual({
+      inputTokens: 4_200,
+      outputTokens: 180,
+      cachedInputTokens: 1_500,
+    });
+    expect(nativeUsageCostUsd(usage)).toBe(0.031);
+  });
+
+  it("reads ACPX cumulative usage and a USD cost object", () => {
+    const usage = {
+      cumulative: {
+        inputTokens: 3_000,
+        outputTokens: 240,
+        cachedReadTokens: 900,
+      },
+      cost: { amount: 0.044, currency: "USD" },
+    };
+    expect(normalizeNativeUsage(usage)).toEqual({
+      inputTokens: 3_000,
+      outputTokens: 240,
+      cachedInputTokens: 900,
+    });
+    expect(nativeUsageCostUsd(usage)).toBe(0.044);
+  });
+
+  it("does not treat a non-USD ACPX amount as dollars", () => {
+    expect(
+      nativeUsageCostUsd({ cost: { amount: 1.25, currency: "EUR" } }),
+    ).toBeUndefined();
+  });
+});
 
 describe("remote provider pack manifest", () => {
   const canonical = (value: unknown): string => {

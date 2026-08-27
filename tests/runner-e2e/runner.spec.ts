@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import { RunnerApi, pollUntil } from "./api.js";
+import { buildRuntimeUsage, summarizeExecutionBilling } from "./billing.js";
 import { runnerExecutionById } from "./catalog.js";
 import { classifyFailure } from "./failure-classifier.js";
 import { setupLiveFixtures, type LiveFixtureValues } from "./live-fixtures.js";
@@ -60,6 +61,19 @@ interface RunRecord {
   resultJson?: Record<string, unknown> | null;
   error?: string | null;
   errorCode?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+interface EnvironmentLeaseRecord {
+  id: string;
+  issueId?: string | null;
+  heartbeatRunId?: string | null;
+  provider?: string | null;
+  acquiredAt?: string | null;
+  releasedAt?: string | null;
+  updatedAt?: string | null;
+  metadata?: Record<string, unknown> | null;
 }
 
 interface InteractionRecord {
@@ -279,7 +293,9 @@ async function expectPlanStageMarkerVisible(page: Page, marker: string) {
     page
       .getByTestId("task-chat-plan-preview")
       .filter({ hasText: pattern })
-      .or(page.getByTestId("task-chat-agent-bubble").filter({ hasText: pattern }))
+      .or(
+        page.getByTestId("task-chat-agent-bubble").filter({ hasText: pattern }),
+      )
       .last(),
   ).toBeVisible({ timeout: 30_000 });
 }
@@ -309,6 +325,7 @@ for (const execution of executions) {
     let fixtures: LiveFixtureValues | undefined;
     let issue: IssueRecord | undefined;
     let selectedRuns: RunRecord[] = [];
+    let runtimeLeases: EnvironmentLeaseRecord[] = [];
     let matcherResults: MatcherResult[] = [];
     const screenshots: NonNullable<RunnerE2EResult["screenshots"]> = [];
     let primaryError: unknown;
@@ -327,6 +344,23 @@ for (const execution of executions) {
         contentType: "image/png",
       });
       screenshots.push({ id, label, file });
+    };
+
+    const captureRuntimeLeases = async () => {
+      if (!fixtures || execution.environment.id !== "daytona") return;
+      const listed = await api.get<EnvironmentLeaseRecord[]>(
+        `/api/environments/${fixtures.environment.id}/leases`,
+      );
+      const selectedRunIds = new Set(selectedRuns.map((run) => run.id));
+      const relevant = listed.filter(
+        (lease) =>
+          lease.provider === "daytona" &&
+          (selectedRunIds.size === 0 ||
+            (lease.heartbeatRunId &&
+              selectedRunIds.has(lease.heartbeatRunId)) ||
+            (issue && lease.issueId === issue.id)),
+      );
+      runtimeLeases = relevant.length > 0 ? relevant : listed;
     };
 
     const captureFailureApiState = async () => {
@@ -1026,6 +1060,12 @@ for (const execution of executions) {
         failureClassOverride = "secret_leak";
       }
       if (fixtures) {
+        await captureRuntimeLeases().catch((error) => {
+          networkDiagnostics.push({
+            runtimeBillingCaptureError:
+              error instanceof Error ? error.message : String(error),
+          });
+        });
         try {
           await fixtures.teardown();
           cleanup = "passed";
@@ -1046,6 +1086,17 @@ for (const execution of executions) {
             `Cleanup failed after ${primaryError ? "test failure" : "test execution"}: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
+        if (runtimeLeases.length > 0) {
+          runtimeLeases = await Promise.all(
+            runtimeLeases.map((lease) =>
+              api
+                .get<EnvironmentLeaseRecord>(
+                  `/api/environment-leases/${lease.id}`,
+                )
+                .catch(() => lease),
+            ),
+          );
+        }
       } else {
         cleanup =
           primaryError &&
@@ -1059,7 +1110,13 @@ for (const execution of executions) {
       }
 
       const finishedAtMs = Date.now();
-      const result: RunnerE2EResult = {
+      const runtimeUsage = buildRuntimeUsage({
+        environmentId: execution.environment.id,
+        runs: selectedRuns,
+        leases: runtimeLeases,
+        fallbackFinishedAt: new Date(finishedAtMs),
+      });
+      const resultWithoutBilling: RunnerE2EResult = {
         schema: "paperclip.runner-e2e.result/v1",
         executionId: execution.id,
         attempt,
@@ -1095,9 +1152,14 @@ for (const execution of executions) {
                   usage: candidate.usageJson ?? null,
                 })),
               },
+        runtimeUsage,
         matcherResults,
         screenshots,
         cleanup,
+      };
+      const result: RunnerE2EResult = {
+        ...resultWithoutBilling,
+        billing: summarizeExecutionBilling(resultWithoutBilling),
       };
       await mkdir(privateDir, { recursive: true });
       await writeFile(

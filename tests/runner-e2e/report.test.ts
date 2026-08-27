@@ -38,6 +38,13 @@ describe("runner E2E report aggregation", () => {
       startedAt: "2026-08-26T00:00:00.000Z",
       finishedAt: "2026-08-26T00:00:01.000Z",
       durationMs: 1_000,
+      runIds: ["run-2"],
+      usage: {
+        inputTokens: 1_250,
+        outputTokens: 75,
+        cachedInputTokens: 500,
+        costUsd: 0.0125,
+      },
       cleanup: "passed",
     };
     for (const attempt of [1, 2]) {
@@ -123,6 +130,14 @@ describe("runner E2E report aggregation", () => {
       await readFile(path.join(output, "normalized-results.json"), "utf8"),
     );
     expect(normalized).toMatchObject({ passed: 1, failed: 0 });
+    expect(normalized.billing).toMatchObject({
+      reportedLlmCostUsd: 0.0125,
+      llm: {
+        inputTokens: 1_250,
+        outputTokens: 75,
+        runsWithReportedCost: 1,
+      },
+    });
     expect(normalized.results[0]).toMatchObject({
       attempt: 2,
       evidenceValid: true,
@@ -144,6 +159,11 @@ describe("runner E2E report aggregation", () => {
     expect(dashboard).toContain("View gallery · 1");
     expect(dashboard).toContain("message_contains");
     expect(dashboard).toContain("Matchers and test context");
+    expect(dashboard).toContain("Campaign billing summary");
+    expect(dashboard).toContain("LLM reported subtotal");
+    expect(dashboard).toContain("1,250 in · 75 out");
+    expect(dashboard).toContain("$0.0125");
+    expect(dashboard).toContain("unpriced or unavailable runs are excluded");
     expect(
       await readFile(path.join(output, "assets", "favicon.svg"), "utf8"),
     ).toContain("<svg");

@@ -2959,11 +2959,7 @@ export async function executePaperclipNativeSession(input: {
               : "openai",
     model: input.execution.provider.model,
     usage: normalizeNativeUsage(native.usage),
-    costUsd: numericUsageField(native.usage, [
-      "providerCostUsd",
-      "costUsd",
-      "cost",
-    ]),
+    costUsd: nativeUsageCostUsd(native.usage),
     usageBasis: "per_run",
     nativeFinalization: finalization,
   };
@@ -2992,17 +2988,75 @@ function numericUsageField(
   return undefined;
 }
 
-function normalizeNativeUsage(usage: Record<string, unknown> | null) {
+function nativeUsageMeasurement(usage: Record<string, unknown>) {
+  const nestedUsage = record(usage.usage);
+  const candidates = [
+    record(usage.runDelta),
+    record(nestedUsage.runDelta),
+    record(usage.total),
+    record(nestedUsage.total),
+    record(usage.cumulative),
+    record(nestedUsage.cumulative),
+    nestedUsage,
+    usage,
+  ];
+  return (
+    candidates.find(
+      (candidate) =>
+        numericUsageField(candidate, [
+          "inputTokens",
+          "input",
+          "promptTokens",
+          "outputTokens",
+          "output",
+          "completionTokens",
+        ]) !== undefined,
+    ) ?? usage
+  );
+}
+
+export function nativeUsageCostUsd(usage: Record<string, unknown> | null) {
   if (!usage) return undefined;
-  const cache = record(usage.cache);
+  const measurement = nativeUsageMeasurement(usage);
+  const direct =
+    numericUsageField(usage, [
+      "providerCostUsd",
+      "cacheAdjustedCostUsd",
+      "costUsd",
+    ]) ??
+    numericUsageField(measurement, [
+      "providerCostUsd",
+      "cacheAdjustedCostUsd",
+      "costUsd",
+    ]);
+  if (direct !== undefined) return direct;
+  const cost = record(usage.cost);
+  const currency =
+    typeof cost.currency === "string" ? cost.currency.toUpperCase() : "USD";
+  if (currency !== "USD") return undefined;
+  return numericUsageField(cost, ["amount", "total"]);
+}
+
+export function normalizeNativeUsage(usage: Record<string, unknown> | null) {
+  if (!usage) return undefined;
+  const measurement = nativeUsageMeasurement(usage);
+  const cache = record(measurement.cache);
   const cachedInputTokens =
-    numericUsageField(usage, ["cachedInputTokens", "cacheReadInputTokens"]) ??
-    numericUsageField(cache, ["read"]);
+    numericUsageField(measurement, [
+      "cachedInputTokens",
+      "cacheReadInputTokens",
+      "cacheReadTokens",
+      "cachedReadTokens",
+    ]) ?? numericUsageField(cache, ["read"]);
   return {
     inputTokens:
-      numericUsageField(usage, ["inputTokens", "input", "promptTokens"]) ?? 0,
+      numericUsageField(measurement, [
+        "inputTokens",
+        "input",
+        "promptTokens",
+      ]) ?? 0,
     outputTokens:
-      numericUsageField(usage, [
+      numericUsageField(measurement, [
         "outputTokens",
         "output",
         "completionTokens",

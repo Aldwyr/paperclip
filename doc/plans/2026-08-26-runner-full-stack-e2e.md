@@ -59,7 +59,9 @@ the resolved configuration.
     continuation or pending interaction,
     expected runtime mode, environment ID/lease, and isolated workspace through
     public APIs; and
-11. capture phase screenshots (initial/revised Plan where applicable and final
+11. capture selected-run token/provider-cost records and environment lease
+    durations through public APIs;
+12. capture phase screenshots (initial/revised Plan where applicable and final
     state) and tear fixtures down in reverse order.
 
 No production endpoint/schema was added and direct database writes are absent.
@@ -117,8 +119,15 @@ packaging.
 
 Each normalized result records profile, environment, case, provider/model,
 runtime mode, issue/run IDs, timing, cleanup, retry attempt, and usage/cost when
-the provider reports it. It also records each matcher result and the labeled
-screenshot phases used by the screenshot-first campaign dashboard.
+the provider reports it. Native usage normalization accepts the flat legacy
+shape plus runner `runDelta`/`total` and ACPX `cumulative`/USD-cost shapes. A
+per-test billing summary reports input/output/cached tokens, provider-reported
+LLM dollars and coverage, agent runtime, Daytona lease duration, and a
+versioned public-list-price Daytona estimate. The campaign report aggregates
+the same dimensions. Unpriced and unavailable runs remain visible and excluded
+from the reported-dollar subtotal rather than being treated as free. It also
+records each matcher result and the labeled screenshot phases used by the
+screenshot-first campaign dashboard.
 
 ## CI campaign
 

@@ -1,4 +1,8 @@
 import type { MatrixExecution, RunnerE2EResult } from "./types.js";
+import {
+  aggregateCampaignBilling,
+  summarizeExecutionBilling,
+} from "./billing.js";
 
 export interface RunnerDashboardEntry {
   result: RunnerE2EResult;
@@ -37,6 +41,14 @@ function durationLabel(durationMs: number) {
   const seconds = Math.round(durationMs / 1_000);
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function tokenLabel(value: number) {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function usdLabel(value: number) {
+  return `$${value.toFixed(value < 0.01 ? 6 : 4)}`;
 }
 
 function safeEvidenceHref(base: string | undefined, relative: string) {
@@ -121,6 +133,7 @@ function renderCase(
     entry?.errors.join("; ") ||
     (entry?.valid ? "All invariants passed" : "Not selected");
   const screenshots = resolveScreenshots(entry);
+  const billing = entry ? summarizeExecutionBilling(entry.result) : null;
   const availableFiles = entry?.evidenceFiles
     ? new Set(entry.evidenceFiles)
     : null;
@@ -163,12 +176,20 @@ function renderCase(
         )
         .join("")}</div>`
     : "";
+  const billingStrip = billing
+    ? `<div class="billing-strip" aria-label="Billing for ${html(execution.id)}">
+        <div><span>Tokens</span><strong>${html(tokenLabel(billing.llm.inputTokens))} in · ${html(tokenLabel(billing.llm.outputTokens))} out</strong><small>${html(tokenLabel(billing.llm.cachedInputTokens))} cached · ${billing.llm.runsWithTokenUsage}/${billing.llm.runCount} runs covered</small></div>
+        <div><span>LLM spend</span><strong>${billing.llm.runsWithReportedCost > 0 ? html(usdLabel(billing.reportedCostUsd)) : html(billing.llm.costStatus)}</strong><small>${billing.llm.runsWithReportedCost}/${billing.llm.runCount} runs provider-priced</small></div>
+        <div><span>Execution</span><strong>${billing.runtime.estimatedListCostUsd === undefined ? html(billing.runtime.costStatus === "not_metered" ? "Local · not metered" : "Cost unavailable") : `${html(usdLabel(billing.runtime.estimatedListCostUsd))} est.`}</strong><small>${html(durationLabel(billing.runtime.agentRunDurationMs))} agent${billing.runtime.leaseDurationMs === null ? "" : ` · ${html(durationLabel(billing.runtime.leaseDurationMs))} lease`}</small></div>
+      </div>`
+    : "";
   return `<article class="case case-${state}" data-execution-id="${html(execution.id)}">
     <div class="case-heading">
       <strong>${html(execution.task.label)}</strong>
       <span class="status">${html(label)}</span>
     </div>
     ${gallery}
+    ${billingStrip}
     <code class="execution-id">${html(execution.id)}</code>
     <details class="case-context">
       <summary>Matchers and test context</summary>
@@ -177,6 +198,8 @@ function renderCase(
         ? `<dl>
             <div><dt>Attempt</dt><dd>${entry.result.attempt}</dd></div>
             <div><dt>Duration</dt><dd>${html(durationLabel(entry.result.durationMs))}</dd></div>
+            <div><dt>Agent runtime</dt><dd>${html(durationLabel(billing!.runtime.agentRunDurationMs))}</dd></div>
+            ${billing!.runtime.leaseDurationMs === null ? "" : `<div><dt>Environment lease</dt><dd>${html(durationLabel(billing!.runtime.leaseDurationMs))}</dd></div>`}
             <div><dt>Runtime</dt><dd>${html(entry.result.runtimeMode)}</dd></div>
             <div><dt>Provider</dt><dd>${html(entry.result.provider)}</dd></div>
             <div><dt>Model</dt><dd>${html(entry.result.model)}</dd></div>
@@ -186,7 +209,7 @@ function renderCase(
     }
     <p class="detail">${html(detail)}</p>
     ${matcherRows ? `<div class="matcher-wrap"><table class="matchers"><thead><tr><th>Result</th><th>Matcher</th><th>Expectation</th><th>Detail</th></tr></thead><tbody>${matcherRows}</tbody></table></div>` : `<p class="detail">No matcher result was recorded.</p>`}
-    ${entry?.result.usage ? `<details class="usage"><summary>Usage and cost metadata</summary><pre>${html(JSON.stringify(entry.result.usage, null, 2))}</pre></details>` : ""}
+    ${entry ? `<details class="usage"><summary>Usage and billing metadata</summary><pre>${html(JSON.stringify({ billing, rawUsage: entry.result.usage ?? null }, null, 2))}</pre></details>` : ""}
     ${links}
     </details>
   </article>`;
@@ -225,6 +248,9 @@ export function renderRunnerE2EDashboard(input: RunnerDashboardInput) {
   const screenshotCount = selectedEntries.reduce(
     (total, entry) => total + resolveScreenshots(entry).length,
     0,
+  );
+  const campaignBilling = aggregateCampaignBilling(
+    selectedEntries.map((entry) => entry.result),
   );
   const rows = profiles
     .map((profile, profileIndex) => {
@@ -418,6 +444,18 @@ export function renderRunnerE2EDashboard(input: RunnerDashboardInput) {
     .matchers th { background: var(--raised); color: var(--muted-foreground); font-weight: 600; }
     .matchers code { display: inline; color: var(--foreground); }
     .usage { margin: 12px 0; color: var(--muted-foreground); }
+    .billing-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 12px 0 10px; border: 1px solid var(--border); border-radius: calc(var(--radius) * .8); background: var(--raised); }
+    .billing-strip > div { min-width: 0; padding: 9px 10px; border-right: 1px solid var(--border); }
+    .billing-strip > div:last-child { border-right: 0; }
+    .billing-strip span, .billing-strip small { display: block; color: var(--muted-foreground); font-size: 9px; }
+    .billing-strip span { letter-spacing: .06em; text-transform: uppercase; }
+    .billing-strip strong { display: block; margin: 3px 0 1px; overflow-wrap: anywhere; font: 550 11px/1.35 var(--font-mono); font-variant-numeric: tabular-nums; }
+    .billing-overview { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin: 0 0 32px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); }
+    .billing-metric { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--border); }
+    .billing-metric:last-child { border-right: 0; }
+    .billing-metric strong { display: block; overflow-wrap: anywhere; font: 550 17px/1.25 var(--font-mono); font-variant-numeric: tabular-nums; }
+    .billing-metric span { display: block; margin-top: 4px; color: var(--muted-foreground); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+    .billing-note { grid-column: 1 / -1; margin: 0; padding: 11px 16px; border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: 11px; }
     .case-context > summary, .usage > summary { width: fit-content; cursor: pointer; color: var(--foreground); font-size: 12px; font-weight: 600; }
     pre { max-height: 240px; overflow: auto; padding: 12px; border: 1px solid var(--border); border-radius: calc(var(--radius) * .8); background: var(--raised); color: var(--foreground); font-size: 10px; white-space: pre-wrap; }
     footer { display: flex; justify-content: space-between; gap: 16px; padding-top: 16px; color: var(--muted-foreground); font: 11px/1.4 var(--font-mono); }
@@ -440,6 +478,9 @@ export function renderRunnerE2EDashboard(input: RunnerDashboardInput) {
       main { width: min(100% - 32px, 1560px); margin-top: 32px; }
       .report-header { grid-template-columns: 1fr; gap: 24px; }
       .report-actions { flex-wrap: wrap; }
+      .billing-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .billing-metric:nth-child(3) { border-right: 0; }
+      .billing-metric:nth-child(-n+3) { border-bottom: 1px solid var(--border); }
       .table-wrap { max-height: none; }
     }
     @media (max-width: 640px) {
@@ -452,6 +493,12 @@ export function renderRunnerE2EDashboard(input: RunnerDashboardInput) {
       .metric { min-width: 0; flex: 1; padding: 11px; }
       .metric strong { font-size: 16px; }
       .gallery-launch { width: 100%; }
+      .billing-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .billing-metric, .billing-metric:nth-child(3) { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+      .billing-metric:nth-child(even) { border-right: 0; }
+      .billing-strip { grid-template-columns: 1fr; }
+      .billing-strip > div { border-right: 0; border-bottom: 1px solid var(--border); }
+      .billing-strip > div:last-child { border-bottom: 0; }
       .gallery-toolbar, .gallery-footer { padding: 12px; }
       .gallery-stage { padding: 12px; }
       .gallery-footer { align-items: stretch; flex-direction: column; }
@@ -492,6 +539,15 @@ export function renderRunnerE2EDashboard(input: RunnerDashboardInput) {
         <button class="gallery-launch" type="button" data-gallery-open ${screenshotCount === 0 ? "disabled" : ""}>View gallery · ${screenshotCount}</button>
       </div>
     </header>
+    <section class="billing-overview" aria-label="Campaign billing summary">
+      <div class="billing-metric"><strong>${html(tokenLabel(campaignBilling.llm.inputTokens))}</strong><span>Input tokens</span></div>
+      <div class="billing-metric"><strong>${html(tokenLabel(campaignBilling.llm.outputTokens))}</strong><span>Output tokens</span></div>
+      <div class="billing-metric"><strong>${html(tokenLabel(campaignBilling.llm.cachedInputTokens))}</strong><span>Cached tokens</span></div>
+      <div class="billing-metric"><strong>${html(usdLabel(campaignBilling.reportedLlmCostUsd))}</strong><span>LLM reported subtotal</span></div>
+      <div class="billing-metric"><strong>${html(usdLabel(campaignBilling.estimatedRuntimeCostUsd))}</strong><span>Daytona list estimate</span></div>
+      <div class="billing-metric"><strong>${campaignBilling.llm.runsWithReportedCost}/${campaignBilling.llm.runCount}</strong><span>Runs provider-priced</span></div>
+      <p class="billing-note">Model spend is the provider-reported subtotal; unpriced or unavailable runs are excluded, never counted as free. Daytona runtime is a public-list-price estimate from captured lease time and pinned resources, before credits, discounts, storage allowance, or invoice adjustments. Local execution has no external runtime meter.</p>
+    </section>
     <div class="table-kicker"><strong>Configuration matrix</strong><span>${profiles.length} profiles · ${environments.length} environments · ${input.expected.length} selected</span></div>
     <div class="table-wrap">
       <table class="matrix">

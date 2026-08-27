@@ -41,7 +41,20 @@ Daytona creates a sandbox environment through the public API. Keep
 `reuseLease:false`, `runnerLifecycleMode:"per_turn"`, short provider cleanup
 backstops, a Daytona secret reference, and an immutable image digest. Teardown
 must delete the environment with reusable-lease destruction and must fail the
-cell if cleanup cannot be confirmed.
+cell if cleanup cannot be confirmed. Keep CPU, memory, and disk explicit: lease
+metadata and the per-test public-list-price runtime estimate depend on that
+pinned billable resource shape. Changing it requires updating billing tests and
+reviewing the versioned Daytona rates in `billing.ts`.
+
+## Usage and billing data
+
+Do not add fixture-authored token or dollar expectations. The live harness
+reads usage from selected public heartbeat-run records and records coverage per
+run. Provider-reported dollars remain distinct from runtime estimates. A zero
+or missing native usage payload is `unavailable` unless a real token-bearing
+receipt or provider cost proves otherwise. New execution environments must
+provide lease/resource metadata for a runtime estimate or explicitly remain
+`unavailable`; never infer that missing billing data means free execution.
 
 Future providers (SSH, E2B, Modal, Cloudflare, Kubernetes, Novita, exe.dev)
 should implement the same setup/probe/cleanup contract before being added to a

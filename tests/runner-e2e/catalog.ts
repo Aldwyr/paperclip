@@ -61,7 +61,7 @@ function commonAgent(
           ...(adapterType === "paperclip_runner"
             ? []
             : [
-                "For a planning task, do not inspect the OpenAPI schema. PUT /api/issues/$PAPERCLIP_TASK_ID/documents/plan with {title:\"Plan\",format:\"markdown\",body,changeSummary}; read latestRevisionId and latestRevisionNumber from that response. Then POST /api/issues/$PAPERCLIP_TASK_ID/interactions with {kind:\"request_confirmation\",continuationPolicy:\"wake_assignee\",payload:{version:1,prompt,acceptLabel:\"Approve\",rejectLabel:\"Reject\",rejectRequiresReason:true,target:{type:\"issue_document\",key:\"plan\",revisionId,revisionNumber}}}, and PATCH the issue to {status:\"in_review\"}. Include Authorization and X-Paperclip-Run-Id on every write.",
+                'For a planning task, do not inspect the OpenAPI schema. PUT /api/issues/$PAPERCLIP_TASK_ID/documents/plan with {title:"Plan",format:"markdown",body,changeSummary}; read latestRevisionId and latestRevisionNumber from that response. Then POST /api/issues/$PAPERCLIP_TASK_ID/interactions with {kind:"request_confirmation",continuationPolicy:"wake_assignee",payload:{version:1,prompt,acceptLabel:"Approve",rejectLabel:"Reject",rejectRequiresReason:true,target:{type:"issue_document",key:"plan",revisionId,revisionNumber}}}, and PATCH the issue to {status:"in_review"}. Include Authorization and X-Paperclip-Run-Id on every write.',
               ]),
           "Never print, persist, or expose credential values, and never create unrelated work.",
         ].join("\n"),
@@ -313,6 +313,11 @@ export const runnerEnvironments: readonly EnvironmentFixture[] = [
           provider: "daytona",
           apiKey: requiredDaytonaSecret(input),
           image: input.daytonaImage,
+          // Pin the billable resource shape so per-test runtime list-price
+          // estimates remain reproducible when provider defaults change.
+          cpu: 4,
+          memory: 4,
+          disk: 10,
           reuseLease: false,
           runnerLifecycleMode: "per_turn",
           autoStopInterval: 5,

@@ -141,6 +141,56 @@ export type FailureClass =
   | "secret_leak"
   | "cleanup_failure";
 
+export type RunnerE2ECostStatus =
+  | "reported"
+  | "estimated"
+  | "partial"
+  | "unpriced"
+  | "unavailable"
+  | "not_metered";
+
+export interface RunnerE2ERuntimeUsage {
+  provider: RunnerEnvironmentId;
+  /** Sum of the selected Paperclip heartbeat-run spans. */
+  agentRunDurationMs: number;
+  /** Sum of provider lease windows when the environment exposes leases. */
+  leaseDurationMs: number | null;
+  leaseCount: number;
+  cpuCores?: number;
+  memoryGiB?: number;
+  diskGiB?: number;
+  estimatedListCostUsd?: number;
+  costStatus: "estimated" | "unavailable" | "not_metered";
+  costSource:
+    | "daytona_public_list_price"
+    | "provider_cost_unavailable"
+    | "local_not_metered";
+  pricingAsOf?: string;
+  pricingUrl?: string;
+}
+
+export interface RunnerE2EBillingSummary {
+  llm: {
+    runCount: number;
+    runsWithTokenUsage: number;
+    runsWithReportedCost: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    totalTokens: number;
+    reportedCostUsd: number;
+    costStatus: Exclude<RunnerE2ECostStatus, "estimated" | "not_metered">;
+  };
+  runtime: RunnerE2ERuntimeUsage;
+  /** Provider-reported model spend only; never includes unknown/unpriced runs. */
+  reportedCostUsd: number;
+  /** Public-list-price estimate for metered execution infrastructure. */
+  estimatedRuntimeCostUsd: number;
+  /** Reported model subtotal plus the runtime list-price estimate. */
+  observedAndEstimatedCostUsd: number;
+  complete: boolean;
+}
+
 export interface RunnerE2EResult {
   schema: "paperclip.runner-e2e.result/v1";
   executionId: string;
@@ -161,6 +211,8 @@ export interface RunnerE2EResult {
   finishedAt: string;
   durationMs: number;
   usage?: Record<string, unknown> | null;
+  runtimeUsage?: RunnerE2ERuntimeUsage;
+  billing?: RunnerE2EBillingSummary;
   matcherResults?: Array<{
     matcher: Matcher;
     passed: boolean;

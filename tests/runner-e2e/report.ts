@@ -7,6 +7,10 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { runnerMatrix } from "./catalog.js";
+import {
+  aggregateCampaignBilling,
+  summarizeExecutionBilling,
+} from "./billing.js";
 import { renderRunnerE2EDashboard } from "./dashboard.js";
 import type { RunnerE2EResult } from "./types.js";
 
@@ -226,14 +230,20 @@ async function main() {
     stageDashboardEvidence(selected, output),
     stageDashboardBrandAssets(output),
   ]);
+  const resolvedResults = selected.map((entry) => ({
+    ...entry.result,
+    billing: summarizeExecutionBilling(entry.result),
+  }));
+  const billing = aggregateCampaignBilling(resolvedResults);
   const normalized = {
     schema: "paperclip.runner-e2e.campaign/v1",
     generatedAt: new Date().toISOString(),
     expected,
     passed: selected.filter((entry) => entry.valid).length,
     failed: selected.filter((entry) => !entry.valid).length,
-    results: selected.map((entry) => ({
-      ...entry.result,
+    billing,
+    results: selected.map((entry, index) => ({
+      ...resolvedResults[index]!,
       evidenceDirectory: entry.directory,
       evidenceValid: entry.valid,
       evidenceErrors: entry.errors,
@@ -248,8 +258,8 @@ async function main() {
     generatedAt: normalized.generatedAt,
     expected,
     catalog: runnerMatrix,
-    entries: selected.map((entry) => ({
-      result: entry.result,
+    entries: selected.map((entry, index) => ({
+      result: resolvedResults[index]!,
       valid: entry.valid,
       errors: entry.errors,
       evidenceBaseHref: stagedEvidence.get(entry.result.executionId)?.baseHref,
@@ -266,11 +276,20 @@ async function main() {
     "",
     `Passed: ${normalized.passed}/${selected.length}`,
     "",
-    "| Cell | Attempt | Result | Runtime | Duration | Detail |",
-    "|---|---:|---|---|---:|---|",
-    ...selected.map((entry) => {
+    `Tokens: ${billing.llm.inputTokens} input / ${billing.llm.outputTokens} output / ${billing.llm.cachedInputTokens} cached`,
+    "",
+    `Provider-reported LLM cost: $${billing.reportedLlmCostUsd.toFixed(6)} (${billing.llm.runsWithReportedCost}/${billing.llm.runCount} runs priced)`,
+    "",
+    `Estimated Daytona list-price runtime cost: $${billing.estimatedRuntimeCostUsd.toFixed(6)}`,
+    "",
+    "| Cell | Attempt | Result | Runtime | Duration | Tokens (in/out) | LLM reported | Runtime estimate | Detail |",
+    "|---|---:|---|---|---:|---:|---:|---:|---|",
+    ...selected.map((entry, index) => {
       const detail = entry.errors.join("; ").replaceAll("|", "\\|") || "ok";
-      return `| ${entry.result.executionId} | ${entry.result.attempt} | ${entry.valid ? "pass" : "fail"} | ${entry.result.runtimeMode} | ${Math.round(entry.result.durationMs / 1000)}s | ${detail} |`;
+      const resolved = resolvedResults[index]!;
+      const cellBilling = resolved.billing!;
+      const runtimeCost = cellBilling.runtime.estimatedListCostUsd;
+      return `| ${resolved.executionId} | ${resolved.attempt} | ${entry.valid ? "pass" : "fail"} | ${resolved.runtimeMode} | ${Math.round(resolved.durationMs / 1000)}s | ${cellBilling.llm.inputTokens}/${cellBilling.llm.outputTokens} | $${cellBilling.reportedCostUsd.toFixed(6)} (${cellBilling.llm.costStatus}) | ${runtimeCost === undefined ? cellBilling.runtime.costStatus : `$${runtimeCost.toFixed(6)} est.`} | ${detail} |`;
     }),
     "",
   ];

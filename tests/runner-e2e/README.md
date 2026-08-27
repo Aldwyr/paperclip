@@ -149,8 +149,32 @@ Every completed local campaign also writes
 `tests/runner-e2e/results/<campaign>/dashboard.html`. The self-contained page
 shows the complete profile/environment grid with screenshot thumbnails.
 Expanding a case shows its matchers, pass/fail details, provider/model/runtime,
-timings, usage, and evidence links. The CI report job stages the same portable
+timings, token and cost accounting, and evidence links. The campaign header
+aggregates input, output, and cached tokens, provider-reported LLM spend,
+Daytona list-price runtime estimates, and pricing coverage. Missing provider
+usage is labeled `unavailable` or `unpriced`; it is never presented as zero
+cost. The CI report job stages the same portable
 site at `normalized/index.html` inside the merged report artifact.
+
+### Billing interpretation
+
+Each result contains raw sanitized `usage`, normalized `billing`, and
+`runtimeUsage`:
+
+- LLM token and dollar values come from the persisted heartbeat-run usage. A
+  multi-turn case aggregates every selected run and records how many runs
+  supplied tokens and provider-reported cost.
+- Local execution records agent run time but is `not_metered` because there is
+  no external environment provider charge to attribute.
+- Daytona records every public-API lease window and its pinned 4 vCPU, 4 GiB
+  RAM, and 10 GiB disk allocation. Its runtime dollar value is an estimate at
+  the versioned public list rates in `billing.ts`, not an invoice amount.
+  Credits, discounts, the storage allowance, and delayed billing adjustments
+  can make the eventual Daytona charge lower.
+
+`normalized-results.json` includes the per-test summaries and a campaign-level
+`billing` rollup. `summary.md` carries the same totals for the GitHub Actions
+job summary.
 
 Before publication, the launcher:
 
