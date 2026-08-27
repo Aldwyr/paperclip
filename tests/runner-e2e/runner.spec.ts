@@ -268,6 +268,22 @@ function renderedMarkerPattern(marker: string) {
   );
 }
 
+async function expectPlanStageMarkerVisible(page: Page, marker: string) {
+  const pattern = renderedMarkerPattern(marker);
+  // Depending on the interaction presentation, the task thread either
+  // expands the canonical Plan body inline or renders a compact `plan · vN`
+  // confirmation card while the agent's adjacent visible message describes
+  // the published revision. Backend assertions separately verify the exact
+  // canonical document body, revision ID, step count, and pending interaction.
+  await expect(
+    page
+      .getByTestId("task-chat-plan-preview")
+      .filter({ hasText: pattern })
+      .or(page.getByTestId("task-chat-agent-bubble").filter({ hasText: pattern }))
+      .last(),
+  ).toBeVisible({ timeout: 30_000 });
+}
+
 for (const execution of executions) {
   const privateDir = path.join(privateRoot, "cases", execution.task.id);
   const resultPath = path.join(privateDir, "result.json");
@@ -562,12 +578,7 @@ for (const execution of executions) {
           `/${encodeURIComponent(issuePrefix)}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}`,
           { waitUntil: "domcontentloaded" },
         );
-        await expect(
-          page
-            .getByTestId("task-chat-plan-preview")
-            .filter({ hasText: renderedMarkerPattern(planMarkers.draft) })
-            .last(),
-        ).toBeVisible({ timeout: 30_000 });
+        await expectPlanStageMarkerVisible(page, planMarkers.draft);
         await captureScreenshot(
           "plan-draft",
           "Initial plan awaiting revision",
@@ -645,14 +656,7 @@ for (const execution of executions) {
           `/${encodeURIComponent(issuePrefix)}/issues/${encodeURIComponent(issue.identifier ?? issue.id)}`,
           { waitUntil: "domcontentloaded" },
         );
-        await expect(
-          page
-            .getByTestId("task-chat-plan-preview")
-            .filter({
-              hasText: renderedMarkerPattern(planMarkers.revised),
-            })
-            .last(),
-        ).toBeVisible({ timeout: 30_000 });
+        await expectPlanStageMarkerVisible(page, planMarkers.revised);
         await captureScreenshot(
           "plan-revised",
           "Revised plan awaiting acceptance",
