@@ -1612,6 +1612,14 @@ const DEFAULT_PROCESS_SESSION_SHUTDOWN_WAIT_MS = 3_000;
 // this adds no new sandbox-to-host data flow.
 const DEFAULT_PROCESS_SESSION_LEASE_REFRESH_MS = 60_000;
 const DEFAULT_PROCESS_SESSION_LEASE_TTL_MS = 900_000;
+// The lease refresh runs one small control-plane command (`set -C` + `mv`),
+// never the long-lived agent process, so it gets its own short exec budget
+// instead of the run's adapter execution timeout. That run timeout can run
+// up to the 4-hour sandbox default, or be unset (no bound at all) on other
+// targets, and `stop()` awaits the whole refresh chain before it removes
+// `sessionDir` — so a stalled refresh reusing that timeout could make
+// `stop()` wait for the run's own budget instead of a few seconds.
+const PROCESS_SESSION_LEASE_REFRESH_EXEC_TIMEOUT_MS = 10_000;
 // The name does not end in ".json", so no `.json`-only reader (the stdin
 // poller) ever lists it.
 const PROCESS_SESSION_LEASE_FILE_NAME = ".paperclip-session-lease";
@@ -1914,7 +1922,9 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
         args: shellCommandArgs(script),
         cwd: target.remoteCwd,
         env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
-        timeoutMs,
+        // Bounded independently of the run's own `timeoutMs` -- see
+        // `PROCESS_SESSION_LEASE_REFRESH_EXEC_TIMEOUT_MS`.
+        timeoutMs: PROCESS_SESSION_LEASE_REFRESH_EXEC_TIMEOUT_MS,
         // A busy persistent session must never queue this behind an
         // in-run session command and starve the lease.
         bypassSession: true,

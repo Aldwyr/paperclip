@@ -2319,4 +2319,80 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
       }),
     ]);
   }, 30_000);
+
+  it("T31 the lease refresh exec carries its own short timeout, never the run's adapter timeout", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lease-refresh-timeout-"));
+    cleanupDirs.push(rootDir);
+    const childPath = path.join(rootDir, "quiet-child.mjs");
+    await writeFile(childPath, "process.stdin.resume();\n", "utf8");
+
+    const refreshTimeoutsSeen: Array<number | undefined> = [];
+    let counter = 0;
+    const runner = {
+      execute: async (input: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        stdin?: string;
+        timeoutMs?: number;
+        onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+      }): Promise<RunProcessResult> => {
+        const script = input.args?.[1] ?? "";
+        if (script.includes("nohup node")) {
+          return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: null };
+        }
+        if (script.includes("set -C") && script.includes(LEASE_FILE_NAME)) {
+          refreshTimeoutsSeen.push(input.timeoutMs);
+        }
+        counter += 1;
+        const command =
+          input.command === "bash" ? "/bin/bash" : input.command === "sh" ? "/bin/sh" : input.command;
+        return runChildProcess(`lease-refresh-timeout-run-${counter}`, command, input.args ?? [], {
+          cwd: input.cwd ?? process.cwd(),
+          env: input.env ?? {},
+          stdin: input.stdin,
+          timeoutSec: Math.max(1, Math.ceil((input.timeoutMs ?? 30_000) / 1000)),
+          graceSec: 5,
+          onLog: input.onLog ?? (async () => {}),
+        });
+      },
+    };
+    // Mirrors DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC (the 4-hour sandbox
+    // adapter execution timeout). No `timeoutSec` is passed to the bridge
+    // below, so this target value alone becomes the run's own `timeoutMs`.
+    const FOUR_HOUR_RUN_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "local-test",
+      remoteCwd: rootDir,
+      timeoutMs: FOUR_HOUR_RUN_TIMEOUT_MS,
+      runner,
+    };
+
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-lease-refresh-timeout",
+      target,
+      runtimeRootDir: path.posix.join(rootDir, ".paperclip-runtime", "acpx"),
+      adapterKey: "acpx",
+      command: process.execPath,
+      args: [childPath],
+      cwd: rootDir,
+      env: {},
+      onLog: async () => {},
+    });
+    expect(bridge).not.toBeNull();
+    await waitFor(() => refreshTimeoutsSeen.length > 0, 4_000);
+    await bridge!.stop();
+
+    // The run's own adapter timeout must never reach the refresh exec: a
+    // stalled refresh bounded by it could make stop() wait up to 4 hours.
+    expect(refreshTimeoutsSeen.length).toBeGreaterThan(0);
+    for (const seen of refreshTimeoutsSeen) {
+      expect(seen).toBeDefined();
+      expect(seen).toBeLessThan(FOUR_HOUR_RUN_TIMEOUT_MS);
+      expect(seen).toBeLessThanOrEqual(10_000);
+    }
+  }, 10_000);
 });
