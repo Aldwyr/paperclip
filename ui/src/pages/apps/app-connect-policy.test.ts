@@ -32,6 +32,12 @@ describe("app connect policy", () => {
     expect(canEnterAppsConnect(new URLSearchParams("byo=1&source=zapier"))).toBe(true);
   });
 
+  it("admits retained hidden-provider reconnects without opening fresh setup", () => {
+    expect(canEnterAppsConnect(new URLSearchParams("source=github"))).toBe(false);
+    expect(canEnterAppsConnect(new URLSearchParams("source=github&reconnect=connection-1"))).toBe(true);
+    expect(canEnterAppsConnect(new URLSearchParams("source=unknown&reconnect=connection-1"))).toBe(false);
+  });
+
   it("builds a generic source deep link", () => {
     expect(appSourceConnectHref("notion")).toBe("/apps/connect?source=notion");
     expect(appSourceResumeHref("notion", "11111111-1111-4111-8111-111111111111")).toBe(
