@@ -1,7 +1,9 @@
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
-export const WAKEUP_REQUEST_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// Keep terminal requests for at least as long as the issue diagnostics lookback.
+// The diagnostics service currently supports a 14-day wake-history window.
+export const WAKEUP_REQUEST_TERMINAL_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 export const WAKEUP_REQUEST_RETENTION_BATCH_SIZE = 10_000;
 
 export function wakeupRequestRetentionService(db: Db) {

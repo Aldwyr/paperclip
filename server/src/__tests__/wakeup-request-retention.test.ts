@@ -32,7 +32,8 @@ describeEmbeddedPostgres("agent wakeup request retention", () => {
 
   it("prunes old skipped and coalesced rows in bounded batches while preserving audit and referenced rows", async () => {
     const now = new Date("2026-08-27T12:00:00.000Z");
-    const old = new Date("2026-08-19T12:00:00.000Z");
+    const old = new Date("2026-08-12T12:00:00.000Z");
+    const withinDiagnosticsWindow = new Date("2026-08-19T12:00:00.000Z");
     const recent = new Date("2026-08-26T12:00:00.000Z");
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -41,6 +42,7 @@ describeEmbeddedPostgres("agent wakeup request retention", () => {
       coalesced: randomUUID(),
       completed: randomUUID(),
       failed: randomUUID(),
+      diagnosticsWindowSkipped: randomUUID(),
       recentSkipped: randomUUID(),
       referencedSkipped: randomUUID(),
     };
@@ -101,6 +103,15 @@ describeEmbeddedPostgres("agent wakeup request retention", () => {
         finishedAt: old,
       },
       {
+        id: ids.diagnosticsWindowSkipped,
+        companyId,
+        agentId,
+        source: "assignment",
+        status: "skipped",
+        requestedAt: withinDiagnosticsWindow,
+        finishedAt: withinDiagnosticsWindow,
+      },
+      {
         id: ids.recentSkipped,
         companyId,
         agentId,
@@ -147,6 +158,7 @@ describeEmbeddedPostgres("agent wakeup request retention", () => {
 
     expect(remaining).toEqual([
       ids.completed,
+      ids.diagnosticsWindowSkipped,
       ids.failed,
       ids.recentSkipped,
       ids.referencedSkipped,
