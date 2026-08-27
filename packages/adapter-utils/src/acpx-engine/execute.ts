@@ -2456,10 +2456,19 @@ async function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promi
 // (see `RuntimeSettlementPlan.skipRemoteClose` above), so a slow or stuck peer
 // on an otherwise live channel can still hold the close open for hours. This
 // deadline gives the healthy close its own, much shorter bound, separate from
-// the execution timeout. A close that passes this deadline is never cancelled
-// — it keeps running in the background — and `recordAbandonedSessionClose`
-// tracks it so `reapAbandonedSessionCloses` can reconcile it once it actually
-// settles.
+// the execution timeout. A close that passes this deadline is never
+// cancelled: `recordAbandonedSessionClose` tracks it, and
+// `reapAbandonedSessionCloses` clears the record once the close settles.
+//
+// That record is bookkeeping only. No other code reads it, and the engine
+// never re-issues the close. On a run against a remote sandbox,
+// `stopRunTransport` runs right after this step and stops the same
+// host-to-sandbox channel the abandoned close needs to carry its answer
+// back, so on that lane the close has already lost its only path to a real
+// answer once this deadline fires, and its record may stay for a long time.
+// On a run against a local process, no such channel exists, so the abandoned
+// close keeps running against the real local process, unaffected by
+// settlement, and can finish and clear its own record on its own.
 const HEALTHY_END_SESSION_DEADLINE_MS = 30_000;
 
 /**

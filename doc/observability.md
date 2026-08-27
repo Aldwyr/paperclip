@@ -693,10 +693,23 @@ carry their own deadline today:
   call reuses the adapter's full execution timeout, so a slow or stuck peer on
   an otherwise healthy channel can still hold the close open for hours. This
   step's own deadline is separate from, and much shorter than, that execution
-  timeout. The close call itself is never cancelled on a timeout: it keeps
-  running in the background, and the engine tracks it in an in-process pending
-  map so a later run's startup sweep can reconcile the bookkeeping once the
-  close actually settles. The sweep never waits on a still-running close.
+  timeout. The close call itself is never cancelled on a timeout: the engine
+  keeps an in-process record of it, and a later run's startup sweep clears
+  that record once the close settles. The sweep never waits on a
+  still-running close.
+
+  The record is bookkeeping only. No other part of the engine reads it, and
+  the engine never starts a second close for the same session.
+
+  On a run against a remote sandbox, one settlement step runs right after
+  `end_session`. That step stops the same host-to-sandbox channel the
+  abandoned close needs to carry its answer back. So the abandoned close
+  loses its channel soon after the deadline fires, and its record can then
+  stay in place for a long time, because the close may never truly finish.
+
+  On a run against a local process, no such channel exists. The abandoned
+  close keeps running against the same local process, unaffected by
+  settlement, and can finish and clear its own record later.
 
 A `timed_out` step outcome is independent of `resultJson.timeoutFired` on the
 run record: that flag reflects only a trusted, typed host signal that the
