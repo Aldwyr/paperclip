@@ -125,6 +125,7 @@ export const WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE = "ERR_WORKSPACE_RESTORE_LOCK_T
 export type WorkspaceRestoreFailureCode =
   | "restore_permission_denied"
   | "restore_lock_timeout"
+  | "restore_timed_out"
   | "restore_failed";
 
 /**
@@ -165,6 +166,8 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
       return "the restore could not write to the workspace (permission denied)";
     case "restore_lock_timeout":
       return "the restore timed out waiting for the workspace merge lock";
+    case "restore_timed_out":
+      return "the restore did not finish before the host deadline";
     case "restore_failed":
       return "the restore failed";
   }

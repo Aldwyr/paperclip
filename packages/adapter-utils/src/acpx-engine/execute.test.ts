@@ -6005,6 +6005,10 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     handle: unknown,
     runtime: unknown,
     sandbox: Awaited<ReturnType<typeof setupRemoteSandbox>>,
+    options: {
+      deps?: Partial<AcpxEngineExecutorOptions>;
+      ctx?: Partial<AdapterExecutionContext>;
+    } = {},
   ) {
     vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockImplementationOnce(
       async () => handle as never,
@@ -6014,6 +6018,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     );
     const execute = createAcpxEngineExecutor({
       createRuntime: () => runtime as never,
+      ...options.deps,
     });
     return await execute({
       runId: "run-duplex-seam",
@@ -6031,6 +6036,7 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
       onLog: async () => {},
       onMeta: async () => {},
       onEvent: async () => {},
+      ...options.ctx,
     } as never);
   }
 
@@ -6107,5 +6113,152 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     expect(fake.markOrderlyCompletion).toHaveBeenCalledTimes(1);
     fake.emitLoss("provider_exit");
     expect(fake.readDisposition().failed).toBe(false);
+  });
+
+  it("makes no remote close call on a latched loss, still attempts the copy-back, and finalizes without waiting on the remote peer", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const closeCalls: unknown[] = [];
+    const controlled = runtimeWithControlledResult(() => fake.emitLoss("provider_exit"));
+    const runtime = {
+      ...controlled,
+      close: async (input: unknown) => {
+        closeCalls.push(input);
+        // Never resolves. If `endSession` ever awaited this on the latched-
+        // loss path, this test would time out instead of passing — the same
+        // shape of hang the incident hit for four hours.
+        await new Promise(() => {});
+      },
+    };
+    let teardownCalls = 0;
+
+    const result = await runRemote(fake.handle, runtime, sandbox, {
+      deps: {
+        prepareRemoteManagedHome: async ({ stage }) => ({
+          stagedRuntime: await stage([]),
+          teardown: async () => {
+            teardownCalls += 1;
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    expect(result.errorCode).toBe("duplex_channel_lost");
+    // No remote call ever placed for this session's `endSession` step.
+    expect(closeCalls).toHaveLength(0);
+    // The copy-back still ran, in its existing ordered position.
+    expect(teardownCalls).toBe(1);
+  });
+
+  it("records a typed workspace-restore failure, never a successful cleanup, when the copy-back's session is unavailable on a latched loss", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const runtime = runtimeWithControlledResult(() => fake.emitLoss("provider_exit"));
+
+    const result = await runRemote(fake.handle, runtime, sandbox, {
+      deps: {
+        prepareRemoteManagedHome: async ({ stage }) => ({
+          stagedRuntime: await stage([]),
+          teardown: async () => {
+            throw new Error("session not found");
+          },
+        }),
+      },
+    });
+
+    expect(result.errorCode).toBe("duplex_channel_lost");
+    expect(result.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_failed" });
+  });
+
+  it("keeps the staging lease held while a non-cancelled copy-back writes past its deadline, and releases it once the copy-back settles", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const runtime = runtimeWithControlledResult(() => fake.emitLoss("provider_exit"));
+    const stagingLocks = new Map<string, Promise<unknown>>();
+    let releaseTeardown!: () => void;
+    const teardownGate = new Promise<void>((resolve) => {
+      releaseTeardown = resolve;
+    });
+
+    const result = await runRemote(fake.handle, runtime, sandbox, {
+      deps: {
+        channelLostSyncBackDeadlineMs: 20,
+        stagingLocks,
+        prepareRemoteManagedHome: async ({ stage }) => ({
+          stagedRuntime: await stage([]),
+          teardown: async () => {
+            await teardownGate;
+            return { ok: true };
+          },
+        }),
+      },
+    });
+
+    // The deadline fired and the run finalized promptly with a typed timeout
+    // result, never reported as a successful cleanup.
+    expect(result.resultJson).toMatchObject({ workspaceRestoreFailure: "restore_timed_out" });
+    // The copy-back has no cancellation hook and may still be writing, so the
+    // staging lease for this session must still be held — a same-session run
+    // would still block on it.
+    expect(stagingLocks.size).toBe(1);
+
+    releaseTeardown();
+    await vi.waitFor(() => {
+      expect(stagingLocks.size).toBe(0);
+    });
+  });
+
+  it("invalidates the run-scoped credential on a latched loss, and never on a healthy completion", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const lostChannel = createFakeBridgeHandle();
+    const invalidateCallsOnLoss: number[] = [];
+    await runRemote(
+      lostChannel.handle,
+      runtimeWithControlledResult(() => lostChannel.emitLoss("provider_exit")),
+      sandbox,
+      { ctx: { onInvalidateRunCredential: async () => void invalidateCallsOnLoss.push(1) } },
+    );
+    expect(invalidateCallsOnLoss).toHaveLength(1);
+
+    const healthy = createFakeBridgeHandle();
+    const invalidateCallsOnHealthy: number[] = [];
+    const healthySandbox = await setupRemoteSandbox();
+    await runRemote(healthy.handle, runtimeWithControlledResult(), healthySandbox, {
+      ctx: { onInvalidateRunCredential: async () => void invalidateCallsOnHealthy.push(1) },
+    });
+    expect(invalidateCallsOnHealthy).toHaveLength(0);
+  });
+
+  it("emits a timed_out sync_back phase event carrying only phase, durationMs, and outcome", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const runtime = runtimeWithControlledResult(() => fake.emitLoss("provider_exit"));
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    const result = await runRemote(fake.handle, runtime, sandbox, {
+      deps: {
+        channelLostSyncBackDeadlineMs: 20,
+        prepareRemoteManagedHome: async ({ stage }) => ({
+          stagedRuntime: await stage([]),
+          teardown: () => new Promise(() => {}),
+        }),
+      },
+      ctx: {
+        onEvent: async (event) => void events.push(event),
+      },
+    });
+
+    const syncBackTiming = events.find(
+      (event) => event.eventType === "run.phase.timing" && event.payload?.phase === "sync_back",
+    );
+    expect(syncBackTiming).toBeDefined();
+    expect(syncBackTiming?.payload?.outcome).toBe("timed_out");
+    expect(Object.keys(syncBackTiming?.payload ?? {}).sort()).toEqual(["durationMs", "outcome", "phase"]);
+    // A settlement-step timeout is not the adapter execution timeout: it must
+    // never set the top-level `timedOut` flag the host reads to decide
+    // `resultJson.timeoutFired`. Only a trusted, typed host signal that the
+    // adapter execution timeout itself fired may set that flag.
+    expect(result.timedOut).toBe(false);
   });
 });

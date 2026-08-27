@@ -4,6 +4,7 @@ import type { StartupSpan, StartupTraceContext, StartupTracer } from "./startup-
 import {
   clampSpanLabel,
   createRuntimeSpanRunner,
+  emitLastProgressToTerminalDiagnostic,
   emitRunPhaseTiming,
   emitSkippedStartupStep,
   getActiveStepContext,
@@ -11,6 +12,7 @@ import {
   NOOP_STARTUP_SPAN,
   NOOP_STARTUP_TRACE_CONTEXT,
   normalizeProviderFamily,
+  RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE,
   RUN_PHASE_NAMES,
   RUN_PHASE_TIMING_EVENT_TYPE,
   runWithoutActiveStep,
@@ -769,5 +771,53 @@ describe("run phase timing telemetry", () => {
 
     // A throwing telemetry sink never propagates, so the run continues.
     await expect(emitRunPhaseTiming(ctx, "turn", 9, "failed")).resolves.toBeUndefined();
+  });
+});
+
+describe("last-progress-to-terminal diagnostic", () => {
+  it("test_diagnostic_emits_only_a_finite_non_negative_duration", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
+
+    await emitLastProgressToTerminalDiagnostic(ctx, 4200);
+
+    expect(events).toHaveLength(1);
+    const event = events[0]!;
+    expect(event.eventType).toBe(RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE);
+    // The payload carries exactly the one closed field and nothing else — no
+    // progress text, timestamp, path, session handle, or provider error text.
+    expect(Object.keys(event.payload ?? {})).toEqual(["durationMs"]);
+    expect(event.payload).toEqual({ durationMs: 4200 });
+  });
+
+  it("test_diagnostic_rejects_non_finite_and_negative_durations", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
+
+    await emitLastProgressToTerminalDiagnostic(ctx, Number.NaN);
+    await emitLastProgressToTerminalDiagnostic(ctx, Number.POSITIVE_INFINITY);
+    await emitLastProgressToTerminalDiagnostic(ctx, -5);
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("test_diagnostic_zero_duration_is_valid", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
+
+    await emitLastProgressToTerminalDiagnostic(ctx, 0);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]!.payload).toEqual({ durationMs: 0 });
+  });
+
+  it("test_diagnostic_telemetry_failure_does_not_fail_the_run", async () => {
+    const ctx = {
+      onEvent: async () => {
+        throw new Error("telemetry sink boom");
+      },
+    };
+
+    await expect(emitLastProgressToTerminalDiagnostic(ctx, 10)).resolves.toBeUndefined();
   });
 });

@@ -17,6 +17,7 @@ import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@pap
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
+import { isRunScopedCredentialRevoked } from "../services/run-credential-revocation.js";
 
 const CLOUD_TENANT_WRITE_DEBOUNCE_MS = 5_000;
 const CLOUD_TENANT_WRITE_DEBOUNCE_MAX = 1_000;
@@ -313,6 +314,11 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
         next(unauthorized(invalidAgentTokenMessage(token)));
+        return;
+      }
+
+      if (isRunScopedCredentialRevoked(claims.run_id)) {
+        next(unauthorized("Run-scoped agent token was revoked; obtain fresh credentials and retry"));
         return;
       }
 

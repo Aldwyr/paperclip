@@ -191,6 +191,16 @@ export interface AdapterExecutionContext {
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
   /**
+   * Locally revoke the run-scoped credential (`authToken`) so every later
+   * request that presents it fails. The engine calls this once, before it
+   * finalizes a run whose sandbox duplex control channel was lost — the
+   * peer that held the credential is presumed gone, so no later use of it
+   * can be legitimate. The call carries no credential material and no
+   * opaque handle, only the run identity already on `ctx`. Optional: a host
+   * that has not wired revocation yet simply skips the call.
+   */
+  onInvalidateRunCredential?: () => Promise<void>;
+  /**
    * The injected OpenTelemetry startup trace context (tracer + root
    * parent-context helper). The server passes the real, endpoint-gated
    * implementation; when absent, the ACPX engine uses a no-op, so the whole

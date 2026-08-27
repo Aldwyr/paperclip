@@ -132,6 +132,7 @@ import {
 import { createSandboxRunSite, type SandboxRunSite } from "./run-site-sandbox.js";
 import {
   createRuntimeSpanRunner,
+  emitLastProgressToTerminalDiagnostic,
   emitRunPhaseTiming,
   emitSkippedStartupStep,
   getActiveStepContext,
@@ -140,6 +141,7 @@ import {
   NOOP_STARTUP_TRACE_CONTEXT,
   runWithRuntimeParent,
   setSandboxRootSpanAttributes,
+  type RunPhaseOutcome,
   type RuntimeSpanRunner,
   type SandboxRootSpanContext,
   type StartupSpan,
@@ -337,6 +339,13 @@ export interface AcpxRemoteManagedHomeResult {
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
+  /**
+   * The host-enforced deadline for the copy-back on a run whose duplex
+   * control channel already latched a loss. Defaults to
+   * `CHANNEL_LOST_SYNC_BACK_DEADLINE_MS`; a test shortens it to observe the
+   * timeout path without a real wait.
+   */
+  channelLostSyncBackDeadlineMs?: number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -2387,6 +2396,45 @@ async function syncBackManagedHome(prepared: AcpxPreparedRuntime): Promise<Works
     .catch((): WorkspaceRestoreOutcome => ({ ok: false, code: "restore_failed" }));
 }
 
+// The host-enforced deadline for the copy-back on a run whose duplex control
+// channel already latched a loss. The sandbox side of that channel is
+// presumed gone, so the copy-back is bounded here instead of left to hang on
+// the same dead peer that stalled the old `endSession` remote close. A
+// healthy run's copy-back stays unbounded (this sub-task fixes the
+// lost-channel path only; a generic deadline for every copy-back is a later,
+// separately reviewed change).
+const CHANNEL_LOST_SYNC_BACK_DEADLINE_MS = 60_000;
+
+/** How a deadline-bound operation resolved. */
+type DeadlineOutcome<T> =
+  | { readonly kind: "settled"; readonly value: T }
+  // The deadline won the race. `settle` is the ORIGINAL operation promise,
+  // still running: it has no cancellation hook, so the caller must keep
+  // tracking it (never abandon it) to know when it truly finishes.
+  | { readonly kind: "timed_out"; readonly settle: Promise<T> };
+
+/**
+ * Race `run()` against `deadlineMs`. On a timeout, this returns immediately
+ * with the still-pending original promise attached, so the caller can bound
+ * its own wait without ever losing track of the real operation.
+ */
+async function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promise<DeadlineOutcome<T>> {
+  const settle = run();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<{ kind: "timed_out" }>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: "timed_out" }), deadlineMs);
+  });
+  try {
+    const raced = await Promise.race([
+      settle.then((value): DeadlineOutcome<T> => ({ kind: "settled", value })),
+      timedOut,
+    ]);
+    return raced.kind === "timed_out" ? { kind: "timed_out", settle } : raced;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** How the settlement `endSession` step releases the runtime a run acquired. */
 interface RuntimeSettlementPlan {
   // "direct" closes the runtime itself and swallows or records the close error;
@@ -2405,6 +2453,19 @@ interface RuntimeSettlementPlan {
   // Cancel the running turn with this reason before the close (the turn-error
   // path cancels before it closes). Null on every other path.
   readonly cancelTurnReason: string | null;
+  // True only on a latched duplex loss. The peer is already gone, so
+  // `endSession` must not place any remote call for this session: it drops
+  // the local warm-handle bookkeeping (if any) and returns, and never calls
+  // `runtime.close`. False on every other path, where `endSession` closes the
+  // runtime exactly as before.
+  //
+  // Why this matters: the runtime library's own close path bounds its
+  // session-close RPC with a `withTimeout` wrapper that reuses the adapter's
+  // configured execution timeout as the RPC deadline — the SAME value, not a
+  // short one. On a dead channel that RPC can never succeed, so without this
+  // flag a latched loss still blocks for up to the full execution timeout
+  // before that internal wrapper (not this engine) finally gives up.
+  readonly skipRemoteClose: boolean;
 }
 
 function renderPaperclipEnvNote(env: Record<string, string>): string {
@@ -3296,6 +3357,8 @@ function openTurnSpan(
 export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const createRuntime = deps.createRuntime ?? createAcpRuntime;
   const now = deps.now ?? (() => Date.now());
+  const channelLostSyncBackDeadlineMs =
+    deps.channelLostSyncBackDeadlineMs ?? CHANNEL_LOST_SYNC_BACK_DEADLINE_MS;
   const warmHandles = deps.warmHandles ?? defaultWarmHandles;
   const stagedRuntimes = deps.stagedRuntimes ?? defaultStagedRuntimes;
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
@@ -3390,6 +3453,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // null on the host lane (no staging) and on a build failure (where
     // `buildRuntime` already released its own partial lease).
     let releaseStagingLease: (() => void) | null = null;
+    // Set only when a latched duplex loss put the sync-back copy-back on its
+    // host-enforced deadline and the deadline won. It carries the real
+    // copy-back promise so the run's own `finally` can defer the staging-
+    // lease release until that promise actually settles, instead of on the
+    // deadline: the copy-back has no cancellation hook, so a non-cancelled
+    // write can still be in flight after the deadline fires, and releasing
+    // the lease before it settles would let a same-session run re-stage into
+    // a workspace this run may still be writing.
+    let pendingSyncBackCompletion: Promise<void> | null = null;
+    // The wall-clock moment the seam confirmed a latched duplex loss. Set only
+    // on that path. The last-progress-to-terminal diagnostic measures from
+    // here to the run's fully settled state, so it reports how long teardown
+    // took once the outcome was already known — the signal that would have
+    // caught a stuck teardown before it read `running` for four hours.
+    let lossDetectedAtMs: number | null = null;
+    // True only on a latched duplex loss. The settlement `syncBack` step
+    // reads this to decide whether the copy-back needs its host-enforced
+    // deadline: the sandbox side of a healthy channel is still reachable, so
+    // only a latched loss bounds the copy-back here.
+    let channelLostForSettlement = false;
     try {
       // Evict idle staged runtimes BEFORE building the runtime, since buildRuntime
       // consults the staged cache to decide whether a compatible resume may reuse
@@ -3487,7 +3570,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // (from the closed allowlist), the wall time, and the outcome, and
       // never a command, a path, an environment value, or an identifier. A
       // failure to emit this event never fails the run.
-      const emitPhase = (phase: string, startMs: number, outcome: "ok" | "failed"): Promise<void> =>
+      const emitPhase = (phase: string, startMs: number, outcome: RunPhaseOutcome): Promise<void> =>
         emitRunPhaseTiming(ctx, phase, now() - startMs, outcome);
       // Time a settlement step and emit its phase timing on every path. A step
       // error still emits `failed` before it re-throws to the Phase 3 error policy.
@@ -3500,6 +3583,25 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           throw error;
         }
         await emitPhase(phase, start, "ok");
+      };
+      // Time a settlement step whose own outcome is not simply "did it throw":
+      // `run` reports which of the closed outcomes applies (a step that hits
+      // its own host-enforced deadline resolves normally with `"timed_out"`,
+      // never by throwing). A step error still emits `failed` before it
+      // re-throws to the Phase 3 error policy, exactly like `timedPhase`.
+      const timedPhaseWithOutcome = async (
+        phase: string,
+        run: () => Promise<RunPhaseOutcome>,
+      ): Promise<void> => {
+        const start = now();
+        let outcome: RunPhaseOutcome;
+        try {
+          outcome = await run();
+        } catch (error) {
+          await emitPhase(phase, start, "failed");
+          throw error;
+        }
+        await emitPhase(phase, start, outcome);
       };
       // The turn the run started. It is hoisted to the run scope so the settlement
       // `endSession` step can cancel a running turn before it closes the runtime
@@ -3803,6 +3905,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             dropWarmEntry: true,
             recordCloseError: true,
             cancelTurnReason: null,
+            skipRemoteClose: false,
           };
           await emitPhase("ensure_session", ensureSessionPhaseStart, "failed");
           const { classified, message } = await emitAcpxFailure({
@@ -3839,6 +3942,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             dropWarmEntry: false,
             recordCloseError: true,
             cancelTurnReason: null,
+            skipRemoteClose: false,
           };
           await emitPhase("ensure_session", ensureSessionPhaseStart, "failed");
           capturedResult = {
@@ -3922,6 +4026,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           dropWarmEntry: true,
           recordCloseError: true,
           cancelTurnReason: null,
+          skipRemoteClose: false,
         };
         await emitPhase("configure_session", configureSessionStart, "failed");
         const { classified, message } = await emitAcpxFailure({
@@ -4139,6 +4244,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const channelLostMessage = duplexLossReason
           ? `The sandbox duplex control channel was lost (${duplexLossReason}) before the run completed.`
           : null;
+        if (channelLost) {
+          lossDetectedAtMs = now();
+          channelLostForSettlement = true;
+          // Fail the run-scoped credential closed before any teardown step
+          // runs, so a later request that still carries it — from the peer
+          // this run just lost, or from a delayed retry — is denied. The
+          // call carries no credential material and no opaque handle, only
+          // the run identity already on `ctx`. A revocation failure must
+          // never crash the teardown (that would reopen the exact hang this
+          // fix removes), so it is recorded and swallowed like every other
+          // best-effort teardown step.
+          try {
+            await ctx.onInvalidateRunCredential?.();
+          } catch (err) {
+            await recordTeardownError("invalidate-run-credential", err);
+          }
+        }
         // A completed, non-timed-out turn whose channel stayed live is the one
         // success path. Every other outcome — a failed, cancelled, or timed-out
         // terminal, or a completed terminal with a lost channel — is a failure.
@@ -4175,6 +4297,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           dropWarmEntry: false,
           recordCloseError: false,
           cancelTurnReason: null,
+          // A latched loss means the peer is already gone: place no remote
+          // call for this session. Every other outcome keeps today's close.
+          skipRemoteClose: channelLost,
         };
 
         const errorMessage = timedOut
@@ -4313,6 +4438,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           dropWarmEntry: true,
           recordCloseError: true,
           cancelTurnReason: preEmitMessage,
+          skipRemoteClose: false,
         };
         // Emit the failure best-effort. `turnFinalize` must not reject, so a
         // failing emission never propagates: the settlement owns the teardown, and
@@ -4420,12 +4546,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             dropWarmEntry: false,
             recordCloseError: true,
             cancelTurnReason: null,
+            skipRemoteClose: false,
           };
           // Cancel a running turn before the close (the turn-error path).
           if (settlement.cancelTurnReason && activeTurn) {
             await activeTurn.cancel({ reason: settlement.cancelTurnReason }).catch(() => {});
           }
           const existing = warmHandles.get(prepared.sessionKey);
+          if (settlement.skipRemoteClose) {
+            // The peer is already gone (a latched duplex loss): release the
+            // runtime locally and place no remote call. Drop a matching warm
+            // handle from the local cache directly — never through
+            // `closeWarmHandle`, which itself calls `runtime.close` and would
+            // reintroduce the same remote call this branch exists to skip.
+            if (warmHandleMatches(existing, runtime, settlement.handle) && existing) {
+              clearWarmHandleTimer(existing);
+              warmHandles.delete(prepared.sessionKey);
+              flushChildStderr(existing.childStderrState);
+            }
+            return;
+          }
           if (
             settlement.mode === "warm_or_close" &&
             warmHandleMatches(existing, runtime, settlement.handle) &&
@@ -4477,14 +4617,44 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // publishes the run parent into the runtime-parent store while the restore
         // runs, so the host mints a `traceparent` for the provider spans, and the
         // per-task restore spans parent to `sandbox.syncBack`.
-        syncBack: () => timedPhase("sync_back", async () => {
-          await runRuntimeSpan("sandbox.syncBack", async () => {
-            const restoreOutcome = await syncBackManagedHome(prepared);
-            if (!restoreOutcome.ok) {
-              workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
+        //
+        // A latched duplex loss bounds the copy-back on its own host-enforced
+        // deadline (`CHANNEL_LOST_SYNC_BACK_DEADLINE_MS`): the sandbox side of
+        // that channel is presumed gone, so the copy-back can hang on the same
+        // dead peer the fast-fail above already stopped waiting on. The
+        // copy-back has no cancellation hook, so a deadline never abandons it —
+        // it keeps the real promise in `pendingSyncBackCompletion`, and the run
+        // `finally` defers the staging-lease release to that promise instead of
+        // to this step returning. This never discards staged state: the
+        // deadline only bounds the wait, and a workspace-restore failure is
+        // recorded, never silently reported as a successful cleanup.
+        syncBack: () => timedPhaseWithOutcome("sync_back", () =>
+          runRuntimeSpan("sandbox.syncBack", async (): Promise<RunPhaseOutcome> => {
+            if (!channelLostForSettlement) {
+              const restoreOutcome = await syncBackManagedHome(prepared);
+              if (!restoreOutcome.ok) {
+                workspaceRestoreFailureField = { workspaceRestoreFailure: restoreOutcome.code };
+              }
+              return "ok";
             }
-          });
-        }),
+            const raced = await withDeadline(
+              () => syncBackManagedHome(prepared),
+              channelLostSyncBackDeadlineMs,
+            );
+            if (raced.kind === "timed_out") {
+              workspaceRestoreFailureField = { workspaceRestoreFailure: "restore_timed_out" };
+              pendingSyncBackCompletion = raced.settle.then(
+                () => {},
+                () => {},
+              );
+              return "timed_out";
+            }
+            if (!raced.value.ok) {
+              workspaceRestoreFailureField = { workspaceRestoreFailure: raced.value.code };
+            }
+            return "ok";
+          }),
+        ),
         // The staging lease releases as the run's final act, AFTER the coordinator
         // reproduces the result, in the run root `finally` below. This step stays a
         // no-op in the live engine: a same-session second run must stay blocked on
@@ -4558,12 +4728,40 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // bridge-stop → sync-back → lease release.
       const leaseRelease = releaseStagingLease as (() => void) | null;
       if (leaseRelease) {
-        const leaseStart = now();
-        leaseRelease();
-        // Fire-and-forget the phase timing: the release is the run's final act, so
-        // the run must not await telemetry here. `emitRunPhaseTiming` swallows a
-        // sink failure, so this never rejects.
-        void emitRunPhaseTiming(ctx, "release_staging_lease", now() - leaseStart, "ok");
+        const releaseAndReport = () => {
+          const leaseStart = now();
+          leaseRelease();
+          // Fire-and-forget the phase timing: the release is the run's final
+          // act, so the run must not await telemetry here. `emitRunPhaseTiming`
+          // swallows a sink failure, so this never rejects.
+          void emitRunPhaseTiming(ctx, "release_staging_lease", now() - leaseStart, "ok");
+        };
+        // Read into a local so the branch below reads a fixed snapshot: a
+        // settlement step assigns `pendingSyncBackCompletion` from a closure
+        // nested well before this point, and TypeScript narrows a captured
+        // `let` through that indirection the same way it already does for
+        // `releaseStagingLease` just above — the cast matches that existing
+        // pattern.
+        const pendingSyncBack = pendingSyncBackCompletion as Promise<void> | null;
+        if (pendingSyncBack) {
+          // The copy-back deadline won the race and the real copy-back has no
+          // cancellation hook, so it may still be writing. Defer the release —
+          // off the run's own return path, so THIS run still finalizes
+          // promptly — until the real copy-back settles. A same-session run
+          // stays blocked on the lease for exactly that long, never longer and
+          // never released early.
+          void pendingSyncBack.then(releaseAndReport);
+        } else {
+          releaseAndReport();
+        }
+      }
+      // The last-progress-to-terminal diagnostic: only on a latched duplex
+      // loss, and only after every settlement step above (including a bounded
+      // sync-back) has returned. It reports how long teardown took once the
+      // run's outcome was already known, off the same fire-and-forget pattern
+      // as the phase timing above.
+      if (lossDetectedAtMs !== null) {
+        void emitLastProgressToTerminalDiagnostic(ctx, now() - lossDetectedAtMs);
       }
     }
   };

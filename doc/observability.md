@@ -128,9 +128,9 @@ for `fs`, `dns`, and `net` are disabled by default because they are too chatty
 for this workload; everything else from
 `@opentelemetry/auto-instrumentations-node` is on (HTTP, Express, PG, etc.).
 
-This document also holds two local instrumentation contracts: the sandbox
-startup trace spans, and the sandbox duplex transport instrumentation. Both
-sections follow below.
+This document also holds three local instrumentation contracts: the sandbox
+startup trace spans, the sandbox duplex transport instrumentation, and the run
+lifecycle phase timing. All three sections follow below.
 
 ## Sentry Error Monitoring
 
@@ -659,3 +659,58 @@ key never reaches a sink by accident.
 To add a name or an enum value, extend the literal constant in
 `duplex-observability.ts` first, then update the test that asserts the closed set.
 Keep every dimension low-cardinality and free of user content.
+
+## Run Lifecycle Phase Timing
+
+This section documents two run-log events the ACPX run engine emits: one
+per-phase timing event, and one teardown diagnostic. Both ride the existing
+run-events bridge (`ctx.onEvent`), not OpenTelemetry and not Paperclip
+Telemetry. A failure to emit either event never fails the run. The code owner
+is `packages/adapter-utils/src/acpx-engine/startup-timing.ts`.
+
+### `run.phase.timing`
+
+One event per named run-lifecycle phase (`place_workspace`, `start_transport`,
+`create_runtime`, `ensure_session`, `configure_session`, `prepare_turn`,
+`turn`, `end_session`, `settle_reuse`, `stop_transport`, `sync_back`,
+`release_staging_lease`). The phase name must be one member of this closed
+allowlist; a name outside it emits nothing.
+
+The payload is a closed shape: exactly `phase`, `durationMs`, and `outcome`. It
+never carries a command, a path, an environment value, or a raw identifier. A
+negative or a non-finite duration clamps to `0`.
+
+`outcome` is one of `ok`, `failed`, or `timed_out`. `timed_out` marks a step a
+host-owned deadline cut off before it settled on its own — today this applies
+only to the `sync_back` step (the sandbox workspace copy-back) on a run whose
+duplex control channel already latched a loss, where the copy-back has no
+cancellation hook and the deadline bounds the wait without abandoning it (the
+run's own staging lease stays held until the copy-back genuinely settles). A
+`timed_out` step outcome is independent of `resultJson.timeoutFired` on the
+run record: that flag reflects only a trusted, typed host signal that the
+run's own overall adapter execution timeout fired, never a single settlement
+step's deadline.
+
+### `run.last_progress_to_terminal`
+
+One diagnostic event, emitted only on a run whose duplex control channel
+latched a loss. The payload is a closed shape: exactly `durationMs` — the
+elapsed time between the moment the engine confirmed the loss and the moment
+every settlement step (including a deadline-bound `sync_back`) returned. It
+answers one question: how long did teardown take once the run's outcome was
+already known. A non-finite or a negative duration is an invalid measurement
+and is dropped, so this emits nothing on that input. The payload never carries
+progress text, a timestamp, a path, a session handle, provider error text, or
+any other identifier.
+
+### Related workspace-restore failure code
+
+A `sync_back` step that hits its deadline on a latched duplex loss also
+records `workspaceRestoreFailure: "restore_timed_out"` on the run's
+`resultJson` (see `packages/adapter-utils/src/workspace-restore-merge.ts`).
+This is a new member of the existing closed `WorkspaceRestoreFailureCode` set,
+alongside `restore_permission_denied`, `restore_lock_timeout`, and
+`restore_failed`. A `sync_back` failure on the same path (for example, an
+unavailable sandbox session) still records `restore_failed`, the existing
+generic code — the run never reports a failed or a bounded copy-back as a
+successful cleanup.

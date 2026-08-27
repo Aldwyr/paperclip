@@ -120,6 +120,7 @@ import {
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
+import { revokeRunScopedCredential } from "./run-credential-revocation.js";
 import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
@@ -16305,6 +16306,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             onSpawn,
             authToken: authToken ?? undefined,
+            onInvalidateRunCredential: async () => {
+              revokeRunScopedCredential(run.id);
+            },
           });
         }
         // Adapter returned cleanly, which means its workspace-restore finally

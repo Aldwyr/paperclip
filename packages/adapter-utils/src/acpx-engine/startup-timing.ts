@@ -828,8 +828,12 @@ export type RunPhaseName = (typeof RUN_PHASE_NAMES)[number];
 
 const RUN_PHASE_NAME_SET: ReadonlySet<string> = new Set(RUN_PHASE_NAMES);
 
-/** The closed outcome set for a phase-timing event. */
-export type RunPhaseOutcome = "ok" | "failed";
+/**
+ * The closed outcome set for a phase-timing event. `timed_out` marks a step a
+ * host-owned deadline cut off before it settled on its own; it carries a
+ * finite, measured duration (the deadline value), never an open-ended wait.
+ */
+export type RunPhaseOutcome = "ok" | "failed" | "timed_out";
 
 /**
  * Emit exactly one `run.phase.timing` event for a run-lifecycle phase. The
@@ -854,6 +858,44 @@ export async function emitRunPhaseTiming(
     level: "info",
     message: `run phase: ${phase} (${safeDuration}ms)`,
     payload: { phase, durationMs: safeDuration, outcome },
+  };
+  try {
+    await ctx.onEvent?.(event);
+  } catch {
+    // Telemetry never fails the run.
+  }
+}
+
+/**
+ * The event type for the last-progress-to-terminal diagnostic. It rides the
+ * same run-events bridge as {@link RUN_PHASE_TIMING_EVENT_TYPE} and never
+ * changes run control flow.
+ */
+export const RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE = "run.last_progress_to_terminal";
+
+/**
+ * Emit the last-progress-to-terminal diagnostic: the elapsed time between the
+ * run's last known-good signal and the run reaching a fully settled terminal
+ * state. It answers one question — how long did teardown take once the run's
+ * outcome was already known — without carrying any content that could
+ * identify the run. The payload is a closed shape: exactly `durationMs`. It
+ * never carries progress text, a timestamp, a path, a session handle,
+ * provider error text, or any other identifier. A non-finite or a negative
+ * duration is an invalid measurement, so this drops it and emits nothing.
+ * Every sink call sits inside an error swallow, so a throwing telemetry sink
+ * never fails the run.
+ */
+export async function emitLastProgressToTerminalDiagnostic(
+  ctx: Pick<AdapterExecutionContext, "onEvent">,
+  durationMs: number,
+): Promise<void> {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  const event: AdapterRuntimeEvent = {
+    eventType: RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE,
+    stream: "system",
+    level: "info",
+    message: `run last progress to terminal: ${durationMs}ms`,
+    payload: { durationMs },
   };
   try {
     await ctx.onEvent?.(event);
