@@ -234,6 +234,10 @@ jobs:
       - name: Build runner TypeScript prerequisites
         run: pnpm --filter @paperclipai/paperclip-eval-kernel build
 
+      - name: Build native remote provider pack
+        if: matrix.environmentId == 'daytona' && (matrix.profileId == 'runner-opencode' || startsWith(matrix.profileId, 'runner-acpx-'))
+        run: pnpm --filter @paperclipai/paperclip-runner build:provider-pack
+
       - name: Install pinned legacy Claude CLI
         if: matrix.profileId == 'legacy-claude'
         run: npm install --global --omit=dev @anthropic-ai/claude-code@2.1.19
@@ -252,6 +256,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
           PAPERCLIP_E2E_DAYTONA_IMAGE: ${{ needs.daytona_image.outputs.image }}
+          PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH: ${{ github.workspace }}/packages/paperclip-runner/provider-pack
           PAPERCLIP_E2E_CAMPAIGN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.executionId }}
         run: pnpm test:e2e:runner -- --id "${{ matrix.executionId }}"
 

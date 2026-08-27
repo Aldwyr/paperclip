@@ -40,6 +40,12 @@ describe("runner E2E Daytona image contract", () => {
     expect(workflow).toContain("docker image inspect");
     expect(workflow).toContain('.Config.User == "daytona"');
     expect(workflow).toContain("PAPERCLIP_RUNNER_PROVIDER_PACK_ROOT=");
+    expect(workflow).toContain(
+      "pnpm --filter @paperclipai/paperclip-runner build:provider-pack",
+    );
+    expect(workflow).toContain(
+      "PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH: ${{ github.workspace }}/packages/paperclip-runner/provider-pack",
+    );
     expect(workflow).toContain("anonymous_config");
   });
 });
