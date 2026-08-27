@@ -18,23 +18,31 @@ The fleet image is currently amd64-only because the pinned Cursor and GitHub CLI
 checksums cover amd64.
 
 ```bash
+content_id="$(pnpm --silent test:e2e:runner:image-id)"
 docker buildx build \
   --platform linux/amd64 \
+  --build-arg PAPERCLIP_RUNNER_CONTENT_ID="${content_id}" \
   --build-arg PAPERCLIP_RUNNER_SOURCE_REVISION="$(git rev-parse HEAD)" \
-  --tag paperclip-daytona-runner:dev \
+  --tag "paperclip-daytona-runner:e2e-content-${content_id}" \
   --load \
   --file docker/daytona-runner/Dockerfile \
   .
 
 docker run --rm --platform linux/amd64 \
   --entrypoint paperclip-runnerd \
-  paperclip-daytona-runner:dev \
+  "paperclip-daytona-runner:e2e-content-${content_id}" \
   --build-metadata
 ```
 
 The metadata must advertise `dial_ws_loopback`, `dial_wss`, and `listen_ws`.
 The explicit entrypoint is needed only for this local probe because Daytona's
 base image uses its own long-running sandbox entrypoint.
+
+`test:e2e:runner:image-id` hashes the audited Docker build dependency closure
+and target platform. Git commits that do not change those inputs reuse the same
+content tag. `PAPERCLIP_RUNNER_SOURCE_REVISION` remains the full Git SHA that
+built the first published copy and is retained as provenance rather than cache
+identity.
 
 ## Use in Paperclip
 

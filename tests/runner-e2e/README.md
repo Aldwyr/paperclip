@@ -104,23 +104,37 @@ Use the immutable digest printed by the `Publish verified Daytona image` job,
 or publish the current source locally:
 
 ```bash
-image="ghcr.io/paperclipai/paperclip-daytona-runner:e2e-git-$(git rev-parse HEAD)"
-docker buildx build \
-  --platform linux/amd64 \
-  --build-arg "PAPERCLIP_RUNNER_SOURCE_REVISION=$(git rev-parse HEAD)" \
-  --file docker/daytona-runner/Dockerfile \
-  --tag "$image" \
-  --push \
-  .
+content_id="$(pnpm --silent test:e2e:runner:image-id)"
+source_revision="$(git rev-parse HEAD)"
+image="ghcr.io/paperclipai/paperclip-daytona-runner:e2e-content-${content_id}"
+if ! docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+  docker buildx build \
+    --platform linux/amd64 \
+    --build-arg "PAPERCLIP_RUNNER_CONTENT_ID=${content_id}" \
+    --build-arg "PAPERCLIP_RUNNER_SOURCE_REVISION=${source_revision}" \
+    --file docker/daytona-runner/Dockerfile \
+    --tag "$image" \
+    --push \
+    .
+fi
 docker buildx imagetools inspect "$image"
 ```
+
+The content ID hashes the audited image inputs, including the Dockerfile,
+platform, root package/lock/build configuration, dependency patches,
+`paperclip-eval-kernel`, and `paperclip-runner`. Changes elsewhere in the
+repository keep the same tag and reuse the already signed image. The Git SHA is
+stored separately as image provenance. CI reads that provenance back from a
+reused image when it builds the controller-side provider pack, preserving the
+exact manifest match required to avoid restaging the pack into Daytona.
 
 Resolve the manifest digest and set `PAPERCLIP_E2E_DAYTONA_IMAGE` to
 `ghcr.io/paperclipai/paperclip-daytona-runner@sha256:...`. The repository
 workflow signs that digest with Cosign/OIDC and verifies that it is publicly
 pullable, includes the provider pack, and advertises `dial_ws_loopback`,
 `dial_wss`, and `listen_ws`. The GHCR package must be configured as public;
-the image job deliberately fails its anonymous-pull check otherwise.
+the image job deliberately fails its anonymous-pull check otherwise. Existing
+content tags are never rebuilt or overwritten by the workflow.
 
 ## Evidence and cleanup
 

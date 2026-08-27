@@ -62,6 +62,7 @@
     "test:storybook-visual:update": "node scripts/storybook-visual-baseline.mjs download && pnpm build-storybook && npx playwright test --config tests/storybook-visual/playwright.config.ts --update-snapshots && node scripts/storybook-visual-baseline.mjs pack",
     "test:e2e": "pnpm run preflight:workspace-links && npx playwright test --config tests/e2e/playwright.config.ts",
     "test:e2e:runner": "node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/launch.ts",
+    "test:e2e:runner:image-id": "node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/daytona-image-content.ts",
     "test:e2e:runner:unit": "vitest run --config tests/runner-e2e/vitest.config.ts",
     "test:e2e:runner:typecheck": "tsc -p tests/runner-e2e/tsconfig.json",
     "test:e2e:runner:report": "node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/report.ts",

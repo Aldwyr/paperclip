@@ -32,6 +32,13 @@ RUN pnpm --filter @paperclipai/paperclip-runner build:typescript \
 # runner-specific addition is /usr/local/bin/paperclip-runnerd below.
 FROM daytonaio/sandbox:0.8.0
 
+ARG PAPERCLIP_RUNNER_CONTENT_ID
+ARG PAPERCLIP_RUNNER_SOURCE_REVISION
+RUN test -n "${PAPERCLIP_RUNNER_CONTENT_ID}" \
+    && test -n "${PAPERCLIP_RUNNER_SOURCE_REVISION}"
+LABEL io.paperclip.runner.content-id="${PAPERCLIP_RUNNER_CONTENT_ID}" \
+      org.opencontainers.image.revision="${PAPERCLIP_RUNNER_SOURCE_REVISION}"
+
 USER root
 
 ENV PAPERCLIP_RUNNER_PROVIDER_PACK_ROOT=/opt/paperclip-runner/provider-pack

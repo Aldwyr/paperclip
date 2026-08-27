@@ -128,11 +128,16 @@ schedulable profile/environment/case jobs for a full run. The paid matrix uses
 `fail-fast:false`, `max-parallel:16`, and 25-minute local or 40-minute Daytona
 job limits that cover the scenario deadline plus one fresh-harness retry.
 
-When Daytona is selected, one image job reuses a verified digest for the tested
-SHA or builds `linux/amd64` from `docker/daytona-runner/Dockerfile`, pushes
-`e2e-git-<sha>`, signs with Cosign/OIDC, verifies anonymous pull, checks runner
-contract/transport metadata, and exposes the immutable digest to every Daytona
-cell.
+When Daytona is selected, one image job computes an audited content ID from the
+`linux/amd64` platform, Dockerfile, root package/lock/build configuration,
+dependency patches, eval-kernel package, and runner package. It reuses the
+verified `e2e-content-<sha256>` image when that dependency closure is unchanged,
+or builds and publishes it otherwise. The tested Git SHA remains separate image
+provenance. Reuse reads that original revision back into the controller-side
+provider-pack build so its manifest remains byte-identical to the preinstalled
+pack. The job signs with Cosign/OIDC, verifies anonymous pull, checks the content
+label and runner contract/transport metadata, and exposes the immutable digest
+to every Daytona cell.
 
 Every execution uploads a 30-day sanitized bundle. The final job always downloads
 evidence, merges Playwright blob reports into HTML/JUnit, stages the sanitized

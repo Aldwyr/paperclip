@@ -46,6 +46,7 @@ jobs:
       matrix: ${{ steps.catalog.outputs.matrix }}
       needs_daytona: ${{ steps.catalog.outputs.needs_daytona }}
       execution_ids: ${{ steps.catalog.outputs.execution_ids }}
+      daytona_image_content_id: ${{ steps.daytona_image_content.outputs.content_id }}
     steps:
       - uses: actions/checkout@v7
 
@@ -59,6 +60,10 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+
+      - name: Compute Daytona image content ID
+        id: daytona_image_content
+        run: echo "content_id=$(pnpm --silent test:e2e:runner:image-id)" >> "$GITHUB_OUTPUT"
 
       - name: Validate selectors and emit matrix
         id: catalog
@@ -128,6 +133,8 @@ jobs:
       id-token: write
     outputs:
       image: ${{ steps.image.outputs.image }}
+      source_revision: ${{ steps.image.outputs.source_revision }}
+      content_id: ${{ steps.image.outputs.content_id }}
     steps:
       - uses: actions/checkout@v7
 
@@ -156,19 +163,24 @@ jobs:
         id: image
         env:
           NEEDS_DAYTONA: ${{ needs.catalog.outputs.needs_daytona }}
-          IMAGE_TAG: ghcr.io/paperclipai/paperclip-daytona-runner:e2e-git-${{ github.sha }}
+          IMAGE_CONTENT_ID: ${{ needs.catalog.outputs.daytona_image_content_id }}
+          IMAGE_TAG: ghcr.io/paperclipai/paperclip-daytona-runner:e2e-content-${{ needs.catalog.outputs.daytona_image_content_id }}
         run: |
           set -euo pipefail
           if [ "$NEEDS_DAYTONA" != true ]; then
             echo "image=" >> "$GITHUB_OUTPUT"
+            echo "source_revision=" >> "$GITHUB_OUTPUT"
+            echo "content_id=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          [[ "$IMAGE_CONTENT_ID" =~ ^[0-9a-f]{64}$ ]]
           identity="^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/runner-full-stack-e2e.yml@"
           if docker buildx imagetools inspect "$IMAGE_TAG" >/dev/null 2>&1; then
             digest="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           else
             docker buildx build \
               --platform linux/amd64 \
+              --build-arg "PAPERCLIP_RUNNER_CONTENT_ID=${IMAGE_CONTENT_ID}" \
               --build-arg "PAPERCLIP_RUNNER_SOURCE_REVISION=${GITHUB_SHA}" \
               --file docker/daytona-runner/Dockerfile \
               --tag "$IMAGE_TAG" \
@@ -198,6 +210,10 @@ jobs:
           # configuration here without creating a redundant container.
           image_config="$(docker image inspect "$immutable" \
             --format '{{json .}}')"
+          published_content_id="$(jq -r '.Config.Labels["io.paperclip.runner.content-id"] // empty' <<< "$image_config")"
+          source_revision="$(jq -r '.Config.Labels["org.opencontainers.image.revision"] // empty' <<< "$image_config")"
+          test "$published_content_id" = "$IMAGE_CONTENT_ID"
+          [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]]
           jq -e \
             '.Architecture == "amd64" and
              .Os == "linux" and
@@ -205,6 +221,8 @@ jobs:
              (.Config.Env | any(startswith("PAPERCLIP_RUNNER_PROVIDER_PACK_ROOT=")))' \
             <<< "$image_config" >/dev/null
           echo "image=$immutable" >> "$GITHUB_OUTPUT"
+          echo "source_revision=$source_revision" >> "$GITHUB_OUTPUT"
+          echo "content_id=$published_content_id" >> "$GITHUB_OUTPUT"
 
   test:
     name: ${{ matrix.executionId }}
@@ -236,6 +254,11 @@ jobs:
 
       - name: Build native remote provider pack
         if: matrix.environmentId == 'daytona' && (matrix.profileId == 'runner-opencode' || startsWith(matrix.profileId, 'runner-acpx-'))
+        env:
+          # Reused images retain the source revision that was embedded in their
+          # provider pack. Matching it here lets the server reuse that exact
+          # preinstalled pack instead of uploading a duplicate to the lease.
+          PAPERCLIP_RUNNER_SOURCE_REVISION: ${{ needs.daytona_image.outputs.source_revision }}
         run: pnpm --filter @paperclipai/paperclip-runner build:provider-pack
 
       - name: Install pinned legacy Claude CLI
