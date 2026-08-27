@@ -28,6 +28,25 @@ import { NativeSessionSteeringError } from "../services/native-runtime/native-se
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+const DIRECT_ADAPTER_TYPES = [
+  "acpx_local",
+  "claude_local",
+  "codex_local",
+  "cursor_cloud",
+  "cursor",
+  "gemini_local",
+  "grok_local",
+  "hermes_gateway",
+  "hermes_local",
+  "kimi_local",
+  "openclaw_gateway",
+  "opencode_local",
+  "pi_local",
+  "process",
+  "http",
+  "external_test_adapter",
+] as const;
+
 describeEmbeddedPostgres("question response delivery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -53,7 +72,12 @@ describeEmbeddedPostgres("question response delivery", () => {
     await tempDb?.cleanup();
   });
 
-  async function seed(args: { sourceStatus?: string; successorStatus?: "queued" | "running" } = {}) {
+  async function seed(args: {
+    adapterType?: string;
+    runtimeMode?: "legacy" | "native";
+    sourceStatus?: string;
+    successorStatus?: "queued" | "running";
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const goalId = randomUUID();
@@ -72,7 +96,7 @@ describeEmbeddedPostgres("question response delivery", () => {
       name: "Runner",
       role: "engineer",
       status: "active",
-      adapterType: "codex_local",
+      adapterType: args.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -93,7 +117,7 @@ describeEmbeddedPostgres("question response delivery", () => {
       agentId,
       invocationSource: "manual",
       status: args.sourceStatus ?? "succeeded",
-      runtimeMode: "native",
+      runtimeMode: args.runtimeMode ?? "native",
       driverKind: "codex",
       contextSnapshot: { issueId },
       ...(args.sourceStatus === "running" ? { startedAt: new Date() } : { finishedAt: new Date() }),
@@ -105,7 +129,7 @@ describeEmbeddedPostgres("question response delivery", () => {
         agentId,
         invocationSource: "manual",
         status: args.successorStatus,
-        runtimeMode: "native",
+        runtimeMode: args.runtimeMode ?? "native",
         driverKind: "codex",
         contextSnapshot: { issueId },
         ...(args.successorStatus === "running" ? { startedAt: new Date() } : {}),
