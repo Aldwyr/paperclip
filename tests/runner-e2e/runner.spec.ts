@@ -8,6 +8,10 @@ import { classifyFailure } from "./failure-classifier.js";
 import { setupLiveFixtures, type LiveFixtureValues } from "./live-fixtures.js";
 import { evaluateMatchers, type MatcherResult } from "./matchers.js";
 import {
+  isNonExecutingReviewFenceRun,
+  numberedPlanStepCount,
+} from "./run-observations.js";
+import {
   assertSecretFree,
   findSecretLeakInJsonValues,
   normalizedSecrets,
@@ -228,6 +232,7 @@ function matchingRuns(runs: RunRecord[], issue: IssueRecord) {
     [issue.executionRunId, issue.checkoutRunId].filter(Boolean),
   );
   return runs.filter((run) => {
+    if (isNonExecutingReviewFenceRun(run)) return false;
     const context = record(run.contextSnapshot);
     return (
       context.issueId === issue.id ||
@@ -260,10 +265,6 @@ function renderedMarkerPattern(marker: string) {
       .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
       .join("\\\\?_"),
   );
-}
-
-function numberedPlanStepCount(body: string | null | undefined) {
-  return [...(body ?? "").matchAll(/^\s*\d+[.)]\s+/gm)].length;
 }
 
 for (const execution of executions) {

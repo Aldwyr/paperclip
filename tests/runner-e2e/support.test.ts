@@ -21,6 +21,10 @@ import {
   sanitizeJson,
 } from "./redaction.js";
 import { parseDarwinSharedMemory } from "./shared-memory.js";
+import {
+  isNonExecutingReviewFenceRun,
+  numberedPlanStepCount,
+} from "./run-observations.js";
 import { runnerE2EWebServerCommand } from "./web-server-command.js";
 
 const cleanupDirectories: string[] = [];
@@ -207,6 +211,39 @@ describe("runner E2E matchers", () => {
       },
     );
     expect(results.every((result) => result.passed)).toBe(true);
+  });
+});
+
+describe("runner E2E run observations", () => {
+  it("counts provider-equivalent numbered Plan step formats", () => {
+    expect(numberedPlanStepCount("1. First\n2) Second")).toBe(2);
+    expect(
+      numberedPlanStepCount(
+        "# Plan\n\nStep 1 — First\n\nStep 2 — Second\n\nStep 3: Verify",
+      ),
+    ).toBe(3);
+    expect(numberedPlanStepCount("## **Step 1** — First\n- **2.** Second")).toBe(2);
+  });
+
+  it("excludes only queued continuations fenced while awaiting review", () => {
+    expect(
+      isNonExecutingReviewFenceRun({
+        status: "cancelled",
+        errorCode: "issue_continuation_waiting_on_review",
+      }),
+    ).toBe(true);
+    expect(
+      isNonExecutingReviewFenceRun({
+        status: "failed",
+        errorCode: "issue_continuation_waiting_on_review",
+      }),
+    ).toBe(false);
+    expect(
+      isNonExecutingReviewFenceRun({
+        status: "cancelled",
+        errorCode: "provider_failure",
+      }),
+    ).toBe(false);
   });
 });
 
