@@ -2417,14 +2417,19 @@ const CHANNEL_LOST_SYNC_BACK_DEADLINE_MS = 60_000;
 type DeadlineOutcome<T> =
   | { readonly kind: "settled"; readonly value: T }
   // The deadline won the race. `settle` is the ORIGINAL operation promise,
-  // still running: it has no cancellation hook, so the caller must keep
-  // tracking it (never abandon it) to know when it truly finishes.
+  // still running: it has no cancellation hook, so the caller must choose
+  // whether to keep it or abandon it. The two callers make different
+  // choices. The healthy `end_session` close abandons `settle` and keeps no
+  // record of it (see `HEALTHY_END_SESSION_DEADLINE_MS`). The channel-lost
+  // copy-back keeps `settle` in `pendingSyncBackCompletion`, and the run
+  // `finally` defers the staging-lease release to it.
   | { readonly kind: "timed_out"; readonly settle: Promise<T> };
 
 /**
  * Race `run()` against `deadlineMs`. On a timeout, this returns immediately
  * with the still-pending original promise attached, so the caller can bound
- * its own wait without ever losing track of the real operation.
+ * its own wait and then choose whether to keep the promise or abandon it.
+ * See `DeadlineOutcome` above for what each caller of this helper chooses.
  */
 async function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promise<DeadlineOutcome<T>> {
   const settle = run();
