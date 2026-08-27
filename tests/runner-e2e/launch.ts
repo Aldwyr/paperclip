@@ -48,6 +48,7 @@ const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const localEnvPath = path.join(repositoryRoot, ".env.runner-e2e.local");
 const resultsRoot = path.join(repositoryRoot, "tests/runner-e2e/results");
 const activeProcessGroups = new Set<number>();
+const activeProcessCleanup = new Map<number, Promise<string | null>>();
 let cancelled = false;
 
 function cleanId(value: string) {
@@ -115,8 +116,13 @@ async function terminateProcessGroup(pid: number) {
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     cancelled = true;
-    for (const pid of activeProcessGroups)
-      stopProcessGroup(pid, signal === "SIGINT" ? "SIGTERM" : signal);
+    for (const pid of activeProcessGroups) {
+      if (activeProcessCleanup.has(pid)) {
+        stopProcessGroup(pid, "SIGKILL");
+        continue;
+      }
+      activeProcessCleanup.set(pid, terminateProcessGroup(pid));
+    }
   });
 }
 
@@ -253,9 +259,13 @@ async function runProcess(
   });
   if (timer) clearTimeout(timer);
   const processCleanupError = child.pid
-    ? await terminateProcessGroup(child.pid)
+    ? await (activeProcessCleanup.get(child.pid) ??
+        terminateProcessGroup(child.pid))
     : null;
-  if (child.pid) activeProcessGroups.delete(child.pid);
+  if (child.pid) {
+    activeProcessGroups.delete(child.pid);
+    activeProcessCleanup.delete(child.pid);
+  }
   await new Promise<void>((resolve) => log.end(resolve));
   return {
     exitCode,
@@ -305,6 +315,7 @@ async function readResult(resultPath: string, fallback: RunnerE2EResult) {
 async function copySharedEvidence(privateRoot: string, casePrivateDir: string) {
   for (const relative of [
     "server.log",
+    "playwright.log",
     "junit.xml",
     "html-report",
     "blob-report",

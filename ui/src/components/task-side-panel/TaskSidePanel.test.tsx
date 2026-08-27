@@ -7,6 +7,7 @@ import type { Issue, IssueDocument } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
+  taskPanelDocumentTab,
   taskPanelPropertiesTab,
   writeTaskSidePanelState,
 } from "@/lib/task-side-panel-state";
@@ -24,7 +25,7 @@ class ResizeObserverStub {
 
 const fixture = vi.hoisted(() => ({
   documents: [] as IssueDocument[] | undefined,
-  plan: null as IssueDocument | null,
+  plan: null as IssueDocument | null | undefined,
 }));
 
 const routeFixture = vi.hoisted(() => ({
@@ -157,16 +158,13 @@ describe("TaskSidePanel", () => {
     expect(container.textContent).toContain("Properties content");
   });
 
-  it("opens and selects Plan for a planning task", async () => {
+  it("does not create a Plan tab for planning mode before a plan exists", async () => {
     await render(panel({ issue: issue({ workMode: "planning" }) }));
-    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Plan");
-    expect(container.textContent).toContain("Plan content");
-    const viewport = container.querySelector<HTMLElement>('[role="tabpanel"][data-side-panel-content-viewport="true"]')!;
-    const prose = viewport.querySelector<HTMLElement>('[data-side-panel-prose-content="true"]')!;
-    expect(viewport.className).toContain("overflow-auto");
-    expect(viewport.className).toContain("scrollbar-while-scrolling");
-    expect(viewport.className).not.toContain("max-w-4xl");
-    expect(prose.className).toContain("max-w-4xl");
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Properties");
+    expect(container.querySelector('[data-side-panel-tab-target="document:plan"]')).toBeNull();
+
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Open a new tab"]')?.click());
+    expect(Array.from(container.querySelectorAll('[role="option"]')).some((item) => item.textContent?.includes("Plan"))).toBe(false);
   });
 
   it("opens a newly materialized plan until the user has interacted", async () => {
@@ -179,6 +177,7 @@ describe("TaskSidePanel", () => {
 
   it("opens a plan deep link without looping while document metadata loads", async () => {
     fixture.documents = undefined;
+    fixture.plan = undefined;
 
     await render(panel({
       issue: issue({ workMode: "planning" }),
@@ -209,6 +208,24 @@ describe("TaskSidePanel", () => {
     await render(panel({ issue: issue({ workMode: "planning" }) }));
     expect(container.querySelector('[role="tab"]')).toBeNull();
     expect(container.getElementsByTagName("input")[0]?.getAttribute("aria-label")).toBe("Search tabs and resources…");
+  });
+
+  it("removes a Plan tab persisted before a plan document existed", async () => {
+    writeTaskSidePanelState("user-1", "company-1", "task-1", {
+      state: {
+        tabs: [taskPanelPropertiesTab(), taskPanelDocumentTab("plan", "Plan")],
+        activeTabId: "document:plan",
+      },
+      launcherOpen: false,
+      userInteracted: false,
+      autoPlanHandled: false,
+      updatedAt: 1,
+    });
+
+    await render(panel({ issue: issue({ workMode: "planning" }) }));
+
+    expect(container.querySelector('[data-side-panel-tab-target="document:plan"]')).toBeNull();
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Properties");
   });
 
   it("opens an ordinary document deep link in a deduplicated document tab", async () => {

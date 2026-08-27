@@ -135,6 +135,7 @@ describe("TaskChatLiveTail", () => {
       { kind: "thinking", ts: TS, text: "Provider reasoning summary" },
       { kind: "assistant", ts: TS, text: "Visible answer." },
     ]);
+    expect(items[0]).toMatchObject({ kind: "thinking", streaming: false });
     render(items);
 
     expect(container.textContent).toContain("Visible answer.");
@@ -142,20 +143,15 @@ describe("TaskChatLiveTail", () => {
       '[data-testid="task-chat-phase-summary"]',
     );
     expect(reasoningPhase?.textContent).toContain("Reasoning");
-    expect(reasoningPhase?.getAttribute("aria-expanded")).toBe("false");
-    flushSync(() => reasoningPhase?.click());
+    expect(reasoningPhase?.getAttribute("aria-expanded")).toBe("true");
 
     expect(container.textContent).toContain("Provider reasoning summary");
     const thinking = container.querySelector('[data-testid="task-chat-thinking"]');
-    const disclosure = thinking?.querySelector<HTMLButtonElement>("button");
-    const preview = thinking?.querySelector(
-      '[data-testid="task-chat-thinking-preview"]',
-    );
-    expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
-    expect(preview?.textContent).toBe("Provider reasoning summary");
-    expect(preview?.classList.contains("task-chat-collapsed-line-fade")).toBe(
-      true,
-    );
+    expect(thinking?.getAttribute("data-state")).toBe("settled");
+    expect(
+      thinking?.querySelector('[data-testid="task-chat-thinking-text"]')
+        ?.textContent,
+    ).toContain("Provider reasoning summary");
     const phaseChildren = thinking?.closest(
       '[data-testid="task-chat-phase-children"]',
     );
@@ -174,19 +170,9 @@ describe("TaskChatLiveTail", () => {
     expect(
       thinking
         ?.querySelector('[data-testid="task-chat-thinking-icon"]')
-        ?.parentElement?.classList.contains("justify-center"),
+        ?.classList.contains("text-muted-foreground/50"),
     ).toBe(true);
     expect(thinking?.querySelector(".task-chat-reasoning-markdown")).toBeNull();
-
-    flushSync(() => disclosure?.click());
-
-    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
-    expect(
-      thinking?.querySelector(".task-chat-expanded-line-wrap"),
-    ).not.toBeNull();
-    expect(
-      thinking?.querySelector(".task-chat-reasoning-markdown")?.textContent,
-    ).toContain("Provider reasoning summary");
   });
 
   it("bounds long tool targets and wraps the full value only when expanded", () => {

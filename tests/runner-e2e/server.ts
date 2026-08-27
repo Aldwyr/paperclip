@@ -43,6 +43,9 @@ const serverEnvironment = buildPaperclipServerEnvironment(process.env, {
   PAPERCLIP_SECRETS_STRICT_MODE: "true",
   PAPERCLIP_DB_BACKUP_ENABLED: "false",
   PAPERCLIP_DB_BACKUP_DIR: path.join(temporaryRoot, "backups"),
+  // Onboarding normally opens the app after listen. Browser ownership belongs
+  // to Playwright in this harness, so never create a developer desktop tab.
+  PAPERCLIP_OPEN_ON_LISTEN: "false",
 });
 assertIsolatedServerEnvironment(serverEnvironment, {
   temporaryRoot,

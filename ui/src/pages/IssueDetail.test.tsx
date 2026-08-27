@@ -50,6 +50,7 @@ const mockIssuesApi = vi.hoisted(() => ({
   discardQueuedComment: vi.fn(),
   markRead: vi.fn(),
   update: vi.fn(),
+  resolveRecoveryAction: vi.fn(),
   previewTreeControl: vi.fn(),
   getTreeControlState: vi.fn(),
   listTreeHolds: vi.fn(),
@@ -359,6 +360,7 @@ vi.mock("../components/TaskChatThread", () => ({
     threadHeader?: ReactNode;
     onStopRun?: (runId: string) => Promise<void>;
     stopRunLabel?: string;
+    onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
     runFinalizationActions?: readonly {
       id: string;
       label: string;
@@ -377,6 +379,15 @@ vi.mock("../components/TaskChatThread", () => ({
             onClick={() => void props.onStopRun?.("run-active-1")}
           >
             {props.stopRunLabel ?? "Stop run"}
+          </button>
+        ) : null}
+        {props.onTryAgainNoLiveExecutionPath ? (
+          <button
+            type="button"
+            data-testid="mock-no-live-path-try-again"
+            onClick={() => void props.onTryAgainNoLiveExecutionPath?.()}
+          >
+            Try again
           </button>
         ) : null}
         {props.runFinalizationActions?.map((action) => (
@@ -1872,6 +1883,51 @@ describe("IssueDetail", () => {
     mockIssuesApi.update.mockReset();
   });
 
+  it("moves a blocked task back to todo when the no-live-path notice tries again", async () => {
+    const activeRecoveryAction = {
+      id: "recovery-action-1",
+    } as NonNullable<Issue["activeRecoveryAction"]>;
+    const issue = createIssue({
+      status: "blocked",
+      assigneeAgentId: "agent-1",
+      activeRecoveryAction,
+    });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockIssuesApi.resolveRecoveryAction.mockResolvedValue({
+      issue: { ...issue, status: "todo", activeRecoveryAction: null },
+      recoveryAction: { ...activeRecoveryAction, status: "resolved" },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const tryAgain = container.querySelector<HTMLButtonElement>(
+      '[data-testid="mock-no-live-path-try-again"]',
+    );
+    expect(tryAgain).not.toBeNull();
+
+    await act(async () => {
+      tryAgain!.click();
+    });
+
+    await waitForAssertion(() => {
+      expect(mockIssuesApi.resolveRecoveryAction).toHaveBeenCalledWith(issue.identifier, {
+        actionId: activeRecoveryAction.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+      });
+    });
+
+    mockIssuesApi.resolveRecoveryAction.mockReset();
+  });
+
   it("removes an inbox-origin archived issue and restores it when the toast Undo action is pressed", async () => {
     const issue = createIssue({
       id: "issue-1",
@@ -2911,6 +2967,67 @@ describe("IssueDetail", () => {
     // stays hidden without touching the persisted panelVisible preference.
     expect(mockOpenPanel).not.toHaveBeenCalled();
     expect(mockClosePanel).toHaveBeenCalled();
+  });
+
+  it("starts a planning-mode task as chat-only until its plan document exists", async () => {
+    mockSetBreadcrumbToolbar.mockClear();
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIssuePlanDecompositions: false,
+      enableExperimentalFileViewer: false,
+      enableExternalObjects: false,
+    });
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      originKind: "manual",
+      workMode: "planning",
+    }));
+    mockIssuesApi.getDocument.mockResolvedValue(null);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await flushReact();
+    await flushReact();
+
+    expect(mockOpenPanel).not.toHaveBeenCalled();
+    expect(mockClosePanel).toHaveBeenCalled();
+    expect(
+      container.querySelector('button[aria-label="Toggle side panel"]'),
+    ).toBeNull();
+    const toolbar = [...mockSetBreadcrumbToolbar.mock.calls]
+      .reverse()
+      .map(([node]) => node)
+      .find((node) => node !== null);
+    expect(toolbar).toBeDefined();
+  });
+
+  it("reveals the planning-mode task sidebar when its plan document exists", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIssuePlanDecompositions: false,
+      enableExperimentalFileViewer: false,
+      enableExternalObjects: false,
+    });
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      originKind: "manual",
+      workMode: "planning",
+    }));
+    mockIssuesApi.getDocument.mockResolvedValue({ id: "doc-1", key: "plan" });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitForAssertion(() => {
+      expect(mockOpenPanel).toHaveBeenCalled();
+    });
   });
 
   it("keeps the Show properties button clickable on the first task and reveals the sidebar on demand", async () => {

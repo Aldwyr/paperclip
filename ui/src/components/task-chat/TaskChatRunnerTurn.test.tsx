@@ -439,18 +439,71 @@ describe("TaskChatRunnerTurn", () => {
         ?.parentElement?.classList.contains("justify-center"),
     ).toBe(true);
     expect(
-      thinkingRows?.[0]?.querySelector("button")?.classList.contains(
+      thinkingRows?.[0]?.querySelector(
+        '[data-testid="task-chat-thinking-text"]',
+      )?.textContent,
+    ).toContain("Inspect the current card.");
+    expect(
+      thinkingRows?.[0]?.querySelector(".task-chat-reasoning-markdown"),
+    ).toBeNull();
+    expect(
+      thinkingRows?.[1]?.querySelector("button")?.classList.contains(
         "font-normal",
       ),
     ).toBe(true);
+  });
+
+  it("renders only the current reasoning block as active", () => {
+    render([
+      {
+        id: "old-reasoning",
+        kind: "thinking",
+        lines: ["Inspect the current card."],
+        streaming: true,
+        transcriptIndex: 1,
+      },
+      {
+        id: "read",
+        kind: "tool",
+        name: "Read files",
+        rawName: "Read",
+        status: "completed",
+      },
+      {
+        id: "current-reasoning",
+        kind: "thinking",
+        lines: ["Verify the updated state."],
+        streaming: true,
+        transcriptIndex: 3,
+      },
+    ]);
+
     act(() =>
-      thinkingRows?.[0]
-        ?.querySelector<HTMLButtonElement>("button")
+      container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="task-chat-phase-summary"]',
+        )
         ?.click(),
     );
+
+    const oldReasoning = container.querySelector(
+      '[data-activity-item-id="old-reasoning"]',
+    );
+    expect(oldReasoning?.textContent).toBe("Inspect the current card.");
+    expect(oldReasoning?.querySelector(".shimmer-text")).toBeNull();
     expect(
-      thinkingRows?.[0]?.querySelector(".task-chat-reasoning-markdown"),
+      oldReasoning?.querySelector('[data-testid="task-chat-thinking-text"]'),
     ).not.toBeNull();
+
+    const currentReasoning = container.querySelector(
+      '[data-activity-item-id="current-reasoning"]',
+    );
+    expect(currentReasoning?.textContent).toContain("Reasoning…");
+    expect(
+      currentReasoning
+        ?.querySelector('[data-testid="task-chat-thinking-icon"]')
+        ?.classList.contains("text-(--status-agent-running)"),
+    ).toBe(true);
   });
 
   it("does not let a textless reasoning lifecycle remove sticky commentary", () => {

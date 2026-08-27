@@ -27,6 +27,12 @@ Every attempt allocates a new OS temporary root with a Paperclip home, embedded
 database, workspace, private artifacts, logs, port, instance ID, and signing
 secrets.
 
+Local runs default to one worker and are intended for a narrow `--id` smoke
+test. The high-parallelism full matrix is a GitHub Actions responsibility; an
+operator must explicitly raise `--max-parallel` to overlap local stacks. The
+harness disables Paperclip's normal post-onboarding desktop browser launch so
+Playwright is the only browser owner.
+
 The launcher deletes ambient database URLs. `playwright.config.ts` separately
 constructs the Paperclip child environment and strips OpenAI, Anthropic,
 OpenRouter, and Daytona variables. It starts

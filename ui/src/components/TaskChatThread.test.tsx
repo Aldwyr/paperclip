@@ -1726,6 +1726,50 @@ describe("TaskChatThread composer alignment (PAP-498)", () => {
   });
 });
 
+describe("TaskChatThread no-live-execution-path recovery", () => {
+  const noLivePathComment = {
+    id: "comment-no-live-path",
+    companyId: "company-1",
+    issueId: "issue-1",
+    authorType: "system" as const,
+    authorAgentId: null,
+    authorUserId: null,
+    body: "Paperclip retried continuation, but it still has no live execution path.",
+    presentation: {
+      kind: "system_notice" as const,
+      tone: "danger" as const,
+      title: "No live execution path",
+      detailsDefaultOpen: false,
+    },
+    metadata: null,
+    createdAt: new Date("2026-08-26T12:00:00.000Z"),
+    updatedAt: new Date("2026-08-26T12:00:00.000Z"),
+  };
+
+  it("offers Try again only while the task is blocked", async () => {
+    const onTryAgain = vi.fn();
+    const props = {
+      comments: [noLivePathComment],
+      onAdd: async () => {},
+      onTryAgainNoLiveExecutionPath: onTryAgain,
+      showComposer: false,
+    };
+
+    render(<TaskChatThread {...props} issueStatus="blocked" />);
+    const tryAgain = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-no-live-path-try-again"]',
+    );
+    expect(tryAgain).not.toBeNull();
+
+    flushSync(() => tryAgain!.click());
+    await Promise.resolve();
+    expect(onTryAgain).toHaveBeenCalledTimes(1);
+
+    render(<TaskChatThread {...props} issueStatus="todo" />);
+    expect(container.querySelector('[data-testid="task-chat-no-live-path-try-again"]')).toBeNull();
+  });
+});
+
 describe("TaskChatThread blocker links", () => {
   it("shows the direct and server-selected terminal blocker at the top and bottom", () => {
     const terminalBlocker = {

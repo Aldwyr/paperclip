@@ -477,7 +477,7 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
     }
 
     if (shouldRunNow && !opts.invokedByRun) {
-      process.env.PAPERCLIP_OPEN_ON_LISTEN = "true";
+      process.env.PAPERCLIP_OPEN_ON_LISTEN ??= "true";
       const { runCommand } = await import("./run.js");
       await runCommand({ config: configPath, repair: true, yes: true });
       return;
@@ -746,7 +746,7 @@ export async function onboard(opts: OnboardOptions): Promise<void> {
   }
 
   if (shouldRunNow && !opts.invokedByRun) {
-    process.env.PAPERCLIP_OPEN_ON_LISTEN = "true";
+    process.env.PAPERCLIP_OPEN_ON_LISTEN ??= "true";
     const { runCommand } = await import("./run.js");
     await runCommand({ config: configPath, repair: true, yes: true });
     return;

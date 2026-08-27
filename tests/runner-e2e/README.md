@@ -61,7 +61,7 @@ pnpm test:e2e:runner -- --group native --environment local
 pnpm test:e2e:runner -- --profile runner-codex --case message-marker
 pnpm test:e2e:runner -- --case plan-revise-accept --group local
 pnpm test:e2e:runner -- --case ask-question --group native
-pnpm test:e2e:runner -- --all --max-parallel 8
+pnpm test:e2e:runner -- --all
 ```
 
 The catalog contains three cases for every profile/environment pair:
@@ -81,10 +81,15 @@ AND semantics. `--id` is exclusive with dimension selectors and `--all`.
 `--headed`, `--ui`, and `--debug` are forwarded to Playwright. An unknown
 selector, an empty selection, or a run with no explicit selector exits before
 Paperclip starts. `--max-parallel <n>` controls the number of isolated
-profile/environment/case harnesses that can overlap (default 4, also configurable
+profile/environment/case harnesses that can overlap (default 1, also configurable
 with `PAPERCLIP_E2E_MAX_PARALLEL`). Headed/UI/debug runs are forced to one worker.
 The Plan case is still sequential internally because its turns share one task;
 it runs in parallel with unrelated scenarios.
+
+Use a single `--id` smoke test for routine local verification. Full-matrix
+parallelism is intended for GitHub Actions; raising local parallelism starts
+multiple Paperclip/Postgres/Chromium stacks and can consume substantial CPU and
+memory.
 
 Credential-free checks are:
 

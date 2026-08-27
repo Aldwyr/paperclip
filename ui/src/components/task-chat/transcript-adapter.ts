@@ -641,6 +641,7 @@ export function transcriptToTaskChatItems(
       }
       case "assistant": {
         if (!entry.text) break;
+        finishThinking();
         const channel = entry.channel;
         if (messageIndex >= 0 && messageChannel === channel) {
           const it = items[messageIndex];

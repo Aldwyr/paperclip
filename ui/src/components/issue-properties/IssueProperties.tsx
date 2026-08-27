@@ -210,9 +210,7 @@ export function IssueProperties({
     }
     setPaneHeaderSlot(document.getElementById(PROPERTIES_PANE_HEADER_SLOT_ID));
   }, [taskChatShellEnabled, inline]);
-  // Plan earns a tab as soon as an issue is in planning mode, even before the
-  // plan document arrives. This keeps an expected plan surface visible and
-  // lets its diagnostic empty state explain what is missing.
+  // A Plan tab represents materialized plan content, not merely planning mode.
   // Same query keys as the tab bodies, so these share their cached fetches.
   const { data: paneTabPlanDocument } = useIssuePlanDocument(
     taskChatShellEnabled ? issue.id : null,
@@ -241,8 +239,7 @@ export function IssueProperties({
   const hasPlanTab =
     Boolean(paneTabPlanDocument)
     || (paneTabAcceptedPlans?.length ?? 0) > 0
-    || paneTabStandaloneDocuments.length > 0
-    || issue.workMode === "planning";
+    || paneTabStandaloneDocuments.length > 0;
   // Artifacts covers the same three sources the tab body composes: work
   // products, documents (redundant with the Plan tab, intentionally), and
   // agent-created attachments. User comment uploads stay thread-only and

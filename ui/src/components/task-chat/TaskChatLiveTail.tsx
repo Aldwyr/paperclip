@@ -105,6 +105,11 @@ function renderTailRow(
         <TaskChatActivityPhase
           key={item.id}
           item={item}
+          defaultOpen={item.items.some(
+            (child) =>
+              child.kind === "thinking" &&
+              child.lines.some((line) => line.trim().length > 0),
+          )}
           childrenClassName="relative ml-2.5 pl-6"
           showChildRail
           renderChild={(child) => child.kind === "tool"

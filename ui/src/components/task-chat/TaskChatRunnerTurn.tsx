@@ -106,7 +106,7 @@ function RunnerActivityTimeline({ items }: { items: readonly TaskChatItem[] }) {
         aria-label="Run activity"
         data-testid="task-chat-runner-activity-list"
       >
-        {items.map((item) => (
+        {items.map((item, index) => (
           <li className="min-w-0" key={item.id} data-activity-item-id={item.id}>
             {item.kind === "message" ? (
               <div
@@ -120,6 +120,7 @@ function RunnerActivityTimeline({ items }: { items: readonly TaskChatItem[] }) {
             ) : item.kind === "thinking" ? (
               <TaskChatThinking
                 item={item}
+                active={Boolean(item.streaming) && index === items.length - 1}
                 defaultOpen={false}
                 rowClassName="mx-0 px-0"
               />

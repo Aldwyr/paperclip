@@ -10,21 +10,47 @@ export function TaskChatThinking({
   item,
   defaultOpen,
   rowClassName,
+  active = Boolean(item.streaming),
 }: {
   item: TaskChatThinkingItem;
   /** Activity timelines keep reasoning as one compact row until requested. */
   defaultOpen?: boolean;
   /** Optional alignment override for a containing activity rail. */
   rowClassName?: string;
+  /** Whether this reasoning block is the runner's current activity. */
+  active?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen ?? false);
   const body = item.lines.join("\n").trim();
   const preview = flattenSelfTalk(body);
   const baseLabel = item.channel === "detail" ? "Reasoning detail" : "Reasoning";
-  const active = item.streaming === true;
   const label = active
     ? body ? `${baseLabel}…` : "Thinking…"
     : item.summaryLabel ?? (body ? baseLabel : "Thought");
+
+  if (body && !active) {
+    return (
+      <div
+        className={cn(
+          "flex min-w-0 items-start gap-1.5 px-1 py-0.5 text-xs font-normal text-muted-foreground",
+          rowClassName,
+        )}
+        data-testid="task-chat-thinking"
+        data-state="settled"
+      >
+        <span className="flex w-5 shrink-0 items-center justify-center">
+          <Brain
+            className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/50"
+            aria-hidden
+            data-testid="task-chat-thinking-icon"
+          />
+        </span>
+        <div className="min-w-0 flex-1" data-testid="task-chat-thinking-text">
+          <MarkdownBody softBreaks linkIssueReferences>{body}</MarkdownBody>
+        </div>
+      </div>
+    );
+  }
 
   if (!body) {
     return (

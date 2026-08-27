@@ -3096,33 +3096,38 @@ export function IssueDetail() {
   );
   const panelIssue = useMemo(() => issue ?? null, [issue?.id, issuePanelKey]);
   const panelChildIssues = useMemo(() => childIssues, [issuePanelKey]);
-  // Onboarding first task only: hide the Properties sidebar until a plan exists,
-  // then reveal it already on the Plan tab. We gate the panel *mount* (withhold
+  // Planning tasks start as chat-only until a plan exists, then reveal the
+  // sidebar already on the Plan tab. The onboarding first task keeps the same
+  // behavior even if its work mode changes. We gate the panel *mount* (withhold
   // the panel content) rather than flipping the global `panelVisible` preference
   // — that preference persists to localStorage and would leak "hidden" into every
-  // other task. Every non-first task has originKind !== onboarding_first_task, so
-  // `suppressPanelForFirstTask` stays false and behavior is unchanged. The user
-  // can still opt in early via the "Show properties" header button, which sets a
-  // per-issue override (keyed on the issue id so it resets across navigations).
+  // other task. The user can still opt in early via the "Show properties" header
+  // button, which sets a per-issue override (keyed on the issue id so it resets
+  // across navigations).
   const isOnboardingFirstTask =
     taskChatShellEnabled &&
     issue?.originKind === ONBOARDING_FIRST_TASK_ORIGIN_KIND;
-  const { data: firstTaskPlanDoc } = useIssuePlanDocument(
-    isOnboardingFirstTask ? issue?.id : null,
+  const shouldDeferPanelUntilPlan =
+    taskChatShellEnabled &&
+    (isOnboardingFirstTask || issue?.workMode === "planning");
+  const { data: deferredPanelPlanDoc } = useIssuePlanDocument(
+    shouldDeferPanelUntilPlan ? issue?.id : null,
   );
-  const [firstTaskPanelOverrideIssueId, setFirstTaskPanelOverrideIssueId] =
+  const [panelBeforePlanOverrideIssueId, setPanelBeforePlanOverrideIssueId] =
     useState<string | null>(null);
-  const firstTaskPanelOverride =
-    firstTaskPanelOverrideIssueId !== null &&
-    firstTaskPanelOverrideIssueId === issue?.id;
-  const suppressPanelForFirstTask =
-    isOnboardingFirstTask && !firstTaskPlanDoc && !firstTaskPanelOverride;
+  const panelBeforePlanOverride =
+    panelBeforePlanOverrideIssueId !== null &&
+    panelBeforePlanOverrideIssueId === issue?.id;
+  const suppressPanelUntilPlan =
+    shouldDeferPanelUntilPlan &&
+    !deferredPanelPlanDoc &&
+    !panelBeforePlanOverride;
   const openTaskSidePanel = useCallback(() => {
-    if (suppressPanelForFirstTask && issue?.id) {
-      setFirstTaskPanelOverrideIssueId(issue.id);
+    if (suppressPanelUntilPlan && issue?.id) {
+      setPanelBeforePlanOverrideIssueId(issue.id);
     }
     setPanelVisible(true);
-  }, [issue?.id, setPanelVisible, suppressPanelForFirstTask]);
+  }, [issue?.id, setPanelVisible, suppressPanelUntilPlan]);
   const showRichSubIssuesSection = shouldRenderRichSubIssuesSection(
     childIssuesLoading,
     childIssues.length,
@@ -4950,7 +4955,7 @@ export function IssueDetail() {
       taskChatShellEnabled &&
       !isMobile &&
       Boolean(issue?.id) &&
-      (!panelVisible || suppressPanelForFirstTask);
+      (!panelVisible || suppressPanelUntilPlan);
 
     setBreadcrumbToolbar(
       showTaskPanelLauncher ? (
@@ -4972,7 +4977,7 @@ export function IssueDetail() {
     openTaskSidePanel,
     panelVisible,
     setBreadcrumbToolbar,
-    suppressPanelForFirstTask,
+    suppressPanelUntilPlan,
     taskChatShellEnabled,
   ]);
 
@@ -5036,7 +5041,7 @@ export function IssueDetail() {
   }, [issue?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!panelIssue || suppressPanelForFirstTask) {
+    if (!panelIssue || suppressPanelUntilPlan) {
       closePanel();
       return;
     }
@@ -5085,7 +5090,7 @@ export function IssueDetail() {
     openPanel,
     panelChildIssues,
     panelIssue,
-    suppressPanelForFirstTask,
+    suppressPanelUntilPlan,
     resolvedHasActiveRun,
     checkIssueMonitorNow.isPending,
     checkIssueMonitorNow.mutate,
@@ -5254,8 +5259,8 @@ export function IssueDetail() {
       if (isMobile) {
         setMobilePropsOpen(true);
       } else {
-        if (suppressPanelForFirstTask && issue?.id) {
-          setFirstTaskPanelOverrideIssueId(issue.id);
+        if (suppressPanelUntilPlan && issue?.id) {
+          setPanelBeforePlanOverrideIssueId(issue.id);
         }
         setPanelVisible(true);
       }
@@ -5275,7 +5280,7 @@ export function IssueDetail() {
       issue?.id,
       issueId,
       setPanelVisible,
-      suppressPanelForFirstTask,
+      suppressPanelUntilPlan,
       taskChatShellEnabled,
     ],
   );
@@ -6564,7 +6569,7 @@ export function IssueDetail() {
             )}
           </Button>
           {taskChatShellEnabled ||
-          (panelVisible && !suppressPanelForFirstTask) ? null : (
+          (panelVisible && !suppressPanelUntilPlan) ? null : (
             <TooltipProvider>
               <SidePanelToggleButton
                 open={false}

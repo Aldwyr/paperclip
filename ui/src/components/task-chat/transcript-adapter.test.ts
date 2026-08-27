@@ -1442,7 +1442,6 @@ describe("paperclip runner semantic channels", () => {
       ],
       { runId: "run-reasoning-activity", running: true },
     );
-
     const thinking = parsed.filter(
       (item): item is Extract<TaskChatItem, { kind: "thinking" }> =>
         item.kind === "thinking",
@@ -1530,8 +1529,8 @@ describe("paperclip runner semantic channels", () => {
       interstitial: true,
       channel: "progress",
     });
-    expect(parsed[1]).toMatchObject({ channel: "summary" });
-    expect(parsed[2]).toMatchObject({ channel: "detail" });
+    expect(parsed[1]).toMatchObject({ channel: "summary", streaming: false });
+    expect(parsed[2]).toMatchObject({ channel: "detail", streaming: false });
     expect(parsed[3]).toMatchObject({ interstitial: false, channel: "final" });
     const history = settledRunChildren(parsed);
     expect(JSON.stringify(history)).not.toContain("Done.");

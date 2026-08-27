@@ -27,6 +27,7 @@ export function TaskChatActivityPhase({
   renderChild,
   renderChildren,
   autoOpen = true,
+  defaultOpen = false,
   childrenClassName,
   showChildRail = false,
   appearance = "classic",
@@ -35,6 +36,8 @@ export function TaskChatActivityPhase({
   renderChild: (child: TaskChatActivityPhaseItem["items"][number]) => ReactNode;
   renderChildren?: (children: TaskChatActivityPhaseItem["items"]) => ReactNode;
   autoOpen?: boolean;
+  /** Keep useful historical content visible in an in-flight transcript. */
+  defaultOpen?: boolean;
   childrenClassName?: string;
   /** Draws a nested-activity rail aligned beneath the summary disclosure. */
   showChildRail?: boolean;
@@ -42,8 +45,9 @@ export function TaskChatActivityPhase({
   appearance?: "classic" | "runner";
 }) {
   const shouldAutoOpen =
-    autoOpen &&
-    (item.active ||
+    defaultOpen ||
+    (autoOpen &&
+      (item.active ||
       item.items.some(
         (child) =>
           (child.kind === "thinking" && child.streaming) ||
@@ -57,7 +61,7 @@ export function TaskChatActivityPhase({
           (child.kind === "protocol" &&
             child.surface === "runtime_request" &&
             child.status === "pending"),
-      ));
+      )));
   const [open, setOpen] = useState(shouldAutoOpen);
   useEffect(() => {
     if (shouldAutoOpen) setOpen(true);
