@@ -107,7 +107,7 @@ describe("runtime context materialization", () => {
     }
   });
 
-  it("does not materialize an API key into the isolated Codex home", async () => {
+  it("materializes only an owner-readable API login cache and replaces stale auth", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-runtime-context-api-key-"));
     roots.push(root);
     const codexHome = join(root, "codex-home");
@@ -121,12 +121,19 @@ describe("runtime context materialization", () => {
     await prepareIsolatedCodexHome({
       context: null,
       codexHome,
+      apiKey: "fresh-ephemeral-key",
     });
 
-    await expect(stat(join(codexHome, "auth.json"))).rejects.toThrow();
+    await expect(readFile(join(codexHome, "auth.json"), "utf8")).resolves.toBe(
+      JSON.stringify({ OPENAI_API_KEY: "fresh-ephemeral-key" }),
+    );
+    expect((await stat(join(codexHome, "auth.json"))).mode & 0o777).toBe(0o600);
     await expect(readFile(join(codexHome, "config.toml"), "utf8")).resolves.toContain(
       "shell_snapshot = false",
     );
+
+    await prepareIsolatedCodexHome({ context: null, codexHome });
+    await expect(stat(join(codexHome, "auth.json"))).rejects.toThrow();
   });
 
   it("reconciles changed and empty assignments without following unexpected symlinks", async () => {

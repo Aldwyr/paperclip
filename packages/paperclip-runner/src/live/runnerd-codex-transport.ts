@@ -1381,6 +1381,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
+        apiKey:
+          this.options.environment?.CODEX_API_KEY ??
+          this.options.environment?.OPENAI_API_KEY,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
@@ -1704,6 +1707,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
+        apiKey:
+          this.options.environment?.CODEX_API_KEY ??
+          this.options.environment?.OPENAI_API_KEY,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }

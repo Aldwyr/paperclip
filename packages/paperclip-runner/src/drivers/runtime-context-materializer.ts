@@ -50,15 +50,15 @@ export async function materializeNativeRuntimeSkills(context: NativeRuntimeConte
   }
 }
 
-export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeContextSnapshot | null; codexHome: string; sourceCodexHome?: string | null; nativeMcp?: NativeMcpLaunchBinding | null }): Promise<void> {
+export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeContextSnapshot | null; codexHome: string; sourceCodexHome?: string | null; nativeMcp?: NativeMcpLaunchBinding | null; apiKey?: string | null }): Promise<void> {
   await mkdir(input.codexHome, { recursive: true, mode: 0o700 });
   await chmod(input.codexHome, 0o700);
   await materializeNativeRuntimeSkills(input.context, join(input.codexHome, "skills"));
   await rm(join(input.codexHome, "config.toml"), { force: true });
   await writeFile(join(input.codexHome, "config.toml"), [
-    // Codex shell snapshots serialize the provider process environment. Native
-    // Codex receives API-key credentials only through that environment, so a
-    // snapshot would turn an ephemeral credential into durable session state.
+    // Codex shell snapshots serialize the provider process environment. The
+    // native runner injects short-lived provider and MCP bindings, so a
+    // snapshot would turn ephemeral credentials into durable session state.
     "[features]",
     "shell_snapshot = false",
     "",
@@ -71,6 +71,18 @@ export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeCo
   ].join("\n"), { mode: 0o600 });
   const targetAuth = join(input.codexHome, "auth.json");
   await rm(targetAuth, { force: true });
+  const apiKey = input.apiKey?.trim();
+  if (apiKey) {
+    // The pinned Codex app-server authenticates API-key automation through its
+    // login cache rather than the CLI-only CODEX_API_KEY path. Keep this file
+    // owner-only in the disposable session home; backup and evidence packaging
+    // explicitly exclude auth.json.
+    await writeFile(targetAuth, JSON.stringify({ OPENAI_API_KEY: apiKey }), {
+      mode: 0o600,
+    });
+    await chmod(targetAuth, 0o600);
+    return;
+  }
   const sourceHome = input.sourceCodexHome?.trim();
   if (!sourceHome) return;
   const sourceAuth = join(sourceHome, "auth.json");
