@@ -33,7 +33,24 @@
         "workspace",
         "page",
         "database"
-      ]
+      ],
+      "credentialSources": {
+        "vercelConnect": {
+          "services": [
+            "notion"
+          ],
+          "principalModes": [
+            "user"
+          ],
+          "scopes": [
+            "*"
+          ],
+          "header": {
+            "name": "Authorization",
+            "prefix": "Bearer "
+          }
+        }
+      }
     }
   ],
   "redirectConstraints": "https-or-loopback-http",

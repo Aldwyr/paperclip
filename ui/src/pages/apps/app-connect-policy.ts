@@ -1,12 +1,12 @@
 import {
-  CONNECTABLE_APP_DEFINITIONS,
+  APP_STORE_DEFINITIONS,
   appSupportsCatalogSetup,
   connectionMethodSupportsAutomaticOAuth,
   getAvailableConnectionMethods,
-  getConnectableAppDefinition,
+  getAppStoreDefinition,
 } from "@paperclipai/shared";
 
-export const MCP_DIRECT_OAUTH_CONNECT_SLUGS = CONNECTABLE_APP_DEFINITIONS
+export const MCP_DIRECT_OAUTH_CONNECT_SLUGS = APP_STORE_DEFINITIONS
   .filter((app) => getAvailableConnectionMethods(app).some((method) =>
     connectionMethodSupportsAutomaticOAuth(method)
   ))
@@ -20,6 +20,16 @@ export function appSourceConnectHref(slug: string): string {
   return `/apps/connect?${new URLSearchParams({ source: slug }).toString()}`;
 }
 
+/** Resume one exact draft through the same setup wizard used for a new app. */
+export function appSourceResumeHref(slug: string, connectionId: string): string {
+  return `/apps/connect?${new URLSearchParams({ source: slug, resume: connectionId }).toString()}`;
+}
+
+export function vercelConnectSourceHref(slug?: string): string {
+  if (!slug) return "/apps/vercel-connect";
+  return `/apps/vercel-connect?${new URLSearchParams({ source: slug }).toString()}`;
+}
+
 export function resolveAppsConnectRouteKey(input: {
   serviceSlug?: string | null;
   appKey?: string | null;
@@ -30,6 +40,6 @@ export function resolveAppsConnectRouteKey(input: {
 
 export function canEnterAppsConnect(searchParams: URLSearchParams): boolean {
   if (searchParams.get("byo") === "1") return true;
-  const entry = getConnectableAppDefinition(searchParams.get("source") ?? "");
+  const entry = getAppStoreDefinition(searchParams.get("source") ?? "");
   return appSupportsCatalogSetup(entry);
 }

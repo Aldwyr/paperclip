@@ -1,11 +1,13 @@
-import { CONNECTABLE_APP_DEFINITIONS, appSupportsCatalogSetup } from "@paperclipai/shared";
+import { APP_STORE_DEFINITIONS, appSupportsCatalogSetup } from "@paperclipai/shared";
 import { describe, expect, it } from "vitest";
 import {
   MCP_DIRECT_OAUTH_CONNECT_SLUGS,
   appSourceConnectHref,
+  appSourceResumeHref,
   canEnterAppsConnect,
   isMcpDirectOAuthConnectSlug,
   resolveAppsConnectRouteKey,
+  vercelConnectSourceHref,
 } from "./app-connect-policy";
 
 describe("app connect policy", () => {
@@ -23,8 +25,8 @@ describe("app connect policy", () => {
     expect(canEnterAppsConnect(new URLSearchParams("source=notion"))).toBe(true);
     expect(canEnterAppsConnect(new URLSearchParams("source=jira"))).toBe(true);
     expect(canEnterAppsConnect(new URLSearchParams("source=asana"))).toBe(true);
-    expect(canEnterAppsConnect(new URLSearchParams("source=github"))).toBe(true);
-    expect(canEnterAppsConnect(new URLSearchParams("source=context7"))).toBe(true);
+    expect(canEnterAppsConnect(new URLSearchParams("source=github"))).toBe(false);
+    expect(canEnterAppsConnect(new URLSearchParams("source=context7"))).toBe(false);
     expect(canEnterAppsConnect(new URLSearchParams("source=zapier"))).toBe(true);
     expect(canEnterAppsConnect(new URLSearchParams("source=unknown"))).toBe(false);
     expect(canEnterAppsConnect(new URLSearchParams("byo=1&source=zapier"))).toBe(true);
@@ -32,10 +34,15 @@ describe("app connect policy", () => {
 
   it("builds a generic source deep link", () => {
     expect(appSourceConnectHref("notion")).toBe("/apps/connect?source=notion");
+    expect(appSourceResumeHref("notion", "11111111-1111-4111-8111-111111111111")).toBe(
+      "/apps/connect?source=notion&resume=11111111-1111-4111-8111-111111111111",
+    );
+    expect(vercelConnectSourceHref()).toBe("/apps/vercel-connect");
+    expect(vercelConnectSourceHref("notion")).toBe("/apps/vercel-connect?source=notion");
   });
 
   it("routes every capability-backed catalog definition through its source deep link", () => {
-    const connectableApps = CONNECTABLE_APP_DEFINITIONS.filter(appSupportsCatalogSetup);
+    const connectableApps = APP_STORE_DEFINITIONS.filter(appSupportsCatalogSetup);
 
     expect(connectableApps.length).toBeGreaterThan(0);
     for (const app of connectableApps) {

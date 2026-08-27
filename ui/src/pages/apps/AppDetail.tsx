@@ -40,7 +40,7 @@ import {
 import { appTabHref, appTabLabel, isAppTabKey, type AppTabKey } from "./app-tabs";
 import { SetupPanel } from "./app-detail/SetupPanel";
 import { ServicesPanel } from "./app-detail/ServicesPanel";
-import { ComposioProvenanceChip } from "./ComposioProvenanceChip";
+import { ConnectionProvenanceChip } from "./ComposioProvenanceChip";
 import { IdentitiesSection } from "./app-detail/IdentitiesSection";
 import { PermissionsPanel } from "./app-detail/PermissionsPanel";
 import { TestPanel } from "./app-detail/TestPanel";
@@ -860,7 +860,7 @@ function AppDetailHeader({
               </span>
             ) : null}
             {unverifiedHost ? <UnverifiedServerBadge host={unverifiedHost} /> : null}
-            <ComposioProvenanceChip connection={connection} />
+            <ConnectionProvenanceChip connection={connection} />
           </div>
         </div>
       </div>

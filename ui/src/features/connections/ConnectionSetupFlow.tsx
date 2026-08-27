@@ -29,6 +29,7 @@ import type {
   ToolApplication,
   ToolConnection,
   ToolConnectionAuthKind,
+  ToolConnectionCredentialSource,
   ToolConnectionCreateCapabilities,
 } from "@paperclipai/shared";
 import {
@@ -39,6 +40,7 @@ import {
   getAppDefinitionForUrl,
   getAvailableConnectionMethod,
   getAvailableConnectionMethods,
+  getRecommendedConnectionMethod,
 } from "@paperclipai/shared";
 import { useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { useCompany } from "@/context/CompanyContext";
@@ -64,12 +66,14 @@ import { cn } from "@/lib/utils";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
 import { navigateTopLevel } from "@/lib/browserNavigation";
+import { redactUrlSecrets } from "@/lib/redact-url-secrets";
 import { AppLogo } from "@/pages/apps/AppLogo";
 import { UnverifiedServerBadge } from "@/pages/apps/UnverifiedServerBadge";
 import {
   appSourceConnectHref,
   isMcpDirectOAuthConnectSlug,
   resolveAppsConnectRouteKey,
+  vercelConnectSourceHref,
 } from "@/pages/apps/app-connect-policy";
 import { parseGoogleSheetIds } from "@/pages/apps/google-sheets";
 import { connectionNameForGrantKind } from "@/pages/apps/connection-identity";
@@ -81,6 +85,7 @@ import {
   genericConnectGuidance,
   genericConnectPayload,
   newCustomHeaderRow,
+  oauthCallbackUrlForBrowser,
   type CustomHeaderRow,
   type GenericConnectDraft,
   type GenericConnectGuidance,
@@ -97,10 +102,18 @@ const ROUTE_STAGE_BY_STEP: Partial<Record<Step, string>> = {
   success: "complete",
 };
 
-function appConnectHref(appKey: string, step: Step): string {
+function appConnectHref(
+  appKey: string,
+  step: Step,
+  credentialSource: ToolConnectionCredentialSource,
+  existing?: { resumeConnectionId?: string | null; reconnectConnectionId?: string | null },
+): string {
   const stage = ROUTE_STAGE_BY_STEP[step] ?? "setup";
   const params = new URLSearchParams({ source: appKey, stage });
-  return `/apps/connect?${params.toString()}`;
+  if (existing?.resumeConnectionId) params.set("resume", existing.resumeConnectionId);
+  if (existing?.reconnectConnectionId) params.set("reconnect", existing.reconnectConnectionId);
+  const path = credentialSource === "vercel_connect" ? "/apps/vercel-connect" : "/apps/connect";
+  return `${path}?${params.toString()}`;
 }
 type AppAccessSelection = "all_agents" | { agentIds: string[] };
 
@@ -130,8 +143,12 @@ function defaultGrantKindFor(method: ConnectionMethodDef | null): ConnectionGran
   return "organization";
 }
 
-function isGoogleSheetsEntry(entry: AppDefinition | null): boolean {
-  return entry?.slug === "google-sheets";
+function isGoogleSheetsRobotMethod(
+  entry: AppDefinition | null,
+  method: ConnectionMethodDef | string | null | undefined,
+): boolean {
+  const methodKey = typeof method === "string" ? method : method?.key;
+  return entry?.slug === "google-sheets" && methodKey === "local";
 }
 
 function defaultMethodConfig(method: ConnectionMethodDef | null): Record<string, string | boolean> {
@@ -141,6 +158,29 @@ function defaultMethodConfig(method: ConnectionMethodDef | null): Record<string,
       .filter((field) => field.defaultValue !== undefined)
       .map((field) => [field.key, field.defaultValue!]),
   );
+}
+
+function connectionMethodsForCredentialSource(
+  entry: AppDefinition | null | undefined,
+  credentialSource: ToolConnectionCredentialSource,
+): ConnectionMethodDef[] {
+  if (!entry) return [];
+  const methods = getAvailableConnectionMethods(entry);
+  return credentialSource === "vercel_connect"
+    ? methods.filter((method) => Boolean(method.credentialSources?.vercelConnect))
+    : methods;
+}
+
+function recommendedSetupConnectionMethod(
+  methods: readonly ConnectionMethodDef[],
+): ConnectionMethodDef | null {
+  const recommended = getRecommendedConnectionMethod(methods);
+  // Capability choices (for example Google Workspace read versus write) have
+  // an intentional default. Unrelated region/authentication variants should
+  // still ask the operator to choose unless only one is available.
+  return methods.length === 1 || recommended?.capabilityProfile
+    ? recommended
+    : null;
 }
 
 function canUseAutomaticOAuthFastPath(entry: AppDefinition | null | undefined): boolean {
@@ -231,6 +271,7 @@ export function readConnectionIntentOAuthOutcome(
 
 export interface ConnectionSetupFlowProps {
   byoOnly?: boolean;
+  credentialSource?: ToolConnectionCredentialSource;
   host?: "page" | "dialog";
   serviceSlug?: string;
   requestedAgentId?: string;
@@ -251,6 +292,7 @@ export interface ConnectionSetupFlowProps {
  */
 export function ConnectionSetupFlow({
   byoOnly = false,
+  credentialSource = "paperclip_vault",
   host = "page",
   serviceSlug,
   requestedAgentId,
@@ -276,14 +318,20 @@ export function ConnectionSetupFlow({
   const appKey = routeParams.appKey ?? searchParams.get("appKey") ?? undefined;
   const sourceSlug = searchParams.get("source")?.trim() || null;
   const createNewConnection = searchParams.get("new") === "1";
+  const resumeConnectionId = searchParams.get("resume")?.trim() || null;
+  const oauthCallbackOutcome = searchParams.get("oauth");
   const reconnectConnectionId = searchParams.get("reconnect")?.trim() || null;
   const reconnectGrantKindHint: ConnectionGrantKind | null = searchParams.get("identity") === "user"
     ? "user"
     : searchParams.get("identity") === "organization"
       ? "organization"
       : null;
+  const vercelConnectMode = credentialSource === "vercel_connect";
   const directOAuthCandidate = serviceSlug ?? sourceSlug;
-  const directOAuthSource = isMcpDirectOAuthConnectSlug(directOAuthCandidate) ? directOAuthCandidate : null;
+  const directOAuthSource = credentialSource === "paperclip_vault"
+    && isMcpDirectOAuthConnectSlug(directOAuthCandidate)
+    ? directOAuthCandidate
+    : null;
   // `source` is the generic curated-app route contract, not an OAuth-only
   // shortcut. Manual OAuth, API-key, no-auth, and configured MCP definitions
   // must all enter the same branded setup flow when Browse links to them.
@@ -322,6 +370,7 @@ export function ConnectionSetupFlow({
   const [credentials, setCredentials] = useState<Record<string, string>>({});
   const [curatedOAuthClientId, setCuratedOAuthClientId] = useState("");
   const [curatedOAuthClientSecret, setCuratedOAuthClientSecret] = useState("");
+  const [vercelConnector, setVercelConnector] = useState("");
   const [connectionMethodKey, setConnectionMethodKey] = useState("");
   const [configValues, setConfigValues] = useState<Record<string, string | boolean>>({});
   const [googleSheetsLinks, setGoogleSheetsLinks] = useState("");
@@ -344,12 +393,25 @@ export function ConnectionSetupFlow({
   const [installChoice, setInstallChoice] = useState<"specific" | "all">(
     requestedAgentId ? "specific" : "all",
   );
-  const [oauthPhase, setOAuthPhase] = useState<OAuthConnectPhase>("entry");
-  const [oauthError, setOAuthError] = useState<string | null>(null);
+  const resumingAfterOAuthFailure = Boolean(
+    resumeConnectionId
+    && (oauthCallbackOutcome === "failed" || oauthCallbackOutcome === "denied"),
+  );
+  const [oauthPhase, setOAuthPhase] = useState<OAuthConnectPhase>(
+    resumingAfterOAuthFailure ? "error" : "entry",
+  );
+  const [oauthError, setOAuthError] = useState<string | null>(() => {
+    if (!resumingAfterOAuthFailure) return null;
+    return oauthCallbackOutcome === "denied"
+      ? "Authorization was cancelled or declined. Your saved connection was not changed."
+      : "Authorization did not complete. Your saved connection is still here, so you can try again.";
+  });
   /** Host of the page the operator is about to be sent to, shown while redirecting. */
   const [authorizationHost, setAuthorizationHost] = useState<string | null>(null);
   const directOAuthAccessConfirmedRef = useRef(false);
   const directOAuthRetryingRef = useRef(false);
+  const hydratedResumeConnectionIdRef = useRef<string | null>(null);
+  const [hydratedResumeConnectionId, setHydratedResumeConnectionId] = useState<string | null>(null);
   const oauthPopupRef = useRef<Window | null>(null);
   const [showConnectionChoice, setShowConnectionChoice] = useState(
     existingConnections.length > 0 && Boolean(onUseExisting),
@@ -432,7 +494,7 @@ export function ConnectionSetupFlow({
       navigate("/apps/connect?byo=1&source=zapier");
       return;
     }
-    if (canUseAutomaticOAuthFastPath(picked)) {
+    if (credentialSource === "paperclip_vault" && canUseAutomaticOAuthFastPath(picked)) {
       navigate(appSourceConnectHref(picked.slug));
       return;
     }
@@ -446,8 +508,9 @@ export function ConnectionSetupFlow({
     setCredentials({});
     setCuratedOAuthClientId("");
     setCuratedOAuthClientSecret("");
-    const methods = getAvailableConnectionMethods(picked);
-    const initialMethod = methods.length === 1 ? methods[0]! : null;
+    setVercelConnector("");
+    const methods = connectionMethodsForCredentialSource(picked, credentialSource);
+    const initialMethod = recommendedSetupConnectionMethod(methods);
     setConnectionMethodKey(initialMethod?.key ?? "");
     setConfigValues(defaultMethodConfig(initialMethod));
     setGoogleSheetsLinks("");
@@ -457,7 +520,11 @@ export function ConnectionSetupFlow({
     setInstallChoice(requestedAgentId ? "specific" : "all");
     setGrantKind(reconnectGrantKind ?? defaultGrantKindFor(initialMethod));
     setStep("access");
-    navigate(appSourceConnectHref(picked.slug));
+    navigate(
+      credentialSource === "vercel_connect"
+        ? vercelConnectSourceHref(picked.slug)
+        : appSourceConnectHref(picked.slug),
+    );
   };
 
   const openGallery = () => {
@@ -471,6 +538,7 @@ export function ConnectionSetupFlow({
     setCredentials({});
     setCuratedOAuthClientId("");
     setCuratedOAuthClientSecret("");
+    setVercelConnector("");
     setConnectionMethodKey("");
     setConfigValues({});
     setGoogleSheetsLinks("");
@@ -480,7 +548,11 @@ export function ConnectionSetupFlow({
     setInstallChoice(requestedAgentId ? "specific" : "all");
     setGrantKind("organization");
     setStep("gallery");
-    navigate(byoOnly ? "/apps/byo" : "/apps/connect?byo=1");
+    navigate(
+      credentialSource === "vercel_connect"
+        ? vercelConnectSourceHref()
+        : byoOnly ? "/apps/byo" : "/apps/connect?byo=1",
+    );
   };
 
   useEffect(() => {
@@ -488,10 +560,10 @@ export function ConnectionSetupFlow({
     setBreadcrumbs([
       { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
       { label: "Apps", href: "/apps" },
-      { label: byoOnly ? "Connect your own tool" : "Connect an app" },
+      { label: vercelConnectMode ? "Vercel Connect" : byoOnly ? "Connect your own tool" : "Connect an app" },
     ]);
     return () => setBreadcrumbs([]);
-  }, [byoOnly, host, setBreadcrumbs, selectedCompany?.name]);
+  }, [byoOnly, host, setBreadcrumbs, selectedCompany?.name, vercelConnectMode]);
 
   const galleryQuery = useQuery({
     queryKey: queryKeys.apps.gallery(selectedCompanyId ?? "__none__"),
@@ -501,13 +573,13 @@ export function ConnectionSetupFlow({
   const applicationsQuery = useQuery({
     queryKey: queryKeys.tools.applications(selectedCompanyId ?? "__none__"),
     queryFn: () => toolsApi.listApplications(selectedCompanyId!),
-    enabled: !!selectedCompanyId && (!!directOAuthSource || !!reconnectConnectionId),
+    enabled: !!selectedCompanyId && (!!directOAuthSource || !!resumeConnectionId || !!reconnectConnectionId),
     refetchOnMount: "always",
   });
   const connectionsQuery = useQuery({
     queryKey: queryKeys.tools.connections(selectedCompanyId ?? "__none__"),
     queryFn: () => toolsApi.listConnections(selectedCompanyId!),
-    enabled: !!selectedCompanyId && (!!directOAuthSource || !!reconnectConnectionId),
+    enabled: !!selectedCompanyId && (!!directOAuthSource || !!resumeConnectionId || !!reconnectConnectionId),
     refetchOnMount: "always",
   });
   const existingOAuthConnection = useMemo(
@@ -527,11 +599,21 @@ export function ConnectionSetupFlow({
       : null,
     [connectionsQuery.data, reconnectConnectionId],
   );
-  const reconnectGrantKind: ConnectionGrantKind | null = reconnectConnection
-    ? reconnectConnection.credentialPolicy === "per_user"
+  const resumeConnection = useMemo(
+    () => resumeConnectionId
+      ? (connectionsQuery.data?.connections ?? []).find((connection) => connection.id === resumeConnectionId) ?? null
+      : null,
+    [connectionsQuery.data, resumeConnectionId],
+  );
+  const identityConnection = resumeConnection ?? reconnectConnection;
+  const reconnectGrantKind: ConnectionGrantKind | null = identityConnection
+    ? identityConnection.credentialPolicy === "per_user"
       ? "user"
       : "organization"
     : reconnectGrantKindHint;
+  const resumableOAuthConnection = resumeConnection?.authKind === "oauth"
+    ? resumeConnection
+    : existingOAuthConnection;
   const existingOAuthGrantKind: ConnectionGrantKind | null = existingOAuthConnection
     ? existingOAuthConnection.credentialPolicy === "per_user"
       ? "user"
@@ -551,15 +633,20 @@ export function ConnectionSetupFlow({
   );
 
   const entryAutomaticOAuthMethod = automaticOAuthMethod(entry);
-  const automaticOAuthEntry = entryAutomaticOAuthMethod ? entry : null;
-  const directOAuthEntry = canUseAutomaticOAuthFastPath(entry) ? entry : null;
+  const automaticOAuthEntry = credentialSource === "paperclip_vault" && entryAutomaticOAuthMethod ? entry : null;
+  const directOAuthEntry = credentialSource === "paperclip_vault" && canUseAutomaticOAuthFastPath(entry) ? entry : null;
   const directOAuthLookupPending = Boolean(directOAuthSource) && (
     !applicationsQuery.isFetchedAfterMount || !connectionsQuery.isFetchedAfterMount
   );
 
   const setAppStep = (nextStep: Step) => {
     setStep(nextStep);
-    if (entry) navigate(appConnectHref(entry.slug, nextStep));
+    if (entry) {
+      navigate(appConnectHref(entry.slug, nextStep, credentialSource, {
+        resumeConnectionId,
+        reconnectConnectionId,
+      }));
+    }
   };
 
   const oauthStartMutation = useMutation({
@@ -625,7 +712,10 @@ export function ConnectionSetupFlow({
       let result: ConnectToolAppResult;
       if (connectEntry) {
         const requestedGrantKind = fixedGrantKind ?? grantKind;
-        const sheetIds = isGoogleSheetsEntry(connectEntry) ? parseGoogleSheetIds(googleSheetsLinks).ids : [];
+        const selectedMethod = getAvailableConnectionMethod(connectEntry, connectionMethodKey || null);
+        const sheetIds = isGoogleSheetsRobotMethod(connectEntry, selectedMethod)
+          ? parseGoogleSheetIds(googleSheetsLinks).ids
+          : [];
         const trimmedGalleryName = galleryName.trim();
         const connectionName = connectionNameForGrantKind(
           trimmedGalleryName || connectEntry.name,
@@ -635,7 +725,11 @@ export function ConnectionSetupFlow({
           galleryKey: connectEntry.slug,
           ...(connectionMethodKey ? { connectionMethodKey } : {}),
           name: connectionName,
-          credentialValues: credentials,
+          credentialSource,
+          ...(credentialSource === "paperclip_vault" ? { credentialValues: credentials } : {}),
+          ...(credentialSource === "vercel_connect"
+            ? { vercelConnect: { connector: vercelConnector.trim() } }
+            : {}),
           ...(curatedOAuthClientId.trim()
             ? {
                 oauthClient: {
@@ -644,12 +738,13 @@ export function ConnectionSetupFlow({
                 },
               }
             : {}),
-          configValues: isGoogleSheetsEntry(connectEntry)
+          configValues: isGoogleSheetsRobotMethod(connectEntry, selectedMethod)
             ? { allowedSpreadsheetIds: sheetIds }
             : Object.keys(configValues).length > 0
               ? configValues
               : undefined,
           applicationId: prefill.applicationId,
+          ...(resumeConnectionId ? { resumeConnectionId } : {}),
           ...(requestedGrantKind === "user" ? { grantKind: requestedGrantKind } : {}),
         });
       } else {
@@ -669,12 +764,28 @@ export function ConnectionSetupFlow({
         );
         result = await toolsApi.connectApp(selectedCompanyId!, {
           ...genericPayload,
+          // Zapier issues a credential-bearing URL, so its branded setup keeps
+          // the compact pasted-URL step. It is still a curated app, though: the
+          // gallery identity must reach the server or Browse can only see a
+          // generic `link` application after setup succeeds.
+          ...(zapierSource || linkMatchedEntry?.slug === "zapier"
+            ? {
+                galleryKey: "zapier",
+                connectionMethodKey: "generated-url",
+              }
+            : {}),
           name: connectionName,
           applicationId: prefill.applicationId,
           ...(effectiveGrantKind === "user" ? { grantKind: effectiveGrantKind } : {}),
         });
       }
-      if (result.auth?.kind === "oauth") await applyAccessInstalls(result.connectionId);
+      // A resumable draft already owns its identity and install reach. Replacing
+      // those choices with this page's defaults would turn "finish setup" into a
+      // silent access change. Fresh connections still persist the Access step
+      // before the browser leaves Paperclip.
+      if (result.auth?.kind === "oauth" && !resumeConnectionId && !reconnectConnectionId) {
+        await applyAccessInstalls(result.connectionId);
+      }
       return result;
     },
     onSuccess: (result) => {
@@ -777,17 +888,22 @@ export function ConnectionSetupFlow({
     if (!requestedAppKey || galleryQuery.isLoading || !galleryQuery.data) return;
 
     const requestedEntry = galleryQuery.data.apps.find((candidate) => candidate.slug === requestedAppKey);
-    const method = requestedEntry ? getAvailableConnectionMethod(requestedEntry) : null;
-    const methods = requestedEntry ? getAvailableConnectionMethods(requestedEntry) : [];
-    const automaticOAuth = Boolean(automaticOAuthMethod(requestedEntry));
+    const methods = connectionMethodsForCredentialSource(requestedEntry, credentialSource);
+    const method = methods.length === 1 ? methods[0]! : null;
+    const automaticOAuth = credentialSource === "paperclip_vault" && Boolean(automaticOAuthMethod(requestedEntry));
+    const vercelUnavailable = credentialSource === "vercel_connect"
+      && galleryQuery.data.credentialSources?.vercelConnect.available !== true;
     const unsupportedOAuth = methods.length === 1
       && method?.auth === "oauth"
       && !connectionMethodSupportsAutomaticOAuth(method)
       && !connectionMethodAcceptsCustomerOAuthClient(method);
-    if (!requestedEntry || unsupportedOAuth || requestedEntry.availability?.available === false) {
+    if (!requestedEntry || methods.length === 0 || unsupportedOAuth || vercelUnavailable || requestedEntry.availability?.available === false) {
       setEntry(null);
       setStep("gallery");
-      navigate("/apps/connect", { replace: true });
+      navigate(
+        credentialSource === "vercel_connect" ? vercelConnectSourceHref() : "/apps/connect",
+        { replace: true },
+      );
       return;
     }
 
@@ -801,8 +917,8 @@ export function ConnectionSetupFlow({
       setCredentials({});
       setCuratedOAuthClientId("");
       setCuratedOAuthClientSecret("");
-      const methods = getAvailableConnectionMethods(requestedEntry);
-      const initialMethod = methods.length === 1 ? methods[0]! : null;
+      setVercelConnector("");
+      const initialMethod = recommendedSetupConnectionMethod(methods);
       setConnectionMethodKey(initialMethod?.key ?? "");
       setConfigValues(defaultMethodConfig(initialMethod));
       setGoogleSheetsLinks("");
@@ -814,7 +930,7 @@ export function ConnectionSetupFlow({
       // Route/service selection initializes the wizard once. Later renders must
       // preserve the user's current step in both hosts instead of snapping back
       // to Access after they continue.
-      setStep("access");
+      setStep(resumeConnectionId ? "key" : "access");
     }
 
     if (automaticOAuth && (
@@ -833,14 +949,96 @@ export function ConnectionSetupFlow({
     applicationsQuery.isFetchedAfterMount,
     connectionsQuery.isError,
     connectionsQuery.isFetchedAfterMount,
+    credentialSource,
     entry?.slug,
     galleryQuery.data,
     galleryQuery.isLoading,
     navigate,
     reconnectGrantKind,
+    resumeConnectionId,
     requestedAppKey,
     requestedAgentId,
   ]);
+
+  // Resume the exact method and non-secret provider configuration that the
+  // interrupted draft already chose. Secrets are intentionally never read back
+  // into the browser; credential-based methods ask for a replacement value.
+  useEffect(() => {
+    hydratedResumeConnectionIdRef.current = null;
+    setHydratedResumeConnectionId(null);
+  }, [resumeConnectionId]);
+
+  useEffect(() => {
+    if (
+      !resumeConnection
+      || !entry
+      || resumeConnection.status !== "draft"
+      || hydratedResumeConnectionIdRef.current === resumeConnection.id
+    ) return;
+    const storedConfig = resumeConnection.config && typeof resumeConnection.config === "object"
+      ? resumeConnection.config
+      : {};
+    const storedSource = typeof storedConfig.sourceTemplateKey === "string"
+      ? storedConfig.sourceTemplateKey
+      : null;
+    if (storedSource && storedSource !== entry.slug) return;
+
+    const storedMethodKey = typeof storedConfig.connectionMethodKey === "string"
+      ? storedConfig.connectionMethodKey
+      : null;
+    const resumedMethod = storedMethodKey
+      ? connectionMethodsForCredentialSource(entry, credentialSource).find(
+          (candidate) => candidate.key === storedMethodKey,
+        ) ?? null
+      : null;
+    setGalleryName(resumeConnection.name || entry.name);
+    if (resumedMethod) {
+      setConnectionMethodKey(resumedMethod.key);
+      const storedMethodConfig = storedConfig.methodConfig && typeof storedConfig.methodConfig === "object"
+        ? storedConfig.methodConfig as Record<string, unknown>
+        : {};
+      setConfigValues({
+        ...defaultMethodConfig(resumedMethod),
+        ...Object.fromEntries(
+          Object.entries(storedMethodConfig).filter(
+            (entry): entry is [string, string | boolean] =>
+              typeof entry[1] === "string" || typeof entry[1] === "boolean",
+          ),
+        ),
+      });
+    }
+    const storedOAuth = storedConfig.oauth && typeof storedConfig.oauth === "object"
+      ? storedConfig.oauth as Record<string, unknown>
+      : null;
+    // Only an operator-owned client belongs in the editable Advanced fields.
+    // Rehydrating a DCR/CIMD client id there would submit it as customer-owned
+    // and corrupt the automatic registration's provenance on the next click.
+    if (
+      storedOAuth?.clientRegistrationSource === "manual"
+      && typeof storedOAuth.clientId === "string"
+    ) {
+      setCuratedOAuthClientId(storedOAuth.clientId);
+    }
+    // A draft exists only after the first half of setup has been saved. Resume
+    // at the credential/provider checkpoint instead of asking for identity and
+    // agent reach again. Automatic OAuth renders the dedicated one-action
+    // screen; configured methods render their saved setup form with secrets
+    // intentionally blank.
+    if (oauthCallbackOutcome === "failed" || oauthCallbackOutcome === "denied") {
+      setOAuthPhase("error");
+      setOAuthError(
+        oauthCallbackOutcome === "denied"
+          ? "Authorization was cancelled or declined. Your saved connection was not changed."
+          : "Authorization did not complete. Your saved connection is still here, so you can try again.",
+      );
+    } else {
+      setOAuthPhase("entry");
+      setOAuthError(null);
+    }
+    setStep("key");
+    hydratedResumeConnectionIdRef.current = resumeConnection.id;
+    setHydratedResumeConnectionId(resumeConnection.id);
+  }, [credentialSource, entry, oauthCallbackOutcome, resumeConnection]);
 
   /**
    * Commit the connection: action defaults, agent reach, and installs.
@@ -899,6 +1097,34 @@ export function ConnectionSetupFlow({
 
   if (!selectedCompanyId) {
     return <div className="p-6 text-sm text-muted-foreground">Select a company to connect apps.</div>;
+  }
+
+  if (resumeConnectionId && connectionsQuery.isFetchedAfterMount && !resumeConnection) {
+    return (
+      <div className="mx-auto max-w-xl rounded-xl border border-border bg-card p-6">
+        <h2 className="text-lg font-semibold text-foreground">This setup can’t be resumed</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          The saved connection no longer exists or is not available to this company.
+        </p>
+        <Button type="button" variant="outline" className="mt-5" onClick={() => navigate("/apps")}>
+          Back to apps
+        </Button>
+      </div>
+    );
+  }
+
+  if (resumeConnectionId && (
+    !connectionsQuery.isFetchedAfterMount
+    || galleryQuery.isLoading
+    || !entry
+    || hydratedResumeConnectionId !== resumeConnection?.id
+  )) {
+    return (
+      <div className="mx-auto max-w-xl space-y-4" aria-label="Loading saved connection setup">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-40 w-full rounded-xl" />
+      </div>
+    );
   }
 
   if (showConnectionChoice && onUseExisting) {
@@ -967,13 +1193,14 @@ export function ConnectionSetupFlow({
     return (
       <OAuthConnectStateScreen
         entry={automaticOAuthEntry}
+        resuming={Boolean(resumeConnectionId)}
         phase={oauthPhase}
         error={oauthError}
         authorizationHost={authorizationHost}
         onRetry={async () => {
           setOAuthError(null);
           setOAuthPhase("starting");
-          const connection = connectResult?.connection ?? existingOAuthConnection;
+          const connection = connectResult?.connection ?? resumableOAuthConnection;
           if (connection) {
             startOAuth(connection);
             return;
@@ -994,7 +1221,12 @@ export function ConnectionSetupFlow({
               setOAuthError("Paperclip couldn’t check for an existing connection. Try again.");
               return;
             }
-            const refreshedConnection = reusableOAuthConnection(
+            const refreshedResumeConnection = resumeConnectionId
+              ? (connectionsResult.data?.connections ?? []).find(
+                  (candidate) => candidate.id === resumeConnectionId && candidate.authKind === "oauth",
+                ) ?? null
+              : null;
+            const refreshedConnection = refreshedResumeConnection ?? reusableOAuthConnection(
               directOAuthSource,
               applicationsResult.data?.applications ?? [],
               connectionsResult.data?.connections ?? [],
@@ -1002,7 +1234,7 @@ export function ConnectionSetupFlow({
                 ? { applicationId: prefill.applicationId, draftOnly: true }
                 : {},
             );
-            if (!directOAuthAccessConfirmedRef.current) {
+            if (!directOAuthAccessConfirmedRef.current && !resumeConnectionId) {
               if (refreshedConnection) {
                 setGrantKind(refreshedConnection.credentialPolicy === "per_user" ? "user" : "organization");
               }
@@ -1063,24 +1295,30 @@ export function ConnectionSetupFlow({
     connectResult?.application.name ??
     entry?.name ??
     (linkName.trim() || defaultGenericMcpName(linkUrl) || "this app");
+  const credentialSourceMethods = connectionMethodsForCredentialSource(entry, credentialSource);
+  const credentialSourceApps = vercelConnectMode
+    ? (galleryQuery.data?.apps ?? []).filter(
+        (app) => connectionMethodsForCredentialSource(app, credentialSource).length > 0,
+      )
+    : galleryQuery.data?.apps ?? [];
   const zapierEntry = zapierSource
     ? galleryQuery.data?.apps.find((app) => app.slug === "zapier") ?? null
     : null;
   const stepLabels = zapierSource
     ? ZAPIER_STEP_LABELS
-    : entry && getAvailableConnectionMethods(entry).length > 1
+    : entry && credentialSourceMethods.length > 1
       ? ["Pick app", "Access", "Choose connection"]
-    : entry && getAvailableConnectionMethod(entry)?.auth === "oauth"
+    : entry && credentialSourceMethods[0]?.auth === "oauth"
       ? ["Pick app", "Access", "Sign in"]
-    : isGoogleSheetsEntry(entry)
+    : isGoogleSheetsRobotMethod(entry, connectionMethodKey)
       ? ["Pick app", "Access", "Share sheet"]
       : STEP_LABELS;
   // The Access step's identity question only makes sense when there *is* a
   // credential, so it reads the selected method's auth kind.
   const accessStepMethod = entry
     ? (connectionMethodKey
-        ? getAvailableConnectionMethods(entry).find((m) => m.key === connectionMethodKey) ?? null
-        : getAvailableConnectionMethod(entry))
+        ? credentialSourceMethods.find((m) => m.key === connectionMethodKey) ?? null
+        : credentialSourceMethods[0] ?? null)
     : null;
   const accessStepAuthKind: ToolConnectionAuthKind = entry
     ? accessStepMethod?.auth ?? "none"
@@ -1093,7 +1331,7 @@ export function ConnectionSetupFlow({
   // unannounced.
   const accessMethodIsKnown = !entry
     || Boolean(connectionMethodKey)
-    || getAvailableConnectionMethods(entry).length === 1;
+    || credentialSourceMethods.length === 1;
   const accessSubmitLabel = accessStepAuthKind === "oauth" && accessMethodIsKnown
     ? `Continue to ${entry?.name ?? "sign-in"}`
     : "Save and continue";
@@ -1111,7 +1349,9 @@ export function ConnectionSetupFlow({
           <StepHeader
             subtitle={
               step === "gallery"
-                ? "Pick the app you want your agents to use."
+                ? vercelConnectMode
+                  ? "Choose a reviewed app to connect through Vercel."
+                  : "Pick the app you want your agents to use."
                 : `Step ${stepIndex + 1} of ${stepLabels.length}`
             }
             step={step}
@@ -1133,7 +1373,9 @@ export function ConnectionSetupFlow({
       {step === "gallery" && (
         <GalleryStep
           loading={galleryQuery.isLoading}
-          apps={galleryQuery.data?.apps ?? []}
+          apps={credentialSourceApps}
+          vercelConnect={vercelConnectMode}
+          vercelConnectAvailability={galleryQuery.data?.credentialSources?.vercelConnect ?? null}
           byo={byo}
           byoOnly={byoOnly}
           source={searchParams.get("source")}
@@ -1170,15 +1412,20 @@ export function ConnectionSetupFlow({
           onOAuthClientIdChange={setCuratedOAuthClientId}
           oauthClientSecret={curatedOAuthClientSecret}
           onOAuthClientSecretChange={setCuratedOAuthClientSecret}
+          credentialSource={credentialSource}
+          vercelConnector={vercelConnector}
+          onVercelConnectorChange={setVercelConnector}
+          vercelConnectAvailability={galleryQuery.data?.credentialSources?.vercelConnect ?? null}
           methodKey={connectionMethodKey}
           onMethodChange={(nextMethod) => {
-            setConnectionMethodKey(nextMethod.key);
-            if (!reconnectGrantKind && nextMethod.grantKinds?.length === 1) {
-              setGrantKind(nextMethod.grantKinds[0]!);
+            setConnectionMethodKey(nextMethod?.key ?? "");
+            if (!reconnectGrantKind) {
+              setGrantKind(defaultGrantKindFor(nextMethod));
             }
             setCredentials({});
             setCuratedOAuthClientId("");
             setCuratedOAuthClientSecret("");
+            setVercelConnector("");
             setConfigValues(defaultMethodConfig(nextMethod));
           }}
           configValues={configValues}
@@ -1193,9 +1440,15 @@ export function ConnectionSetupFlow({
           // Back returns to Access, not to the gallery: the design requires the
           // identity and agent selections to survive moving backward, and
           // `openGallery` resets them.
-          onBack={() => setAppStep("access")}
+          onBack={() => {
+            if (resumeConnectionId || reconnectConnectionId) {
+              navigate("/apps");
+              return;
+            }
+            setAppStep("access");
+          }}
           onConnect={() => {
-            if (isGoogleSheetsEntry(entry)) {
+            if (isGoogleSheetsRobotMethod(entry, connectionMethodKey)) {
               const parsed = parseGoogleSheetIds(googleSheetsLinks);
               if (parsed.invalidCount > 0) {
                 setGoogleSheetsError("That doesn't look like a Google Sheets link.");
@@ -1209,20 +1462,20 @@ export function ConnectionSetupFlow({
             const selectedMethod = getAvailableConnectionMethod(entry, connectionMethodKey || null);
             const selectedMethodHasProviderFields = Boolean(
               selectedMethod?.credentialFields?.length
-              || selectedMethod?.tenantFields?.length
-              || selectedMethod?.extensionFields?.length,
+              || selectedMethod?.tenantFields?.some((field) => !field.hidden)
+              || selectedMethod?.extensionFields?.some((field) => !field.hidden),
             );
             if (
               selectedMethod
               && connectionMethodSupportsAutomaticOAuth(selectedMethod)
-              && existingOAuthConnection
+              && resumableOAuthConnection
               && !selectedMethodHasProviderFields
               && !curatedOAuthClientId.trim()
             ) {
               directOAuthAccessConfirmedRef.current = true;
               setOAuthError(null);
               setOAuthPhase("starting");
-              startOAuth(existingOAuthConnection);
+              startOAuth(resumableOAuthConnection);
               return;
             }
             if (selectedMethod && connectionMethodSupportsAutomaticOAuth(selectedMethod)) {
@@ -1309,7 +1562,7 @@ export function ConnectionSetupFlow({
           docsUrl={accessStepMethod?.consoleLinks?.docs ?? entry?.docsUrl}
           submitLabel={accessSubmitLabel}
           identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
-          preserveAgentAccess={Boolean(automaticOAuthEntry && (existingOAuthConnection || reconnectConnection))}
+          preserveAgentAccess={Boolean(automaticOAuthEntry && (resumableOAuthConnection || reconnectConnection))}
           pending={connectMutation.isPending || oauthStartMutation.isPending}
           // Leaving Access abandons the app choice entirely, so this resets the
           // draft and returns to the gallery the operator came from.
@@ -1320,7 +1573,7 @@ export function ConnectionSetupFlow({
               setOAuthError(null);
               setOAuthPhase("starting");
               setAppStep("key");
-              if (existingOAuthConnection) startOAuth(existingOAuthConnection);
+              if (resumableOAuthConnection) startOAuth(resumableOAuthConnection);
               else connectApp(directOAuthEntry);
               return;
             }
@@ -1410,6 +1663,7 @@ function StepHeader({
 export function OAuthConnectStateScreen({
   entry,
   identity,
+  resuming = false,
   phase,
   error,
   authorizationHost,
@@ -1420,6 +1674,8 @@ export function OAuthConnectStateScreen({
   entry?: AppDefinition | null;
   /** Identity for an unknown remote MCP server: its own name plus its host. */
   identity?: { name: string; unverifiedHost: string | null };
+  /** This screen is continuing a durable draft rather than creating a new one. */
+  resuming?: boolean;
   phase: OAuthConnectPhase;
   error?: string | null;
   /**
@@ -1435,8 +1691,12 @@ export function OAuthConnectStateScreen({
   const unverifiedHost = entry ? null : identity?.unverifiedHost ?? null;
   const status = phase === "entry"
     ? {
-        title: `Connect ${serverName} to Paperclip`,
-        body: `Paperclip will open ${serverName} so you can choose a workspace and approve access.`,
+        title: resuming
+          ? `Finish connecting ${serverName}`
+          : `Connect ${serverName} to Paperclip`,
+        body: resuming
+          ? `Your connection is saved. Continue in ${serverName} to approve access; its identity and agent access will stay the same.`
+          : `Paperclip will open ${serverName} so you can choose a workspace and approve access.`,
       }
     : phase === "starting"
       ? {
@@ -1487,7 +1747,9 @@ export function OAuthConnectStateScreen({
         <div className="mt-6 flex items-center gap-2">
           {phase === "error" || phase === "entry" ? (
             <Button type="button" onClick={onRetry}>
-              {phase === "entry" ? `Continue to ${serverName}` : "Try again"}
+              {phase === "entry"
+                ? resuming ? `Finish with ${serverName}` : `Continue to ${serverName}`
+                : "Try again"}
             </Button>
           ) : (
             <Button type="button" disabled>
@@ -1539,6 +1801,9 @@ function ZapierConnectStep({
       <div className="mt-8">
         <label className="text-sm font-medium text-foreground">Zapier MCP URL</label>
         <Input
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
           value={link}
           onChange={(event) => onLinkChange(event.target.value)}
           onKeyDown={(event) => {
@@ -1574,6 +1839,8 @@ function GalleryStep({
   apps,
   byo = false,
   byoOnly = false,
+  vercelConnect = false,
+  vercelConnectAvailability = null,
   source = null,
   onPick,
   onUseLink,
@@ -1586,6 +1853,13 @@ function GalleryStep({
   byo?: boolean;
   /** Canonical BYO page: keep the URL path and alternate methods, without the app gallery. */
   byoOnly?: boolean;
+  /** Isolated Vercel catalog: no native-provider or bring-your-own setup paths. */
+  vercelConnect?: boolean;
+  vercelConnectAvailability?: {
+    available: boolean;
+    manageUrl: string;
+    reason: string | null;
+  } | null;
   source?: string | null;
   onPick: (entry: AppDefinition) => void;
   onUseLink: (link: string) => void;
@@ -1639,6 +1913,32 @@ function GalleryStep({
 
   return (
     <div className="space-y-6">
+      {vercelConnect ? (
+        <div className="rounded-xl border border-border bg-card p-5">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h2 className="text-lg font-bold tracking-tight">Connect through Vercel</h2>
+              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+                Create and manage the provider connector in Vercel. Paperclip stores its reference and applies agent access, policy, approval, and audit controls here.
+              </p>
+            </div>
+            {vercelConnectAvailability ? (
+              <Button asChild variant="outline" size="sm" className="shrink-0">
+                <a href={vercelConnectAvailability.manageUrl} target="_blank" rel="noreferrer">
+                  Open Vercel Connect
+                  <ArrowUpRight className="ml-2 h-3.5 w-3.5" />
+                </a>
+              </Button>
+            ) : null}
+          </div>
+          {vercelConnectAvailability?.available === false ? (
+            <InlineBanner tone="danger" compact className="mt-4">
+              {vercelConnectAvailability.reason ?? "Vercel Connect is unavailable on this instance."}
+            </InlineBanner>
+          ) : null}
+        </div>
+      ) : null}
+
       {!byoOnly && (
         <>
           <div className="relative">
@@ -1660,7 +1960,8 @@ function GalleryStep({
                 && !connectionMethodSupportsAutomaticOAuth(candidate)
                 && !connectionMethodAcceptsCustomerOAuthClient(candidate)
               );
-              const unavailable = app.availability?.available === false;
+              const unavailable = app.availability?.available === false
+                || (vercelConnect && vercelConnectAvailability?.available !== true);
               return (
                 <button
                   key={app.slug}
@@ -1668,7 +1969,7 @@ function GalleryStep({
                   disabled={oauthBlocked || unavailable}
                   title={
                     unavailable
-                      ? app.availability?.reason
+                      ? app.availability?.reason ?? vercelConnectAvailability?.reason ?? undefined
                       : undefined
                   }
                   onClick={() => onPick(app)}
@@ -1682,7 +1983,9 @@ function GalleryStep({
                   <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">{copy.tagline}</div>
                   <div className="mt-3 text-xs font-semibold text-foreground">
                     {unavailable ? (
-                      <span className="text-muted-foreground">{app.availability?.reason ?? "Unavailable on this instance."}</span>
+                      <span className="text-muted-foreground">
+                        {app.availability?.reason ?? vercelConnectAvailability?.reason ?? "Unavailable on this instance."}
+                      </span>
                     ) : oauthBlocked ? (
                       <span className="text-muted-foreground">Unavailable</span>
                     ) : (
@@ -1700,7 +2003,7 @@ function GalleryStep({
         </>
       )}
 
-      <div
+      {!vercelConnect ? <div
         ref={linkSectionRef}
         className={cn(
           "grid gap-4 border-t border-border pt-5 md:grid-cols-(--gtc-13)",
@@ -1758,6 +2061,9 @@ function GalleryStep({
           <div className="flex gap-2">
             <Input
               ref={linkInputRef}
+              type={zapierSource || matchedEntry?.slug === "zapier" ? "password" : "url"}
+              autoComplete="off"
+              spellCheck={false}
               aria-label="MCP server URL"
               value={linkInput}
               onChange={(e) => {
@@ -1776,9 +2082,9 @@ function GalleryStep({
           </div>
           {linkError && <div className="text-xs text-destructive">{linkError}</div>}
         </div>
-      </div>
+      </div> : null}
 
-      <div className="border-t border-border pt-5">
+      {!vercelConnect ? <div className="border-t border-border pt-5">
         <div className="text-sm font-semibold text-foreground">More ways to connect</div>
         <p className="mt-1 text-xs text-muted-foreground">
           For tools that aren’t in the gallery. You’ll need details from the tool’s docs.
@@ -1797,7 +2103,7 @@ function GalleryStep({
             onClick={onPasteConfig}
           />
         </div>
-      </div>
+      </div> : null}
     </div>
   );
 }
@@ -1919,6 +2225,7 @@ function LinkConnectStep({
   const canSubmit = canSubmitGenericConnect(draft);
   const showSimpleKeyQuestion = authMode === "auto";
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const displayedLink = matchedEntry?.slug === "zapier" ? redactUrlSecrets(link) : link;
 
   useEffect(() => {
     if (guidance?.focus === "name") nameInputRef.current?.focus();
@@ -1936,7 +2243,7 @@ function LinkConnectStep({
         </span>
         <div className="min-w-0">
           <h2 className="text-xl font-bold tracking-tight">Connect your own MCP server</h2>
-          <p className="mt-1 truncate font-mono text-sm text-muted-foreground" title={link}>{link}</p>
+          <p className="mt-1 truncate font-mono text-sm text-muted-foreground" title={displayedLink}>{displayedLink}</p>
           <UnverifiedServerBadge host={host} className="mt-2" />
         </div>
       </div>
@@ -2263,6 +2570,10 @@ function KeyStep({
   onOAuthClientIdChange,
   oauthClientSecret,
   onOAuthClientSecretChange,
+  credentialSource,
+  vercelConnector,
+  onVercelConnectorChange,
+  vercelConnectAvailability,
   methodKey,
   onMethodChange,
   configValues,
@@ -2283,8 +2594,16 @@ function KeyStep({
   onOAuthClientIdChange: (next: string) => void;
   oauthClientSecret: string;
   onOAuthClientSecretChange: (next: string) => void;
+  credentialSource: ToolConnectionCredentialSource;
+  vercelConnector: string;
+  onVercelConnectorChange: (next: string) => void;
+  vercelConnectAvailability: {
+    available: boolean;
+    manageUrl: string;
+    reason: string | null;
+  } | null;
   methodKey: string;
-  onMethodChange: (method: ConnectionMethodDef) => void;
+  onMethodChange: (method: ConnectionMethodDef | null) => void;
   configValues: Record<string, string | boolean>;
   onConfigChange: (next: Record<string, string | boolean>) => void;
   googleSheetsLinks: string;
@@ -2295,30 +2614,82 @@ function KeyStep({
   onConnect: () => void;
 }) {
   const copy = appCopyFor(entry.slug, entry.description);
-  const methods = getAvailableConnectionMethods(entry);
-  const method = methods.length > 1 && !methodKey
-    ? null
-    : getAvailableConnectionMethod(entry, methodKey || null);
+  const methods = useMemo(
+    () => connectionMethodsForCredentialSource(entry, credentialSource),
+    [credentialSource, entry],
+  );
+  const method = methodKey
+    ? methods.find((candidate) => candidate.key === methodKey) ?? null
+    : recommendedSetupConnectionMethod(methods);
+  const capabilityGroups = useMemo(() => {
+    if (!methods.some((candidate) => candidate.capabilityProfile)) return [];
+    return Array.from(methods.reduce((groups, candidate) => {
+      const key = candidate.capabilityProfile!.key;
+      const existing = groups.get(key);
+      if (existing) {
+        existing.methods.push(candidate);
+      } else {
+        groups.set(key, {
+          key,
+          label: candidate.capabilityProfile?.label ?? candidate.label ?? candidate.key,
+          description: candidate.capabilityProfile?.description ?? candidate.whenToUse,
+          methods: [candidate],
+        });
+      }
+      return groups;
+    }, new Map<string, {
+      key: string;
+      label: string;
+      description: string;
+      methods: ConnectionMethodDef[];
+    }>()),
+    ).map(([, group]) => group);
+  }, [methods]);
+  const selectedMethodCapabilityKey = method?.capabilityProfile?.key ?? method?.key ?? "";
+  const capabilityGroupKeys = capabilityGroups.map((group) => group.key).join("|");
+  const [capabilityKey, setCapabilityKey] = useState(
+    selectedMethodCapabilityKey
+      || recommendedSetupConnectionMethod(methods)?.capabilityProfile?.key
+      || (capabilityGroups.length === 1 ? capabilityGroups[0]!.key : ""),
+  );
+  useEffect(() => {
+    if (selectedMethodCapabilityKey) {
+      setCapabilityKey(selectedMethodCapabilityKey);
+      return;
+    }
+    setCapabilityKey((current) => {
+      if (capabilityGroups.some((group) => group.key === current)) return current;
+      return recommendedSetupConnectionMethod(methods)?.capabilityProfile?.key
+        || (capabilityGroups.length === 1 ? capabilityGroups[0]!.key : "");
+    });
+  }, [capabilityGroupKeys, capabilityGroups, methods, selectedMethodCapabilityKey]);
+  const capabilityMethods = capabilityGroups.length > 1
+    ? capabilityGroups.find((group) => group.key === capabilityKey)?.methods ?? []
+    : methods;
   const fields = (method?.credentialFields ?? []).map((field) => ({
     ...field,
     configPath: credentialConfigPath(field),
     helpUrl: method?.consoleLinks?.keys ?? method?.consoleLinks?.docs ?? "",
   }));
-  const allFilled = fields.every(
+  const vercelReview = method?.credentialSources?.vercelConnect ?? null;
+  const usingVercel = credentialSource === "vercel_connect";
+  const allFilled = usingVercel || fields.every(
     (f) => f.required === false || (values[f.configPath]?.trim().length ?? 0) > 0,
   );
   const acceptsCustomerOAuthClient = connectionMethodAcceptsCustomerOAuthClient(method);
   const customerOAuthClientRequired = acceptsCustomerOAuthClient
     && !connectionMethodSupportsAutomaticOAuth(method);
-  const oauthClientFilled = !customerOAuthClientRequired || oauthClientId.trim().length > 0;
+  const oauthClientFilled = usingVercel || !customerOAuthClientRequired || oauthClientId.trim().length > 0;
+  const vercelConnectorFilled = !usingVercel || vercelConnector.trim().length > 0;
   const oauthCallbackUrl = method?.auth === "oauth" && acceptsCustomerOAuthClient
-    ? new URL("/api/tools/oauth/callback", window.location.origin).toString()
+    ? oauthCallbackUrlForBrowser()
     : null;
-  const configFields = [...(method?.tenantFields ?? []), ...(method?.extensionFields ?? [])];
+  const allConfigFields = [...(method?.tenantFields ?? []), ...(method?.extensionFields ?? [])];
+  const configFields = allConfigFields.filter((field) => !field.hidden);
   const standardConfigFields = configFields.filter((field) => field.advanced !== true);
   const advancedConfigFields = configFields.filter((field) => field.advanced === true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const configFilled = configFields.every((field) => {
+  const configFilled = allConfigFields.every((field) => {
     if (!field.required) return true;
     const value = configValues[field.key];
     return typeof value === "boolean" || (typeof value === "string" && value.trim().length > 0);
@@ -2328,11 +2699,59 @@ function KeyStep({
     const value = configValues[key];
     return typeof value === "string" && value.trim().length > 0;
   });
-  const hasMethodSelection = methods.length <= 1 || Boolean(methodKey);
+  const hasCapabilitySelection = capabilityGroups.length <= 1 || Boolean(capabilityKey);
+  const hasMethodSelection = hasCapabilitySelection
+    && (capabilityMethods.length <= 1 ? Boolean(method) : Boolean(methodKey));
   const robotEmail = entry.availability?.robotEmail ?? null;
   const unavailable = entry.availability?.available === false;
+  const optionalCustomerOAuthClient = !usingVercel
+    && acceptsCustomerOAuthClient
+    && !customerOAuthClientRequired;
+  const hasAdvancedSettings = advancedConfigFields.length > 0 || optionalCustomerOAuthClient;
+  const capabilitySelection = capabilityGroups.length > 1 ? (
+    <div>
+      <label className="text-sm font-medium text-foreground">What should Paperclip be able to do?</label>
+      <RadioCardGroup
+        ariaLabel={`Access level for ${entry.name}`}
+        className="mt-2"
+        value={capabilityKey}
+        onValueChange={(nextKey) => {
+          const nextGroup = capabilityGroups.find((group) => group.key === nextKey);
+          if (!nextGroup) return;
+          setCapabilityKey(nextKey);
+          onMethodChange(getRecommendedConnectionMethod(nextGroup.methods));
+        }}
+        options={capabilityGroups.map((group) => ({
+          value: group.key,
+          title: group.label,
+          description: group.description,
+        }))}
+      />
+      {!capabilityKey && <p className="mt-2 text-xs text-muted-foreground">Choose an access level to continue.</p>}
+    </div>
+  ) : null;
+  const authenticationSelection = capabilityMethods.length > 1 ? (
+    <div>
+      <label className="text-sm font-medium text-foreground">How do you want to connect?</label>
+      <RadioCardGroup
+        ariaLabel={`How to connect ${entry.name}`}
+        className="mt-2"
+        value={methodKey}
+        onValueChange={(nextKey) => {
+          const nextMethod = capabilityMethods.find((candidate) => candidate.key === nextKey);
+          if (nextMethod) onMethodChange(nextMethod);
+        }}
+        options={capabilityMethods.map((candidate) => ({
+          value: candidate.key,
+          title: candidate.label ?? (candidate.auth === "oauth" ? `Sign in with ${entry.name}` : "Use an API key"),
+          description: `${connectionMethodAuthenticationLabel(candidate)}. ${candidate.whenToUse}`,
+        }))}
+      />
+      {!method && <p className="mt-2 text-xs text-muted-foreground">Choose a connection method to continue.</p>}
+    </div>
+  ) : null;
 
-  if (isGoogleSheetsEntry(entry)) {
+  if (isGoogleSheetsRobotMethod(entry, method)) {
     const parsed = parseGoogleSheetIds(googleSheetsLinks);
     const canConnect = !unavailable && Boolean(robotEmail) && googleSheetsLinks.trim().length > 0;
     return (
@@ -2346,6 +2765,7 @@ function KeyStep({
         </div>
 
         <div className="mt-8 space-y-6">
+          {capabilitySelection}
           <ConnectionNameField name={name} onNameChange={onNameChange} />
 
           {robotEmail ? (
@@ -2419,26 +2839,8 @@ function KeyStep({
       </div>
 
       <div className="mt-8 space-y-6">
-        {methods.length > 1 && (
-          <div>
-            <label className="text-sm font-medium text-foreground">How do you want to connect?</label>
-            <RadioCardGroup
-              ariaLabel={`How to connect ${entry.name}`}
-              className="mt-2"
-              value={methodKey}
-              onValueChange={(nextKey) => {
-                const nextMethod = methods.find((candidate) => candidate.key === nextKey);
-                if (nextMethod) onMethodChange(nextMethod);
-              }}
-              options={methods.map((candidate) => ({
-                value: candidate.key,
-                title: candidate.label ?? (candidate.auth === "oauth" ? `Sign in with ${entry.name}` : "Use an API key"),
-                description: `${connectionMethodAuthenticationLabel(candidate)}. ${candidate.whenToUse}`,
-              }))}
-            />
-            {!method && <p className="mt-2 text-xs text-muted-foreground">Choose a method to continue.</p>}
-          </div>
-        )}
+        {capabilitySelection}
+        {authenticationSelection}
 
         {method?.warnings?.map((warning) => (
           <InlineBanner key={warning} tone="warning" compact>
@@ -2463,6 +2865,42 @@ function KeyStep({
           </div>
         ) : null}
 
+        {usingVercel && vercelReview && vercelConnectAvailability ? (
+          <div className="space-y-4 rounded-lg border border-border p-4">
+            <div>
+              <div className="text-sm font-medium text-foreground">Create or attach the connector in Vercel</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Paperclip does not copy Vercel’s setup forms. Finish connector setup there, then paste its UID below.
+              </p>
+              <a
+                href={vercelConnectAvailability.manageUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-foreground underline underline-offset-2"
+              >
+                Open Vercel Connect
+                <ArrowUpRight className="h-3 w-3" />
+              </a>
+            </div>
+            <div>
+              <label className="text-sm font-medium text-foreground" htmlFor="vercel-connect-connector">
+                Connector UID or ID
+              </label>
+              <Input
+                id="vercel-connect-connector"
+                value={vercelConnector}
+                onChange={(event) => onVercelConnectorChange(event.target.value)}
+                autoComplete="off"
+                placeholder="service/my-connector or scl_…"
+                className="mt-2 h-11 font-mono"
+              />
+              <p className="mt-2 text-xs text-muted-foreground">
+                Paperclip validates the connector and stores only its reference and redacted verification metadata.
+              </p>
+            </div>
+          </div>
+        ) : null}
+
         <ConnectionNameField name={name} onNameChange={onNameChange} />
 
         {standardConfigFields.map((field) => (
@@ -2474,7 +2912,7 @@ function KeyStep({
           />
         ))}
 
-        {advancedConfigFields.length > 0 && (
+        {hasAdvancedSettings && (
           <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
             <CollapsibleTrigger className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
               <ChevronDown className={cn("h-4 w-4 transition-transform", advancedOpen && "rotate-180")} />
@@ -2490,89 +2928,37 @@ function KeyStep({
                     onChange={(value) => onConfigChange({ ...configValues, [field.key]: value })}
                   />
                 ))}
+                {optionalCustomerOAuthClient ? (
+                  <OAuthClientFields
+                    entry={entry}
+                    method={method!}
+                    callbackUrl={oauthCallbackUrl}
+                    clientId={oauthClientId}
+                    onClientIdChange={onOAuthClientIdChange}
+                    clientSecret={oauthClientSecret}
+                    onClientSecretChange={onOAuthClientSecretChange}
+                    required={false}
+                  />
+                ) : null}
               </div>
             </CollapsibleContent>
           </Collapsible>
         )}
 
-        {method?.auth === "oauth" && acceptsCustomerOAuthClient ? (
-          <div className="space-y-4 rounded-lg border border-border p-4">
-            <div>
-              <div className="text-sm font-medium text-foreground">
-                {customerOAuthClientRequired ? "Your OAuth app" : "Use your own OAuth app"}
-              </div>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Register Paperclip's callback URI in {entry.name}, then enter the customer-owned client details.
-              </p>
-              {method.consoleLinks?.register ? (
-                <a
-                  href={method.consoleLinks.register}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-foreground underline underline-offset-2"
-                >
-                  Open {entry.name} app settings
-                  <ArrowUpRight className="h-3 w-3" />
-                </a>
-              ) : null}
-            </div>
-            {oauthCallbackUrl ? (
-              <div>
-                <label className="text-sm font-medium text-foreground">Paperclip callback URL</label>
-                <div className="mt-2 flex min-w-0 flex-col gap-2 sm:flex-row">
-                  <div
-                    title={oauthCallbackUrl}
-                    className="min-h-11 min-w-0 flex-1 rounded-md border border-input bg-muted/40 px-3 py-2.5 font-mono text-xs leading-tight text-foreground break-all"
-                  >
-                    {oauthCallbackUrl}
-                  </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="shrink-0"
-                    onClick={() => void copyTextToClipboard(oauthCallbackUrl).catch(() => {})}
-                  >
-                    <Copy className="mr-2 h-4 w-4" />
-                    Copy
-                  </Button>
-                </div>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Add this exact URL to {entry.name} before continuing. It must match the authorization request.
-                </p>
-              </div>
-            ) : null}
-            <div>
-              <label className="text-sm font-medium text-foreground" htmlFor="curated-oauth-client-id">
-                Client ID
-              </label>
-              <Input
-                id="curated-oauth-client-id"
-                value={oauthClientId}
-                onChange={(event) => onOAuthClientIdChange(event.target.value)}
-                autoComplete="off"
-                placeholder={customerOAuthClientRequired ? "Required" : "Optional"}
-                className="mt-2 h-11 font-mono"
-              />
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground" htmlFor="curated-oauth-client-secret">
-                Client secret
-              </label>
-              <Input
-                id="curated-oauth-client-secret"
-                type="password"
-                value={oauthClientSecret}
-                onChange={(event) => onOAuthClientSecretChange(event.target.value)}
-                autoComplete="off"
-                placeholder="Optional for public clients"
-                className="mt-2 h-11 font-mono"
-              />
-            </div>
-            <StoredSecurelyNote />
-          </div>
+        {!usingVercel && method?.auth === "oauth" && customerOAuthClientRequired ? (
+          <OAuthClientFields
+            entry={entry}
+            method={method}
+            callbackUrl={oauthCallbackUrl}
+            clientId={oauthClientId}
+            onClientIdChange={onOAuthClientIdChange}
+            clientSecret={oauthClientSecret}
+            onClientSecretChange={onOAuthClientSecretChange}
+            required
+          />
         ) : null}
 
-        {method && fields.length === 0 ? (
+        {usingVercel ? null : method && fields.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             {method.auth === "oauth"
               ? `You’ll continue to ${entry.name} to sign in securely.`
@@ -2607,7 +2993,7 @@ function KeyStep({
           ))
         )}
 
-        {method?.auth === "api_key" && (
+        {!usingVercel && method?.auth === "api_key" && (
           <div className="flex items-start gap-3 rounded-lg bg-muted/50 p-4">
             <Lock className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
             <div>
@@ -2630,12 +3016,113 @@ function KeyStep({
               ? "You’ll sign in before anything turns on."
               : "We’ll check the key before turning anything on."}
           </span>
-          <Button onClick={onConnect} disabled={submitting || !hasMethodSelection || !allFilled || !oauthClientFilled || !configFilled || !configRequirementMet}>
+          <Button onClick={onConnect} disabled={submitting || !hasMethodSelection || !allFilled || !oauthClientFilled || !vercelConnectorFilled || !configFilled || !configRequirementMet}>
             {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {submitting ? "Checking…" : method?.auth === "oauth" ? "Continue to sign in" : "Connect"}
+            {submitting
+              ? "Checking…"
+              : usingVercel
+                ? method?.auth === "oauth" ? "Validate and continue" : "Validate and connect"
+                : method?.auth === "oauth" ? "Continue to sign in" : "Connect"}
           </Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function OAuthClientFields({
+  entry,
+  method,
+  callbackUrl,
+  clientId,
+  onClientIdChange,
+  clientSecret,
+  onClientSecretChange,
+  required,
+}: {
+  entry: AppDefinition;
+  method: ConnectionMethodDef;
+  callbackUrl: string | null;
+  clientId: string;
+  onClientIdChange: (next: string) => void;
+  clientSecret: string;
+  onClientSecretChange: (next: string) => void;
+  required: boolean;
+}) {
+  return (
+    <div className="space-y-4 rounded-lg border border-border p-4">
+      <div>
+        <div className="text-sm font-medium text-foreground">
+          {required ? "Your OAuth app" : "Use your own OAuth app"}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Register Paperclip's callback URI in {entry.name}, then enter the customer-owned client details.
+        </p>
+        {method.consoleLinks?.register ? (
+          <a
+            href={method.consoleLinks.register}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-foreground underline underline-offset-2"
+          >
+            Open {entry.name} app settings
+            <ArrowUpRight className="h-3 w-3" />
+          </a>
+        ) : null}
+      </div>
+      {callbackUrl ? (
+        <div>
+          <label className="text-sm font-medium text-foreground">Paperclip callback URL</label>
+          <div className="mt-2 flex min-w-0 flex-col gap-2 sm:flex-row">
+            <div
+              title={callbackUrl}
+              className="min-h-11 min-w-0 flex-1 rounded-md border border-input bg-muted/40 px-3 py-2.5 font-mono text-xs leading-tight text-foreground break-all"
+            >
+              {callbackUrl}
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="shrink-0"
+              onClick={() => void copyTextToClipboard(callbackUrl).catch(() => {})}
+            >
+              <Copy className="mr-2 h-4 w-4" />
+              Copy
+            </Button>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Add this exact URL to {entry.name} before continuing. It must match the authorization request.
+          </p>
+        </div>
+      ) : null}
+      <div>
+        <label className="text-sm font-medium text-foreground" htmlFor="curated-oauth-client-id">
+          Client ID
+        </label>
+        <Input
+          id="curated-oauth-client-id"
+          value={clientId}
+          onChange={(event) => onClientIdChange(event.target.value)}
+          autoComplete="off"
+          placeholder={required ? "Required" : "Optional"}
+          className="mt-2 h-11 font-mono"
+        />
+      </div>
+      <div>
+        <label className="text-sm font-medium text-foreground" htmlFor="curated-oauth-client-secret">
+          Client secret
+        </label>
+        <Input
+          id="curated-oauth-client-secret"
+          type="password"
+          value={clientSecret}
+          onChange={(event) => onClientSecretChange(event.target.value)}
+          autoComplete="off"
+          placeholder="Optional for public clients"
+          className="mt-2 h-11 font-mono"
+        />
+      </div>
+      <StoredSecurelyNote />
     </div>
   );
 }

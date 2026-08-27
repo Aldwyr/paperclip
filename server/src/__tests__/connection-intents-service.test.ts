@@ -237,6 +237,9 @@ describeEmbeddedPostgres("connectionIntentService", () => {
       .rejects.toThrow("already resolved");
     await expect(service.request(claims, "unknown-service"))
       .rejects.toThrow("is not available");
+    expect((await service.search(claims, "github")).results).toEqual([]);
+    await expect(service.request(claims, "github"))
+      .rejects.toThrow("is not available");
   });
 
   it("rejects cross-company claims and tokens after the run ends", async () => {

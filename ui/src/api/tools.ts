@@ -89,6 +89,15 @@ export type ToolProfilesResponse = { profiles: ToolProfileWithDetails[] };
 export type ToolGalleryResponse = {
   apps: AppDefinition[];
   capabilities: ToolConnectionCreateCapabilities;
+  credentialSources: {
+    vercelConnect: {
+      available: boolean;
+      enabled: boolean;
+      authentication: "workload_oidc" | "access_token" | null;
+      manageUrl: string;
+      reason: string | null;
+    };
+  };
 };
 export type ToolMcpGatewaysResponse = { gateways: ToolMcpGatewayWithTokens[] };
 export type CreateGatewayTokenInput = Omit<CreateToolMcpGatewayToken, "expiresAt"> & {

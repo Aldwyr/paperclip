@@ -113,7 +113,7 @@ function PostHogConfigurationSection({ connection }: { connection: ToolConnectio
   const tools = typeof config.tools === "string" && config.tools ? config.tools : "None";
   const rows = [
     ["Connection method", method],
-    ["Project ID", typeof config.projectId === "string" ? config.projectId : "Not set"],
+    ["Project pin", typeof config.projectId === "string" ? config.projectId : "Use active project"],
     ["Read-only mode", config.readOnly === true ? "On" : "Off"],
     ["Feature groups", features],
     ["Individual tools", tools],
@@ -123,7 +123,7 @@ function PostHogConfigurationSection({ connection }: { connection: ToolConnectio
     <section>
       <h2 className="text-sm font-bold text-foreground">PostHog access scope</h2>
       <p className="mt-0.5 text-sm text-muted-foreground">
-        This connection is pinned to the project and analytics surface below.
+        PostHog uses its normal account defaults unless you narrow the optional controls below.
       </p>
       <dl className="mt-4 divide-y divide-border">
         {rows.map(([label, value]) => (

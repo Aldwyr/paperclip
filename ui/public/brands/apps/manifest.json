@@ -37,7 +37,7 @@
     {
       "slug": "beehiiv",
       "provider": "beehiiv",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/beehiiv.png",
       "officialSourceUrl": "https://www.beehiiv.com",
       "upstreamAssetUrl": "https://beehiiv-marketing-images.s3.amazonaws.com/Redesign2023/favicon.png",
@@ -47,7 +47,7 @@
     {
       "slug": "bitly",
       "provider": "Bitly",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/bitly.svg",
       "officialSourceUrl": "https://bitly.com/pages/press",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/bitly.svg",
@@ -67,7 +67,7 @@
     {
       "slug": "brex",
       "provider": "Brex",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/brex.svg",
       "darkAsset": "/brands/apps/brex-dark.svg",
       "officialSourceUrl": "https://www.brex.com/journal/press",
@@ -78,7 +78,7 @@
     {
       "slug": "candid",
       "provider": "Candid",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/candid.png",
       "officialSourceUrl": "https://candid.org",
       "upstreamAssetUrl": "https://cdn.candid.org/images/candid-logo/candid-logo-square.png",
@@ -119,7 +119,7 @@
     {
       "slug": "coda",
       "provider": "Coda",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/coda.svg",
       "officialSourceUrl": "https://coda.io",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/coda.svg",
@@ -129,7 +129,7 @@
     {
       "slug": "composio",
       "provider": "Composio",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/composio.svg",
       "darkAsset": "/brands/apps/composio-dark.svg",
       "officialSourceUrl": "https://composio.dev",
@@ -140,7 +140,7 @@
     {
       "slug": "context7",
       "provider": "Context7",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/context7.svg",
       "darkAsset": "/brands/apps/context7-dark.svg",
       "officialSourceUrl": "https://context7.com",
@@ -151,7 +151,7 @@
     {
       "slug": "egnyte",
       "provider": "Egnyte",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/egnyte.svg",
       "officialSourceUrl": "https://www.egnyte.com/presskit.html",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/egnyte.svg",
@@ -161,7 +161,7 @@
     {
       "slug": "embat",
       "provider": "Embat",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/embat.svg",
       "officialSourceUrl": "https://www.embat.io",
       "upstreamAssetUrl": "https://www.embat.io/favicon.svg",
@@ -171,7 +171,7 @@
     {
       "slug": "github",
       "provider": "GitHub",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/github.svg",
       "darkAsset": "/brands/apps/github-dark.svg",
       "officialSourceUrl": "https://github.com/logos",
@@ -200,6 +200,48 @@
       "darkVariantRequired": false
     },
     {
+      "slug": "google-drive", "provider": "Google Drive", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-drive.svg", "officialSourceUrl": "https://drive.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googledrive.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-docs", "provider": "Google Docs", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-docs.svg", "officialSourceUrl": "https://docs.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googledocs.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-slides", "provider": "Google Slides", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-slides.svg", "officialSourceUrl": "https://slides.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googleslides.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-calendar", "provider": "Google Calendar", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-calendar.svg", "officialSourceUrl": "https://calendar.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googlecalendar.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-chat", "provider": "Google Chat", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-chat.svg", "officialSourceUrl": "https://chat.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googlechat.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-people", "provider": "Google People", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-people.svg", "officialSourceUrl": "https://contacts.google.com",
+      "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/googlecontacts.svg",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
+      "slug": "google-workspace-search", "provider": "Google Workspace Search", "catalogVisible": true,
+      "localAsset": "/brands/apps/google-workspace-search.svg", "officialSourceUrl": "https://workspace.google.com",
+      "upstreamAssetUrl": "https://fonts.google.com/icons?selected=Material+Symbols+Outlined:search:FILL@0;wght@400;GRAD@0;opsz@24",
+      "assetType": "svg", "darkVariantRequired": false
+    },
+    {
       "slug": "hugging-face",
       "provider": "Hugging Face",
       "catalogVisible": true,
@@ -223,7 +265,7 @@
     {
       "slug": "kernel",
       "provider": "Kernel",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/kernel.svg",
       "officialSourceUrl": "https://www.kernel.sh",
       "upstreamAssetUrl": "https://www.kernel.sh/rebrand/logos/logo-kernel-square.svg",
@@ -243,7 +285,7 @@
     {
       "slug": "local-falcon",
       "provider": "Local Falcon",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/local-falcon.png",
       "officialSourceUrl": "https://www.localfalcon.com",
       "upstreamAssetUrl": "https://www.localfalcon.com/uploads/ico/android-chrome-192x192.png",
@@ -253,7 +295,7 @@
     {
       "slug": "make",
       "provider": "Make",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/make.svg",
       "darkAsset": "/brands/apps/make-dark.svg",
       "officialSourceUrl": "https://www.make.com/en/press",
@@ -264,7 +306,7 @@
     {
       "slug": "manufact",
       "provider": "Manufact",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/manufact.svg",
       "officialSourceUrl": "https://manufact.com",
       "upstreamAssetUrl": "https://manufact.com/favicon.svg",
@@ -326,7 +368,7 @@
     {
       "slug": "oreilly",
       "provider": "O'Reilly",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/oreilly.svg",
       "officialSourceUrl": "https://www.oreilly.com/about/logos/",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/oreilly.svg",
@@ -346,7 +388,7 @@
     {
       "slug": "planetscale",
       "provider": "PlanetScale",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/planetscale.svg",
       "darkAsset": "/brands/apps/planetscale-dark.svg",
       "officialSourceUrl": "https://planetscale.com",
@@ -378,7 +420,7 @@
     {
       "slug": "razorpay",
       "provider": "Razorpay",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/razorpay.svg",
       "darkAsset": "/brands/apps/razorpay-dark.svg",
       "officialSourceUrl": "https://razorpay.com/newsroom/brand-assets/",
@@ -400,7 +442,7 @@
     {
       "slug": "sanity",
       "provider": "Sanity",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/sanity.svg",
       "darkAsset": "/brands/apps/sanity-dark.svg",
       "officialSourceUrl": "https://github.com/sanity-io/logos/blob/e298a1ac2757c83910fe08b496a115bc9aef06bd/src/sanityMonogram.tsx",
@@ -420,9 +462,19 @@
       "darkVariantRequired": true
     },
     {
+      "slug": "shopify",
+      "provider": "Shopify",
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/shopify.svg",
+      "officialSourceUrl": "https://www.shopify.com/brand-assets",
+      "upstreamAssetUrl": "https://cdn.shopify.com/static/brand-assets/shopify-shopping-bag.zip",
+      "assetType": "svg",
+      "darkVariantRequired": false
+    },
+    {
       "slug": "similarweb",
       "provider": "Similarweb",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/similarweb.svg",
       "darkAsset": "/brands/apps/similarweb-dark.svg",
       "officialSourceUrl": "https://www.similarweb.com",
@@ -433,7 +485,7 @@
     {
       "slug": "slack",
       "provider": "Slack",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/slack.png",
       "officialSourceUrl": "https://slack.com/brand-guidelines",
       "upstreamAssetUrl": "https://a.slack-edge.com/80588/marketing/img/meta/slack_hash_256.png",
@@ -463,7 +515,7 @@
     {
       "slug": "ticket-tailor",
       "provider": "Ticket Tailor",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/ticket-tailor.svg",
       "darkAsset": "/brands/apps/ticket-tailor-dark.svg",
       "officialSourceUrl": "https://www.tickettailor.com",
@@ -474,7 +526,7 @@
     {
       "slug": "ticktick",
       "provider": "TickTick",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/ticktick.svg",
       "officialSourceUrl": "https://ticktick.com",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/ticktick.svg",
@@ -525,7 +577,7 @@
     {
       "slug": "xero",
       "provider": "Xero",
-      "catalogVisible": true,
+      "catalogVisible": false,
       "localAsset": "/brands/apps/xero.svg",
       "officialSourceUrl": "https://www.xero.com/uk/about/media/downloads",
       "upstreamAssetUrl": "https://github.com/simple-icons/simple-icons/blob/16.28.0/icons/xero.svg",

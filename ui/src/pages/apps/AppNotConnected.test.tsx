@@ -347,6 +347,23 @@ describe("AppNotConnected", () => {
     );
   });
 
+  it("keeps a removed Vercel-backed connection in the isolated Vercel setup", async () => {
+    listConnectionsMock.mockResolvedValue({
+      connections: [connection({ credentialSource: "vercel_connect" })],
+    });
+
+    await renderPage();
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent?.trim() === "Reconnect")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/apps/vercel-connect?applicationId=app-1&name=GitHub&new=1&reconnect=conn-old&identity=organization&source=github&link=https%3A%2F%2Fgithub.example%2Fmcp",
+    );
+  });
+
   it("prefills a custom MCP reconnect from the stored transport URL", async () => {
     listApplicationsMock.mockResolvedValue({
       applications: [application({ applicationKey: "custom-mcp", name: "Bla", metadata: null })],

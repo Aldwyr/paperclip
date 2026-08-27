@@ -24,9 +24,9 @@
       ],
       "whenToUse": "Use a restricted customer-owned key when browser sign-in is not suitable.",
       "defaults": {
-        "serverUrl": "https://mcp.mem0.ai/mcp"
+        "serverUrl": "https://mcp.mem0.ai/mcp/"
       },
-      "guidanceMd": "Use a customer-created Mem0 key. A Mem0 API key.",
+      "guidanceMd": "Use a customer-created Mem0 key. A Mem0 API key; the live server currently requires the slash-normalized endpoint.",
       "riskTier": "S3",
       "label": "Use an API key",
       "credentialFields": [
@@ -49,7 +49,7 @@
         "docs": "https://docs.mem0.ai/platform/mem0-mcp"
       },
       "warnings": [
-        "A Mem0 API key."
+        "A Mem0 API key; the live server currently requires the slash-normalized endpoint."
       ]
     }
   ]

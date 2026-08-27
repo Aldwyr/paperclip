@@ -175,7 +175,24 @@ export function ReconnectCard({
         tone: "error",
       }),
   });
+  const verifyVercel = useMutation({
+    mutationFn: () => toolsApi.checkConnectionHealth(connection.id),
+    onSuccess: () => {
+      pushToast({
+        title: "Vercel credential verified",
+        body: `${humanizeConnectionDisplayName(connection)} is back online.`,
+        tone: "success",
+      });
+      onReconnected();
+    },
+    onError: (error) => pushToast({
+      title: "Credential still needs attention",
+      body: error instanceof Error ? error.message : "Review the connector in Vercel Connect and try again.",
+      tone: "error",
+    }),
+  });
   const oauth = connection.authKind === "oauth";
+  const managedByVercel = connection.credentialSource === "vercel_connect";
 
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
@@ -194,6 +211,23 @@ export function ReconnectCard({
           <p className="text-sm text-amber-800 dark:text-amber-200">
             {reconnectUnavailableMessage ?? "You don't have permission to reconnect this identity."}
           </p>
+        ) : managedByVercel && !oauth ? (
+          <div className="flex items-center gap-2">
+            <Button type="button" size="sm" variant="outline" asChild>
+              <a href="https://vercel.com/connect" target="_blank" rel="noreferrer">
+                Manage in Vercel <ArrowUpRight className="ml-1.5 h-3.5 w-3.5" />
+              </a>
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={verifyVercel.isPending}
+              onClick={() => verifyVercel.mutate()}
+            >
+              {verifyVercel.isPending && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+              Check again
+            </Button>
+          </div>
         ) : oauth ? (
           <Button
             type="button"
@@ -275,6 +309,14 @@ function ReconnectForm({
   const filled = usesGallery
     ? fields.every((f) => f.required === false || (values[f.configPath]?.trim().length ?? 0) > 0)
     : single.trim().length > 0;
+
+  if (connection.credentialSource === "vercel_connect") {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Credentials for this connection are managed in Vercel Connect.
+      </p>
+    );
+  }
 
   return (
     <div className="space-y-3">

@@ -33,7 +33,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 import { AppLogo } from "./AppLogo";
-import { ComposioProvenanceChip } from "./ComposioProvenanceChip";
+import { ConnectionProvenanceChip } from "./ComposioProvenanceChip";
 import { composioChildParentConnectionId } from "./composio-services";
 import {
   appApplicationSourceSlug,
@@ -422,7 +422,7 @@ export function Connections() {
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="font-medium text-foreground">{row.displayName}</span>
-                              <ComposioProvenanceChip connection={row.connection} />
+                              <ConnectionProvenanceChip connection={row.connection} />
                             </div>
                             {hint && (
                               <div className="truncate text-xs text-muted-foreground">{hint}</div>

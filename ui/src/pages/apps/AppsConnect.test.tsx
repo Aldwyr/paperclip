@@ -30,6 +30,7 @@ const NOTION = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "notion")!
 const ASANA = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "asana")!;
 const POSTHOG = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "posthog")!;
 const GOOGLE_SHEETS = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "google-sheets")!;
+const GOOGLE_DRIVE = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "google-drive")!;
 const GMAIL = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === "gmail")!;
 
 vi.mock("@/api/tools", () => ({
@@ -158,9 +159,14 @@ async function passAccessStep() {
  * when the optional client ID is left empty. */
 async function submitCuratedOAuthSetup() {
   const submit = buttonByText("Continue to sign in");
-  expect(submit).toBeTruthy();
+  // Automatic OAuth definitions hand off directly from Access. Definitions
+  // with required provider configuration still render the setup submit.
+  if (!submit) {
+    await flushReact();
+    return;
+  }
   await act(async () => {
-    submit?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    submit.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   await flushReact();
 }
@@ -464,7 +470,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).toContain("Create an Asana MCP OAuth app");
     expect(container.textContent).toContain("Paperclip callback URL");
     expect(container.textContent).toContain(
-      new URL("/api/tools/oauth/callback", window.location.origin).toString(),
+      "http://localhost:3000/api/tools/oauth/callback",
     );
     expect(buttonByText("Continue to sign in")?.disabled).toBe(true);
 
@@ -515,6 +521,19 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(document.body.textContent).toContain("Who is this credential for?");
     expect(document.body.textContent).toContain("Just me.");
     expect(mockNavigate).not.toHaveBeenCalledWith("/apps/connect", { replace: true });
+  });
+
+  it("defaults Google Drive setup to its write-capable connection method", async () => {
+    mockParams.appKey = "google-drive";
+    listGalleryMock.mockResolvedValue({ apps: [GOOGLE_DRIVE] });
+
+    await render();
+    await passAccessStep();
+
+    expect(radioContaining("Read & create")?.getAttribute("aria-checked")).toBe("true");
+    expect(radioContaining("Read only")?.getAttribute("aria-checked")).toBe("false");
+    expect(container.textContent).toContain("Before connecting, enroll the signed-in Workspace account");
+    expect(container.textContent).toContain("Your OAuth app");
   });
 
   /**
@@ -569,7 +588,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Pick the app you want your agents to use.");
   });
 
-  it("requires a PostHog method and submits the selected project scope", async () => {
+  it("connects PostHog without a project ID and keeps optional controls advanced", async () => {
     mockParams.appKey = "posthog";
     listGalleryMock.mockResolvedValueOnce({ apps: [POSTHOG] });
     await render();
@@ -588,13 +607,16 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
 
-    const projectInput = container.querySelector<HTMLInputElement>('input[placeholder="12345"]');
+    expect(container.textContent).not.toContain("Where are credentials managed?");
+    expect(container.textContent).not.toContain("Vercel Connect");
+
     const keyInput = container.querySelector<HTMLInputElement>('input[type="password"]');
     const advanced = buttonByText("Advanced");
-    expect(projectInput).toBeTruthy();
     expect(keyInput).toBeTruthy();
-    expect(container.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("false");
+    expect(container.querySelector<HTMLInputElement>('input[placeholder="Optional numeric project ID"]')).toBeNull();
+    expect(container.querySelector('[role="switch"]')).toBeNull();
     expect(advanced?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.textContent).not.toContain("Pin to project ID");
     expect(container.textContent).not.toContain("Feature groups");
     expect(container.textContent).not.toContain("Individual tools");
     expect(container.textContent).not.toContain("Tool response mode");
@@ -605,17 +627,22 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(advanced?.getAttribute("aria-expanded")).toBe("true");
+    expect(container.textContent).toContain("Pin to project ID");
+    expect(container.querySelector<HTMLInputElement>('input[placeholder="Optional numeric project ID"]')).toBeTruthy();
+    expect(container.querySelector('[role="switch"]')?.getAttribute("aria-checked")).toBe("false");
     expect(container.textContent).toContain("Feature groups");
     expect(container.textContent).toContain("Individual tools");
-    expect(container.textContent).toContain("Tool response mode");
+    expect(container.textContent).not.toContain("Tool response mode");
 
     await act(async () => {
-      setInputValue(projectInput!, "12345");
       setInputValue(keyInput!, "phx_test-key");
     });
     await flushReact();
+    const submit = buttonByText("Connect");
+    expect(submit).toBeTruthy();
+    expect(submit?.disabled).toBe(false);
     await act(async () => {
-      buttonByText("Connect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      submit?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     await flushReact();
 
@@ -623,9 +650,9 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       galleryKey: "posthog",
       connectionMethodKey: "mcp-api-key",
       name: "PostHog for the company",
+      credentialSource: "paperclip_vault",
       credentialValues: { "credentials.authorization": "phx_test-key" },
       configValues: {
-        projectId: "12345",
         readOnly: false,
         mode: "tools",
       },
@@ -633,6 +660,104 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       // Flexible methods default to a company identity, represented by omitting
       // the optional personal grantKind from the request.
     });
+  });
+
+  it("hands reviewed PostHog credentials to Vercel and submits only the connector reference", async () => {
+    mockParams.appKey = "posthog";
+    listGalleryMock.mockResolvedValueOnce({
+      apps: [POSTHOG],
+      credentialSources: {
+        vercelConnect: {
+          available: true,
+          enabled: true,
+          authentication: "access_token",
+          manageUrl: "https://vercel.com/connect",
+          reason: null,
+        },
+      },
+    });
+    await render(undefined, false, <AppsConnect credentialSource="vercel_connect" />);
+    await passAccessStep();
+    await act(async () => {
+      radioContaining("Use a personal API key")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Create or attach the connector in Vercel");
+    expect(container.querySelector('a[href="https://vercel.com/connect"]')).toBeTruthy();
+    expect(container.querySelector<HTMLInputElement>('input[type="password"]')).toBeNull();
+    const connectorInput = container.querySelector<HTMLInputElement>('#vercel-connect-connector');
+    expect(connectorInput).toBeTruthy();
+    await act(async () => {
+      setInputValue(connectorInput!, "posthog/paperclip");
+    });
+    await flushReact();
+    const vercelSubmit = buttonByText("Validate and connect");
+    expect(vercelSubmit).toBeTruthy();
+    expect(vercelSubmit?.disabled).toBe(false);
+    await act(async () => {
+      vercelSubmit?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenCalledWith("company-1", {
+      galleryKey: "posthog",
+      connectionMethodKey: "mcp-api-key",
+      name: "PostHog for the company",
+      credentialSource: "vercel_connect",
+      vercelConnect: { connector: "posthog/paperclip" },
+      configValues: { readOnly: false, mode: "tools" },
+      applicationId: undefined,
+    });
+    expect(JSON.stringify(connectAppMock.mock.calls[0])).not.toContain("credentialValues");
+  });
+
+  it("folds optional customer-owned OAuth details under Advanced", async () => {
+    mockParams.appKey = "posthog";
+    listGalleryMock.mockResolvedValueOnce({ apps: [POSTHOG] });
+    await render();
+    await passAccessStep();
+
+    await act(async () => {
+      radioContaining("Sign in with PostHog")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const advanced = buttonByText("Advanced");
+    expect(advanced?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.textContent).not.toContain("Use your own OAuth app");
+    expect(container.querySelector("#curated-oauth-client-id")).toBeNull();
+    expect(buttonByText("Continue to sign in")?.disabled).toBe(false);
+
+    await act(async () => {
+      advanced?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Use your own OAuth app");
+    expect(container.querySelector("#curated-oauth-client-id")).toBeTruthy();
+    expect(container.textContent).toContain("Paperclip callback URL");
+  });
+
+  it("shows unavailable Vercel configuration only inside the isolated Vercel entry point", async () => {
+    listGalleryMock.mockResolvedValueOnce({
+      apps: [POSTHOG],
+      credentialSources: {
+        vercelConnect: {
+          available: false,
+          enabled: true,
+          authentication: null,
+          manageUrl: "https://vercel.com/connect",
+          reason: "Vercel Connect needs workload OIDC or an instance access token.",
+        },
+      },
+    });
+    await render(undefined, false, <AppsConnect credentialSource="vercel_connect" />);
+
+    expect(container.textContent).toContain("Connect through Vercel");
+    expect(container.textContent).toContain("Vercel Connect needs workload OIDC or an instance access token.");
+    expect(buttonContaining("PostHog")?.disabled).toBe(true);
+    expect(container.textContent).not.toContain("Where are credentials managed?");
   });
 
   it("renders the same PostHog method choices in page and task-dialog hosts", async () => {
@@ -795,6 +920,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       galleryKey: "notion",
       connectionMethodKey: "mcp-oauth",
       name: "Notion for the company",
+      credentialSource: "paperclip_vault",
       credentialValues: {},
       configValues: undefined,
       applicationId: undefined,
@@ -859,6 +985,97 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     expect(navigateTopLevelMock).toHaveBeenCalledWith(
       "https://mcp.notion.com/authorize?state=existing",
+    );
+  });
+
+  it("resumes the exact draft selected by Finish setup", async () => {
+    mockSearch.value = "source=notion&resume=22222222-2222-4222-8222-222222222222";
+    listGalleryMock.mockResolvedValueOnce({ apps: [NOTION] });
+    listApplicationsMock.mockResolvedValueOnce({
+      applications: [{
+        id: "app-notion",
+        status: "active",
+        metadata: { sourceTemplateKey: "notion" },
+      }],
+    });
+    listConnectionsMock.mockResolvedValueOnce({
+      connections: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          applicationId: "app-notion",
+          authKind: "oauth",
+          credentialPolicy: "shared",
+          status: "draft",
+          config: { sourceTemplateKey: "notion" },
+          transportConfig: {},
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          applicationId: "app-notion",
+          authKind: "oauth",
+          credentialPolicy: "per_user",
+          status: "draft",
+          config: { sourceTemplateKey: "notion" },
+          transportConfig: {},
+        },
+      ],
+    });
+
+    await render();
+    expect(container.textContent).toContain("Finish connecting Notion");
+    expect(container.textContent).toContain("identity and agent access will stay the same");
+    expect(container.textContent).not.toContain("Choose access before sign-in");
+    expect(buttonByText("Continue to sign in")).toBeUndefined();
+    await act(async () => {
+      buttonByText("Finish with Notion")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(startOAuthMock).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      { asCurrentUser: true },
+    );
+    expect(navigateTopLevelMock).toHaveBeenCalledWith(
+      "https://mcp.notion.com/authorize?state=resumed",
+    );
+  });
+
+  it("returns a declined OAuth draft to the same one-action resume checkpoint", async () => {
+    mockSearch.value = "source=notion&resume=22222222-2222-4222-8222-222222222222&oauth=denied&code=oauth_authorization_denied";
+    listGalleryMock.mockResolvedValueOnce({ apps: [NOTION] });
+    listApplicationsMock.mockResolvedValueOnce({
+      applications: [{
+        id: "app-notion",
+        status: "draft",
+        metadata: { sourceTemplateKey: "notion" },
+      }],
+    });
+    listConnectionsMock.mockResolvedValueOnce({
+      connections: [{
+        id: "22222222-2222-4222-8222-222222222222",
+        applicationId: "app-notion",
+        authKind: "oauth",
+        credentialPolicy: "shared",
+        status: "draft",
+        config: { sourceTemplateKey: "notion", connectionMethodKey: "mcp-oauth" },
+        transportConfig: {},
+      }],
+    });
+
+    await render();
+    await flushReact();
+    expect(container.textContent).toContain("Notion couldn’t connect");
+    expect(container.textContent).toContain("Your saved connection was not changed");
+    expect(buttonByText("Try again")).toBeTruthy();
+
+    await act(async () => {
+      buttonByText("Try again")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+    expect(startOAuthMock).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      { asCurrentUser: false },
     );
   });
 
@@ -1013,6 +1230,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       galleryKey: "notion",
       connectionMethodKey: "mcp-oauth",
       name: "Notion for the company",
+      credentialSource: "paperclip_vault",
       credentialValues: {},
       configValues: undefined,
       applicationId: "app-notion",
@@ -1327,6 +1545,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(container.textContent).toContain("This looks like Zapier.");
+    expect(linkInput?.type).toBe("password");
+    expect(linkInput?.autocomplete).toBe("off");
 
     await act(async () => {
       buttonByText("Continue")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -1334,7 +1554,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(container.textContent).toContain("Connect your own MCP server");
-    expect(container.textContent).toContain(zapierUrl);
+    expect(container.textContent).not.toContain(zapierUrl);
+    expect(container.textContent).toContain("token=REDACTED");
     expect(nameInputFrom(container)?.value).toBe("Zapier");
     expect(container.querySelector('input[type="password"]')).toBeNull();
 
@@ -1347,6 +1568,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({
       link: zapierUrl,
       name: "Zapier for the company",
+      galleryKey: "zapier",
+      connectionMethodKey: "generated-url",
     });
     expect(connectAppMock.mock.calls[0]?.[1].credentialValues).toBeUndefined();
   });
@@ -1398,6 +1621,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     const linkInput = container.querySelector<HTMLInputElement>(
       'input[placeholder^="https://mcp.zapier.com"]',
     );
+    expect(linkInput?.type).toBe("password");
+    expect(linkInput?.autocomplete).toBe("off");
     const zapierUrl = "https://mcp.zapier.com/api/v1/connect?token=secret-token";
     await act(async () => setInputValue(linkInput!, zapierUrl));
     await flushReact();
@@ -1411,6 +1636,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({
       link: zapierUrl,
       name: "Zapier for the company",
+      galleryKey: "zapier",
+      connectionMethodKey: "generated-url",
     });
     // No grantKind is sent: the pasted-URL path never offered the choice, and
     // sending "user" without asking would mis-scope the credential.
@@ -1508,6 +1735,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
     await passAccessStep();
+    await act(async () => {
+      buttonContaining("Share selected sheets")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
 
     expect(container.textContent).toContain("Share each sheet with this email");
     expect(container.textContent).toContain("robot@paperclip.iam.gserviceaccount.com");
@@ -1530,6 +1761,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
     await passAccessStep();
+    await act(async () => {
+      buttonContaining("Share selected sheets")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
     const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
     await act(async () => setTextareaValue(textarea!, "https://example.com/not-a-sheet"));
     await flushReact();
@@ -1609,6 +1844,47 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(input).toMatchObject({ galleryKey: "github", name: "GitHub for the company" });
   });
 
+  it("continues an exact credential-based draft instead of creating a replacement", async () => {
+    const connectionId = "33333333-3333-4333-8333-333333333333";
+    mockSearch.value = `source=github&resume=${connectionId}`;
+    listGalleryMock.mockResolvedValueOnce({ apps: [GITHUB] });
+    listApplicationsMock.mockResolvedValueOnce({
+      applications: [{ id: "app-github", status: "active", metadata: { sourceTemplateKey: "github" } }],
+    });
+    listConnectionsMock.mockResolvedValueOnce({
+      connections: [{
+        id: connectionId,
+        applicationId: "app-github",
+        name: "Engineering GitHub for the company",
+        authKind: "api_key",
+        credentialPolicy: "shared",
+        status: "draft",
+        config: { sourceTemplateKey: "github", connectionMethodKey: "mcp-key" },
+        transportConfig: {},
+      }],
+    });
+
+    await render();
+    await passAccessStep();
+    expect(nameInputFrom(container)?.value).toBe("Engineering GitHub for the company");
+    const keyField = container.querySelector<HTMLInputElement>("input[type=password]");
+    await act(async () => setInputValue(keyField!, "replacement-key"));
+    await flushReact();
+    await act(async () => {
+      buttonByText("Connect")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenCalledTimes(1);
+    expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({
+      galleryKey: "github",
+      connectionMethodKey: "mcp-key",
+      resumeConnectionId: connectionId,
+      name: "Engineering GitHub for the company",
+      credentialValues: { "credentials.authorization": "replacement-key" },
+    });
+  });
+
   it("a custom name in the gallery step is sent to the connect mutation", async () => {
     await render();
 
@@ -1648,6 +1924,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
     await passAccessStep();
+    await act(async () => {
+      buttonContaining("Share selected sheets")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
 
     // Default is the app name.
     expect(nameInputFrom(container)?.value).toBe("Google Sheets");
@@ -1684,6 +1964,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     });
     await flushReact();
     await passAccessStep();
+    await act(async () => {
+      buttonContaining("Share selected sheets")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
     const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
     await act(async () =>
       setTextareaValue(

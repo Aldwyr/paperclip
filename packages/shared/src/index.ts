@@ -288,6 +288,8 @@ export {
   type SourceTrustMetadata,
 } from "./trust-policy.js";
 export {
+  APP_STORE_DEFINITIONS,
+  APP_STORE_HIDDEN_SLUGS,
   CONNECTABLE_APP_DEFINITIONS,
   CONNECTABLE_APP_SLUGS,
   DEFAULT_OWNERSHIP_AVAILABILITY,
@@ -300,13 +302,17 @@ export {
   connectionMethodSupportsAutomaticOAuth,
   credentialConfigPath,
   getAppDefinitionForUrl,
+  getAppStoreDefinition,
   getAvailableConnectionMethod,
   getAvailableConnectionMethods,
   getConnectableAppDefinition,
+  getRecommendedConnectionMethod,
   isConnectableAppSlug,
+  isAppStoreVisibleSlug,
   recommendedDefaultsForApp,
 } from "./app-definitions.js";
 export { APP_DEFINITIONS } from "./app-definitions.generated.js";
+export * from "./google-workspace-connectors.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
@@ -1389,11 +1395,17 @@ export type {
   ToolCatalogEntryKind,
   ToolConnectionHealthStatus,
   ToolConnectionAuthKind,
+  ToolConnectionCredentialSource,
   ToolConnectionCredentialPolicy,
   ToolConnectionOwnership,
   ToolConnectionTransport,
   ToolConnectionStatus,
   ToolConnectionKind,
+  VercelConnectCredentialReference,
+  VercelConnectCredentialSummary,
+  VercelConnectGrantReference,
+  VercelConnectGrantSummary,
+  VercelConnectPrincipalMode,
   ToolCatalogEntryStatus,
   ToolAppAttentionItem,
   ToolAppAttentionReason,

@@ -541,5 +541,8 @@ function newConnectionHref({
     previousAddress,
   ].find((value): value is string => typeof value === "string" && /^https?:\/\//i.test(value));
   if (storedLink) params.set("link", storedLink);
-  return `/apps/connect?${params.toString()}`;
+  const path = previousConnection?.credentialSource === "vercel_connect"
+    ? "/apps/vercel-connect"
+    : "/apps/connect";
+  return `${path}?${params.toString()}`;
 }

@@ -27,14 +27,14 @@
       "defaults": {
         "serverUrl": "https://mcp.supabase.com/mcp"
       },
-      "guidanceMd": "Connect Supabase in the browser. A Supabase account; use a development project and default to project-scoped read-only access.",
+      "guidanceMd": "Connect Supabase in the browser and scope the connection to one development project. Write tools start enabled and remain governed by Paperclip's action policies.",
       "riskTier": "S4",
       "label": "Sign in with Supabase",
       "consoleLinks": {
         "docs": "https://supabase.com/docs/guides/ai-tools/mcp"
       },
       "warnings": [
-        "A Supabase account; use a development project and default to project-scoped read-only access.",
+        "A Supabase account; use a development project and review write actions before connecting production data.",
         "Do not connect production data unless you have reviewed Supabase's MCP security guidance."
       ],
       "tenantFields": [
@@ -54,8 +54,8 @@
           "key": "readOnly",
           "label": "Read-only mode",
           "type": "checkbox",
-          "defaultValue": true,
-          "helperMd": "Keep enabled unless the agent must change the database.",
+          "defaultValue": false,
+          "helperMd": "Enable this to prevent the connection from changing the database.",
           "transport": {
             "location": "query",
             "name": "read_only",
@@ -91,7 +91,7 @@
       "defaults": {
         "serverUrl": "https://mcp.supabase.com/mcp"
       },
-      "guidanceMd": "Use a customer-created Supabase key. A Supabase account; use a development project and default to project-scoped read-only access.",
+      "guidanceMd": "Use a customer-created Supabase key scoped to one development project. Write tools start enabled and remain governed by Paperclip's action policies.",
       "riskTier": "S4",
       "label": "Use an API key",
       "credentialFields": [
@@ -114,7 +114,7 @@
         "docs": "https://supabase.com/docs/guides/ai-tools/mcp"
       },
       "warnings": [
-        "A Supabase account; use a development project and default to project-scoped read-only access.",
+        "A Supabase account; use a development project and review write actions before connecting production data.",
         "Do not connect production data unless you have reviewed Supabase's MCP security guidance."
       ],
       "tenantFields": [
@@ -134,8 +134,8 @@
           "key": "readOnly",
           "label": "Read-only mode",
           "type": "checkbox",
-          "defaultValue": true,
-          "helperMd": "Keep enabled unless the agent must change the database.",
+          "defaultValue": false,
+          "helperMd": "Enable this to prevent the connection from changing the database.",
           "transport": {
             "location": "query",
             "name": "read_only",
