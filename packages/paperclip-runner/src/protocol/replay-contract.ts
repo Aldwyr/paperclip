@@ -190,7 +190,11 @@ function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
   const uniqueEvents = new Map<string, PrpEvent>();
   const semanticCalls = new Map<
     string,
-    { input?: { envelope: PrpSemanticToolEnvelope; index: number }; result?: { envelope: PrpSemanticToolEnvelope; index: number } }
+    {
+      input?: { envelope: PrpSemanticToolEnvelope; index: number };
+      result?: { envelope: PrpSemanticToolEnvelope; index: number };
+      reconciled?: { envelope: PrpSemanticToolEnvelope; index: number };
+    }
   >();
   fixture.events.forEach((event, index) => {
     if (event.runId !== fixture.identity.runId) {
@@ -273,6 +277,30 @@ function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
           code: "binding_mismatch",
           path: `/events/${call.result.index}/payload/semantic_tool/${field}`,
           message: `semantic_tool result ${field} must match its input envelope`,
+        });
+      }
+    }
+    if (call.reconciled !== undefined) {
+      for (const field of ["operationId", "idempotencyKey"] as const) {
+        if (
+          canonicalJson(call.input.envelope[field]) !==
+          canonicalJson(call.reconciled.envelope[field])
+        ) {
+          issues.push({
+            code: "binding_mismatch",
+            path: `/events/${call.reconciled.index}/payload/semantic_tool/${field}`,
+            message: `semantic_tool reconciled ${field} must match its input envelope`,
+          });
+        }
+      }
+      if (
+        call.input.envelope.content.digest !==
+        call.reconciled.envelope.content.digest
+      ) {
+        issues.push({
+          code: "binding_mismatch",
+          path: `/events/${call.reconciled.index}/payload/semantic_tool/content/digest`,
+          message: "semantic_tool reconciled digest must match its input envelope",
         });
       }
     }

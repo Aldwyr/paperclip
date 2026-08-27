@@ -375,10 +375,15 @@ async fn upload_context_directory(
     Ok(HarnessSkill::S3(source))
 }
 
-async fn upload_agentcore_runtime_context(
-    client: &aws_sdk_s3::Client,
+struct AgentCoreContextAsset {
+    digest: String,
+    files: Vec<(PathBuf, Vec<u8>)>,
+    generated_skill: Option<String>,
+}
+
+fn prepare_agentcore_runtime_context_assets(
     config: &AwsAgentCoreProviderConfig,
-) -> Result<Vec<HarnessSkill>, String> {
+) -> Result<Vec<AgentCoreContextAsset>, String> {
     let context = config.runtime_context.as_ref().ok_or_else(|| {
         "AgentCore requires paperclip.native-execution-input.v3 runtimeContext".to_owned()
     })?;
@@ -397,16 +402,11 @@ async fn upload_agentcore_runtime_context(
         &format!("{instruction_digest}\0{entry_path}\0{instruction_companion}"),
         64,
     );
-    let mut skills = vec![
-        upload_context_directory(
-            client,
-            config,
-            &instruction_asset_digest,
-            instruction_files,
-            Some(instruction_companion),
-        )
-        .await?,
-    ];
+    let mut assets = vec![AgentCoreContextAsset {
+        digest: instruction_asset_digest,
+        files: instruction_files,
+        generated_skill: Some(instruction_companion),
+    }];
     let assigned = context
         .get("skills")
         .and_then(Value::as_array)
@@ -418,7 +418,31 @@ async fn upload_agentcore_runtime_context(
         if !files.iter().any(|(path, _)| path == Path::new("SKILL.md")) {
             return Err("AgentCore custom skill bundle is missing SKILL.md".to_owned());
         }
-        skills.push(upload_context_directory(client, config, digest, files, None).await?);
+        assets.push(AgentCoreContextAsset {
+            digest: digest.to_owned(),
+            files,
+            generated_skill: None,
+        });
+    }
+    Ok(assets)
+}
+
+async fn upload_agentcore_runtime_context(
+    client: &aws_sdk_s3::Client,
+    config: &AwsAgentCoreProviderConfig,
+) -> Result<Vec<HarnessSkill>, String> {
+    let mut skills = Vec::new();
+    for asset in prepare_agentcore_runtime_context_assets(config)? {
+        skills.push(
+            upload_context_directory(
+                client,
+                config,
+                &asset.digest,
+                asset.files,
+                asset.generated_skill,
+            )
+            .await?,
+        );
     }
     Ok(skills)
 }
@@ -1619,6 +1643,77 @@ mod tests {
         assert!(instructions.starts_with("paperclip prompt\n\nAGENTS entry\n\n"));
         assert!(instructions.ends_with("attached Paperclip HarnessSkill under `instructions/`."));
         assert!(!instructions.contains(local_root));
+    }
+
+    #[test]
+    fn agentcore_upload_plan_contains_instruction_siblings_and_complete_assigned_skill_trees() {
+        let root = std::env::temp_dir().join(format!(
+            "paperclip-agentcore-context-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let instruction_root = root.join("instructions");
+        let skill_root = root.join("reviewer");
+        fs::create_dir_all(instruction_root.join("references")).unwrap();
+        fs::create_dir_all(skill_root.join("references")).unwrap();
+        fs::write(instruction_root.join("AGENTS.md"), "Follow the entry.\n").unwrap();
+        fs::write(
+            instruction_root.join("references/policy.md"),
+            "Instruction sibling.\n",
+        )
+        .unwrap();
+        fs::write(skill_root.join("SKILL.md"), "# Reviewer\n").unwrap();
+        fs::write(
+            skill_root.join("references/checklist.md"),
+            "- Verify tests\n",
+        )
+        .unwrap();
+        let mut config = config();
+        config.runtime_context = Some(json!({
+            "instructions": {
+                "entryPath": "AGENTS.md",
+                "bundle": {
+                    "digest": "a".repeat(64),
+                    "rootPath": instruction_root.display().to_string()
+                }
+            },
+            "skills": [{
+                "key": "company-1/reviewer",
+                "runtimeName": "reviewer",
+                "bundle": {
+                    "digest": "b".repeat(64),
+                    "rootPath": skill_root.display().to_string()
+                }
+            }]
+        }));
+
+        let assets = prepare_agentcore_runtime_context_assets(&config).unwrap();
+
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].digest.len(), 64);
+        assert!(assets[0]
+            .generated_skill
+            .as_ref()
+            .is_some_and(|skill| skill.contains("instructions/AGENTS.md")));
+        assert!(assets[0]
+            .files
+            .iter()
+            .any(|(path, bytes)| path == Path::new("instructions/AGENTS.md")
+                && bytes == b"Follow the entry.\n"));
+        assert!(assets[0].files.iter().any(|(path, bytes)| path
+            == Path::new("instructions/references/policy.md")
+            && bytes == b"Instruction sibling.\n"));
+        assert_eq!(assets[1].digest, "b".repeat(64));
+        assert!(assets[1].generated_skill.is_none());
+        assert!(assets[1]
+            .files
+            .iter()
+            .any(|(path, bytes)| path == Path::new("SKILL.md") && bytes == b"# Reviewer\n"));
+        assert!(assets[1]
+            .files
+            .iter()
+            .any(|(path, bytes)| path == Path::new("references/checklist.md")
+                && bytes == b"- Verify tests\n"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

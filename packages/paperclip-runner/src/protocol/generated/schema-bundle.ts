@@ -1797,7 +1797,8 @@ export const semanticToolSchema = {
     "phase": {
       "enum": [
         "input",
-        "result"
+        "result",
+        "reconciled"
       ]
     },
     "operationId": {
@@ -3171,6 +3172,7 @@ export const eventSchema = {
         "runner.reconciled",
         "runner.disconnected",
         "runner.draining",
+        "runner.backpressure",
         "runner.suspending",
         "runner.suspended",
         "runner.stopped",
@@ -3232,6 +3234,7 @@ export const eventSchema = {
         "usage.reported",
         "semantic_tool.input",
         "semantic_tool.result",
+        "semantic_tool.reconciled",
         "mcp_app.discovered",
         "mcp_app.resource.resolved",
         "mcp_app.initializing",
@@ -3719,6 +3722,40 @@ export const eventSchema = {
                     "properties": {
                       "phase": {
                         "const": "result"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "semantic_tool.reconciled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "semantic_tool": {
+                "allOf": [
+                  {
+                    "$ref": "https://paperclip.dev/schemas/prp/v1/semantic-tool.schema.json"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "const": "reconciled"
                       }
                     }
                   }

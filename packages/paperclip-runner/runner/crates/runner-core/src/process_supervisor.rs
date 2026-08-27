@@ -434,7 +434,25 @@ mod tests {
     use super::SUPERVISED_ENV_KEYS;
 
     #[test]
-    fn supervised_environment_allows_managed_acpx_codex_credential() {
-        assert!(SUPERVISED_ENV_KEYS.contains(&"PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"));
+    fn supervised_environment_allows_every_qualified_provider_credential() {
+        for credential in [
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET",
+        ] {
+            assert!(
+                SUPERVISED_ENV_KEYS.contains(&credential),
+                "provider credential {credential} must reach the supervised adapter"
+            );
+        }
+        for forbidden in ["PAPERCLIP_API_KEY", "DATABASE_URL", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(
+                !SUPERVISED_ENV_KEYS.contains(&forbidden),
+                "control-plane credential {forbidden} must not reach the supervised adapter"
+            );
+        }
     }
 }

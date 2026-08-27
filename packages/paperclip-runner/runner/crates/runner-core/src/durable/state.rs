@@ -1673,10 +1673,22 @@ fn execute_command_effect(
                 "run.result.proposed",
                 0,
                 json!({
-                    "schema": "paperclip.prp.result.v1",
-                    "status": "succeeded",
+                    "schema": "paperclip.run_result.v1",
                     "reportedWorkDisposition": "done",
                     "summary": "Durable runner durable transport recovered without duplicate effects.",
+                    "completionClaim": {
+                        "contractRevision": "durable-recovery-v1",
+                        "objectiveSatisfied": true,
+                        "criteria": [],
+                        "remainingWork": [],
+                    },
+                    "evidence": [],
+                    "verification": [{
+                        "commandOrCheck": "durable recovery scenario",
+                        "status": "passed",
+                    }],
+                    "attentionRequests": [],
+                    "artifacts": [],
                 }),
                 None,
             )?;

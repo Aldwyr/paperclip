@@ -90,6 +90,32 @@ describe("PRP provider-neutral semantic receipts", () => {
     });
   });
 
+  it("validates the digest-only receipt emitted when a pending tool call is reconciled", () => {
+    const semanticTool = {
+      schema: "paperclip.prp.semantic_tool.v1",
+      schemaVersion: 1,
+      phase: "reconciled",
+      operationId: "get_task_context",
+      callId: "call_reconciled_test",
+      correlation,
+      idempotencyKey: null,
+      content: {
+        digest: `sha256:${"a".repeat(64)}`,
+        redactionDisposition: "digest_only",
+        references: [],
+      },
+    };
+    const reconciled = event("semantic_tool.reconciled", semanticTool);
+
+    expect(validatePrpEvent(reconciled).ok).toBe(true);
+    expect(
+      validatePrpEvent({
+        ...reconciled,
+        payload: { semantic_tool: { ...semanticTool, phase: "input" } },
+      }).ok,
+    ).toBe(false);
+  });
+
   it("maps denial and conflict codes onto protocol authorization boundaries", () => {
     expect(semanticAuthorizationBoundaryForCode("company_scope_denied")).toBe("company");
     expect(semanticAuthorizationBoundaryForCode("actor_role_denied")).toBe("actor");
@@ -99,13 +125,13 @@ describe("PRP provider-neutral semantic receipts", () => {
 });
 
 function event(
-  eventType: "mcp_app.tool_input" | "mcp_app.tool_result",
-  semanticTool: ReturnType<typeof createPrpSemanticToolInputEnvelope>,
+  eventType: "mcp_app.tool_input" | "mcp_app.tool_result" | "semantic_tool.reconciled",
+  semanticTool: Record<string, unknown>,
 ): PrpEvent {
   return {
     schema: "paperclip.prp.event.v1",
     sourceEventId: `${eventType}:receipt_test`,
-    sourceSeq: eventType === "mcp_app.tool_input" ? 1 : 2,
+    sourceSeq: eventType === "mcp_app.tool_input" ? 1 : eventType === "mcp_app.tool_result" ? 2 : 3,
     sourceInstanceId: "runner_receipt_test",
     sourceKind: "runner",
     runId: correlation.runId,

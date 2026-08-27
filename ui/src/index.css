@@ -274,8 +274,8 @@
   --side-panel-tab-radius: var(--radius-xl);
   --side-panel-control-radius: var(--radius-xl);
   --side-panel-launcher-width: var(--sz-320px);
-  --side-panel-bg: rgb(10 10 10);
-  --side-panel-fg: oklch(0.985 0 0);
+  --side-panel-bg: var(--background);
+  --side-panel-fg: var(--foreground);
   --side-panel-tab-active-bg: color-mix(in oklab, var(--accent) 88%, var(--background));
   --side-panel-tab-hover-bg: color-mix(in oklab, var(--accent) 58%, transparent);
 
@@ -318,6 +318,8 @@
 .dark {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
+  --side-panel-bg: rgb(10 10 10);
+  --side-panel-fg: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);

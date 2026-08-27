@@ -295,6 +295,8 @@ export interface CapabilityRunnerdCodexTransportOptions {
   runnerFilesystemRoot?: string;
   /** Current run's authority catalog, used when a suspended session is rebound. */
   resumeDynamicTools?: readonly Readonly<Record<string, unknown>>[];
+  /** Provider turn recorded by the owner checkpoint when restoring an active run. */
+  resumeActiveTurnId?: string | null;
   /** Explicitly permits ACPX to rotate its provider-native session after a governed wait. */
   providerRecoveryPolicy?:
     | "same_session_only"
@@ -627,6 +629,13 @@ export function rehydrateRunnerdUsageNotification(
   };
 }
 
+export function rehydrateRunnerdThreadTokenUsage(
+  cumulative: unknown,
+): { total: Record<string, unknown> } | null {
+  const total = record(cumulative);
+  return Object.keys(total).length === 0 ? null : { total };
+}
+
 export function rehydrateRunnerdResultNotification(
   result: Record<string, unknown>,
   openedThreadId: string,
@@ -954,6 +963,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // session cannot become an unhandled process-level rejection.
     void this.#failureSignal.catch(() => undefined);
     this.#ownsRoot = options.stateDirectory === undefined;
+    this.#turnId = options.resumeActiveTurnId ?? "";
     this.#root =
       options.stateDirectory ??
       mkdtempSync(resolve(tmpdir(), "paperclip-runner-lab-prp-"));
@@ -1078,7 +1088,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         typeof providerConfig.cwd === "string"
           ? providerConfig.cwd
           : this.options.runnerFilesystemRoot ?? tmpdir();
-      const session = record(durable.providerUsageCumulative);
+      const tokenUsage = rehydrateRunnerdThreadTokenUsage(
+        durable.providerUsageCumulative,
+      );
+      const recoveredTurns =
+        durable.activeTurn === true && this.#turnId.length > 0
+          ? [{ id: this.#turnId, status: "inProgress" }]
+          : [];
       return {
         thread: {
           id: this.#threadId,
@@ -1087,8 +1103,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             ? {}
             : { providerIdentity: structuredClone(this.#providerIdentity) }),
           cwd,
-          turns: [],
-          ...(session.usage === undefined ? {} : { tokenUsage: session.usage }),
+          turns: recoveredTurns,
+          ...(tokenUsage === null ? {} : { tokenUsage }),
         },
       };
     }

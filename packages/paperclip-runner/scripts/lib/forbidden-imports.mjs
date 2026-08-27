@@ -83,6 +83,7 @@ function violationReason({ file, packageRoot, specifier }) {
   const relativeFile = relative(packageRoot, file).split(/[\\/]/).join("/");
   const isExampleConsumer = relativeFile.startsWith("examples/");
   const isCleanConsumerHarness = relativeFile === "scripts/check-clean-consumers.mjs";
+  const isRunnerEvalHarness = relativeFile === "src/eval/workflow-harness.ts";
   const publicRunnerImports = new Set([
     "@paperclipai/paperclip-runner/browser",
     "@paperclipai/paperclip-runner/react",
@@ -106,7 +107,7 @@ function violationReason({ file, packageRoot, specifier }) {
     !publicRunnerImports.has(specifier)
   ) {
     if (
-      isCleanConsumerHarness
+      (isCleanConsumerHarness || isRunnerEvalHarness)
       && specifier === "@paperclipai/paperclip-eval-kernel"
     ) {
       return null;
@@ -149,14 +150,25 @@ function violationReason({ file, packageRoot, specifier }) {
 async function manifestViolations(packageRoot) {
   const manifestPath = resolve(packageRoot, "package.json");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  const dependencyGroups = [
+  const runtimeDependencyGroups = [
     manifest.dependencies ?? {},
     manifest.optionalDependencies ?? {},
     manifest.peerDependencies ?? {},
-    manifest.devDependencies ?? {},
   ];
-  const dependencies = new Set(dependencyGroups.flatMap((group) => Object.keys(group)));
-  return [...dependencies]
+  const runtimeDependencies = new Set(
+    runtimeDependencyGroups.flatMap((group) => Object.keys(group)),
+  );
+  const reviewedDevelopmentDependencies = new Set([
+    "@paperclipai/paperclip-eval-kernel",
+  ]);
+  const unreviewedDevelopmentDependencies = Object.keys(
+    manifest.devDependencies ?? {},
+  ).filter(
+    (name) =>
+      name.startsWith("@paperclipai/") &&
+      !reviewedDevelopmentDependencies.has(name),
+  );
+  return [...runtimeDependencies, ...unreviewedDevelopmentDependencies]
     .filter(
       (name) => name.startsWith("@paperclipai/") && name !== "@paperclipai/paperclip-runner",
     )

@@ -325,15 +325,14 @@ fn multipart_file(body: &mut Vec<u8>, boundary: &str, filename: &str, bytes: &[u
 
 fn upload_managed_skill(
     client: &Client,
+    origin: &str,
     title: &str,
     top_level: &str,
     mut files: Vec<(PathBuf, Vec<u8>)>,
     generated_skill: Option<String>,
 ) -> Result<Value, LocalRunnerError> {
     let listed: Value = client
-        .get(format!(
-            "{ANTHROPIC_ORIGIN}/v1/skills?limit=1000&source=custom"
-        ))
+        .get(format!("{origin}/v1/skills?limit=1000&source=custom"))
         .send()
         .map_err(|_| LocalRunnerError::invalid("Anthropic skill mapping lookup failed"))?
         .json()
@@ -395,7 +394,7 @@ fn upload_managed_skill(
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     let response = client
-        .post(format!("{ANTHROPIC_ORIGIN}/v1/skills"))
+        .post(format!("{origin}/v1/skills"))
         .header(
             CONTENT_TYPE,
             format!("multipart/form-data; boundary={boundary}"),
@@ -422,9 +421,11 @@ fn upload_managed_skill(
     Ok(json!({ "type": "custom", "skill_id": skill_id, "version": version }))
 }
 
-fn upload_managed_runtime_skills(
+fn upload_managed_runtime_skills_at(
     api_key: &str,
     config: &ClaudeManagedProviderConfig,
+    origin: &str,
+    require_https: bool,
 ) -> Result<Vec<Value>, LocalRunnerError> {
     let Some(context) = config.runtime_context.as_ref() else {
         return Ok(Vec::new());
@@ -441,11 +442,15 @@ fn upload_managed_runtime_skills(
         HeaderValue::from_static(ANTHROPIC_VERSION),
     );
     headers.insert("anthropic-beta", HeaderValue::from_static(SKILLS_BETA));
-    let client = Client::builder()
+    let mut client_builder = Client::builder()
         .default_headers(headers)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
-        .https_only(true)
+        .https_only(require_https);
+    if !require_https {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder
         .build()
         .map_err(|_| LocalRunnerError::invalid("failed to construct Anthropic skills client"))?;
 
@@ -466,6 +471,7 @@ fn upload_managed_runtime_skills(
     );
     let mut attachments = vec![upload_managed_skill(
         &client,
+        origin.trim_end_matches('/'),
         &format!(
             "pc:{}:{}:instructions:{}",
             config.profile_id, config.agent_version, instruction_identity
@@ -482,6 +488,7 @@ fn upload_managed_runtime_skills(
         let root = Path::new(runtime_text(skill, "/bundle/rootPath")?);
         attachments.push(upload_managed_skill(
             &client,
+            origin.trim_end_matches('/'),
             &format!(
                 "pc:{}:{}:{}:{}",
                 config.profile_id,
@@ -495,6 +502,13 @@ fn upload_managed_runtime_skills(
         )?);
     }
     Ok(attachments)
+}
+
+fn upload_managed_runtime_skills(
+    api_key: &str,
+    config: &ClaudeManagedProviderConfig,
+) -> Result<Vec<Value>, LocalRunnerError> {
+    upload_managed_runtime_skills_at(api_key, config, ANTHROPIC_ORIGIN, true)
 }
 
 fn managed_system_instructions(
@@ -1791,6 +1805,16 @@ mod tests {
         history_events: &[Value],
         stream_count: &AtomicUsize,
     ) {
+        if request.method == "GET" && request.path.starts_with("/v1/skills?") {
+            return send_json_response(socket, "200 OK", &json!({ "data": [] }));
+        }
+        if request.method == "POST" && request.path == "/v1/skills" {
+            return send_json_response(
+                socket,
+                "200 OK",
+                &json!({ "id": "skill_test", "latest_version": 1 }),
+            );
+        }
         if request.method == "POST" && request.path.starts_with("/v1/sessions?") {
             return send_json_response(socket, "200 OK", &json!({ "id": "session_test" }));
         }
@@ -1949,6 +1973,115 @@ mod tests {
         assert!(instructions.contains("attached `paperclip-instructions-"));
         assert!(instructions.ends_with("skill under `instructions/`."));
         assert!(!instructions.contains(local_root));
+    }
+
+    #[test]
+    fn managed_skill_uploads_include_instruction_siblings_and_complete_assigned_skill_trees() {
+        let service = FakeAnthropicService::start(vec![], vec![]);
+        let root = std::env::temp_dir().join(format!(
+            "paperclip-claude-managed-context-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let instruction_root = root.join("instructions");
+        let skill_root = root.join("reviewer");
+        fs::create_dir_all(instruction_root.join("references")).unwrap();
+        fs::create_dir_all(skill_root.join("references")).unwrap();
+        fs::write(
+            instruction_root.join("AGENTS.md"),
+            "Follow the entry instructions.\n",
+        )
+        .unwrap();
+        fs::write(
+            instruction_root.join("references/policy.md"),
+            "Instruction sibling policy.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_root.join("SKILL.md"),
+            "# Reviewer\nUse the checklist.\n",
+        )
+        .unwrap();
+        fs::write(
+            skill_root.join("references/checklist.md"),
+            "- Verify the tests\n",
+        )
+        .unwrap();
+        let mut config = config();
+        config.runtime_context = Some(json!({
+            "instructions": {
+                "entryPath": "AGENTS.md",
+                "bundle": {
+                    "digest": "instruction-digest",
+                    "rootPath": instruction_root.display().to_string()
+                }
+            },
+            "skills": [{
+                "key": "company-1/reviewer",
+                "runtimeName": "reviewer",
+                "bundle": {
+                    "digest": "skill-digest",
+                    "rootPath": skill_root.display().to_string()
+                }
+            }]
+        }));
+
+        let attached = upload_managed_runtime_skills_at(
+            "anthropic-test-secret",
+            &config,
+            &service.origin,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(attached.len(), 2);
+        assert!(attached.iter().all(|skill| {
+            skill.get("skill_id") == Some(&json!("skill_test"))
+                && skill.get("version") == Some(&json!(1))
+        }));
+        let requests = service.captured();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "GET" && request.path.starts_with("/v1/skills?"))
+                .count(),
+            2
+        );
+        let uploads = requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/v1/skills")
+            .collect::<Vec<_>>();
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads.iter().all(|request| request
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-api-key: anthropic-test-secret")));
+        let instruction_upload = uploads
+            .iter()
+            .find(|request| request.body.contains("Follow the entry instructions."))
+            .unwrap();
+        assert!(instruction_upload
+            .body
+            .contains("/instructions/AGENTS.md\""));
+        assert!(instruction_upload
+            .body
+            .contains("/instructions/references/policy.md\""));
+        assert!(instruction_upload
+            .body
+            .contains("Instruction sibling policy."));
+        assert!(instruction_upload.body.contains("/SKILL.md\""));
+        let assigned_upload = uploads
+            .iter()
+            .find(|request| request.body.contains("# Reviewer"))
+            .unwrap();
+        assert!(assigned_upload.body.contains("reviewer/SKILL.md\""));
+        assert!(assigned_upload
+            .body
+            .contains("reviewer/references/checklist.md\""));
+        assert!(assigned_upload.body.contains("- Verify the tests"));
+        assert!(uploads
+            .iter()
+            .all(|request| !request.body.contains("anthropic-test-secret")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -24,6 +24,7 @@ import {
   expandRunnerdCanonicalNotifications,
   rehydrateRunnerdPlanNotification,
   rehydrateRunnerdResultNotification,
+  rehydrateRunnerdThreadTokenUsage,
   rehydrateRunnerdTurnNotification,
   rehydrateRunnerdUsageNotification,
   rehydrateRunnerdWorkspaceChangeNotification,
@@ -120,6 +121,70 @@ it("passes the configured Codex API key only through the provider process enviro
     CODEX_API_KEY: "configured-automation-key",
   });
   expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
+});
+
+it.each([
+  {
+    agent: "pi" as const,
+    allowed: ["OPENROUTER_API_KEY"],
+    denied: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY", "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"],
+  },
+  {
+    agent: "claude" as const,
+    allowed: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+    denied: ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"],
+  },
+  {
+    agent: "codex" as const,
+    allowed: ["OPENAI_API_KEY", "CODEX_API_KEY", "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"],
+    denied: ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
+  },
+])("passes only $agent ACPX credentials and the durable runtime binding", ({ agent, allowed, denied }) => {
+  const credentialEnvironment: Record<string, string> = {
+    OPENROUTER_API_KEY: "openrouter-canary",
+    ANTHROPIC_API_KEY: "anthropic-canary",
+    CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-canary",
+    OPENAI_API_KEY: "openai-canary",
+    CODEX_API_KEY: "codex-canary",
+    PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-codex-canary",
+  };
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "acpx",
+    options: {
+      provider: "acpx",
+      stateDirectory: "/isolated/session",
+      acpxAgent: agent,
+      environment: {
+        PATH: "/bin",
+        ...credentialEnvironment,
+        PAPERCLIP_API_KEY: "must-not-reach-provider",
+        DATABASE_URL: "must-not-reach-provider",
+      },
+    },
+    identity: {
+      runnerInstanceId: "runner-1",
+      environmentLeaseId: "lease-1",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+    },
+    codexHome: "/isolated/codex-home",
+    runtimeContextPath: "/isolated/runtime-context.json",
+    hasRuntimeContext: true,
+  });
+
+  expect(environment).toMatchObject({
+    PATH: "/bin",
+    PAPERCLIP_RUNNER_INSTANCE_ID: "runner-1",
+    PAPERCLIP_RUN_ID: "run-1",
+    PAPERCLIP_NORMALIZED_SESSION_ID: "session-1",
+    PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH: "/isolated/runtime-context.json",
+  });
+  for (const key of allowed) expect(environment[key]).toBe(credentialEnvironment[key]);
+  for (const key of denied) expect(environment[key]).toBeUndefined();
+  expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
+  expect(environment.DATABASE_URL).toBeUndefined();
 });
 
 it.each(["opencode", "acpx"] as const)(
@@ -238,6 +303,15 @@ it("rehydrates normalized usage with the opened driver binding", () => {
       runDelta: { inputTokens: 3 },
     },
   });
+});
+
+it("rehydrates durable cumulative usage for a cold thread read", () => {
+  expect(
+    rehydrateRunnerdThreadTokenUsage({ inputTokens: 12, outputTokens: 3 }),
+  ).toEqual({
+    total: { inputTokens: 12, outputTokens: 3 },
+  });
+  expect(rehydrateRunnerdThreadTokenUsage(null)).toBeNull();
 });
 
 it("binds a durable semantic result to the active provider turn", () => {

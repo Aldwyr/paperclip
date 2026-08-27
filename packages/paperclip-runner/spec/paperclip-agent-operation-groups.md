@@ -6,7 +6,7 @@ Status: canonical explanatory contract for the Paperclip runner V1 surface.
 
 This document keeps three independent meanings of **group** separate. PRP families describe wire evidence and controller commands; capability placement decides who owns an operation; behavioral eval groups organize the 106 scenario corpus. None of the three axes can be used as a substitute for another.
 
-The generated totals are **103 PRP events in 31 event families**, **18 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
+The generated totals are **105 PRP events in 31 event families**, **18 controller commands in 7 command families**, **10 control-plane operations**, **41 reconciled semantic operations** (14 always, 27 optional), and **106 scenarios in 16 behavior groups**.
 
 ## Axis 1: PRP v1 event and command families
 
@@ -16,7 +16,7 @@ PRP records ordered, replayable execution evidence. It is not the model's Paperc
 
 | Family | Purpose | Events | Count |
 | --- | --- | --- | ---: |
-| `runner` | Runner connection, drain, and diagnostic lifecycle. | `runner.connected`<br>`runner.reconnected`<br>`runner.reconciled`<br>`runner.disconnected`<br>`runner.draining`<br>`runner.suspending`<br>`runner.suspended`<br>`runner.stopped`<br>`runner.diagnostic` | 9 |
+| `runner` | Runner connection, drain, and diagnostic lifecycle. | `runner.connected`<br>`runner.reconnected`<br>`runner.reconciled`<br>`runner.disconnected`<br>`runner.draining`<br>`runner.backpressure`<br>`runner.suspending`<br>`runner.suspended`<br>`runner.stopped`<br>`runner.diagnostic` | 10 |
 | `runtime` | Runner phase transitions. | `runtime.phase.changed` | 1 |
 | `sandbox` | Sandbox resource measurements. | `sandbox.metric` | 1 |
 | `workspace` | Workspace readiness. | `workspace.ready`<br>`workspace.change.updated`<br>`workspace.diff.recorded`<br>`workspace.file.referenced` | 4 |
@@ -39,7 +39,7 @@ PRP records ordered, replayable execution evidence. It is not the model's Paperc
 | `turn` | Model turn submission through terminal turn disposition. | `turn.submitted`<br>`turn.accepted`<br>`turn.started`<br>`turn.completed`<br>`turn.failed`<br>`turn.interrupted`<br>`turn.cancelled` | 7 |
 | `item` | Provider-neutral model/tool item lifecycle. | `item.started`<br>`item.delta`<br>`item.completed`<br>`item.failed` | 4 |
 | `usage` | Provider/model-attributed usage and accounting boundaries. | `usage.reported` | 1 |
-| `semantic_tool` | Canonical authorized Paperclip tool input and result evidence. | `semantic_tool.input`<br>`semantic_tool.result` | 2 |
+| `semantic_tool` | Canonical authorized Paperclip tool input and result evidence. | `semantic_tool.input`<br>`semantic_tool.result`<br>`semantic_tool.reconciled` | 3 |
 | `mcp_app` | MCP App discovery, initialization, tool, action, host-context, and teardown evidence. | `mcp_app.discovered`<br>`mcp_app.resource.resolved`<br>`mcp_app.initializing`<br>`mcp_app.ready`<br>`mcp_app.tool_input`<br>`mcp_app.tool_result`<br>`mcp_app.action.requested`<br>`mcp_app.action.resolved`<br>`mcp_app.host_context.changed`<br>`mcp_app.failed`<br>`mcp_app.teardown` | 11 |
 | `runtime_request` | Runtime permission/input request lifecycle. | `runtime_request.created`<br>`runtime_request.resolved`<br>`runtime_request.expired`<br>`runtime_request.cancelled` | 4 |
 | `interaction` | Issue-thread interaction proposal, materialization, response, delivery, and rejection. | `interaction.request.proposed`<br>`interaction.request.materialized`<br>`interaction.request.rejected`<br>`interaction.response.progressed`<br>`interaction.response.resolved`<br>`interaction.response.delivered` | 6 |

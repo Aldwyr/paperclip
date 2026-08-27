@@ -1322,6 +1322,7 @@ fn poll_provider(
                     }
                 };
                 if pending_before_resume {
+                    let input_digest = sha256_digest(canonical_json(&call.input).as_bytes());
                     enqueue_event(
                         state,
                         config,
@@ -1332,6 +1333,18 @@ fn poll_provider(
                                 "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
                                 "phase": "reconciled", "operationId": call.operation_id,
                                 "callId": call.call_id,
+                                "correlation": {
+                                    "runId": state.run_id,
+                                    "normalizedSessionId": state.normalized_session_id,
+                                    "turnId": state.turn_id,
+                                    "itemId": state.item_id,
+                                },
+                                "idempotencyKey": Value::Null,
+                                "content": {
+                                    "digest": input_digest,
+                                    "redactionDisposition": "digest_only",
+                                    "references": [],
+                                },
                             },
                             "reason": "provider_replayed_pending_call",
                         }),

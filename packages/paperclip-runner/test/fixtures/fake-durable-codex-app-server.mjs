@@ -43,6 +43,21 @@ function finishTurn(turnId, toolResult) {
   state.turns[turnId] = "completed";
   save();
   send({
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: state.threadId,
+      turnId,
+      tokenUsage: {
+        total: {
+          inputTokens: state.nextTurn * 10,
+          cachedInputTokens: 0,
+          outputTokens: state.nextTurn * 2,
+          reasoningOutputTokens: 0,
+        },
+      },
+    },
+  });
+  send({
     method: "turn/completed",
     params: { threadId: state.threadId, turn: { id: turnId, status: "completed" } },
   });

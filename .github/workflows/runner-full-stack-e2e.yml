@@ -296,6 +296,8 @@ jobs:
     name: Merge and enforce campaign result
     if: always() && needs.catalog.result == 'success'
     needs: [catalog, daytona_image, test]
+    outputs:
+      dashboard_ready: ${{ steps.dashboard_ready.outputs.ready }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -372,16 +374,29 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Detect screenshot dashboard
+        id: dashboard_ready
+        if: always()
+        run: |
+          set -euo pipefail
+          dashboard_root="runner-e2e-merged-report/normalized"
+          screenshot="$(find "$dashboard_root" -type f -name '*.png' -print -quit 2>/dev/null || true)"
+          if [ -f "$dashboard_root/index.html" ] && [ -n "$screenshot" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Package screenshot dashboard for GitHub Pages
-        if: success() && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
+        if: always() && steps.dashboard_ready.outputs.ready == 'true' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
         uses: actions/upload-pages-artifact@v4
         with:
           path: runner-e2e-merged-report/normalized
 
   pages:
-    name: Publish latest green screenshot dashboard
+    name: Publish latest screenshot dashboard
     needs: report
-    if: needs.report.result == 'success' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
+    if: always() && needs.report.outputs.dashboard_ready == 'true' && vars.RUNNER_FULL_STACK_E2E_PUBLISH_PAGES == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
