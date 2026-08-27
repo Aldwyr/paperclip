@@ -130,10 +130,10 @@ function flushWithTimeout(client: TelemetryClient, timeoutMs: number): Promise<v
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       resolve();
     };
     const timer = setTimeout(finish, timeoutMs);
-    timer.unref?.();
     client.flush().then(finish, finish);
   });
 }
