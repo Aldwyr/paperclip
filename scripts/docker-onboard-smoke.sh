@@ -135,11 +135,19 @@ generate_bootstrap_invite_url() {
   printf '%s\n' "$invite_url"
 }
 
+# Seconds any single bootstrap request may take. Without this a connection that
+# is accepted and then stalls hangs curl forever: the retry loop below only
+# checks its deadline between attempts, so an unbounded call never returns to be
+# checked and the job runs to its own timeout printing nothing.
+SMOKE_REQUEST_TIMEOUT_SECONDS="${SMOKE_REQUEST_TIMEOUT_SECONDS:-20}"
+
 post_json_with_cookies() {
   local url="$1"
   local body="$2"
   local output_file="$3"
   curl -sS \
+    --connect-timeout 5 \
+    --max-time "$SMOKE_REQUEST_TIMEOUT_SECONDS" \
     -o "$output_file" \
     -w "%{http_code}" \
     -c "$COOKIE_JAR" \

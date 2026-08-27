@@ -140,6 +140,17 @@ test("gives up at the deadline rather than hanging", () => {
   assert.ok(r.elapsedMs < 30000, `overran the deadline: ${r.elapsedMs}ms`);
 });
 
+test("bounds every request so the deadline can actually be reached", () => {
+  // The retry loop only checks its deadline between attempts. An unbounded curl
+  // that connects and then stalls never returns to be checked, so the job would
+  // run to its own 45-minute timeout printing nothing — strictly worse than the
+  // single-attempt failure this change replaced. Asserted on the script text
+  // because the harness above stubs the helper out.
+  const helper = extractFunction("post_json_with_cookies");
+  assert.match(helper, /--max-time/, "post_json_with_cookies must cap request duration");
+  assert.match(helper, /--connect-timeout/, "post_json_with_cookies must cap connect time");
+});
+
 test("reports the HTTP status it saw, not just an empty body", () => {
   // The reason this flake went a week without a diagnosis: the failure printed
   // the response body, and a sign-up that never connected has none. The status
