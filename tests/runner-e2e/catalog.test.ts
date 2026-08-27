@@ -119,6 +119,8 @@ describe("runner E2E catalog", () => {
       files: { "AGENTS.md": expect.stringContaining("/interactions") },
     });
     expect(task!.buildPrompt("nonce")).toContain("request_confirmation");
+    expect(task!.buildPrompt("nonce")).toContain("baseRevisionId");
+    expect(task!.buildRevisionRequest?.("nonce")).toContain("baseRevisionId");
   });
 
   it("accepts only complete immutable Daytona digests", () => {
