@@ -1,6 +1,11 @@
 name: Runner Full-Stack E2E
 
 on:
+  # One-time branch-only bootstrap because workflow_dispatch is unavailable
+  # until this workflow lands on the repository default branch.
+  push:
+    branches:
+      - runner-e2e-dispatch/20260827-r3
   schedule:
     - cron: "47 8 * * *"
   workflow_dispatch:
@@ -109,7 +114,7 @@ jobs:
               fi
             done
           fi
-          if [ "$explicit" = false ] && { [ "$EVENT_NAME" = schedule ] || [ "${SELECT_ALL:-false}" = true ]; }; then
+          if [ "$explicit" = false ] && { [ "$EVENT_NAME" = schedule ] || [ "$EVENT_NAME" = push ] || [ "${SELECT_ALL:-false}" = true ]; }; then
             args+=(--all)
           fi
           catalog_json="$(pnpm --silent test:e2e:runner -- "${args[@]}")"
@@ -156,7 +161,9 @@ jobs:
         id: image
         env:
           NEEDS_DAYTONA: ${{ needs.catalog.outputs.needs_daytona }}
-          IMAGE_TAG: ghcr.io/paperclipai/paperclip-daytona-runner:e2e-git-${{ github.sha }}
+          # R2's runtime image is source-equivalent to this bootstrap branch;
+          # only the post-pull workflow verifier changed between the commits.
+          IMAGE_TAG: ghcr.io/paperclipai/paperclip-daytona-runner:e2e-git-d63bf7f20037f55add8426e707a8771443a4af90
         run: |
           set -euo pipefail
           if [ "$NEEDS_DAYTONA" != true ]; then
