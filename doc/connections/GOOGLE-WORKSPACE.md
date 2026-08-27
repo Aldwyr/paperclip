@@ -22,6 +22,30 @@ Google's hosted Workspace MCP servers are Developer Preview services. The app
 cards remain independent even when several services use the same customer-owned
 Google OAuth client or the same Paperclip ID broker deployment.
 
+## Developer Preview enrollment
+
+Google grants preview access to the specific Workspace email addresses and
+Google Cloud project numbers registered with the program. Submitting the form
+is not the approval signal:
+
+1. Google first sends a Google Group membership notification after verifying
+   the Workspace account.
+2. Google then sends a final confirmation after registering the Cloud project,
+   usually within a couple of days. This final email is the signal that MCP
+   testing can begin.
+3. If no final confirmation arrives within a week, check spam and contact the
+   Developer Preview program team from the
+   [program page](https://developers.google.com/workspace/preview).
+
+Enrollment does not authorize every user of an OAuth client. Additional tester
+emails and Cloud projects must be added through Google's member request forms.
+Google's preview terms also prohibit making a pre-GA integration available to
+end users outside the enrolled company or domain unless Google grants explicit
+permission. Consequently, Paperclip-managed Google OAuth is limited to
+registered internal testers during preview. Other companies must enroll their
+own Workspace testers and Cloud project and use a customer-owned OAuth app until
+Google makes Workspace MCP generally available.
+
 ## App matrix
 
 | App card | MCP endpoint | Capability choices |
