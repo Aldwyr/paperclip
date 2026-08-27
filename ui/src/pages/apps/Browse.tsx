@@ -82,7 +82,7 @@ export function Browse() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
+      { label: selectedCompany?.name ?? "Organization", href: "/dashboard" },
       { label: "Apps" },
     ]);
     return () => setBreadcrumbs([]);
@@ -280,7 +280,7 @@ export function Browse() {
   if (!selectedCompanyId) {
     return (
       <div className="p-6 text-sm text-muted-foreground">
-        Select a company to browse apps.
+        Select an organization to browse apps.
       </div>
     );
   }

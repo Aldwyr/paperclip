@@ -528,7 +528,7 @@ export function EffectiveAgentPanel({ companyId, agentOptions }: { companyId: st
                   <div key={profile.id} className="flex items-center justify-between gap-3 px-3 py-2.5">
                     <span className="min-w-0 truncate text-sm font-medium text-foreground">{profile.name}</span>
                     {profile.summary.isCompanyDefault ? (
-                      <Badge variant="secondary">Company default</Badge>
+                      <Badge variant="secondary">Organization default</Badge>
                     ) : null}
                   </div>
                 ))}
@@ -925,7 +925,7 @@ export function ProfilesTab({ companyId }: { companyId: string }) {
         <EmptyState
           icon={Layers}
           message="No access profiles yet"
-          description="Create a profile to group tool selectors, then bind it to the company or a specific agent."
+          description="Create a profile to group tool selectors, then bind it to the organization or a specific agent."
           action="New profile"
           onAction={() => setCreateOpen(true)}
         />

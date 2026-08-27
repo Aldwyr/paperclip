@@ -6,9 +6,9 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { createCapturedOutputBuffer, parseJsonResponseWithLimit } from "./dev-runner-output.ts";
+import { applyDevRunnerOptions } from "./dev-runner-options.ts";
 import { collectWatchedSnapshot as collectDevServerWatchedSnapshot, diffSnapshots } from "./dev-runner-snapshot.mjs";
 import { createDevServiceIdentity, repoRoot } from "./dev-service-profile.ts";
-import { applyDevRunnerOptions } from "../server/src/dev-runner-options.ts";
 import { bootstrapDevRunnerWorktreeEnv, isWorktreeSeedPending } from "../server/src/dev-runner-worktree.ts";
 import {
   findAdoptableLocalService,
@@ -26,7 +26,7 @@ const mode = process.argv[2] === "watch" ? "watch" : "dev";
 let cliArgs: string[];
 let dataDir: string | null;
 try {
-  const appliedOptions = applyDevRunnerOptions(process.argv.slice(3));
+  const appliedOptions = applyDevRunnerOptions(process.argv.slice(3), process.env, repoRoot);
   cliArgs = appliedOptions.forwardedArgs;
   dataDir = appliedOptions.dataDir;
 } catch (error) {

@@ -528,6 +528,15 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     listGalleryMock.mockResolvedValue({ apps: [GOOGLE_DRIVE] });
 
     await render();
+
+    expect(container.textContent).toContain("Google Developer Preview access required");
+    expect(container.textContent).toContain("does not enable unrelated Paperclip customers");
+    expect(container.textContent).toContain("final project-registration email");
+    expect(
+      Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find((link) =>
+        link.textContent?.includes("Apply or verify Developer Preview enrollment"),
+      )?.href,
+    ).toBe("https://developers.google.com/workspace/preview");
     await passAccessStep();
 
     expect(radioContaining("Read & create")?.getAttribute("aria-checked")).toBe("true");

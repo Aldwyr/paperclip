@@ -1559,6 +1559,7 @@ export function ConnectionSetupFlow({
           capabilities={galleryQuery.data?.capabilities}
           guidance={accessStepMethod?.guidanceMd}
           warnings={accessStepMethod?.warnings}
+          setupPrerequisite={entry?.setupPrerequisite}
           docsUrl={accessStepMethod?.consoleLinks?.docs ?? entry?.docsUrl}
           submitLabel={accessSubmitLabel}
           identityLoading={Boolean(automaticOAuthEntry) && directOAuthLookupPending}
@@ -3202,6 +3203,7 @@ export function AccessStep({
   capabilities,
   guidance,
   warnings,
+  setupPrerequisite,
   docsUrl,
   submitLabel,
   identityLoading = false,
@@ -3229,6 +3231,7 @@ export function AccessStep({
   } | null;
   guidance?: string;
   warnings?: string[];
+  setupPrerequisite?: AppDefinition["setupPrerequisite"];
   docsUrl?: string;
   submitLabel: string;
   /** Wait for a durable OAuth connection before showing a reconnect identity. */
@@ -3287,12 +3290,35 @@ export function AccessStep({
           </div>
         </div>
 
-        {guidance || warnings?.length || docsUrl ? (
+        {guidance || warnings?.length || setupPrerequisite || docsUrl ? (
           <div className="space-y-3 border-b border-border p-6">
             {warnings?.map((warning) => (
               <InlineBanner key={warning} tone="warning" compact>{warning}</InlineBanner>
             ))}
             {guidance ? <p className="text-sm text-foreground">{guidance}</p> : null}
+            {setupPrerequisite ? (
+              <div className="rounded-lg border border-border bg-muted/30 p-4">
+                <h3 className="text-sm font-semibold text-foreground">{setupPrerequisite.title}</h3>
+                <p className="mt-1 text-xs text-muted-foreground">{setupPrerequisite.description}</p>
+                {setupPrerequisite.steps?.length ? (
+                  <ol
+                    aria-label={`${setupPrerequisite.title} steps`}
+                    className="mt-3 list-decimal space-y-1 pl-4 text-xs text-muted-foreground"
+                  >
+                    {setupPrerequisite.steps.map((step) => <li key={step}>{step}</li>)}
+                  </ol>
+                ) : null}
+                <a
+                  href={setupPrerequisite.actionUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-foreground underline underline-offset-2"
+                >
+                  {setupPrerequisite.actionLabel}
+                  <ArrowUpRight className="h-3 w-3" />
+                </a>
+              </div>
+            ) : null}
             {docsUrl ? (
               <a
                 href={docsUrl}

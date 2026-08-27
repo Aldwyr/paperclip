@@ -96,6 +96,15 @@ describe("AppDefinition catalog",()=>{
   expect(getAvailableConnectionMethod(gmail)?.key).toBe("customer-draft-oauth");
   expect(getRecommendedConnectionMethod(drive.methods.filter((candidate)=>candidate.ownershipModes.includes("customer")))?.key).toBe("customer-write-oauth");
  });
+ it("explains Google Workspace Developer Preview enrollment before connection",()=>{
+  const googleWorkspaceMcpSlugs=["gmail","google-drive","google-docs","google-slides","google-calendar","google-chat","google-people","google-workspace-search"];
+  for(const slug of googleWorkspaceMcpSlugs){
+   const prerequisite=APP_DEFINITIONS.find((app)=>app.slug===slug)?.setupPrerequisite;
+   expect(prerequisite?.actionUrl,slug).toBe("https://developers.google.com/workspace/preview");
+   expect(prerequisite?.description,slug).toContain("does not enable unrelated Paperclip customers");
+   expect(prerequisite?.steps?.join(" "),slug).toContain("final project-registration email");
+  }
+ });
  it("withholds unverified and reserved providers from the app store without deleting their definitions",()=>{
   expect([...APP_STORE_HIDDEN_SLUGS].sort()).toEqual([
    "beehiiv","bitly","brex","candid","coda","composio","context7","egnyte","embat","github","kernel","local-falcon","make","manufact","oreilly","planetscale","razorpay","sanity","similarweb","slack","ticket-tailor","ticktick","xero",

@@ -1,18 +1,23 @@
 import path from "node:path";
 import {
+  DEFAULT_PAPERCLIP_INSTANCE_ID,
   expandHomePrefix,
   resolvePaperclipConfigPathForInstance,
   resolvePaperclipInstanceId,
-} from "@paperclipai/shared/home-paths";
+} from "../packages/shared/src/home-paths.ts";
 
 export interface AppliedDevRunnerOptions {
   forwardedArgs: string[];
   dataDir: string | null;
 }
 
-function requireOptionValue(args: string[], index: number, option: string): string {
+function requireOptionValue(
+  args: string[],
+  index: number,
+  option: string,
+): string {
   const value = args[index + 1]?.trim();
-  if (!value || value.startsWith("--")) {
+  if (!value || value.startsWith("-")) {
     throw new Error(`${option} requires a value`);
   }
   return value;
@@ -47,16 +52,22 @@ export function applyDevRunnerOptions(
   }
 
   const dataDir = path.resolve(cwd, expandHomePrefix(dataDirRaw));
-  const instanceId = resolvePaperclipInstanceId(env.PAPERCLIP_INSTANCE_ID);
   const hasExplicitConfig = Boolean(env.PAPERCLIP_CONFIG?.trim());
+  const hasExplicitContext = Boolean(env.PAPERCLIP_CONTEXT?.trim());
 
   env.PAPERCLIP_HOME = dataDir;
-  env.PAPERCLIP_INSTANCE_ID = instanceId;
   if (!hasExplicitConfig) {
+    const instanceId = resolvePaperclipInstanceId(
+      env.PAPERCLIP_INSTANCE_ID ?? DEFAULT_PAPERCLIP_INSTANCE_ID,
+    );
+    env.PAPERCLIP_INSTANCE_ID = instanceId;
     env.PAPERCLIP_CONFIG = resolvePaperclipConfigPathForInstance({
       homeDir: dataDir,
       instanceId,
     });
+  }
+  if (!hasExplicitContext) {
+    env.PAPERCLIP_CONTEXT = path.resolve(dataDir, "context.json");
   }
 
   return { forwardedArgs, dataDir };
