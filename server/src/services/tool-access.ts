@@ -7933,6 +7933,9 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
           });
         } catch (error) {
           if (error instanceof HttpError && asRecord(error.details).code === "oauth_reauthorization_required") {
+            const retainedCredentialSecretRefs = grant.credentialSecretRefs.filter(
+              (ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token",
+            );
             const providerTenant = {
               ...(grant.providerTenant ?? {}),
               oauth: {
@@ -7943,6 +7946,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
             const [marked] = await db.update(connectionGrants).set({
               status: "needs_reauthorization",
               providerTenant,
+              credentialSecretRefs: retainedCredentialSecretRefs,
               updatedAt: now(),
             }).where(and(
               eq(connectionGrants.id, grant.id),
@@ -7964,6 +7968,33 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
                 code: "oauth_refresh_superseded",
                 retryable: true,
               });
+            }
+            if (marked.kind === "organization") {
+              const latestConnection = await getConnectionRow(connection.id, connection.companyId);
+              const [reauthorizationRequired] = await db.update(toolConnections).set({
+                status: "draft",
+                enabled: false,
+                credentialSecretRefs: latestConnection.credentialSecretRefs.filter(
+                  (ref) => ref.configPath !== "oauth.access_token" && ref.configPath !== "oauth.refresh_token",
+                ),
+                credentialRefs: latestConnection.credentialRefs.filter(
+                  (ref) => ref.name !== "oauth.access_token" && ref.name !== "oauth.refresh_token",
+                ),
+                updatedAt: now(),
+              }).where(and(
+                eq(toolConnections.id, latestConnection.id),
+                eq(toolConnections.companyId, latestConnection.companyId),
+              )).returning();
+              await syncCredentialBindings(reauthorizationRequired);
+            } else {
+              const activeGrantRefs = await db.select({
+                refs: connectionGrants.credentialSecretRefs,
+              }).from(connectionGrants).where(and(
+                eq(connectionGrants.companyId, connection.companyId),
+                eq(connectionGrants.connectionId, connection.id),
+                eq(connectionGrants.status, "active"),
+              ));
+              await syncCredentialBindings(connection, activeGrantRefs.flatMap((row) => row.refs));
             }
             throw new HttpError(error.status, error.message, {
               ...asRecord(error.details),

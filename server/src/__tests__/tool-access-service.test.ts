@@ -5355,7 +5355,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(JSON.stringify(connection.config)).not.toContain("refresh-token");
   });
 
-  it("uses the direct loopback request origin for OAuth when no public URL is configured", async () => {
+  it("normalizes a direct numeric loopback origin for OAuth when no public URL is configured", async () => {
     vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_ID", "slack-client-id");
     vi.stubEnv("PAPERCLIP_TOOL_OAUTH_SLACK_CLIENT_SECRET", "slack-client-secret");
     const company = await createCompany(db);
@@ -5369,7 +5369,7 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(connectRes.status).toBe(201);
     const startUrl = new URL(connectRes.body.auth.startUrl);
     expect(startUrl.searchParams.get("redirect_uri")).toBe(
-      "http://127.0.0.1:3200/api/tools/oauth/callback",
+      "http://localhost:3200/api/tools/oauth/callback",
     );
   });
 
