@@ -875,15 +875,17 @@ export const RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE = "run.last_progress_to_te
 
 /**
  * Emit the last-progress-to-terminal diagnostic: the elapsed time between the
- * run's last known-good signal and the run reaching a fully settled terminal
- * state. It answers one question — how long did teardown take once the run's
- * outcome was already known — without carrying any content that could
- * identify the run. The payload is a closed shape: exactly `durationMs`. It
- * never carries progress text, a timestamp, a path, a session handle,
- * provider error text, or any other identifier. A non-finite or a negative
- * duration is an invalid measurement, so this drops it and emits nothing.
- * Every sink call sits inside an error swallow, so a throwing telemetry sink
- * never fails the run.
+ * turn's last progress signal and the moment the turn reaches its terminal
+ * state. It answers one question — how long did the run stay silent before
+ * it finished — without carrying any content that could identify the run.
+ * This event emits for every turn that reaches a terminal state, whether the
+ * turn completes, fails, is cancelled, or times out, and whether or not the
+ * duplex control channel later latches a loss. The payload is a closed
+ * shape: exactly `durationMs`. It never carries progress text, a timestamp,
+ * a path, a session handle, provider error text, or any other identifier. A
+ * non-finite or a negative duration is an invalid measurement, so this drops
+ * it and emits nothing. Every sink call sits inside an error swallow, so a
+ * throwing telemetry sink never fails the run.
  */
 export async function emitLastProgressToTerminalDiagnostic(
   ctx: Pick<AdapterExecutionContext, "onEvent">,
@@ -895,6 +897,46 @@ export async function emitLastProgressToTerminalDiagnostic(
     stream: "system",
     level: "info",
     message: `run last progress to terminal: ${durationMs}ms`,
+    payload: { durationMs },
+  };
+  try {
+    await ctx.onEvent?.(event);
+  } catch {
+    // Telemetry never fails the run.
+  }
+}
+
+/**
+ * The event type for the duplex-loss teardown-duration diagnostic. It rides
+ * the same run-events bridge as {@link RUN_PHASE_TIMING_EVENT_TYPE} and never
+ * changes run control flow.
+ */
+export const RUN_DUPLEX_LOSS_TEARDOWN_DURATION_EVENT_TYPE = "run.duplex_loss_teardown_duration";
+
+/**
+ * Emit the duplex-loss teardown-duration diagnostic: the elapsed time
+ * between the moment the engine confirmed the duplex control channel's loss
+ * and the moment every settlement step (including a deadline-bound
+ * sync-back) returned. It answers one question — how long did teardown take
+ * once a latched loss already decided the run's outcome — without carrying
+ * any content that could identify the run. This event emits only on a run
+ * whose duplex control channel latched a loss. The payload is a closed
+ * shape: exactly `durationMs`. It never carries progress text, a timestamp,
+ * a path, a session handle, provider error text, or any other identifier. A
+ * non-finite or a negative duration is an invalid measurement, so this drops
+ * it and emits nothing. Every sink call sits inside an error swallow, so a
+ * throwing telemetry sink never fails the run.
+ */
+export async function emitDuplexLossTeardownDurationDiagnostic(
+  ctx: Pick<AdapterExecutionContext, "onEvent">,
+  durationMs: number,
+): Promise<void> {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  const event: AdapterRuntimeEvent = {
+    eventType: RUN_DUPLEX_LOSS_TEARDOWN_DURATION_EVENT_TYPE,
+    stream: "system",
+    level: "info",
+    message: `run duplex loss teardown duration: ${durationMs}ms`,
     payload: { durationMs },
   };
   try {

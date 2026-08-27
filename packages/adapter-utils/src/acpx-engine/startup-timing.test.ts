@@ -4,6 +4,7 @@ import type { StartupSpan, StartupTraceContext, StartupTracer } from "./startup-
 import {
   clampSpanLabel,
   createRuntimeSpanRunner,
+  emitDuplexLossTeardownDurationDiagnostic,
   emitLastProgressToTerminalDiagnostic,
   emitRunPhaseTiming,
   emitSkippedStartupStep,
@@ -12,6 +13,7 @@ import {
   NOOP_STARTUP_SPAN,
   NOOP_STARTUP_TRACE_CONTEXT,
   normalizeProviderFamily,
+  RUN_DUPLEX_LOSS_TEARDOWN_DURATION_EVENT_TYPE,
   RUN_LAST_PROGRESS_TO_TERMINAL_EVENT_TYPE,
   RUN_PHASE_NAMES,
   RUN_PHASE_TIMING_EVENT_TYPE,
@@ -775,7 +777,7 @@ describe("run phase timing telemetry", () => {
 });
 
 describe("last-progress-to-terminal diagnostic", () => {
-  it("test_diagnostic_emits_only_a_finite_non_negative_duration", async () => {
+  it("emits only a finite, non-negative duration", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
 
@@ -790,7 +792,7 @@ describe("last-progress-to-terminal diagnostic", () => {
     expect(event.payload).toEqual({ durationMs: 4200 });
   });
 
-  it("test_diagnostic_rejects_non_finite_and_negative_durations", async () => {
+  it("rejects a non-finite or a negative duration", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
 
@@ -801,7 +803,7 @@ describe("last-progress-to-terminal diagnostic", () => {
     expect(events).toHaveLength(0);
   });
 
-  it("test_diagnostic_zero_duration_is_valid", async () => {
+  it("treats a zero duration as valid", async () => {
     const events: AdapterRuntimeEvent[] = [];
     const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
 
@@ -811,7 +813,7 @@ describe("last-progress-to-terminal diagnostic", () => {
     expect(events[0]!.payload).toEqual({ durationMs: 0 });
   });
 
-  it("test_diagnostic_telemetry_failure_does_not_fail_the_run", async () => {
+  it("does not fail the run when the telemetry sink throws", async () => {
     const ctx = {
       onEvent: async () => {
         throw new Error("telemetry sink boom");
@@ -819,5 +821,43 @@ describe("last-progress-to-terminal diagnostic", () => {
     };
 
     await expect(emitLastProgressToTerminalDiagnostic(ctx, 10)).resolves.toBeUndefined();
+  });
+});
+
+describe("duplex-loss teardown-duration diagnostic", () => {
+  it("emits only a finite, non-negative duration", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
+
+    await emitDuplexLossTeardownDurationDiagnostic(ctx, 4200);
+
+    expect(events).toHaveLength(1);
+    const event = events[0]!;
+    expect(event.eventType).toBe(RUN_DUPLEX_LOSS_TEARDOWN_DURATION_EVENT_TYPE);
+    // The payload carries exactly the one closed field and nothing else — no
+    // progress text, timestamp, path, session handle, or provider error text.
+    expect(Object.keys(event.payload ?? {})).toEqual(["durationMs"]);
+    expect(event.payload).toEqual({ durationMs: 4200 });
+  });
+
+  it("rejects a non-finite or a negative duration", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const ctx = { onEvent: async (event: AdapterRuntimeEvent) => void events.push(event) };
+
+    await emitDuplexLossTeardownDurationDiagnostic(ctx, Number.NaN);
+    await emitDuplexLossTeardownDurationDiagnostic(ctx, Number.POSITIVE_INFINITY);
+    await emitDuplexLossTeardownDurationDiagnostic(ctx, -5);
+
+    expect(events).toHaveLength(0);
+  });
+
+  it("does not fail the run when the telemetry sink throws", async () => {
+    const ctx = {
+      onEvent: async () => {
+        throw new Error("telemetry sink boom");
+      },
+    };
+
+    await expect(emitDuplexLossTeardownDurationDiagnostic(ctx, 10)).resolves.toBeUndefined();
   });
 });

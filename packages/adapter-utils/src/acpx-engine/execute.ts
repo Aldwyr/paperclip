@@ -132,6 +132,7 @@ import {
 import { createSandboxRunSite, type SandboxRunSite } from "./run-site-sandbox.js";
 import {
   createRuntimeSpanRunner,
+  emitDuplexLossTeardownDurationDiagnostic,
   emitLastProgressToTerminalDiagnostic,
   emitRunPhaseTiming,
   emitSkippedStartupStep,
@@ -3588,7 +3589,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // `run` reports which of the closed outcomes applies (a step that hits
       // its own host-enforced deadline resolves normally with `"timed_out"`,
       // never by throwing). A step error still emits `failed` before it
-      // re-throws to the Phase 3 error policy, exactly like `timedPhase`.
+      // re-throws to the caller, exactly like `timedPhase`.
       const timedPhaseWithOutcome = async (
         phase: string,
         run: () => Promise<RunPhaseOutcome>,
@@ -4094,6 +4095,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // phase covers the started turn and the event relay.
       let preparePhaseStart = now();
       let turnPhaseStart = now();
+      // The last time the engine observed turn progress: the turn start (the
+      // fallback for a turn that emits no event) or the most recent event the
+      // relay pulled from `turn.events`. `turnFinalize` reads this against the
+      // moment the terminal arrives, so the diagnostic covers a stalled turn
+      // even while its duplex channel stays healthy.
+      let lastTurnProgressAtMs = now();
       // Open the agent turn span as a child of the run root span. It wraps the
       // whole turn: the executor holds `turnSpan.parentContext` for later exec
       // parenting, and the `finally` below ends the span once on every path. The
@@ -4162,6 +4169,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // phase starts next.
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
         turnPhaseStart = now();
+        // The turn has not produced an event yet, so its start is the last
+        // known-good signal until the relay observes one.
+        lastTurnProgressAtMs = turnPhaseStart;
       };
       const stepTurnStart = (signal: AbortSignal, startTimeoutMs: number | undefined): StartedTurn => {
         const turn = runtime.startTurn({
@@ -4183,6 +4193,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const turn = activeTurn as AcpRuntimeTurn;
         const toolTitles = new Map<string, string>();
         for await (const event of turn.events) {
+          // Every event the relay pulls off the turn is a progress signal,
+          // whatever its type: it proves the turn is still live.
+          lastTurnProgressAtMs = now();
           if (event.type === "text_delta" && event.stream !== "thought") {
             currentOutputChunk.push(event.text);
           } else if (event.type === "tool_call" && event.tag !== "tool_call_update") {
@@ -4207,6 +4220,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (input.kind === "terminal") {
         const terminal = input.terminal;
         const timedOut = input.timedOut;
+        // Read the terminal-reached time as close to the terminal boundary as
+        // possible, before any of the teardown work below can add its own
+        // delay to the measurement.
+        const terminalReachedAtMs = now();
         // Read the sandbox duplex control-channel disposition at the ACP
         // terminal-finalization boundary, before the bridge teardown. A control
         // channel that died mid-turn latches a failure with a typed loss reason;
@@ -4364,6 +4381,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           turnPhaseStart,
           turnSucceeded ? "ok" : "failed",
         );
+        // The last-progress-to-terminal diagnostic: every turn that reaches
+        // this terminal, whatever its outcome, reports how long it stayed
+        // silent before it finished.
+        await emitLastProgressToTerminalDiagnostic(ctx, terminalReachedAtMs - lastTurnProgressAtMs);
         // Return the typed turn completion so the coordinator settles for the right
         // cause. The completion carries no live resources; the settlement claims the
         // ledger and owns the release. A clean completed turn carries no cause, so
@@ -4755,13 +4776,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           releaseAndReport();
         }
       }
-      // The last-progress-to-terminal diagnostic: only on a latched duplex
-      // loss, and only after every settlement step above (including a bounded
-      // sync-back) has returned. It reports how long teardown took once the
-      // run's outcome was already known, off the same fire-and-forget pattern
-      // as the phase timing above.
+      // The duplex-loss teardown-duration diagnostic: only on a latched
+      // duplex loss, and only after every settlement step above (including a
+      // bounded sync-back) has returned. It reports how long teardown took
+      // once the run's outcome was already known, off the same
+      // fire-and-forget pattern as the phase timing above.
       if (lossDetectedAtMs !== null) {
-        void emitLastProgressToTerminalDiagnostic(ctx, now() - lossDetectedAtMs);
+        void emitDuplexLossTeardownDurationDiagnostic(ctx, now() - lossDetectedAtMs);
       }
     }
   };

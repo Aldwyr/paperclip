@@ -662,11 +662,11 @@ Keep every dimension low-cardinality and free of user content.
 
 ## Run Lifecycle Phase Timing
 
-This section documents two run-log events the ACPX run engine emits: one
-per-phase timing event, and one teardown diagnostic. Both ride the existing
-run-events bridge (`ctx.onEvent`), not OpenTelemetry and not Paperclip
-Telemetry. A failure to emit either event never fails the run. The code owner
-is `packages/adapter-utils/src/acpx-engine/startup-timing.ts`.
+This section documents three run-log events the ACPX run engine emits: one
+per-phase timing event, and two diagnostic events. All three ride the
+existing run-events bridge (`ctx.onEvent`), not OpenTelemetry and not
+Paperclip Telemetry. A failure to emit any event never fails the run. The
+code owner is `packages/adapter-utils/src/acpx-engine/startup-timing.ts`.
 
 ### `run.phase.timing`
 
@@ -692,6 +692,20 @@ run's own overall adapter execution timeout fired, never a single settlement
 step's deadline.
 
 ### `run.last_progress_to_terminal`
+
+One diagnostic event, emitted for every turn that reaches a terminal state —
+whether the turn completes, fails, is cancelled, or times out, and whether or
+not the duplex control channel later latches a loss. The payload is a closed
+shape: exactly `durationMs` — the elapsed time between the turn's last
+progress signal (the most recent event the engine relayed from the turn, or
+the turn start if it relayed none) and the moment the turn reaches its
+terminal state. It answers one question: how long did the run stay silent
+before it finished. A non-finite or a negative duration is an invalid
+measurement and is dropped, so this emits nothing on that input. The payload
+never carries progress text, a timestamp, a path, a session handle, provider
+error text, or any other identifier.
+
+### `run.duplex_loss_teardown_duration`
 
 One diagnostic event, emitted only on a run whose duplex control channel
 latched a loss. The payload is a closed shape: exactly `durationMs` — the

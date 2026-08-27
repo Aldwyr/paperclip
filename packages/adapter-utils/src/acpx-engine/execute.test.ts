@@ -6261,4 +6261,83 @@ describe("ACPX engine sandbox bridge run-disposition seam (fail-closed)", () => 
     // adapter execution timeout itself fired may set that flag.
     expect(result.timedOut).toBe(false);
   });
+
+  it("measures the exact gap between the turn's last progress event and its terminal", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    let currentNow = 0;
+    let resolveEventsDone!: () => void;
+    const eventsDone = new Promise<void>((resolve) => {
+      resolveEventsDone = resolve;
+    });
+    // The turn emits one event, then stays silent for 58 minutes before its
+    // terminal arrives — the same shape as the incident this diagnostic
+    // exists to catch, with a healthy duplex channel throughout.
+    const runtime = {
+      ensureSession: async () => ({
+        backendSessionId: "backend-session",
+        agentSessionId: "agent-session",
+        runtimeSessionName: "runtime-session",
+      }),
+      startTurn: () => ({
+        events: (async function* () {
+          currentNow = 1_000;
+          yield { type: "text_delta", stream: "assistant" as const, text: "hi" };
+          resolveEventsDone();
+        })(),
+        result: eventsDone.then(() => {
+          currentNow = 1_000 + 58 * 60_000;
+          return { status: "completed" as const, stopReason: "end_turn" };
+        }),
+        cancel: async () => {},
+      }),
+      setConfigOption: async () => {},
+      close: async () => {},
+    };
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    const result = await runRemote(fake.handle, runtime, sandbox, {
+      deps: { now: () => currentNow },
+      ctx: { onEvent: async (event) => void events.push(event) },
+    });
+
+    expect(result.exitCode).toBe(0);
+    const progressEvent = events.find((event) => event.eventType === "run.last_progress_to_terminal");
+    expect(progressEvent?.payload).toEqual({ durationMs: 58 * 60_000 });
+  });
+
+  it("emits the last-progress-to-terminal event on a healthy completion, and no teardown-duration event", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const runtime = runtimeWithControlledResult();
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    await runRemote(fake.handle, runtime, sandbox, {
+      ctx: { onEvent: async (event) => void events.push(event) },
+    });
+
+    const progressEvent = events.find((event) => event.eventType === "run.last_progress_to_terminal");
+    const teardownEvent = events.find((event) => event.eventType === "run.duplex_loss_teardown_duration");
+    expect(progressEvent).toBeDefined();
+    expect(typeof progressEvent?.payload?.durationMs).toBe("number");
+    expect(teardownEvent).toBeUndefined();
+  });
+
+  it("emits both the last-progress-to-terminal event and the teardown-duration event on a latched loss", async () => {
+    const sandbox = await setupRemoteSandbox();
+    const fake = createFakeBridgeHandle();
+    const runtime = runtimeWithControlledResult(() => fake.emitLoss("provider_exit"));
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+
+    await runRemote(fake.handle, runtime, sandbox, {
+      ctx: { onEvent: async (event) => void events.push(event) },
+    });
+
+    const progressEvent = events.find((event) => event.eventType === "run.last_progress_to_terminal");
+    const teardownEvent = events.find((event) => event.eventType === "run.duplex_loss_teardown_duration");
+    expect(progressEvent).toBeDefined();
+    expect(typeof progressEvent?.payload?.durationMs).toBe("number");
+    expect(teardownEvent).toBeDefined();
+    expect(typeof teardownEvent?.payload?.durationMs).toBe("number");
+  });
 });
