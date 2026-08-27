@@ -287,6 +287,27 @@ describeEmbeddedPostgres("heartbeat teardown terminalizes the run before releasi
       .then((rows) => rows.length);
     expect(eventCount).toBe(0);
   });
+
+  // A timed-out run also releases its environment lease in the run-end
+  // teardown `finally`, the same as a failed run. This is the durable bound
+  // an abandoned healthy-close leans on: the sandbox and every process
+  // inside it go away here, whether or not the abandoned close ever answers.
+  it("threads a timed-out run's status through unchanged and maps it to a failed lease release", async () => {
+    const { companyId, agentId, runId } = await seed({ issueStatus: "done", runStatus: "timed_out" });
+
+    const observed = await runTeardownSequenceObservingRelease({ runId, companyId, agentId });
+
+    expect(observed.statusBeforeTerminalize).toBe("timed_out");
+    expect(observed.statusThreadedToRelease).toBe("timed_out");
+    expect(observed.dbStatusAtRelease).toBe("timed_out");
+
+    // A timed-out run maps to a failed lease release at the orchestrator, the
+    // same as a failed run: the lease release still runs, but the reaper
+    // treats the sandbox as needing cleanup rather than a clean hand-back.
+    expect(observed.releaseCallCount).toBe(1);
+    expect(observed.orchestratorObservedRunId).toBe(runId);
+    expect(observed.orchestratorObservedLeaseStatus).toBe("failed");
+  });
 });
 
 // Pin the real run-status → lease-release-status mapping the teardown threads

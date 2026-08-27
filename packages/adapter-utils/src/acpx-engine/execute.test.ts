@@ -31,12 +31,10 @@ import {
   findAncestorBin,
   geminiVersionSupportsNativeAcpFlag,
   parseGeminiVersionParts,
-  reapAbandonedSessionCloses,
   referencedSourceContentSignature,
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
-  type PendingSessionClose,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
@@ -6473,106 +6471,4 @@ describe("ACPX engine healthy teardown close deadline", () => {
     expect(warmHandles.size).toBe(0);
   });
 
-  it("records a real abandoned close in the pending map, then lets a later sweep remove it once the close genuinely settles", async () => {
-    const root = await makeTempRoot();
-    const stateDir = path.join(root, "state");
-    // An isolated map, not the module-level default: this proves `execute`
-    // itself writes the entry (the producer half), not a hand-built one.
-    const pendingSessionCloses = new Map<string, PendingSessionClose>();
-    let closeCalls = 0;
-    let resolveClose!: () => void;
-    const closeSettle = new Promise<void>((resolve) => {
-      resolveClose = resolve;
-    });
-    const execute = createAcpxEngineExecutor({
-      warmHandles: new Map(),
-      healthyEndSessionDeadlineMs: 20,
-      pendingSessionCloses,
-      createRuntime: () =>
-        ({
-          ensureSession: async () => ({
-            backendSessionId: "backend-session",
-            agentSessionId: "agent-session",
-            runtimeSessionName: "runtime-session",
-          }),
-          startTurn: () => ({
-            events: (async function* () {})(),
-            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
-            cancel: async () => {},
-          }),
-          setConfigOption: async () => {},
-          // A healthy peer whose close answers only once the test resolves
-          // it, well after this run's own short deadline fires.
-          close: async () => {
-            closeCalls += 1;
-            await closeSettle;
-          },
-        }) as never,
-    });
-
-    const result = await execute({
-      runId: "abandoned-close-bookkeeping",
-      agent: { id: "agent-1", companyId: "company-1" },
-      runtime: {},
-      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
-      context: {},
-      onLog: async () => {},
-      onMeta: async () => {},
-      onEvent: async () => {},
-    } as never);
-
-    expect(result.exitCode).toBe(0);
-    expect(closeCalls).toBe(1);
-
-    // The producer half: `execute`'s own deadline abandoned the close and
-    // wrote the entry through `recordAbandonedSessionClose`. The test never
-    // touches the map directly.
-    expect(pendingSessionCloses.size).toBe(1);
-    const [[sessionKey, entry]] = [...pendingSessionCloses.entries()];
-    expect(entry.sessionKey).toBe(sessionKey);
-    expect(entry.settled).toBe(false);
-
-    // Let the real close settle. `entry.settled` must flip through the
-    // engine's own `.then` handler, not through a hand-set flag.
-    resolveClose();
-    await entry.settle;
-    expect(entry.settled).toBe(true);
-
-    // The consumer half, driven by the same map: the sweep removes the entry
-    // now that it has genuinely settled.
-    reapAbandonedSessionCloses(pendingSessionCloses);
-    expect(pendingSessionCloses.has(sessionKey)).toBe(false);
-    expect(pendingSessionCloses.size).toBe(0);
-  });
-});
-
-describe("reapAbandonedSessionCloses", () => {
-  it("removes an entry once its abandoned close settles, and is safe to run twice", async () => {
-    const pending = new Map<string, PendingSessionClose>();
-    let resolveClose!: () => void;
-    const settle = new Promise<void>((resolve) => {
-      resolveClose = resolve;
-    });
-    const entry: PendingSessionClose = { sessionKey: "session-1", settle, settled: false };
-    pending.set("session-1", entry);
-    settle.then(() => {
-      entry.settled = true;
-    });
-
-    // The original close is still in flight: the sweep must not remove it,
-    // and it must not wait on it either.
-    reapAbandonedSessionCloses(pending);
-    expect(pending.has("session-1")).toBe(true);
-
-    resolveClose();
-    await settle;
-    // The original close settled in the background: the next sweep reconciles it.
-    reapAbandonedSessionCloses(pending);
-    expect(pending.has("session-1")).toBe(false);
-
-    // Running the sweep again for the same (already-removed) key is a no-op,
-    // not an error and not a second removal of anything.
-    expect(() => reapAbandonedSessionCloses(pending)).not.toThrow();
-    expect(pending.size).toBe(0);
-  });
 });

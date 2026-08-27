@@ -694,22 +694,38 @@ carry their own deadline today:
   an otherwise healthy channel can still hold the close open for hours. This
   step's own deadline is separate from, and much shorter than, that execution
   timeout. The close call itself is never cancelled on a timeout: the engine
-  keeps an in-process record of it, and a later run's startup sweep clears
-  that record once the close settles. The sweep never waits on a
-  still-running close.
+  stops waiting and moves on, but it keeps no record of the abandoned close.
+  No in-process mechanism tracks it and no later sweep in this engine reaps
+  it.
 
-  The record is bookkeeping only. No other part of the engine reads it, and
-  the engine never starts a second close for the same session.
+  The real bound on an abandoned close is not in this engine. It comes from
+  the sandbox lease the run holds, through three layers:
 
-  On a run against a remote sandbox, one settlement step runs right after
-  `end_session`. That step stops the same host-to-sandbox channel the
-  abandoned close needs to carry its answer back. So the abandoned close
-  loses its channel soon after the deadline fires, and its record can then
-  stay in place for a long time, because the close may never truly finish.
+  1. **The run-end environment-lease release.** Every run releases its
+     environment lease in a `finally` clause at the end of run teardown,
+     regardless of outcome — a failed or timed-out run releases its lease the
+     same as a succeeded one. That release destroys the sandbox the abandoned
+     close was talking to, and with it every process inside the sandbox,
+     including the stuck remote peer the close was waiting on.
+  2. **The durable `pending_cleanup` lease row.** If the sandbox destroy
+     itself fails, or the provider's worker process is not running to answer
+     it, the lease lands in a durable, server-owned `pending_cleanup` row.
+     This row survives a host restart. A sweep retries it both at server boot
+     and on a recurring schedule, until the destroy succeeds.
+  3. **The sandbox provider's own auto-stop, auto-archive, and auto-delete
+     intervals.** Every sandbox carries these intervals from the moment it is
+     created. They reclaim the sandbox on the provider's own side even when
+     every host-side cleanup step above fails or never runs.
 
-  On a run against a local process, no such channel exists. The abandoned
-  close keeps running against the same local process, unaffected by
-  settlement, and can finish and clear its own record later.
+  On a run against a local process, no sandbox and no duplex channel exist.
+  The abandoned close keeps running against the real local process,
+  unaffected by settlement, and finishes on its own.
+
+  One lease policy is a deliberate exception to layer 1: a lease with the
+  `retain_on_failure` policy on a failed run becomes `retained`, not
+  `pending_cleanup`, so the reaper never destroys it — the policy keeps that
+  sandbox alive on purpose, for reuse. On that path, an abandoned close's
+  remote process is bounded only by the provider's own intervals (layer 3).
 
 A `timed_out` step outcome is independent of `resultJson.timeoutFired` on the
 run record: that flag reflects only a trusted, typed host signal that the

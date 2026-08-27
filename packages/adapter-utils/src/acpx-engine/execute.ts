@@ -354,13 +354,6 @@ export interface AcpxEngineExecutorOptions {
    * timeout path without a real wait.
    */
   healthyEndSessionDeadlineMs?: number;
-  /**
-   * The healthy remote closes a deadline abandoned mid-flight, keyed by
-   * `sessionKey`. `reapAbandonedSessionCloses` reconciles an entry once its
-   * original close call actually settles. Defaults to a shared module-level
-   * map; tests pass an isolated map.
-   */
-  pendingSessionCloses?: Map<string, PendingSessionClose>;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -2456,73 +2449,20 @@ async function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promi
 // (see `RuntimeSettlementPlan.skipRemoteClose` above), so a slow or stuck peer
 // on an otherwise live channel can still hold the close open for hours. This
 // deadline gives the healthy close its own, much shorter bound, separate from
-// the execution timeout. A close that passes this deadline is never
-// cancelled: `recordAbandonedSessionClose` tracks it, and
-// `reapAbandonedSessionCloses` clears the record once the close settles.
+// the execution timeout.
 //
-// That record is bookkeeping only. No other code reads it, and the engine
-// never re-issues the close. On a run against a remote sandbox,
-// `stopRunTransport` runs right after this step and stops the same
-// host-to-sandbox channel the abandoned close needs to carry its answer
-// back, so on that lane the close has already lost its only path to a real
-// answer once this deadline fires, and its record may stay for a long time.
-// On a run against a local process, no such channel exists, so the abandoned
-// close keeps running against the real local process, unaffected by
-// settlement, and can finish and clear its own record on its own.
+// A close that passes this deadline is abandoned: this engine stops waiting
+// on it and moves on, but it never cancels the underlying close call, and
+// this process keeps no record of it. The bound on that abandoned close does
+// not live here. The run's own environment-lease release (a `finally` on
+// every run, regardless of outcome) destroys the sandbox and every process
+// inside it; a release that fails lands a durable, server-owned
+// `pending_cleanup` lease row that a boot-time and scheduled sweep retries;
+// and the sandbox provider's own auto-stop, auto-archive, and auto-delete
+// intervals, set at sandbox creation, bound the resource even if every
+// host-side cleanup step fails or never runs. See `doc/observability.md` for
+// the full chain.
 const HEALTHY_END_SESSION_DEADLINE_MS = 30_000;
-
-/**
- * One session's healthy remote close that a deadline abandoned mid-flight.
- * `settle` is the ORIGINAL close call, still running in the background: it has
- * no cancellation hook, so this only tracks it, never re-issues it.
- */
-export interface PendingSessionClose {
-  readonly sessionKey: string;
-  readonly settle: Promise<unknown>;
-  settled: boolean;
-}
-
-const defaultPendingSessionCloses = new Map<string, PendingSessionClose>();
-
-/**
- * Record a healthy close a deadline abandoned, so a later sweep can finish the
- * bookkeeping once the real close settles. A second abandoned close for the
- * same session key (a later run) replaces the earlier entry — this engine
- * process holds at most one runtime per session key at a time, so only the
- * newest abandoned close is worth tracking.
- */
-function recordAbandonedSessionClose(
-  pending: Map<string, PendingSessionClose>,
-  sessionKey: string,
-  settle: Promise<unknown>,
-): void {
-  const entry: PendingSessionClose = { sessionKey, settle, settled: false };
-  pending.set(sessionKey, entry);
-  settle.then(
-    () => {
-      entry.settled = true;
-    },
-    () => {
-      entry.settled = true;
-    },
-  );
-}
-
-/**
- * Reconcile the pending-close map: drop every entry whose original close call
- * has actually settled by now. This never waits on a still-running close — it
- * only reads the `settled` flag `recordAbandonedSessionClose` arms, so it never
- * reintroduces the unbounded wait the deadline exists to avoid. Idempotent: a
- * second call for the same key finds either an unsettled entry (no-op, left in
- * place) or no entry at all (the first call already removed it), so it never
- * double-removes or double-reports.
- */
-export function reapAbandonedSessionCloses(pending: Map<string, PendingSessionClose>): void {
-  for (const [key, entry] of pending.entries()) {
-    if (!entry.settled) continue;
-    if (pending.get(key) === entry) pending.delete(key);
-  }
-}
 
 /** How the settlement `endSession` step releases the runtime a run acquired. */
 interface RuntimeSettlementPlan {
@@ -3450,7 +3390,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     deps.channelLostSyncBackDeadlineMs ?? CHANNEL_LOST_SYNC_BACK_DEADLINE_MS;
   const healthyEndSessionDeadlineMs =
     deps.healthyEndSessionDeadlineMs ?? HEALTHY_END_SESSION_DEADLINE_MS;
-  const pendingSessionCloses = deps.pendingSessionCloses ?? defaultPendingSessionCloses;
   const warmHandles = deps.warmHandles ?? defaultWarmHandles;
   const stagedRuntimes = deps.stagedRuntimes ?? defaultStagedRuntimes;
   const stagingLocks = deps.stagingLocks ?? defaultStagingLocks;
@@ -3575,10 +3514,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         now,
         idleMs: warmIdleMs,
       });
-      // Reconcile any healthy close a prior run's deadline abandoned. This never
-      // waits on a still-running close (see `reapAbandonedSessionCloses`), so it
-      // adds no wait to this run's own startup.
-      reapAbandonedSessionCloses(pendingSessionCloses);
       // The sum of the step wall times. The root span records it as `root.work_ms`
       // and the difference from its own wall time as `root.diff_ms` (the overlap
       // the parallel steps saved). Every step reports its wall time through
@@ -4686,9 +4621,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // peer can still leave the remote close unanswered. Bound the wait
           // on this engine's own short deadline, separate from the adapter
           // execution timeout the vendored runtime's internal bound reuses
-          // (see `HEALTHY_END_SESSION_DEADLINE_MS`). The close itself is never
-          // cancelled on a timeout — only this wait is bounded — so a later
-          // sweep can still reconcile it once it actually settles.
+          // (see `HEALTHY_END_SESSION_DEADLINE_MS`). The close itself is
+          // never cancelled on a timeout — only this wait is bounded — and
+          // this process keeps no record of the abandoned close. The run's
+          // own environment-lease release bounds it instead; see
+          // `HEALTHY_END_SESSION_DEADLINE_MS` above.
           if (
             settlement.mode === "warm_or_close" &&
             warmHandleMatches(existing, runtime, settlement.handle) &&
@@ -4708,7 +4645,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               healthyEndSessionDeadlineMs,
             );
             if (raced.kind === "timed_out") {
-              recordAbandonedSessionClose(pendingSessionCloses, prepared.sessionKey, raced.settle);
               return "timed_out";
             }
             return "ok";
@@ -4727,9 +4663,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 .catch(onCloseError),
             healthyEndSessionDeadlineMs,
           );
-          if (raced.kind === "timed_out") {
-            recordAbandonedSessionClose(pendingSessionCloses, prepared.sessionKey, raced.settle);
-          }
           if (settlement.dropWarmEntry && warmHandleMatches(existing, runtime, settlement.handle) && existing) {
             clearWarmHandleTimer(existing);
             warmHandles.delete(prepared.sessionKey);
