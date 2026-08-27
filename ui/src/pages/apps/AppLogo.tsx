@@ -23,16 +23,17 @@ interface AppLogoProps {
   name: string;
   brandKey?: string | null;
   logoUrl?: string | null;
+  darkLogoUrl?: string | null;
   size?: number;
   className?: string;
 }
 
 /**
  * App icon for the gallery and connected-apps surfaces. Renders the manifest
- * favicon when available, falling back to a coloured letter tile (deterministic
- * colour per app name) when the image is missing or fails to load.
+ * official local provider mark when available, including a dark-mode variant.
+ * The deterministic letter tile is reserved for runtime image failures.
  */
-export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLogoProps) {
+export function AppLogo({ name, brandKey, logoUrl, darkLogoUrl, size = 36, className }: AppLogoProps) {
   const [failed, setFailed] = useState(false);
   const lookupKey = brandKey?.trim() || name;
   const [localAssetResult, setLocalAssetResult] = useState<{
@@ -47,6 +48,7 @@ export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLo
   // chance to resolve this provider. Otherwise the browser requests the
   // remote asset during the first render even when a bundled mark exists.
   const resolvedLogoUrl = localLookupComplete ? localAssets?.light ?? logoUrl : null;
+  const resolvedDarkLogoUrl = localLookupComplete ? localAssets?.dark ?? darkLogoUrl : null;
 
   useEffect(() => {
     let active = true;
@@ -64,7 +66,7 @@ export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLo
 
   useEffect(() => {
     setFailed(false);
-  }, [resolvedLogoUrl, localAssets?.dark]);
+  }, [resolvedDarkLogoUrl, resolvedLogoUrl]);
 
   if (resolvedLogoUrl && !failed) {
     return (
@@ -72,22 +74,22 @@ export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLo
         className={cn("inline-flex shrink-0 items-center justify-center overflow-hidden rounded-lg bg-muted", className)}
         style={dimension}
       >
-        {localAssets?.dark ? (
+        {resolvedDarkLogoUrl ? (
           <>
             <img
               src={resolvedLogoUrl}
               alt=""
               width={size}
               height={size}
-              className="h-full w-full object-contain dark:hidden"
+              className="h-full w-full object-contain p-1.5 dark:hidden"
               onError={() => setFailed(true)}
             />
             <img
-              src={localAssets.dark}
+              src={resolvedDarkLogoUrl}
               alt=""
               width={size}
               height={size}
-              className="hidden h-full w-full object-contain dark:block"
+              className="hidden h-full w-full object-contain p-1.5 dark:block"
               onError={() => setFailed(true)}
             />
           </>
@@ -97,7 +99,7 @@ export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLo
             alt=""
             width={size}
             height={size}
-            className="h-full w-full object-contain"
+            className="h-full w-full object-contain p-1.5"
             onError={() => setFailed(true)}
           />
         )}
@@ -108,11 +110,11 @@ export function AppLogo({ name, brandKey, logoUrl, size = 36, className }: AppLo
   return (
     <span
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-lg font-bold text-white",
+        "inline-flex shrink-0 items-center justify-center rounded-lg text-sm font-bold text-white",
         colorFor(name),
         className,
       )}
-      style={{ ...dimension, fontSize: Math.round(size * 0.42) }}
+      style={dimension}
       aria-hidden="true"
     >
       {letter}
