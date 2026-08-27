@@ -19,6 +19,21 @@ export function normalizedSecrets(values: readonly (string | undefined)[]) {
   ].sort((left, right) => right.length - left.length);
 }
 
+export function isEphemeralCodexRuntimeAuthFile(
+  paperclipHome: string,
+  file: string,
+) {
+  const relative = path.relative(paperclipHome, file).split(path.sep).join("/");
+  return (
+    /^instances\/[^/]+\/companies\/[^/]+\/agents\/[^/]+\/codex-home\/auth\.json$/.test(
+      relative,
+    ) ||
+    /^instances\/[^/]+\/runtime\/paperclip-runner\/durable-sessions\/[^/]+\/codex-home\/auth\.json$/.test(
+      relative,
+    )
+  );
+}
+
 export function redactText(value: string, secrets: readonly string[]) {
   let redacted = redactDiagnosticText(value, "[REDACTED]");
   return redactKnownSecretsAndShapes(redacted, secrets);

@@ -17,6 +17,7 @@ import {
   findSecretLeak,
   findSecretLeakInJsonValues,
   findSecretLeakInDirectory,
+  isEphemeralCodexRuntimeAuthFile,
   redactText,
   sanitizeJson,
 } from "./redaction.js";
@@ -481,6 +482,43 @@ describe("runner E2E evidence redaction", () => {
         ignoreFile: (file) => file === runtimeAuth,
       }),
     ).resolves.toMatchObject({ file: forbiddenConfig });
+  });
+
+  it("recognizes both managed and durable-session Codex runtime auth files", () => {
+    const root = path.join(os.tmpdir(), "paperclip-home");
+    expect(
+      isEphemeralCodexRuntimeAuthFile(
+        root,
+        path.join(
+          root,
+          "instances/instance-1/companies/company-1/agents/agent-1/codex-home/auth.json",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isEphemeralCodexRuntimeAuthFile(
+        root,
+        path.join(
+          root,
+          "instances/instance-1/runtime/paperclip-runner/durable-sessions/session-1/codex-home/auth.json",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      isEphemeralCodexRuntimeAuthFile(
+        root,
+        path.join(root, "instances/instance-1/runtime/auth.json"),
+      ),
+    ).toBe(false);
+    expect(
+      isEphemeralCodexRuntimeAuthFile(
+        root,
+        path.join(
+          root,
+          "instances/instance-1/runtime/paperclip-runner/durable-sessions/session-1/codex-home/config.toml",
+        ),
+      ),
+    ).toBe(false);
   });
 
   it("publishes only allowlisted sanitized files and reports source leaks", async () => {

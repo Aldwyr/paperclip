@@ -25,6 +25,7 @@ import { assertEmbeddedDatabaseIsolation } from "./instance-isolation.js";
 import {
   assertSecretFree,
   findSecretLeakInDirectory,
+  isEphemeralCodexRuntimeAuthFile,
   normalizedSecrets,
   sanitizeJson,
 } from "./redaction.js";
@@ -519,15 +520,9 @@ async function runAttempt(input: {
             ignoreFile: (file) => expectedEphemeralCredentials.has(file),
           });
           if (!leak) break;
-          const relative = path
-            .relative(paperclipHome, leak.file)
-            .split(path.sep)
-            .join("/");
           const isManagedCodexRuntimeAuth =
             label === "Paperclip home" &&
-            /^instances\/[^/]+\/companies\/[^/]+\/agents\/[^/]+\/codex-home\/auth\.json$/.test(
-              relative,
-            );
+            isEphemeralCodexRuntimeAuthFile(paperclipHome, leak.file);
           if (isManagedCodexRuntimeAuth) {
             const metadata = await lstat(leak.file);
             if (metadata.isFile() && (metadata.mode & 0o777) === 0o600) {
