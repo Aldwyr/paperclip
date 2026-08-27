@@ -72,3 +72,4 @@ tests/storybook-visual/playwright-report/
 .herenow
 .vercel/
 .env.local
+test-results/
