@@ -106,6 +106,25 @@ describe("runtime context materialization", () => {
     }
   });
 
+  it("materializes a configured API key into the isolated Codex home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-runtime-context-api-key-"));
+    roots.push(root);
+    const sourceCodexHome = join(root, "source-codex-home");
+    const codexHome = join(root, "codex-home");
+    await mkdir(sourceCodexHome, { recursive: true });
+    await writeFile(join(sourceCodexHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "host-key-must-not-win" }), { mode: 0o600 });
+
+    await prepareIsolatedCodexHome({
+      context: null,
+      codexHome,
+      sourceCodexHome,
+      apiKey: "configured-agent-key",
+    });
+
+    await expect(readFile(join(codexHome, "auth.json"), "utf8")).resolves.toBe(JSON.stringify({ OPENAI_API_KEY: "configured-agent-key" }));
+    expect((await stat(join(codexHome, "auth.json"))).mode & 0o777).toBe(0o600);
+  });
+
   it("reconciles changed and empty assignments without following unexpected symlinks", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-runtime-context-reconcile-"));
     roots.push(root);

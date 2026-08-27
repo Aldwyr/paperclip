@@ -253,7 +253,7 @@ function normalizePlanMarkdown(body: string | null | undefined) {
   return (body ?? "").replaceAll("\\_", "_");
 }
 
-function renderedPlanMarkerPattern(marker: string) {
+function renderedMarkerPattern(marker: string) {
   return new RegExp(
     marker
       .split("_")
@@ -496,7 +496,7 @@ for (const execution of executions) {
         await expect(
           page
             .getByTestId("task-chat-plan-preview")
-            .filter({ hasText: renderedPlanMarkerPattern(planMarkers.draft) })
+            .filter({ hasText: renderedMarkerPattern(planMarkers.draft) })
             .last(),
         ).toBeVisible({ timeout: 30_000 });
         await captureScreenshot(
@@ -580,7 +580,7 @@ for (const execution of executions) {
           page
             .getByTestId("task-chat-plan-preview")
             .filter({
-              hasText: renderedPlanMarkerPattern(planMarkers.revised),
+              hasText: renderedMarkerPattern(planMarkers.revised),
             })
             .last(),
         ).toBeVisible({ timeout: 30_000 });
@@ -854,7 +854,7 @@ for (const execution of executions) {
         page
           .getByTestId("task-chat-thread")
           .getByTestId("task-chat-agent-bubble")
-          .filter({ hasText: marker })
+          .filter({ hasText: renderedMarkerPattern(marker) })
           .last(),
       ).toBeVisible({ timeout: 30_000 });
       await expect(

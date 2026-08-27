@@ -51,7 +51,7 @@ export async function materializeNativeRuntimeSkills(context: NativeRuntimeConte
   }
 }
 
-export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeContextSnapshot | null; codexHome: string; sourceCodexHome?: string | null; nativeMcp?: NativeMcpLaunchBinding | null }): Promise<void> {
+export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeContextSnapshot | null; codexHome: string; sourceCodexHome?: string | null; nativeMcp?: NativeMcpLaunchBinding | null; apiKey?: string | null }): Promise<void> {
   await mkdir(input.codexHome, { recursive: true, mode: 0o700 });
   await chmod(input.codexHome, 0o700);
   await materializeNativeRuntimeSkills(input.context, join(input.codexHome, "skills"));
@@ -63,6 +63,19 @@ export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeCo
       `http_headers = { Authorization = ${JSON.stringify(`Bearer ${input.nativeMcp.token}`)} }`,
       "",
     ].join("\n"), { mode: 0o600 });
+  }
+  const apiKey = input.apiKey;
+  if (apiKey?.trim()) {
+    // Codex app-server intentionally receives a small allowlisted process
+    // environment and does not inherit OPENAI_API_KEY. Materialize an
+    // API-key-only credential in the per-session Codex home instead. That
+    // home is excluded from durable backup credentials and removed with the
+    // isolated runner state.
+    const target = join(input.codexHome, "auth.json");
+    await rm(target, { force: true });
+    await writeFile(target, JSON.stringify({ OPENAI_API_KEY: apiKey }), { mode: 0o600 });
+    await chmod(target, 0o600);
+    return;
   }
   const sourceHome = input.sourceCodexHome?.trim();
   if (!sourceHome) return;
