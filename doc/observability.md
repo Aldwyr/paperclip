@@ -713,9 +713,12 @@ carry their own deadline today:
      This row survives a host restart. A sweep retries it both at server boot
      and on a recurring schedule, until the destroy succeeds.
   3. **The sandbox provider's own auto-stop, auto-archive, and auto-delete
-     intervals.** Every sandbox carries these intervals from the moment it is
-     created. They reclaim the sandbox on the provider's own side even when
-     every host-side cleanup step above fails or never runs.
+     intervals.** The provider applies these intervals from its own
+     configuration. The default configuration sets all three intervals, so a
+     sandbox under the default configuration is bounded on the provider's own
+     side even when every host-side cleanup step above fails or never runs. An
+     operator can disable one or more of these intervals in the
+     configuration, and a disabled interval gives no such bound.
 
   On a run against a local process, no sandbox and no duplex channel exist.
   The abandoned close keeps running against the real local process,
@@ -724,8 +727,10 @@ carry their own deadline today:
   One lease policy is a deliberate exception to layer 1: a lease with the
   `retain_on_failure` policy on a failed run becomes `retained`, not
   `pending_cleanup`, so the reaper never destroys it — the policy keeps that
-  sandbox alive on purpose, for reuse. On that path, an abandoned close's
-  remote process is bounded only by the provider's own intervals (layer 3).
+  sandbox alive on purpose, for reuse. On that path, the provider's own
+  intervals (layer 3) are the only remaining bound on an abandoned close's
+  remote process. If the sandbox's configuration disables those intervals,
+  the retained sandbox has no automatic bound at all.
 
 A `timed_out` step outcome is independent of `resultJson.timeoutFired` on the
 run record: that flag reflects only a trusted, typed host signal that the
