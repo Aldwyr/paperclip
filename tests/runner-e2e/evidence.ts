@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   mkdir,
   readFile,
@@ -80,19 +80,48 @@ function isAllowed(relative: string) {
   return ALLOWED_DIRECTORIES.has(segments[0]);
 }
 
-function inspectZip(source: string, secrets: readonly string[]) {
-  try {
-    const expanded = execFileSync("unzip", ["-p", source], {
-      maxBuffer: 256 * 1024 * 1024,
+async function inspectZip(source: string, secrets: readonly string[]) {
+  // Failure traces can exceed Node's child-process output buffer. Stream the
+  // expanded archive through the exact-value scanner with enough overlap to
+  // detect a credential split across stdout chunks, without retaining the
+  // archive in memory or weakening fail-closed evidence publication.
+  const overlap = Math.max(
+    256,
+    ...secrets.map((secret) => Buffer.byteLength(secret, "utf8") + 16),
+  );
+  return new Promise<string | null>((resolve) => {
+    const unzip = spawn("unzip", ["-p", source], {
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    // Traces include loaded application source and therefore deliberate fake
-    // provider-key fixtures. ZIPs cannot be safely rewritten, so admit them
-    // only after exact-value scanning against the credentials loaded for this
-    // campaign; textual snapshots still receive shape scanning and redaction.
-    return findSecretLeak(expanded, secrets, { includeShapes: false });
-  } catch (error) {
-    return `zip could not be inspected: ${error instanceof Error ? error.message : String(error)}`;
-  }
+    let carry = Buffer.alloc(0);
+    let leak: string | null = null;
+    let spawnError: Error | null = null;
+
+    unzip.stdout.on("data", (chunk: Buffer) => {
+      if (leak) return;
+      const data = Buffer.concat([carry, chunk]);
+      leak = findSecretLeak(data, secrets, { includeShapes: false });
+      carry = data.subarray(Math.max(0, data.length - overlap));
+      if (leak) unzip.kill();
+    });
+    // Drain diagnostics so a noisy unzip cannot block. Error text is withheld
+    // because archive paths and contents belong to private attempt evidence.
+    unzip.stderr.resume();
+    unzip.on("error", (error) => {
+      spawnError = error;
+    });
+    unzip.on("close", (code) => {
+      if (leak) return resolve(leak);
+      if (spawnError) {
+        return resolve(`zip could not be inspected: ${spawnError.message}`);
+      }
+      return resolve(
+        code === 0
+          ? null
+          : `zip could not be inspected: unzip exited with code ${String(code)}`,
+      );
+    });
+  });
 }
 
 export async function packageEvidence(input: {
@@ -140,7 +169,7 @@ export async function packageEvidence(input: {
       await writeFile(destination, safe, "utf8");
       files.push(relative);
     } else if (extension === ".zip") {
-      const leak = inspectZip(source, input.secrets);
+      const leak = await inspectZip(source, input.secrets);
       if (leak) {
         leaks.push({ file: relative, reason: leak });
         continue;

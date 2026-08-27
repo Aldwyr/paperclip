@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -278,6 +279,13 @@ describe("runner E2E failure policy", () => {
     expect(
       classifyFailure(
         new Error("Provider request timed out during generation"),
+      ),
+    ).toBe("transient_infrastructure");
+    expect(
+      classifyFailure(
+        new Error(
+          "runner_ingress_unavailable: paperclip-runnerd: cumulative ACK cannot move beyond the produced source cursor",
+        ),
       ),
     ).toBe("transient_infrastructure");
     expect(
@@ -577,6 +585,45 @@ describe("runner E2E evidence redaction", () => {
     );
     expect(() => JSON.parse(uploaded)).not.toThrow();
     expect(uploaded).toContain("[REDACTED]");
+  });
+
+  it("streams large ZIP evidence and detects exact secrets", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "runner-e2e-zip-evidence-test-"),
+    );
+    cleanupDirectories.push(root);
+    const privateDir = path.join(root, "private");
+    const uploadDir = path.join(root, "upload");
+    const blobDir = path.join(privateDir, "blob-report");
+    await mkdir(blobDir, { recursive: true });
+    await writeFile(
+      path.join(blobDir, "trace.txt"),
+      Buffer.concat([
+        Buffer.alloc(2 * 1024 * 1024, "x"),
+        Buffer.from(secret),
+      ]),
+    );
+    execFileSync("zip", ["-q", "report.zip", "trace.txt"], {
+      cwd: blobDir,
+    });
+    await rm(path.join(blobDir, "trace.txt"));
+
+    const packaged = await packageEvidence({
+      privateDir,
+      uploadDir,
+      secrets: [secret],
+      expectPassScreenshot: false,
+    });
+
+    expect(packaged.leaks).toEqual([
+      {
+        file: path.join("blob-report", "report.zip"),
+        reason: "exact secret value",
+      },
+    ]);
+    await expect(
+      readFile(path.join(uploadDir, "blob-report", "report.zip")),
+    ).rejects.toThrow();
   });
 });
 
