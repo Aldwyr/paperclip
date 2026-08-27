@@ -642,6 +642,14 @@ for (const execution of executions) {
           `Expected exactly ${execution.task.expectedRunCount} task heartbeat run(s); observed ${selectedRuns.length}`,
         );
       }
+      // The company run-list endpoint intentionally returns only a compact,
+      // allowlisted context summary. Hydrate each selected run through the
+      // public detail endpoint before asserting environment/lease metadata.
+      selectedRuns = await Promise.all(
+        selectedRuns.map((candidate) =>
+          api.get<RunRecord>(`/api/heartbeat-runs/${candidate.id}`),
+        ),
+      );
       const run =
         selectedRuns.find(
           (candidate) => candidate.id === issue!.executionRunId,
