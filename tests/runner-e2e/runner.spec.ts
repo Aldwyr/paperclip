@@ -312,6 +312,76 @@ for (const execution of executions) {
       screenshots.push({ id, label, file });
     };
 
+    const captureFailureApiState = async () => {
+      if (!fixtures || !issue) return;
+      const capture = async <T,>(operation: () => Promise<T>) =>
+        operation().catch((error) => ({
+          evidenceCaptureError:
+            error instanceof Error ? error.message : String(error),
+        }));
+      const [currentIssue, listedRuns, comments, interactions] =
+        await Promise.all([
+          capture(() => api.get<IssueRecord>(`/api/issues/${issue!.id}`)),
+          capture(() =>
+            api.get<RunRecord[]>(
+              `/api/companies/${fixtures!.company.id}/heartbeat-runs?agentId=${fixtures!.agent.id}&limit=20`,
+            ),
+          ),
+          capture(() =>
+            api.get<CommentRecord[]>(
+              `/api/issues/${issue!.id}/comments?order=asc`,
+            ),
+          ),
+          capture(() =>
+            api.get<InteractionRecord[]>(
+              `/api/issues/${issue!.id}/interactions`,
+            ),
+          ),
+        ]);
+      const taskRuns = Array.isArray(listedRuns)
+        ? matchingRuns(
+            listedRuns,
+            "id" in currentIssue ? currentIssue : issue,
+          )
+        : [];
+      const detailedRuns = await Promise.all(
+        taskRuns.map((candidate) =>
+          capture(() =>
+            api.get<RunRecord>(`/api/heartbeat-runs/${candidate.id}`),
+          ).then((value) => ("id" in value ? value : candidate)),
+        ),
+      );
+      if (detailedRuns.length > 0) selectedRuns = detailedRuns;
+      const runEvidence = await Promise.all(
+        detailedRuns.map(async (candidate) => ({
+          runId: candidate.id,
+          log: await capture(() =>
+            api.get<unknown>(
+              `/api/heartbeat-runs/${candidate.id}/log?limitBytes=1048576`,
+            ),
+          ),
+          events: await capture(() =>
+            api.get<RunEventRecord[]>(
+              `/api/heartbeat-runs/${candidate.id}/events?limit=1000`,
+            ),
+          ),
+        })),
+      );
+      await writeSanitizedJson(
+        snapshotsDir,
+        "api-state.json",
+        {
+          capturePhase: "failure",
+          issue: currentIssue,
+          runs: detailedRuns,
+          comments,
+          interactions,
+          runEvidence,
+        },
+        secrets,
+      );
+    };
+
     page.on("console", (message) => {
       if (["error", "warning"].includes(message.type())) {
         consoleDiagnostics.push({
@@ -890,6 +960,25 @@ for (const execution of executions) {
       }
     } catch (error) {
       primaryError = error;
+      try {
+        await captureFailureApiState();
+      } catch (captureError) {
+        const failureClass = classifyFailure(captureError);
+        if (failureClass === "secret_leak") {
+          failureClassOverride = "secret_leak";
+          primaryError = new AggregateError(
+            [primaryError, captureError],
+            `Failure evidence contained unsafe data: ${captureError instanceof Error ? captureError.message : String(captureError)}`,
+          );
+        } else {
+          networkDiagnostics.push({
+            evidenceCaptureError:
+              captureError instanceof Error
+                ? captureError.message
+                : String(captureError),
+          });
+        }
+      }
       if (!page.isClosed()) {
         const failureScreenshot = path.join(privateDir, "failure.png");
         await page
