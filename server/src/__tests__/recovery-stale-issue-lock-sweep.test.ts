@@ -11,11 +11,45 @@ import {
   issueComments,
   issueRelations,
   issues,
+  runCredentialRevocations,
 } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { isRunScopedCredentialRevoked } from "../services/run-credential-revocation.js";
+
+// Wraps a real drizzle `Db` and makes the first `failures` inserts into
+// `runCredentialRevocations` reject, then lets every later call (on that
+// table or any other) go through untouched. This forces the durable
+// revocation write inside `terminalizeOrphanedRunningRun` to fail the way a
+// transient database fault would, so a test can prove the stale-run sweep
+// reacts to exactly that failure and recovers once the write starts landing
+// again.
+function withFailingRevocationInsert(realDb: Db, failures: number): Db {
+  let remaining = failures;
+  return new Proxy(realDb, {
+    get(target, prop, receiver) {
+      if (prop === "insert") {
+        return (table: unknown) => {
+          if (table === runCredentialRevocations && remaining > 0) {
+            remaining -= 1;
+            return {
+              values: () => ({
+                onConflictDoNothing: () =>
+                  Promise.reject(new Error("simulated durable revocation insert fault")),
+              }),
+            };
+          }
+          return (target.insert as (t: unknown) => unknown)(table);
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as Db;
+}
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -47,6 +81,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issues);
+    await db.delete(runCredentialRevocations);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -589,5 +624,70 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
+  });
+
+  it("holds an orphaned running run open through a revocation-write failure, then terminalizes it once a retry lands the row", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    // The run recorded a pid that never maps to a live process, so the sweep
+    // decides to terminalize it on the process-death authority alone.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000 })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Revocation write fails — sweep leaves the run open",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    // Drive the real stale-run sweep, not a seeded marker. The durable
+    // revocation insert fails, the way a transient database fault would. The
+    // sweep must not force a terminal status, or clear the lock, without a
+    // durable revocation row.
+    const faultyDb = withFailingRevocationInsert(db, 1);
+    const firstPass = await heartbeatService(faultyDb).sweepStaleIssueLocks();
+
+    expect(firstPass.terminalizedRunIds).toEqual([]);
+    expect(firstPass.cleared).toBe(0);
+    const rowAfterFailure = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(rowAfterFailure).toBe("running");
+    expect(await isRunScopedCredentialRevoked(db, { companyId, runId: runningRunId })).toBe(false);
+    const lockAfterFailure = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lockAfterFailure).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+
+    // Database access recovers. A later sweep over the same still-running run
+    // retries the same durable write using a healthy connection.
+    const secondPass = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(secondPass.terminalizedRunIds).toEqual([runningRunId]);
+    expect(secondPass.cleared).toBe(1);
+    expect(await isRunScopedCredentialRevoked(db, { companyId, runId: runningRunId })).toBe(true);
+    const rowAfterRetry = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(rowAfterRetry).toBe("interrupted");
+    const lockAfterRetry = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lockAfterRetry).toEqual({ checkoutRunId: null, executionRunId: null });
   });
 });

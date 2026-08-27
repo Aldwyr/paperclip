@@ -16328,10 +16328,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             onSpawn,
             authToken: authToken ?? undefined,
             onInvalidateRunCredential: async () => {
-              // Await the durable write here, before the adapter returns and
-              // the run finalizes. A write fault must propagate: it fails
-              // the run closed instead of letting an unrevoked credential
-              // stay live past the point the engine decided to revoke it.
+              // Await the durable write here, before the adapter returns.
+              // A write fault here does not fail the run closed: the engine
+              // catches it (see the catch around this call in
+              // packages/adapter-utils/src/acpx-engine/execute.ts) and keeps
+              // its own teardown prompt. The real enforcement point is the
+              // finalization gate below (the DUPLEX_CHANNEL_LOST_ERROR_CODE
+              // branch) and its two backstops, terminalizeRunOnLeaseRelease
+              // in this file and terminalizeOrphanedRunningRun in
+              // server/src/services/recovery/service.ts. Each of them
+              // confirms the revocation again before it lets the run reach a
+              // terminal status.
               await revokeRunScopedCredential(db, {
                 companyId: agent.companyId,
                 runId: run.id,

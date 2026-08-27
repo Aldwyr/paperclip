@@ -4,12 +4,18 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
+  agentRuntimeState,
+  agentWakeupRequests,
   companies,
+  companySkills,
   createDb,
+  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   runCredentialRevocations,
+  workspaceOperations,
 } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
@@ -18,11 +24,42 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { isRunScopedCredentialRevoked } from "../services/run-credential-revocation.js";
+import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "@paperclipai/adapter-utils/bridge-transport-contract";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
 
+// Drives the real finalization gate at the end of `executeRun`, not a
+// reproduction of it: the adapter reports a lost duplex channel, exactly the
+// signal the gate keys on. Everything before that point in `executeRun` is
+// real production code; only the adapter's `execute` call is a test double,
+// so the run cannot depend on a real sandbox process.
+const mockDuplexChannelLostAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage: "sandbox duplex control channel lost",
+    errorCode: DUPLEX_CHANNEL_LOST_ERROR_CODE,
+    summary: "Adapter reported a lost duplex channel.",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: mockDuplexChannelLostAdapterExecute,
+    })),
+  };
+});
+
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
+import { runningProcesses } from "../adapters/index.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -92,9 +129,21 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
     if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
     else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
 
+    mockDuplexChannelLostAdapterExecute.mockClear();
+    runningProcesses.clear();
+    // A wakeup dispatches its run execution fire-and-forget, so drain every
+    // in-flight execution before the deletes below, or a late write can race
+    // them and trip a foreign-key check.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(runCredentialRevocations);
+    await db.delete(activityLog);
+    await db.delete(workspaceOperations);
+    await db.delete(executionWorkspaces);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
+    await db.delete(companySkills);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -211,6 +260,65 @@ describeEmbeddedPostgres("run-credential revocation gates terminal run finalizat
       .set("Authorization", `Bearer ${token}`);
     expect(rejectedAfterRecovery.status).toBe(401);
     expect(rejectedAfterRecovery.body.error).toContain("revoked");
+  });
+
+  it("holds a run open through a revocation-write failure at the primary finalization gate, driven end to end from a real adapter result", async () => {
+    // Drive the real production path: heartbeat.wakeup queues a run and
+    // dispatches executeRun, which calls the (mocked) adapter, reads back a
+    // lost-duplex-channel error code, and reaches the finalization gate at
+    // the same point a live sandbox teardown would. Only the adapter call
+    // itself is a test double; the gate, the write, and the run-status update
+    // around it are all real.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const triggeringUserId = `manual-${randomUUID()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `J${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true } },
+      permissions: {},
+    });
+
+    // The teardown in the same executeRun call retries the same write once
+    // more, immediately, through the lease-release backstop (see the
+    // `finally` block around heartbeat.ts:17091-17101). Fail both attempts,
+    // so only the primary finalization gate — not that immediate retry — is
+    // under test here: a hold that survives just the first fault would also
+    // pass with the gate itself deleted.
+    const faultyDb = withFailingRevocationInsert(db, 2);
+    // No environmentRuntime override here: unlike the direct-call tests
+    // above, this test drives the real lease-acquire path too, so it needs
+    // the service's real default runtime, not the release-only fake.
+    const heartbeatWithFaultyDb = heartbeatService(faultyDb);
+
+    const run = await heartbeatWithFaultyDb.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      requestedByActorType: "user",
+      requestedByActorId: triggeringUserId,
+    });
+    expect(run).not.toBeNull();
+    await heartbeatWithFaultyDb.drainActiveRunExecutions();
+
+    // The adapter reported a lost duplex channel, and both durable
+    // revocation-write attempts failed. The run must stay open, not reach a
+    // terminal status.
+    expect(mockDuplexChannelLostAdapterExecute).toHaveBeenCalledTimes(1);
+    const rowAfterFailure = await runRow(run!.id);
+    expect(["queued", "running"]).toContain(rowAfterFailure.status);
+    expect(await isRunScopedCredentialRevoked(db, { companyId, runId: run!.id })).toBe(false);
   });
 
   it("does not write a revocation row for a run that already reached a terminal status on the normal path", async () => {
