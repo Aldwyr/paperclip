@@ -190,25 +190,20 @@ jobs:
           docker system prune --all --force >/dev/null
           anonymous_config="$(mktemp -d)"
           docker --config "$anonymous_config" pull "$immutable"
-          if ! metadata="$(docker run --rm --platform linux/amd64 \
-            --entrypoint /usr/local/bin/paperclip-runnerd \
-            "$immutable" --build-metadata 2>&1)"; then
-            echo "Runner metadata probe failed: $metadata" >&2
-            docker system df >&2 || true
-            exit 1
-          fi
+          # The Dockerfile's final two RUN steps execute the runner metadata,
+          # transport-mode, provider-pack JSON, and pinned ACP binary checks as
+          # root and as the unprivileged Daytona user. Starting another
+          # container after this full pull can exhaust the hosted runner's thin
+          # writable layer even after pruning, so assert the published image
+          # configuration here without creating a redundant container.
+          image_config="$(docker image inspect "$immutable" \
+            --format '{{json .}}')"
           jq -e \
-            '.binaryContractVersion == 2 and
-             (.prpTransportModes | index("dial_ws_loopback")) != null and
-             (.prpTransportModes | index("dial_wss")) != null and
-             (.prpTransportModes | index("listen_ws")) != null' \
-            <<< "$metadata" >/dev/null
-          provider_metadata="$(docker run --rm --platform linux/amd64 \
-            --entrypoint /bin/cat "$immutable" \
-            /opt/paperclip-runner/provider-pack/provider-pack.json)"
-          jq -e --arg revision "$GITHUB_SHA" \
-            '.runnerSourceRevision == $revision and (.artifacts | type == "object") and (.pins | type == "object")' \
-            <<< "$provider_metadata" >/dev/null
+            '.Architecture == "amd64" and
+             .Os == "linux" and
+             .Config.User == "daytona" and
+             (.Config.Env | any(startswith("PAPERCLIP_RUNNER_PROVIDER_PACK_ROOT=")))' \
+            <<< "$image_config" >/dev/null
           echo "image=$immutable" >> "$GITHUB_OUTPUT"
 
   test:
