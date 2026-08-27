@@ -64,6 +64,31 @@ describe("runner E2E catalog", () => {
     }
   });
 
+  it("binds native Codex automation auth to the encrypted OpenAI secret", () => {
+    const execution = runnerMatrix.find(
+      (candidate) => candidate.id === "runner-codex.local.message-marker",
+    );
+    expect(execution).toBeDefined();
+    const secretRef = {
+      type: "secret_ref" as const,
+      secretId: "22222222-2222-4222-8222-222222222222",
+      version: "latest" as const,
+    };
+    const agent = execution!.profile.buildAgent({
+      environmentId: "11111111-1111-4111-8111-111111111111",
+      environmentFixtureId: "local",
+      workspacePath: "/tmp/runner-e2e-workspace",
+      secretRefs: { OPENAI_API_KEY: secretRef },
+      executionId: execution!.id,
+    });
+    expect(agent.adapterConfig).toMatchObject({
+      env: {
+        OPENAI_API_KEY: secretRef,
+        CODEX_API_KEY: secretRef,
+      },
+    });
+  });
+
   it("gives legacy planning agents a direct bounded API recipe", () => {
     const task = runnerTasks.find(
       (candidate) => candidate.id === "plan-revise-accept",

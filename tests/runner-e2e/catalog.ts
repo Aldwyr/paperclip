@@ -143,6 +143,7 @@ function nativeProfile(input: {
       provider: input.provider,
     },
     buildAgent(buildInput) {
+      const credentialRef = requiredSecret(buildInput, input.credential);
       const permissionConfig =
         input.provider === "codex"
           ? { codexPermissionMode: "never" }
@@ -156,7 +157,13 @@ function nativeProfile(input: {
         idleTimeoutMs: 300_000,
         ...permissionConfig,
         env: {
-          [input.credential]: requiredSecret(buildInput, input.credential),
+          [input.credential]: credentialRef,
+          // Codex's supported automation credential is CODEX_API_KEY. Keep
+          // OPENAI_API_KEY as the operator-facing fixture secret name and bind
+          // the same encrypted reference to the runtime-specific alias.
+          ...(input.provider === "codex"
+            ? { CODEX_API_KEY: credentialRef }
+            : {}),
         },
       });
     },
