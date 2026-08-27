@@ -12,7 +12,6 @@ async function assertSafeTree(root: string, relative = ""): Promise<void> {
     else if (!stat.isFile()) throw new Error(`runtime context asset contains an unsupported file: ${childRelative}`);
   }
 }
-
 async function makeReadOnly(root: string): Promise<void> {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const child = join(root, entry.name);
@@ -56,14 +55,20 @@ export async function prepareIsolatedCodexHome(input: { context: NativeRuntimeCo
   await chmod(input.codexHome, 0o700);
   await materializeNativeRuntimeSkills(input.context, join(input.codexHome, "skills"));
   await rm(join(input.codexHome, "config.toml"), { force: true });
-  if (input.nativeMcp) {
-    await writeFile(join(input.codexHome, "config.toml"), [
+  await writeFile(join(input.codexHome, "config.toml"), [
+    // Codex shell snapshots serialize the provider process environment. Native
+    // Codex receives API-key credentials only through that environment, so a
+    // snapshot would turn an ephemeral credential into durable session state.
+    "[features]",
+    "shell_snapshot = false",
+    "",
+    ...(input.nativeMcp ? [
       `[mcp_servers.${JSON.stringify(input.nativeMcp.name)}]`,
       `url = ${JSON.stringify(input.nativeMcp.url)}`,
       `http_headers = { Authorization = ${JSON.stringify(`Bearer ${input.nativeMcp.token}`)} }`,
       "",
-    ].join("\n"), { mode: 0o600 });
-  }
+    ] : []),
+  ].join("\n"), { mode: 0o600 });
   const targetAuth = join(input.codexHome, "auth.json");
   await rm(targetAuth, { force: true });
   const sourceHome = input.sourceCodexHome?.trim();

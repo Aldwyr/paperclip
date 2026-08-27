@@ -30,7 +30,6 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
   }));
 });
-
 function context(skillRoot: string, instructionRoot: string, runtimeName = "assigned"): NativeRuntimeContextSnapshot {
   const digest = "0".repeat(64);
   const value = {
@@ -76,6 +75,8 @@ describe("runtime context materialization", () => {
     await expect(stat(join(codexHome, "skills", "unassigned"))).rejects.toThrow();
     expect((await stat(join(codexHome, "skills", "assigned", "SKILL.md"))).mode & 0o222).toBe(0);
     const config = await readFile(join(codexHome, "config.toml"), "utf8");
+    expect(config).toContain("[features]");
+    expect(config).toContain("shell_snapshot = false");
     expect(config).toContain("paperclip-assigned");
     expect(config).toContain("Bearer ");
     expect(config).not.toContain("unassigned");
@@ -123,6 +124,9 @@ describe("runtime context materialization", () => {
     });
 
     await expect(stat(join(codexHome, "auth.json"))).rejects.toThrow();
+    await expect(readFile(join(codexHome, "config.toml"), "utf8")).resolves.toContain(
+      "shell_snapshot = false",
+    );
   });
 
   it("reconciles changed and empty assignments without following unexpected symlinks", async () => {
