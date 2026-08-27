@@ -170,7 +170,7 @@ describe("runner E2E matchers", () => {
         { kind: "runtime_mode", expected: "native" },
       ],
       {
-        message: "  complete   PAPERCLIP_E2E_OK_nonce  ",
+        message: "  complete   PAPERCLIP\\_E2E\\_OK\\_nonce  ",
         issueStatus: "done",
         runtimeMode: "native",
       },

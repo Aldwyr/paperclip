@@ -40,6 +40,10 @@ export interface MatcherResult {
 function normalizeMessage(value: string | undefined) {
   return (value ?? "")
     .replace(/\r\n/g, "\n")
+    // Some provider renderers escape underscores in plain-text identifiers
+    // before persisting Markdown. Treat that presentation-only escape as the
+    // same visible marker for exact/contains/ordered message assertions.
+    .replace(/\\_/g, "_")
     .replace(/[ \t]+/g, " ")
     .trim();
 }
