@@ -923,8 +923,9 @@ function nativeHarnessEnvironmentFingerprint(
     .update(
       canonicalJson({
         companyId: execution.binding.companyId,
+        agentId: execution.binding.agentId,
+        issueId: execution.binding.issueId,
         normalizedSessionId: nativeSessionKey(execution),
-        executionWorkspaceId: execution.binding.executionWorkspaceId,
         workspace: {
           cwd: execution.workspace.cwd,
           repoUrl: execution.workspace.repoUrl,

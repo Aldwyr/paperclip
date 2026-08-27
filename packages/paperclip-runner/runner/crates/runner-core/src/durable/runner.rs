@@ -2610,6 +2610,22 @@ mod tests {
     }
 
     #[test]
+    fn bearer_values_are_redacted_without_erasing_safe_failure_context() {
+        let sanitized = crate::durable::redact_text(
+            "MCP request failed: Authorization: Bearer secret-token, status 401 Unauthorized",
+        );
+        assert_eq!(
+            sanitized,
+            "MCP request failed: Authorization: Bearer [REDACTED], status 401 Unauthorized"
+        );
+        assert!(!sanitized.contains("secret-token"));
+        assert_eq!(
+            crate::durable::redact_text("Bearer first; retry used bearer second\nfailed"),
+            "Bearer [REDACTED]; retry used bearer [REDACTED]\nfailed"
+        );
+    }
+
+    #[test]
     fn durable_events_strip_binary_payloads_but_preserve_artifact_metadata() {
         let sanitized = crate::durable::sanitize_value(&json!({
             "item": {

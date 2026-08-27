@@ -586,7 +586,11 @@ mod tests {
             &json!({"item":{"id":"exec-1","type":"commandExecution","status":"completed","aggregatedOutput":output}}),
         );
         let payload = &events[0].1;
-        assert_eq!(payload["output"], "[REDACTED]");
+        assert_eq!(payload["outputTruncated"], true);
+        assert_eq!(
+            payload["output"].as_str().unwrap().as_bytes().len(),
+            MAX_OUTPUT_BYTES
+        );
         assert!(!payload.to_string().contains("secret"));
         assert!(payload["outputDigest"]
             .as_str()

@@ -758,10 +758,39 @@ fn redaction_key(key: &str) -> bool {
 }
 
 pub fn redact_text(input: &str) -> String {
-    if input.to_ascii_lowercase().contains("bearer ") {
-        return "[REDACTED]".to_owned();
+    const BEARER_PREFIX: &[u8] = b"bearer ";
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    while cursor + BEARER_PREFIX.len() <= bytes.len() {
+        let Some(relative_start) = bytes[cursor..]
+            .windows(BEARER_PREFIX.len())
+            .position(|candidate| candidate.eq_ignore_ascii_case(BEARER_PREFIX))
+        else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let value_start = start + BEARER_PREFIX.len();
+        output.push_str(&input[cursor..start]);
+        output.push_str(&input[start..value_start]);
+        output.push_str("[REDACTED]");
+
+        let value_end = input[value_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (character.is_whitespace()
+                    || matches!(character, '\"' | '\'' | ',' | ';' | ')' | ']' | '}'))
+                .then_some(value_start + offset)
+            })
+            .unwrap_or(input.len());
+        cursor = value_end;
     }
-    input.to_owned()
+    if output.is_empty() {
+        input.to_owned()
+    } else {
+        output.push_str(&input[cursor..]);
+        output
+    }
 }
 
 pub fn sanitize_value(value: &Value) -> Value {

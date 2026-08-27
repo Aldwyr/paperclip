@@ -298,6 +298,20 @@ describe("verified native harness backups", () => {
         },
       });
 
+      const continuationExecution = {
+        ...backupExecution,
+        binding: {
+          ...backupExecution.binding,
+          runId: "run-2",
+          executionWorkspaceId: "run-2",
+        },
+      } as NativeExecutionInputV1;
+      expect(verifyNativeHarnessBackup({
+        root,
+        execution: continuationExecution,
+        runnerInstanceId: "runner-1",
+      })).not.toBeNull();
+
       await writeFile(join(current, "codex-home", "sessions", "thread.jsonl"), "corrupt");
       expect(verifyNativeHarnessBackup({
         root,
