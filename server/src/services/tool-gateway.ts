@@ -3242,6 +3242,16 @@ export function createToolGatewayService(
     return { entry, connection };
   }
 
+  async function governedToolArguments(
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+    parameters: unknown,
+  ): Promise<unknown> {
+    if (tool.providerType !== "mcp_remote_http") return parameters;
+    const { connection } = await resolveConnectedRemoteTool(session, tool);
+    return projectedConnectionToolArguments(connection, parameters);
+  }
+
   async function resolveConnectedLocalStdioTool(session: ToolGatewaySession, tool: ToolGatewayDescriptor) {
     if (tool.providerType !== "mcp_local_stdio" || !tool.connectionId || !tool.catalogEntryId) {
       throw new ToolGatewayHttpError(404, `Tool "${tool.name}" not found`, "tool_not_found");
@@ -3780,7 +3790,6 @@ export function createToolGatewayService(
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedRemoteTool(session, tool);
-    const projectedParameters = projectedConnectionToolArguments(connection, parameters);
     const grant = await resolveConnectionGrant(session, connection);
     const composioScopeRevision = `${grant.id}:${grant.status}:${grant.updatedAt.toISOString()}`;
     const composioChild = composioChildConfig(connection);
@@ -3861,7 +3870,7 @@ export function createToolGatewayService(
           method: "tools/call",
           params: {
             name: entry.toolName,
-            arguments: projectedParameters,
+            arguments: parameters,
           },
         }),
       };
@@ -5860,7 +5869,7 @@ export function createToolGatewayService(
         });
       }
 
-      const requestedParameters = input.parameters ?? {};
+      const requestedParameters = await governedToolArguments(session, tool, input.parameters ?? {});
       const argumentValidation = validateToolContent({
         value: requestedParameters,
         direction: "arguments",
@@ -6344,6 +6353,14 @@ export function createToolGatewayService(
         virtualToolName = "run_tool";
         tool = targetTool;
         requestedParameters = targetParameters;
+      }
+
+      // Managed provider arguments are part of the governed call, not a
+      // transport decoration. Project them before hashing, policy evaluation,
+      // approval signing, previews, and audit summaries. Approved retries use
+      // the already-projected signed payload below and never re-project it.
+      if (!input.approvedActionRequestId) {
+        requestedParameters = await governedToolArguments(session, tool, requestedParameters);
       }
 
       const argumentValidation = validateToolContent({
