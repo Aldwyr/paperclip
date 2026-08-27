@@ -3346,6 +3346,30 @@ describe("sandbox callback bridge", () => {
     expect(forwardCalls).toBe(0);
   }, 15_000);
 
+  it("the generated HTTP/2 gateway fails a request at the response bound instead of hanging when the host never finishes the stream", async () => {
+    // The host settings handshake already bounds the wait before the first
+    // stream opens. This test proves the generated gateway also bounds the
+    // rest of the response lifecycle: a host that opens a stream and then
+    // never sends a body, an error, or an abort must still fail the local
+    // request instead of leaving it pending forever.
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    const gateway = await startHttp2GatewayForTest({
+      bridgeToken,
+      responseTimeoutMs: 100,
+      forwardRequest: () => new Promise(() => {}),
+    });
+
+    const start = Date.now();
+    const response = await fetch(`${gateway.baseUrl}/api/agents/me`, {
+      headers: { authorization: `Bearer ${bridgeToken}` },
+    });
+    expect(Date.now() - start).toBeLessThan(5_000);
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "Timed out waiting for the HTTP/2 bridge response stream to finish.",
+    });
+  }, 15_000);
+
   it("rejects a request body over maxBodyBytes on the queue path before it writes the queue file", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-queue-maxbody-"));
     cleanupDirs.push(rootDir);
@@ -3696,6 +3720,44 @@ describe("sandbox callback bridge", () => {
         receivedToken: bridgeToken,
       }),
     ).rejects.toThrow("Bridge response body exceeded the configured size limit.");
+  });
+
+  it("fails a request at the response bound when the host opens a stream but never finishes it", async () => {
+    // The settings handshake already completed by the time this stream
+    // opens, so only the per-stream response timer can end the wait. Before
+    // this timer existed, a host that opened a stream and then went silent
+    // left `forwardRequest` pending forever.
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    const [serverSide, clientSide] = duplexPair();
+    const handle = createHttp2BridgeServer({
+      bridgeToken,
+      forwardRequest: () => new Promise(() => {}),
+    });
+    handle.bindChannel(channelFromDuplex(serverSide));
+
+    const gateway = createSandboxHttp2BridgeGateway({
+      bridgeToken,
+      createConnection: () => clientSide,
+      responseTimeoutMs: 100,
+    });
+    cleanupFns.push(async () => {
+      await gateway.close();
+      serverSide.destroy();
+      clientSide.destroy();
+    });
+
+    const start = Date.now();
+    await expect(
+      gateway.forwardRequest({
+        method: "GET",
+        path: "/api/agents/me",
+        query: "",
+        headers: {},
+        body: Buffer.alloc(0),
+        receivedToken: bridgeToken,
+      }),
+    ).rejects.toThrow("Timed out waiting for the HTTP/2 bridge response stream to finish.");
+    expect(Date.now() - start).toBeLessThan(5_000);
   });
 
   it("the generated gateway asset opens its first stream only after the host settings frame arrives", async () => {

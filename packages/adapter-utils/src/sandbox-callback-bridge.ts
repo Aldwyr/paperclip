@@ -1891,10 +1891,13 @@ export interface CreateSandboxHttp2BridgeGatewayOptions {
    */
   onGoaway?: (record: { lastStreamId: number; errorCode: number }) => void;
   /**
-   * The time bound, in milliseconds, on the wait for the host's first
-   * `remoteSettings` event. The gateway opens no stream before that event
-   * arrives or before this bound passes, whichever comes first. The default
-   * is {@link DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS}.
+   * The time bound, in milliseconds, applied twice: once on the wait for the
+   * host's first `remoteSettings` event (the gateway opens no stream before
+   * that event arrives or before this bound passes, whichever comes first),
+   * and again, independently, on each opened stream's response lifecycle (an
+   * opened stream that never sends "end", "error", or "aborted" is destroyed
+   * and the request fails at this same bound). The default is
+   * {@link DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS}.
    */
   responseTimeoutMs?: number;
   /**
@@ -1916,6 +1919,7 @@ function forwardOneHttp2Request(
     body: Buffer;
   },
   maxBodyBytes: number,
+  responseTimeoutMs: number,
 ): Promise<SandboxHttp2BridgeGatewayResponse> {
   return new Promise((resolve, reject) => {
     const query = request.query.trim();
@@ -1942,8 +1946,22 @@ function forwardOneHttp2Request(
     const settle = (run: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(responseTimer);
       run();
     };
+    // The handshake before this call already bounds the wait for the host's
+    // remote settings. This timer bounds the rest of the response lifecycle:
+    // an opened stream that never sends "end", "error", or "aborted" would
+    // otherwise leave this promise pending forever, which hangs the caller.
+    // It is armed for exactly this one stream and cleared the moment the
+    // stream settles any other way.
+    const responseTimer = setTimeout(() => {
+      settle(() => {
+        stream.destroy();
+        reject(new Error("Timed out waiting for the HTTP/2 bridge response stream to finish."));
+      });
+    }, responseTimeoutMs);
+    responseTimer.unref();
     stream.on("response", (headers) => {
       const rawStatus = headers[":status"];
       status = typeof rawStatus === "number" ? rawStatus : Number(rawStatus) || 502;
@@ -2056,6 +2074,7 @@ export function createSandboxHttp2BridgeGateway(
             body: request.body,
           },
           maxBodyBytes,
+          responseTimeoutMs,
         ),
       );
     },
@@ -2527,8 +2546,22 @@ function runHttp2Gateway() {
         const settle = (run) => {
           if (settled) return;
           settled = true;
+          clearTimeout(responseTimer);
           run();
         };
+        // The handshake above already bounds the wait for the host's remote
+        // settings. This timer bounds the rest of the response lifecycle: an
+        // opened stream that never sends "end", "error", or "aborted" would
+        // otherwise leave this promise pending forever, which hangs the local
+        // gateway request. It is armed for exactly this one stream and
+        // cleared the moment the stream settles any other way.
+        const responseTimer = setTimeout(function () {
+          settle(() => {
+            stream.destroy();
+            reject(new Error("Timed out waiting for the HTTP/2 bridge response stream to finish."));
+          });
+        }, responseTimeoutMs);
+        responseTimer.unref();
         stream.on("response", (headers) => {
           const raw = headers[":status"];
           status = typeof raw === "number" ? raw : Number(raw) || 502;
