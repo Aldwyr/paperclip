@@ -851,8 +851,10 @@ export function createCapabilityRunnerdProviderEnvironment(input: {
     HOME: input.codexHome,
     CODEX_HOME: input.codexHome,
   });
-  const apiKey = input.options.environment?.OPENAI_API_KEY;
-  if (apiKey?.trim()) environment.OPENAI_API_KEY = apiKey;
+  for (const key of ["OPENAI_API_KEY", "CODEX_API_KEY"] as const) {
+    const apiKey = input.options.environment?.[key];
+    if (apiKey?.trim()) environment[key] = apiKey;
+  }
   return environment;
 }
 

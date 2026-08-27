@@ -96,6 +96,7 @@ it("passes the configured Codex API key only through the provider process enviro
       environment: {
         PATH: "/bin",
         OPENAI_API_KEY: "configured-provider-key",
+        CODEX_API_KEY: "configured-automation-key",
         PAPERCLIP_API_KEY: "must-not-reach-provider",
       },
     },
@@ -116,6 +117,7 @@ it("passes the configured Codex API key only through the provider process enviro
     HOME: "/isolated/codex-home",
     CODEX_HOME: "/isolated/codex-home",
     OPENAI_API_KEY: "configured-provider-key",
+    CODEX_API_KEY: "configured-automation-key",
   });
   expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
 });
