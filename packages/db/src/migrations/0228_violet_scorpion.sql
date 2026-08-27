@@ -140,6 +140,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS "issue_question_response_deliveries_interactio
 CREATE UNIQUE INDEX IF NOT EXISTS "issue_question_response_deliveries_correlation_uq" ON "issue_question_response_deliveries" USING btree ("correlation_id");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "issue_question_response_deliveries_pending_idx" ON "issue_question_response_deliveries" USING btree ("status","created_at");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "issue_question_response_deliveries_company_issue_idx" ON "issue_question_response_deliveries" USING btree ("company_id","issue_id","created_at");--> statement-breakpoint
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: This partial index covers a new question-response key prefix, so existing deployments have no matching rows; Drizzle applies migrations transactionally and cannot use CONCURRENTLY.
+CREATE UNIQUE INDEX IF NOT EXISTS "agent_wakeup_requests_question_response_delivery_idempotency_uq" ON "agent_wakeup_requests" USING btree ("company_id","idempotency_key") WHERE "agent_wakeup_requests"."idempotency_key" LIKE 'question-response:%' AND "agent_wakeup_requests"."status" NOT IN ('skipped', 'failed', 'cancelled');--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "managed_agent_profiles_company_idx" ON "managed_agent_profiles" USING btree ("company_id");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "managed_agent_profiles_company_key_uq" ON "managed_agent_profiles" USING btree ("company_id","profile_key");--> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "managed_agent_profiles_company_resource_uq" ON "managed_agent_profiles" USING btree ("company_id","anthropic_agent_id","agent_version","environment_id");--> statement-breakpoint
