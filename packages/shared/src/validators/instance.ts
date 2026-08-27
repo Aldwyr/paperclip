@@ -43,7 +43,6 @@ export const patchInstanceGeneralSettingsSchema = z
   .strict();
 
 export const instanceExperimentalSettingsSchema = z.object({
-  enableNativeRunner: z.boolean().default(false),
   enableEnvironments: z.boolean().default(false),
   enableNativeRunner: z.boolean().default(false),
   enableManagedSandboxOnly: z.boolean().default(false),
@@ -66,6 +65,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   enableDecisions: z.boolean().default(false),
   enableGoalsSidebarLink: z.boolean().default(false),
   enableServerInfoDebugView: z.boolean().default(false),
+  enablePaperclipDeveloperMode: z.boolean().default(false),
   enableSimplifiedEnglishInteractions: z.boolean().default(false),
   autoRestartDevServerWhenIdle: z.boolean().default(false),
   enableIssueGraphLivenessAutoRecovery: z.boolean().default(false),
@@ -76,6 +76,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   // off the host keeps the file bridge for every run with no manifest change and
   // no redeploy. The host reads this per run before it selects the transport.
   enableSandboxDuplexBridge: z.boolean().default(false),
+  enableRunnerPreviewIngress: z.boolean().default(false),
   enableWorktreeRunExecution: z.boolean().default(false),
   worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
   worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),

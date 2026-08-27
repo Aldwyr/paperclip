@@ -1,0 +1,168 @@
+# Paid Full-Stack Runner E2E Test System
+
+**Status:** Implemented; live credentialed acceptance and nightly activation pending.
+
+## Objective
+
+Provide a browser-based, paid acceptance system that proves Paperclip can
+configure an agent, create and assign a task through the UI, run that task in a
+real local or Daytona execution environment, render the final answer, and
+persist the correct task/run/runtime state.
+
+The acceptance matrix is eight production-owned runner profiles by two
+environments by three deterministic task cases: 48 executions and 80 paid
+agent turns. It is independent of the general E2E suite and never runs on pull
+requests or ordinary pushes.
+
+## Implemented architecture
+
+`tests/runner-e2e/launch.ts` is the billable entry point. It parses explicit
+selectors, loads the ignored local credential file with shell precedence,
+validates credential/image requirements, and schedules independent scenarios
+through a bounded worker pool. Each profile/environment/case execution receives
+its own Paperclip process. The dependent draft, revision, acceptance, and final
+verification turns of the Plan scenario remain ordered inside that execution;
+unrelated executions overlap. A retry receives a completely fresh harness.
+Every attempt allocates a new OS temporary root with a Paperclip home, embedded
+database, workspace, private artifacts, logs, port, instance ID, and signing
+secrets.
+
+The launcher deletes ambient database URLs. `playwright.config.ts` separately
+constructs the Paperclip child environment and strips OpenAI, Anthropic,
+OpenRouter, and Daytona variables. It starts
+`paperclipai onboard --yes --run`, waits on `/api/health`, refuses server reuse,
+and requires the generated embedded Postgres path to remain below the allocated
+temporary root. Local storage, database backups, logs, and the generated
+encrypted-secrets master key are also pinned below that root and verified from
+the resolved configuration.
+
+`runner.spec.ts` performs the live path:
+
+1. enable native runner flags required by the selected cell;
+2. create a unique company through `/api/companies`;
+3. POST required credential values once to the encrypted company-secrets API;
+4. discover the isolated instance-managed local environment or create Daytona;
+5. create the agent with secret references through the public agents API;
+6. open the issues UI, create the nonce-bearing task, select the agent, and
+   submit `Create Task`;
+7. rely on assigned-task wake behavior;
+8. discover the issue through the public API and open its task page;
+9. execute any fixture-defined browser follow-ups and wait for the marker and
+   `Done` state in the UI;
+10. assert the fixture's expected successful run count, no recovery
+    continuation or pending interaction,
+    expected runtime mode, environment ID/lease, and isolated workspace through
+    public APIs; and
+11. capture phase screenshots (initial/revised Plan where applicable and final
+    state) and tear fixtures down in reverse order.
+
+No production endpoint/schema was added and direct database writes are absent.
+
+## Catalog and deterministic task
+
+`catalog.ts` imports production model/qualification constants. It defines the
+legacy Codex, Claude, and OpenCode profiles and native Codex, OpenCode, ACPX Pi,
+ACPX Claude, and ACPX Codex profiles. Each is crossed with local and Daytona.
+
+Catalog startup validates unique IDs, shared agent/environment schemas,
+declared credentials, supported combinations, raw secret-looking values,
+known selectors, and exactly 48 executions. Interfaces are in `types.ts`;
+fixture dependency management is in `fixture-registry.ts`; deterministic
+matcher behavior is in `matchers.ts`.
+
+The `message-marker` case requires one basic final marker and task completion.
+The `ask-question` case creates the task in Ask mode, asks a deterministic
+question, verifies its visible answer marker, and verifies Done. The
+`plan-revise-accept` case creates a planning task, verifies a two-step canonical
+Plan and revision-bound confirmation, requests a three-step revision through
+the browser, verifies the new canonical revision and confirmation target,
+accepts it through the browser, and verifies the final implementation marker,
+three successful runs, and Done. `message_contains` is normalized rather than
+exact to tolerate harmless provider framing. Plan markers also normalize
+provider-added Markdown underscore escaping.
+
+## Failure, retry, and cleanup policy
+
+Candidate failures, missing/invalid credentials, incompatible models or
+artifacts, secret leakage, and cleanup invariant failures are final.
+Server/bootstrap, browser handshake, 429/5xx/network, and classified Daytona
+transport failures (including a transport-level cleanup failure) may retry
+once. A retry receives a completely new Paperclip instance/database/workspace.
+There is no USD ceiling; bounded cases, per-case deadlines, and one
+infrastructure retry are the runaway bounds.
+
+Playwright owns the foreground server process, while wrapper/launcher process
+groups ensure child runners are terminated. Fixture teardown deletes agents,
+destroys Daytona environments/leases, and removes companies. The launcher then
+packages evidence and removes the complete temporary root. Daytona auto-stop,
+archive, and delete remain provider-side backstops for abrupt job cancellation.
+
+## Evidence security
+
+Private attempt state is never uploaded wholesale. `evidence.ts` allowlists
+screenshots, videos, traces/blob reports, sanitized logs/snapshots, HTML, JUnit,
+and result JSON. Text is redacted using exact loaded values and known key
+shapes. Raw API snapshots are scanned before sanitization, ZIPs are expanded,
+and the closed Paperclip home/database plus workspace receive a streaming
+exact-value scan before deletion. Unsafe binary/ZIP files are omitted, any
+detected leak fails the cell, and a pass without `final-state.png` is rejected.
+Paperclip home, database, workspace, master key, and raw logs are deleted after
+packaging.
+
+Each normalized result records profile, environment, case, provider/model,
+runtime mode, issue/run IDs, timing, cleanup, retry attempt, and usage/cost when
+the provider reports it. It also records each matcher result and the labeled
+screenshot phases used by the screenshot-first campaign dashboard.
+
+## CI campaign
+
+`.github/workflows/runner-full-stack-e2e.yml` has a `08:47 UTC` cron and manual
+dispatch inputs mirroring local selectors. The catalog job emits 48 independently
+schedulable profile/environment/case jobs for a full run. The paid matrix uses
+`fail-fast:false`, `max-parallel:16`, and 25-minute local or 40-minute Daytona
+job limits that cover the scenario deadline plus one fresh-harness retry.
+
+When Daytona is selected, one image job reuses a verified digest for the tested
+SHA or builds `linux/amd64` from `docker/daytona-runner/Dockerfile`, pushes
+`e2e-git-<sha>`, signs with Cosign/OIDC, verifies anonymous pull, checks runner
+contract/transport metadata, and exposes the immutable digest to every Daytona
+cell.
+
+Every execution uploads a 30-day sanitized bundle. The final job always downloads
+evidence, merges Playwright blob reports into HTML/JUnit, stages the sanitized
+screenshots, and emits a screenshot grid whose expandable cards contain matcher
+results and execution context. It fails unless every selected latest attempt
+passed with cleanup and required evidence. The report always remains a GitHub
+Actions artifact. If `RUNNER_FULL_STACK_E2E_PUBLISH_PAGES=true`, the latest
+green report is also deployed with GitHub Pages; this uses GitHub's OIDC-backed
+Pages permissions and requires no S3 credential. The workflow follows
+[Playwright blob report merging](https://playwright.dev/docs/test-sharding#merge-reports)
+and [GitHub dynamic matrix outputs](https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs).
+
+The cron is present but billable scheduled execution requires repository
+variable `RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED=true`. This enforces the launch
+gate below rather than spending before live qualification is complete.
+
+## Live activation sequence
+
+Run in order, recording the produced campaign artifacts:
+
+1. headed `legacy-codex.local.message-marker`;
+2. headless one local legacy and one local native cell;
+3. one Daytona legacy and one Daytona native cell, confirming lease cleanup;
+4. one manually dispatched complete 48-execution campaign; and
+5. set `RUNNER_FULL_STACK_E2E_NIGHTLY_ENABLED=true` only after step 4 is green.
+
+For every cell verify UI ownership/assignment, visible marker, `done` issue,
+the expected successful heartbeat run count, correct legacy/native mode, correct local or
+Daytona execution context, native runner metadata, no pending interaction,
+secret-free persisted/evidence state, and confirmed local/lease cleanup.
+
+## Deferred scope
+
+Claude Managed Agents, AWS AgentCore, CircleCI-specific output, SSH/E2B/Modal/
+Cloudflare/Kubernetes/Novita/exe.dev environments, LLM judges, ASCII-art
+rubrics, and file-writing cases remain outside v1. The typed environment/task/
+matcher contracts and dependency registry are the extension points for those
+fixtures and for future Paperclip objects such as projects, goals, apps, and
+configuration.

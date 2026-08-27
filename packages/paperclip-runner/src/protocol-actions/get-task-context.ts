@@ -20,16 +20,16 @@ export const getTaskContextAction = {
     "idempotency": "none",
     "disabledByDefault": false,
     "realBindingStatus": "live_codex",
-    "realServiceBinding": "unbound",
-    "prpEvidence": "read projection surfaced via a tool-result item event; no control-plane state diff",
-    "prpBindingStatus": "audit_pending",
+    "realServiceBinding": "PaperclipRunnerToolAuthority active issue/run + accepted plan revision",
+    "prpEvidence": "bound company/assignment query plus exact accepted document revision projection",
+    "prpBindingStatus": "bound",
     "legacyAliases": [
       "mcp:paperclipMe"
     ]
   },
   "documentation": {
     "title": "Get active task context",
-    "description": "Read the active mock task, actor, wake, ancestors, budget, and interaction results.",
+    "description": "Read the active task and actor, including the exact approved Markdown revision when this issue has an accepted plan.",
     "note": null
   },
   "examples": {
@@ -50,7 +50,7 @@ export const getTaskContextAction = {
       "operationId": "get_task_context",
       "version": 1,
       "title": "Get active task context",
-      "description": "Read the active mock task, actor, wake, ancestors, budget, and interaction results.",
+      "description": "Read the active task and actor, including the exact approved Markdown revision when this issue has an accepted plan.",
       "exposure": "always",
       "requiredClaims": [],
       "allowedModes": [

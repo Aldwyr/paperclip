@@ -94,6 +94,78 @@ describe("buildPaperclipRunnerConfig", () => {
     }))).toMatchObject({
       provider: "opencode",
       model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      opencodePermissionMode: "allow",
+    });
+  });
+
+  it("defaults every Paperclip Runner harness to its maximum permission mode", () => {
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      paperclipRunnerProvider: "acpx",
+      paperclipRunnerAcpxAgent: "claude",
+      model: "",
+      dangerouslyBypassSandbox: true,
+      adapterSchemaValues: {
+        permissionPolicy: "interactive",
+        dangerouslyBypassApprovalsAndSandbox: true,
+      },
+    }))).toMatchObject({
+      provider: "acpx",
+      acpxAgent: "claude",
+      model: "claude-sonnet-5",
+      codexPermissionMode: "never",
+      opencodePermissionMode: "allow",
+      acpxPermissionMode: "approve-all",
+    });
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      dangerouslyBypassSandbox: true,
+      adapterSchemaValues: {
+        permissionPolicy: "interactive",
+        dangerouslyBypassSandbox: true,
+      },
+    }))).toEqual(expect.not.objectContaining({
+      dangerouslyBypassApprovalsAndSandbox: expect.anything(),
+      dangerouslyBypassSandbox: expect.anything(),
+      permissionPolicy: expect.anything(),
+    }));
+  });
+
+  it("persists lower provider-specific permission modes", () => {
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      codexPermissionMode: "on-request",
+      opencodePermissionMode: "ask",
+      acpxPermissionMode: "approve-reads",
+    }))).toMatchObject({
+      codexPermissionMode: "on-request",
+      opencodePermissionMode: "ask",
+      acpxPermissionMode: "approve-reads",
+    });
+  });
+
+  it("persists managed-provider defaults that are displayed by the custom form", () => {
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      paperclipRunnerProvider: "claude_managed",
+      adapterSchemaValues: { managedProfileId: "profile-1" },
+    }))).toMatchObject({
+      provider: "claude_managed",
+      managedProfileId: "profile-1",
+      maxSessionListCostUsd: 1,
+      managedAgentsRetentionAcknowledged: false,
+    });
+
+    expect(buildPaperclipRunnerConfig(makeValues({
+      adapterType: "paperclip_runner",
+      paperclipRunnerProvider: "aws_agentcore",
+      adapterSchemaValues: { agentCoreProfileId: "profile-2" },
+    }))).toMatchObject({
+      provider: "aws_agentcore",
+      agentCoreProfileId: "profile-2",
+      maxEstimatedSessionCostUsd: 1,
+      qualificationRevision: "aws-agentcore-harness-v1",
+      agentCoreRetentionAcknowledged: false,
     });
   });
 });

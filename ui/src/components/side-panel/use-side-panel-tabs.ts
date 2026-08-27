@@ -33,7 +33,9 @@ export function sidePanelTabsReducer<TPayload>(
     case "open": {
       const existing = state.tabs.find((tab) => tab.id === action.tab.id);
       if (existing) {
-        return action.activate === false ? state : { ...state, activeTabId: existing.id };
+        return action.activate === false || state.activeTabId === existing.id
+          ? state
+          : { ...state, activeTabId: existing.id };
       }
       return {
         tabs: [...state.tabs, action.tab],
@@ -41,7 +43,9 @@ export function sidePanelTabsReducer<TPayload>(
       };
     }
     case "select":
-      return state.tabs.some((tab) => tab.id === action.tabId)
+      return state.activeTabId === action.tabId
+        ? state
+        : state.tabs.some((tab) => tab.id === action.tabId)
         ? { ...state, activeTabId: action.tabId }
         : state;
     case "close": {

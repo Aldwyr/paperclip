@@ -156,6 +156,7 @@ import {
 import { ResponsibleUserDenialNotice } from "../components/ResponsibleUserDenialNotice";
 import { RunWorkspaceRecoverySurface } from "../components/RunWorkspaceRecoverySurface";
 import { RunnerInspector } from "../components/RunnerInspector";
+import { HoneycombRunLink } from "../components/HoneycombRunLink";
 import {
   ProviderTraceStatusBadge,
   runRequestedProviderTrace,
@@ -4103,6 +4104,12 @@ function RunDetail({
   const canUseProviderTrace =
     boardAccess?.source === "local_implicit" ||
     boardAccess?.isInstanceAdmin === true;
+  const { data: experimentalSettings } = useQuery({
+    queryKey: queryKeys.instance.experimentalSettings,
+    queryFn: () => instanceSettingsApi.getExperimental(),
+  });
+  const paperclipDeveloperMode =
+    experimentalSettings?.enablePaperclipDeveloperMode === true;
   const { data: providerTraceRows } = useQuery({
     queryKey: queryKeys.providerTraceMetadata(run.companyId, [run.id]),
     queryFn: () => heartbeatsApi.providerTraceMetadata(run.companyId, [run.id]),
@@ -4362,7 +4369,7 @@ function RunDetail({
         <div className="flex flex-col sm:flex-row">
           {/* Left column: status + timing */}
           <div className="flex-1 p-4 space-y-3">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <StatusBadge status={run.status} />
               <ProviderTraceStatusBadge
                 trace={providerTraceMetadata}
@@ -4413,6 +4420,7 @@ function RunDetail({
                 <Eye className="h-3.5 w-3.5 mr-1" />
                 Inspect run
               </Button>
+              <HoneycombRunLink runId={run.id} enabled={paperclipDeveloperMode} />
               {canUseProviderTrace &&
               !["queued", "running"].includes(run.status) ? (
                 <Button

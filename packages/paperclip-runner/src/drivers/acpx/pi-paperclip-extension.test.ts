@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import paperclipPiExtension from "./pi-paperclip-extension.js";
+import paperclipPiExtension, { parseDsmlToolCalls } from "./pi-paperclip-extension.js";
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -12,6 +12,29 @@ afterEach(() => {
 });
 
 describe("paperclip Pi extension", () => {
+  it("strictly converts complete DSML envelopes into typed tool calls", () => {
+    expect(parseDsmlToolCalls(`
+      <｜DSML｜tool_calls>
+      <｜DSML｜invoke name="write_document">
+      <｜DSML｜parameter name="key" string="true">plan</｜DSML｜parameter>
+      <｜DSML｜parameter name="baseRevisionId" string="false">null</｜DSML｜parameter>
+      <｜DSML｜parameter name="metadata" string="false">{"revision":2}</｜DSML｜parameter>
+      </｜DSML｜invoke>
+      </｜DSML｜tool_calls>
+    `)).toEqual([{
+      name: "write_document",
+      arguments: { key: "plan", baseRevisionId: null, metadata: { revision: 2 } },
+    }]);
+    expect(parseDsmlToolCalls("before <｜DSML｜tool_calls></｜DSML｜tool_calls>" )).toBeNull();
+    expect(parseDsmlToolCalls(`
+      <｜DSML｜tool_calls>
+      <｜DSML｜invoke name="write_document">
+      <｜DSML｜parameter name="baseRevisionId" string="false">not-json</｜DSML｜parameter>
+      </｜DSML｜invoke>
+      </｜DSML｜tool_calls>
+    `)).toBeNull();
+  });
+
   it("registers only the public catalog and gates built-ins without exposing command content", async () => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-pi-extension-"));
     const workspace = join(root, "workspace");
@@ -57,10 +80,12 @@ describe("paperclip Pi extension", () => {
 
     const tools: Array<Record<string, unknown>> = [];
     let toolCallHandler: ((event: Record<string, unknown>) => Promise<unknown>) | null = null;
+    let messageEndHandler: ((event: Record<string, unknown>) => unknown) | null = null;
     await paperclipPiExtension({
       registerTool(tool) { tools.push(tool as unknown as Record<string, unknown>); },
       on(event, handler) {
         if (event === "tool_call") toolCallHandler = handler as unknown as typeof toolCallHandler;
+        if (event === "message_end") messageEndHandler = handler as unknown as typeof messageEndHandler;
       },
     } as never);
 
@@ -104,5 +129,35 @@ describe("paperclip Pi extension", () => {
     expect(JSON.stringify(requests)).not.toContain("printf hello");
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-2", input: { command: "cat /etc/passwd" } })).toMatchObject({ block: true });
     expect(await toolCallHandler!({ toolName: "bash", toolCallId: "bash-parent", input: { command: "cat safe/../../etc/passwd" } })).toMatchObject({ block: true });
+
+    const baseMessage = {
+      role: "assistant",
+      api: "openai-completions",
+      provider: "openrouter",
+      model: "deepseek-v4-flash-0731",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: 1,
+    };
+    const recovered = await messageEndHandler!({
+      message: {
+        ...baseMessage,
+        content: [{ type: "text", text: `<｜DSML｜tool_calls>
+          <｜DSML｜invoke name="paperclip_finish">
+          <｜DSML｜parameter name="reportedWorkDisposition" string="true">done</｜DSML｜parameter>
+          </｜DSML｜invoke>
+        </｜DSML｜tool_calls>` }],
+      },
+    }) as { message: { content: Array<Record<string, unknown>>; stopReason: string } };
+    expect(recovered.message).toMatchObject({
+      stopReason: "toolUse",
+      content: [{ type: "toolCall", name: "paperclip_finish", arguments: { reportedWorkDisposition: "done" } }],
+    });
+    expect(await messageEndHandler!({
+      message: {
+        ...baseMessage,
+        content: [{ type: "text", text: `<｜DSML｜tool_calls><｜DSML｜invoke name="unknown_tool"></｜DSML｜invoke></｜DSML｜tool_calls>` }],
+      },
+    })).toBeUndefined();
   });
 });

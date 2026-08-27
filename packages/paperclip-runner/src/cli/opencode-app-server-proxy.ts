@@ -1,12 +1,22 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 
 import type { HarnessRuntimeRequestResolution, HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
-import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { OpenCodeServerDriver } from "../drivers/opencode/opencode-server-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
+import { openCodeProxyTaskEnvelope } from "./opencode-proxy-task-envelope.js";
+import {
+  shouldAnnounceOpenCodeProxyTurn,
+  shouldForwardOpenCodeProxyItem,
+} from "./opencode-proxy-events.js";
+import { enqueueOpenCodeProxyInput } from "./opencode-proxy-input.js";
+import {
+  assertOpenCodeProxyCollaborationMode,
+  openCodeProxyCollaborationModes,
+} from "./opencode-proxy-collaboration-mode.js";
 
 type RpcMessage = { id?: string | number; method?: string; params?: unknown; result?: unknown; error?: unknown };
 
@@ -17,8 +27,19 @@ let driver: OpenCodeServerDriver | null = null;
 let session: HarnessSession | null = null;
 let eventPump: Promise<void> | null = null;
 let cwd = "";
+let activeModel = "";
 let activeTurnId: string | null = null;
 const announcedTurnIds = new Set<string>();
+
+function openCodeCommand(): string {
+  const configured = process.env.PAPERCLIP_OPENCODE_COMMAND?.trim();
+  if (configured && configured !== "opencode") return configured;
+  try {
+    return createRequire(import.meta.url).resolve("opencode-ai/bin/opencode.exe");
+  } catch {
+    return configured || "opencode";
+  }
+}
 
 function send(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -49,6 +70,7 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
   cwd = resolve(text(params.cwd, process.cwd()));
   const model = text(params.model);
   if (!model.includes("/")) throw new Error("OpenCode proxy requires model in provider/model form");
+  activeModel = model;
   const dynamicTools = Array.isArray(params.dynamicTools) ? params.dynamicTools.map(record) : [];
   const runtimeContextPath = process.env.PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH?.trim();
   const runtimeContext = runtimeContextPath
@@ -56,18 +78,11 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
     : null;
   driver = new OpenCodeServerDriver({
     model,
-    command: process.env.PAPERCLIP_OPENCODE_COMMAND?.trim() || "opencode",
+    command: openCodeCommand(),
     runtimeDirectory: runtimeDirectory(),
     environment: process.env,
     runnerInstanceId: process.env.PAPERCLIP_RUNNER_INSTANCE_ID ?? "paperclip-runnerd-opencode",
-    taskEnvelope: createCodexTaskEnvelope({
-      objective: "Complete the provider turn supplied by Paperclip Runner.",
-      constraints: [
-        text(params.baseInstructions, "Complete only the supplied task."),
-        "Work only inside the supplied working directory.",
-        "Use Paperclip MCP tools for semantic operations.",
-      ],
-    }),
+    taskEnvelope: openCodeProxyTaskEnvelope(params),
     systemInstructions: text(params.baseInstructions, "Complete only the supplied task."),
     runtimeContext,
     dynamicTools,
@@ -110,12 +125,11 @@ async function open(params: Record<string, unknown>, resume: boolean): Promise<R
 }
 
 function threadResponse(id: string): Record<string, unknown> {
-  return { thread: { id, sessionId: id, cwd }, model: process.env.PAPERCLIP_OPENCODE_MODEL ?? null };
+  return { thread: { id, sessionId: id, cwd }, model: activeModel };
 }
 
 function announceTurnStarted(opened: HarnessSession, turnId: string): void {
-  if (announcedTurnIds.has(turnId)) return;
-  announcedTurnIds.add(turnId);
+  if (!shouldAnnounceOpenCodeProxyTurn(announcedTurnIds, turnId)) return;
   send({
     method: "turn/started",
     params: {
@@ -132,6 +146,11 @@ async function pumpEvents(opened: HarnessSession): Promise<void> {
     if (event.eventType === "turn.started") {
       if (typeof event.turnId === "string") announceTurnStarted(opened, event.turnId);
     } else if (event.eventType === "item.started" || event.eventType === "item.delta" || event.eventType === "item.completed") {
+      // The inner OpenCode driver publishes session-scoped model metadata as
+      // an item before any turn exists. The outer Codex protocol facade emits
+      // its own model item, so forwarding this unbound duplicate would quite
+      // correctly trip the facade's strict turn-binding validator.
+      if (!shouldForwardOpenCodeProxyItem({ turnId: event.turnId, kind: payload.kind })) continue;
       const assistantText = payload.kind === "text" && typeof payload.text === "string"
         ? payload.text
         : null;
@@ -229,8 +248,12 @@ async function handle(message: RpcMessage): Promise<void> {
       break;
     case "thread/start": result = await open(params, false); break;
     case "thread/resume": result = await open(params, true); break;
+    case "collaborationMode/list":
+      result = openCodeProxyCollaborationModes(activeModel);
+      break;
     case "turn/start": {
       if (!session) throw new Error("OpenCode thread is not open");
+      assertOpenCodeProxyCollaborationMode(params);
       const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
       const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
       const turn = await session.startTurn({ message: { role: "user", text: messageText } });
@@ -238,12 +261,11 @@ async function handle(message: RpcMessage): Promise<void> {
       // OpenCode normally publishes session/turn startup over SSE, but a fast
       // completion can make the synchronous prompt response the only place the
       // authoritative turn id is observed. Emit the normalized notification
-      // after this request's JSON-RPC response: runnerd's request reader ignores
-      // notifications that arrive before the matching response. Clearing an
-      // earlier SSE announcement guarantees one post-response signal, while
-      // announceTurnStarted still deduplicates any later SSE echo.
+      // after this request's JSON-RPC response when SSE did not already announce
+      // it. runnerd buffers notifications received while awaiting a response,
+      // so replaying an earlier SSE announcement would violate strict turn
+      // binding at the outer driver.
       queueMicrotask(() => {
-        announcedTurnIds.delete(turn.turnId);
         announceTurnStarted(session!, turn.turnId);
       });
       result = { turn: { id: turn.turnId, status: "inProgress" } };
@@ -263,12 +285,38 @@ async function handle(message: RpcMessage): Promise<void> {
   send({ id: message.id, result });
 }
 
+let pendingInput = Promise.resolve();
+let bootstrapFailure: Error | null = null;
 input.on("line", (line) => {
   if (!line.trim()) return;
   let message: RpcMessage;
   try { message = JSON.parse(line) as RpcMessage; }
   catch (error) { process.stderr.write(`Invalid JSON-RPC input: ${String(error)}\n`); return; }
-  void handle(message).catch((error) => send({ id: message.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } }));
+  pendingInput = enqueueOpenCodeProxyInput(
+    pendingInput,
+    async () => {
+      if (bootstrapFailure) {
+        throw new Error(
+          `OpenCode provider bootstrap failed before ${message.method ?? "the dependent command"}: ${bootstrapFailure.message}`,
+        );
+      }
+      await handle(message);
+    },
+    (error) => {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      if (
+        message.method === "initialize"
+        || message.method === "thread/start"
+        || message.method === "thread/resume"
+      ) {
+        bootstrapFailure ??= normalized;
+      }
+      send({
+        id: message.id,
+        error: { code: -32000, message: normalized.message },
+      });
+    },
+  );
 });
 
 let shutdownPromise: Promise<void> | null = null;
@@ -287,6 +335,6 @@ function shutdown(exitCode = 0): Promise<void> {
   return shutdownPromise;
 }
 
-input.on("close", () => { void shutdown(); });
+input.on("close", () => { void pendingInput.then(() => shutdown()); });
 process.on("SIGTERM", () => { void shutdown(); });
 process.on("SIGINT", () => { void shutdown(); });

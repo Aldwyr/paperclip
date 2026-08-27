@@ -15,7 +15,7 @@ export function createSanitizedAcpxEnvironment(
     ? ["OPENROUTER_API_KEY"]
     : agent === "claude"
       ? ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
-      : ["OPENAI_API_KEY", "CODEX_API_KEY"];
+      : ["OPENAI_API_KEY", "CODEX_API_KEY", "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"];
   const allowed = new Set([
     "PATH", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",

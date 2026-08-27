@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { shouldQueueFollowupForRunningIssueWake } from "../services/heartbeat.ts";
 
 describe("shouldQueueFollowupForRunningIssueWake", () => {
-  it("queues a structured interaction response behind the turn that created it", () => {
+  it("preserves a deferred fallback while the source turn is still running", () => {
     expect(shouldQueueFollowupForRunningIssueWake({
       contextSnapshot: {
         wakeReason: "issue_commented",

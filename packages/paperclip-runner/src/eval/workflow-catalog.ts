@@ -97,20 +97,19 @@ export const RUNNER_WORKFLOW_CATALOG: readonly RunnerWorkflowEvalCase[] = Object
   }),
   workflow({
     id: "planning-lifecycle",
-    title: "Reject, revise, accept, and delegate a plan",
-    lanes: ["deterministic", "live"], tags: ["plan", "delegation", "approval"], coreLiveRepeat: false,
+    title: "Reject, revise, accept, and execute a cohesive plan on the source",
+    lanes: ["deterministic", "live"], tags: ["plan", "same-issue", "approval"], coreLiveRepeat: false,
     providers: [...ALL_PROVIDERS],
     steps: [
       { kind: "run_start", taskMode: "plan" },
       { kind: "review_decision", decision: "reject" },
       { kind: "review_decision", decision: "approve" },
-      { kind: "child_completion", childProvider: "opencode" },
     ],
     assertions: {
       issueStatus: "done", runStatus: "succeeded", semanticDisposition: "done", maxRuns: 4,
-      orderedMarkers: ["plan-v1", "rejection", "plan-v2", "acceptance", "child", "parent-final"],
-      requiredPrpEventTypes: ["plan.updated", "delegation.completed", "run.terminal"],
-      requiredOperationIds: ["write_document", "request_human_input", "create_task", "finish_task"],
+      orderedMarkers: ["plan-v1", "rejection", "plan-v2", "acceptance", "same-issue", "parent-final"],
+      requiredPrpEventTypes: ["plan.updated", "run.result.accepted", "run.terminal"],
+      requiredOperationIds: ["write_document", "request_human_input", "finish_task"],
     },
   }),
   workflow({
@@ -132,16 +131,20 @@ export const RUNNER_WORKFLOW_CATALOG: readonly RunnerWorkflowEvalCase[] = Object
   }),
   workflow({
     id: "delegation-return",
-    title: "Return one child summary without rediscovery",
-    lanes: ["deterministic", "live"], tags: ["delegation", "wake", "cross-provider"], coreLiveRepeat: false,
+    title: "Decompose an accepted plan for a justified independent boundary",
+    lanes: ["deterministic", "live"], tags: ["plan", "delegation", "dependency", "cross-provider"], coreLiveRepeat: false,
     providers: [...ALL_PROVIDERS],
-    steps: [{ kind: "run_start", taskMode: "execute" }, { kind: "child_completion", childProvider: "opencode" }],
+    steps: [
+      { kind: "run_start", taskMode: "plan" },
+      { kind: "review_decision", decision: "approve" },
+      { kind: "child_completion", childProvider: "opencode" },
+    ],
     assertions: {
       issueStatus: "done", runStatus: "succeeded", semanticDisposition: "done", maxRuns: 2,
       orderedMarkers: ["child-result", "parent-wake", "parent-final"],
       requiredPrpEventTypes: ["delegation.completed", "run.result.accepted", "run.terminal"],
       forbiddenPrpEventTypes: ["delegation.duplicate_wake"],
-      requiredOperationIds: ["create_task", "finish_task"],
+      requiredOperationIds: ["write_document", "request_human_input", "create_task", "set_dependencies", "finish_task"],
     },
   }),
   workflow({

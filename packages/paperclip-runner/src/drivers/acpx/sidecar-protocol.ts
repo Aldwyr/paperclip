@@ -1,5 +1,6 @@
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
+import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
 import {
   GENERATED_ACPX_SIDECAR_COMMANDS,
   GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
@@ -40,9 +41,12 @@ export interface AcpxSidecarOpenParams {
   workingDirectory: string;
   agent: QualifiedAcpxAgent;
   model: string;
+  permissionMode: NativeAcpxPermissionMode;
+  permissionModePinned: boolean;
   systemInstructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
   tools: readonly Readonly<Record<string, unknown>>[];
+  providerSessionKey?: string;
   expectedIdentity?: AcpxExpectedSessionIdentity;
 }
 
@@ -56,6 +60,7 @@ export interface AcpxExpectedSessionIdentity {
   workspaceDigest: string;
   requestedModel: string;
   effectiveModel: string;
+  permissionMode?: NativeAcpxPermissionMode;
 }
 
 export function parseAcpxSidecarRequest(value: unknown): AcpxSidecarRequest {
@@ -78,6 +83,25 @@ export function boundedSidecarValue(value: unknown, maxBytes = 64 * 1024): Recor
   const serialized = JSON.stringify(value);
   if (!serialized || Buffer.byteLength(serialized) > maxBytes) return { omitted: true, reason: "payload_limit" };
   return record(JSON.parse(serialized));
+}
+
+export function sanitizeAcpxPlanEntries(value: unknown): Array<{
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  priority: string | null;
+}> {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 256).flatMap((candidate) => {
+    const entry = record(candidate);
+    const content = text(entry.content).trim().slice(0, 4_000);
+    const status = text(entry.status);
+    if (!content || (status !== "pending" && status !== "in_progress" && status !== "completed")) return [];
+    return [{
+      content,
+      status,
+      priority: text(entry.priority).slice(0, 80) || null,
+    }];
+  });
 }
 
 export function record(value: unknown): Record<string, unknown> {

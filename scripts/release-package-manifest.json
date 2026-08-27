@@ -90,6 +90,11 @@
     "publishFromCi": false
   },
   {
+    "dir": "packages/paperclip-runner",
+    "name": "@paperclipai/paperclip-runner",
+    "publishFromCi": true
+  },
+  {
     "dir": "packages/plugins/sdk",
     "name": "@paperclipai/plugin-sdk",
     "publishFromCi": true

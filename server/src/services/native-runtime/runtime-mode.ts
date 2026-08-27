@@ -153,7 +153,7 @@ export function resolveNativeRuntimeMode(input: {
   }
   if (
     (!input.workspaceId && !runnerAdapterSelected && runnerProvider !== "claude_managed" && runnerProvider !== "aws_agentcore")
-    || input.target?.kind && input.target.kind !== "local"
+    || (!runnerAdapterSelected && input.target?.kind && input.target.kind !== "local")
   ) {
     throw new NativeRuntimeEligibilityError("a realized local workspace is required");
   }

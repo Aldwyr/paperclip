@@ -28,6 +28,7 @@ import { loadLiveConsoleConformanceFixture } from "../../protocol/live-console-f
 import {
   CodexAppServerDriver,
   createIsolatedCodexAppServerArgs,
+  parseCodexTurnDiff,
 } from "./codex-app-server-driver.js";
 import {
   runCodexCodexTracer,
@@ -99,6 +100,11 @@ class FakeCodexTransport implements CodexAppServerTransport {
   turnStartResponse: Promise<Record<string, unknown>> | null = null;
   goalState: Record<string, unknown> | null = null;
   confirmCollaborationMode = true;
+  runtimeRequestResolver: ((input: {
+    requestId: string;
+    turnId: string;
+    resolution: HarnessRuntimeRequestResolution;
+  }) => Promise<void>) | null = null;
 
   constructor(
     readonly threadId = "thread-1",
@@ -154,7 +160,7 @@ class FakeCodexTransport implements CodexAppServerTransport {
         modelProvider: "openai",
         cwd: "/workspace",
         sandbox: { type: "workspaceWrite" },
-        approvalPolicy: "never",
+        approvalPolicy: params.approvalPolicy,
         instructionSources: [],
       };
     }
@@ -215,6 +221,14 @@ class FakeCodexTransport implements CodexAppServerTransport {
 
   setServerRequestHandler(handler: CodexServerRequestHandler): void {
     this.handler = handler;
+  }
+
+  async resolveRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    resolution: HarnessRuntimeRequestResolution;
+  }): Promise<void> {
+    await this.runtimeRequestResolver?.(input);
   }
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
@@ -376,6 +390,69 @@ async function traceCompletedProposal(
 }
 
 describe("Codex app-server Codex driver", () => {
+  it("parses a complete Codex turn diff snapshot with bounded file statistics", () => {
+    expect(parseCodexTurnDiff([
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 95%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "--- a/src/old.ts",
+      "+++ b/src/new.ts",
+      "@@ -1 +1,2 @@",
+      "-old",
+      "+new",
+      "+another",
+      "diff --git a/assets/image.png b/assets/image.png",
+      "Binary files a/assets/image.png and b/assets/image.png differ",
+    ].join("\n"))).toEqual([
+      expect.objectContaining({
+        path: "src/new.ts",
+        previousPath: "src/old.ts",
+        operation: "rename",
+        additions: 2,
+        deletions: 1,
+        binary: false,
+      }),
+      expect.objectContaining({
+        path: "assets/image.png",
+        operation: "modify",
+        additions: null,
+        deletions: null,
+        binary: true,
+      }),
+    ]);
+  });
+
+  it("bounds aggregate Codex diffs and rejects unsafe workspace paths", () => {
+    const patches = Array.from({ length: 2_001 }, (_, index) => [
+      `diff --git a/src/file-${index}.ts b/src/file-${index}.ts`,
+      `--- a/src/file-${index}.ts`,
+      `+++ b/src/file-${index}.ts`,
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n"));
+    expect(parseCodexTurnDiff(patches.join("\n"))).toHaveLength(2_000);
+
+    const oversized = parseCodexTurnDiff([
+      "diff --git a/src/large.ts b/src/large.ts",
+      "--- a/src/large.ts",
+      "+++ b/src/large.ts",
+      "@@ -0,0 +1 @@",
+      `+${"x".repeat(300_000)}`,
+    ].join("\n"));
+    expect(oversized[0]?.diff).toHaveLength(256 * 1_024);
+
+    expect(parseCodexTurnDiff([
+      "diff --git a/../../secret.txt b/../../secret.txt",
+      "--- a/../../secret.txt",
+      "+++ b/../../secret.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n"))).toEqual([]);
+  });
+
   it("persists process ownership before sending provider requests", async () => {
     const transport = new FakeCodexTransport();
     Object.assign(transport, {
@@ -459,6 +536,27 @@ describe("Codex app-server Codex driver", () => {
     });
   });
 
+  it("forwards the persisted native model to the runner transport", async () => {
+    const transport = new FakeCodexTransport();
+    const driver = makeDriver([transport], { model: "qualified-provider-model" });
+
+    await driver.openSession({
+      runId: "run-qualified-model",
+      normalizedSessionId: "normalized-qualified-model",
+      workingDirectory: "/workspace",
+    });
+
+    expect(
+      transport.calls.find((call) => call.method === "thread/start")?.params,
+    ).toMatchObject({
+      model: "qualified-provider-model",
+      completionContract: {
+        revision: "codex-demo-v1",
+        criterionIds: ["file"],
+      },
+    });
+  });
+
   it("places Paperclip runtime instructions in Codex's system channel and enables only selected skill instructions", async () => {
     const transport = new FakeCodexTransport();
     const baseInstructions = [
@@ -504,6 +602,38 @@ describe("Codex app-server Codex driver", () => {
     transport.push("turn/started", {
       threadId: "thread-1",
       turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("turn/plan/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      revision: 1,
+      plan: [
+        { step: "Inspect", status: "completed" },
+        { step: "Implement", status: "inProgress" },
+      ],
+    });
+    transport.push("turn/diff/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      revision: 1,
+      diff: [
+        "diff --git a/hello.txt b/hello.txt",
+        "--- a/hello.txt",
+        "+++ b/hello.txt",
+        "@@ -1 +1,2 @@",
+        "-hello",
+        "+hello world",
+        "+again",
+      ].join("\n"),
+    });
+    transport.push("turn/plan/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      revision: 2,
+      plan: [
+        { step: "Inspect", status: "completed" },
+        { step: "Implement", status: "completed" },
+      ],
     });
     transport.push("item/started", {
       threadId: "thread-1",
@@ -584,13 +714,26 @@ describe("Codex app-server Codex driver", () => {
     expect(
       events.filter((event) => event.eventType === "run.terminal"),
     ).toHaveLength(0);
-    expect(
-      events.find((event) => event.eventType === "workspace.change.updated")
-        ?.payload,
-    ).toMatchObject({
+    const workspaceEvents = events.filter((event) => event.eventType === "workspace.change.updated");
+    expect(workspaceEvents[0]?.payload).toMatchObject({
+      schema: "paperclip.workspace.diff.v1",
+      changeSetId: `${turn.turnId}:workspace`,
+      complete: false,
+      totals: { files: 1, additions: 2, deletions: 1 },
+    });
+    expect(workspaceEvents.at(-1)?.payload).toMatchObject({
       schema: "paperclip.workspace.diff.v1",
       complete: true,
       totals: { files: 1 },
+    });
+    const planEvents = events.filter((event) => event.eventType === "plan.updated");
+    expect(planEvents).toHaveLength(2);
+    expect(new Set(planEvents.map((event) => event.itemId))).toEqual(new Set([turn.turnId]));
+    expect(planEvents.at(-1)?.payload).toMatchObject({
+      planId: turn.turnId,
+      revision: 2,
+      complete: true,
+      syncStatus: "not_applicable",
     });
     expect(
       events.find((event) => event.eventType === "workspace.diff.recorded")
@@ -658,6 +801,40 @@ describe("Codex app-server Codex driver", () => {
     });
   });
 
+  it("admits a strictly bound semantic result from the durable runner", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-durable-result",
+      normalizedSessionId: "normalized-durable-result",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Finish through runnerd." },
+    });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("paperclip/runResult", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      itemId: "semantic-result-1",
+      result,
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "completed", items: [] },
+    });
+
+    const events = await collectUntilTerminal(session.events());
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(
+      events.find((event) => event.eventType === "run.result.proposed"),
+    ).toMatchObject({ turnId: turn.turnId, itemId: "semantic-result-1" });
+  });
+
   it("correlates rehydrated notifications with the final canonical PRP event ids", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({
@@ -712,6 +889,166 @@ describe("Codex app-server Codex driver", () => {
       expect.arrayContaining(itemMapping?.emittedEventIds ?? []),
     );
     expect(JSON.stringify(events)).not.toContain("paperclipTrace");
+  });
+
+  it("maps canonical workspace snapshots with monotonic revisions and one terminal diff", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-canonical-workspace",
+      normalizedSessionId: "normalized-canonical-workspace",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Change the workspace." },
+    });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    const first = {
+      schema: "paperclip.workspace.diff.v1",
+      changeSetId: `${turn.turnId}:workspace`,
+      revision: 1,
+      source: "harness_reported",
+      complete: false,
+      files: [{
+        path: "src/index.ts",
+        operation: "modify",
+        previousPath: null,
+        additions: 1,
+        deletions: 0,
+        binary: false,
+        diff: "+first\n",
+      }],
+      totals: { files: 1, additions: 1, deletions: 0 },
+      patchArtifactRef: null,
+    };
+    const second = {
+      ...first,
+      revision: 1,
+      files: [
+        first.files[0],
+        {
+          path: "src/new-name.ts",
+          operation: "rename",
+          previousPath: "src/old-name.ts",
+          additions: 0,
+          deletions: 0,
+          binary: false,
+          diff: "rename from src/old-name.ts\nrename to src/new-name.ts\n",
+        },
+        {
+          path: "public/image.png",
+          operation: "modify",
+          previousPath: null,
+          additions: null,
+          deletions: null,
+          binary: true,
+          diff: null,
+        },
+      ],
+      totals: { files: 3, additions: null, deletions: null },
+    };
+    transport.pushTraced(
+      "paperclip/workspaceChange/updated",
+      { threadId: "thread-1", turnId: turn.turnId, workspaceChange: first },
+      "event_workspace_1",
+      "workspace.change.updated",
+    );
+    transport.pushTraced(
+      "paperclip/workspaceChange/updated",
+      { threadId: "thread-1", turnId: turn.turnId, workspaceChange: second },
+      "event_workspace_2",
+      "workspace.change.updated",
+    );
+    transport.push("paperclip/workspaceChange/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      workspaceChange: second,
+    });
+    transport.push("paperclip/workspaceChange/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      workspaceChange: {
+        ...second,
+        files: [{ ...second.files[0], path: "/absolute/not-allowed.ts" }],
+      },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "completed", items: [] },
+    });
+
+    const events = await collectUntilTerminal(session.events());
+    const updates = events.filter(
+      (event) => event.eventType === "workspace.change.updated",
+    );
+    expect(
+      updates.map(
+        (event) => (event.payload as Record<string, unknown>).revision,
+      ),
+    ).toEqual([1, 2]);
+    expect(
+      (updates[1]?.payload as Record<string, unknown>).files,
+    ).toHaveLength(3);
+    expect(events.filter((event) => event.eventType === "workspace.diff.recorded"))
+      .toHaveLength(1);
+    expect(
+      events.find((event) => event.eventType === "workspace.diff.recorded")?.payload,
+    ).toMatchObject({
+      revision: 2,
+      source: "runner_verified",
+      complete: true,
+      totals: { files: 3, additions: null, deletions: null },
+    });
+    expect(
+      transport.traceInterpretations.filter((entry) =>
+        entry.providerMethod === "paperclip/workspaceChange/updated"
+      ).map((entry) => entry.disposition),
+    ).toEqual(["mapped", "mapped"]);
+  });
+
+  it("finalizes an authoritative empty workspace snapshot when a turn is interrupted", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-empty-interrupted-workspace",
+      normalizedSessionId: "normalized-empty-interrupted-workspace",
+      workingDirectory: "/workspace",
+    });
+    const turn = await session.startTurn({
+      message: { role: "user", text: "Inspect without changing files." },
+    });
+    transport.push("turn/started", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "inProgress" },
+    });
+    transport.push("paperclip/workspaceChange/updated", {
+      threadId: "thread-1",
+      turnId: turn.turnId,
+      workspaceChange: {
+        schema: "paperclip.workspace.diff.v1",
+        changeSetId: `${turn.turnId}:workspace`,
+        revision: 1,
+        source: "harness_reported",
+        complete: false,
+        files: [],
+        totals: { files: 0, additions: 0, deletions: 0 },
+        patchArtifactRef: null,
+      },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: turn.turnId, status: "interrupted", items: [] },
+    });
+
+    const events = await collectUntilTerminal(session.events());
+    expect(events.find((event) => event.eventType === "workspace.change.updated")?.payload)
+      .toMatchObject({ revision: 1, complete: false, totals: { files: 0 } });
+    expect(events.filter((event) => event.eventType === "workspace.diff.recorded"))
+      .toHaveLength(1);
+    expect(events.find((event) => event.eventType === "workspace.diff.recorded")?.payload)
+      .toMatchObject({ revision: 1, source: "runner_verified", complete: true, totals: { files: 0 } });
+    expect(events.some((event) => event.eventType === "turn.interrupted")).toBe(true);
   });
 
   it("accepts a thread usage snapshot replayed before a resumed turn starts", async () => {
@@ -974,6 +1311,33 @@ describe("Codex app-server Codex driver", () => {
       const: "blocked",
     });
   });
+
+  it.each(["never", "on-request", "untrusted"] as const)(
+    "pins approval policy %s for both thread start and resume",
+    async (approvalPolicy) => {
+      const first = new FakeCodexTransport();
+      const second = new FakeCodexTransport();
+      const driver = makeDriver([first, second], { approvalPolicy });
+      const original = await driver.openSession({
+        runId: `run-policy-${approvalPolicy}`,
+        normalizedSessionId: `normalized-policy-${approvalPolicy}`,
+        workingDirectory: "/workspace",
+      });
+      const started = await original.events()[Symbol.asyncIterator]().next();
+      const snapshot = await original.snapshot();
+      await original.close({ reason: "policy recovery test" });
+      const recovered = await driver.recoverSession?.(snapshot);
+      expect(recovered).toMatchObject({ recovered: true });
+      const resumed = await recovered!.session!.events()[Symbol.asyncIterator]().next();
+      expect(first.calls.find((call) => call.method === "thread/start")?.params)
+        .toMatchObject({ approvalPolicy });
+      expect(second.calls.find((call) => call.method === "thread/resume")?.params)
+        .toMatchObject({ approvalPolicy });
+      expect(started.value).toMatchObject({ eventType: "session.started", payload: { context: { approvalPolicy } } });
+      expect(resumed.value).toMatchObject({ eventType: "session.resumed", payload: { context: { approvalPolicy } } });
+      await recovered?.session?.close({ reason: "policy recovery complete" });
+    },
+  );
 
   it("allows eval fixtures to opt out of Codex collaboration instructions", async () => {
     const transport = new FakeCodexTransport();
@@ -1613,6 +1977,7 @@ describe("Codex app-server Codex driver", () => {
       questions: [
         {
           id: "environment",
+          required: false,
           answerMode: "single_select",
           customAnswer: { enabled: true },
           options: [
@@ -1620,7 +1985,7 @@ describe("Codex app-server Codex driver", () => {
             { id: "option-2", label: "Production", description: "Deploy directly to production." },
           ],
         },
-        { id: "regions", answerMode: "multi_select" },
+        { id: "regions", answerMode: "multi_select", required: false },
         { id: "notes", answerMode: "text", required: false },
       ],
     });
@@ -1847,6 +2212,154 @@ describe("Codex app-server Codex driver", () => {
     expect(validatePrpEvent(expired!)).toMatchObject({ ok: true });
   });
 
+  it("hands a live canonical input off exactly once when the durable window expires", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-durable-handoff",
+      normalizedSessionId: "normalized-durable-handoff",
+      workingDirectory: "/workspace",
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask before continuing." },
+    });
+    const pending = transport.invoke({
+      id: "handoff-input",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "handoff-input-item",
+        questions: [{
+          id: "environment",
+          header: "Environment",
+          question: "Where should we deploy?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        }],
+      },
+    });
+    let created: PrpEvent | null = null;
+    for (let count = 0; count < 20; count += 1) {
+      const event = await iterator.next();
+      if (event.done) break;
+      if (event.value.eventType === "runtime_request.created") {
+        created = event.value;
+        break;
+      }
+    }
+    expect(created).not.toBeNull();
+
+    await expect(session.handoffRuntimeRequest?.({
+      requestId: "handoff-input",
+      turnId,
+      reason: "durable_handoff",
+    })).resolves.toBe("handed_off");
+    await expect(session.handoffRuntimeRequest?.({
+      requestId: "handoff-input",
+      turnId,
+      reason: "durable_handoff",
+    })).resolves.toBe("already_settled");
+    expect(await pending).toEqual({ answers: {} });
+
+    let expired: PrpEvent | null = null;
+    for (let count = 0; count < 20; count += 1) {
+      const event = await iterator.next();
+      if (event.done) break;
+      if (event.value.eventType === "runtime_request.expired") {
+        expired = event.value;
+        break;
+      }
+    }
+    expect(expired).toMatchObject({
+      turnId,
+      itemId: "handoff-input-item",
+      payload: {
+        requestId: "handoff-input",
+        reason: "durable_handoff",
+        replayAllowed: false,
+        requestType: "input",
+        request: {
+          schema: "paperclip.runtime_request.v2",
+          requestId: "handoff-input",
+          type: "input",
+        },
+      },
+    });
+    await session.close({ reason: "test complete" });
+  });
+
+  it("lets an answer claimed before expiry win the terminal-event race", async () => {
+    const transport = new FakeCodexTransport();
+    let releaseResolution!: () => void;
+    transport.runtimeRequestResolver = () => new Promise<void>((resolve) => {
+      releaseResolution = resolve;
+    });
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-answer-handoff-race",
+      normalizedSessionId: "normalized-answer-handoff-race",
+      workingDirectory: "/workspace",
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: "Ask before continuing." },
+    });
+    const providerRequest = transport.invoke({
+      id: "race-input",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId,
+        itemId: "race-input-item",
+        questions: [{
+          id: "environment",
+          header: "Environment",
+          question: "Where should we deploy?",
+          options: [{ label: "Staging" }, { label: "Production" }],
+        }],
+      },
+    });
+    for (let count = 0; count < 20; count += 1) {
+      const event = await iterator.next();
+      if (event.done || event.value.eventType === "runtime_request.created") break;
+    }
+    const resolution = session.resolveRuntimeRequest!({
+      requestId: "race-input",
+      turnId,
+      resolution: {
+        action: "submit",
+        response: {
+          schema: "paperclip.question_response.v1",
+          answers: { environment: { selectedOptionIds: ["option-1"] } },
+        },
+      },
+    });
+    await Promise.resolve();
+    await expect(session.handoffRuntimeRequest?.({
+      requestId: "race-input",
+      turnId,
+      reason: "durable_handoff",
+    })).resolves.toBe("already_settled");
+    releaseResolution();
+    await resolution;
+    await providerRequest;
+
+    let terminalEvent: PrpEvent | null = null;
+    for (let count = 0; count < 20; count += 1) {
+      const event = await iterator.next();
+      if (event.done) break;
+      if (
+        event.value.payload.requestId === "race-input"
+        && ["runtime_request.resolved", "runtime_request.cancelled", "runtime_request.expired"].includes(event.value.eventType)
+      ) {
+        terminalEvent = event.value;
+        break;
+      }
+    }
+    expect(terminalEvent?.eventType).toBe("runtime_request.resolved");
+    expect(session.pendingRuntimeRequests?.()).toEqual([]);
+    await session.close({ reason: "test complete" });
+  });
+
   it("redacts browser-visible request details and diagnostics from the fixture markers", async () => {
     const fixture = await loadLiveConsoleConformanceFixture(
       liveConsoleFixturePath,
@@ -1960,6 +2473,61 @@ describe("Codex app-server Codex driver", () => {
     expect(
       events.filter((event) => event.eventType === "turn.completed"),
     ).toHaveLength(1);
+  });
+
+  it("accepts a normalized runnerd echo of a tool-committed semantic result", async () => {
+    const transport = new FakeCodexTransport();
+    const session = await makeDriver([transport]).openSession({
+      runId: "run-result-normalized-echo",
+      normalizedSessionId: "normalized-result-normalized-echo",
+      workingDirectory: "/workspace",
+    });
+    await session.startTurn({ message: { role: "user", text: "Complete." } });
+    const toolShaped = structuredClone(result) as unknown as Record<string, unknown>;
+    toolShaped.verification = [{
+      commandOrCheck: "read hello.txt",
+      status: "passed",
+      result: "hello",
+    }];
+    delete toolShaped.attentionRequests;
+    expect(
+      await transport.invoke({
+        id: "tool-result",
+        method: "item/tool/call",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          callId: "tool-result",
+          tool: "paperclip_finish",
+          arguments: toolShaped,
+        },
+      }),
+    ).toMatchObject({ success: true });
+    transport.push("paperclip/runResult", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "tool-result",
+      result: {
+        ...result,
+        verification: [{
+          commandOrCheck: "read hello.txt",
+          status: "passed",
+          detail: "hello",
+        }],
+      },
+    });
+    transport.push("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed", items: [] },
+    });
+
+    const events = await collectUntilTerminal(session.events());
+    expect(
+      events.filter((event) => event.eventType === "run.result.proposed"),
+    ).toHaveLength(1);
+    expect(events.some((event) => event.eventType === "session.failed")).toBe(
+      false,
+    );
   });
 
   it("advertises and dispatches run-authorized control-plane tools", async () => {

@@ -202,7 +202,7 @@ function SidePanelStoryHarness(args: SidePanelStoryArgs) {
       open={launcherOpen}
       onOpenChange={setLauncherOpen}
       trigger={(
-        <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 rounded-xl" aria-label="Open a new tab">
+        <Button type="button" variant="ghost" size="icon-sm" className="h-(--side-panel-tab-height) w-(--side-panel-tab-height) shrink-0 rounded-xl text-muted-foreground hover:text-foreground focus-visible:text-foreground" aria-label="Open a new tab">
           <Plus aria-hidden />
         </Button>
       )}
@@ -286,6 +286,84 @@ function SidePanelStoryHarness(args: SidePanelStoryArgs) {
   return <div className={args.dark ? "dark" : undefined}>{frame}</div>;
 }
 
+function TaskPagePersistentLauncherStory() {
+  const [panelOpen, setPanelOpen] = useState(false);
+
+  return (
+    <div className="flex h-screen min-h-0 overflow-hidden bg-background text-foreground">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-4 md:px-6">
+          <span className="shrink-0 text-sm text-muted-foreground">Tasks</span>
+          <span aria-hidden className="text-muted-foreground">›</span>
+          <span className="shrink-0 font-mono text-sm text-muted-foreground">PAP-16679</span>
+          <span className="min-w-0 flex-1 truncate text-sm">
+            Keep the task side-panel launcher available while scrolling
+          </span>
+          {panelOpen ? null : (
+            <span data-testid="task-page-panel-launcher">
+              <SidePanelToggleButton
+                open={false}
+                onToggle={() => setPanelOpen(true)}
+                shortcut="]"
+              />
+            </span>
+          )}
+        </header>
+
+        <main
+          data-testid="scrollable-task-page"
+          className="min-h-0 flex-1 overflow-y-auto px-5 py-8 md:px-12"
+        >
+          <div className="mx-auto max-w-3xl space-y-7">
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <span className="flex size-6 items-center justify-center rounded-full bg-muted text-(length:--text-nano)">CO</span>
+                Codex
+              </div>
+              <p className="text-sm leading-6 text-muted-foreground">
+                This full task frame demonstrates that the launcher belongs to the persistent
+                task row rather than the scrollable conversation header.
+              </p>
+            </div>
+            {Array.from({ length: 18 }, (_, index) => (
+              <section key={index} className="space-y-2 py-2">
+                <div className="text-sm font-medium">Task activity {index + 1}</div>
+                <p className="text-sm leading-6 text-muted-foreground">
+                  Runner commentary, workspace activity, and historical receipts can make the
+                  thread much taller than the viewport. Scroll here and the task row remains in
+                  place with its panel launcher.
+                </p>
+              </section>
+            ))}
+          </div>
+        </main>
+      </div>
+
+      {panelOpen ? (
+        <div className="w-[380px] shrink-0">
+          <SidePanelFrame
+            open
+            presentation="docked"
+            contentMode="padded"
+            header={<div className="px-2 text-sm font-medium">Task properties</div>}
+            trailingControls={(
+              <SidePanelToggleButton open onToggle={() => setPanelOpen(false)} />
+            )}
+          >
+            <div className="space-y-4">
+              <h2 className="text-base font-semibold">Properties</h2>
+              <p className="text-sm text-muted-foreground">
+                The top-row launcher is hidden while this panel is open. Use the panel control to
+                close it and restore the launcher.
+              </p>
+            </div>
+          </SidePanelFrame>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 const meta = {
   title: "Navigation/Side Panel",
   component: SidePanelStoryHarness,
@@ -357,6 +435,26 @@ export const MobileSheet: Story = {
   parameters: { viewport: { defaultViewport: "mobile1" } },
 };
 
+export const TaskPagePersistentLauncher: Story = {
+  name: "Task Page / Persistent Launcher",
+  render: () => <TaskPagePersistentLauncherStory />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const taskPage = canvas.getByTestId("scrollable-task-page");
+    taskPage.scrollTop = 900;
+    taskPage.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    const launcher = canvas.getByTestId("task-page-panel-launcher");
+    await expect(launcher).toBeVisible();
+    await userEvent.click(within(launcher).getByRole("button", { name: "Toggle side panel" }));
+    await expect(canvas.queryByTestId("task-page-panel-launcher")).not.toBeInTheDocument();
+    await expect(canvas.getByText("Task properties")).toBeVisible();
+
+    await userEvent.click(canvas.getByRole("button", { name: "Toggle side panel" }));
+    await expect(canvas.getByTestId("task-page-panel-launcher")).toBeVisible();
+  },
+};
+
 export const KeyboardNavigationAndClose: Story = {
   args: { width: 620, initialTabCount: 4, initialActiveTabId: "properties" },
   play: async ({ canvasElement }) => {
@@ -395,7 +493,12 @@ export const ClosingInactiveTab: Story = {
   args: { width: 620, initialTabCount: 4, initialActiveTabId: "document:plan" },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByRole("button", { name: "Close Artifacts" }));
+    const artifacts = await canvas.findByRole("tab", { name: "Artifacts" });
+    await expect(canvas.queryByRole("button", { name: "Close Artifacts" })).not.toBeInTheDocument();
+    await userEvent.pointer([
+      { keys: "[MouseMiddle>]", target: artifacts },
+      { keys: "[/MouseMiddle]", target: artifacts },
+    ]);
     await expect(canvas.queryByRole("tab", { name: "Artifacts" })).not.toBeInTheDocument();
     await expect(canvas.getByRole("tab", { name: "Plan" })).toHaveAttribute("aria-selected", "true");
   },
@@ -731,7 +834,7 @@ function TaskCompositionFixture({ state }: { state: TaskFixtureState }) {
       presentation="popover"
       open={launcherOpen}
       onOpenChange={setLauncherOpen}
-      trigger={<Button variant="ghost" size="icon-sm" aria-label="Open a new tab"><Plus /></Button>}
+      trigger={<Button variant="ghost" size="icon-sm" className="h-(--side-panel-tab-height) w-(--side-panel-tab-height)" aria-label="Open a new tab"><Plus /></Button>}
     />
   );
   return (

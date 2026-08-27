@@ -23,7 +23,7 @@ class ResizeObserverStub {
 (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
 
 const fixture = vi.hoisted(() => ({
-  documents: [] as IssueDocument[],
+  documents: [] as IssueDocument[] | undefined,
   plan: null as IssueDocument | null,
 }));
 
@@ -161,6 +161,12 @@ describe("TaskSidePanel", () => {
     await render(panel({ issue: issue({ workMode: "planning" }) }));
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Plan");
     expect(container.textContent).toContain("Plan content");
+    const viewport = container.querySelector<HTMLElement>('[role="tabpanel"][data-side-panel-content-viewport="true"]')!;
+    const prose = viewport.querySelector<HTMLElement>('[data-side-panel-prose-content="true"]')!;
+    expect(viewport.className).toContain("overflow-auto");
+    expect(viewport.className).toContain("scrollbar-while-scrolling");
+    expect(viewport.className).not.toContain("max-w-4xl");
+    expect(prose.className).toContain("max-w-4xl");
   });
 
   it("opens a newly materialized plan until the user has interacted", async () => {
@@ -168,6 +174,17 @@ describe("TaskSidePanel", () => {
     fixture.plan = issueDocument("plan", "Plan");
     fixture.documents = [fixture.plan];
     await render(panel());
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Plan");
+  });
+
+  it("opens a plan deep link without looping while document metadata loads", async () => {
+    fixture.documents = undefined;
+
+    await render(panel({
+      issue: issue({ workMode: "planning" }),
+      documentDeepLink: { requestId: 1, documentKey: "plan" },
+    }));
+
     expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Plan");
   });
 

@@ -18,14 +18,15 @@ fn build_metadata() -> serde_json::Value {
         "binaryName": "paperclip-runnerd",
         "packageName": "@paperclipai/paperclip-runner",
         "packageVersion": env!("CARGO_PKG_VERSION"),
-        "binaryContractVersion": 1,
+        "binaryContractVersion": 2,
         "nativeExecutionVersion": 1,
         "harnessDriverVersion": 1,
         "prp": {
             "name": "paperclip.runner",
             "minimumVersion": 1,
             "maximumVersion": 1
-        }
+        },
+        "prpTransportModes": ["dial_ws_loopback", "dial_wss", "listen_ws"]
     })
 }
 
@@ -225,8 +226,40 @@ fn run_durable_mode(
     let max_runtime = optional_duration_value(args, "--max-lifetime-ms")?
         .or(optional_duration_value(args, "--max-runtime-ms")?)
         .unwrap_or(Duration::MAX);
+    let connect_url = match (
+        args.iter().any(|argument| argument == "--connect-url"),
+        args.iter().any(|argument| argument == "--listen-address")
+            || args.iter().any(|argument| argument == "--listen-port")
+            || args.iter().any(|argument| argument == "--listen-path"),
+    ) {
+        (true, false) => value(args, "--connect-url")?,
+        (false, true) => {
+            let address = value(args, "--listen-address")?;
+            let port = value(args, "--listen-port")?;
+            let path = value(args, "--listen-path")?;
+            if address != "0.0.0.0" || port != "43127" {
+                return Err(LocalRunnerError::invalid(
+                    "runner listener requires --listen-address 0.0.0.0 and --listen-port 43127",
+                ));
+            }
+            if !path.starts_with("/api/runner/v1/connect/") || path.contains(['?', '#', '\\']) {
+                return Err(LocalRunnerError::invalid("runner listener path is invalid"));
+            }
+            format!("listen://{address}:{port}{path}")
+        }
+        _ => {
+            return Err(LocalRunnerError::invalid(
+                "durable runner requires exactly one of --connect-url or --listen-address/--listen-port/--listen-path",
+            ))
+        }
+    };
     let config = DurableRunnerConfig {
-        connect_url: value(args, "--connect-url")?,
+        connect_url,
+        ca_bundle_path: args
+            .iter()
+            .any(|argument| argument == "--ca-bundle-path")
+            .then(|| value(args, "--ca-bundle-path").map(PathBuf::from))
+            .transpose()?,
         state_dir: PathBuf::from(value(args, "--state-dir")?),
         runner_instance_id: value(args, "--runner-id")?,
         environment_lease_id: value(args, "--environment-lease-id")?,
@@ -250,6 +283,7 @@ fn run_durable_mode(
         p0_reserve_bytes: usize_value(args, "--p0-reserve-bytes", 32 * 1024)?,
         max_frame_bytes: usize_value(args, "--max-frame-bytes", 1024 * 1024)?,
         reconnect_delay: duration_value(args, "--reconnect-delay-ms", 25)?,
+        reconnect_grace: optional_duration_value(args, "--reconnect-grace-ms")?,
         max_runtime,
         lifecycle_mode,
         idle_timeout,
@@ -272,7 +306,9 @@ fn run(bootstrap_ticket: Option<BootstrapTicket>) -> Result<(), LocalRunnerError
     {
         return run_codex_app_server_proxy(&args);
     }
-    if args.iter().any(|argument| argument == "--connect-url") {
+    if args.iter().any(|argument| argument == "--connect-url")
+        || args.iter().any(|argument| argument == "--listen-address")
+    {
         return run_durable_mode(&args, bootstrap_ticket);
     }
     run_local_runner(RunnerConfig {
@@ -300,11 +336,15 @@ mod tests {
         let metadata = build_metadata();
         assert_eq!(metadata["schema"], RUNNERD_BUILD_METADATA_SCHEMA);
         assert_eq!(metadata["packageVersion"], "0.1.2");
-        assert_eq!(metadata["binaryContractVersion"], 1);
+        assert_eq!(metadata["binaryContractVersion"], 2);
         assert_eq!(metadata["nativeExecutionVersion"], 1);
         assert_eq!(metadata["harnessDriverVersion"], 1);
         assert_eq!(metadata["prp"]["minimumVersion"], 1);
         assert_eq!(metadata["prp"]["maximumVersion"], 1);
+        assert_eq!(
+            metadata["prpTransportModes"],
+            json!(["dial_ws_loopback", "dial_wss", "listen_ws"])
+        );
     }
 }
 

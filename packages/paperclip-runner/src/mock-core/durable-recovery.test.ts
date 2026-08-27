@@ -25,6 +25,10 @@ import {
   runDurableRecoveryRecovery,
   runDurableToolBridgeConformance,
 } from "./durable-recovery.js";
+import {
+  spawnRunner,
+  type RunnerProcessLaunchSpec,
+} from "../control-plane/durable-prp-control-plane.js";
 
 async function upgradeSocket(url: string): Promise<Socket> {
   const parsed = new URL(url);
@@ -1001,6 +1005,10 @@ describe.sequential("Durable transport and recovery", () => {
       AWS_ACCESS_KEY_ID: "must-not-cross-runner-boundary",
       AWS_SESSION_TOKEN: "must-not-cross-runner-boundary",
       ANTHROPIC_API_KEY: "sk-ant-live-only",
+      CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-live-only",
+      OPENAI_API_KEY: "openai-live-only",
+      CODEX_API_KEY: "codex-live-only",
+      PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-codex-auth-live-only",
       UNRELATED_SERVER_SECRET: "must-not-cross-runner-boundary",
     });
 
@@ -1011,10 +1019,68 @@ describe.sequential("Durable transport and recovery", () => {
     expect(environment.AWS_REGION).toBe("us-east-1");
     expect(environment.AWS_ACCESS_KEY_ID).toBeUndefined();
     expect(environment.AWS_SESSION_TOKEN).toBeUndefined();
+    expect(environment.CLAUDE_CODE_OAUTH_TOKEN).toBe("claude-oauth-live-only");
+    expect(environment.OPENAI_API_KEY).toBe("openai-live-only");
+    expect(environment.CODEX_API_KEY).toBe("codex-live-only");
+    expect(environment.PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET)
+      .toBe("managed-codex-auth-live-only");
     expect(environment.UNRELATED_SERVER_SECRET).toBeUndefined();
     expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
-    expect(environment.OPENAI_API_KEY).toBeUndefined();
     expect(environment.EMAIL_AGENTMAIL_GENERAL_API_KEY).toBeUndefined();
+  });
+
+  it("relaunches an immutable runner specification with a fresh one-use bootstrap ticket", () => {
+    const launches: RunnerProcessLaunchSpec[] = [];
+    const processLauncher = (spec: RunnerProcessLaunchSpec) => {
+      launches.push(spec);
+      return {
+        child: {
+          pid: 42,
+          exitCode: null,
+          signalCode: null,
+          kill: () => true,
+        },
+        completion: new Promise<never>(() => undefined),
+      };
+    };
+    const first = spawnRunner({
+      connection: {
+        mode: "listen",
+        listenAddress: "0.0.0.0",
+        listenPort: 43_127,
+        listenPath: "/api/runner/v1/connect/run-1",
+      },
+      stateDirectory: "/runner-state",
+      identity: {
+        runnerInstanceId: "runner-1",
+        environmentLeaseId: "lease-1",
+        runId: "run-1",
+        normalizedSessionId: "session-1",
+        turnId: "turn-1",
+        itemId: "item-1",
+      },
+      ticket: "bootstrap-first",
+      maxOutboxBytes: 1024,
+      p0ReserveBytes: 512,
+      environment: {
+        PATH: "/usr/bin",
+        PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-codex-auth-canary",
+      },
+      processLauncher,
+    });
+    const second = first.restart?.("bootstrap-second");
+
+    expect(second).toBeDefined();
+    expect(launches).toHaveLength(2);
+    expect(launches[0]?.environment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET)
+      .toBe("bootstrap-first");
+    expect(launches[1]?.environment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET)
+      .toBe("bootstrap-second");
+    expect(launches[0]?.environment.PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET)
+      .toBe("managed-codex-auth-canary");
+    expect(launches[1]?.environment.PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET)
+      .toBe("managed-codex-auth-canary");
+    expect(launches[1]?.args).toEqual(launches[0]?.args);
   });
 
   it("keeps the eval connection lease independent from the provider turn deadline", () => {

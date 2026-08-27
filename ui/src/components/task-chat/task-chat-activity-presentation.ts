@@ -15,7 +15,6 @@ import {
   ShieldCheck,
   TerminalSquare,
   Users,
-  type LucideIcon,
 } from "lucide-react";
 import type {
   TaskChatMaterializedResourceItem,
@@ -24,9 +23,16 @@ import type {
   TaskChatWorkspaceChangeItem,
   TaskChatWorkspaceFileItem,
 } from "./task-chat-model";
+import {
+  humanizeToolName,
+  isGenericToolName,
+  mcpToolIdentity,
+  toolActivityPresentation,
+  type ToolIcon,
+} from "./tool-taxonomy";
 
 export interface TaskChatActivityPresentation {
-  icon: LucideIcon;
+  icon: ToolIcon;
   runningLabel: string;
   completedLabel: string;
   failedLabel?: string;
@@ -36,6 +42,11 @@ export interface TaskChatActivityPresentation {
 
 function providerDetail(item: TaskChatProviderActivityItem, ...labels: string[]): string | undefined {
   return item.details.find((entry) => labels.includes(entry.label))?.value;
+}
+
+function meaningfulToolDetail(value: string | undefined): string | undefined {
+  if (!value || isGenericToolName(value) || /^tool(?:\s+|_)call\b/i.test(value)) return undefined;
+  return value;
 }
 
 export function providerActivityPresentation(item: TaskChatProviderActivityItem): TaskChatActivityPresentation {
@@ -52,8 +63,39 @@ export function providerActivityPresentation(item: TaskChatProviderActivityItem)
       }
       return { icon: Search, runningLabel: "Searching the web", completedLabel: "Searched the web", failedLabel: "Web search failed", interruptedLabel: "Web search stopped", detail };
     }
-    case "tool_execution":
-      return { icon: TerminalSquare, runningLabel: "Running a tool", completedLabel: "Ran a tool", failedLabel: "Tool failed", interruptedLabel: "Tool stopped", detail };
+    case "tool_execution": {
+      const name = providerDetail(item, "Name");
+      const target = providerDetail(item, "Target");
+      const progress = providerDetail(item, "Progress");
+      const tool = toolActivityPresentation({
+        name,
+        transport: providerDetail(item, "Transport"),
+        namespace: providerDetail(item, "Namespace"),
+        operation: providerDetail(item, "Operation"),
+        target,
+        progress,
+      });
+      const boundedActivity = meaningfulToolDetail(item.summary)
+        ?? meaningfulToolDetail(progress)
+        ?? meaningfulToolDetail(target);
+      const activityIsIdentity = Boolean(
+        boundedActivity && name && humanizeToolName(boundedActivity) === humanizeToolName(name),
+      );
+      const technicalName = name ? mcpToolIdentity(name)?.name ?? name : tool.displayName;
+      const source = tool.sourceLabel
+        ? `${tool.sourceLabel} · ${technicalName}`
+        : name && !isGenericToolName(name) && humanizeToolName(name) !== tool.runningLabel.replace(/^Running /, "")
+          ? name
+          : undefined;
+      return {
+        icon: tool.icon,
+        runningLabel: tool.runningLabel,
+        completedLabel: tool.completedLabel,
+        failedLabel: tool.failedLabel,
+        interruptedLabel: tool.interruptedLabel,
+        detail: [activityIsIdentity ? undefined : boundedActivity, source].filter(Boolean).join(" · ") || undefined,
+      };
+    }
     case "plan":
       return { icon: ListChecks, runningLabel: "Updating the plan", completedLabel: "Updated the plan", failedLabel: "Plan update failed", interruptedLabel: "Plan update stopped", detail };
     case "delegation": {

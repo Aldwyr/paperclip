@@ -138,8 +138,97 @@ describe("TaskChatLiveTail", () => {
     render(items);
 
     expect(container.textContent).toContain("Visible answer.");
+    const reasoningPhase = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-phase-summary"]',
+    );
+    expect(reasoningPhase?.textContent).toContain("Reasoning");
+    expect(reasoningPhase?.getAttribute("aria-expanded")).toBe("false");
+    flushSync(() => reasoningPhase?.click());
+
     expect(container.textContent).toContain("Provider reasoning summary");
-    expect(container.querySelector('[data-testid="task-chat-thinking"]')).not.toBeNull();
+    const thinking = container.querySelector('[data-testid="task-chat-thinking"]');
+    const disclosure = thinking?.querySelector<HTMLButtonElement>("button");
+    const preview = thinking?.querySelector(
+      '[data-testid="task-chat-thinking-preview"]',
+    );
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("false");
+    expect(preview?.textContent).toBe("Provider reasoning summary");
+    expect(preview?.classList.contains("task-chat-collapsed-line-fade")).toBe(
+      true,
+    );
+    const phaseChildren = thinking?.closest(
+      '[data-testid="task-chat-phase-children"]',
+    );
+    expect(phaseChildren?.classList.contains("ml-2.5")).toBe(true);
+    expect(phaseChildren?.classList.contains("pl-6")).toBe(true);
+    expect(
+      phaseChildren?.querySelector('[data-testid="task-chat-phase-child-rail"]'),
+    ).not.toBeNull();
+    expect(thinking?.textContent).not.toContain("Reasoning");
+    expect(thinking?.querySelector(".shimmer-text")).toBeNull();
+    expect(
+      thinking
+        ?.querySelector('[data-testid="task-chat-thinking-icon"]')
+        ?.classList.contains("text-(--status-agent-running)"),
+    ).toBe(false);
+    expect(
+      thinking
+        ?.querySelector('[data-testid="task-chat-thinking-icon"]')
+        ?.parentElement?.classList.contains("justify-center"),
+    ).toBe(true);
+    expect(thinking?.querySelector(".task-chat-reasoning-markdown")).toBeNull();
+
+    flushSync(() => disclosure?.click());
+
+    expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+    expect(
+      thinking?.querySelector(".task-chat-expanded-line-wrap"),
+    ).not.toBeNull();
+    expect(
+      thinking?.querySelector(".task-chat-reasoning-markdown")?.textContent,
+    ).toContain("Provider reasoning summary");
+  });
+
+  it("bounds long tool targets and wraps the full value only when expanded", () => {
+    const longPath =
+      "/Users/dotta/paperclip/instances/default/companies/company-id/codex/home/skills/paperclip/references/API-reference.md";
+    const items = parse([
+      {
+        kind: "tool_call",
+        ts: TS,
+        name: "Read",
+        toolUseId: "long-read",
+        input: { file_path: longPath },
+      },
+    ]);
+    const renderedTarget = items
+      .flatMap((item) =>
+        item.kind === "activity_phase" ? item.items : [item],
+      )
+      .find((item) => item.kind === "tool")?.target;
+    render(items);
+
+    const tool = container.querySelector<HTMLButtonElement>(
+      ".tc-enter-tool button",
+    );
+    const collapsedTarget = tool?.querySelector(
+      ".task-chat-collapsed-line-fade",
+    );
+    expect(tool?.classList.contains("overflow-hidden")).toBe(true);
+    expect(tool?.getAttribute("aria-expanded")).toBe("false");
+    expect(renderedTarget).toBeTruthy();
+    expect(collapsedTarget?.textContent).toBe(renderedTarget);
+
+    flushSync(() => tool?.click());
+
+    const expandedTarget = container.querySelector(
+      '[data-testid="task-chat-tool-target-detail"]',
+    );
+    expect(tool?.getAttribute("aria-expanded")).toBe("true");
+    expect(expandedTarget?.textContent).toBe(renderedTarget);
+    expect(
+      expandedTarget?.classList.contains("task-chat-expanded-line-wrap"),
+    ).toBe(true);
   });
 
   it("shows the empty message when nothing renderable has streamed yet", () => {

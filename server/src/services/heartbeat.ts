@@ -103,6 +103,12 @@ import {
 // git-credentials module became its canonical home; existing importers keep working.
 export { scrubGitCredentialText };
 import { publishLiveEvent } from "./live-events.js";
+import {
+  queuedCommentIdsFromRunContext,
+  queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
+  withQueuedCommentIdsInWakePayload,
+} from "./issue-queued-comment-queue.js";
 import { documentService } from "./documents.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import {
@@ -115,11 +121,14 @@ import {
   executePaperclipNativeSession,
   finalizeNativeRun,
   isNativeSessionId,
+  materializeLegacyQuestionResponseWakeProjection,
   materializeNativeInteractionResponses,
   rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
   resolveHeartbeatNativeRuntimeMode,
 } from "./native-runtime/index.js";
+import { resolveAcpxCodexManagedCredentialEnvironment } from "./native-runtime/acpx-managed-credential.js";
+import type { NativeRunHistoricalSpan } from "./native-runtime/native-run-trace.js";
 import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
@@ -365,6 +374,7 @@ import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
+  resolvePaperclipRunnerPermissionMode,
   resolveSessionCompactionPolicy,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
@@ -379,7 +389,10 @@ import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
-import { environmentRuntimeService } from "./environment-runtime.js";
+import {
+  environmentRuntimeService,
+  type ProviderResourceDisposition,
+} from "./environment-runtime.js";
 import { managedAgentProfileService } from "./managed-agent-profiles.js";
 import { remoteAgentProfileService } from "./remote-agent-profiles.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
@@ -423,21 +436,11 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
 import { executeNativeCodexRunner } from "./native-runtime/native-codex-runner.js";
 import { prepareNativeHeartbeatRun } from "./native-runtime/prepare-native-run.js";
-import {
-  NativeRunnerSelectionError,
-  resolveHeartbeatRuntimeMode,
-} from "./native-runtime/runtime-mode.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
-
-function nativeRunnerErrorCode(error: unknown): string | null {
-  if (error instanceof NativeRunnerSelectionError) return error.code;
-  const message = error instanceof Error ? error.message : String(error);
-  return message.match(/^(paperclip_runner_[a-z0-9_]+)/)?.[1] ?? null;
-}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -472,6 +475,8 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
+const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
+  "paperclipai/paperclip/paperclip-converting-plans-to-tasks";
 const PAPERCLIP_AGENT_MESSAGE_KEY = "paperclipAgentMessage";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -1631,6 +1636,48 @@ export function leaseReleaseStatusForRunStatus(
 ): Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> {
   if (status === "cancelled") return "expired";
   return status === "failed" || status === "timed_out" ? "failed" : "released";
+}
+
+export interface NativeSandboxLifecycle {
+  runnerProcess: "per_turn" | "warm";
+  sandboxResource: "keep_running" | "stop_and_reuse" | "destroy_after_turn";
+  failoverBackup: "verified";
+}
+
+export function resolveNativeSandboxLifecycle(input: {
+  adapterType: string;
+  lifecyclePolicy:
+    | { mode: "per_turn"; idleTimeoutMs: null }
+    | { mode: "warm"; idleTimeoutMs: number };
+  target: {
+    kind: "local" | "remote";
+    transport?: string;
+    reusableLeaseConfigured?: boolean;
+    effectiveCapabilities?: { reusableLeases: boolean } | null;
+  } | null;
+}): NativeSandboxLifecycle | null {
+  if (
+    input.adapterType !== "paperclip_runner" ||
+    input.target?.kind !== "remote" ||
+    input.target.transport !== "sandbox"
+  )
+    return null;
+  const reusableLease =
+    input.target.reusableLeaseConfigured === true &&
+    input.target.effectiveCapabilities?.reusableLeases === true;
+  if (input.lifecyclePolicy.mode === "warm" && !reusableLease) {
+    throw new Error("runner_warm_lifecycle_requires_reusable_provider_lease");
+  }
+  return {
+    runnerProcess: input.lifecyclePolicy.mode,
+    sandboxResource:
+      input.lifecyclePolicy.mode === "warm"
+        ? "keep_running"
+        : reusableLease
+          ? "stop_and_reuse"
+          : "destroy_after_turn",
+    failoverBackup: "verified",
+  };
 }
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
@@ -6421,6 +6468,7 @@ async function resolveAcceptedPlanWakeRoutingDecision(args: {
 export function mergeCoalescedContextSnapshot(
   existingRaw: unknown,
   incoming: Record<string, unknown>,
+  options: { preserveExistingInteractionContinuation?: boolean } = {},
 ) {
   const existing = parseObject(existingRaw);
   const merged: Record<string, unknown> = {
@@ -6443,7 +6491,13 @@ export function mergeCoalescedContextSnapshot(
     // regenerate any structured payload from those ids.
     delete merged[PAPERCLIP_WAKE_PAYLOAD_KEY];
   }
-  if (!hasInteractionContinuationWakeContext(incoming)) {
+  if (
+    !hasInteractionContinuationWakeContext(incoming) &&
+    !(
+      options.preserveExistingInteractionContinuation === true &&
+      hasInteractionContinuationWakeContext(existing)
+    )
+  ) {
     clearInteractionContinuationWakeContext(merged);
   }
   return merged;
@@ -7241,6 +7295,11 @@ export function buildPaperclipTaskMarkdown(input: {
     kind?: string | null;
     status?: string | null;
   } | null;
+  acceptedPlan?: {
+    documentId?: string | null;
+    revisionId?: string | null;
+    revisionNumber?: number | null;
+  } | null;
   acceptedPlanContinuation?: boolean;
   // false builds the compact variant used for resume deltas, where the session
   // already received the description with the assignment.
@@ -7291,7 +7350,7 @@ export function buildPaperclipTaskMarkdown(input: {
       }
       if (acceptedPlanContinuation) {
         directive =
-          "Use create_task to create exactly one standard implementation child containing the complete approved plan, assign it to yourself, and make the planning issue wait on that child. Do not write code or perform implementation work on the planning issue. Creating the child is your responsibility; do not report blocked merely because no child exists yet.";
+          "Implement the accepted plan on this issue when the work is small and cohesive. Use the paperclip-converting-plans-to-tasks skill to decide whether decomposition is justified. Create the minimum child issue graph only for qualifying ownership, parallelism, dependency, review, or lifecycle boundaries. Do not create a child merely because a plan was accepted.";
       }
       lines.push(
         `- Work mode: ${quoteTaskScalar("planning")}`,
@@ -7310,7 +7369,18 @@ export function buildPaperclipTaskMarkdown(input: {
       lines.push(
         "",
         "Accepted plan directive:",
-        "Use create_task to create exactly one standard implementation child containing the complete approved plan, assign it to yourself, and make the source issue wait on that child. Do not write code or perform implementation work on the source issue. Creating the child is your responsibility; do not report blocked merely because no child exists yet.",
+        "Implement the accepted plan on this issue when the work is small and cohesive. Use the paperclip-converting-plans-to-tasks skill to decide whether decomposition is justified. Create the minimum child issue graph only for qualifying ownership, parallelism, dependency, review, or lifecycle boundaries. Do not create a child merely because a plan was accepted.",
+      );
+    }
+    if (acceptedPlanContinuation && input.acceptedPlan?.revisionId) {
+      const revisionNumber = input.acceptedPlan.revisionNumber
+        ? ` revision ${input.acceptedPlan.revisionNumber}`
+        : " revision";
+      const documentId = input.acceptedPlan.documentId
+        ? ` of document ${input.acceptedPlan.documentId}`
+        : "";
+      lines.push(
+        `- Approved plan:${revisionNumber} ${input.acceptedPlan.revisionId}${documentId}. Follow this exact revision, not a later draft.`,
       );
     }
     const description =
@@ -8277,6 +8347,13 @@ export function heartbeatService(
     agentId: string;
     status: string | null | undefined;
     failureReason?: string | null;
+    providerResourceDisposition?: ProviderResourceDisposition;
+    nativeLifecycleTelemetry?: {
+      provider: string;
+      harness: string;
+      lifecycleMode: "per_turn" | "warm";
+      sandboxResource: "keep_running" | "stop_and_reuse" | "destroy_after_turn";
+    };
   }) {
     const releaseResult = await envOrchestrator
       .releaseForRun({
@@ -8285,6 +8362,8 @@ export function heartbeatService(
         agentId: input.agentId,
         status: leaseReleaseStatusForRunStatus(input.status),
         failureReason: input.failureReason ?? undefined,
+        providerResourceDisposition: input.providerResourceDisposition,
+        nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
       .catch((err) => {
         logger.warn(
@@ -14786,20 +14865,256 @@ export function heartbeatService(
         responsibleUserId: null,
       },
     });
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        responsibleUserId,
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(
-        and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return null;
+    const claimWrite = await db.transaction(async (tx) => {
+      // Queue mutation takes these locks in the same order. Keeping claim on the
+      // same order makes the wake state the authoritative dispatch boundary:
+      // either discard commits first and this run is cancelled, or claim commits
+      // first and discard reports queued_comment_already_dispatching.
+      if (issueId) {
+        await tx
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, issueId),
+              eq(issues.companyId, run.companyId),
+            ),
+          )
+          .for("update");
+      }
+
+      const lockedWake = run.wakeupRequestId
+        ? await tx
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.id, run.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, run.companyId),
+            ),
+          )
+          .for("update")
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+        : null;
+      const lockedRun = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.companyId, run.companyId),
+          ),
+        )
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRun || lockedRun.status !== "queued") return null;
+
+      const cancelQueuedRun = async (input: {
+        reason: string;
+        errorCode: string;
+        cancelWake: boolean;
+      }) => {
+        if (lockedWake && input.cancelWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: claimedAt,
+              error: input.reason,
+              updatedAt: claimedAt,
+            })
+            .where(
+              and(
+                eq(agentWakeupRequests.id, lockedWake.id),
+                eq(agentWakeupRequests.status, "queued"),
+              ),
+            );
+        }
+        const cancelled = await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: claimedAt,
+            error: input.reason,
+            errorCode: input.errorCode,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(heartbeatRuns.id, lockedRun.id),
+              eq(heartbeatRuns.status, "queued"),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (issueId) {
+          await tx
+            .update(issues)
+            .set({
+              executionRunId: null,
+              executionAgentNameKey: null,
+              executionLockedAt: null,
+              updatedAt: claimedAt,
+            })
+            .where(
+              and(
+                eq(issues.id, issueId),
+                eq(issues.companyId, run.companyId),
+                eq(issues.executionRunId, lockedRun.id),
+              ),
+            );
+        }
+        return cancelled;
+      };
+
+      if (run.wakeupRequestId && lockedWake?.status !== "queued") {
+        const cancelled = await cancelQueuedRun({
+          reason: "Cancelled because the wake request is no longer queued",
+          errorCode: "wakeup_not_queued",
+          cancelWake: false,
+        });
+        return cancelled ? { kind: "cancelled" as const, run: cancelled } : null;
+      }
+
+      let claimedContextSnapshot = lockedRun.contextSnapshot;
+      const runCommentIds = queuedCommentIdsFromRunContext(
+        claimedContextSnapshot,
+      );
+      const wakeCommentIds = queuedCommentIdsFromWakePayload(
+        lockedWake?.payload,
+      );
+      const queuedCommentIds = runCommentIds.length > 0
+        ? runCommentIds
+        : wakeCommentIds;
+      if (queuedCommentIds.length > 0 && issueId) {
+        const commentRows = await tx
+          .select({ id: issueComments.id, deletedAt: issueComments.deletedAt })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, run.companyId),
+              eq(issueComments.issueId, issueId),
+              inArray(issueComments.id, queuedCommentIds),
+            ),
+          );
+        const commentsById = new Map(commentRows.map((row) => [row.id, row]));
+        const liveCommentIds = queuedCommentIds.filter((commentId) => {
+          const comment = commentsById.get(commentId);
+          return Boolean(comment && !comment.deletedAt);
+        });
+
+        if (liveCommentIds.length === 0) {
+          const cancelled = await cancelQueuedRun({
+            reason: "Queued messages were discarded before dispatch",
+            errorCode: "queued_comment_discarded",
+            cancelWake: true,
+          });
+          return cancelled
+            ? { kind: "cancelled" as const, run: cancelled }
+            : null;
+        }
+
+        if (
+          liveCommentIds.length !== queuedCommentIds.length ||
+          liveCommentIds.some(
+            (commentId, index) => commentId !== queuedCommentIds[index],
+          )
+        ) {
+          claimedContextSnapshot = withQueuedCommentIdsInRunContext(
+            claimedContextSnapshot,
+            liveCommentIds,
+          );
+          if (lockedWake) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                payload: withQueuedCommentIdsInWakePayload(
+                  lockedWake.payload,
+                  liveCommentIds,
+                ),
+                updatedAt: claimedAt,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.id, lockedWake.id),
+                  eq(agentWakeupRequests.status, "queued"),
+                ),
+              );
+          }
+        }
+      }
+
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          responsibleUserId,
+          contextSnapshot: claimedContextSnapshot,
+          startedAt: lockedRun.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, lockedRun.id),
+            eq(heartbeatRuns.status, "queued"),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) return null;
+
+      if (lockedWake) {
+        const claimedWake = await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "claimed",
+            claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(agentWakeupRequests.id, lockedWake.id),
+              eq(agentWakeupRequests.status, "queued"),
+            ),
+          )
+          .returning({ id: agentWakeupRequests.id })
+          .then((rows) => rows[0] ?? null);
+        if (!claimedWake) {
+          throw conflict("The wake request is no longer queued", {
+            code: "wakeup_not_queued",
+          });
+        }
+      }
+
+      return { kind: "claimed" as const, run: claimed };
+    });
+    if (!claimWrite) return null;
+    if (claimWrite.kind === "cancelled") {
+      publishLiveEvent({
+        companyId: claimWrite.run.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: claimWrite.run.id,
+          agentId: claimWrite.run.agentId,
+          status: claimWrite.run.status,
+          invocationSource: claimWrite.run.invocationSource,
+          triggerDetail: claimWrite.run.triggerDetail,
+          error: claimWrite.run.error ?? null,
+          errorCode: claimWrite.run.errorCode ?? null,
+          startedAt: claimWrite.run.startedAt
+            ? new Date(claimWrite.run.startedAt).toISOString()
+            : null,
+          finishedAt: claimWrite.run.finishedAt
+            ? new Date(claimWrite.run.finishedAt).toISOString()
+            : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(claimWrite.run);
+      return null;
+    }
+    const claimed = claimWrite.run;
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -14821,8 +15136,6 @@ export function heartbeatService(
       },
     });
     publishRunLifecyclePluginEvent(claimed);
-
-    await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
     // not at queue time. Guard is idempotent — safe if called more than once.
@@ -16554,6 +16867,17 @@ export function heartbeatService(
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
     let nativeSessionResumeScheduled = false;
+    let providerResourceDispositionForRun:
+      ProviderResourceDisposition | undefined;
+    let nativeLifecycleTelemetryForRun:
+      | {
+          provider: string;
+          harness: string;
+          lifecycleMode: "per_turn" | "warm";
+          sandboxResource:
+            "keep_running" | "stop_and_reuse" | "destroy_after_turn";
+        }
+      | undefined;
     let providerTraceCapture: Awaited<
       ReturnType<typeof traceStore.prepare>
     > | null = null;
@@ -16979,6 +17303,21 @@ export function heartbeatService(
             "accepted_plan_confirmation" &&
           Object.keys(parseObject(context.acceptedPlanWakeRouting)).length ===
             0,
+        acceptedPlan: (() => {
+          const accepted = parseObject(
+            parseObject(context.planReviewInteraction).acceptedTargetRevision,
+          );
+          const revisionId = readNonEmptyString(accepted.revisionId);
+          if (!revisionId) return null;
+          return {
+            documentId: readNonEmptyString(accepted.documentId),
+            revisionId,
+            revisionNumber:
+              typeof accepted.revisionNumber === "number"
+                ? accepted.revisionNumber
+                : null,
+          };
+        })(),
       };
       const taskMarkdown = buildPaperclipTaskMarkdown(taskMarkdownInput);
       const taskMarkdownCompact = buildPaperclipTaskMarkdown({
@@ -17325,6 +17664,13 @@ export function heartbeatService(
           companyId: agent.companyId,
           issueId,
         });
+      const runScopedSkillKeys = acceptedPlanContinuationWake
+        && !acceptedPlanWakeRoutingDecision?.suppressAcceptedContinuation
+        ? [
+            ...runScopedMentionedSkillKeys,
+            ACCEPTED_PLAN_CONVERSION_SKILL_KEY,
+          ]
+        : runScopedMentionedSkillKeys;
       const pushCapabilityPreflightRequired = requiresPushCapabilityPreflight({
         adapterType: agent.adapterType,
         issueId,
@@ -17367,7 +17713,7 @@ export function heartbeatService(
       }
       const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
         resolvedConfig,
-        runScopedMentionedSkillKeys,
+        runScopedSkillKeys,
       );
       const runtimeSkillPreference = readPaperclipSkillSyncPreference(
         effectiveResolvedConfig,
@@ -18043,17 +18389,39 @@ export function heartbeatService(
           })
           .where(eq(heartbeatRuns.id, run.id));
       }
-      const acquiredEnvironment = await envOrchestrator.acquireForRun({
-        companyId: agent.companyId,
-        selectedEnvironmentId,
-        localEnvironmentId: localEnvironment.id,
-        adapterType: agent.adapterType,
-        issueId: issueId ?? null,
-        heartbeatRunId: run.id,
-        agentId: agent.id,
-        persistedExecutionWorkspace,
-        executionWorkspaceSettings: environmentExecutionWorkspaceSettings,
-      });
+      const nativeRunnerPreparationSpans: NativeRunHistoricalSpan[] = [];
+      const environmentAcquireStartedAtMs = Date.now();
+      let acquiredEnvironment: Awaited<ReturnType<typeof envOrchestrator.acquireForRun>>;
+      try {
+        acquiredEnvironment = await envOrchestrator.acquireForRun({
+          companyId: agent.companyId,
+          selectedEnvironmentId,
+          localEnvironmentId: localEnvironment.id,
+          adapterType: agent.adapterType,
+          issueId: issueId ?? null,
+          heartbeatRunId: run.id,
+          agentId: agent.id,
+          persistedExecutionWorkspace,
+          executionWorkspaceSettings: environmentExecutionWorkspaceSettings,
+        });
+        nativeRunnerPreparationSpans.push({
+          name: "environment.acquire",
+          parentName: "task.run",
+          startedAtMs: environmentAcquireStartedAtMs,
+          endedAtMs: Date.now(),
+          attributes: { adapter: agent.adapterType },
+        });
+      } catch (error) {
+        nativeRunnerPreparationSpans.push({
+          name: "environment.acquire",
+          parentName: "task.run",
+          startedAtMs: environmentAcquireStartedAtMs,
+          endedAtMs: Date.now(),
+          outcome: "failed",
+          attributes: { adapter: agent.adapterType },
+        });
+        throw error;
+      }
       const selectedEnvironment = acquiredEnvironment.environment;
       // Defense-in-depth: re-check the actually-acquired environment against the
       // execution allowlist. Even if selection were bypassed, a denied (local/ssh/
@@ -18084,38 +18452,62 @@ export function heartbeatService(
         lease: acquiredEnvironment.lease,
         leaseContext: acquiredEnvironment.leaseContext,
       };
-      const duplexTelemetryRecorder = createHostDuplexTelemetryRecorder({
-        tracer: getStartupTracer(),
-        incrementCounter: (metric) => {
-          void incrementToolRuntimeMetricCounter(db, {
-            companyId: run.companyId,
-            metric,
-          }).catch(() => {});
+      const duplexObservabilityRecorder = createHostDuplexObservabilityRecorder(
+        {
+          tracer: getStartupTracer(),
+          incrementCounter: (metric) => {
+            void incrementToolRuntimeMetricCounter(db, {
+              companyId: run.companyId,
+              metric,
+            }).catch(() => {});
+          },
+          emitTransportEvent: (event) => {
+            void (async () => {
+              const seq = await nextRunEventSeq(run.id);
+              await appendRunEvent(run, seq, {
+                eventType: event.name,
+                stream: "system",
+                level: event.dimensions.outcome === "error" ? "warn" : "info",
+                payload: { ...event.dimensions },
+              });
+            })().catch(() => {});
+          },
         },
-        emitTransportEvent: (event) => {
-          void (async () => {
-            const seq = await nextRunEventSeq(run.id);
-            await appendRunEvent(run, seq, {
-              eventType: event.name,
-              stream: "system",
-              level: event.dimensions.outcome === "error" ? "warn" : "info",
-              payload: { ...event.dimensions },
-            });
-          })().catch(() => {});
-        },
-      });
-      const realizationResult = await envOrchestrator.realizeForRun({
-        environment: selectedEnvironment,
-        lease: activeEnvironmentLease.lease,
-        adapterType: agent.adapterType,
-        companyId: agent.companyId,
-        issueId: issueId ?? null,
-        heartbeatRunId: run.id,
-        executionWorkspace,
-        effectiveExecutionWorkspaceMode,
-        persistedExecutionWorkspace,
-        duplexTelemetryRecorder,
-      });
+      );
+      const environmentRealizeStartedAtMs = Date.now();
+      let realizationResult: Awaited<ReturnType<typeof envOrchestrator.realizeForRun>>;
+      try {
+        realizationResult = await envOrchestrator.realizeForRun({
+          environment: selectedEnvironment,
+          lease: activeEnvironmentLease.lease,
+          adapterType: agent.adapterType,
+          companyId: agent.companyId,
+          issueId: issueId ?? null,
+          heartbeatRunId: run.id,
+          executionWorkspace,
+          effectiveExecutionWorkspaceMode,
+          persistedExecutionWorkspace,
+          duplexObservabilityRecorder,
+        });
+        nativeRunnerPreparationSpans.push({
+          name: "environment.workspace.realize",
+          parentName: "task.run",
+          startedAtMs: environmentRealizeStartedAtMs,
+          endedAtMs: Date.now(),
+          attributes: { driver: selectedEnvironment.driver },
+        });
+      } catch (error) {
+        nativeRunnerPreparationSpans.push({
+          name: "environment.workspace.realize",
+          parentName: "task.run",
+          startedAtMs: environmentRealizeStartedAtMs,
+          endedAtMs: Date.now(),
+          outcome: "failed",
+          attributes: { driver: selectedEnvironment.driver },
+        });
+        throw error;
+      }
+      const environmentRealizeEndedAtMs = Date.now();
       activeEnvironmentLease = {
         ...activeEnvironmentLease,
         lease: realizationResult.lease,
@@ -18850,6 +19242,39 @@ export function heartbeatService(
           let nativeResumeCheckpoint: ReturnType<
             typeof rebindNativeSessionCheckpoint
           > = null;
+          const agentLifecyclePolicy =
+            parseObject(agent.adapterConfig).lifecycleMode === "warm"
+              ? {
+                  mode: "warm" as const,
+                  idleTimeoutMs:
+                    Number.isSafeInteger(
+                      parseObject(agent.adapterConfig).idleTimeoutMs,
+                    ) &&
+                    Number(parseObject(agent.adapterConfig).idleTimeoutMs) > 0
+                      ? Number(parseObject(agent.adapterConfig).idleTimeoutMs)
+                      : 300_000,
+                }
+              : { mode: "per_turn" as const, idleTimeoutMs: null };
+          const environmentLifecyclePolicy =
+            executionTarget?.kind === "remote" &&
+            executionTarget.transport === "sandbox"
+              ? executionTarget.runnerLifecyclePolicy ?? null
+              : null;
+          const effectiveLifecyclePolicy =
+            environmentLifecyclePolicy ?? agentLifecyclePolicy;
+          if (
+            effectiveLifecyclePolicy.mode === "warm" &&
+            executionTarget?.kind === "remote" &&
+            executionTarget.transport === "sandbox" &&
+            (
+              executionTarget.reusableLeaseConfigured !== true ||
+              executionTarget.effectiveCapabilities?.reusableLeases !== true
+            )
+          ) {
+            throw new Error(
+              "runner_warm_environment_requires_reusable_lease",
+            );
+          }
           const persistedProfile = persistedRunnerProfile;
           if (persistedNativeExecutionInput) {
             nativeExecution = persistedNativeExecutionInput;
@@ -19016,6 +19441,18 @@ export function heartbeatService(
                       "pi" | "claude" | "codex",
                   }
                 : {}),
+              codexApprovalPolicy: resolvePaperclipRunnerPermissionMode(
+                "codex",
+                parseObject(runtimeConfig).codexPermissionMode,
+              ) as "never" | "on-request" | "untrusted",
+              opencodePermissionMode: resolvePaperclipRunnerPermissionMode(
+                "opencode",
+                parseObject(runtimeConfig).opencodePermissionMode,
+              ) as "allow" | "ask" | "deny",
+              acpxPermissionMode: resolvePaperclipRunnerPermissionMode(
+                "acpx",
+                parseObject(runtimeConfig).acpxPermissionMode,
+              ) as "approve-all" | "approve-reads" | "deny-all",
               model:
                 typeof parseObject(agent.adapterConfig).model === "string"
                   ? String(parseObject(agent.adapterConfig).model)
@@ -19108,22 +19545,7 @@ export function heartbeatService(
                     },
                   }
                 : {}),
-              lifecyclePolicy:
-                parseObject(agent.adapterConfig).lifecycleMode === "warm"
-                  ? {
-                      mode: "warm",
-                      idleTimeoutMs:
-                        Number.isSafeInteger(
-                          parseObject(agent.adapterConfig).idleTimeoutMs,
-                        ) &&
-                        Number(parseObject(agent.adapterConfig).idleTimeoutMs) >
-                          0
-                          ? Number(
-                              parseObject(agent.adapterConfig).idleTimeoutMs,
-                            )
-                          : 300_000,
-                    }
-                  : { mode: "per_turn", idleTimeoutMs: null },
+              lifecyclePolicy: effectiveLifecyclePolicy,
               interactionResponses,
               completionContract: {
                 id: completionContract.row.id,
@@ -19153,6 +19575,44 @@ export function heartbeatService(
               }
             }
           }
+          const nativeSandboxLifecycle = resolveNativeSandboxLifecycle({
+            adapterType: agent.adapterType,
+            lifecyclePolicy: nativeExecution.session.lifecyclePolicy,
+            target: executionTarget,
+          });
+          if (nativeSandboxLifecycle) {
+            nativeLifecycleTelemetryForRun = {
+              provider: nativeExecution.provider.kind,
+              harness: nativeExecution.session.driverKind,
+              lifecycleMode: nativeExecution.session.lifecyclePolicy.mode,
+              sandboxResource: nativeSandboxLifecycle.sandboxResource,
+            };
+            const selectedLifecycleSpan = getStartupTracer(
+              "paperclip.environment-lifecycle",
+            ).startSpan("sandbox.lifecycle.selected", {
+              attributes: {
+                "paperclip.native.span.provider": nativeExecution.provider.kind,
+                "paperclip.native.span.harness":
+                  nativeExecution.session.driverKind,
+                "paperclip.native.span.lifecycle_mode":
+                  nativeExecution.session.lifecyclePolicy.mode,
+                "paperclip.native.span.sandbox_resource":
+                  nativeSandboxLifecycle.sandboxResource,
+                "paperclip.native.span.outcome": "selected",
+                "paperclip.native.span.bytes_transferred": 0,
+              },
+            });
+            selectedLifecycleSpan.end();
+          }
+          providerResourceDispositionForRun =
+            nativeSandboxLifecycle?.sandboxResource === "keep_running"
+              ? "keep_running"
+              : nativeSandboxLifecycle?.sandboxResource === "stop_and_reuse"
+                ? "stop_and_retain"
+                : nativeSandboxLifecycle?.sandboxResource ===
+                    "destroy_after_turn"
+                  ? "destroy"
+                  : undefined;
           await db.transaction(async (tx) => {
             const lockedRun = await tx
               .select()
@@ -19214,6 +19674,7 @@ export function heartbeatService(
                     ? previousNativeRun.runnerInstanceId
                     : (lockedRun.runnerInstanceId ?? nativeRunnerInstanceId),
                 nativeSessionId: lockedRun.nativeSessionId ?? nativeSessionId,
+                nativeIssueId: lockedRun.nativeIssueId ?? issueRef.id,
                 driverKind:
                   lockedRun.driverKind ??
                   nativeExecution?.session.driverKind ??
@@ -19532,6 +19993,44 @@ export function heartbeatService(
               }
             }
             const nativeMcpServer = nativeMcpServers[0] ?? null;
+            const nativeDispatchAtMs = Date.now();
+            const runCreatedAtMs = run.createdAt.getTime();
+            const runStartedAtMs = (run.startedAt ?? run.createdAt).getTime();
+            const wakeComments = Array.isArray(parseObject(context.paperclipWake).comments)
+              ? (parseObject(context.paperclipWake).comments as unknown[])
+              : [];
+            const wakeCommentCreatedAtMs = wakeComments
+              .map((value) => Date.parse(readNonEmptyString(parseObject(value).createdAt) ?? ""))
+              .filter(Number.isFinite)
+              .sort((a, b) => a - b)[0];
+            if (wakeCommentCreatedAtMs !== undefined) {
+              nativeRunnerPreparationSpans.unshift({
+                name: "comment.to_run_created",
+                parentName: "task.run",
+                startedAtMs: wakeCommentCreatedAtMs,
+                endedAtMs: Math.max(wakeCommentCreatedAtMs, runCreatedAtMs),
+              });
+            }
+            nativeRunnerPreparationSpans.push(
+              {
+                name: "heartbeat.queue",
+                parentName: "task.run",
+                startedAtMs: runCreatedAtMs,
+                endedAtMs: Math.max(runCreatedAtMs, runStartedAtMs),
+              },
+              {
+                name: "heartbeat.prepare_before_environment",
+                parentName: "task.run",
+                startedAtMs: runStartedAtMs,
+                endedAtMs: Math.max(runStartedAtMs, environmentAcquireStartedAtMs),
+              },
+              {
+                name: "heartbeat.prepare_after_environment",
+                parentName: "task.run",
+                startedAtMs: Math.min(nativeDispatchAtMs, environmentRealizeEndedAtMs),
+                endedAtMs: nativeDispatchAtMs,
+              },
+            );
             adapterResult = await executePaperclipNativeSession({
               db,
               execution: nativeExecution,
@@ -19540,10 +20039,16 @@ export function heartbeatService(
               backend: options.nativeSessionBackendFactory?.(nativeExecution),
               useRunnerd: agent.adapterType === "paperclip_runner",
               onLog,
+              onEvent: onAdapterEvent,
+              preparationSpans: nativeRunnerPreparationSpans,
               // Bootstrap the provider with executable/home discovery while
               // keeping the agent's configured provider values authoritative.
               runnerEnvironment: {
                 ...buildNativeProviderEnvironment(adapterEnv),
+                ...(nativeExecution.provider.kind === "acpx"
+                  && nativeExecution.provider.agent === "codex"
+                  ? resolveAcpxCodexManagedCredentialEnvironment(adapterEnv)
+                  : {}),
                 ...(nativeMcpServer ? {
                   PAPERCLIP_NATIVE_MCP_NAME: nativeMcpServer.name,
                   PAPERCLIP_NATIVE_MCP_URL: nativeMcpServer.url,
@@ -19558,13 +20063,60 @@ export function heartbeatService(
                     }
                   : {}),
               },
+              runnerExecutionTarget: executionTarget,
+              enableRunnerPreviewIngress:
+                resolvedInstanceSettings.experimental
+                  .enableRunnerPreviewIngress === true,
+              runnerPublicUrl:
+                runtimeEnv.PAPERCLIP_RUNNER_PUBLIC_URL?.trim() || null,
+              runnerCaBundlePath:
+                runtimeEnv.PAPERCLIP_RUNNER_CA_BUNDLE_PATH?.trim() || null,
+              runnerRemoteBinaryPath:
+                runtimeEnv.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH?.trim() || null,
+              runnerRemoteCodexPath:
+                runtimeEnv.PAPERCLIP_RUNNER_REMOTE_CODEX_PATH?.trim() || null,
+              runnerRemoteCodexNpmSpec:
+                runtimeEnv.PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC?.trim() ||
+                null,
+              runnerRemoteProviderPackPath:
+                runtimeEnv.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH?.trim()
+                || null,
               enqueueWakeup,
               onSpawn: async (meta) => {
                 await persistRunProcessMetadata(run.id, meta);
               },
             });
           } else {
-            const adapterContext = { ...context };
+            const interactionId = readNonEmptyString(context.interactionId);
+            const legacyQuestionResponse =
+              issueRef
+              && interactionId
+              && readNonEmptyString(context.interactionKind) === "ask_user_questions"
+              && readNonEmptyString(context.interactionStatus) === "answered"
+                ? await materializeLegacyQuestionResponseWakeProjection({
+                    db,
+                    companyId: agent.companyId,
+                    issueId: issueRef.id,
+                    runId: run.id,
+                    agentId: agent.id,
+                    interactionId,
+                  })
+                : null;
+            // Do not write the answer projection back to `context`: legacy
+            // adapters need it in their prompt, but the authoritative answers
+            // remain on the interaction instead of being duplicated in the
+            // heartbeat run snapshot.
+            const adapterContext: Record<string, unknown> = {
+              ...context,
+              ...(legacyQuestionResponse
+                ? {
+                    [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
+                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+                      questionResponse: legacyQuestionResponse,
+                    },
+                  }
+                : {}),
+            };
             const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
               db,
               agent,
@@ -20791,6 +21343,8 @@ export function heartbeatService(
           agentId: run.agentId,
           status: latestRun?.status,
           failureReason: latestRun?.error ?? undefined,
+          providerResourceDisposition: providerResourceDispositionForRun,
+          nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
         });
         await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
       }
@@ -21013,7 +21567,7 @@ export function heartbeatService(
       }
 
       while (true) {
-        const deferred = await tx
+        let deferred = await tx
           .select()
           .from(agentWakeupRequests)
           .where(
@@ -21028,6 +21582,115 @@ export function heartbeatService(
           .then((rows) => rows[0] ?? null);
 
         if (!deferred) break;
+
+        const queuedCommentIds = queuedCommentIdsFromWakePayload(
+          deferred.payload,
+        );
+        if (queuedCommentIds.length > 0) {
+          const queuedCommentRows = await tx
+            .select({
+              id: issueComments.id,
+              deletedAt: issueComments.deletedAt,
+              createdByRunId: issueComments.createdByRunId,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, queuedCommentIds),
+              ),
+            );
+          const targetsFinishingRunAgent = deferred.agentId === run.agentId;
+          const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
+            const row = queuedCommentRows.find(
+              (candidate) => candidate.id === commentId,
+            );
+            return Boolean(
+              row &&
+              !row.deletedAt &&
+              (!targetsFinishingRunAgent || row.createdByRunId !== run.id),
+            );
+          });
+          const now = new Date();
+          const queuedContext = parseObject(
+            parseObject(deferred.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+          );
+          const queuedReason =
+            readNonEmptyString(queuedContext.wakeReason) ??
+            readNonEmptyString(deferred.reason);
+          const queuedWakeIsCommentOnly =
+            !queuedReason ||
+            queuedReason === "issue_commented" ||
+            queuedReason === "issue_reopened_via_comment" ||
+            queuedReason === "issue_comment_mentioned";
+          const preservesIndependentContinuation =
+            hasInteractionContinuationWakeContext(queuedContext) ||
+            queuedContext.resumeIntent === true ||
+            !queuedWakeIsCommentOnly;
+
+          if (
+            liveNonSelfCommentIds.length === 0 &&
+            !preservesIndependentContinuation
+          ) {
+            const containedSelfAuthoredComment = queuedCommentRows.some(
+              (row) =>
+                targetsFinishingRunAgent &&
+                !row.deletedAt &&
+                row.createdByRunId === run.id,
+            );
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: containedSelfAuthoredComment
+                  ? "Deferred wake contained only comments authored by the finishing run"
+                  : "Queued messages were discarded before promotion",
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.id, deferred.id),
+                  eq(
+                    agentWakeupRequests.status,
+                    "deferred_issue_execution",
+                  ),
+                ),
+              );
+            continue;
+          }
+
+          if (
+            liveNonSelfCommentIds.length !== queuedCommentIds.length ||
+            liveNonSelfCommentIds.some(
+              (commentId, index) => commentId !== queuedCommentIds[index],
+            )
+          ) {
+            const normalizedWake = await tx
+              .update(agentWakeupRequests)
+              .set({
+                payload: withQueuedCommentIdsInWakePayload(
+                  deferred.payload,
+                  liveNonSelfCommentIds,
+                ),
+                updatedAt: now,
+              })
+              .where(
+                and(
+                  eq(agentWakeupRequests.id, deferred.id),
+                  eq(
+                    agentWakeupRequests.status,
+                    "deferred_issue_execution",
+                  ),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (!normalizedWake) continue;
+            deferred = normalizedWake;
+          }
+        }
 
         const deferredAgent = await tx
           .select()
@@ -22659,6 +23322,11 @@ export function heartbeatService(
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               availableActiveExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
+              {
+                preserveExistingInteractionContinuation:
+                  availableActiveExecutionRun.status === "queued" ||
+                  availableActiveExecutionRun.status === "scheduled_retry",
+              },
             );
             const mergedRun = await tx
               .update(heartbeatRuns)
@@ -22721,6 +23389,7 @@ export function heartbeatService(
               const mergedDeferredContext = mergeCoalescedContextSnapshot(
                 existingDeferredContext,
                 enrichedContextSnapshot,
+                { preserveExistingInteractionContinuation: true },
               );
               const mergedDeferredPayload = {
                 ...existingDeferredPayload,
@@ -23048,6 +23717,11 @@ export function heartbeatService(
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
+        {
+          preserveExistingInteractionContinuation:
+            coalescedTargetRun.status === "queued" ||
+            coalescedTargetRun.status === "scheduled_retry",
+        },
       );
       const mergedRun = await db
         .update(heartbeatRuns)

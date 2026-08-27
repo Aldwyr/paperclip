@@ -7,13 +7,20 @@ import {
   useState,
   type ComponentProps,
 } from "react";
-import { IssueChatThread } from "@/components/IssueChatThread";
+import {
+  IssueAssigneePausedNotice,
+  IssueChatThread,
+} from "@/components/IssueChatThread";
 import {
   useLiveRunTranscripts,
   type RunTranscriptSource,
 } from "@/components/transcript/useLiveRunTranscripts";
 import { TaskChatLiveTail } from "@/components/task-chat/TaskChatLiveTail";
 import { TaskChatRunnerTurn } from "@/components/task-chat/TaskChatRunnerTurn";
+import {
+  TaskChatTurnStatusIsland,
+  taskChatTurnStatusModel,
+} from "@/components/task-chat/TaskChatTurnStatusIsland";
 import { commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
 import {
   assembleThreadItems,
@@ -21,9 +28,12 @@ import {
   buildTurnSummary,
   coalesceSettledTurns,
   isTerminalRunStatus,
-  paperclipRunnerHistoryItems,
+  embedPlanDocumentAtWriteBoundary,
+  paperclipRunnerFinalResponse,
+  paperclipRunnerTimelineItems,
   prependIssueBrief,
   settledRunChildren,
+  splitTranscriptAtAnchors,
   transcriptToTaskChatItems,
   type SettledTurnMergeMeta,
 } from "@/components/task-chat/transcript-adapter";
@@ -36,19 +46,28 @@ import type {
   TaskChatInteractionItem,
   TaskChatItem,
   TaskChatMessageItem,
+  TaskChatPlanDocumentItem,
   TaskChatRuntimeRequestDecision,
   TaskChatRuntimeRequestItem,
   TaskChatTurnItem,
 } from "@/components/task-chat/task-chat-model";
-import { latestPendingRuntimeRequest } from "@/components/task-chat/task-chat-model";
-import { TaskChatInteractionCard } from "@/components/task-chat/TaskChatInteractionCard";
 import {
-  interactionThreadAnchorMs,
-  isSuppressedThreadInteraction,
-} from "@/components/task-chat/interaction-thread-order";
-import { shouldHideInteractionCard } from "@/lib/issue-thread-interactions";
+  latestPendingRuntimeRequest,
+  runtimeRequestReplacesComposerSkip,
+} from "@/components/task-chat/task-chat-model";
+import { TaskChatInteractionCard } from "@/components/task-chat/TaskChatInteractionCard";
+import { TaskChatProtocolCard } from "@/components/task-chat/TaskChatProtocolCard";
+import { interactionThreadAnchorMs } from "@/components/task-chat/interaction-thread-order";
+import {
+  interactionReplacesComposerSkip,
+  shouldHideInteractionCard,
+} from "@/lib/issue-thread-interactions";
 import { TaskChatBubbleActions } from "@/components/task-chat/TaskChatBubbleActions";
-import type { FeedbackVoteValue } from "@paperclipai/shared";
+import type {
+  FeedbackVoteValue,
+  IssueDocument,
+  IssueThreadInteraction,
+} from "@paperclipai/shared";
 import {
   TaskChatThreadView,
   taskChatContentKey,
@@ -103,6 +122,65 @@ function formatResourceBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function interactionTargetsPlanRevision(
+  interaction: IssueThreadInteraction,
+  planDocument: IssueDocument,
+): boolean {
+  if (interaction.kind !== "request_confirmation") return false;
+  const target = interaction.payload.target;
+  if (target?.type !== "issue_document" || target.key !== "plan") return false;
+  if (target.issueId && target.issueId !== planDocument.issueId) return false;
+  if (planDocument.latestRevisionId) {
+    return target.revisionId === planDocument.latestRevisionId;
+  }
+  return target.revisionNumber === planDocument.latestRevisionNumber;
+}
+
+function isResolvedPlanConfirmation(interaction: IssueThreadInteraction) {
+  return (
+    interaction.kind === "request_confirmation" &&
+    (interaction.status === "accepted" || interaction.status === "rejected") &&
+    interaction.payload.target?.type === "issue_document" &&
+    interaction.payload.target.key === "plan"
+  );
+}
+
+// A runner-authored plan review is only the lifecycle receipt. Its full plan
+// preview already belongs to the source turn's write_document boundary, so
+// resolving or expiring the review must not insert a second large block there.
+function runnerTurnOwnsPlanPreview(
+  interaction: IssueThreadInteraction,
+  renderedRunIds: ReadonlySet<string>,
+  tailRunId: string | null,
+): boolean {
+  if (!interaction.sourceRunId || interaction.kind !== "request_confirmation")
+    return false;
+  const target = interaction.payload.target;
+  return (
+    target?.type === "issue_document" &&
+    target.key === "plan" &&
+    (renderedRunIds.has(interaction.sourceRunId) ||
+      tailRunId === interaction.sourceRunId)
+  );
+}
+
+function threadOwnsPlanPreview(
+  interaction: IssueThreadInteraction,
+  planDocument: IssueDocument | null | undefined,
+  planDocumentSourceRunId: string | null,
+  renderedRunIds: ReadonlySet<string>,
+  tailRunId: string | null,
+): boolean {
+  if (!planDocument || !interactionTargetsPlanRevision(interaction, planDocument))
+    return false;
+  // Plans without a native-run owner are canonical chronological thread
+  // entries. In particular, legacy adapters write them through shell/API
+  // tools rather than a semantic write_document boundary, so the pending
+  // confirmation must not replace that durable timeline position.
+  if (!planDocumentSourceRunId) return true;
+  return runnerTurnOwnsPlanPreview(interaction, renderedRunIds, tailRunId);
+}
+
 function isRunnerResponseComment(params: {
   comment: TaskChatThreadProps["comments"][number];
   runId: string;
@@ -130,7 +208,9 @@ const EMPTY_LIVE_ISSUE_IDS: ReadonlySet<string> = new Set<string>();
 const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
 
-function acceptedSemanticResult(value: unknown): Record<string, unknown> | null {
+function acceptedSemanticResult(
+  value: unknown,
+): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const resultJson = value as Record<string, unknown>;
   const semanticResult = resultJson.semanticResult;
@@ -161,35 +241,51 @@ function acceptedSemanticResultSummary(value: unknown): string | null {
 }
 
 function acceptedSemanticResultVerificationCaveats(value: unknown) {
-  const runResult = value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
+  const runResult =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
   const finalizedCaveats = Array.isArray(runResult.verificationCaveats)
     ? runResult.verificationCaveats
     : [];
   if (finalizedCaveats.length > 0) {
     return finalizedCaveats.flatMap((candidate) => {
-      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+      )
+        return [];
       const caveat = candidate as Record<string, unknown>;
       if (typeof caveat.commandOrCheck !== "string") return [];
-      return [{
-        commandOrCheck: caveat.commandOrCheck,
-        reasonCode: typeof caveat.reasonCode === "string" ? caveat.reasonCode : null,
-        detail: typeof caveat.detail === "string" ? caveat.detail : null,
-      }];
+      return [
+        {
+          commandOrCheck: caveat.commandOrCheck,
+          reasonCode:
+            typeof caveat.reasonCode === "string" ? caveat.reasonCode : null,
+          detail: typeof caveat.detail === "string" ? caveat.detail : null,
+        },
+      ];
     });
   }
   const result = acceptedSemanticResult(value);
-  const verification = Array.isArray(result?.verification) ? result.verification : [];
+  const verification = Array.isArray(result?.verification)
+    ? result.verification
+    : [];
   return verification.flatMap((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+      return [];
     const check = candidate as Record<string, unknown>;
-    if (check.status !== "not_run" || typeof check.commandOrCheck !== "string") return [];
-    return [{
-      commandOrCheck: check.commandOrCheck,
-      reasonCode: typeof check.reasonCode === "string" ? check.reasonCode : null,
-      detail: typeof check.detail === "string" ? check.detail : null,
-    }];
+    if (check.status !== "not_run" || typeof check.commandOrCheck !== "string")
+      return [];
+    return [
+      {
+        commandOrCheck: check.commandOrCheck,
+        reasonCode:
+          typeof check.reasonCode === "string" ? check.reasonCode : null,
+        detail: typeof check.detail === "string" ? check.detail : null,
+      },
+    ];
   });
 }
 
@@ -207,6 +303,44 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 }
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread>;
+
+type PendingComposerInput =
+  | {
+      key: string;
+      kind: "runtime";
+      item: TaskChatRuntimeRequestItem;
+      label: string;
+    }
+  | {
+      key: string;
+      kind: "durable";
+      interaction: TaskChatInteractionItem["interaction"];
+      label: string;
+    };
+
+function durableInputLabel(
+  interaction: TaskChatInteractionItem["interaction"],
+): string {
+  if (interaction.kind === "ask_user_questions")
+    return interaction.title ?? "Questions";
+  if (interaction.kind === "suggest_tasks")
+    return interaction.title ?? "Suggested tasks";
+  if (interaction.kind === "request_checkbox_confirmation")
+    return interaction.title ?? "Choose options";
+  if (interaction.kind === "request_item_verdicts")
+    return interaction.title ?? "Review items";
+  if (
+    interaction.payload.target?.type === "issue_document" &&
+    interaction.payload.target.key === "plan"
+  ) {
+    return interaction.title ?? "Review plan";
+  }
+  if (interaction.payload.toolAction)
+    return interaction.title ?? "Approve tool action";
+  if (interaction.payload.secretProposal)
+    return interaction.title ?? "Review secret proposal";
+  return interaction.title ?? "Confirmation";
+}
 
 /**
  * Chat-style task thread — the default task detail experience.
@@ -241,6 +375,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     issueId = null,
     agentMap,
     userLabelMap,
+    userProfileMap,
     currentUserId,
     onAdd,
     issueWorkMode = "standard",
@@ -266,6 +401,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     onRejectInteraction,
     onSubmitInteractionAnswers,
     onCancelInteraction,
+    onSkipInteraction,
     onSubmitInteractionVerdicts,
     externalReferences,
     threadHeader,
@@ -277,6 +413,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     draftKey,
     onInterruptQueued,
     interruptingQueuedRunId,
+    onTryAgainNoLiveExecutionPath,
+    tryAgainNoLiveExecutionPathPending = false,
     queuedCommentQueue,
     onEditQueuedComment,
     onReorderQueuedComments,
@@ -465,7 +603,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   }, [linkedRuns]);
 
   const verificationCaveatsByRunId = useMemo(() => {
-    const map = new Map<string, ReturnType<typeof acceptedSemanticResultVerificationCaveats>>();
+    const map = new Map<
+      string,
+      ReturnType<typeof acceptedSemanticResultVerificationCaveats>
+    >();
     for (const run of linkedRuns ?? []) {
       const caveats = acceptedSemanticResultVerificationCaveats(run.resultJson);
       if (caveats.length > 0) map.set(run.runId, caveats);
@@ -626,12 +767,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       map.set(comment.runId, comment.id);
     }
     // A settled Paperclip turn normally attaches to its durable final reply.
-    // Same-turn steering splits that causal interval: the activity began at
-    // run start, the human input arrived during it, and the final reply landed
-    // later. Leave that turn unanchored so the chronological assembler places
-    // its collapsed Worked row at run start, before the injected human bubble;
-    // anchoring it to either comment would necessarily put one of them on the
-    // wrong side of the whole (currently indivisible) activity disclosure.
+    // Same-turn steering splits that causal interval into timestamped segments,
+    // so each segment must stay unanchored and interleave around the injected
+    // human bubble through the chronological assembler.
     for (const comment of comments) {
       const runId = comment.steeredIntoRunId;
       if (!comment.deletedAt && runId && comment.conversationAnchorAt) {
@@ -645,7 +783,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     const map = new Map<string, number[]>();
     for (const comment of comments) {
       const runId = comment.steeredIntoRunId;
-      if (comment.deletedAt || !runId || !comment.conversationAnchorAt) continue;
+      if (comment.deletedAt || !runId || !comment.conversationAnchorAt)
+        continue;
       const anchorMs = toMs(comment.conversationAnchorAt);
       if (!Number.isFinite(anchorMs)) continue;
       const anchors = map.get(runId) ?? [];
@@ -657,6 +796,81 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   }, [comments]);
 
   const { data: planDocument } = useIssuePlanDocument(issueId);
+
+  // A native-runner Plan is part of the turn that wrote its current revision.
+  // Legacy adapters do not expose the semantic write_document boundary needed
+  // for stable embedding, so their Plans remain chronological thread entries.
+  // Prefer a native review request's explicit run binding; while that request
+  // is still being created, infer the native owner from the document timestamp.
+  const planDocumentSourceRunId = useMemo(() => {
+    if (!planDocument) return null;
+    const candidates = new Map<
+      string,
+      {
+        id: string;
+        adapterType: string;
+        agentId?: string | null;
+        createdAt?: Date | string | null;
+        startedAt?: Date | string | null;
+        finishedAt?: Date | string | null;
+      }
+    >();
+    for (const run of linkedRuns ?? []) {
+      candidates.set(run.runId, {
+        ...run,
+        id: run.runId,
+        adapterType: run.adapterType ?? "",
+      });
+    }
+    for (const run of liveRuns ?? []) candidates.set(run.id, run);
+    if (activeRun) candidates.set(activeRun.id, activeRun);
+
+    const linkedReview = (interactions ?? []).find(
+      (interaction) => {
+        if (!interaction.sourceRunId) return false;
+        const sourceRun = candidates.get(interaction.sourceRunId);
+        return (
+          sourceRun?.adapterType === "paperclip_runner" &&
+          interactionTargetsPlanRevision(interaction, planDocument)
+        );
+      },
+    );
+    if (linkedReview?.sourceRunId) return linkedReview.sourceRunId;
+
+    const documentAtMs = toMs(planDocument.updatedAt);
+    const matchingRuns = [...candidates.values()].filter((run) => {
+      if (run.adapterType !== "paperclip_runner") return false;
+      if (
+        planDocument.updatedByAgentId &&
+        run.agentId &&
+        planDocument.updatedByAgentId !== run.agentId
+      ) {
+        return false;
+      }
+      const startedAtMs = toMs(run.startedAt ?? run.createdAt);
+      const finishedAtMs = run.finishedAt
+        ? toMs(run.finishedAt)
+        : Number.POSITIVE_INFINITY;
+      return (
+        startedAtMs <= documentAtMs + 1_000 &&
+        documentAtMs <= finishedAtMs + 1_000
+      );
+    });
+    matchingRuns.sort(
+      (a, b) =>
+        toMs(b.startedAt ?? b.createdAt) - toMs(a.startedAt ?? a.createdAt),
+    );
+    return matchingRuns[0]?.id ?? null;
+  }, [activeRun, interactions, linkedRuns, liveRuns, planDocument]);
+
+  const planTurnItem = useMemo<TaskChatPlanDocumentItem | null>(() => {
+    if (!planDocument || !planDocumentSourceRunId) return null;
+    return {
+      id: `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`,
+      kind: "plan_document",
+      document: planDocument,
+    };
+  }, [planDocument, planDocumentSourceRunId]);
 
   // Comments, interactions, and the plan-doc marker merged into one
   // chronological backbone (same sort keys and same-run handoff shift as the
@@ -697,21 +911,39 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         ms: comment.conversationAnchorAt
           ? toMs(comment.conversationAnchorAt)
           : toMs(comment.createdAt),
-        order: 1 + Math.min(comment.conversationAnchorSequence ?? 0, 999) / 1000,
+        order:
+          1 + Math.min(comment.conversationAnchorSequence ?? 0, 999) / 1000,
         id: item.id,
         item,
       });
     });
     for (const interaction of interactions ?? []) {
-      // Withdrawn/superseded confirmations are retracted calls to action — drop
-      // them so a dead card never stacks above the one that replaced it
-      // (PAP-416).
-      if (isSuppressedThreadInteraction(interaction)) continue;
       // A never-rendered card — a degenerate `ask_user_questions` (e.g. the
       // onboarding `Test / A` placeholder) or a stale sibling superseded by a
       // newer question (PAP-437) — is filtered here so it leaves no empty slot
       // or gap in the ordered backbone (PAP-424, plan from PAP-420).
-      if (shouldHideInteractionCard(interaction)) continue;
+      const isSupersededQuestionReceipt =
+        interaction.kind === "ask_user_questions" &&
+        interaction.status !== "pending" &&
+        interaction.result?.expirationReason ===
+          "superseded_by_newer_interaction";
+      if (
+        shouldHideInteractionCard(interaction) &&
+        !isSupersededQuestionReceipt
+      )
+        continue;
+      // The plan preview is already embedded at this run's write_document
+      // boundary. Pending controls live in the composer takeover, so mounting
+      // the interaction's second preview here would make the plan jump and
+      // duplicate during the live-to-settled handoff.
+      if (
+        interaction.status === "pending" &&
+        planDocument &&
+        planDocumentSourceRunId === interaction.sourceRunId &&
+        interactionTargetsPlanRevision(interaction, planDocument)
+      ) {
+        continue;
+      }
       const createdAtMs = toMs(interaction.createdAt);
       const handoffAtMs =
         interaction.kind === "request_confirmation" && interaction.sourceRunId
@@ -726,10 +958,14 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           : null;
       const id = `interaction:${interaction.id}`;
       entries.push({
-        // A resolved card settles at its resolution time so it never reads
-        // above a message written before the user answered (PAP-416); pending
-        // cards keep the request-time (handoff/createdAt) slot.
-        ms: interactionThreadAnchorMs(interaction, handoffAtMs ?? createdAtMs),
+        // Question forms and plan previews remain where they were asked. Their
+        // separately projected human responses stay at resolvedAt.
+        ms: isResolvedPlanConfirmation(interaction)
+          ? (handoffAtMs ?? createdAtMs)
+          : interactionThreadAnchorMs(
+              interaction,
+              handoffAtMs ?? createdAtMs,
+            ),
         order: 2,
         id,
         item: { id, kind: "interaction", interaction },
@@ -807,29 +1043,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         },
       });
     }
-    if (planDocument) {
-      const pendingReviewAlreadyPreviewsRevision = (interactions ?? []).some((interaction) => {
-        if (interaction.kind !== "request_confirmation" || interaction.status !== "pending") return false;
-        if (isSuppressedThreadInteraction(interaction) || shouldHideInteractionCard(interaction)) return false;
-        const target = interaction.payload.target;
-        if (target?.type !== "issue_document" || target.key !== "plan") return false;
-        if (target.issueId && target.issueId !== planDocument.issueId) return false;
-        if (planDocument.latestRevisionId) return target.revisionId === planDocument.latestRevisionId;
-        return target.revisionNumber === planDocument.latestRevisionNumber;
-      });
-      if (!pendingReviewAlreadyPreviewsRevision) {
-        const id = `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`;
-        entries.push({
-          ms: toMs(planDocument.updatedAt),
-          order: 0,
+    if (planDocument && !planDocumentSourceRunId) {
+      const id = `plan-doc:${planDocument.latestRevisionId ?? planDocument.id}`;
+      entries.push({
+        ms: toMs(planDocument.updatedAt),
+        order: 0,
+        id,
+        item: {
           id,
-          item: {
-            id,
-            kind: "plan_document",
-            document: planDocument,
-          },
-        });
-      }
+          kind: "plan_document",
+          document: planDocument,
+        },
+      });
     }
     return entries.sort(
       (a, b) => a.ms - b.ms || a.order - b.order || a.id.localeCompare(b.id),
@@ -846,11 +1071,68 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     linkedRuns,
     liveRuns,
     planDocument,
+    planDocumentSourceRunId,
     heldPaperclipRunnerRunId,
     heldPaperclipRunnerStartedAtMs,
     heldPaperclipRunnerFinalText,
     queuedCommentIds,
   ]);
+
+  const legacyTimelineAnchorsByRun = useMemo(() => {
+    const windows = new Map<
+      string,
+      { adapterType: string; startMs: number; endMs: number }
+    >();
+    for (const run of linkedRuns ?? []) {
+      windows.set(run.runId, {
+        adapterType: run.adapterType ?? "",
+        startMs: toMs(run.startedAt ?? run.createdAt),
+        endMs: run.finishedAt
+          ? toMs(run.finishedAt)
+          : Number.POSITIVE_INFINITY,
+      });
+    }
+    for (const run of liveRuns ?? []) {
+      windows.set(run.id, {
+        adapterType: run.adapterType,
+        startMs: toMs(run.startedAt ?? run.createdAt),
+        endMs: run.finishedAt
+          ? toMs(run.finishedAt)
+          : Number.POSITIVE_INFINITY,
+      });
+    }
+    if (activeRun) {
+      windows.set(activeRun.id, {
+        adapterType: activeRun.adapterType,
+        startMs: toMs(activeRun.startedAt ?? activeRun.createdAt),
+        endMs: activeRun.finishedAt
+          ? toMs(activeRun.finishedAt)
+          : Number.POSITIVE_INFINITY,
+      });
+    }
+
+    const anchorsByRun = new Map<string, number[]>();
+    for (const [runId, window] of windows) {
+      if (
+        window.adapterType === "paperclip_runner" ||
+        !Number.isFinite(window.startMs)
+      ) {
+        continue;
+      }
+      const anchors = orderedEntries
+        .map((entry) => entry.ms)
+        .filter(
+          (entryMs) =>
+            Number.isFinite(entryMs) &&
+            entryMs > window.startMs &&
+            entryMs <= window.endMs,
+        );
+      if (anchors.length > 0) {
+        anchorsByRun.set(runId, [...new Set(anchors)].sort((a, b) => a - b));
+      }
+    }
+    return anchorsByRun;
+  }, [activeRun, linkedRuns, liveRuns, orderedEntries]);
 
   // Boolean gate (stable across the host's per-render brief objects) so the
   // heavy assembly memo doesn't recompute on every parent render.
@@ -866,11 +1148,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     // double-rendering beside its own settled turn.
     const settledRunIds = new Set<string>();
     const entriesWithFailures = [...orderedEntries];
-    // Settled turns for every terminal run whose transcript we have. Messages
-    // and thinking are excluded entirely (PAP-361): the final reply already
-    // landed as the run's comment bubble, interstitial updates are ephemeral
-    // (live-line only), and thinking stays in the run log / classic
-    // transcript — "Worked · N tools" expands to exactly the tool rows.
+    // Settled turns for every terminal run whose transcript we have. Provider
+    // commentary, grouped activity (including reasoning summaries), and
+    // terminal request receipts remain in transcript order. Final text is
+    // owned by a posted comment when one exists; yielded interaction runs keep
+    // the accepted summary in the turn's durable response slot instead.
     const settledTurns: {
       turn: TaskChatTurnItem;
       anchorCommentId: string | null;
@@ -884,8 +1166,55 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       if (liveRun && source.id === liveRun.id) continue;
       const entries = transcriptByRun.get(source.id) ?? [];
       const meta = linkedRunMetaById.get(source.id);
+      const acceptedSummary = acceptedSemanticResultSummary(meta?.resultJson);
       if (entries.length === 0) {
-        if (source.status === "failed" || source.status === "timed_out") {
+        if (
+          source.adapterType === "paperclip_runner" &&
+          acceptedSummary &&
+          !lastCommentIdByRun.has(source.id)
+        ) {
+          const startedAtMs = toMs(meta?.startedAt ?? meta?.createdAt);
+          const finishedAtMs = toMs(meta?.finishedAt);
+          const durationMs =
+            startedAtMs > 0 && finishedAtMs > 0
+              ? Math.max(0, finishedAtMs - startedAtMs)
+              : undefined;
+          const failed = source.status !== "succeeded";
+          const turnId = `${source.id}:turn`;
+          turnMergeMetaById.set(turnId, {
+            agentKey: meta?.agentId ?? "",
+            agentName: meta?.agentName,
+            parts: [{ entries, durationMs, failed }],
+          });
+          settledTurns.push({
+            turn: {
+              id: turnId,
+              kind: "turn",
+              settled: true,
+              agentName:
+                meta?.agentName ??
+                (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
+              agentIcon: meta?.agentId
+                ? agentMap?.get(meta.agentId)?.icon
+                : undefined,
+              standaloneHeader: true,
+              animateFold: liveSeenRef.current.has(source.id),
+              items: [],
+              finalResponse: paperclipRunnerFinalResponse([], {
+                runId: source.id,
+                agentName: meta?.agentName,
+                fallbackSummary: acceptedSummary,
+              }),
+              summary: buildTurnSummary(entries, { durationMs, failed }),
+            },
+            anchorCommentId: null,
+            startMs: startedAtMs > 0 ? startedAtMs : Number.POSITIVE_INFINITY,
+          });
+          settledRunIds.add(source.id);
+        } else if (
+          source.status === "failed" ||
+          source.status === "timed_out"
+        ) {
           settledRunIds.add(source.id);
           const code = meta?.errorCode ?? "native_runner_process_exited";
           const retryDetail = meta?.scheduledRetryAt
@@ -936,10 +1265,23 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         Number.isFinite(started) && Number.isFinite(finished)
           ? Math.max(0, finished - started)
           : undefined;
+      const hasPaperclipRunnerResponse =
+        source.adapterType === "paperclip_runner" &&
+        Boolean(
+          acceptedSummary ||
+          entries.some(
+            (entry) =>
+              (entry.kind === "assistant" &&
+                entry.channel === "final" &&
+                Boolean(entry.text.trim())) ||
+              (entry.kind === "run_result" && Boolean(entry.summary.trim())),
+          ),
+        );
       if (
         source.status === "succeeded" &&
         !lastCommentIdByRun.has(source.id) &&
-        resolvedWithoutUserFacingResponse(meta?.resultJson)
+        resolvedWithoutUserFacingResponse(meta?.resultJson) &&
+        !hasPaperclipRunnerResponse
       ) {
         const id = `${source.id}:terminal-notice`;
         entriesWithFailures.push({
@@ -957,61 +1299,83 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       }
       const failed = source.status !== "succeeded";
       const startSlotRaw = meta?.startedAt ?? meta?.createdAt;
-      const startSlotMs = startSlotRaw ? toMs(startSlotRaw) : Number.POSITIVE_INFINITY;
-      const steeringAnchors = source.adapterType === "paperclip_runner"
-        ? steeringAnchorsByRun.get(source.id) ?? []
-        : [];
-      const segments = steeringAnchors.length === 0
-        ? [{ startMs: startSlotMs, endMs: Number.POSITIVE_INFINITY, entries }]
-        : [startSlotMs, ...steeringAnchors].map((segmentStartMs, index) => {
-            const segmentEndMs = steeringAnchors[index] ?? Number.POSITIVE_INFINITY;
-            return {
-              startMs: segmentStartMs,
-              endMs: segmentEndMs,
-              entries: entries.filter((entry) => {
-                const entryMs = toMs(entry.ts);
-                const afterStart = index === 0 || entryMs >= segmentStartMs;
-                return afterStart && entryMs < segmentEndMs;
-              }),
-            };
-          });
+      const startSlotMs = startSlotRaw
+        ? toMs(startSlotRaw)
+        : Number.POSITIVE_INFINITY;
+      const timelineAnchors =
+        source.adapterType === "paperclip_runner"
+          ? (steeringAnchorsByRun.get(source.id) ?? [])
+          : (legacyTimelineAnchorsByRun.get(source.id) ?? []);
+      const segments = splitTranscriptAtAnchors(
+        entries,
+        startSlotMs,
+        timelineAnchors,
+      );
       for (const [segmentIndex, segment] of segments.entries()) {
         if (segment.entries.length === 0) continue;
-        const parsed = transcriptToTaskChatItems(segment.entries, {
+        const parsedTranscript = transcriptToTaskChatItems(segment.entries, {
           runId: source.id,
           agentName: meta?.agentName,
           running: false,
         });
+        const parsed =
+          source.id === planDocumentSourceRunId && planTurnItem
+            ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
+            : parsedTranscript;
         const children = settledRunChildren(
           source.adapterType === "paperclip_runner"
-            ? paperclipRunnerHistoryItems(parsed)
+            ? paperclipRunnerTimelineItems(parsed)
             : parsed,
         );
-        if (children.length === 0 && source.adapterType !== "paperclip_runner") continue;
+        const finalResponse =
+          source.adapterType === "paperclip_runner" &&
+          !lastCommentIdByRun.has(source.id)
+            ? paperclipRunnerFinalResponse(parsed, {
+                runId: source.id,
+                agentName: meta?.agentName,
+                fallbackSummary: acceptedSummary,
+              })
+            : undefined;
+        if (
+          children.length === 0 &&
+          !finalResponse &&
+          source.adapterType !== "paperclip_runner"
+        )
+          continue;
         settledRunIds.add(source.id);
-        const segmented = steeringAnchors.length > 0;
+        const segmented = timelineAnchors.length > 0;
         const turnId = segmented
           ? `${source.id}:turn:${segmentIndex}`
           : `${source.id}:turn`;
         const segmentFinishedMs = Number.isFinite(segment.endMs)
           ? segment.endMs
           : finished;
-        const segmentDurationMs = Number.isFinite(segment.startMs) && Number.isFinite(segmentFinishedMs)
-          ? Math.max(0, segmentFinishedMs - segment.startMs)
-          : durationMs;
+        const segmentDurationMs =
+          Number.isFinite(segment.startMs) && Number.isFinite(segmentFinishedMs)
+            ? Math.max(0, segmentFinishedMs - segment.startMs)
+            : durationMs;
         turnMergeMetaById.set(turnId, {
           agentKey: meta?.agentId ?? "",
           agentName: meta?.agentName,
-          parts: [{ entries: segment.entries, durationMs: segmentDurationMs, failed }],
+          parts: [
+            { entries: segment.entries, durationMs: segmentDurationMs, failed },
+          ],
         });
         settledTurns.push({
           turn: {
             id: turnId,
             kind: "turn",
             settled: true,
+            agentName:
+              meta?.agentName ??
+              (meta?.agentId ? agentMap?.get(meta.agentId)?.name : undefined),
+            agentIcon: meta?.agentId
+              ? agentMap?.get(meta.agentId)?.icon
+              : undefined,
             standaloneHeader: source.adapterType === "paperclip_runner",
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
+            finalResponse,
             summary: buildTurnSummary(segment.entries, {
               durationMs: segmentDurationMs,
               failed,
@@ -1019,12 +1383,92 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           },
           anchorCommentId: segmented
             ? null
-            : lastCommentIdByRun.get(source.id) ?? null,
+            : (lastCommentIdByRun.get(source.id) ?? null),
           // A post-steering segment ties the acknowledgement-backed human
           // bubble and is therefore inserted immediately after it. The first
           // segment retains the normal run-start slot.
           startMs: segment.startMs,
         });
+      }
+    }
+
+    // Same-turn steering is visible before a live run settles. Freeze every
+    // completed pre-steer interval into the main chronology immediately, then
+    // leave only the last interval to the streaming tail below. Reusing the
+    // settled ids and projection makes the terminal handoff structurally
+    // identical instead of moving one unsplit live turn around the steer.
+    if (liveRun) {
+      const timelineAnchors =
+        liveRun.adapterType === "paperclip_runner"
+          ? (steeringAnchorsByRun.get(liveRun.id) ?? [])
+          : (legacyTimelineAnchorsByRun.get(liveRun.id) ?? []);
+      if (timelineAnchors.length > 0) {
+        const entries = transcriptByRun.get(liveRun.id) ?? [];
+        const startSlotMs =
+          (liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
+          toMs(liveRun.createdAt);
+        const segments = splitTranscriptAtAnchors(
+          entries,
+          startSlotMs,
+          timelineAnchors,
+        );
+        for (const [segmentIndex, segment] of segments.slice(0, -1).entries()) {
+          if (segment.entries.length === 0) continue;
+          const parsedTranscript = transcriptToTaskChatItems(segment.entries, {
+            runId: liveRun.id,
+            agentName: liveRun.agentName,
+            running: false,
+          });
+          const parsed =
+            liveRun.id === planDocumentSourceRunId && planTurnItem
+              ? embedPlanDocumentAtWriteBoundary(parsedTranscript, planTurnItem)
+              : parsedTranscript;
+          const children = settledRunChildren(
+            liveRun.adapterType === "paperclip_runner"
+              ? paperclipRunnerTimelineItems(parsed)
+              : parsed,
+          );
+          if (children.length === 0) continue;
+          const turnId = `${liveRun.id}:turn:${segmentIndex}`;
+          const segmentDurationMs =
+            Number.isFinite(segment.startMs) && Number.isFinite(segment.endMs)
+              ? Math.max(0, segment.endMs - segment.startMs)
+              : undefined;
+          turnMergeMetaById.set(turnId, {
+            agentKey: liveRun.agentId ?? "",
+            agentName: liveRun.agentName,
+            parts: [
+              {
+                entries: segment.entries,
+                durationMs: segmentDurationMs,
+                failed: false,
+              },
+            ],
+          });
+          settledTurns.push({
+            turn: {
+              id: turnId,
+              kind: "turn",
+              settled: true,
+              agentName:
+                liveRun.agentName ??
+                (liveRun.agentId
+                  ? agentMap?.get(liveRun.agentId)?.name
+                  : undefined),
+              agentIcon: liveRun.agentId
+                ? agentMap?.get(liveRun.agentId)?.icon
+                : undefined,
+              standaloneHeader:
+                liveRun.adapterType === "paperclip_runner",
+              items: children,
+              summary: buildTurnSummary(segment.entries, {
+                durationMs: segmentDurationMs,
+              }),
+            },
+            anchorCommentId: null,
+            startMs: segment.startMs,
+          });
+        }
       }
     }
     settledTurns.sort((a, b) =>
@@ -1082,7 +1526,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     linkedRunMetaById,
     lastCommentIdByRun,
     steeringAnchorsByRun,
+    legacyTimelineAnchorsByRun,
     hasBrief,
+    planDocumentSourceRunId,
+    planTurnItem,
+    agentMap,
   ]);
 
   // Hand off once the settled turn or its reply comment is in the thread; a
@@ -1104,10 +1552,18 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           })
         : comment.runId === settlingRun.id && !comment.deletedAt,
     );
+  const settlingHasDurableInteraction =
+    settlingRun != null &&
+    (interactions ?? []).some(
+      (interaction) =>
+        interaction.sourceRunId === settlingRun.id &&
+        !shouldHideInteractionCard(interaction),
+    );
   const settledRunRendered =
     settlingRun != null &&
     (settlingIsPaperclipRunner
-      ? settlingHasComment && settledRunIds.has(settlingRun.id)
+      ? settledRunIds.has(settlingRun.id) &&
+        (settlingHasComment || settlingHasDurableInteraction)
       : settlingHasComment || settledRunIds.has(settlingRun.id));
   useEffect(() => {
     if (!settlingRun) return;
@@ -1135,22 +1591,43 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ? settlingRun!.id
       : null;
   const tailStreaming = Boolean(liveRun);
-  const tailEntries = tailRunId ? (transcriptByRun.get(tailRunId) ?? []) : [];
   const tailAdapterType = tailRunId
     ? runs.find((run) => run.id === tailRunId)?.adapterType
     : null;
   const paperclipRunnerTail = tailAdapterType === "paperclip_runner";
-  const tailContentKey = tailEntries.reduce((total, entry) => {
+  const tailAllEntries = tailRunId
+    ? (transcriptByRun.get(tailRunId) ?? [])
+    : [];
+  const tailTimelineAnchors = tailRunId
+    ? paperclipRunnerTail
+      ? (steeringAnchorsByRun.get(tailRunId) ?? [])
+      : (legacyTimelineAnchorsByRun.get(tailRunId) ?? [])
+    : [];
+  const tailSegmentStartMs =
+    tailTimelineAnchors.length > 0
+      ? tailTimelineAnchors[tailTimelineAnchors.length - 1]
+      : null;
+  const tailEntries =
+    tailSegmentStartMs == null
+      ? tailAllEntries
+      : tailAllEntries.filter((entry) => toMs(entry.ts) >= tailSegmentStartMs);
+  const tailPlanItem =
+    tailRunId === planDocumentSourceRunId ? planTurnItem : null;
+  const tailEntryContentKey = tailEntries.reduce((total, entry) => {
     if ("text" in entry) return total + entry.text.length;
     if ("content" in entry) return total + entry.content.length;
     return total + entry.kind.length;
   }, tailEntries.length);
+  const tailContentKey = `${tailSegmentStartMs ?? "run-start"}:${tailEntryContentKey}`;
   const blockerContentKey = blockerLinks
     ? `${blockerLinks.directBlocker.id}:${blockerLinks.ultimateBlocker?.id ?? ""}`
     : liveWorkLinks
       ? `live:${liveWorkLinks.steps.map((step) => `${step.blocker.id}:${step.status}`).join(",")}:${liveWorkLinks.nowRunning.map((blocker) => blocker.id).join(",")}`
       : "";
-  const threadContentKey = `${taskChatContentKey(items)}:${tailContentKey}:${blockerContentKey}`;
+  const tailPlanContentKey = tailPlanItem
+    ? `${tailPlanItem.id}:${tailPlanItem.document.body.length}`
+    : "";
+  const threadContentKey = `${taskChatContentKey(items)}:${tailContentKey}:${tailPlanContentKey}:${blockerContentKey}`;
 
   // Status-pill inputs for the tail (PAP-461, A1): the run's start, its finish
   // (once terminal), and the "called N tools" summary. Memoized on the
@@ -1165,7 +1642,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ? liveRun.status
     : (runs.find((run) => run.id === settlingRun?.id)?.status ?? "succeeded");
   const tailStartedAtMs = liveRun
-    ? ((liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
+    ? (tailSegmentStartMs ??
+      (liveRun.startedAt ? toMs(liveRun.startedAt) : null) ??
       toMs(liveRun.createdAt))
     : (settlingRun?.startedAtMs ?? null);
   const tailFinishedAtMs = liveRun
@@ -1200,17 +1678,33 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const visibleTailAgentName = tailAgentName ?? tailAgent?.name ?? null;
   const visibleTailAgentIcon = tailAgent?.icon ?? null;
   const tailItems = useMemo(
-    () =>
-      tailRunId
-        ? transcriptToTaskChatItems(tailEntries, {
-            runId: tailRunId,
-            agentName: tailAgentName,
-            running: tailStreaming,
-          })
-        : [],
+    () => {
+      if (!tailRunId) return [];
+      const parsed = transcriptToTaskChatItems(tailEntries, {
+        runId: tailRunId,
+        agentName: tailAgentName,
+        running: tailStreaming,
+      });
+      return tailPlanItem
+        ? embedPlanDocumentAtWriteBoundary(parsed, tailPlanItem)
+        : parsed;
+    },
     // tailEntries is a fresh array each render; tailContentKey tracks its content.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [tailRunId, tailContentKey, tailStreaming, tailAgentName],
+    [
+      tailRunId,
+      tailContentKey,
+      tailStreaming,
+      tailAgentName,
+      tailPlanContentKey,
+    ],
+  );
+  const tailTurnStatus = useMemo(
+    () =>
+      isTerminalRunStatus(tailStatus)
+        ? null
+        : taskChatTurnStatusModel(tailItems),
+    [tailItems, tailStatus],
   );
   const pendingRuntimeRequest = latestPendingRuntimeRequest(tailItems);
   const handleRuntimeRequestDecision = useCallback(
@@ -1255,11 +1749,102 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     },
     [],
   );
-  const runtimeComposerDisabledReason =
-    composerDisabledReason ??
-    (pendingRuntimeRequest
-      ? "Resolve the runtime request before sending another message."
-      : undefined);
+  const pendingComposerInputs = useMemo<PendingComposerInput[]>(() => {
+    const result: PendingComposerInput[] = [];
+    const runtimeKey = pendingRuntimeRequest
+      ? `runtime:${pendingRuntimeRequest.runId}:${pendingRuntimeRequest.requestId}`
+      : null;
+    if (pendingRuntimeRequest && runtimeKey) {
+      result.push({
+        key: runtimeKey,
+        kind: "runtime",
+        item: pendingRuntimeRequest,
+        label:
+          pendingRuntimeRequest.questionSet?.title ??
+          (pendingRuntimeRequest.requestType === "permission"
+            ? "Runtime permission"
+            : "Runtime input"),
+      });
+    }
+    const durable = (interactions ?? [])
+      .filter(
+        (interaction) =>
+          interaction.status === "pending" &&
+          !shouldHideInteractionCard(interaction),
+      )
+      .sort((left, right) => toMs(right.createdAt) - toMs(left.createdAt));
+    for (const interaction of durable) {
+      const recoveredRuntimeKey =
+        interaction.kind === "ask_user_questions" &&
+        interaction.sourceRunId &&
+        interaction.payload.runtimeRequestId
+          ? `runtime:${interaction.sourceRunId}:${interaction.payload.runtimeRequestId}`
+          : null;
+      const key = recoveredRuntimeKey ?? `interaction:${interaction.id}`;
+      if (key === runtimeKey) continue;
+      result.push({
+        key,
+        kind: "durable",
+        interaction,
+        label: durableInputLabel(interaction),
+      });
+    }
+    return result;
+  }, [interactions, pendingRuntimeRequest]);
+  const [takeoverMode, setTakeoverMode] = useState<"open" | "normal">("open");
+  const [selectedPendingKey, setSelectedPendingKey] = useState<string | null>(
+    null,
+  );
+  const knownPendingKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const currentKeys = new Set(
+      pendingComposerInputs.map((input) => input.key),
+    );
+    const hasNewInput = pendingComposerInputs.some(
+      (input) => !knownPendingKeysRef.current.has(input.key),
+    );
+    knownPendingKeysRef.current = currentKeys;
+    setSelectedPendingKey((current) =>
+      current && currentKeys.has(current)
+        ? current
+        : (pendingComposerInputs[0]?.key ?? null),
+    );
+    if (hasNewInput) setTakeoverMode("open");
+  }, [pendingComposerInputs]);
+  const selectedPendingInput =
+    pendingComposerInputs.find((input) => input.key === selectedPendingKey) ??
+    pendingComposerInputs[0] ??
+    null;
+  const interactionDraftKey = selectedPendingInput
+    ? `paperclip:task-input:${issueId ?? "unknown"}:${selectedPendingInput.key}`
+    : undefined;
+  const openPendingTakeover = useCallback(() => {
+    setTakeoverMode("open");
+  }, []);
+  const showNextPendingInput = useCallback(() => {
+    if (pendingComposerInputs.length < 2) return;
+    const currentIndex = pendingComposerInputs.findIndex(
+      (input) => input.key === selectedPendingInput?.key,
+    );
+    setSelectedPendingKey(
+      pendingComposerInputs[(currentIndex + 1) % pendingComposerInputs.length]
+        ?.key ?? null,
+    );
+  }, [pendingComposerInputs, selectedPendingInput?.key]);
+  const skipPendingInput = useCallback(
+    async (input: PendingComposerInput) => {
+      if (input.kind === "runtime") {
+        await handleRuntimeRequestDecision(input.item, { action: "cancel" });
+      } else {
+        if (!onSkipInteraction)
+          throw new Error("Skipping this interaction is unavailable.");
+        await onSkipInteraction(input.interaction);
+      }
+      setTakeoverMode("normal");
+    },
+    [handleRuntimeRequestDecision, onSkipInteraction],
+  );
+  const runtimeComposerDisabledReason = composerDisabledReason ?? undefined;
   const assigneeUsesPaperclipRunner = Boolean(
     issueAssigneeAgentId &&
     agentMap?.get(issueAssigneeAgentId)?.adapterType === "paperclip_runner",
@@ -1369,6 +1954,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       <TaskChatInteractionCard
         item={item}
         planDocument={planDocument}
+        showPlanPreview={
+          !threadOwnsPlanPreview(
+            item.interaction,
+            planDocument,
+            planDocumentSourceRunId,
+            settledRunIds,
+            tailRunId,
+          )
+        }
         agentMap={agentMap}
         currentUserId={currentUserId}
         userLabelMap={userLabelMap}
@@ -1378,6 +1972,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         onCancelInteraction={onCancelInteraction}
         onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
         onUploadImage={imageUploadHandler}
+        mentions={mentions}
         externalReferences={externalReferences}
       />
     ),
@@ -1391,8 +1986,12 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       onCancelInteraction,
       onSubmitInteractionVerdicts,
       imageUploadHandler,
+      mentions,
       externalReferences,
       planDocument,
+      planDocumentSourceRunId,
+      settledRunIds,
+      tailRunId,
     ],
   );
 
@@ -1402,13 +2001,75 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     return agentMap?.get(assigneeAgentId) ?? null;
   }, [agentMap, currentAssigneeValue]);
 
+  const takeoverContent = selectedPendingInput ? (
+    selectedPendingInput.kind === "runtime" ? (
+      <TaskChatProtocolCard
+        item={selectedPendingInput.item}
+        presentation="takeover"
+        draftKey={interactionDraftKey}
+        imageUploadHandler={imageUploadHandler}
+        mentions={mentions}
+        onRuntimeRequestDecision={handleRuntimeRequestDecision}
+      />
+    ) : (
+      <TaskChatInteractionCard
+        item={{
+          id: `interaction:${selectedPendingInput.interaction.id}`,
+          kind: "interaction",
+          interaction: selectedPendingInput.interaction,
+        }}
+        presentation="takeover"
+        draftKey={interactionDraftKey}
+        planDocument={planDocument}
+        agentMap={agentMap}
+        currentUserId={currentUserId}
+        userLabelMap={userLabelMap}
+        onAcceptInteraction={onAcceptInteraction}
+        onRejectInteraction={onRejectInteraction}
+        onSubmitInteractionAnswers={onSubmitInteractionAnswers}
+        onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
+        onUploadImage={imageUploadHandler}
+        mentions={mentions}
+        externalReferences={externalReferences}
+      />
+    )
+  ) : null;
+  const composerTakeover =
+    takeoverMode === "open" && selectedPendingInput && takeoverContent
+      ? {
+          id: selectedPendingInput.key,
+          label: selectedPendingInput.label,
+          pendingCount: pendingComposerInputs.length,
+          content: takeoverContent,
+          onDismiss: () => setTakeoverMode("normal"),
+          onSkip: () => skipPendingInput(selectedPendingInput),
+          onShowNext: showNextPendingInput,
+          inlineSkip:
+            selectedPendingInput.kind === "durable"
+              ? selectedPendingInput.interaction.kind ===
+                  "ask_user_questions" ||
+                selectedPendingInput.interaction.kind ===
+                  "request_item_verdicts"
+              : selectedPendingInput.item.requestType === "input" &&
+                Boolean(selectedPendingInput.item.questionSet),
+          hideSkip:
+            selectedPendingInput.kind === "durable"
+              ? interactionReplacesComposerSkip(
+                  selectedPendingInput.interaction,
+                )
+              : runtimeRequestReplacesComposerSkip(selectedPendingInput.item),
+        }
+      : null;
+  const autoFollowContentKey = `${threadContentKey}:${composerTakeover?.id ?? "composer"}`;
+
   // Mobile (PAP-360): the app shell scrolls the DOCUMENT (Layout's main is
   // overflow-visible with auto height), so the desktop bounded h-dvh chain
   // collapses the absolute-inset transcript viewport to 0px. Render the thread
   // in document flow instead (the same scroll={false} path the previews use)
-  // and track auto-follow against window scroll. Desktop stays byte-identical.
+  // and track auto-follow against window scroll. Both paths include takeover
+  // state so opening or closing composer input preserves bottom pinning.
   const { isMobile } = useSidebar();
-  useWindowAutoFollow(isMobile ? threadContentKey : 0, isMobile);
+  useWindowAutoFollow(isMobile ? autoFollowContentKey : 0, isMobile);
 
   return (
     <div
@@ -1425,7 +2086,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           >
             {threadHeaderWithBlockers ? (
               <div
-                className="mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-6 px-4 pt-4"
+                className={cn(
+                  "mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-6 px-4",
+                  isMobile ? "pt-4" : "pt-3",
+                )}
                 data-testid="task-chat-thread-header"
               >
                 {threadHeaderWithBlockers}
@@ -1452,12 +2116,22 @@ export function TaskChatThread(props: TaskChatThreadProps) {
             }
             renderMessageActions={renderMessageActions}
             renderQueuedAction={renderQueuedAction}
+            onTryAgainNoLiveExecutionPath={
+              issueStatus === "blocked"
+                ? onTryAgainNoLiveExecutionPath
+                : undefined
+            }
+            tryAgainNoLiveExecutionPathPending={
+              tryAgainNoLiveExecutionPathPending
+            }
             tail={
               tailRunId || optimisticRunnerStartup || bottomBlockerLinks ? (
                 <>
                   {tailRunId || optimisticRunnerStartup ? (
                     <div data-testid="task-chat-live-transcript">
-                      {paperclipRunnerTail || pendingRuntimeRequest || optimisticRunnerStartup ? (
+                      {paperclipRunnerTail ||
+                      pendingRuntimeRequest ||
+                      optimisticRunnerStartup ? (
                         <TaskChatRunnerTurn
                           runId={tailRunId}
                           agentName={visibleTailAgentName}
@@ -1468,7 +2142,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                           }
                           startedAtMs={tailStartedAtMs}
                           finishedAtMs={tailFinishedAtMs}
-                          planDocument={planDocument}
                           onRuntimeRequestDecision={
                             handleRuntimeRequestDecision
                           }
@@ -1499,7 +2172,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 </>
               ) : null
             }
-            contentKey={threadContentKey}
+            contentKey={autoFollowContentKey}
+            className={isMobile ? undefined : "pt-3"}
             scroll={!isMobile}
           />
         )}
@@ -1534,6 +2208,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           )}
         >
           {composerAccessory}
+          {tailTurnStatus ? (
+            <TaskChatTurnStatusIsland model={tailTurnStatus} />
+          ) : null}
           <div
             className="relative isolate flex flex-col"
             data-testid="task-chat-composer-stack"
@@ -1572,6 +2249,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 mentions={mentions}
                 enableReassign={enableReassign}
                 reassignOptions={reassignOptions}
+                agentMap={agentMap}
+                userProfileMap={userProfileMap}
                 currentAssigneeValue={currentAssigneeValue}
                 issueStatus={issueStatus}
                 mobile={isMobile}
@@ -1579,6 +2258,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 queuedEdit={queuedEdit}
                 onSaveQueuedEdit={saveQueuedEdit}
                 onCancelQueuedEdit={() => setQueuedEdit(null)}
+                takeover={composerTakeover}
+                pendingTakeover={
+                  pendingComposerInputs.length > 0
+                    ? {
+                        count: pendingComposerInputs.length,
+                        label: `${pendingComposerInputs.length} pending input${pendingComposerInputs.length === 1 ? "" : "s"}`,
+                        onOpen: openPendingTakeover,
+                      }
+                    : null
+                }
               />
             </div>
           </div>

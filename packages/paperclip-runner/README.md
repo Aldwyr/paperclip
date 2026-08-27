@@ -214,6 +214,7 @@ pnpm --filter @paperclipai/paperclip-runner smoke:capability:aws-agentcore
 - [Capability live runnerd/Codex loop](docs/capability-live-runnerd-codex.md)
 - [Capability issue-thread UI](docs/capability-issue-thread-ui.md)
 - [PRP compatibility/versioning policy](docs/protocol-compatibility.md)
+- [Adding a harness and permission-mode requirements](docs/adding-a-harness.md)
 - [Paperclip Evals integration contract](docs/evals-integration.md)
 - [PRP v1 expressiveness audit](spec/prp-v1-expressiveness-audit.md)
 - [Cumulative end-to-end tutorial](docs/tutorials/end-to-end.md)

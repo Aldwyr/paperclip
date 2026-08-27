@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { SidePanelContentMode, SidePanelPresentation } from "./types";
+import { useScrollbarWhileScrolling } from "./use-scrollbar-while-scrolling";
 
 export interface SidePanelFrameProps {
   children: ReactNode;
@@ -36,6 +37,7 @@ export function SidePanelFrame({
   bodyClassName,
   style,
 }: SidePanelFrameProps) {
+  const handleScroll = useScrollbarWhileScrolling();
   return (
     <section
       aria-label={label}
@@ -45,7 +47,7 @@ export function SidePanelFrame({
       data-maximized={maximized ? "true" : "false"}
       data-resizing={resizing ? "true" : "false"}
       className={cn(
-        "flex min-h-0 min-w-0 flex-col overflow-hidden bg-card text-card-foreground",
+        "flex min-h-0 min-w-0 flex-col overflow-hidden bg-(--side-panel-bg) text-(--side-panel-fg)",
         presentation === "docked" && "h-full border-l border-border",
         presentation === "sheet" && "h-full w-full",
         presentation === "embedded" && "h-full rounded-xl border border-border",
@@ -55,7 +57,7 @@ export function SidePanelFrame({
       style={style}
     >
       {(header || trailingControls) ? (
-        <header className="flex h-(--side-panel-header-height) min-w-0 shrink-0 items-center gap-1 border-b border-border px-2">
+        <header className="flex h-(--side-panel-header-height) min-w-0 shrink-0 items-center gap-1 px-2">
           <div className="flex min-w-0 flex-1 self-stretch">{header}</div>
           {trailingControls ? (
             <div className="flex shrink-0 items-center gap-1">{trailingControls}</div>
@@ -63,15 +65,21 @@ export function SidePanelFrame({
         </header>
       ) : null}
       <div
+        data-side-panel-content-viewport="true"
+        onScroll={handleScroll}
         className={cn(
           "min-h-0 flex-1",
           contentMode === "full-bleed" ? "overflow-hidden" : "overflow-auto",
+          contentMode !== "full-bleed" && "scrollbar-while-scrolling",
           contentMode === "padded" && "p-4",
-          contentMode === "prose" && "mx-auto w-full max-w-4xl overflow-auto px-6 py-4",
           bodyClassName,
         )}
       >
-        {children}
+        {contentMode === "prose" ? (
+          <div data-side-panel-prose-content="true" className="mx-auto w-full max-w-4xl px-6 py-4">
+            {children}
+          </div>
+        ) : children}
       </div>
       {footer ? <footer className="shrink-0 border-t border-border">{footer}</footer> : null}
     </section>
@@ -100,7 +108,11 @@ export function SidePanelToggleButton({
           aria-label={label}
           aria-pressed={open}
           onClick={onToggle}
-          className={cn(open && "bg-accent text-accent-foreground", className)}
+          className={cn(
+            "h-(--side-panel-tab-height) w-(--side-panel-tab-height)",
+            open && "bg-accent text-accent-foreground",
+            className,
+          )}
         >
           {open ? <PanelRightClose aria-hidden /> : <PanelRightOpen aria-hidden />}
         </Button>
@@ -127,6 +139,7 @@ export function SidePanelWindowControls({
         type="button"
         variant="ghost"
         size="icon-sm"
+        className="h-(--side-panel-tab-height) w-(--side-panel-tab-height) text-muted-foreground hover:text-foreground focus-visible:text-foreground"
         onClick={() => onMaximizedChange(!maximized)}
         aria-label={maximized ? "Restore side panel" : "Maximize side panel"}
         title={maximized ? "Restore side panel" : "Maximize side panel"}

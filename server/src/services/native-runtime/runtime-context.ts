@@ -108,12 +108,24 @@ async function materializeAsset(files: AssetFile[]): Promise<NativeRuntimeAssetR
       await fs.writeFile(target, file.content, { mode: file.mode & 0o555 });
       await fs.chmod(target, file.mode & 0o555);
     }
-    await makeDirectoriesReadOnly(stagingRoot);
     await fs.mkdir(path.dirname(rootPath), { recursive: true, mode: 0o700 });
-    await fs.rename(stagingRoot, rootPath).catch(async (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY") throw error;
+    let publishedRoot = false;
+    await fs.rename(stagingRoot, rootPath).then(() => {
+      publishedRoot = true;
+    }).catch(async (error: NodeJS.ErrnoException) => {
+      // Concurrent publishers can surface EACCES on macOS when the winning
+      // destination has already been made read-only. Treat that as a race only
+      // when the content-addressed destination now exists; a genuine permission
+      // failure with no published destination must still fail loudly.
+      const publishedByPeer = (await fs.stat(rootPath).catch(() => null))?.isDirectory() === true;
+      if (error.code !== "EEXIST" && error.code !== "ENOTEMPTY" && !publishedByPeer) throw error;
       await fs.rm(stagingRoot, { recursive: true, force: true });
     });
+    // Publish the writable staging directory first. Renaming a read-only
+    // directory can fail with EACCES on macOS even when both parents are owned
+    // and writable. Files are already immutable; directories become immutable
+    // immediately after this process wins publication.
+    if (publishedRoot) await makeDirectoriesReadOnly(rootPath);
     await fs.mkdir(path.dirname(manifestPath), { recursive: true, mode: 0o700 });
     await fs.writeFile(manifestPath, manifestText, { flag: "wx", mode: 0o400 }).catch(async (error: NodeJS.ErrnoException) => {
       if (error.code !== "EEXIST") throw error;

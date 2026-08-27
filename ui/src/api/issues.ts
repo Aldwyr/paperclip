@@ -243,7 +243,7 @@ export const issuesApi = {
   editQueuedComment: (
     id: string,
     commentId: string,
-    data: { body: string; targetRunId: string; revision: string },
+    data: { body: string; queueId: string; revision: string },
   ) =>
     api.patch<IssueQueuedCommentQueue>(
       `/issues/${id}/queued-comments/${commentId}`,
@@ -251,12 +251,12 @@ export const issuesApi = {
     ),
   reorderQueuedComments: (
     id: string,
-    data: { orderedCommentIds: string[]; targetRunId: string; revision: string },
+    data: { orderedCommentIds: string[]; queueId: string; revision: string },
   ) => api.put<IssueQueuedCommentQueue>(`/issues/${id}/queued-comments/order`, data),
   steerQueuedComment: (
     id: string,
     commentId: string,
-    data: { targetRunId: string; revision: string },
+    data: { queueId: string; targetRunId: string; revision: string },
   ) =>
     api.post<IssueQueuedCommentQueue>(
       `/issues/${id}/queued-comments/${commentId}/steer`,
@@ -265,7 +265,7 @@ export const issuesApi = {
   discardQueuedComment: (
     id: string,
     commentId: string,
-    data: { targetRunId: string; revision: string },
+    data: { queueId: string; revision: string },
   ) =>
     api.delete<IssueQueuedCommentQueue>(
       `/issues/${id}/queued-comments/${commentId}`,
@@ -287,6 +287,8 @@ export const issuesApi = {
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/reject`, reason ? { reason } : {}),
   cancelInteraction: (id: string, interactionId: string, reason?: string) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/cancel`, reason ? { reason } : {}),
+  skipInteraction: (id: string, interactionId: string, reason?: string) =>
+    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/skip`, reason ? { reason } : {}),
   respondToInteraction: (
     id: string,
     interactionId: string,

@@ -1,7 +1,6 @@
 import * as React from "react";
 import { StrictMode } from "react";
 import * as ReactDOM from "react-dom";
-import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "@/lib/router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
@@ -20,6 +19,7 @@ import { initPluginBridge } from "./plugins/bridge-init";
 import { PluginLauncherProvider } from "./plugins/launchers";
 import { startPerfMeasureReaper } from "./lib/perf-measure-reaper";
 import { startServiceWorkerUpdates } from "./lib/service-worker-updates";
+import { getOrCreateReactRoot } from "./lib/react-root";
 import "@mdxeditor/editor/style.css";
 import "./index.css";
 
@@ -56,7 +56,8 @@ function CompanyAwareBreadcrumbProvider({ children }: { children: React.ReactNod
   return <BreadcrumbProvider companyName={selectedCompany?.name ?? null}>{children}</BreadcrumbProvider>;
 }
 
-createRoot(document.getElementById("root")!).render(
+// The shared registry keeps this entrypoint idempotent across Vite module replacement.
+getOrCreateReactRoot(document.getElementById("root")!).render(
   <StrictMode>
     <AppErrorBoundary>
       <QueryClientProvider client={queryClient}>

@@ -450,6 +450,12 @@ export function providerTraceStore(db: Db) {
     };
   }
 
+  async function readExactEntries(runId: string, companyId: string) {
+    const row = await getByRun(runId, companyId);
+    if (!row || row.deletedAt) return null;
+    return readEntries(row.traceRef);
+  }
+
   async function revealFrame(
     runId: string,
     companyId: string,
@@ -494,6 +500,7 @@ export function providerTraceStore(db: Db) {
     prepare,
     finalize,
     inspect,
+    readExactEntries,
     revealFrame,
     download,
     remove,

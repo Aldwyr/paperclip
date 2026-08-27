@@ -45,6 +45,7 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
   const ref = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
   const easingRef = useRef(false);
+  const clientHeightRef = useRef<number | null>(null);
   const scrollbarIdleTimerRef = useRef<number | null>(null);
   const scrollbarIdleDelayRef = useRef<number | null>(null);
   const [pillPhase, setPillPhase] = useState<PillPhase>("hidden");
@@ -89,8 +90,34 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
     el.scrollTop = el.scrollHeight; // instant, never smooth
   }, []);
 
+  const followViewportResize = useCallback(() => {
+    const el = ref.current;
+    if (!el) return false;
+    const previousClientHeight = clientHeightRef.current;
+    const nextClientHeight = el.clientHeight;
+    clientHeightRef.current = nextClientHeight;
+    if (
+      previousClientHeight == null ||
+      previousClientHeight <= 0 ||
+      previousClientHeight === nextClientHeight ||
+      !pinnedRef.current
+    ) {
+      return false;
+    }
+    scrollToBottom();
+    return true;
+  }, [scrollToBottom]);
+
   const handleScroll = useCallback(() => {
     showScrollbarWhileScrolling();
+    // A growing composer shrinks this viewport. Some browsers dispatch the
+    // resulting scroll event before ResizeObserver, so preserve the previous
+    // pinned state here instead of mistaking the layout change for a user
+    // scroll away from the bottom.
+    if (followViewportResize()) {
+      hidePill();
+      return;
+    }
     const pinned = isPinned();
     if (easingRef.current) {
       // Smooth re-follow in flight: intermediate scroll events must not
@@ -105,7 +132,13 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
     pinnedRef.current = pinned;
     if (pinned) hidePill();
     else showPill();
-  }, [isPinned, hidePill, showPill, showScrollbarWhileScrolling]);
+  }, [
+    followViewportResize,
+    isPinned,
+    hidePill,
+    showPill,
+    showScrollbarWhileScrolling,
+  ]);
 
   const handleJumpToLatest = useCallback(() => {
     const el = ref.current;
@@ -152,6 +185,18 @@ export function TaskMessageScroller({ children, contentKey, className }: TaskMes
       window.clearTimeout(scrollbarIdleTimerRef.current);
     }
   }, []);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    clientHeightRef.current = el.clientHeight;
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followViewportResize()) hidePill();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [followViewportResize, hidePill]);
 
   // Follow new content only when already pinned; otherwise hold position.
   useLayoutEffect(() => {

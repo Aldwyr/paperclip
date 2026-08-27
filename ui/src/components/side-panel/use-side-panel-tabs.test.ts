@@ -26,6 +26,13 @@ describe("sidePanelTabsReducer", () => {
     expect(focused.activeTabId).toBe("a");
   });
 
+  it("preserves state identity when the requested tab is already active", () => {
+    const initial = state(["a", "b"], "b");
+
+    expect(sidePanelTabsReducer(initial, { type: "open", tab: tab("b") })).toBe(initial);
+    expect(sidePanelTabsReducer(initial, { type: "select", tabId: "b" })).toBe(initial);
+  });
+
   it("selects the right neighbor, then the left, when closing the active tab", () => {
     const right = sidePanelTabsReducer(state(["a", "b", "c"], "b"), { type: "close", tabId: "b" });
     expect(right.activeTabId).toBe("c");

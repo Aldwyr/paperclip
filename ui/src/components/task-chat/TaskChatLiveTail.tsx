@@ -7,7 +7,8 @@ import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatMarker } from "./TaskChatMarker";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
-import { buildActivityPhases } from "./transcript-adapter";
+import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
+import { buildTurnTimelineRows } from "./transcript-adapter";
 
 /**
  * Live-tail body for the experimental chat-style view (PAP-463, Workstream C1
@@ -23,9 +24,9 @@ import { buildActivityPhases } from "./transcript-adapter";
  * no "Streaming" chip, no uppercase "USED TERMINAL" cards. The status pill above
  * this body (`TaskChatLiveRunPill`) owns the run-status affordance.
  *
- * Stable assistant boundaries compact the rows into activity phases. The
- * trailing streaming assistant chunk stays in the status pill's self-talk
- * slot, while historical interstitials remain readable above their summaries.
+ * Stable assistant and runtime-request boundaries compact the rows into an
+ * ordered turn timeline. Commentary remains readable above the activity group
+ * it introduced, and resolved request receipts keep their original slot.
  */
 export function TaskChatLiveTail({
   items,
@@ -46,7 +47,7 @@ export function TaskChatLiveTail({
   const visibleItems = excludeFinal
     ? items.filter((item) => item.kind !== "message" || item.interstitial)
     : items;
-  const rows = buildActivityPhases(visibleItems, true)
+  const rows = buildTurnTimelineRows(visibleItems, true)
     .map((item) => renderTailRow(item, onRuntimeRequestDecision))
     .filter((row): row is ReactElement => row != null);
 
@@ -104,6 +105,8 @@ function renderTailRow(
         <TaskChatActivityPhase
           key={item.id}
           item={item}
+          childrenClassName="relative ml-2.5 pl-6"
+          showChildRail
           renderChild={(child) => child.kind === "tool"
             ? <TaskChatToolCard item={child} />
             : child.kind === "thinking"
@@ -111,7 +114,9 @@ function renderTailRow(
               : child.kind === "marker"
                 ? <TaskChatMarker item={child} />
                 : child.kind === "protocol"
-                  ? <TaskChatProtocolCard item={child} onRuntimeRequestDecision={onRuntimeRequestDecision} />
+                  ? child.surface === "runtime_request"
+                    ? <TaskChatProtocolCard item={child} onRuntimeRequestDecision={onRuntimeRequestDecision} />
+                    : <TaskChatProtocolActivityRow item={child} />
                   : <TaskChatUsageReadout item={child} />}
         />
       );

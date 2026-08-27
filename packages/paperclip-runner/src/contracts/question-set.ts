@@ -8,6 +8,7 @@ export interface PaperclipQuestionOption {
   id: string;
   label: string;
   description?: string;
+  recommended?: boolean;
 }
 
 export interface PaperclipQuestionCustomAnswer {
@@ -159,12 +160,16 @@ export function parsePaperclipQuestionSet(value: unknown): PaperclipQuestionSet 
           const optionPath = `${path}/options/${optionIndex}`;
           const option = record(rawOption);
           if (option === null) throw new PaperclipQuestionValidationError(optionPath, "must be an object");
+          if (option.recommended !== undefined && typeof option.recommended !== "boolean") {
+            throw new PaperclipQuestionValidationError(`${optionPath}/recommended`, "must be boolean");
+          }
           return {
             id: requiredText(option.id, `${optionPath}/id`, 160),
             label: requiredText(option.label, `${optionPath}/label`, 1_000),
             ...(optionalText(option.description, `${optionPath}/description`) !== undefined
               ? { description: optionalText(option.description, `${optionPath}/description`) }
               : {}),
+            ...(option.recommended !== undefined ? { recommended: option.recommended } : {}),
           };
         })
       : undefined;

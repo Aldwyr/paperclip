@@ -90,7 +90,7 @@ export function TaskChatPlanPreviewCard({
       : livePlanContent(source.activity);
   const live = source.kind === "live";
   const headerDetail = revision == null
-    ? live ? "writing…" : null
+    ? null
     : `rev ${revision}`;
   const body = (
     <>
@@ -99,11 +99,12 @@ export function TaskChatPlanPreviewCard({
           aria-hidden
           className={cn("h-4 w-4 shrink-0", live && "text-(--status-agent-running)")}
         />
-        <span className="font-medium">Plan</span>
+        <span className={cn("font-medium", live && "shimmer-text shimmer-text-muted")} data-testid={live ? "task-chat-plan-streaming-status" : undefined}>
+          {live ? "Writing plan" : "Plan"}
+        </span>
         {headerDetail ? (
           <span
             className={cn("text-xs", live && "shimmer-text shimmer-text-muted")}
-            data-testid={live ? "task-chat-plan-streaming-status" : undefined}
           >
             · {headerDetail}
           </span>

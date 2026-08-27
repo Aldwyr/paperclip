@@ -6742,6 +6742,36 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!parent) throw notFound("Parent issue not found");
 
+      const idempotencyKey = data.idempotencyKey?.trim();
+      if (idempotencyKey) {
+        const existingChild = await db
+          .select({ issue: issues })
+          .from(issueCreateIdempotencyKeys)
+          .innerJoin(issues, eq(issueCreateIdempotencyKeys.issueId, issues.id))
+          .where(and(
+            eq(issueCreateIdempotencyKeys.companyId, parent.companyId),
+            eq(issueCreateIdempotencyKeys.idempotencyKey, idempotencyKey),
+          ))
+          .limit(1)
+          .then((rows) => rows[0]?.issue ?? null);
+        if (existingChild) {
+          if (existingChild.parentId !== parent.id) {
+            throw conflict("Child creation idempotency key belongs to another parent issue");
+          }
+          data.onDeduplicated?.("idempotency_key");
+          const [enriched] = await withIssueLabels(db, [existingChild]);
+          const [withRelations] = await withIssueRelationSummaries(
+            parent.companyId,
+            [enriched],
+            db,
+          );
+          return {
+            issue: withRelations,
+            parentBlockerAdded: false,
+          };
+        }
+      }
+
       const [{ childCount }] = await db
         .select({ childCount: sql<number>`count(*)::int` })
         .from(issues)

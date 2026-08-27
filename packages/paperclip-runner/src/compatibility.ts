@@ -9,7 +9,7 @@ export const PAPERCLIP_RUNNER_COMPATIBILITY = Object.freeze({
     protocol: 1,
     prp: 1,
     runnerClient: 1,
-    runnerdBinary: 1,
+    runnerdBinary: 2,
     harnessDriver: 1,
     nativeExecution: 1,
     evalIntegration: 1,

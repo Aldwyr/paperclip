@@ -388,6 +388,43 @@ export async function materializeNativeInteractionResponses(input: {
   return responses.sort((left, right) => left.interactionId.localeCompare(right.interactionId));
 }
 
+export type LegacyQuestionResponseWakeProjection = {
+  interactionId: string;
+  summaryMarkdown: string;
+};
+
+/**
+ * Legacy adapters do not consume the runner's closed interaction-response
+ * envelope. Project an answered question set into their wake prompt at invoke
+ * time instead. The caller must keep this projection ephemeral so the
+ * interaction result remains the only control-plane copy of the answers.
+ */
+export async function materializeLegacyQuestionResponseWakeProjection(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  runId: string;
+  agentId: string;
+  interactionId: string;
+}): Promise<LegacyQuestionResponseWakeProjection | null> {
+  const responses = await materializeNativeInteractionResponses({
+    ...input,
+    interactionIds: [input.interactionId],
+  });
+  const response = responses.find((candidate) =>
+    candidate.interactionId === input.interactionId
+    && candidate.kind === "ask_user_questions"
+    && candidate.response.status === "answered"
+  );
+  if (!response) return null;
+  const summaryMarkdown = record(response.response.result).summaryMarkdown;
+  if (typeof summaryMarkdown !== "string" || summaryMarkdown.trim().length === 0) return null;
+  return {
+    interactionId: response.interactionId,
+    summaryMarkdown: summaryMarkdown.trim(),
+  };
+}
+
 /** Native runtimes never receive credentials and never auto-approve requests. */
 export function rejectUnsupportedNativeRuntimeRequest(requestKind: string) {
   return {

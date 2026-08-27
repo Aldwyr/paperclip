@@ -44,6 +44,19 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       normalizedSessionId: input.identity.sessionId,
       workingDirectory: input.workingDirectory ?? process.cwd(),
     });
+    try {
+      assertProviderSessionIdentity(
+        session,
+        (await this.#driver.descriptor()).kind,
+        "session.open",
+      );
+    } catch (error) {
+      await session.close({
+        reason: "provider session bootstrap returned an incomplete identity",
+        force: true,
+      }).catch(() => undefined);
+      throw error;
+    }
     return new HarnessNativeSession(input, session);
   }
 
@@ -82,6 +95,19 @@ export class HarnessDriverBackend implements NativeSessionBackend {
     if (!recovered.recovered || recovered.session === undefined) {
       return { recovered: false, reason: recovered.reason };
     }
+    try {
+      assertProviderSessionIdentity(
+        recovered.session,
+        (await this.#driver.descriptor()).kind,
+        "session.recover",
+      );
+    } catch (error) {
+      await recovered.session.close({
+        reason: "provider session recovery returned an incomplete identity",
+        force: true,
+      }).catch(() => undefined);
+      throw error;
+    }
     return {
       recovered: true,
       session: new HarnessNativeSession(
@@ -89,6 +115,24 @@ export class HarnessDriverBackend implements NativeSessionBackend {
         recovered.session,
       ),
     };
+  }
+}
+
+function assertProviderSessionIdentity(
+  session: HarnessSession,
+  provider: string,
+  stage: "session.open" | "session.recover",
+): void {
+  const ids = session.ids();
+  if (
+    typeof ids.driverSessionId !== "string"
+    || ids.driverSessionId.trim().length === 0
+    || typeof ids.providerSessionId !== "string"
+    || ids.providerSessionId.trim().length === 0
+  ) {
+    throw new Error(
+      `provider_initialize_protocol_error: provider=${provider} stage=${stage} missing durable provider session identity`,
+    );
   }
 }
 
@@ -118,6 +162,7 @@ class HarnessNativeSession implements NativeSession {
       reconciliation: this.#session.reconcile !== undefined,
       usage: this.#session.usage !== undefined,
       runtimeRequestResolution: this.#session.resolveRuntimeRequest !== undefined,
+      runtimeRequestHandoff: this.#session.handoffRuntimeRequest !== undefined,
       goals: this.#session.goal !== undefined,
       threadLineage: this.#session.lineage !== undefined,
     };
@@ -140,6 +185,7 @@ class HarnessNativeSession implements NativeSession {
     let sourceInstanceId: string | null = null;
     let lastSourceSequence = 0;
     let sawTerminal = false;
+    let synthesizedDurableWait = false;
     let streamFailure: unknown = null;
     const observedPendingInputs = new Map<string, Record<string, unknown>>();
     try {
@@ -182,16 +228,18 @@ class HarnessNativeSession implements NativeSession {
     }
 
     // The provider can disappear while its native RPC is awaiting the user.
-    // Emit one canonical terminal fact before propagating the stream failure;
-    // the control plane can then materialize the durable continuation without
+    // Emit one canonical terminal fact and replace the stream failure with a
+    // governed wait; the control plane can materialize the continuation without
     // ever trying to replay the dead provider request.
     if (!sawTerminal && !this.#explicitlyCancelled && sourceInstanceId) {
       const snapshot = await this.#session.snapshot().catch(() => null);
+      let governedWaitTurnId: string | undefined;
       for (const request of observedPendingInputs.values()) {
         const sourceSeq = Math.max(lastSourceSequence, snapshot?.lastSourceSequence ?? 0) + 1;
         lastSourceSequence = sourceSeq;
         const requestId = String(request.requestId);
         const turnId = typeof request.turnId === "string" ? request.turnId : undefined;
+        governedWaitTurnId ??= turnId;
         const itemId = typeof request.itemId === "string" ? request.itemId : requestId;
         yield {
           schema: "paperclip.prp.event.v1",
@@ -210,6 +258,7 @@ class HarnessNativeSession implements NativeSession {
           payload: {
             requestId,
             ...(turnId ? { turnId } : {}),
+            itemId,
             requestKind: "runtime",
             reason: "provider_process_lost",
             replayAllowed: false,
@@ -221,8 +270,35 @@ class HarnessNativeSession implements NativeSession {
           },
         };
       }
+      if (governedWaitTurnId) {
+        const sourceSeq = Math.max(lastSourceSequence, snapshot?.lastSourceSequence ?? 0) + 1;
+        lastSourceSequence = sourceSeq;
+        synthesizedDurableWait = true;
+        sawTerminal = true;
+        this.#terminal = {
+          schema: "paperclip.prp.terminal.v1",
+          turnTerminalState: "interrupted",
+          runTerminalState: "cancelled",
+          reportedWorkDisposition: "yielded",
+        };
+        yield {
+          schema: "paperclip.prp.event.v1",
+          sourceEventId: `${sourceInstanceId}:${this.#input.identity.runId}:${sourceSeq}`,
+          sourceSeq,
+          sourceInstanceId,
+          sourceKind: "runner",
+          runId: this.#input.identity.runId,
+          normalizedSessionId: this.#input.identity.sessionId,
+          turnId: governedWaitTurnId,
+          eventType: "turn.interrupted",
+          schemaVersion: 1,
+          priority: 0,
+          emittedAt: new Date().toISOString(),
+          payload: { status: "interrupted", reason: "provider_process_lost" },
+        };
+      }
     }
-    if (streamFailure) throw streamFailure;
+    if (streamFailure && !synthesizedDurableWait) throw streamFailure;
   }
 
   startTurn(input: Parameters<HarnessSession["startTurn"]>[0]) {
@@ -255,6 +331,17 @@ class HarnessNativeSession implements NativeSession {
       throw new Error("native_runtime_request_resolution_unavailable");
     }
     return this.#session.resolveRuntimeRequest(input);
+  }
+
+  handoffRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }) {
+    if (this.#session.handoffRuntimeRequest === undefined) {
+      throw new Error("native_runtime_request_handoff_unavailable");
+    }
+    return this.#session.handoffRuntimeRequest(input);
   }
 
   async result() {

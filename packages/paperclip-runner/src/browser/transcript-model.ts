@@ -429,6 +429,7 @@ export function capabilityRows(capabilities: RunnerCapabilities): CapabilityRow[
     ["interrupt", capabilities.interruption],
     ["resume", capabilities.resume],
     ["runtime requests", capabilities.runtimeRequestResolution],
+    ["runtime request handoff", capabilities.runtimeRequestHandoff],
     ["goals", capabilities.goals],
     ["child threads", capabilities.threadLineage],
     ["structured result", capabilities.structuredResult],

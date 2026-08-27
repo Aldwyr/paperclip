@@ -112,6 +112,32 @@ export type {
   LoginRunnerDisposable,
   LoginRunnerRaceResult,
 } from "./login-runner-lifecycle.js";
+export {
+  PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
+  isPaperclipRunnerProvider,
+  resolvePaperclipRunnerPermissionMode,
+} from "./paperclip-runner-permissions.js";
+export {
+  PAPERCLIP_RUNNER_INGRESS_PORT,
+  PAPERCLIP_RUNNER_CONNECT_PATH_PREFIX,
+  PaperclipRunnerTransportError,
+  buildDirectRunnerConnectUrl,
+  resolvePaperclipRunnerTransport,
+} from "./runner-connectivity.js";
+export type {
+  SecretHeader,
+  RunnerIngressEndpoint,
+  PaperclipRunnerTransport,
+} from "./runner-connectivity.js";
+export type {
+  AcpxPermissionMode,
+  CodexPermissionMode,
+  OpenCodePermissionMode,
+  PaperclipRunnerPermissionCapability,
+  PaperclipRunnerPermissionMode,
+  PaperclipRunnerPermissionOption,
+  PaperclipRunnerProvider,
+} from "./paperclip-runner-permissions.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

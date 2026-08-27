@@ -20,6 +20,12 @@ export * from "./provider-events.js";
 export {
   DurablePrpControlPlane,
   type DurablePrpControlPlaneOptions,
+  type PrpWireConnection,
+  type PrpWireAttachment,
+  type TransportCloseReason,
+  type RunnerProcessConnection,
+  type RunnerProcessLaunchSpec,
+  type RunnerProcessHandle,
 } from "./control-plane/durable-prp-control-plane.js";
 export * from "./drivers/codex/app-server-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
@@ -33,6 +39,7 @@ export * from "./drivers/runner-tool-bridge.js";
 export {
   createRunnerdCodexTransport,
   defaultCapabilityRunnerdBinary,
+  resolveSourceCodexHome,
   type RunnerdCodexTransport,
   type RunnerdCodexTransportOptions,
 } from "./live/runnerd-codex-transport.js";
@@ -46,5 +53,4 @@ export * from "./generated/capability-contract.js";
 export * from "./semantic-tools/index.js";
 export * as acceptedCapabilitySemanticTools from "./semantic-tools/index.js";
 export * from "./catalog/index.js";
-export * from "./eval/index.js";
 export * from "./compatibility.js";

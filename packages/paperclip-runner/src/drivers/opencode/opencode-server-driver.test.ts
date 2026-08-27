@@ -72,6 +72,18 @@ afterEach(async () => {
 });
 
 describe("OpenCodeServerDriver", () => {
+  it("advertises within-turn plans as unsupported", async () => {
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: "/tmp/paperclip-opencode-capabilities",
+      command: fixture,
+    });
+    const descriptor = await driver.descriptor();
+    expect(descriptor.capabilities.typedEventFamilies
+      .find((family) => family.family === "plan"))
+      .toMatchObject({ availability: "unsupported" });
+  });
+
   it("starts an authenticated isolated server, creates a session, streams usage, aborts, and cleans up", async () => {
     await chmod(fixture, 0o755);
     const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-driver-"));
@@ -171,7 +183,9 @@ describe("OpenCodeServerDriver", () => {
     expect(environment.projectConfigDisabled).toBe("true");
     expect(mcpEvidence.tools).toEqual(expect.arrayContaining(["paperclip_finish", "paperclip_block"]));
     expect(config).toContain("openrouter/deepseek/deepseek-v4-flash-0731");
+    expect(config).toContain('"*": "allow"');
     expect(config).toContain('"external_directory": "deny"');
+    expect(events.some((event) => event.eventType === "runtime_request.created")).toBe(false);
     expect(config).not.toContain("test-openrouter-key");
     expect(diagnostics.join("\n")).not.toContain("test-openrouter-key");
     expect(diagnostics.join("\n")).toContain("[REDACTED]");
@@ -369,8 +383,8 @@ describe("OpenCodeServerDriver", () => {
         input: {
           schema: "paperclip.question_set.v1",
           questions: [
-            { id: "environment", answerMode: "single_select", customAnswer: { enabled: true } },
-            { id: "regions", answerMode: "multi_select" },
+            { id: "environment", answerMode: "single_select", required: false, customAnswer: { enabled: true } },
+            { id: "regions", answerMode: "multi_select", required: false },
           ],
         },
       },
@@ -412,6 +426,79 @@ describe("OpenCodeServerDriver", () => {
       },
     });
     await session.close({ reason: "test" });
+  });
+
+  it("hands a native question to the durable interaction path without touching permissions", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-handoff-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-question-handoff-workspace-"));
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const session = await driver.openSession({
+      runId: "run-native-question-handoff",
+      normalizedSessionId: "native-question-handoff",
+      workingDirectory: workspace,
+    });
+    const { turnId } = await session.startTurn({ message: { role: "user", text: "native-question" } });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    let created: Awaited<ReturnType<typeof iterator.next>>["value"] | null = null;
+    for (let count = 0; count < 30; count += 1) {
+      const next = await iterator.next();
+      if (next.done) break;
+      if (next.value.eventType === "runtime_request.created") {
+        created = next.value;
+        break;
+      }
+    }
+    expect(created).toMatchObject({
+      payload: { request: { requestId: "question-native-1", type: "input" } },
+    });
+
+    await expect(session.handoffRuntimeRequest?.({
+      requestId: "question-native-1",
+      turnId,
+      reason: "durable_handoff",
+    })).resolves.toBe("handed_off");
+    await expect(session.handoffRuntimeRequest?.({
+      requestId: "question-native-1",
+      turnId,
+      reason: "durable_handoff",
+    })).resolves.toBe("already_settled");
+
+    let expired: Awaited<ReturnType<typeof iterator.next>>["value"] | null = null;
+    for (let count = 0; count < 20; count += 1) {
+      const next = await iterator.next();
+      if (next.done) break;
+      if (next.value.eventType === "runtime_request.expired") {
+        expired = next.value;
+        break;
+      }
+    }
+    expect(expired).toMatchObject({
+      payload: {
+        requestId: "question-native-1",
+        reason: "durable_handoff",
+        replayAllowed: false,
+        requestType: "input",
+        request: {
+          schema: "paperclip.runtime_request.v2",
+          requestId: "question-native-1",
+          type: "input",
+        },
+      },
+    });
+    expect(session.pendingRuntimeRequests?.()).toEqual([]);
+    const terminal = (await session.transcript?.())?.events.filter((event) =>
+      event.payload.requestId === "question-native-1"
+      && ["runtime_request.resolved", "runtime_request.cancelled", "runtime_request.expired"].includes(event.eventType)
+    );
+    expect(terminal).toHaveLength(1);
+    await session.close({ reason: "handoff test complete" });
   });
 
   it("recovers a missed pending question from the list endpoint and rejects it", async () => {
@@ -473,6 +560,86 @@ describe("OpenCodeServerDriver", () => {
     });
     expect(session.pendingRuntimeRequests?.()).toEqual([]);
     await session.close({ reason: "recovery test complete" });
+  });
+
+  it.each([
+    { style: "legacy", action: "accept" as const, reply: "once" },
+    { style: "v2", action: "accept_for_session" as const, reply: "always" },
+    { style: "v2", action: "decline" as const, reply: "reject" },
+  ])("normalizes $style permission events and maps $action to $reply", async ({ style, action, reply }) => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), `paperclip-opencode-permission-${style}-`));
+    const workspace = await mkdtemp(join(tmpdir(), `paperclip-opencode-permission-${style}-workspace-`));
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      permissionMode: "ask",
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const normalizedSessionId = `native-permission-${style}-${action}`;
+    const session = await driver.openSession({
+      runId: `run-${normalizedSessionId}`,
+      normalizedSessionId,
+      workingDirectory: workspace,
+    });
+    const { turnId } = await session.startTurn({
+      message: { role: "user", text: `native-permission-${style}` },
+    });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    let created: Awaited<ReturnType<typeof iterator.next>>["value"] | null = null;
+    for (let count = 0; count < 30; count += 1) {
+      const next = await iterator.next();
+      if (next.done) break;
+      if (next.value.eventType === "runtime_request.created") {
+        created = next.value;
+        break;
+      }
+    }
+    expect(created).toMatchObject({
+      payload: {
+        request: {
+          requestId: "permission-native-1",
+          type: "permission",
+          actions: ["accept", "accept_for_session", "decline", "cancel"],
+        },
+      },
+    });
+    await session.resolveRuntimeRequest?.({
+      requestId: "permission-native-1",
+      turnId,
+      resolution: { action },
+    });
+    const persisted = JSON.parse(
+      await readFile(join(root, normalizedSessionId, "data", "fake-permission-reply.json"), "utf8"),
+    );
+    expect(persisted).toEqual({
+      url: expect.stringContaining(`directory=${encodeURIComponent(workspace)}`),
+      body: { reply },
+    });
+    expect(session.pendingRuntimeRequests?.()).toEqual([]);
+    await session.close({ reason: "permission test complete" });
+  });
+
+  it.each(["allow", "ask", "deny"] as const)("pins the %s permission mode while retaining external-directory denial", async (permissionMode) => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), `paperclip-opencode-mode-${permissionMode}-`));
+    const workspace = await mkdtemp(join(tmpdir(), `paperclip-opencode-mode-${permissionMode}-workspace-`));
+    roots.push(root, workspace);
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      permissionMode,
+      runtimeDirectory: root,
+      command: fixture,
+      environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+    });
+    const session = await driver.openSession({ runId: `run-${permissionMode}`, normalizedSessionId: permissionMode, workingDirectory: workspace });
+    const config = JSON.parse(await readFile(join(root, permissionMode, "config", "opencode", "opencode.json"), "utf8"));
+    expect(config.permission).toMatchObject({ "*": permissionMode, external_directory: "deny" });
+    expect(config.permission.paperclip_finish).toBeUndefined();
+    expect(config.permission["paperclip_*"]).toBe("allow");
+    await session.close({ reason: "permission mode test complete" });
   });
 
   it("clears a stale active turn that already has a persisted terminal fingerprint", async () => {
@@ -705,5 +872,41 @@ describe("OpenCodeServerDriver", () => {
     expect(session.ids().providerSessionId).toBe("ses_fake_1");
     expect(spawns).toHaveLength(2);
     await session.close({ reason: "test" });
+  });
+
+  it("reports startup exit details with stderr captured after spawn and redacted", async () => {
+    await chmod(fixture, 0o755);
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-driver-"));
+    const workspace = await mkdtemp(join(tmpdir(), "paperclip-opencode-workspace-"));
+    roots.push(root, workspace);
+    const exitingFixture = join(root, "exit-before-health.mjs");
+    await writeFile(
+      exitingFixture,
+      "#!/usr/bin/env node\nprocess.stderr.write(`credential=${process.env.OPENROUTER_API_KEY}\\nauthorization=super-secret-opencode-token\\n`);\nprocess.exit(17);\n",
+      { mode: 0o755 },
+    );
+    const driver = new OpenCodeServerDriver({
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      runtimeDirectory: root,
+      command: exitingFixture,
+      environment: {
+        PATH: process.env.PATH,
+        OPENROUTER_API_KEY: "fixture-key",
+      },
+    });
+    const error = await driver.openSession({
+      runId: "run-startup-exit",
+      normalizedSessionId: "startup-exit",
+      workingDirectory: workspace,
+    }).then(
+      () => "provider unexpectedly started",
+      (cause: unknown) => String(cause),
+    );
+    expect(error).toContain("provider_process_exited");
+    expect(error).toContain("provider=opencode");
+    expect(error).toContain("stage=health");
+    expect(error).toContain("[REDACTED]");
+    expect(error).not.toContain("fixture-key");
+    expect(error).not.toContain("super-secret-opencode-token");
   });
 });

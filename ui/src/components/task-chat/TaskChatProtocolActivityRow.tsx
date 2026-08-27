@@ -260,9 +260,11 @@ export function TaskChatProtocolActivityRow({ item }: { item: TaskChatProtocolIt
   const status = itemStatus(item);
   const row = (
     <>
-      <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden data-testid="task-chat-protocol-activity-icon" />
+      <span className="flex w-5 shrink-0 items-center justify-center">
+        <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden data-testid="task-chat-protocol-activity-icon" />
+      </span>
       <span className={cn("shrink-0 font-medium", active && "shimmer-text shimmer-text-muted")}>{label}{active ? "…" : ""}</span>
-      {presentation.detail ? <span className="min-w-0 truncate font-mono text-(length:--text-micro)">{presentation.detail}</span> : null}
+      {presentation.detail ? <span className="task-chat-collapsed-line-fade min-w-0 flex-1 font-mono text-(length:--text-micro)">{presentation.detail}</span> : null}
       <span className="ml-auto flex shrink-0 items-center gap-2">
         {expandable ? (
           <ChevronRight
@@ -277,7 +279,7 @@ export function TaskChatProtocolActivityRow({ item }: { item: TaskChatProtocolIt
 
   if (item.surface === "resource" && item.href) {
     return (
-      <a className="group/activity -mx-1.5 flex min-h-6 min-w-0 items-center gap-2 rounded-sm px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground" href={item.href} data-testid="task-chat-protocol-activity-row">
+      <a className="group/activity -mx-1.5 flex min-h-6 w-full min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-sm px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground" href={item.href} data-testid="task-chat-protocol-activity-row">
         {row}
       </a>
     );
@@ -289,12 +291,12 @@ export function TaskChatProtocolActivityRow({ item }: { item: TaskChatProtocolIt
       onClick={() => setOpen((value) => !value)}
       aria-expanded={open}
       aria-controls={detailId}
-      className="group/activity -mx-1.5 flex min-h-6 min-w-0 items-center gap-2 rounded-sm px-1.5 py-1 text-left text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="group/activity -mx-1.5 flex min-h-6 w-full min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-sm px-1.5 py-1 text-left text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       {row}
     </button>
   ) : (
-    <div className="group/activity -mx-1.5 flex min-h-6 min-w-0 items-center gap-2 rounded-sm px-1.5 py-1 text-muted-foreground">
+    <div className="group/activity -mx-1.5 flex min-h-6 w-full min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-sm px-1.5 py-1 text-muted-foreground">
       {row}
     </div>
   );

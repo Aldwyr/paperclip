@@ -24,6 +24,34 @@ function fakeGeometry(el: HTMLElement, { scrollHeight = 1000, clientHeight = 400
   });
 }
 
+function fakeResizableGeometry(
+  el: HTMLElement,
+  { scrollHeight = 1000, clientHeight = 400 } = {},
+) {
+  let currentClientHeight = clientHeight;
+  let scrollTop = 0;
+  Object.defineProperty(el, "scrollHeight", {
+    value: scrollHeight,
+    configurable: true,
+  });
+  Object.defineProperty(el, "clientHeight", {
+    get: () => currentClientHeight,
+    configurable: true,
+  });
+  Object.defineProperty(el, "scrollTop", {
+    get: () => scrollTop,
+    set: (value: number) => {
+      scrollTop = value;
+    },
+    configurable: true,
+  });
+  return {
+    setClientHeight(value: number) {
+      currentClientHeight = value;
+    },
+  };
+}
+
 /**
  * Scroll/wheel are continuous-priority events, so React flushes the resulting
  * state updates asynchronously — wait a macrotask after dispatching.
@@ -159,6 +187,59 @@ describe("TaskMessageScroller", () => {
     // New content must not yank the held position.
     render(2);
     expect(el.scrollTop).toBe(100);
+  });
+
+  it("follows a shrinking viewport while pinned so a growing composer cannot cover the latest text", async () => {
+    let triggerResize = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          triggerResize = () =>
+            callback([], this as unknown as ResizeObserver);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    render();
+    const el = scroller();
+    const geometry = fakeResizableGeometry(el);
+    triggerResize();
+    await scrollTo(el, 600);
+
+    geometry.setClientHeight(200);
+    triggerResize();
+
+    expect(el.scrollTop).toBe(el.scrollHeight);
+    expect(pill()).toBeNull();
+  });
+
+  it("holds a reader's position when the composer grows while they are scrolled up", async () => {
+    let triggerResize = () => {};
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          triggerResize = () =>
+            callback([], this as unknown as ResizeObserver);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    render();
+    const el = scroller();
+    const geometry = fakeResizableGeometry(el);
+    triggerResize();
+    await scrollTo(el, 100);
+    await waitForPill(true);
+
+    geometry.setClientHeight(200);
+    triggerResize();
+
+    expect(el.scrollTop).toBe(100);
+    expect(pill()).not.toBeNull();
   });
 
   it("small drifts within the pin threshold do not show the pill", async () => {

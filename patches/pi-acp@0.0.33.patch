@@ -27,7 +27,16 @@ index ead9809cabc9f3b203f1769db3cabb8327dd758a..113b166120711705edcabaca2d63ae40
      if (params.sessionPath) args.push("--session", params.sessionPath);
      const child = spawn(cmd, args, {
        cwd: params.cwd,
-@@ -949,6 +958,22 @@ var PiAcpSession = class {
+@@ -173,6 +182,7 @@ var PiRpcProcess = class _PiRpcProcess {
+       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e });
+     }
+-    child.stderr.on("data", () => {
++    child.stderr.on("data", (chunk) => {
++      process.stderr.write(chunk);
+     });
+     const proc = new _PiRpcProcess(child);
+     try {
+@@ -949,6 +959,22 @@ var PiAcpSession = class {
      switch (type) {
        case "message_update": {
          const ame = ev.assistantMessageEvent;

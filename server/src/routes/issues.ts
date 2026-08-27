@@ -32,6 +32,7 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  skipIssueThreadInteractionSchema,
   withdrawIssueThreadInteractionSchema,
   companySearchExtractQuerySchema,
   companySearchQuerySchema,
@@ -260,23 +261,31 @@ import {
   NativeSessionSteeringError,
   steerNativeSession,
 } from "../services/native-runtime/native-session-executor.js";
+import {
+  queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
+  withQueuedCommentIdsInWakePayload,
+} from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
-const queuedCommentTargetSchema = z.object({
-  targetRunId: z.string().min(1),
+const queuedCommentMutationTargetSchema = z.object({
+  queueId: z.string().min(1),
   revision: z.string().min(1),
 });
-const editQueuedCommentSchema = queuedCommentTargetSchema.extend({
+const queuedCommentSteeringTargetSchema = queuedCommentMutationTargetSchema.extend({
+  targetRunId: z.string().min(1),
+});
+const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
   body: z
     .string()
     .min(1)
     .max(200_000)
     .refine((value) => value.trim().length > 0, "Queued message cannot be empty"),
 });
-const reorderQueuedCommentsSchema = queuedCommentTargetSchema.extend({
+const reorderQueuedCommentsSchema = queuedCommentMutationTargetSchema.extend({
   orderedCommentIds: z.array(z.string().min(1)).max(MAX_ISSUE_COMMENT_LIMIT),
 });
 
@@ -2879,6 +2888,20 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const commentWasCreatedByAssigneeRun = async (
+    comment: { companyId: string; createdByRunId?: string | null },
+    assigneeAgentId: string | null | undefined,
+  ) => {
+    // Legacy adapters can authenticate through the board while still stamping
+    // the real source run on the comment. Treat that durable provenance as the
+    // author identity for wake routing.
+    if (!comment.createdByRunId || !assigneeAgentId) return false;
+    const sourceRun = await heartbeat.getRun(comment.createdByRunId);
+    return (
+      sourceRun?.companyId === comment.companyId &&
+      sourceRun.agentId === assigneeAgentId
+    );
+  };
   const questionResponseDeliveries = questionResponseDeliveryService(db, { heartbeat });
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
@@ -5411,59 +5434,71 @@ export function issueRoutes(
   }
 
   type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
-  type DeferredIssueWake = typeof agentWakeupRequests.$inferSelect;
-  const QUEUE_CONTEXT_KEY = "_paperclipWakeContext";
-  const QUEUE_IDS_KEY = "wakeCommentIds";
-
-  function queuedCommentIdsFromWake(wake: DeferredIssueWake | null): string[] {
-    if (!wake) return [];
-    const context = readObject(readObject(wake.payload)[QUEUE_CONTEXT_KEY]);
-    const ids = Array.isArray(context[QUEUE_IDS_KEY]) ? context[QUEUE_IDS_KEY] : [];
-    const seen = new Set<string>();
-    return ids.flatMap((value) => {
-      if (typeof value !== "string" || !value || seen.has(value)) return [];
-      seen.add(value);
-      return [value];
-    });
-  }
+  type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+  type IssueQueueWake = typeof agentWakeupRequests.$inferSelect;
+  type IssueQueueRun = typeof heartbeatRuns.$inferSelect;
+  type IssueQueueState = {
+    wake: IssueQueueWake;
+    state: "deferred" | "queued";
+    queueRun: IssueQueueRun | null;
+  };
 
   function queueRevision(input: {
-    runId: string | null;
-    wake: DeferredIssueWake | null;
+    wake: IssueQueueWake | null;
     comments: Array<{ id: string; updatedAt: Date }>;
   }): string {
     return createHash("sha256")
       .update(JSON.stringify({
-        runId: input.runId,
-        wakeId: input.wake?.id ?? null,
-        wakeUpdatedAt: input.wake?.updatedAt?.toISOString() ?? null,
+        queueId: input.wake?.id ?? null,
         comments: input.comments.map((comment) => [comment.id, comment.updatedAt.toISOString()]),
       }))
       .digest("hex")
       .slice(0, 32);
   }
 
-  async function findDeferredIssueWake(
+  async function findQueuedCommentWake(
     executor: IssueQueueDb,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
-    lock = false,
-  ): Promise<DeferredIssueWake | null> {
+  ): Promise<IssueQueueState | null> {
     if (!issue.assigneeAgentId) return null;
-    const query = executor
+    const rows = await executor
       .select()
       .from(agentWakeupRequests)
       .where(and(
         eq(agentWakeupRequests.companyId, issue.companyId),
         eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
       ))
       .orderBy(asc(agentWakeupRequests.requestedAt));
-    const rows = lock ? await query.for("update") : await query;
-    return rows.find((row) => readObject(row.payload).issueId === issue.id) ?? null;
+
+    for (const wake of rows) {
+      if (
+        readObject(wake.payload).issueId !== issue.id
+        || queuedCommentIdsFromWakePayload(wake.payload).length === 0
+      ) continue;
+      if (wake.status === "deferred_issue_execution") {
+        return { wake, state: "deferred", queueRun: null };
+      }
+      if (!wake.runId) continue;
+      const queueRun = await executor
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, wake.runId),
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+          eq(heartbeatRuns.wakeupRequestId, wake.id),
+          eq(heartbeatRuns.status, "queued"),
+        ))
+        .limit(1)
+        .then((runRows) => runRows[0] ?? null);
+      if (queueRun) return { wake, state: "queued", queueRun };
+    }
+    return null;
   }
 
-  async function queueCommentsForWake(executor: IssueQueueDb, issueId: string, wake: DeferredIssueWake | null) {
-    const ids = queuedCommentIdsFromWake(wake);
+  async function queueCommentsForWake(executor: IssueQueueDb, issueId: string, wake: IssueQueueWake | null) {
+    const ids = queuedCommentIdsFromWakePayload(wake?.payload);
     if (ids.length === 0) return [];
     const rows = await executor
       .select()
@@ -5481,27 +5516,45 @@ export function issueRoutes(
     issue: { id: string; companyId: string; assigneeAgentId: string | null };
     activeRun: Awaited<ReturnType<typeof resolveActiveIssueRun>>;
     actor: ReturnType<typeof getActorInfo>;
-    wake?: DeferredIssueWake | null;
+    queueState?: IssueQueueState | null;
     steeringDisposition?: IssueQueuedCommentQueue["steeringDisposition"];
   }): Promise<IssueQueuedCommentQueue> {
-    const wake = input.wake === undefined
-      ? await findDeferredIssueWake(input.executor, input.issue)
-      : input.wake;
+    const queueState = input.queueState === undefined
+      ? await findQueuedCommentWake(input.executor, input.issue)
+      : input.queueState;
+    const wake = queueState?.wake ?? null;
     const comments = await queueCommentsForWake(input.executor, input.issue.id, wake);
+    const assignedAgent = input.issue.assigneeAgentId
+      ? await input.executor
+        .select({ adapterType: agents.adapterType })
+        .from(agents)
+        .where(and(
+          eq(agents.id, input.issue.assigneeAgentId),
+          eq(agents.companyId, input.issue.companyId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
     const protocol = input.activeRun?.runtimeMode === "native"
+      || assignedAgent?.adapterType === "paperclip_runner"
       ? "paperclip_runner_v1" as const
       : "legacy" as const;
+    const steeringRun = queueState?.state === "deferred" ? input.activeRun : null;
     let steeringDisposition = input.steeringDisposition
-      ?? (protocol === "paperclip_runner_v1" && input.activeRun
-        ? await getNativeSessionSteeringState(input.activeRun.id)
+      ?? (protocol === "paperclip_runner_v1" && steeringRun
+        ? await getNativeSessionSteeringState(steeringRun.id)
           .then((state) => state.disposition)
           .catch(() => "temporarily_unavailable" as const)
         : "unsupported" as const);
-    if (!input.activeRun || comments.length === 0) steeringDisposition = "temporarily_unavailable";
+    if (protocol === "paperclip_runner_v1" && (!steeringRun || comments.length === 0)) {
+      steeringDisposition = "temporarily_unavailable";
+    }
     return {
       issueId: input.issue.id,
-      targetRunId: input.activeRun?.id ?? null,
-      revision: queueRevision({ runId: input.activeRun?.id ?? null, wake, comments }),
+      queueId: wake?.id ?? null,
+      state: queueState?.state ?? null,
+      targetRunId: steeringRun?.id ?? null,
+      revision: queueRevision({ wake, comments }),
       protocol,
       steeringDisposition,
       entries: comments.map((comment, position) => ({
@@ -5513,31 +5566,13 @@ export function issueRoutes(
     };
   }
 
-  function updateWakePayloadCommentIds(wake: DeferredIssueWake, ids: string[]) {
-    const payload = { ...readObject(wake.payload) };
-    const context = { ...readObject(payload[QUEUE_CONTEXT_KEY]) };
-    if (ids.length > 0) {
-      context[QUEUE_IDS_KEY] = ids;
-      context.wakeCommentId = ids[ids.length - 1];
-      context.commentId = ids[ids.length - 1];
-      payload.commentId = ids[ids.length - 1];
-    } else {
-      delete context[QUEUE_IDS_KEY];
-      delete context.wakeCommentId;
-      delete context.commentId;
-      delete payload.commentId;
-    }
-    payload[QUEUE_CONTEXT_KEY] = context;
-    return payload;
-  }
-
   function assertQueueMutationTarget(input: {
     queue: IssueQueuedCommentQueue;
-    targetRunId: string;
+    queueId: string;
     revision: string;
   }) {
-    if (input.queue.targetRunId !== input.targetRunId) {
-      throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+    if (input.queue.queueId !== input.queueId) {
+      throw conflict("The queued message targets a stale queue", { code: "queued_comment_stale_queue" });
     }
     if (input.queue.revision !== input.revision) {
       throw conflict("The queued messages changed in another session", { code: "queued_comment_revision_conflict" });
@@ -5545,43 +5580,287 @@ export function issueRoutes(
   }
 
   async function lockQueuedCommentState(input: {
-    tx: Parameters<Parameters<Db["transaction"]>[0]>[0];
-    issue: { id: string; companyId: string; assigneeAgentId: string | null };
+    tx: IssueQueueTx;
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string | null;
+      executionRunId?: string | null;
+    };
     actor: ReturnType<typeof getActorInfo>;
-    targetRunId: string;
+    queueId: string;
+    targetRunId?: string;
   }) {
     await input.tx
       .select({ id: issueRows.id })
       .from(issueRows)
       .where(and(eq(issueRows.id, input.issue.id), eq(issueRows.companyId, input.issue.companyId)))
       .for("update");
-    const activeRun = await input.tx
+    const wake = await input.tx
       .select()
-      .from(heartbeatRuns)
+      .from(agentWakeupRequests)
       .where(and(
-        eq(heartbeatRuns.id, input.targetRunId),
-        eq(heartbeatRuns.companyId, input.issue.companyId),
-        eq(heartbeatRuns.status, "running"),
+        eq(agentWakeupRequests.id, input.queueId),
+        eq(agentWakeupRequests.companyId, input.issue.companyId),
+        input.issue.assigneeAgentId
+          ? eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId)
+          : undefined,
       ))
       .for("update")
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    const runContext = readObject(activeRun?.contextSnapshot);
-    if (!activeRun || (runContext.issueId !== input.issue.id && runContext.taskId !== input.issue.id)) {
-      throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+    if (
+      !wake
+      || readObject(wake.payload).issueId !== input.issue.id
+      || queuedCommentIdsFromWakePayload(wake.payload).length === 0
+    ) {
+      throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
     }
-    const wake = await findDeferredIssueWake(input.tx, input.issue, true);
+
+    let state: IssueQueueState["state"];
+    let queueRun: IssueQueueRun | null = null;
+    if (wake.status === "deferred_issue_execution") {
+      state = "deferred";
+    } else if (wake.status === "queued" && wake.runId) {
+      queueRun = await input.tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, wake.runId),
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.agentId, wake.agentId),
+          eq(heartbeatRuns.wakeupRequestId, wake.id),
+        ))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!queueRun || queueRun.status !== "queued") {
+        throw conflict("The queued message is already being dispatched", {
+          code: "queued_comment_already_dispatching",
+        });
+      }
+      state = "queued";
+    } else if (
+      wake.status === "claimed"
+      || wake.status === "running"
+      || (wake.runId && (wake.status === "succeeded" || wake.status === "failed"))
+    ) {
+      throw conflict("The queued message is already being dispatched", {
+        code: "queued_comment_already_dispatching",
+      });
+    } else {
+      throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+    }
+
+    const activeRunId = state === "deferred"
+      ? input.targetRunId ?? input.issue.executionRunId ?? null
+      : null;
+    const activeRun = activeRunId
+      ? await input.tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, activeRunId),
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.status, "running"),
+        ))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    if (input.targetRunId) {
+      const runContext = readObject(activeRun?.contextSnapshot);
+      if (!activeRun || (runContext.issueId !== input.issue.id && runContext.taskId !== input.issue.id)) {
+        throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+      }
+    }
+    const queueState = { wake, state, queueRun } satisfies IssueQueueState;
     const queue = await buildQueuedCommentQueue({
       executor: input.tx,
       issue: input.issue,
       activeRun,
       actor: input.actor,
-      wake,
-      steeringDisposition: activeRun.runtimeMode === "native"
+      queueState,
+      steeringDisposition: activeRun?.runtimeMode === "native"
         ? "temporarily_unavailable"
         : "unsupported",
     });
-    return { activeRun, wake, queue };
+    return { activeRun, wake, queueRun, state, queue, queueState };
+  }
+
+  async function updateQueuedRunCommentIds(
+    tx: IssueQueueTx,
+    queueRun: IssueQueueRun | null,
+    ids: string[],
+    updatedAt: Date,
+  ) {
+    if (!queueRun) return null;
+    const updated = await tx
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: withQueuedCommentIdsInRunContext(queueRun.contextSnapshot, ids),
+        updatedAt,
+      })
+      .where(and(eq(heartbeatRuns.id, queueRun.id), eq(heartbeatRuns.status, "queued")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) {
+      throw conflict("The queued message is already being dispatched", {
+        code: "queued_comment_already_dispatching",
+      });
+    }
+    return updated;
+  }
+
+  async function discardQueuedComment(input: {
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string | null;
+      executionRunId?: string | null;
+    };
+    actor: ReturnType<typeof getActorInfo>;
+    commentId: string;
+    queueId: string;
+    revision?: string;
+  }) {
+    return db.transaction(async (tx) => {
+      const locked = await lockQueuedCommentState({
+        tx,
+        issue: input.issue,
+        actor: input.actor,
+        queueId: input.queueId,
+      });
+      if (input.revision) {
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          queueId: input.queueId,
+          revision: input.revision,
+        });
+      }
+      const entry = locked.queue.entries.find(
+        (candidate) => candidate.comment.id === input.commentId,
+      );
+      if (!entry) {
+        throw conflict("The queued message is no longer pending", {
+          code: "queued_comment_not_pending",
+        });
+      }
+      const actorOwnsEntry = input.actor.actorType === "agent"
+        ? entry.comment.authorAgentId === input.actor.agentId
+        : entry.comment.authorUserId === input.actor.actorId;
+      if (!actorOwnsEntry) {
+        throw forbidden("Only the queued message author can discard it");
+      }
+
+      const deleted = await tx
+        .delete(issueComments)
+        .where(and(
+          eq(issueComments.id, input.commentId),
+          eq(issueComments.issueId, input.issue.id),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!deleted) {
+        throw conflict("The queued message is no longer pending", {
+          code: "queued_comment_not_pending",
+        });
+      }
+      await issueReferencesSvc.deleteCommentSource(input.commentId, tx);
+      await externalObjectsSvc.syncCommentSafely(input.commentId, tx);
+
+      const remainingIds = locked.queue.entries
+        .map((candidate) => candidate.comment.id)
+        .filter((candidateId) => candidateId !== input.commentId);
+      const now = new Date();
+      let nextQueueState: IssueQueueState | null = null;
+
+      if (remainingIds.length === 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: "Queued message discarded before dispatch",
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id));
+
+        if (locked.queueRun) {
+          const cancelledRun = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: "Queued message discarded before dispatch",
+              errorCode: "queued_comment_discarded",
+              updatedAt: now,
+            })
+            .where(and(
+              eq(heartbeatRuns.id, locked.queueRun.id),
+              eq(heartbeatRuns.status, "queued"),
+            ))
+            .returning({ id: heartbeatRuns.id })
+            .then((rows) => rows[0] ?? null);
+          if (!cancelledRun) {
+            throw conflict("The queued message is already being dispatched", {
+              code: "queued_comment_already_dispatching",
+            });
+          }
+        }
+      } else {
+        const updatedWake = await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, remainingIds),
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id))
+          .returning()
+          .then((rows) => rows[0] ?? locked.wake);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          remainingIds,
+          now,
+        );
+        nextQueueState = {
+          wake: updatedWake,
+          state: locked.state,
+          queueRun: updatedQueueRun ?? locked.queueRun,
+        };
+      }
+
+      await tx
+        .update(issueRows)
+        .set({
+          ...(locked.queueRun && remainingIds.length === 0
+            ? {
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+              }
+            : {}),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueRows.id, input.issue.id),
+          locked.queueRun && remainingIds.length === 0
+            ? eq(issueRows.executionRunId, locked.queueRun.id)
+            : undefined,
+        ));
+
+      return {
+        deleted,
+        queue: await buildQueuedCommentQueue({
+          executor: tx,
+          issue: input.issue,
+          activeRun: locked.activeRun,
+          actor: input.actor,
+          queueState: nextQueueState,
+        }),
+      };
+    });
   }
 
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
@@ -10751,6 +11030,10 @@ export function issueRoutes(
       };
     }
 
+    const commentIsFromAssigneeRun = comment
+      ? await commentWasCreatedByAssigneeRun(comment, issue.assigneeAgentId)
+      : false;
+
     const assigneeChanged =
       issue.assigneeAgentId !== existing.assigneeAgentId || issue.assigneeUserId !== existing.assigneeUserId;
     const statusChangedFromBacklog =
@@ -10910,13 +11193,17 @@ export function issueRoutes(
       if (commentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
-        const selfComment = actorIsAgent && actor.actorId === assigneeId;
+        const selfComment =
+          (actorIsAgent && actor.actorId === assigneeId) ||
+          commentIsFromAssigneeRun;
         // Re-derive closed-ness from the post-update issue so a status change
         // like in_progress -> done with a closure comment does not enqueue a
         // stale issue_commented wake for an already-completed issue.
-        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
+        const shouldWakeAssigneeForComment =
+          !(selfComment && resumeRequested !== true) &&
+          (reopened || !isClosedIssueStatus(issue.status));
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        if (assigneeId && !assigneeChanged && shouldWakeAssigneeForComment) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -10967,7 +11254,10 @@ export function issueRoutes(
         }
 
         for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          if (
+            (actor.actorType === "agent" && actor.actorId === mentionedId) ||
+            (commentIsFromAssigneeRun && mentionedId === assigneeId)
+          ) continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -11472,11 +11762,11 @@ export function issueRoutes(
           tx,
           issue,
           actor,
-          targetRunId: req.body.targetRunId,
+          queueId: req.body.queueId,
         });
         assertQueueMutationTarget({
           queue: locked.queue,
-          targetRunId: req.body.targetRunId,
+          queueId: req.body.queueId,
           revision: req.body.revision,
         });
         const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
@@ -11493,12 +11783,22 @@ export function issueRoutes(
         await tx.update(issueRows).set({ updatedAt }).where(eq(issueRows.id, issue.id));
         await issueReferencesSvc.syncComment(commentId, tx);
         await externalObjectsSvc.syncCommentSafely(commentId, tx);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          locked.queue.entries.map((candidate) => candidate.comment.id),
+          updatedAt,
+        );
         return buildQueuedCommentQueue({
           executor: tx,
           issue,
           activeRun: locked.activeRun,
           actor,
-          wake: locked.wake,
+          queueState: {
+            wake: locked.wake,
+            state: locked.state,
+            queueRun: updatedQueueRun ?? locked.queueRun,
+          },
         });
       });
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
@@ -11516,13 +11816,17 @@ export function issueRoutes(
       if (!issue) return;
       const actor = getActorInfo(req);
       const queue = await db.transaction(async (tx) => {
-        const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
+        const locked = await lockQueuedCommentState({
+          tx,
+          issue,
+          actor,
+          queueId: req.body.queueId,
+        });
         assertQueueMutationTarget({
           queue: locked.queue,
-          targetRunId: req.body.targetRunId,
+          queueId: req.body.queueId,
           revision: req.body.revision,
         });
-        if (!locked.wake) throw conflict("The queued messages are no longer pending", { code: "queued_comment_not_pending" });
         const currentIds = locked.queue.entries.map((entry) => entry.comment.id);
         const orderedIds = req.body.orderedCommentIds as string[];
         const orderedSet = new Set(orderedIds);
@@ -11535,21 +11839,32 @@ export function issueRoutes(
             code: "queued_comment_order_mismatch",
           });
         }
+        const now = new Date();
         const updatedWake = await tx
           .update(agentWakeupRequests)
           .set({
-            payload: updateWakePayloadCommentIds(locked.wake, orderedIds),
-            updatedAt: new Date(),
+            payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, orderedIds),
+            updatedAt: now,
           })
           .where(eq(agentWakeupRequests.id, locked.wake.id))
           .returning()
           .then((rows) => rows[0] ?? locked.wake);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          orderedIds,
+          now,
+        );
         return buildQueuedCommentQueue({
           executor: tx,
           issue,
           activeRun: locked.activeRun,
           actor,
-          wake: updatedWake,
+          queueState: {
+            wake: updatedWake,
+            state: locked.state,
+            queueRun: updatedQueueRun ?? locked.queueRun,
+          },
         });
       });
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
@@ -11558,7 +11873,7 @@ export function issueRoutes(
 
   router.post(
     "/issues/:id/queued-comments/:commentId/steer",
-    validate(queuedCommentTargetSchema),
+    validate(queuedCommentSteeringTargetSchema),
     async (req, res) => {
       assertBoard(req);
       if (!req.actor.userId) throw forbidden("Board user context required");
@@ -11572,7 +11887,18 @@ export function issueRoutes(
       let queue: IssueQueuedCommentQueue;
       try {
         queue = await db.transaction(async (tx) => {
-          const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
+          const locked = await lockQueuedCommentState({
+            tx,
+            issue,
+            actor,
+            queueId: req.body.queueId,
+            targetRunId: req.body.targetRunId,
+          });
+          if (!locked.activeRun) {
+            throw conflict("The queued message targets a stale run", {
+              code: "queued_comment_stale_target",
+            });
+          }
           const runResult = readObject(locked.activeRun.resultJson);
           const acknowledgements = readObject(runResult.queuedSteeringAcknowledgements);
           const priorAcknowledgement = readObject(acknowledgements[commentId]);
@@ -11586,18 +11912,17 @@ export function issueRoutes(
               issue,
               activeRun: locked.activeRun,
               actor,
-              wake: locked.wake,
+              queueState: locked.queueState,
             });
           }
           assertQueueMutationTarget({
             queue: locked.queue,
-            targetRunId: req.body.targetRunId,
+            queueId: req.body.queueId,
             revision: req.body.revision,
           });
           if (locked.queue.protocol !== "paperclip_runner_v1") {
             throw conflict("This runner does not support same-turn steering", { code: "steering_unsupported" });
           }
-          if (!locked.wake) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
           const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
           if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
 
@@ -11620,7 +11945,10 @@ export function issueRoutes(
               .then(() => null)
             : await tx
               .update(agentWakeupRequests)
-              .set({ payload: updateWakePayloadCommentIds(locked.wake, remainingIds), updatedAt: now })
+              .set({
+                payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, remainingIds),
+                updatedAt: now,
+              })
               .where(eq(agentWakeupRequests.id, locked.wake.id))
               .returning()
               .then((rows) => rows[0] ?? locked.wake);
@@ -11646,7 +11974,9 @@ export function issueRoutes(
             issue,
             activeRun: { ...locked.activeRun, resultJson: runResult },
             actor,
-            wake: nextWake,
+            queueState: nextWake
+              ? { wake: nextWake, state: "deferred", queueRun: null }
+              : null,
           });
         });
       } catch (error) {
@@ -11678,7 +12008,7 @@ export function issueRoutes(
 
   router.delete(
     "/issues/:id/queued-comments/:commentId",
-    validate(queuedCommentTargetSchema),
+    validate(queuedCommentMutationTargetSchema),
     async (req, res) => {
       assertBoard(req);
       if (!req.actor.userId) throw forbidden("Board user context required");
@@ -11687,50 +12017,12 @@ export function issueRoutes(
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
       const actor = getActorInfo(req);
-      const queue = await db.transaction(async (tx) => {
-        const locked = await lockQueuedCommentState({ tx, issue, actor, targetRunId: req.body.targetRunId });
-        assertQueueMutationTarget({
-          queue: locked.queue,
-          targetRunId: req.body.targetRunId,
-          revision: req.body.revision,
-        });
-        if (!locked.wake) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
-        const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
-        if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
-        if (!entry.canDiscard) throw forbidden("Only the queued message author can discard it");
-        const deleted = await tx
-          .delete(issueComments)
-          .where(and(eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id)))
-          .returning({ id: issueComments.id })
-          .then((rows) => rows[0] ?? null);
-        if (!deleted) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
-        await issueReferencesSvc.deleteCommentSource(commentId, tx);
-        await externalObjectsSvc.syncCommentSafely(commentId, tx);
-        const remainingIds = locked.queue.entries
-          .map((candidate) => candidate.comment.id)
-          .filter((candidateId) => candidateId !== commentId);
-        const now = new Date();
-        await tx.update(issueRows).set({ updatedAt: now }).where(eq(issueRows.id, issue.id));
-        const nextWake = remainingIds.length === 0
-          ? await tx
-            .update(agentWakeupRequests)
-            .set({ status: "cancelled", finishedAt: now, updatedAt: now })
-            .where(eq(agentWakeupRequests.id, locked.wake.id))
-            .returning()
-            .then(() => null)
-          : await tx
-            .update(agentWakeupRequests)
-            .set({ payload: updateWakePayloadCommentIds(locked.wake, remainingIds), updatedAt: now })
-            .where(eq(agentWakeupRequests.id, locked.wake.id))
-            .returning()
-            .then((rows) => rows[0] ?? locked.wake);
-        return buildQueuedCommentQueue({
-          executor: tx,
-          issue,
-          activeRun: locked.activeRun,
-          actor,
-          wake: nextWake,
-        });
+      const { queue } = await discardQueuedComment({
+        issue,
+        actor,
+        commentId,
+        queueId: req.body.queueId,
+        revision: req.body.revision,
       });
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
@@ -12059,12 +12351,14 @@ export function issueRoutes(
           details: {
             identifier: issue.identifier,
             status: continuationIssue.status,
+            ...(continuationIssue.workMode ? { workMode: continuationIssue.workMode } : {}),
             assigneeAgentId: continuationIssue.assigneeAgentId ?? null,
             assigneeUserId: continuationIssue.assigneeUserId ?? null,
             source: "request_confirmation_accept",
             interactionId: interaction.id,
             _previous: {
               status: issue.status,
+              workMode: issue.workMode,
               assigneeAgentId: issue.assigneeAgentId ?? null,
               assigneeUserId: issue.assigneeUserId ?? null,
             },
@@ -12376,6 +12670,53 @@ export function issueRoutes(
   );
 
   router.post(
+    "/issues/:id/interactions/:interactionId/skip",
+    validate(skipIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type === "agent") {
+        res.status(403).json({ error: "Agent actors cannot skip issue-thread interactions through this board-only route" });
+        return;
+      }
+      assertBoard(req);
+
+      const actor = getActorInfo(req);
+      const interaction = await issueThreadInteractionService(db).skipInteraction(issue, interactionId, req.body, {
+        agentId: actor.agentId,
+        runId: actor.runId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_skipped",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          reason: interaction.result && "reason" in interaction.result
+            ? interaction.result.reason ?? null
+            : null,
+        },
+      });
+
+      // Skip intentionally does not enqueue an interaction continuation. A
+      // subsequent ordinary message uses the existing comment steering path.
+      res.json(interaction);
+    },
+  );
+
+  router.post(
     "/issues/:id/interactions/:interactionId/cancel",
     validate(cancelIssueThreadInteractionSchema),
     async (req, res) => {
@@ -12463,27 +12804,53 @@ export function issueRoutes(
         : comment.authorUserId === actor.actorId;
     const deleteMode = req.query.mode === "cancel" ? "cancel" : "delete";
 
+    const authoritativeQueueWake = issue.assigneeAgentId
+      ? await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+          inArray(agentWakeupRequests.status, [
+            "deferred_issue_execution",
+            "queued",
+            "claimed",
+            "succeeded",
+            "failed",
+          ]),
+        ))
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .then((rows) => rows.find((wake) => (
+          readObject(wake.payload).issueId === issue.id
+          && queuedCommentIdsFromWakePayload(wake.payload).includes(commentId)
+        )) ?? null)
+      : null;
     const activeRun = await resolveActiveIssueRun(issue);
-    const isQueuedComment = activeRun ? isQueuedIssueCommentForActiveRun({ comment, activeRun }) : false;
-    if (deleteMode === "cancel" || isQueuedComment) {
+    const isLegacyQueuedComment = activeRun
+      ? isQueuedIssueCommentForActiveRun({ comment, activeRun })
+      : false;
+    if (deleteMode === "cancel" || authoritativeQueueWake || isLegacyQueuedComment) {
       if (!actorOwnsComment) {
         res.status(403).json({ error: "Only the comment author can cancel queued comments" });
         return;
       }
 
-      if (!activeRun) {
-        res.status(409).json({ error: "Queued comment can no longer be canceled" });
-        return;
-      }
-
-      if (!isQueuedComment) {
-        res.status(409).json({ error: "Only queued comments can be canceled" });
-        return;
-      }
-
-      const removed = await svc.removeComment(commentId);
+      const removed = authoritativeQueueWake
+        ? (await discardQueuedComment({
+          issue,
+          actor,
+          commentId,
+          queueId: authoritativeQueueWake.id,
+        })).deleted
+        : activeRun && isLegacyQueuedComment
+          ? await svc.removeComment(commentId)
+          : null;
       if (!removed) {
-        res.status(404).json({ error: "Comment not found" });
+        res.status(409).json({
+          error: activeRun
+            ? "Only queued comments can be canceled"
+            : "Queued comment can no longer be canceled",
+        });
         return;
       }
 
@@ -12503,7 +12870,8 @@ export function issueRoutes(
           identifier: issue.identifier,
           issueTitle: issue.title,
           source: "queue_cancel",
-          queueTargetRunId: activeRun.id,
+          queueId: authoritativeQueueWake?.id ?? null,
+          queueTargetRunId: activeRun?.id ?? authoritativeQueueWake?.runId ?? null,
         },
       });
 
@@ -13123,6 +13491,11 @@ export function issueRoutes(
       }
     }
 
+    const commentIsFromAssigneeRun = await commentWasCreatedByAssigneeRun(
+      comment,
+      currentIssue.assigneeAgentId,
+    );
+
     await revalidateActiveSourceRecoveryAfterCommittedWrite({
       issue: currentIssue,
       trigger: "comment",
@@ -13216,12 +13589,16 @@ export function issueRoutes(
       })) ?? currentIssue;
       const assigneeId = wakeIssueSnapshot.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
-      const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      const selfComment =
+        (actorIsAgent && actor.actorId === assigneeId) ||
+        commentIsFromAssigneeRun;
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(wakeIssueSnapshot.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      const shouldWakeAssigneeForComment =
+        !(selfComment && resumeRequested !== true) &&
+        (reopened || !isClosedIssueStatus(wakeIssueSnapshot.status));
+      if (assigneeId && shouldWakeAssigneeForComment) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",
@@ -13299,7 +13676,10 @@ export function issueRoutes(
       }
 
       for (const mentionedId of mentionedIds) {
-        if (actorIsAgent && actor.actorId === mentionedId) continue;
+        if (
+          (actorIsAgent && actor.actorId === mentionedId) ||
+          (commentIsFromAssigneeRun && mentionedId === assigneeId)
+        ) continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",

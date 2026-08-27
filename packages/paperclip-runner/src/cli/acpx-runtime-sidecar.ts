@@ -25,6 +25,7 @@ import {
   boundedSidecarValue,
   parseAcpxSidecarRequest,
   record,
+  sanitizeAcpxPlanEntries,
   text,
   type AcpxSidecarEvent,
   type AcpxSidecarOpenParams,
@@ -33,6 +34,11 @@ import {
 } from "../drivers/acpx/sidecar-protocol.js";
 import { validatePrpStructuredRunResult } from "../protocol/replay-contract.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
+import {
+  acpxBootstrapBlockedError,
+  enqueueAcpxSidecarInput,
+  recordAcpxBootstrapFailure,
+} from "./acpx-sidecar-input.js";
 
 interface PendingResolution<T> {
   turnId: string;
@@ -46,6 +52,9 @@ let runId: string | null = null;
 let turnId: string | null = null;
 let sequence = 0;
 let closing = false;
+let pendingInput = Promise.resolve();
+let bootstrapFailure: Error | null = null;
+let providerStderrTail = "";
 const permissions = new Map<string, PendingResolution<AcpPermissionDecision | undefined>>();
 const inputs = new Map<string, PendingResolution<AcpElicitationResponse> & {
   request: AcpElicitationRequest;
@@ -54,8 +63,14 @@ const inputs = new Map<string, PendingResolution<AcpElicitationResponse> & {
 const tools = new Map<string, PendingResolution<unknown>>();
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
-lines.on("line", (line) => void receiveLine(line));
-lines.on("close", () => void shutdown("sidecar stdin closed"));
+lines.on("line", (line) => {
+  pendingInput = enqueueAcpxSidecarInput(
+    pendingInput,
+    () => receiveLine(line),
+    (error) => diagnostic("sidecar_input_failed", safeMessage(error)),
+  );
+});
+lines.on("close", () => void pendingInput.then(() => shutdown("sidecar stdin closed")));
 process.once("SIGTERM", () => void shutdown("sidecar received SIGTERM"));
 process.once("SIGINT", () => void shutdown("sidecar received SIGINT"));
 
@@ -73,12 +88,20 @@ async function receiveLine(line: string): Promise<void> {
     return;
   }
   try {
+    const blocked = acpxBootstrapBlockedError(bootstrapFailure, request.command);
+    if (blocked) throw blocked;
     response(request.id, true, await dispatch(request));
   } catch (error) {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    bootstrapFailure = recordAcpxBootstrapFailure(
+      bootstrapFailure,
+      request.command,
+      normalized,
+    );
     response(request.id, false, undefined, {
-      code: text(record(error).code, "acpx_sidecar_command_failed"),
-      message: safeMessage(error),
-      retryable: record(error).retryable === true,
+      code: text(record(normalized).code, "acpx_sidecar_command_failed"),
+      message: sidecarFailureMessage(normalized),
+      retryable: record(normalized).retryable === true,
     });
   }
 }
@@ -102,6 +125,7 @@ async function dispatch(request: AcpxSidecarRequest): Promise<Record<string, unk
   }
   if (request.command === "session.open") {
     if (host) throw new Error("ACPX sidecar already owns a session");
+    providerStderrTail = "";
     const params = parseOpenParams(request.params);
     openParams = params;
     host = await openRuntime(params);
@@ -221,6 +245,9 @@ async function dispatch(request: AcpxSidecarRequest): Promise<Record<string, unk
 async function openRuntime(params: AcpxSidecarOpenParams): Promise<AcpxRuntimeHost> {
   return AcpxRuntimeHost.open({
     ...params,
+    ...(params.permissionModePinned && !params.providerSessionKey
+      ? { providerSessionKey: `${params.normalizedSessionId}:permission:${params.permissionMode}` }
+      : {}),
     environment: process.env,
     dynamicTools: params.tools,
     dynamicToolHandler: (call) => waitForTool(call),
@@ -243,13 +270,25 @@ async function openRuntime(params: AcpxSidecarOpenParams): Promise<AcpxRuntimeHo
         breakdown,
       });
     },
-    onDiagnostic: (message) => diagnostic("acp_agent_stderr", message),
+    onDiagnostic: (message) => {
+      const safe = safeText(message);
+      providerStderrTail = `${providerStderrTail}${providerStderrTail ? "\n" : ""}${safe}`.slice(-4_096);
+      diagnostic("acp_agent_stderr", safe);
+    },
   });
 }
 
 async function pumpTurn(currentTurnId: string, runtimeTurn: ReturnType<AcpxRuntimeHost["startTurn"]>): Promise<void> {
+  let thinkingEmitted = false;
   try {
-    for await (const event of runtimeTurn.events) emit("runtime.event", sanitizeRuntimeEvent(event), currentTurnId);
+    for await (const event of runtimeTurn.events) {
+      const sanitized = sanitizeRuntimeEvent(event);
+      if (sanitized.type === "thinking") {
+        if (thinkingEmitted) continue;
+        thinkingEmitted = true;
+      }
+      emit("runtime.event", sanitized, currentTurnId);
+    }
     const result = await runtimeTurn.result;
     emit("runtime.turn_terminal", boundedSidecarValue(result), currentTurnId);
   } catch (error) {
@@ -357,7 +396,7 @@ function waitForInput(
 
 function sanitizeRuntimeEvent(event: AcpRuntimeEvent): Record<string, unknown> {
   const runtimeType = text(record(event).type);
-  if (!["text_delta", "status", "tool_call", "error", "done"].includes(runtimeType)) {
+  if (!["text_delta", "status", "tool_call", "plan", "error", "done"].includes(runtimeType)) {
     return {
       type: "provider_notice",
       category: `unclassified_acp_${runtimeType || "unknown"}`.slice(0, 160),
@@ -378,6 +417,12 @@ function sanitizeRuntimeEvent(event: AcpRuntimeEvent): Record<string, unknown> {
       size: event.size ?? null,
       cost: event.cost ?? null,
       breakdown: event.breakdown ?? null,
+    });
+  }
+  if (event.type === "plan") {
+    return boundedSidecarValue({
+      type: "plan",
+      entries: sanitizeAcpxPlanEntries(event.entries),
     });
   }
   if (event.type === "tool_call") {
@@ -469,11 +514,21 @@ function parseOpenParams(value: Record<string, unknown>): AcpxSidecarOpenParams 
     workingDirectory: requiredText(value.workingDirectory, "workingDirectory"),
     agent,
     model,
+    permissionMode: requiredPermissionMode(value.permissionMode),
+    permissionModePinned: value.permissionModePinned === true,
     systemInstructions: requiredText(value.systemInstructions, "systemInstructions"),
     runtimeContext: runtimeContextPath
       ? parseNativeRuntimeContext(JSON.parse(readFileSync(runtimeContextPath, "utf8")))
       : null,
     tools: Array.isArray(value.tools) ? value.tools.slice(0, 512).map(record) : [],
+    ...(value.providerSessionKey === undefined || value.providerSessionKey === null
+      ? {}
+      : {
+          providerSessionKey: requiredText(
+            value.providerSessionKey,
+            "providerSessionKey",
+          ).slice(0, 512),
+        }),
     ...(value.expectedIdentity === undefined || value.expectedIdentity === null
       ? {}
       : { expectedIdentity: parseExpectedIdentity(value.expectedIdentity) }),
@@ -493,7 +548,15 @@ function parseExpectedIdentity(value: unknown): NonNullable<AcpxSidecarOpenParam
     workspaceDigest: requiredText(input.workspaceDigest, "expected workspaceDigest"),
     requestedModel: requiredText(input.requestedModel, "expected requestedModel"),
     effectiveModel: requiredText(input.effectiveModel, "expected effectiveModel"),
+    ...(input.permissionMode === undefined
+      ? {}
+      : { permissionMode: requiredPermissionMode(input.permissionMode) }),
   };
+}
+
+function requiredPermissionMode(value: unknown): AcpxSidecarOpenParams["permissionMode"] {
+  if (value === "approve-all" || value === "approve-reads" || value === "deny-all") return value;
+  throw new Error("permissionMode must be approve-all, approve-reads, or deny-all");
 }
 
 function parsePermissionDecision(value: unknown): AcpPermissionDecision {
@@ -550,6 +613,12 @@ function safeText(value: unknown): string {
 }
 
 function safeMessage(error: unknown): string { return safeText(error instanceof Error ? error.message : error); }
+
+function sidecarFailureMessage(error: unknown): string {
+  const primary = safeMessage(error);
+  if (!providerStderrTail) return primary;
+  return safeText(`${primary} stderrTail=${JSON.stringify(providerStderrTail)}`);
+}
 
 function rejectTurnWaiters(terminalTurnId: string, message: string): void {
   for (const [id, pending] of permissions) if (pending.turnId === terminalTurnId) {

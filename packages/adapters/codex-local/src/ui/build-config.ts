@@ -1,4 +1,9 @@
-import { buildAdapterEnvConfig, type CreateConfigValues } from "@paperclipai/adapter-utils";
+import {
+  buildAdapterEnvConfig,
+  isPaperclipRunnerProvider,
+  resolvePaperclipRunnerPermissionMode,
+  type CreateConfigValues,
+} from "@paperclipai/adapter-utils";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "../index.js";
 
 function parseCommaArgs(value: string): string[] {
@@ -70,11 +75,46 @@ export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string
   delete config.nonInteractivePermissions;
   delete config.stateDir;
   delete config.warmHandleIdleMs;
-  const provider = v.paperclipRunnerProvider
-    ?? (v.adapterSchemaValues?.provider === "opencode" ? "opencode" : "codex");
+  delete config.dangerouslyBypassApprovalsAndSandbox;
+  const schemaValues = { ...(v.adapterSchemaValues ?? {}) };
+  delete schemaValues.provider;
+  delete schemaValues.permissionPolicy;
+  delete schemaValues.dangerouslyBypassApprovalsAndSandbox;
+  delete schemaValues.dangerouslyBypassSandbox;
+  const providerCandidate = v.paperclipRunnerProvider ?? v.adapterSchemaValues?.provider;
+  const provider = isPaperclipRunnerProvider(providerCandidate) ? providerCandidate : "codex";
+  const acpxAgent = v.paperclipRunnerAcpxAgent === "claude" || v.paperclipRunnerAcpxAgent === "codex"
+    ? v.paperclipRunnerAcpxAgent
+    : "pi";
+  const acpxModel = acpxAgent === "claude"
+    ? "claude-sonnet-5"
+    : acpxAgent === "codex"
+      ? "gpt-5.6-sol"
+      : "openrouter/deepseek/deepseek-v4-flash-0731";
   return {
     ...config,
+    ...schemaValues,
     provider,
+    codexPermissionMode: resolvePaperclipRunnerPermissionMode("codex", v.codexPermissionMode),
+    opencodePermissionMode: resolvePaperclipRunnerPermissionMode("opencode", v.opencodePermissionMode),
+    acpxPermissionMode: resolvePaperclipRunnerPermissionMode("acpx", v.acpxPermissionMode),
+    ...(provider === "acpx" ? { acpxAgent, model: v.model || acpxModel } : {}),
+    ...(provider === "claude_managed"
+      ? {
+          maxSessionListCostUsd: schemaValues.maxSessionListCostUsd ?? 1,
+          managedAgentsRetentionAcknowledged:
+            schemaValues.managedAgentsRetentionAcknowledged ?? false,
+        }
+      : {}),
+    ...(provider === "aws_agentcore"
+      ? {
+          maxEstimatedSessionCostUsd: schemaValues.maxEstimatedSessionCostUsd ?? 1,
+          qualificationRevision:
+            schemaValues.qualificationRevision ?? "aws-agentcore-harness-v1",
+          agentCoreRetentionAcknowledged:
+            schemaValues.agentCoreRetentionAcknowledged ?? false,
+        }
+      : {}),
     lifecycleMode: v.paperclipRunnerLifecycleMode ?? "per_turn",
     ...(v.paperclipRunnerLifecycleMode === "warm"
       ? { idleTimeoutMs: v.paperclipRunnerIdleTimeoutMs ?? 300_000 }

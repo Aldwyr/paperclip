@@ -32,6 +32,7 @@ import {
   SidePanelLauncher,
   SidePanelToggleButton,
   SidePanelTabs,
+  useScrollbarWhileScrolling,
   useSidePanelTabs,
   type SidePanelLauncherItem,
   type SidePanelLauncherSection,
@@ -88,6 +89,8 @@ export interface TaskSidePanelProps {
   documentDeepLink?: { requestId: number; documentKey: string } | null;
   onRequestClose?: () => void;
 }
+
+const EMPTY_ISSUE_DOCUMENTS: IssueDocument[] = [];
 
 function tabIcon(tab: SidePanelTabRecord<TaskSidePanelTabPayload>): ReactNode {
   switch (tab.payload.kind) {
@@ -201,8 +204,10 @@ export function TaskSidePanel({
   documentDeepLink,
   onRequestClose,
 }: TaskSidePanelProps) {
+  const handleScroll = useScrollbarWhileScrolling();
   const viewer = useTaskSidePanelFileRouting();
-  const { data: documents = [] } = useIssueDocuments(issue.id);
+  const { data: documentsData } = useIssueDocuments(issue.id);
+  const documents = documentsData ?? EMPTY_ISSUE_DOCUMENTS;
   const { data: planDocument } = useIssuePlanDocument(issue.id);
   const restoredRef = useRef(
     readTaskSidePanelState(accountScope, issue.companyId, issue.id, fileTabsEnabled),
@@ -470,7 +475,7 @@ export function TaskSidePanel({
       open={launcherOpen}
       onOpenChange={setLauncherOpen}
       trigger={(
-        <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 rounded-(--side-panel-control-radius)" aria-label="Open a new tab">
+        <Button type="button" variant="ghost" size="icon-sm" className="h-(--side-panel-tab-height) w-(--side-panel-tab-height) shrink-0 rounded-(--side-panel-control-radius) text-muted-foreground hover:text-foreground focus-visible:text-foreground" aria-label="Open a new tab">
           <Plus aria-hidden />
         </Button>
       )}
@@ -566,7 +571,7 @@ export function TaskSidePanel({
   return (
     <div className="flex h-full min-h-0 flex-col">
       {paneHeaderSlot ? createPortal(tabStrip, paneHeaderSlot) : (
-        <div className="flex h-(--side-panel-header-height) shrink-0 items-center gap-1 border-b border-border px-2">
+        <div className="flex h-(--side-panel-header-height) shrink-0 items-center gap-1 px-2">
           {tabStrip}
           {onRequestClose ? (
             <SidePanelToggleButton open onToggle={onRequestClose} />
@@ -575,17 +580,23 @@ export function TaskSidePanel({
       )}
       <div
         ref={bodyRef}
+        data-side-panel-content-viewport="true"
+        onScroll={handleScroll}
         role={activeTab ? "tabpanel" : undefined}
         id={activeTab ? `side-panel-content-${activeTab.id}` : undefined}
         aria-labelledby={activeTab ? `side-panel-tab-${activeTab.id}` : undefined}
         className={cn(
           "min-h-0 flex-1",
           contentMode === "full-bleed" ? "overflow-hidden" : "overflow-auto",
+          contentMode !== "full-bleed" && "scrollbar-while-scrolling",
           contentMode === "padded" && "p-4",
-          contentMode === "prose" && "mx-auto w-full max-w-4xl overflow-auto px-6 py-4",
         )}
       >
-        {content}
+        {contentMode === "prose" ? (
+          <div data-side-panel-prose-content="true" className="mx-auto w-full max-w-4xl px-6 py-4">
+            {content}
+          </div>
+        ) : content}
       </div>
     </div>
   );

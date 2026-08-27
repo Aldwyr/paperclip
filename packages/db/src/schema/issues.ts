@@ -9,6 +9,7 @@ import {
   jsonb,
   index,
   uniqueIndex,
+  unique,
   bigint,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";

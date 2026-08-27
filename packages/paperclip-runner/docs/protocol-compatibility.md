@@ -48,6 +48,31 @@ The forward-compatibility fixture proves that optional fields survive validation
 without changing the v1 snapshot. The unsupported-version fixture proves that a
 required v2 protocol cannot be replayed by this consumer.
 
+## Within-turn checklist snapshots
+
+`plan.updated` / `paperclip.plan.updated.v1` is a complete, ordered snapshot of
+the provider's checklist for one active turn. It is not a Paperclip Plan
+document and must never be inferred from assistant prose, Codex proposed-plan
+items, or generic TodoWrite output. Every replacement uses the provider turn ID
+as `planId`; PRP `sourceSeq`, not an optional provider revision, determines
+snapshot order. An empty step array clears the checklist, and `complete` is true
+only when a non-empty snapshot contains only `completed` steps. The legacy
+document-coupling fields are always `syncStatus: "not_applicable"` and
+`documentRevision: null`.
+
+| Qualified adapter profile | Checklist support |
+|---|---|
+| Direct Codex App Server | `turn/plan/updated` |
+| ACPX Codex | Structured ACP `plan` entries |
+| ACPX Claude | Structured ACP `plan` entries |
+| ACPX Pi | Unsupported; Pi has no built-in checklist stream |
+| OpenCode | Unsupported until it exposes a structured plan event |
+
+Codex `turn/diff/updated` is normalized separately as the latest same-turn
+`workspace.change.updated` snapshot. Together these two independent event
+families can drive a turn-status UI without changing the public PRP family or
+adding a control-plane endpoint.
+
 ## Provider-neutral semantic receipts
 
 - `capabilities.semanticTools` advertises stable operation IDs, availability,
@@ -104,6 +129,22 @@ process is lost first, Paperclip emits one non-replayable
 `runtime_request.expired` fact and materializes an idempotent durable
 `ask_user_questions` interaction using the identical question set. Explicit
 cancellation and already-resolved requests never create that fallback.
+
+## Native execution permission compatibility
+
+`paperclip.native-execution-input.v4` pins the effective harness permission
+policy in the closed provider configuration: `approvalPolicy` for Codex and
+`permissionMode` for OpenCode and ACPX. The pinned value participates in
+provider-session identity, so an incompatible idle or recovered session is
+replaced on the next execution. An active turn is never mutated in place.
+
+Persisted v1-v3 inputs remain replayable. Missing Codex and OpenCode policy
+fields retain their historical effective behavior. Legacy ACPX
+`permissionPolicy: "interactive"` is interpreted as `approve-reads`, while a
+new v4 ACPX execution defaults to `approve-all` at the server boundary.
+
+See [Adding a harness](adding-a-harness.md) for the permission catalog,
+isolation rules, and provider conformance requirements.
 
 Seven conformance fixtures cover artifact success, redacted denial without
 fallback, stale conflict plus duplicate retry, governed target and continuation

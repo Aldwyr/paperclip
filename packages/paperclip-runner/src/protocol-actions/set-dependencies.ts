@@ -20,9 +20,9 @@ export const setDependenciesAction = {
     "idempotency": "required",
     "disabledByDefault": false,
     "realBindingStatus": "live_codex",
-    "realServiceBinding": "unbound",
+    "realServiceBinding": "issues.update.blockedByIssueIds",
     "prpEvidence": "semantic-operation item event plus company-entity state diff and audit record",
-    "prpBindingStatus": "audit_pending",
+    "prpBindingStatus": "bound",
     "legacyAliases": []
   },
   "documentation": {

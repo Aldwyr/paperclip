@@ -21,7 +21,7 @@ function compatible(): PaperclipRunnerEvalCompatibilityRequirement {
       binaryName: "paperclip-runnerd",
       packageName: "@paperclipai/paperclip-runner",
       packageVersion: PAPERCLIP_RUNNER_BUILD_METADATA.package.version,
-      binaryContractVersion: 1,
+      binaryContractVersion: PAPERCLIP_RUNNER_BUILD_METADATA.contracts.runnerdArtifact,
       nativeExecutionVersion: 1,
       harnessDriverVersion: 1,
       prp: { name: "paperclip.runner", minimumVersion: 1, maximumVersion: 1 },
@@ -76,7 +76,7 @@ describe("Paperclip Evals integration compatibility", () => {
     const requirement = compatible();
     requirement.packageVersion = "9.0.0";
     requirement.runnerd.packageVersion = "8.0.0";
-    requirement.runnerd.binaryContractVersion = 2;
+    requirement.runnerd.binaryContractVersion = 3;
     requirement.runnerd.nativeExecutionVersion = 2;
     requirement.runnerd.harnessDriverVersion = 2;
     requirement.nativeExecutionVersion = 2;

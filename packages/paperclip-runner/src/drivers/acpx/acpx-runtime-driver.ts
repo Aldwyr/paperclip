@@ -20,6 +20,7 @@ import {
 import {
   HarnessCapabilityUnavailableError,
   HarnessStaleTurnError,
+  harnessRuntimeInputExpiredOutcome,
   harnessRuntimeRequestOutcome,
   parseHarnessRuntimeRequestResolution,
   type HarnessDriver,
@@ -40,6 +41,7 @@ import type { PrpEvent, PrpStructuredRunResult } from "../../protocol/replay-con
 import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import {
   canonicalProviderEventsFromAcpxRuntimeEvent,
+  createAcpxToolEventNormalizer,
   providerFamilyCapabilities,
 } from "../../provider-events.js";
 import { canonicalRunnerToolName } from "../runner-tool-bridge.js";
@@ -53,6 +55,7 @@ import {
 } from "./acpx-runtime-host.js";
 import { normalizeAcpFormElicitation } from "./acp-question-adapter.js";
 import { PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2 } from "../../contracts/question-set.js";
+import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
 import {
   ACPX_DRIVER_KIND,
   QUALIFIED_ACPX_VERSION,
@@ -71,6 +74,9 @@ type DynamicToolHandler = (call: {
 export interface AcpxRuntimeDriverOptions {
   agent: QualifiedAcpxAgent;
   model: string;
+  permissionMode?: NativeAcpxPermissionMode;
+  /** False only when replaying a pre-v4 native execution. */
+  permissionModePinned?: boolean;
   runtimeDirectory: string;
   systemInstructions?: string;
   runtimeContext?: NativeRuntimeContextSnapshot | null;
@@ -85,29 +91,32 @@ export interface AcpxRuntimeDriverOptions {
   now?: () => Date;
 }
 
-const BASE_CAPABILITIES: NativeSessionCapabilities = {
-  resume: true,
-  typedEvents: true,
-  typedEventFamilies: providerFamilyCapabilities({
-    plan: "available",
-    tool_execution: "available",
-    model_identity: "available",
-    review: "available",
-    provider_notice: "available",
-    artifact: "policy_disabled",
-  }),
-  steering: false,
-  interruption: true,
-  structuredResult: true,
-  read: true,
-  reconciliation: true,
-  usage: true,
-  dynamicTools: true,
-  runtimeRequestResolution: true,
-  goals: false,
-  threadLineage: false,
-  unsupported: ["steering", "goals", "threadLineage"],
-};
+export function acpxCapabilities(agent: QualifiedAcpxAgent): NativeSessionCapabilities {
+  return {
+    resume: true,
+    typedEvents: true,
+    typedEventFamilies: providerFamilyCapabilities({
+      plan: agent === "pi" ? "unsupported" : "available",
+      tool_execution: "available",
+      model_identity: "available",
+      review: "available",
+      provider_notice: "available",
+      artifact: "policy_disabled",
+    }),
+    steering: false,
+    interruption: true,
+    structuredResult: true,
+    read: true,
+    reconciliation: true,
+    usage: true,
+    dynamicTools: true,
+    runtimeRequestResolution: true,
+    runtimeRequestHandoff: true,
+    goals: false,
+    threadLineage: false,
+    unsupported: ["steering", "goals", "threadLineage"],
+  };
+}
 
 interface PendingPermission {
   request: HarnessRuntimeRequest;
@@ -134,7 +143,7 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       version: QUALIFIED_ACPX_VERSION,
       protocolVersion: "acp/v1",
       runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
-      capabilities: structuredClone(BASE_CAPABILITIES),
+      capabilities: acpxCapabilities(this.#options.agent),
     };
   }
 
@@ -142,6 +151,7 @@ export class AcpxRuntimeDriver implements HarnessDriver {
     const config = record(value);
     const agent = text(config.agent);
     const model = text(config.model);
+    const permissionMode = text(config.permissionMode) || "approve-all";
     const issues: Array<{ path: string; code: string; message: string }> = [];
     if (!["pi", "claude", "codex"].includes(agent)) {
       issues.push({ path: "agent", code: "invalid_agent", message: "ACPX agent must be pi, claude, or codex." });
@@ -149,8 +159,11 @@ export class AcpxRuntimeDriver implements HarnessDriver {
       try { resolveQualifiedAcpxProfile(agent as QualifiedAcpxAgent, model); }
       catch (error) { issues.push({ path: "model", code: "invalid_model", message: String(error) }); }
     }
+    if (!["approve-all", "approve-reads", "deny-all"].includes(permissionMode)) {
+      issues.push({ path: "permissionMode", code: "invalid_permission_mode", message: "ACPX permission mode must be approve-all, approve-reads, or deny-all." });
+    }
     return issues.length === 0
-      ? { ok: true, config: { agent, model, permissionPolicy: "interactive" }, issues: [] }
+      ? { ok: true, config: { agent, model, permissionMode }, issues: [] }
       : { ok: false, config: null, issues };
   }
 
@@ -204,18 +217,25 @@ export class AcpxRuntimeDriver implements HarnessDriver {
     replaceProviderSession = false,
   ): Promise<HarnessSession> {
     let session: AcpxHarnessSession | null = null;
+    const permissionMode = this.#options.permissionMode ?? "approve-all";
+    this.#options.onDiagnostic?.(
+      `Starting ACPX ${this.#options.agent} with permission mode ${permissionMode}.`,
+    );
     const host = await AcpxRuntimeHost.open({
       runtimeDirectory: this.#options.runtimeDirectory,
       normalizedSessionId: input.normalizedSessionId,
       ...(replaceProviderSession
         ? {
             providerSessionKey:
-              `${input.normalizedSessionId}:governed-wait-replacement:${input.runId}`,
+              `${input.normalizedSessionId}${this.#options.permissionModePinned ? `:permission:${permissionMode}` : ""}:governed-wait-replacement:${input.runId}`,
           }
-        : {}),
+        : this.#options.permissionModePinned
+          ? { providerSessionKey: `${input.normalizedSessionId}:permission:${permissionMode}` }
+          : {}),
       workingDirectory: input.workingDirectory,
       agent: this.#options.agent,
       model: this.#options.model,
+      permissionMode,
       systemInstructions: this.#options.systemInstructions,
       runtimeContext: this.#options.runtimeContext,
       ...(!replaceProviderSession && snapshot?.providerIdentity?.kind === "acpx"
@@ -327,6 +347,13 @@ class AcpxHarnessSession implements HarnessSession {
     if (this.#activeTurnId && this.#terminalTurns.has(this.#activeTurnId)) {
       this.#activeTurnId = null;
     }
+    for (const stale of input.snapshot?.pendingRuntimeRequests ?? []) {
+      this.#emit(
+        "runtime_request.cancelled",
+        harnessRuntimeRequestOutcome(stale, { reason: "transport_recovered" }),
+        { turnId: stale.turnId, itemId: stale.itemId },
+      );
+    }
   }
 
   ids() {
@@ -435,6 +462,28 @@ class AcpxHarnessSession implements HarnessSession {
       itemId: pending.request.itemId,
     });
     pendingPermission.settle(decision);
+  }
+
+  async handoffRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }): Promise<"handed_off" | "already_settled"> {
+    const pending = this.#pendingInputs.get(input.requestId);
+    if (
+      !pending
+      || pending.request.turnId !== input.turnId
+      || this.#activeTurnId !== input.turnId
+    ) return "already_settled";
+    if (!this.#pendingInputs.delete(input.requestId)) return "already_settled";
+    this.#emit(
+      "runtime_request.expired",
+      harnessRuntimeInputExpiredOutcome(pending.request, input.reason),
+      { turnId: input.turnId, itemId: pending.request.itemId },
+    );
+    pending.settle({ action: "cancel" });
+    await this.#host.cancel("durable_handoff").catch(() => undefined);
+    return "handed_off";
   }
 
   async requestPermission(context: AcpxRuntimePermissionContext): Promise<AcpPermissionDecision | undefined> {
@@ -680,6 +729,7 @@ class AcpxHarnessSession implements HarnessSession {
         workspaceDigest: workspaceDigest(this.#workingDirectory),
         requestedModel: identity.requestedModel,
         effectiveModel: identity.effectiveModel,
+        permissionMode: identity.permissionMode,
       },
       providerRecoveryPolicy: this.#providerRecoveryPolicy,
       runId: this.#runId,
@@ -706,7 +756,7 @@ class AcpxHarnessSession implements HarnessSession {
     }
     this.#pendingPermissions.clear();
     for (const pending of this.#pendingInputs.values()) {
-      this.#emit("runtime_request.cancelled", harnessRuntimeRequestOutcome(pending.request, { reason: "session_closed" }), {
+      this.#emit("runtime_request.expired", harnessRuntimeInputExpiredOutcome(pending.request, "provider_process_lost"), {
         turnId: pending.request.turnId,
         itemId: pending.request.itemId,
       });
@@ -717,15 +767,28 @@ class AcpxHarnessSession implements HarnessSession {
     await this.#host.close({ reason: input.reason, discardPersistentState: false });
   }
 
+  #expirePendingInputsAfterProviderLoss(): void {
+    for (const [requestId, pending] of this.#pendingInputs) {
+      this.#pendingInputs.delete(requestId);
+      this.#emit(
+        "runtime_request.expired",
+        harnessRuntimeInputExpiredOutcome(pending.request, "provider_process_lost"),
+        { turnId: pending.request.turnId, itemId: pending.request.itemId },
+      );
+      pending.settle({ action: "cancel" });
+    }
+  }
+
   async #pumpTurn(turnId: string, turn: ReturnType<AcpxRuntimeHost["startTurn"]>): Promise<void> {
     try {
       let index = 0;
+      const normalizeToolEvent = createAcpxToolEventNormalizer();
       for await (const event of turn.events) {
         const frameId = this.#host.latestInboundTraceFrameId();
         const emittedEventIds: string[] = [];
         this.#traceCorrelationEventIds = emittedEventIds;
         try {
-          this.#mapRuntimeEvent(event, turnId, ++index);
+          this.#mapRuntimeEvent(normalizeToolEvent(event), turnId, ++index);
         } finally {
           this.#traceCorrelationEventIds = null;
         }
@@ -792,6 +855,7 @@ class AcpxHarnessSession implements HarnessSession {
         this.#emit("turn.failed", { status: "failed", error: { code: result.error.code ?? null, message: redact(result.error.message) } }, { turnId });
       }
     } catch (error) {
+      this.#expirePendingInputsAfterProviderLoss();
       if (this.#activeTurnId === turnId) this.#activeTurnId = null;
       this.#activeTurnAbort = null;
       this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
@@ -805,6 +869,8 @@ class AcpxHarnessSession implements HarnessSession {
   #mapRuntimeEvent(event: AcpRuntimeEvent, turnId: string, index: number): void {
     const itemId = event.type === "tool_call" && event.toolCallId
       ? safeId(event.toolCallId, `${turnId}:acp:${index}`)
+      : event.type === "plan"
+        ? turnId
       : `${turnId}:acp:${index}`;
     if (
       event.type === "tool_call"
@@ -844,7 +910,7 @@ class AcpxHarnessSession implements HarnessSession {
       }, turnId, itemId);
     }
     if (event.type === "tool_call") this.#emitToolLocations(event, turnId, itemId);
-    for (const canonical of canonicalProviderEventsFromAcpxRuntimeEvent(event, itemId)) {
+    for (const canonical of canonicalProviderEventsFromAcpxRuntimeEvent(event, itemId, turnId)) {
       this.#emit(canonical.eventType, canonical.payload, { turnId, itemId: canonical.itemId });
     }
     if (event.type === "error") {
@@ -942,6 +1008,7 @@ function assertRecoveryIdentity(
     || expected.workspaceDigest !== workspaceDigest(workspace)
     || expected.requestedModel !== actual.requestedModel
     || expected.effectiveModel !== actual.effectiveModel
+    || (expected.permissionMode ?? "approve-reads") !== actual.permissionMode
   ) throw new Error("ACPX recovery identity does not match the immutable persisted session");
 }
 

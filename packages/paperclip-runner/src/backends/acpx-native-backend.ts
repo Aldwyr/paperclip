@@ -18,6 +18,8 @@ export function createAcpxNativeSessionBackend(
     runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
     agent: input.provider.agent,
     model: input.provider.model,
+    permissionMode: input.provider.permissionMode ?? "approve-reads",
+    permissionModePinned: input.schema === "paperclip.native-execution-input.v4",
     taskEnvelope: createCodexTaskEnvelope({
       objective: input.completionContract.contract.objective,
       contractRevision: input.completionContract.contract.revision,

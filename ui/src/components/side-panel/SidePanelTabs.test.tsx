@@ -68,8 +68,64 @@ describe("SidePanelTabs", () => {
   it("renders accessible tabs and the anchored add action", () => {
     renderTabs();
     expect(container.querySelector('[role="tablist"]')).not.toBeNull();
-    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Properties");
-    expect(container.querySelector('button[aria-label="Open a new tab"]')).not.toBeNull();
+    const activeTab = container.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
+    expect(activeTab?.textContent).toContain("Properties");
+    expect(activeTab?.className).toContain("text-xs");
+    expect(activeTab?.querySelector("span")?.className).toContain("size-3.5");
+    expect(container.querySelector('button[aria-label="Close Properties"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Close Plan"]')).toBeNull();
+    const addButton = container.querySelector<HTMLButtonElement>('button[aria-label="Open a new tab"]');
+    expect(addButton?.className).toContain("text-muted-foreground");
+    expect(addButton?.className).toContain("h-(--side-panel-tab-height)");
+  });
+
+  it("separates only adjacent inactive tabs", () => {
+    act(() => {
+      root.render(
+        <TooltipProvider>
+          <SidePanelTabs
+            tabs={[
+              { id: "active", type: "view", label: "Active", closable: true },
+              { id: "inactive-one", type: "view", label: "Inactive one", closable: true },
+              { id: "inactive-two", type: "view", label: "Inactive two", closable: true },
+            ]}
+            activeTabId="active"
+            onActiveTabChange={vi.fn()}
+            onCloseTab={vi.fn()}
+          />
+        </TooltipProvider>,
+      );
+    });
+    const separators = container.querySelectorAll('[data-side-panel-tab-separator="true"]');
+    expect(separators).toHaveLength(1);
+    expect(separators[0]?.parentElement?.querySelector('[data-side-panel-tab-target="inactive-two"]')).not.toBeNull();
+  });
+
+  it("keeps intrinsic tab width stable while giving inactive labels the close-button space", () => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      right: 128,
+      bottom: 30,
+      left: 0,
+      width: 128,
+      height: 30,
+      toJSON: () => ({}),
+    });
+    renderTabs("properties");
+    const planWrapper = container.querySelector<HTMLElement>('[data-side-panel-tab-wrapper="document:plan"]')!;
+    const planButton = container.querySelector<HTMLElement>('[data-side-panel-tab-target="document:plan"]')!;
+    expect(planWrapper.style.width).toBe("128px");
+    expect(planButton.className).toContain("pr-2.5");
+    expect(planButton.querySelector('[data-truncated]')?.className ?? planButton.querySelector("span:nth-child(2)")?.className)
+      .toContain("max-w-(--side-panel-tab-label-expanded-max-width)");
+
+    renderTabs("document:plan");
+    const selectedPlanWrapper = container.querySelector<HTMLElement>('[data-side-panel-tab-wrapper="document:plan"]')!;
+    const selectedPlanButton = container.querySelector<HTMLElement>('[data-side-panel-tab-target="document:plan"]')!;
+    expect(selectedPlanWrapper.style.width).toBe("128px");
+    expect(selectedPlanButton.className).toContain("pr-7");
   });
 
   it("closes a tab with its named close action", () => {

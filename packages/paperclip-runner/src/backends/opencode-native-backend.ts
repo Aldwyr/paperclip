@@ -17,6 +17,7 @@ export function createOpenCodeNativeSessionBackend(
     systemInstructions: nativeSystemInstructions(input),
     runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
     model: input.provider.model,
+    permissionMode: input.provider.permissionMode ?? "allow",
     taskEnvelope: createCodexTaskEnvelope({
       objective: input.completionContract.contract.objective,
       contractRevision: input.completionContract.contract.revision,

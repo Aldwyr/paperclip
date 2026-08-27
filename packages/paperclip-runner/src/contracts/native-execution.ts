@@ -3,7 +3,8 @@ import { parseNativeRuntimeContext, type NativeRuntimeContextSnapshot } from "./
 
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V1 = "paperclip.native-execution-input.v1" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V2 = "paperclip.native-execution-input.v2" as const;
-export const NATIVE_EXECUTION_INPUT_SCHEMA = "paperclip.native-execution-input.v3" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V3 = "paperclip.native-execution-input.v3" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA = "paperclip.native-execution-input.v4" as const;
 export const NATIVE_MODEL_ENVELOPE_SCHEMA_V1 = "paperclip.native-model-envelope.v1" as const;
 export const NATIVE_MODEL_ENVELOPE_SCHEMA = "paperclip.native-model-envelope.v2" as const;
 
@@ -75,6 +76,9 @@ export interface NativeAwsAgentCoreProfileSnapshot {
 }
 
 export type NativeAcpxAgent = "pi" | "claude" | "codex";
+export type NativeCodexApprovalPolicy = "never" | "on-request" | "untrusted";
+export type NativeOpenCodePermissionMode = "allow" | "ask" | "deny";
+export type NativeAcpxPermissionMode = "approve-all" | "approve-reads" | "deny-all";
 
 export interface NativeAcpxProfileSnapshot {
   driverKind: "acpx_runtime";
@@ -90,8 +94,8 @@ export interface NativeAcpxProfileSnapshot {
 }
 
 export type NativeProviderConfig =
-  | { kind: "codex"; model: string | null }
-  | { kind: "opencode"; model: string }
+  | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
+  | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
   | {
       kind: "claude_managed";
       model: string;
@@ -113,7 +117,21 @@ export type NativeProviderConfig =
       kind: "acpx";
       agent: NativeAcpxAgent;
       model: string;
-      permissionPolicy: "interactive";
+      permissionMode?: NativeAcpxPermissionMode;
+      /** Present only in persisted v1-v3 inputs. */
+      permissionPolicy?: "interactive";
+      profile: NativeAcpxProfileSnapshot;
+    };
+
+export type NativeProviderConfigV4 =
+  | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
+  | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
+  | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" }>
+  | {
+      kind: "acpx";
+      agent: NativeAcpxAgent;
+      model: string;
+      permissionMode: NativeAcpxPermissionMode;
       profile: NativeAcpxProfileSnapshot;
     };
 
@@ -167,11 +185,16 @@ export interface NativeExecutionInputV2 extends Omit<NativeExecutionInputV1, "sc
 }
 
 export interface NativeExecutionInputV3 extends Omit<NativeExecutionInputV2, "schema"> {
-  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V3;
   runtimeContext: NativeRuntimeContextSnapshot;
 }
 
-export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3;
+export interface NativeExecutionInputV4 extends Omit<NativeExecutionInputV3, "schema" | "provider"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA;
+  provider: NativeProviderConfigV4;
+}
+
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4;
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -248,7 +271,8 @@ function nullableText(value: unknown, path: string): string | null {
  */
 export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
-  const isV3 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
+  const isV4 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA;
+  const isV3 = isV4 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V3;
   const isV2 = isV3 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V2;
   exactKeys(input, [
     "schema",
@@ -265,7 +289,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   ], "input");
   if (!isV2 && input.schema !== NATIVE_EXECUTION_INPUT_SCHEMA_V1) {
     throw new NativeExecutionInputError(
-      `input.schema must be ${NATIVE_EXECUTION_INPUT_SCHEMA_V1}, ${NATIVE_EXECUTION_INPUT_SCHEMA_V2}, or ${NATIVE_EXECUTION_INPUT_SCHEMA}`,
+      `input.schema must be ${NATIVE_EXECUTION_INPUT_SCHEMA_V1}, ${NATIVE_EXECUTION_INPUT_SCHEMA_V2}, ${NATIVE_EXECUTION_INPUT_SCHEMA_V3}, or ${NATIVE_EXECUTION_INPUT_SCHEMA}`,
     );
   }
 
@@ -370,8 +394,12 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       : provider.kind === "aws_agentcore"
         ? ["kind", "model", "agentCoreProfile", "maxEstimatedSessionCostUsd", "invocationLimits"]
       : provider.kind === "acpx"
-        ? ["kind", "agent", "model", "permissionPolicy", "profile"]
-      : ["kind", "model"],
+        ? ["kind", "agent", "model", isV4 ? "permissionMode" : "permissionPolicy", "profile"]
+      : provider.kind === "codex" && isV4
+        ? ["kind", "model", "approvalPolicy"]
+        : provider.kind === "opencode" && isV4
+          ? ["kind", "model", "permissionMode"]
+          : ["kind", "model"],
     "input.provider",
   );
   if (
@@ -492,7 +520,11 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     if (provider.agent !== "pi" && provider.agent !== "claude" && provider.agent !== "codex") {
       throw new NativeExecutionInputError("input.provider.agent must be pi, claude, or codex");
     }
-    if (provider.permissionPolicy !== "interactive") {
+    if (isV4) {
+      if (provider.permissionMode !== "approve-all" && provider.permissionMode !== "approve-reads" && provider.permissionMode !== "deny-all") {
+        throw new NativeExecutionInputError("input.provider.permissionMode must be approve-all, approve-reads, or deny-all");
+      }
+    } else if (provider.permissionPolicy !== "interactive") {
       throw new NativeExecutionInputError("input.provider.permissionPolicy must be interactive");
     }
     const profile = record(provider.profile, "input.provider.profile");
@@ -526,7 +558,9 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       kind: "acpx",
       agent: provider.agent,
       model: providerModel,
-      permissionPolicy: "interactive",
+      ...(isV4
+        ? { permissionMode: provider.permissionMode as NativeAcpxPermissionMode }
+        : { permissionPolicy: "interactive" as const }),
       profile: {
         driverKind: "acpx_runtime",
         protocolVersion: 1,
@@ -541,9 +575,27 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       },
     };
   } else if (provider.kind === "opencode") {
-    parsedProvider = { kind: "opencode", model: providerModel! };
+    if (isV4 && provider.permissionMode !== "allow" && provider.permissionMode !== "ask" && provider.permissionMode !== "deny") {
+      throw new NativeExecutionInputError("input.provider.permissionMode must be allow, ask, or deny");
+    }
+    parsedProvider = {
+      kind: "opencode",
+      model: providerModel!,
+      ...(isV4
+        ? { permissionMode: provider.permissionMode as NativeOpenCodePermissionMode }
+        : {}),
+    };
   } else {
-    parsedProvider = { kind: "codex", model: providerModel };
+    if (isV4 && provider.approvalPolicy !== "never" && provider.approvalPolicy !== "on-request" && provider.approvalPolicy !== "untrusted") {
+      throw new NativeExecutionInputError("input.provider.approvalPolicy must be never, on-request, or untrusted");
+    }
+    parsedProvider = {
+      kind: "codex",
+      model: providerModel,
+      ...(isV4
+        ? { approvalPolicy: provider.approvalPolicy as NativeCodexApprovalPolicy }
+        : {}),
+    };
   }
   if (!Array.isArray(contract.criteria) || contract.criteria.length === 0) {
     throw new NativeExecutionInputError("input.completionContract.contract.criteria must not be empty");
@@ -645,7 +697,13 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     planningContext,
   };
   if (!isV3) return { ...current, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V2 };
-  return { ...current, schema: NATIVE_EXECUTION_INPUT_SCHEMA, runtimeContext: parseNativeRuntimeContext(input.runtimeContext) };
+  const withRuntimeContext = { ...current, runtimeContext: parseNativeRuntimeContext(input.runtimeContext) };
+  if (!isV4) return { ...withRuntimeContext, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V3 };
+  return {
+    ...withRuntimeContext,
+    schema: NATIVE_EXECUTION_INPUT_SCHEMA,
+    provider: parsedProvider as NativeProviderConfigV4,
+  };
 }
 
 export function buildNativeModelEnvelope(input: NativeExecutionInput): NativeModelEnvelopeV1 | NativeModelEnvelopeV2 {

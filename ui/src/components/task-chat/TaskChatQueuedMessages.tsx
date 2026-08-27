@@ -38,6 +38,18 @@ import {
 
 type QueueAction = "steer" | "discard" | null;
 
+function queueActionErrorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const body = (error as { body?: unknown }).body;
+  if (typeof body !== "object" || body === null) return null;
+  const directCode = (body as { code?: unknown }).code;
+  if (typeof directCode === "string") return directCode;
+  const details = (body as { details?: unknown }).details;
+  if (typeof details !== "object" || details === null) return null;
+  const detailCode = (details as { code?: unknown }).code;
+  return typeof detailCode === "string" ? detailCode : null;
+}
+
 export interface TaskChatQueuedMessagesProps {
   queue: IssueQueuedCommentQueue;
   onEdit: (commentId: string) => void;
@@ -184,7 +196,7 @@ export function TaskChatQueuedMessages({
 
   async function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
-    if (!over || active.id === over.id || reordering || pending) return;
+    if (!queue.queueId || !over || active.id === over.id || reordering || pending) return;
     const from = ids.indexOf(String(active.id));
     const to = ids.indexOf(String(over.id));
     if (from < 0 || to < 0) return;
@@ -198,17 +210,21 @@ export function TaskChatQueuedMessages({
     setAnnouncement(`Moved queued message to position ${to + 1} of ${next.length}.`);
     try {
       await onReorder(orderedIds, queue.revision);
-    } catch {
+    } catch (error) {
       setEntries(previous);
       setAnnouncement("");
-      setVisibleError("Couldn’t reorder. Previous order restored.");
+      setVisibleError(
+        queueActionErrorCode(error) === "queued_comment_revision_conflict"
+          ? "The queue changed in another session. Its latest order has been restored."
+          : "Couldn’t reorder. Previous order restored.",
+      );
     } finally {
       setReordering(false);
     }
   }
 
   async function runRowAction(commentId: string, action: Exclude<QueueAction, null>) {
-    if (pending || reordering) return;
+    if (!queue.queueId || pending || reordering) return;
     setPending({ commentId, action });
     setVisibleError(null);
     setAnnouncement(action === "steer" ? "Steering queued message." : "Discarding queued message.");
@@ -217,11 +233,18 @@ export function TaskChatQueuedMessages({
       else await onDiscard(commentId, queue.revision);
       setEntries((current) => current.filter((entry) => entry.comment.id !== commentId));
       setAnnouncement(action === "steer" ? "Message steered into the active turn." : "Queued message discarded.");
-    } catch {
+    } catch (error) {
       setAnnouncement("");
-      setVisibleError(action === "steer"
-        ? "Couldn’t steer. Message is still queued."
-        : "Couldn’t discard. Message is still queued.");
+      const code = queueActionErrorCode(error);
+      setVisibleError(
+        code === "queued_comment_already_dispatching"
+          ? "Too late to discard: this message is already being sent."
+          : action === "steer"
+            ? "Couldn’t steer. Message is still queued."
+            : code === "queued_comment_revision_conflict"
+              ? "The queue changed in another session. Review it and try again."
+              : "Couldn’t discard. Message is still queued.",
+      );
     } finally {
       setPending(null);
     }
@@ -239,7 +262,7 @@ export function TaskChatQueuedMessages({
         <SortableContext items={ids} strategy={verticalListSortingStrategy}>
           {entries.map((entry) => {
             const action = pending?.commentId === entry.comment.id ? pending.action : null;
-            const disabled = Boolean(pending || reordering);
+            const disabled = Boolean(!queue.queueId || pending || reordering);
             return (
               <SortableQueuedMessage
                 key={entry.comment.id}

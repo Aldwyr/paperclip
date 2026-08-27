@@ -20,7 +20,7 @@ export const createTaskAction = {
     "idempotency": "required",
     "disabledByDefault": false,
     "realBindingStatus": "live_codex",
-    "realServiceBinding": "issues.decomposeAcceptedPlan",
+    "realServiceBinding": "issues.createChild",
     "prpEvidence": "semantic-operation item event plus company-entity state diff and audit record",
     "prpBindingStatus": "bound",
     "legacyAliases": [
@@ -29,7 +29,7 @@ export const createTaskAction = {
   },
   "documentation": {
     "title": "Create child task",
-    "description": "Create one durable implementation child under an accepted planning task.",
+    "description": "Create one durable standard child under the active task.",
     "note": null
   },
   "examples": {
@@ -52,7 +52,14 @@ export const createTaskAction = {
         ],
         "scheduledWakeIds": [
           "example"
-        ]
+        ],
+        "task": {
+          "id": "example",
+          "identifier": "EX-2",
+          "parentId": "example-parent",
+          "status": "todo",
+          "assigneeActorId": "example-agent"
+        }
       }
     }
   },
@@ -63,7 +70,7 @@ export const createTaskAction = {
       "operationId": "create_task",
       "version": 1,
       "title": "Create child task",
-      "description": "Create one durable implementation child under an accepted planning task. Include the complete approved plan in the child description.",
+      "description": "Create one durable standard child under the active task. Use only when a real ownership, parallelism, dependency, review, or lifecycle boundary justifies delegation.",
       "exposure": "optional",
       "requiredClaims": [
         "delegation:tasks:create"
@@ -166,6 +173,18 @@ export const createTaskAction = {
             },
             "maxItems": 200,
             "uniqueItems": true
+          },
+          "task": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "identifier": { "type": ["string", "null"] },
+              "parentId": { "type": "string", "minLength": 1 },
+              "status": { "type": "string", "minLength": 1 },
+              "assigneeActorId": { "type": ["string", "null"] }
+            },
+            "required": ["id", "identifier", "parentId", "status", "assigneeActorId"],
+            "additionalProperties": false
           }
         },
         "required": [
@@ -173,7 +192,8 @@ export const createTaskAction = {
           "disposition",
           "stateRevision",
           "entityRefs",
-          "scheduledWakeIds"
+          "scheduledWakeIds",
+          "task"
         ],
         "additionalProperties": false
       }

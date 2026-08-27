@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { activityLog, agents, companies, createDb, documents, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { documentService } from "../documents.js";
+import { issueService } from "../issues.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("PaperclipRunnerToolAuthority", () => {
@@ -16,7 +17,12 @@ describe("PaperclipRunnerToolAuthority", () => {
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-runner-tools-");
     db = createDb(temporary.connectionString);
-    await db.insert(companies).values({ id: companyId, name: "Runner tools", issuePrefix: "RNT" });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Runner tools",
+      issuePrefix: "RNT",
+      issueCounter: 1,
+    });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -29,6 +35,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
+      issueNumber: 1,
       identifier: "RNT-1",
       title: "Exercise real runner tools",
       status: "in_progress",
@@ -54,10 +61,11 @@ describe("PaperclipRunnerToolAuthority", () => {
 
   it("advertises only real bindings and reads the bound task", async () => {
     const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
-    expect(authority.definitions()).toHaveLength(14);
+    expect(authority.definitions()).toHaveLength(16);
     expect(authority.definitions().map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "get_task_context", "get_task_history", "search_tasks", "report_progress",
       "request_human_input",
+      "create_task", "set_dependencies",
       "list_documents", "read_document", "list_document_revisions", "write_document",
       "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
     ]));
@@ -76,6 +84,20 @@ describe("PaperclipRunnerToolAuthority", () => {
       workMode: "ask",
     });
     expect(authority.definitions().map((tool) => tool.name)).toContain("request_human_input");
+    expect(authority.definitions().map((tool) => tool.name)).not.toContain("create_task");
+    expect(authority.definitions().map((tool) => tool.name)).not.toContain("set_dependencies");
+  });
+
+  it("does not advertise delegation tools during pre-acceptance planning", () => {
+    const authority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      workMode: "planning",
+    });
+    expect(authority.definitions().map((tool) => tool.name)).not.toContain("create_task");
+    expect(authority.definitions().map((tool) => tool.name)).not.toContain("set_dependencies");
   });
 
   it("writes progress through the real issue service and replays idempotently", async () => {
@@ -183,60 +205,29 @@ describe("PaperclipRunnerToolAuthority", () => {
     })).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
   });
 
-  it("creates and wakes one durable implementation child after plan acceptance", async () => {
-    const planningIssueId = "00000000-0000-4000-8000-000000000105";
-    const planningRunId = "00000000-0000-4000-8000-000000000106";
-    await db.insert(issues).values({
-      id: planningIssueId,
-      companyId,
-      issueNumber: 2,
-      identifier: "RNT-2",
-      title: "Plan then implement",
-      status: "in_progress",
-      workMode: "planning",
-      assigneeAgentId: agentId,
-    });
-    await db.update(issues).set({ issueNumber: 1 }).where(eq(issues.id, issueId));
-    await db.update(companies).set({ issueCounter: 2 }).where(eq(companies.id, companyId));
-    await db.insert(heartbeatRuns).values({
-      id: planningRunId,
-      companyId,
-      agentId,
-      status: "running",
-      runtimeMode: "native",
-      invocationSource: "automation",
-      triggerDetail: "system",
-      contextSnapshot: { issueId: planningIssueId },
-    });
-    await db.update(issues).set({ executionRunId: planningRunId }).where(eq(issues.id, planningIssueId));
-    const written = await documentService(db).upsertIssueDocument({
-      issueId: planningIssueId,
-      key: "plan",
-      title: "Approved plan",
-      format: "markdown",
-      body: "Implement and test the utility.",
-      baseRevisionId: null,
-      changeSummary: "Initial plan",
-      createdByAgentId: agentId,
-      createdByRunId: planningRunId,
-    });
-    const planningAuthority = new PaperclipRunnerToolAuthority(db, {
-      companyId,
-      agentId,
-      issueId: planningIssueId,
-      runId: planningRunId,
-      workMode: "planning",
-    });
-    const requested = await planningAuthority.execute({
+  it("returns the exact accepted plan revision in task context", async () => {
+    const plan = await documentService(db).getIssueDocumentByKey(issueId, "plan");
+    expect(plan).not.toBeNull();
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    const requested = await authority.execute({
       tool: "request_human_input",
       callId: "approve-plan",
       arguments: {
-        idempotencyKey: `confirmation:${planningIssueId}:plan:${written.document.latestRevisionId}`,
+        idempotencyKey: `confirmation:${issueId}:plan:${plan!.latestRevisionId}`,
         interactionKind: "confirmation",
         title: "Approve the plan",
         prompt: "Approve this exact plan revision?",
-        payload: {},
-        targetRevisionId: written.document.latestRevisionId,
+        payload: {
+          target: {
+            type: "issue_document",
+            issueId,
+            documentId: plan!.id,
+            key: "plan",
+            revisionId: plan!.latestRevisionId,
+            revisionNumber: plan!.latestRevisionNumber,
+          },
+        },
+        targetRevisionId: plan!.latestRevisionId,
         continuationPolicy: "wake_assignee_on_accept",
       },
     });
@@ -247,9 +238,9 @@ describe("PaperclipRunnerToolAuthority", () => {
         payload: {
           target: {
             type: "issue_document",
-            issueId: planningIssueId,
+            issueId,
             key: "plan",
-            revisionId: written.document.latestRevisionId,
+            revisionId: plan!.latestRevisionId,
           },
         },
       },
@@ -259,15 +250,42 @@ describe("PaperclipRunnerToolAuthority", () => {
       resolvedByUserId: "test-user",
       resolvedAt: new Date(),
       result: { outcome: "accepted" } as never,
-    }).where(eq(issueThreadInteractions.issueId, planningIssueId));
+    }).where(eq(issueThreadInteractions.id, (requested as { interaction: { id: string } }).interaction.id));
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: {
+        issueId,
+        workspaceRefreshReason: "accepted_plan_confirmation",
+        planReviewInteraction: {
+          acceptedTargetRevision: {
+            issueId,
+            documentId: plan!.id,
+            key: "plan",
+            revisionId: plan!.latestRevisionId,
+            revisionNumber: plan!.latestRevisionNumber,
+          },
+        },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+
+    await expect(authority.execute({ tool: "get_task_context", callId: "accepted-context", arguments: {} }))
+      .resolves.toMatchObject({
+        acceptedPlan: {
+          documentId: plan!.id,
+          revisionId: plan!.latestRevisionId,
+          revisionNumber: plan!.latestRevisionNumber,
+          markdown: "Use the real document service.",
+        },
+      });
+  });
+
+  it("creates ordinary children, preserves blockers, and deduplicates across runs", async () => {
     const wakes: Array<{ agentId: string; options: Record<string, unknown> }> = [];
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId,
       agentId,
-      issueId: planningIssueId,
-      runId: planningRunId,
-      workMode: "planning",
-      acceptedPlanContinuation: true,
+      issueId,
+      runId,
+      workMode: "standard",
       enqueueWakeup: async (wakeAgentId, options) => {
         wakes.push({ agentId: wakeAgentId, options });
         return null;
@@ -275,24 +293,22 @@ describe("PaperclipRunnerToolAuthority", () => {
     });
     expect(authority.definitions().map((tool) => tool.name)).toContain("create_task");
 
-    const result = await authority.execute({
+    const prerequisite = await authority.execute({
       tool: "create_task",
-      callId: "create-implementation-child",
+      callId: "create-prerequisite",
       arguments: {
-        idempotencyKey: "approved-plan-child",
-        title: "Implement the approved plan",
-        description: "Implement and test the utility from the accepted parent plan.",
+        idempotencyKey: "ordinary-prerequisite",
+        title: "Prepare delegated input",
+        description: "A self-contained prerequisite delegated from the active task.",
       },
     });
 
-    expect(result).toMatchObject({
+    expect(prerequisite).toMatchObject({
       disposition: "applied",
-      acceptedPlanRevisionId: written.document.latestRevisionId,
-      childIssue: {
-        parentId: planningIssueId,
-        workMode: "standard",
+      task: {
+        parentId: issueId,
         status: "todo",
-        assigneeAgentId: agentId,
+        assigneeActorId: agentId,
       },
     });
     expect(wakes).toHaveLength(1);
@@ -300,11 +316,149 @@ describe("PaperclipRunnerToolAuthority", () => {
       agentId,
       options: {
         reason: "issue_assigned",
-        payload: { parentIssueId: planningIssueId },
+        payload: { parentIssueId: issueId },
       },
     });
-    expect(await db.select().from(issues).where(eq(issues.parentId, planningIssueId)))
-      .toHaveLength(1);
+    const prerequisiteId = (prerequisite as { task: { id: string } }).task.id;
+    const dependent = await authority.execute({
+      tool: "create_task",
+      callId: "create-dependent",
+      arguments: {
+        idempotencyKey: "ordinary-dependent",
+        title: "Use delegated input",
+        blockedByTaskIds: [prerequisiteId],
+      },
+    });
+    expect(dependent).toMatchObject({
+      disposition: "applied",
+      scheduledWakeIds: [],
+      task: { parentId: issueId, status: "blocked", assigneeActorId: agentId },
+    });
+    expect(wakes).toHaveLength(1);
+    await expect(issueService(db).getRelationSummaries(issueId)).resolves.toMatchObject({
+      blockedBy: [],
+    });
+
+    await authority.execute({
+      tool: "set_dependencies",
+      callId: "wait-for-prerequisite",
+      arguments: {
+        idempotencyKey: "source-waits-for-prerequisite",
+        blockedByTaskIds: [prerequisiteId],
+      },
+    });
+    await expect(issueService(db).getRelationSummaries(issueId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: prerequisiteId })],
+    });
+
+    await issueService(db).update(prerequisiteId, {
+      status: "done",
+      actorAgentId: agentId,
+    });
+    await expect(authority.execute({
+      tool: "create_task",
+      callId: "create-dependency-ready-child",
+      arguments: {
+        idempotencyKey: "ordinary-ready-dependent",
+        title: "Start after completed delegated input",
+        blockedByTaskIds: [prerequisiteId],
+      },
+    })).resolves.toMatchObject({
+      disposition: "applied",
+      task: { parentId: issueId, status: "todo", assigneeActorId: agentId },
+      scheduledWakeIds: [expect.any(String)],
+    });
+    expect(wakes).toHaveLength(2);
+
+    const nextRunId = "00000000-0000-4000-8000-000000000106";
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({
+      id: nextRunId,
+      companyId,
+      agentId,
+      status: "running",
+      runtimeMode: "native",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      contextSnapshot: { issueId },
+    });
+    await db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, issueId));
+    const retryWakes: Array<unknown> = [];
+    const retryAuthority = new PaperclipRunnerToolAuthority(db, {
+      companyId,
+      agentId,
+      issueId,
+      runId: nextRunId,
+      workMode: "standard",
+      enqueueWakeup: async (_wakeAgentId, options) => {
+        retryWakes.push(options);
+        return null;
+      },
+    });
+    await expect(retryAuthority.execute({
+      tool: "create_task",
+      callId: "cross-run-retry",
+      arguments: {
+        idempotencyKey: "ordinary-prerequisite",
+        title: "Prepare delegated input",
+        description: "A self-contained prerequisite delegated from the active task.",
+      },
+    })).resolves.toMatchObject({ disposition: "duplicate", task: { id: prerequisiteId } });
+    await expect(retryAuthority.execute({
+      tool: "create_task",
+      callId: "cross-run-conflicting-retry",
+      arguments: {
+        idempotencyKey: "ordinary-prerequisite",
+        title: "Conflicting title for the same caller key",
+      },
+    })).rejects.toThrow("paperclip_runner_tool_idempotency_conflict");
+
+    const foreignCompanyId = "00000000-0000-4000-8000-000000000201";
+    const foreignAgentId = "00000000-0000-4000-8000-000000000202";
+    const foreignIssueId = "00000000-0000-4000-8000-000000000203";
+    await db.insert(companies).values({
+      id: foreignCompanyId,
+      name: "Foreign company",
+      issuePrefix: "FGN",
+      issueCounter: 1,
+    });
+    await db.insert(agents).values({
+      id: foreignAgentId,
+      companyId: foreignCompanyId,
+      name: "Foreign agent",
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex" },
+      runtimeConfig: {},
+      status: "active",
+    });
+    await db.insert(issues).values({
+      id: foreignIssueId,
+      companyId: foreignCompanyId,
+      issueNumber: 1,
+      identifier: "FGN-1",
+      title: "Foreign blocker",
+      status: "todo",
+    });
+    await expect(retryAuthority.execute({
+      tool: "create_task",
+      callId: "foreign-assignee",
+      arguments: {
+        idempotencyKey: "foreign-assignee",
+        title: "Invalid foreign assignment",
+        assigneeActorId: foreignAgentId,
+      },
+    })).rejects.toThrow("paperclip_runner_agent_not_found");
+    await expect(retryAuthority.execute({
+      tool: "create_task",
+      callId: "foreign-blocker",
+      arguments: {
+        idempotencyKey: "foreign-blocker",
+        title: "Invalid foreign blocker",
+        blockedByTaskIds: [foreignIssueId],
+      },
+    })).rejects.toThrow();
+    expect(retryWakes).toHaveLength(0);
+    expect(await db.select().from(issues).where(eq(issues.parentId, issueId))).toHaveLength(3);
   });
 
   it("fails closed once the run is no longer active", async () => {

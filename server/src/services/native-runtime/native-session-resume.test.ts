@@ -102,7 +102,7 @@ describe("rebindNativeSessionCheckpoint", () => {
       activeTurnId: null,
       terminalTurns: [],
       pendingRuntimeRequests: [],
-      providerRecoveryPolicy: "same_session_only",
+      providerRecoveryPolicy: "allow_replacement_after_resume_failure",
       identity: { runId: currentRunId, sessionId: normalizedSessionId, companyId, issueId, agentId },
     });
   });
@@ -191,6 +191,51 @@ describe("rebindNativeSessionCheckpoint", () => {
 });
 
 describe("buildNativeExecutionInput wake projection", () => {
+  it("writes native v4 and pins each local provider's effective permission policy", () => {
+    const common = {
+      companyId,
+      runId: currentRunId,
+      issue: { id: issueId, identifier: "DOT-4", title: "Permissions", description: null, workMode: "standard" },
+      taskPrompt: "Verify permissions",
+      agentId,
+      workspace: { id: currentRunId, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId,
+      completionContract: execution(currentRunId).completionContract,
+      runtimeContext: nativeRuntimeContextFixture(),
+    } as const;
+    const codex = buildNativeExecutionInput({
+      ...common,
+      provider: "codex",
+      codexApprovalPolicy: "on-request",
+    });
+    const opencode = buildNativeExecutionInput({
+      ...common,
+      provider: "opencode",
+      model: "openrouter/z-ai/glm-5.2",
+      opencodePermissionMode: "ask",
+    });
+    const acpx = buildNativeExecutionInput({
+      ...common,
+      provider: "acpx",
+      acpxAgent: "claude",
+      model: "claude-sonnet-5",
+      acpxPermissionMode: "deny-all",
+    });
+
+    expect(codex).toMatchObject({
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "codex", approvalPolicy: "on-request" },
+    });
+    expect(opencode).toMatchObject({
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "opencode", permissionMode: "ask" },
+    });
+    expect(acpx).toMatchObject({
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "acpx", permissionMode: "deny-all" },
+    });
+  });
+
   it("places child completion summaries in the closed provider prompt", () => {
     const input = buildNativeExecutionInput({
       companyId,

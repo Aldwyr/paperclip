@@ -1,5 +1,16 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, integer, jsonb, index, bigserial, bigint, uniqueIndex } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  uuid,
+  text,
+  timestamp,
+  integer,
+  jsonb,
+  index,
+  bigserial,
+  bigint,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -27,7 +38,6 @@ export const heartbeatRunEvents = pgTable(
   },
   (table) => ({
     runSeqIdx: index("heartbeat_run_events_run_seq_idx").on(table.runId, table.seq),
-    runSeqUq: uniqueIndex("heartbeat_run_events_run_seq_uq").on(table.runId, table.seq),
     runSourceEventUq: uniqueIndex("heartbeat_run_events_run_source_event_uq")
       .on(table.runId, table.sourceEventId)
       .where(sql`${table.sourceEventId} is not null`),

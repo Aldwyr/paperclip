@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,7 +14,7 @@ use crate::generated_acpx_sidecar_contract::{
     GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
 };
 use crate::local_runner::LocalRunnerError;
-use crate::process_supervisor::SupervisedProcess;
+use crate::process_supervisor::{BoundedLogBuffer, ProcessOutput, SupervisedProcess};
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 const ACPX_SIDECAR_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -43,6 +43,9 @@ pub struct AcpxProvider {
     assistant_text: String,
     provider_requests: u64,
     agent_process_id: Option<u32>,
+    thinking_active: bool,
+    stderr_tail: BoundedLogBuffer,
+    stdout_closed: bool,
 }
 
 impl AcpxProvider {
@@ -50,6 +53,7 @@ impl AcpxProvider {
         config: &AcpxProviderConfig,
         tools: Vec<AuthorizedTool>,
         expected_identity: Option<&ProviderSessionIdentity>,
+        replacement_provider_session_key: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
         validate_config(config)?;
         let process = SupervisedProcess::spawn(
@@ -75,6 +79,9 @@ impl AcpxProvider {
             assistant_text: String::new(),
             provider_requests: 0,
             agent_process_id: None,
+            thinking_active: false,
+            stderr_tail: BoundedLogBuffer::new(32, 8 * 1024),
+            stdout_closed: false,
         };
         provider.request(
             GeneratedAcpxSidecarCommand::Initialize,
@@ -88,9 +95,12 @@ impl AcpxProvider {
                 "workingDirectory": config.cwd,
                 "agent": config.agent,
                 "model": config.model,
+                "permissionMode": config.permission_mode,
+                "permissionModePinned": config.permission_mode_pinned,
                 "systemInstructions": config.instructions,
                 "tools": provider.tools,
                 "expectedIdentity": expected_identity,
+                "providerSessionKey": replacement_provider_session_key,
             }),
         )?;
         let identity = opened.get("identity").unwrap_or(&Value::Null);
@@ -137,27 +147,37 @@ impl AcpxProvider {
     ) -> Result<Value, LocalRunnerError> {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.process.send(&json!({
+        if let Err(error) = self.process.send(&json!({
             "protocolVersion": GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION,
             "id": id,
             "command": command.as_str(),
             "params": params,
-        }))?;
+        })) {
+            return Err(self.request_send_failure(command.as_str(), error));
+        }
         loop {
             let line = self
-                .process
                 .receive_stdout_line(Duration::from_secs(30))?
-                .ok_or_else(|| {
-                    LocalRunnerError::invalid(format!(
-                        "ACPX sidecar {} response timed out",
-                        command.as_str()
-                    ))
-                })?;
-            let message = parse_frame(&line)?;
+                .ok_or_else(|| self.request_wait_failure(command.as_str()))?;
+            let message = parse_frame(&line).map_err(|error| {
+                LocalRunnerError::invalid(format!(
+                    "provider_initialize_protocol_error: provider=acpx stage={}: {error}",
+                    command.as_str()
+                ))
+            })?;
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 if message.get("ok").and_then(Value::as_bool) != Some(true) {
+                    let code = if matches!(
+                        command,
+                        GeneratedAcpxSidecarCommand::Initialize
+                            | GeneratedAcpxSidecarCommand::SessionOpen
+                    ) {
+                        "provider_initialize_protocol_error"
+                    } else {
+                        "provider_request_protocol_error"
+                    };
                     return Err(LocalRunnerError::invalid(format!(
-                        "ACPX sidecar {} failed: {}",
+                        "{code}: provider=acpx stage={}: {}",
                         command.as_str(),
                         message
                             .pointer("/error/message")
@@ -169,6 +189,124 @@ impl AcpxProvider {
             }
             if let Some(event) = self.map_frame(&message)? {
                 self.inbox.push_back(event);
+            }
+        }
+    }
+
+    fn receive_stdout_line(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<String>, LocalRunnerError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match self.process.recv_timeout(remaining) {
+                Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
+                Ok(ProcessOutput::Stderr(line)) => {
+                    self.stderr_tail.push(redact_acpx_diagnostic(&line));
+                }
+                Ok(ProcessOutput::StdoutError(message)) => {
+                    return Err(LocalRunnerError::invalid(format!(
+                        "provider_initialize_protocol_error: provider=acpx stage=stdout: {message}"
+                    )));
+                }
+                Ok(ProcessOutput::StdoutClosed) => {
+                    self.stdout_closed = true;
+                    return Ok(None);
+                }
+                Ok(ProcessOutput::StderrClosed) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(LocalRunnerError::invalid(
+                        "provider_process_output_closed: provider=acpx",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn request_wait_failure(&mut self, command: &str) -> LocalRunnerError {
+        if self.stdout_closed {
+            self.drain_failure_diagnostics(Duration::from_millis(50));
+        } else {
+            self.drain_failure_diagnostics(Duration::ZERO);
+        }
+        let stderr = self.stderr_tail.snapshot().lines.join("\n");
+        let stderr_detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" stderrTail={stderr:?}")
+        };
+        if self.stdout_closed {
+            return match self.process.try_wait() {
+                Ok(Some(exit)) => LocalRunnerError::invalid(format!(
+                    "provider_process_exited: provider=acpx stage={command} exitCode={:?} signal={:?}{stderr_detail}",
+                    exit.exit_code, exit.signal,
+                )),
+                Ok(None) => LocalRunnerError::invalid(format!(
+                    "provider_stdout_closed: provider=acpx stage={command}{stderr_detail}"
+                )),
+                Err(error) => LocalRunnerError::invalid(format!(
+                    "provider_process_status_failed: provider=acpx stage={command}: {error}{stderr_detail}"
+                )),
+            };
+        }
+        let code = if matches!(command, "initialize" | "session.open") {
+            "provider_initialize_timeout"
+        } else {
+            "provider_request_timeout"
+        };
+        LocalRunnerError::invalid(format!(
+            "{code}: provider=acpx stage={command}{stderr_detail}"
+        ))
+    }
+
+    fn request_send_failure(&mut self, command: &str, error: LocalRunnerError) -> LocalRunnerError {
+        self.drain_failure_diagnostics(Duration::from_millis(50));
+        let stderr = self.stderr_tail.snapshot().lines.join("\n");
+        let stderr_detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" stderrTail={stderr:?}")
+        };
+        match self.process.try_wait() {
+            Ok(Some(exit)) => LocalRunnerError::invalid(format!(
+                "provider_process_exited: provider=acpx stage={command} exitCode={:?} signal={:?}{stderr_detail}",
+                exit.exit_code, exit.signal,
+            )),
+            Ok(None) => LocalRunnerError::invalid(format!(
+                "provider_transport_failed: provider=acpx stage={command}: {error}{stderr_detail}"
+            )),
+            Err(status_error) => LocalRunnerError::invalid(format!(
+                "provider_process_status_failed: provider=acpx stage={command}: {status_error}; sendError={error}{stderr_detail}"
+            )),
+        }
+    }
+
+    fn drain_failure_diagnostics(&mut self, max_wait: Duration) {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            let output = if max_wait.is_zero() {
+                self.process.try_recv().ok()
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    None
+                } else {
+                    self.process.recv_timeout(remaining).ok()
+                }
+            };
+            match output {
+                Some(ProcessOutput::Stderr(line)) => {
+                    self.stderr_tail.push(redact_acpx_diagnostic(&line));
+                }
+                Some(ProcessOutput::StderrClosed) => break,
+                Some(ProcessOutput::StdoutClosed) => self.stdout_closed = true,
+                Some(ProcessOutput::Stdout(_)) | Some(ProcessOutput::StdoutError(_)) => {}
+                None => break,
             }
         }
     }
@@ -340,9 +478,16 @@ impl AcpxProvider {
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("failed");
+                let error = payload.get("error").cloned().unwrap_or(Value::Null);
                 let terminal = ProviderEvent::Notification {
                     method: "turn/completed".to_owned(),
-                    params: json!({ "turn": { "id": turn_id, "status": status }, "acpx": payload }),
+                    params: json!({
+                        "threadId": self.acpx_record_id,
+                        "turnId": turn_id,
+                        "turn": { "id": turn_id, "status": status, "error": error },
+                        "error": error,
+                        "acpx": payload,
+                    }),
                 };
                 if self.assistant_text.is_empty() {
                     Ok(Some(terminal))
@@ -351,11 +496,24 @@ impl AcpxProvider {
                     self.inbox.push_back(terminal);
                     Ok(Some(ProviderEvent::Notification {
                         method: "item/completed".to_owned(),
-                        params: json!({ "item": { "id": format!("acpx-message-{turn_id}"), "type": "agentMessage", "text": text } }),
+                        params: json!({
+                            "threadId": self.acpx_record_id,
+                            "turnId": turn_id,
+                            "item": { "id": format!("acpx-message-{turn_id}"), "type": "agentMessage", "text": text },
+                        }),
                     }))
                 }
             }
             GeneratedAcpxSidecarEventType::RuntimeEvent => {
+                // ACPX reports one thought delta per provider chunk. The
+                // canonical PRP surface needs one reasoning item boundary,
+                // not hundreds of duplicate item.started events.
+                if payload.get("type").and_then(Value::as_str) == Some("thinking") {
+                    if self.thinking_active {
+                        return Ok(None);
+                    }
+                    self.thinking_active = true;
+                }
                 if payload.get("type").and_then(Value::as_str) == Some("text_delta") {
                     self.assistant_text.push_str(
                         payload
@@ -364,7 +522,16 @@ impl AcpxProvider {
                             .unwrap_or_default(),
                     );
                 }
-                Ok(Some(map_runtime_event(payload, self.provider_requests)))
+                let turn_id = message
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                Ok(Some(map_runtime_event(
+                    payload,
+                    self.provider_requests,
+                    &self.acpx_record_id,
+                    turn_id,
+                )))
             }
             GeneratedAcpxSidecarEventType::RuntimeProcess => {
                 Ok(Some(ProviderEvent::Notification {
@@ -416,6 +583,7 @@ impl Provider for AcpxProvider {
             workspace_digest: format!("sha256:{:x}", Sha256::digest(self.config.cwd.as_bytes())),
             requested_model: self.config.model.clone(),
             effective_model: self.config.model.clone(),
+            permission_mode: Some(self.config.permission_mode.clone()),
         })
     }
 
@@ -471,12 +639,27 @@ impl Provider for AcpxProvider {
         }
         self.active_turn_id = Some(turn_id.to_owned());
         self.assistant_text.clear();
+        self.thinking_active = false;
         self.provider_requests += 1;
         match self.request(
             GeneratedAcpxSidecarCommand::TurnStart,
             json!({ "turnId": turn_id, "message": message }),
         ) {
-            Ok(response) => Ok(response),
+            Ok(response) => {
+                // Sidecar runtime events can arrive while the turn.start
+                // response is in flight. Put the authoritative turn boundary
+                // ahead of those buffered events so the strict outer driver
+                // observes one valid turn before any items.
+                self.inbox.push_front(ProviderEvent::Notification {
+                    method: "turn/started".to_owned(),
+                    params: json!({
+                        "threadId": self.acpx_record_id,
+                        "turnId": turn_id,
+                        "turn": { "id": turn_id, "status": "inProgress" },
+                    }),
+                });
+                Ok(response)
+            }
             Err(error) => {
                 if self.active_turn_id.as_deref() == Some(turn_id) {
                     self.active_turn_id = None;
@@ -502,7 +685,7 @@ impl Provider for AcpxProvider {
         if let Some(event) = self.inbox.pop_front() {
             return Ok(Some(event));
         }
-        let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+        let Some(line) = self.receive_stdout_line(Duration::from_millis(1))? else {
             return if self.process.try_wait()?.is_some() {
                 Ok(Some(ProviderEvent::Exited))
             } else {
@@ -613,7 +796,7 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
                 Some("@earendil-works/pi-coding-agent"),
                 Some("0.84.2"),
                 "openrouter/deepseek/deepseek-v4-flash-0731",
-                "sha256:e806321f458baaf23aa5580324d8f90a59082066105eda69de35b1ef0c8418eb",
+                "sha256:8c696f38296d53d0061fa11534570c5ddd951b63532aed30e0f1fcc676dc169f",
             ),
             "claude" => (
                 "@agentclientprotocol/claude-agent-acp",
@@ -629,7 +812,7 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
                 None,
                 None,
                 "gpt-5.6-sol",
-                "sha256:8c7fc8af156596668a95ce23d52309f70ad576e75bac6dc209d30378bdbb8ebe",
+                "sha256:94049b3e3c3aee87de62703786e4fa81d031d7bd979f99bdf516d84f28791a79",
             ),
             _ => {
                 return Err(LocalRunnerError::invalid(
@@ -643,7 +826,10 @@ fn validate_config(config: &AcpxProviderConfig) -> Result<(), LocalRunnerError> 
         || config.agent_runtime_package.as_deref() != runtime_package
         || config.agent_runtime_version.as_deref() != runtime_version
         || config.model != model
-        || config.permission_policy != "interactive"
+        || !matches!(
+            config.permission_mode.as_str(),
+            "approve-all" | "approve-reads" | "deny-all"
+        )
         || config.command_digest != command_digest
         || config.normalized_session_id.is_empty()
         || config.run_id.is_empty()
@@ -677,6 +863,25 @@ fn required_text(value: &Value, key: &str, label: &str) -> Result<String, LocalR
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| LocalRunnerError::invalid(format!("ACPX sidecar omitted {label} identity")))
+}
+
+fn redact_acpx_diagnostic(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let boundary = [
+        "authorization",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min();
+    match boundary {
+        Some(index) => format!("{}[REDACTED]", &value[..index]),
+        None => value.chars().take(2_000).collect(),
+    }
 }
 
 fn validate_question_set(value: &Value) -> Result<(), LocalRunnerError> {
@@ -757,7 +962,12 @@ fn permission_kind(value: Option<&str>) -> String {
     }
 }
 
-fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
+fn map_runtime_event(
+    payload: Value,
+    provider_requests: u64,
+    thread_id: &str,
+    turn_id: &str,
+) -> ProviderEvent {
     match payload
         .get("type")
         .and_then(Value::as_str)
@@ -766,6 +976,8 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
         "text_delta" => ProviderEvent::Notification {
             method: "item/delta".to_owned(),
             params: json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
                 "itemId": payload.get("messageId").and_then(Value::as_str).unwrap_or("acpx-agent-message"),
                 "delta": payload.get("text").and_then(Value::as_str).unwrap_or_default(),
                 "authoritative": true,
@@ -773,8 +985,38 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
         },
         "thinking" => ProviderEvent::Notification {
             method: "item/started".to_owned(),
-            params: json!({ "item": { "type": "reasoning", "status": "inProgress" } }),
+            params: json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": { "type": "reasoning", "status": "inProgress" },
+            }),
         },
+        "plan" => {
+            let plan: Vec<Value> = payload
+                .get("entries")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .take(256)
+                        .filter_map(|entry| {
+                            let step = entry.get("content")?.as_str()?.trim();
+                            if step.is_empty() {
+                                return None;
+                            }
+                            Some(json!({
+                                "step": step.chars().take(4000).collect::<String>(),
+                                "status": entry.get("status").and_then(Value::as_str).unwrap_or("pending"),
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ProviderEvent::Notification {
+                method: "turn/plan/updated".to_owned(),
+                params: json!({ "threadId": thread_id, "turnId": turn_id, "plan": plan }),
+            }
+        }
         "semantic_result" => ProviderEvent::SemanticResult {
             result: payload.get("result").cloned().unwrap_or(Value::Null),
             item_id: payload
@@ -794,6 +1036,8 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
             ProviderEvent::Notification {
                 method: "thread/tokenUsage/updated".to_owned(),
                 params: json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
                     "tokenUsage": { "total": {
                         "inputTokens": breakdown.get("inputTokens"),
                         "outputTokens": breakdown.get("outputTokens"),
@@ -818,22 +1062,28 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
                     "item/started"
                 }
                 .to_owned(),
-                params: json!({ "item": {
-                    "id": payload.get("toolCallId"),
-                    "type": "commandExecution",
-                    "command": payload.get("title"),
-                    "status": payload.get("status"),
-                    "locations": payload.get("locations"),
-                    "aggregatedOutput": payload.get("output"),
-                    "outputBytes": payload.get("outputBytes"),
-                    "outputTruncated": payload.get("outputTruncated"),
-                    "outputDigest": payload.get("outputDigest"),
-                }}),
+                params: json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": payload.get("toolCallId"),
+                        "type": "commandExecution",
+                        "command": payload.get("title"),
+                        "status": payload.get("status"),
+                        "locations": payload.get("locations"),
+                        "aggregatedOutput": payload.get("output"),
+                        "outputBytes": payload.get("outputBytes"),
+                        "outputTruncated": payload.get("outputTruncated"),
+                        "outputDigest": payload.get("outputDigest"),
+                    }
+                }),
             }
         }
         "provider_notice" => ProviderEvent::Notification {
             method: "warning".to_owned(),
             params: json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
                 "code": payload.get("category").and_then(Value::as_str).unwrap_or("unclassified_acp_update"),
                 "message": payload.get("summary").and_then(Value::as_str).unwrap_or("The qualified ACP agent emitted an unclassified runtime update."),
             }),
@@ -841,6 +1091,8 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
         _ => ProviderEvent::Notification {
             method: "warning".to_owned(),
             params: json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
                 "code": "unclassified_acp_runtime_event",
                 "message": "The ACPX sidecar emitted an unclassified bounded runtime event.",
             }),
@@ -851,6 +1103,77 @@ fn map_runtime_event(payload: Value, provider_requests: u64) -> ProviderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qualified_test_config(sidecar_script: &str) -> AcpxProviderConfig {
+        AcpxProviderConfig {
+            agent: "pi".to_owned(),
+            model: "openrouter/deepseek/deepseek-v4-flash-0731".to_owned(),
+            acpx_version: "0.13.1".to_owned(),
+            agent_server_package: "pi-acp".to_owned(),
+            agent_server_version: "0.0.33".to_owned(),
+            agent_runtime_package: Some("@earendil-works/pi-coding-agent".to_owned()),
+            agent_runtime_version: Some("0.84.2".to_owned()),
+            command_digest:
+                "sha256:8c696f38296d53d0061fa11534570c5ddd951b63532aed30e0f1fcc676dc169f".to_owned(),
+            sidecar_command: "/bin/sh".into(),
+            sidecar_args: vec!["-c".to_owned(), sidecar_script.to_owned()],
+            runtime_directory: "/tmp/acpx-provider-test".to_owned(),
+            normalized_session_id: "session-test".to_owned(),
+            run_id: "run-test".to_owned(),
+            cwd: "/tmp".to_owned(),
+            instructions: "Test provider bootstrap diagnostics.".to_owned(),
+            permission_mode: "deny-all".to_owned(),
+            permission_mode_pinned: true,
+            runtime_context: None,
+        }
+    }
+
+    #[test]
+    fn initialize_exit_reports_process_state_stage_and_redacted_stderr() {
+        let result = AcpxProvider::start(
+            &qualified_test_config(
+                "IFS= read -r request; echo 'API_KEY=super-secret-acpx-token' >&2; exit 17",
+            ),
+            Vec::new(),
+            None,
+            None,
+        );
+        let error = match result {
+            Ok(mut provider) => {
+                provider.shutdown().unwrap();
+                panic!("provider unexpectedly initialized")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("provider_process_exited"), "{error}");
+        assert!(error.contains("provider=acpx"), "{error}");
+        assert!(error.contains("stage=initialize"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert!(!error.contains("super-secret-acpx-token"), "{error}");
+    }
+
+    #[test]
+    fn malformed_initialize_response_reports_protocol_stage() {
+        let result = AcpxProvider::start(
+            &qualified_test_config("IFS= read -r request; echo 'not-json'"),
+            Vec::new(),
+            None,
+            None,
+        );
+        let error = match result {
+            Ok(mut provider) => {
+                provider.shutdown().unwrap();
+                panic!("provider unexpectedly initialized")
+            }
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("provider_initialize_protocol_error"),
+            "{error}"
+        );
+        assert!(error.contains("provider=acpx"), "{error}");
+        assert!(error.contains("stage=initialize"), "{error}");
+    }
 
     #[test]
     fn rejects_unqualified_profiles() {
@@ -870,7 +1193,8 @@ mod tests {
             run_id: "run".to_owned(),
             cwd: "/tmp/workspace".to_owned(),
             instructions: "safe".to_owned(),
-            permission_policy: "interactive".to_owned(),
+            permission_mode: "approve-all".to_owned(),
+            permission_mode_pinned: true,
             runtime_context: None,
         };
         assert!(validate_config(&config).is_err());
@@ -881,10 +1205,14 @@ mod tests {
         let event = map_runtime_event(
             json!({ "type": "thinking", "text": "secret chain of thought" }),
             1,
+            "thread-1",
+            "turn-1",
         );
         match event {
             ProviderEvent::Notification { params, .. } => {
-                assert!(!params.to_string().contains("secret"))
+                assert!(!params.to_string().contains("secret"));
+                assert_eq!(params["threadId"], "thread-1");
+                assert_eq!(params["turnId"], "turn-1");
             }
             _ => panic!("expected notification"),
         }
@@ -899,6 +1227,8 @@ mod tests {
         let event = map_runtime_event(
             json!({ "type": "semantic_result", "callId": "finish-1", "result": result }),
             1,
+            "thread-1",
+            "turn-1",
         );
         match event {
             ProviderEvent::SemanticResult { result, item_id } => {
@@ -906,6 +1236,35 @@ mod tests {
                 assert_eq!(item_id.as_deref(), Some("finish-1"));
             }
             _ => panic!("expected semantic result"),
+        }
+    }
+
+    #[test]
+    fn preserves_every_structured_plan_entry_for_the_active_turn() {
+        let event = map_runtime_event(
+            json!({
+                "type": "plan",
+                "entries": [
+                    {"content": "Inspect", "status": "completed", "priority": "high"},
+                    {"content": "Implement", "status": "in_progress", "priority": "medium"},
+                    {"content": "Verify", "status": "pending", "priority": "low"}
+                ]
+            }),
+            1,
+            "thread-acp",
+            "turn-acp",
+        );
+        match event {
+            ProviderEvent::Notification { method, params } => {
+                assert_eq!(method, "turn/plan/updated");
+                assert_eq!(params["threadId"], "thread-acp");
+                assert_eq!(params["turnId"], "turn-acp");
+                assert_eq!(params["plan"].as_array().unwrap().len(), 3);
+                assert_eq!(params["plan"][0]["step"], "Inspect");
+                assert_eq!(params["plan"][1]["status"], "in_progress");
+                assert_eq!(params["plan"][2]["step"], "Verify");
+            }
+            _ => panic!("expected plan notification"),
         }
     }
 }

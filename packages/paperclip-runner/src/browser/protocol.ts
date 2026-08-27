@@ -16,6 +16,7 @@ export interface RunnerCapabilities {
   reconciliation?: boolean;
   usage?: boolean;
   runtimeRequestResolution?: boolean;
+  runtimeRequestHandoff?: boolean;
   goals?: boolean;
   threadLineage?: boolean;
   unsupported?: string[];

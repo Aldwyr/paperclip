@@ -116,6 +116,16 @@ describe("resolveNativeRuntimeMode", () => {
       .toThrow(NativeRuntimeEligibilityError);
   });
 
+  it("admits remote targets only through paperclip_runner", () => {
+    expect(resolveNativeRuntimeMode({
+      ...eligible,
+      target: { kind: "remote" },
+      runtimeConfig: {},
+      adapterConfig: { provider: "codex" },
+      agent: { ...eligible.agent, adapterType: "paperclip_runner" },
+    })).toMatchObject({ kind: "native" });
+  });
+
   it("allows paperclip_runner to use a transient local workspace for projectless issues", () => {
     expect(resolveNativeRuntimeMode({
       ...eligible,

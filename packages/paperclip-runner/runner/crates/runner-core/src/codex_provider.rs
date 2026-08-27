@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::local_runner::LocalRunnerError;
-use crate::process_supervisor::{ProcessOutput, SupervisedProcess};
+use crate::process_supervisor::{BoundedLogBuffer, ProcessOutput, SupervisedProcess};
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -249,6 +249,35 @@ pub enum ProviderKind {
     Acpx,
 }
 
+fn provider_kind_label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Codex => "codex",
+        ProviderKind::Opencode => "opencode",
+        ProviderKind::ClaudeManaged => "claude_managed",
+        ProviderKind::AwsAgentcore => "aws_agentcore",
+        ProviderKind::Acpx => "acpx",
+    }
+}
+
+fn redact_provider_diagnostic(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let boundary = [
+        "authorization",
+        "api_key",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min();
+    match boundary {
+        Some(index) => format!("{}[REDACTED]", &value[..index]),
+        None => value.chars().take(2_000).collect(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalProviderConfig {
@@ -259,6 +288,8 @@ pub struct LocalProviderConfig {
     pub args: Vec<String>,
     pub cwd: String,
     pub model: Option<String>,
+    #[serde(default = "default_codex_approval_policy")]
+    pub approval_policy: String,
     pub instructions: String,
     #[serde(default = "default_collaboration_mode")]
     pub collaboration_mode: String,
@@ -333,9 +364,20 @@ pub struct AcpxProviderConfig {
     pub run_id: String,
     pub cwd: String,
     pub instructions: String,
-    pub permission_policy: String,
+    #[serde(default = "default_legacy_acpx_permission_mode")]
+    pub permission_mode: String,
+    #[serde(default)]
+    pub permission_mode_pinned: bool,
     #[serde(default)]
     pub runtime_context: Option<Value>,
+}
+
+fn default_codex_approval_policy() -> String {
+    "never".to_owned()
+}
+
+fn default_legacy_acpx_permission_mode() -> String {
+    "approve-reads".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -460,18 +502,36 @@ pub enum ProviderRuntimeIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum ProviderSessionIdentity {
     #[serde(rename = "acpx")]
     Acpx {
+        #[serde(alias = "normalized_session_id")]
         normalized_session_id: String,
+        #[serde(alias = "acpx_record_id")]
         acpx_record_id: String,
+        #[serde(alias = "backend_session_id")]
         backend_session_id: String,
+        #[serde(alias = "agent_session_id")]
         agent_session_id: String,
+        #[serde(alias = "profile_digest")]
         profile_digest: String,
+        #[serde(alias = "workspace_digest")]
         workspace_digest: String,
+        #[serde(alias = "requested_model")]
         requested_model: String,
+        #[serde(alias = "effective_model")]
         effective_model: String,
+        #[serde(
+            alias = "permission_mode",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        permission_mode: Option<String>,
     },
 }
 
@@ -587,8 +647,11 @@ pub struct CodexProvider {
     pending_runtime_requests: BTreeMap<String, PendingCodexRuntimeRequest>,
     collaboration_mode: String,
     collaboration_mode_payload: Option<Value>,
+    structured_permission_profile: bool,
     trace: Option<ProviderTraceSink>,
     last_trace_frame_id: Option<u64>,
+    stderr_tail: BoundedLogBuffer,
+    stdout_closed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -597,6 +660,19 @@ struct PendingCodexRuntimeRequest {
     method: String,
     provider_params: Value,
     question_set: Value,
+}
+
+fn permission_profile_params(profile_id: &str, structured: bool) -> Value {
+    if structured {
+        json!({"type": "profile", "id": profile_id})
+    } else {
+        json!(profile_id)
+    }
+}
+
+fn requires_structured_permission_profile(error: &LocalRunnerError) -> bool {
+    let detail = error.to_string();
+    detail.contains("invalid type: string") && detail.contains("PermissionProfileSelectionParams")
 }
 
 fn latest_active_provider_turn_id(thread_read: &Value) -> Option<String> {
@@ -700,7 +776,7 @@ fn codex_question_set(method: &str, params: &Value) -> Option<Value> {
                             .unwrap_or("Question"),
                         4_000,
                     ),
-                    "required": question.get("required").and_then(Value::as_bool).unwrap_or(true),
+                    "required": question.get("required").and_then(Value::as_bool).unwrap_or(false),
                     "answerMode": if options.is_empty() {
                         "text"
                     } else if question.get("multiSelect").and_then(Value::as_bool).unwrap_or(false)
@@ -1142,6 +1218,23 @@ impl CodexProvider {
         tools: impl Iterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
     ) -> Result<Self, LocalRunnerError> {
+        Self::start_with_completion_contract(config, tools, resume_thread_id, None)
+    }
+
+    pub fn start_with_completion_contract(
+        config: &LocalProviderConfig,
+        tools: impl Iterator<Item = AuthorizedTool>,
+        resume_thread_id: Option<&str>,
+        completion_contract: Option<&Value>,
+    ) -> Result<Self, LocalRunnerError> {
+        if !matches!(
+            config.approval_policy.as_str(),
+            "never" | "on-request" | "untrusted"
+        ) {
+            return Err(LocalRunnerError::invalid(
+                "unsupported Codex approval policy",
+            ));
+        }
         let mut provider = Self {
             kind: config.kind,
             process: SupervisedProcess::spawn(
@@ -1159,8 +1252,11 @@ impl CodexProvider {
             pending_runtime_requests: BTreeMap::new(),
             collaboration_mode: config.collaboration_mode.clone(),
             collaboration_mode_payload: None,
+            structured_permission_profile: false,
             trace: ProviderTraceSink::from_environment(config.kind),
             last_trace_frame_id: None,
+            stderr_tail: BoundedLogBuffer::new(32, 8 * 1024),
+            stdout_closed: false,
         };
         let initialized = provider.request("initialize", json!({
             "clientInfo": { "name": "paperclip-runnerd", "title": "Paperclip Runner", "version": "1" },
@@ -1186,15 +1282,15 @@ impl CodexProvider {
         } else {
             "paperclip-runner-workspace-only"
         };
-        let opened = if let Some(thread_id) = resume_thread_id {
-            provider.request(
+        let (open_method, mut open_params) = if let Some(thread_id) = resume_thread_id {
+            (
                 "thread/resume",
                 json!({
                     "threadId": thread_id,
                     "cwd": config.cwd,
                     "model": config.model,
-                    "approvalPolicy": "never",
-                    "permissions": permission_profile,
+                    "approvalPolicy": config.approval_policy,
+                    "permissions": permission_profile_params(permission_profile, false),
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
                         config.include_collaboration_mode_instructions,
@@ -1205,15 +1301,15 @@ impl CodexProvider {
                     "experimentalRawEvents": true,
                     "persistExtendedHistory": true,
                 }),
-            )?
+            )
         } else {
-            provider.request(
+            (
                 "thread/start",
                 json!({
                     "cwd": config.cwd,
                     "model": config.model,
-                    "approvalPolicy": "never",
-                    "permissions": permission_profile,
+                    "approvalPolicy": config.approval_policy,
+                    "permissions": permission_profile_params(permission_profile, false),
                     "runtimeWorkspaceRoots": [config.cwd],
                     "config": isolated_thread_config(
                         config.include_collaboration_mode_instructions,
@@ -1224,7 +1320,21 @@ impl CodexProvider {
                     "experimentalRawEvents": true,
                     "persistExtendedHistory": true,
                 }),
-            )?
+            )
+        };
+        if config.kind == ProviderKind::Opencode {
+            if let Some(completion_contract) = completion_contract {
+                open_params["completionContract"] = completion_contract.clone();
+            }
+        }
+        let opened = match provider.request(open_method, open_params.clone()) {
+            Ok(opened) => opened,
+            Err(error) if requires_structured_permission_profile(&error) => {
+                open_params["permissions"] = permission_profile_params(permission_profile, true);
+                provider.structured_permission_profile = true;
+                provider.request(open_method, open_params)?
+            }
+            Err(error) => return Err(error),
         };
         if config.collaboration_mode == "plan" {
             let presets = provider
@@ -1304,7 +1414,7 @@ impl CodexProvider {
         let mut params = json!({
             "threadId": thread_id,
             "cwd": cwd,
-            "permissions": permission_profile,
+            "permissions": permission_profile_params(permission_profile, self.structured_permission_profile),
             "runtimeWorkspaceRoots": [cwd],
             "input": [{"type": "text", "text": message, "text_elements": []}],
         });
@@ -1616,6 +1726,7 @@ impl CodexProvider {
             match self.process.recv_timeout(remaining) {
                 Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
                 Ok(ProcessOutput::Stderr(line)) => {
+                    self.stderr_tail.push(redact_provider_diagnostic(&line));
                     if let Some(trace) = self.trace.as_mut() {
                         if let Some(frame_id) = trace.frame("provider_stderr", line.as_bytes()) {
                             trace.interpretation(
@@ -1633,7 +1744,10 @@ impl CodexProvider {
                 Ok(ProcessOutput::StdoutError(message)) => {
                     return Err(LocalRunnerError::invalid(message))
                 }
-                Ok(ProcessOutput::StdoutClosed) => return Ok(None),
+                Ok(ProcessOutput::StdoutClosed) => {
+                    self.stdout_closed = true;
+                    return Ok(None);
+                }
                 Ok(ProcessOutput::StderrClosed) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1646,13 +1760,14 @@ impl CodexProvider {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LocalRunnerError> {
         let id = self.next_request_id;
         self.next_request_id += 1;
-        self.send_frame(&json!({"id": id, "method": method, "params": params}))?;
+        if let Err(error) = self.send_frame(&json!({"id": id, "method": method, "params": params}))
+        {
+            return Err(self.request_send_failure(method, error));
+        }
         loop {
             let line = self
                 .receive_stdout_line(Duration::from_secs(30))?
-                .ok_or_else(|| {
-                    LocalRunnerError::invalid(format!("Codex {method} response timed out"))
-                })?;
+                .ok_or_else(|| self.request_wait_failure(method))?;
             let frame_id = self.trace_inbound(&line);
             let message: Value = serde_json::from_str(&line).map_err(|error| {
                 if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
@@ -1666,7 +1781,10 @@ impl CodexProvider {
                         "Provider frame was not valid JSON-RPC",
                     );
                 }
-                LocalRunnerError::invalid(format!("Codex emitted invalid JSON-RPC: {error}"))
+                LocalRunnerError::invalid(format!(
+                    "provider_initialize_protocol_error: provider={} stage={method}: emitted invalid JSON-RPC: {error}",
+                    provider_kind_label(self.kind),
+                ))
             })?;
             if message.get("id").and_then(Value::as_u64) == Some(id) {
                 if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), frame_id) {
@@ -1681,13 +1799,104 @@ impl CodexProvider {
                     );
                 }
                 if let Some(error) = message.get("error") {
+                    let code = if method == "initialize" {
+                        "provider_initialize_protocol_error"
+                    } else {
+                        "provider_request_protocol_error"
+                    };
                     return Err(LocalRunnerError::invalid(format!(
-                        "Codex {method} failed: {error}"
+                        "{code}: provider={} stage={method}: {error}",
+                        provider_kind_label(self.kind),
                     )));
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
             }
             self.pending_messages.push_back((message, frame_id));
+        }
+    }
+
+    fn request_wait_failure(&mut self, method: &str) -> LocalRunnerError {
+        if self.stdout_closed {
+            self.drain_failure_diagnostics(Duration::from_millis(50));
+        } else {
+            self.drain_failure_diagnostics(Duration::ZERO);
+        }
+        let provider = provider_kind_label(self.kind);
+        let stderr = self.stderr_tail.snapshot().lines.join("\n");
+        let stderr_detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" stderrTail={stderr:?}")
+        };
+        if self.stdout_closed {
+            return match self.process.try_wait() {
+                Ok(Some(exit)) => LocalRunnerError::invalid(format!(
+                    "provider_process_exited: provider={provider} stage={method} exitCode={:?} signal={:?}{stderr_detail}",
+                    exit.exit_code, exit.signal,
+                )),
+                Ok(None) => LocalRunnerError::invalid(format!(
+                    "provider_stdout_closed: provider={provider} stage={method}{stderr_detail}"
+                )),
+                Err(error) => LocalRunnerError::invalid(format!(
+                    "provider_process_status_failed: provider={provider} stage={method}: {error}{stderr_detail}"
+                )),
+            };
+        }
+        let code = if method == "initialize" {
+            "provider_initialize_timeout"
+        } else {
+            "provider_request_timeout"
+        };
+        LocalRunnerError::invalid(format!(
+            "{code}: provider={provider} stage={method}{stderr_detail}"
+        ))
+    }
+
+    fn request_send_failure(&mut self, method: &str, error: LocalRunnerError) -> LocalRunnerError {
+        self.drain_failure_diagnostics(Duration::from_millis(50));
+        let provider = provider_kind_label(self.kind);
+        let stderr = self.stderr_tail.snapshot().lines.join("\n");
+        let stderr_detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" stderrTail={stderr:?}")
+        };
+        match self.process.try_wait() {
+            Ok(Some(exit)) => LocalRunnerError::invalid(format!(
+                "provider_process_exited: provider={provider} stage={method} exitCode={:?} signal={:?}{stderr_detail}",
+                exit.exit_code, exit.signal,
+            )),
+            Ok(None) => LocalRunnerError::invalid(format!(
+                "provider_transport_failed: provider={provider} stage={method}: {error}{stderr_detail}"
+            )),
+            Err(status_error) => LocalRunnerError::invalid(format!(
+                "provider_process_status_failed: provider={provider} stage={method}: {status_error}; sendError={error}{stderr_detail}"
+            )),
+        }
+    }
+
+    fn drain_failure_diagnostics(&mut self, max_wait: Duration) {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            let output = if max_wait.is_zero() {
+                self.process.try_recv().ok()
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    None
+                } else {
+                    self.process.recv_timeout(remaining).ok()
+                }
+            };
+            match output {
+                Some(ProcessOutput::Stderr(line)) => {
+                    self.stderr_tail.push(redact_provider_diagnostic(&line));
+                }
+                Some(ProcessOutput::StderrClosed) => break,
+                Some(ProcessOutput::StdoutClosed) => self.stdout_closed = true,
+                Some(ProcessOutput::Stdout(_)) | Some(ProcessOutput::StdoutError(_)) => {}
+                None => break,
+            }
         }
     }
 }
@@ -1784,6 +1993,42 @@ mod provider_trace_tests {
     use super::*;
 
     #[test]
+    fn acpx_identity_serializes_for_the_typescript_transport_and_reads_legacy_state() {
+        let identity = ProviderSessionIdentity::Acpx {
+            normalized_session_id: "normalized-1".to_owned(),
+            acpx_record_id: "record-1".to_owned(),
+            backend_session_id: "backend-1".to_owned(),
+            agent_session_id: "agent-1".to_owned(),
+            profile_digest: "sha256:profile".to_owned(),
+            workspace_digest: "sha256:workspace".to_owned(),
+            requested_model: "qualified-model".to_owned(),
+            effective_model: "qualified-model".to_owned(),
+            permission_mode: Some("approve-all".to_owned()),
+        };
+        let serialized = serde_json::to_value(&identity).unwrap();
+        assert_eq!(serialized["normalizedSessionId"], "normalized-1");
+        assert_eq!(serialized["requestedModel"], "qualified-model");
+        assert!(serialized.get("normalized_session_id").is_none());
+
+        let legacy = json!({
+            "kind": "acpx",
+            "normalized_session_id": "normalized-1",
+            "acpx_record_id": "record-1",
+            "backend_session_id": "backend-1",
+            "agent_session_id": "agent-1",
+            "profile_digest": "sha256:profile",
+            "workspace_digest": "sha256:workspace",
+            "requested_model": "qualified-model",
+            "effective_model": "qualified-model",
+            "permission_mode": "approve-all"
+        });
+        assert_eq!(
+            serde_json::from_value::<ProviderSessionIdentity>(legacy).unwrap(),
+            identity,
+        );
+    }
+
+    #[test]
     fn normalizes_and_answers_the_dot_185_three_question_frame() {
         let question_set = codex_question_set(
             "item/tool/requestUserInput",
@@ -1798,6 +2043,7 @@ mod provider_trace_tests {
         )
         .unwrap();
         assert_eq!(question_set["questions"].as_array().unwrap().len(), 3);
+        assert_eq!(question_set["questions"][0]["required"], false);
         assert_eq!(
             question_set["questions"][0]["options"][0]["label"],
             "Focused"
@@ -1877,6 +2123,7 @@ mod provider_trace_tests {
             "collaborationMode": "default"
         }))
         .unwrap();
+        assert_eq!(default_config.approval_policy, "never");
         assert!(default_config.include_collaboration_mode_instructions);
         assert_eq!(
             isolated_thread_config(

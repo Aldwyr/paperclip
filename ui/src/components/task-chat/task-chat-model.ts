@@ -20,16 +20,31 @@ import type {
   IssueDocumentSummary,
   IssueWorkProduct,
 } from "@paperclipai/shared";
-import type { PaperclipQuestionResponse, PaperclipQuestionSet } from "@paperclipai/adapter-utils";
+import type {
+  PaperclipQuestionResponse,
+  PaperclipQuestionSet,
+} from "@paperclipai/adapter-utils";
 
 export type { PaperclipQuestionResponse, PaperclipQuestionSet };
 
 export type TaskChatProviderActivityFamily =
-  | "plan" | "tool_execution" | "research" | "delegation" | "model_identity"
-  | "context" | "artifact" | "review" | "hook" | "memory" | "safety"
-  | "terminal" | "wait" | "provider_notice";
+  | "plan"
+  | "tool_execution"
+  | "research"
+  | "delegation"
+  | "model_identity"
+  | "context"
+  | "artifact"
+  | "review"
+  | "hook"
+  | "memory"
+  | "safety"
+  | "terminal"
+  | "wait"
+  | "provider_notice";
 
-export type TaskChatProviderActivityStatus = "running" | "completed" | "failed" | "interrupted" | "informational";
+export type TaskChatProviderActivityStatus =
+  "running" | "completed" | "failed" | "interrupted" | "informational";
 
 export interface TaskChatWorkspaceChangeFile {
   path: string;
@@ -46,14 +61,12 @@ import type { IssueThreadInteraction } from "@/lib/issue-thread-interactions";
 export type TaskChatAuthorKind = "human" | "agent" | "system";
 
 /** ACP ToolCallStatus. */
-export type TaskChatToolStatus = "pending" | "in_progress" | "completed" | "failed" | "interrupted";
+export type TaskChatToolStatus =
+  "pending" | "in_progress" | "completed" | "failed" | "interrupted";
 
 /** ACP PermissionOptionKind. */
 export type TaskChatApprovalOptionKind =
-  | "allow_once"
-  | "allow_always"
-  | "reject_once"
-  | "reject_always";
+  "allow_once" | "allow_always" | "reject_once" | "reject_always";
 
 /** ACP PlanEntryStatus. */
 export type TaskChatPlanEntryStatus = "pending" | "in_progress" | "completed";
@@ -241,7 +254,13 @@ export interface TaskChatActivityPhaseItem {
   /** Historical assistant update that introduced this phase. */
   interstitial?: TaskChatMessageItem;
   /** Chronological tool/usage rows owned exclusively by this phase. */
-  items: Array<TaskChatToolItem | TaskChatUsageItem | TaskChatThinkingItem | TaskChatMarkerItem | TaskChatProtocolItem>;
+  items: Array<
+    | TaskChatToolItem
+    | TaskChatUsageItem
+    | TaskChatThinkingItem
+    | TaskChatMarkerItem
+    | TaskChatProtocolItem
+  >;
   /** Deterministic, taxonomy-based summary (for example "Read 3 files, ran 1 command"). */
   summary: string;
   /** The tail phase of an in-flight run stays foregrounded. */
@@ -358,7 +377,14 @@ export interface TaskChatRuntimeRequestItem {
   surface: "runtime_request";
   runId: string;
   requestId: string;
-  requestKind: "runtime" | "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null;
+  requestKind:
+    | "runtime"
+    | "command_approval"
+    | "file_approval"
+    | "permission_approval"
+    | "user_input"
+    | "elicitation"
+    | null;
   turnId: string | null;
   requestType: "permission" | "input";
   status: "pending" | "resolved" | "expired" | "cancelled";
@@ -382,9 +408,18 @@ export interface TaskChatRunResultItem {
   disposition: "done" | "blocked" | "needs_review" | "yielded";
   summary: string;
   objectiveSatisfied: boolean | null;
-  verification: Array<{ commandOrCheck: string; status: "passed" | "failed" | "not_run"; detail?: string; artifactRef?: string }>;
+  verification: Array<{
+    commandOrCheck: string;
+    status: "passed" | "failed" | "not_run";
+    detail?: string;
+    artifactRef?: string;
+  }>;
   remainingWork: Array<{ description: string; blocksCompletion: boolean }>;
-  blocker: { reasonCode: string; unblockAction: string; scope: "current_track" | "task_wide" } | null;
+  blocker: {
+    reasonCode: string;
+    unblockAction: string;
+    scope: "current_track" | "task_wide";
+  } | null;
   artifacts: Array<{ kind: string; ref: string; title?: string }>;
 }
 
@@ -430,6 +465,7 @@ export type TaskChatTurnChildItem =
   | TaskChatMarkerItem
   | TaskChatUsageItem
   | TaskChatActivityPhaseItem
+  | TaskChatPlanDocumentItem
   | TaskChatProtocolItem;
 
 /**
@@ -447,6 +483,9 @@ export interface TaskChatTurnItem {
   kind: "turn";
   items: TaskChatTurnChildItem[];
   settled: boolean;
+  /** Agent identity retained when a live runner turn becomes durable history. */
+  agentName?: string;
+  agentIcon?: string | null;
   /**
    * The in-flight run's status line, hoisted to be THE turn's single visible
    * row while collapsed (PAP-354 parent-row model). Absent once settled.
@@ -454,8 +493,10 @@ export interface TaskChatTurnItem {
   liveStatus?: TaskChatStatusItem;
   /** Animate the fold when settling (false = collapse instantly, e.g. history). */
   animateFold?: boolean;
-  /** New-runner turns keep the Worked header standalone above the final response. */
+  /** New-runner turns keep Worked/Stopped fixed above their ordered timeline. */
   standaloneHeader?: boolean;
+  /** Durable response shown after the ordered Paperclip Runner timeline. */
+  finalResponse?: TaskChatMessageItem;
   summary: {
     /** e.g. "38s" — omitted when unknown. */
     durationLabel?: string;
@@ -490,7 +531,8 @@ export function latestPendingRuntimeRequest(
   const seen = new Set<string>();
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
-    if (item.kind !== "protocol" || item.surface !== "runtime_request") continue;
+    if (item.kind !== "protocol" || item.surface !== "runtime_request")
+      continue;
     const key = `${item.runId}:${item.requestId}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -499,13 +541,31 @@ export function latestPendingRuntimeRequest(
   return null;
 }
 
+/** A protocol denial is the explicit negative path, so a second Skip action is redundant. */
+export function runtimeRequestReplacesComposerSkip(
+  item: TaskChatRuntimeRequestItem,
+): boolean {
+  return item.choices.some((choice) => {
+    const key = choice.key.trim().toLowerCase();
+    const label = choice.label.trim().toLowerCase();
+    return (
+      ["deny", "decline", "reject"].includes(key) ||
+      /^(deny|decline|reject)(\b|\s)/.test(label)
+    );
+  });
+}
+
 /** One latest lifecycle entry per request, in the order each request began. */
 export function latestRuntimeRequests(
   items: readonly TaskChatItem[],
 ): TaskChatRuntimeRequestItem[] {
-  const latest = new Map<string, { order: number; item: TaskChatRuntimeRequestItem }>();
+  const latest = new Map<
+    string,
+    { order: number; item: TaskChatRuntimeRequestItem }
+  >();
   for (const [order, item] of items.entries()) {
-    if (item.kind !== "protocol" || item.surface !== "runtime_request") continue;
+    if (item.kind !== "protocol" || item.surface !== "runtime_request")
+      continue;
     const key = `${item.runId}:${item.requestId}`;
     const existing = latest.get(key);
     latest.set(key, { order: existing?.order ?? order, item });

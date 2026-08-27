@@ -21,6 +21,8 @@ describe("side-panel shell controls", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    document.documentElement.style.removeProperty("--motion-scrollbar-idle-delay");
+    vi.useRealTimers();
   });
 
   it("exposes controlled presentation, visibility, maximize, and content layout state", async () => {
@@ -34,6 +36,8 @@ describe("side-panel shell controls", () => {
     expect(frame.getAttribute("data-maximized")).toBe("true");
     expect(frame.getAttribute("data-resizing")).toBe("true");
     expect(frame.getAttribute("aria-hidden")).toBe("true");
+    expect(frame.className).toContain("bg-(--side-panel-bg)");
+    expect(frame.className).toContain("text-(--side-panel-fg)");
     expect(frame.firstElementChild?.className).toContain("overflow-hidden");
   });
 
@@ -51,11 +55,46 @@ describe("side-panel shell controls", () => {
     expect(toggleButtons).toHaveLength(2);
     expect(toggleButtons[0]?.getAttribute("aria-pressed")).toBe("false");
     expect(toggleButtons[1]?.getAttribute("aria-pressed")).toBe("true");
+    expect(toggleButtons[0]?.className).toContain("h-(--side-panel-tab-height)");
     await act(async () => toggleButtons[0]?.click());
-    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="Maximize side panel"]')?.click());
+    const maximizeButton = container.querySelector<HTMLButtonElement>('[aria-label="Maximize side panel"]');
+    expect(maximizeButton?.className).toContain("text-muted-foreground");
+    expect(maximizeButton?.className).toContain("h-(--side-panel-tab-height)");
+    await act(async () => maximizeButton?.click());
     await act(async () => toggleButtons[1]?.click());
     expect(onToggle).toHaveBeenCalledOnce();
     expect(onMaximizedChange).toHaveBeenCalledWith(true);
     expect(onWindowToggle).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the prose scrollbar on the full-width viewport while centering its content", async () => {
+    await act(async () => root.render(
+      <SidePanelFrame contentMode="prose">Document body</SidePanelFrame>,
+    ));
+    const viewport = container.querySelector<HTMLElement>('[data-side-panel-content-viewport="true"]')!;
+    const prose = container.querySelector<HTMLElement>('[data-side-panel-prose-content="true"]')!;
+    expect(viewport.className).toContain("overflow-auto");
+    expect(viewport.className).not.toContain("max-w-4xl");
+    expect(viewport.className).not.toContain("mx-auto");
+    expect(prose.className).toContain("mx-auto");
+    expect(prose.className).toContain("max-w-4xl");
+  });
+
+  it("shows the prose scrollbar only while scroll activity is recent", async () => {
+    vi.useFakeTimers();
+    document.documentElement.style.setProperty("--motion-scrollbar-idle-delay", "600ms");
+    await act(async () => root.render(
+      <SidePanelFrame contentMode="prose">Document body</SidePanelFrame>,
+    ));
+    const viewport = container.querySelector<HTMLElement>('[data-side-panel-content-viewport="true"]')!;
+    expect(viewport.className).toContain("scrollbar-while-scrolling");
+    expect(viewport.getAttribute("data-scroll-active")).toBeNull();
+
+    act(() => viewport.dispatchEvent(new Event("scroll", { bubbles: true })));
+    expect(viewport.getAttribute("data-scroll-active")).toBe("true");
+    act(() => vi.advanceTimersByTime(599));
+    expect(viewport.getAttribute("data-scroll-active")).toBe("true");
+    act(() => vi.advanceTimersByTime(1));
+    expect(viewport.getAttribute("data-scroll-active")).toBeNull();
   });
 });

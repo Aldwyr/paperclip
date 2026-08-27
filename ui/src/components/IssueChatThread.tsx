@@ -237,6 +237,8 @@ interface IssueChatMessageContext {
   onCancelInteraction?: (
     interaction: AskUserQuestionsInteraction,
   ) => Promise<void> | void;
+  /** New task-view composer takeover action. The classic thread does not render it. */
+  onSkipInteraction?: (interaction: IssueThreadInteraction) => Promise<void> | void;
   onSubmitInteractionVerdicts?: (
     interaction: RequestItemVerdictsInteraction,
     verdicts: { id: string; verdict: RequestItemVerdictValue; reason?: string }[],
@@ -487,6 +489,9 @@ interface IssueChatThreadProps {
   /** Resume a paused assignee agent so runs can start again. */
   onResumeAssignee?: () => Promise<void> | void;
   resumeAssigneePending?: boolean;
+  /** Requeues a blocked task after its no-live-execution-path recovery notice. */
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   companyId?: string | null;
   projectId?: string | null;
   issueStatus?: string;
@@ -575,6 +580,8 @@ interface IssueChatThreadProps {
   onCancelInteraction?: (
     interaction: AskUserQuestionsInteraction,
   ) => Promise<void> | void;
+  /** New task-view composer takeover action. The classic thread does not render it. */
+  onSkipInteraction?: (interaction: IssueThreadInteraction) => Promise<void> | void;
   onSubmitInteractionVerdicts?: (
     interaction: RequestItemVerdictsInteraction,
     verdicts: { id: string; verdict: RequestItemVerdictValue; reason?: string }[],
@@ -4586,6 +4593,8 @@ export function IssueChatThread({
   resumeFromBacklogPending = false,
   onResumeAssignee,
   resumeAssigneePending = false,
+  onTryAgainNoLiveExecutionPath: _onTryAgainNoLiveExecutionPath,
+  tryAgainNoLiveExecutionPathPending: _tryAgainNoLiveExecutionPathPending,
   externalReferences,
   linkCaseReferences = false,
 }: IssueChatThreadProps) {

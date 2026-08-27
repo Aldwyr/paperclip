@@ -40,17 +40,49 @@ export default async function paperclipPiExtension(pi: ExtensionAPI): Promise<vo
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .map((value) => resolve(value));
   const rpc = createMcpClient(endpoint, token);
+  const registeredToolNames = new Set<string>([MODEL_INPUT_TOOL]);
   let sessionAllowsGovernedTools = false;
   await initializeMcpClient(rpc, "paperclip-pi-extension");
   registerRuntimeInputTool(pi, rpc);
-  await registerMcpTools(pi, rpc, { privatePermissionTool: true, prefix: "" });
+  await registerMcpTools(pi, rpc, { privatePermissionTool: true, prefix: "" }, registeredToolNames);
   const assignedUrl = process.env.PAPERCLIP_NATIVE_MCP_URL?.trim();
   const assignedToken = process.env.PAPERCLIP_NATIVE_MCP_TOKEN?.trim();
   if (assignedUrl || assignedToken) {
     const assigned = createMcpClient(requiredMcpEndpoint(assignedUrl), requiredSecret(assignedToken));
     await initializeMcpClient(assigned, "paperclip-pi-assigned-mcp");
-    await registerMcpTools(pi, assigned, { privatePermissionTool: false, prefix: "assigned__" });
+    await registerMcpTools(pi, assigned, { privatePermissionTool: false, prefix: "assigned__" }, registeredToolNames);
   }
+
+  // Some OpenAI-compatible OpenRouter models occasionally return their native
+  // DSML tool dialect as an assistant text block. Normalize only a complete,
+  // strictly parsed DSML envelope for a tool we registered. Replacing the
+  // finalized Pi message keeps execution in Pi's real tool-call channel, so
+  // schema validation, extension policy, results, and subsequent model turns
+  // remain identical to an ordinary provider tool call.
+  pi.on("message_end", (event) => {
+    if (event.message.role !== "assistant") return undefined;
+    if (event.message.content.some((item) => item.type === "toolCall")) return undefined;
+    const textItems = event.message.content.filter((item) => item.type === "text");
+    if (textItems.length === 0 || event.message.content.some((item) => !["text", "thinking"].includes(item.type))) {
+      return undefined;
+    }
+    const parsed = parseDsmlToolCalls(textItems.map((item) => item.text).join(""));
+    if (!parsed || parsed.some((call) => !registeredToolNames.has(call.name))) return undefined;
+    const digest = createHash("sha256").update(JSON.stringify(parsed)).digest("hex").slice(0, 24);
+    return {
+      message: {
+        ...event.message,
+        content: parsed.map((call, index) => ({
+          type: "toolCall" as const,
+          id: `paperclip_dsml_${digest}_${index + 1}`,
+          name: call.name,
+          arguments: call.arguments,
+        })),
+        stopReason: "toolUse" as const,
+        rawStopReason: "paperclip_dsml_tool_recovery",
+      },
+    };
+  });
 
   pi.on("tool_call", async (event) => {
     if (BUILTIN_READ_TOOLS.has(event.toolName)) {
@@ -146,7 +178,12 @@ async function initializeMcpClient(rpc: ReturnType<typeof createMcpClient>, clie
   await rpc("notifications/initialized", {}, null);
 }
 
-async function registerMcpTools(pi: ExtensionAPI, rpc: ReturnType<typeof createMcpClient>, options: { privatePermissionTool: boolean; prefix: string }): Promise<void> {
+async function registerMcpTools(
+  pi: ExtensionAPI,
+  rpc: ReturnType<typeof createMcpClient>,
+  options: { privatePermissionTool: boolean; prefix: string },
+  registeredToolNames: Set<string>,
+): Promise<void> {
   const catalog = await rpc("tools/list", {}, "paperclip-pi-tools");
   for (const tool of catalog.result?.tools ?? []) {
     if (
@@ -155,6 +192,7 @@ async function registerMcpTools(pi: ExtensionAPI, rpc: ReturnType<typeof createM
       (options.prefix === "" && tool.name === MODEL_INPUT_TOOL)
     ) continue;
     const registeredName = `${options.prefix}${tool.name}`;
+    registeredToolNames.add(registeredName);
     pi.registerTool({
       name: registeredName,
       label: semanticLabel(registeredName),
@@ -174,6 +212,60 @@ async function registerMcpTools(pi: ExtensionAPI, rpc: ReturnType<typeof createM
       },
     });
   }
+}
+
+export interface ParsedDsmlToolCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/** Strict compatibility parser for the native DeepSeek/OpenRouter DSML tool envelope. */
+export function parseDsmlToolCalls(value: string): ParsedDsmlToolCall[] | null {
+  if (value.length === 0 || value.length > MAX_RESPONSE_BYTES) return null;
+  const envelope = /^\s*<｜DSML｜tool_calls>\s*([\s\S]*?)\s*<\/｜DSML｜tool_calls>\s*$/u.exec(value);
+  if (!envelope) return null;
+  const calls: ParsedDsmlToolCall[] = [];
+  const body = envelope[1] ?? "";
+  const invokePattern = /<｜DSML｜invoke\s+name="([A-Za-z0-9_.:-]{1,200})">\s*([\s\S]*?)\s*<\/｜DSML｜invoke>/gu;
+  let invokeCursor = 0;
+  for (const invoke of body.matchAll(invokePattern)) {
+    if (invoke.index === undefined || body.slice(invokeCursor, invoke.index).trim() !== "") return null;
+    invokeCursor = invoke.index + invoke[0].length;
+    const name = invoke[1]!;
+    const parameters = invoke[2] ?? "";
+    const args: Record<string, unknown> = {};
+    const parameterPattern = /<｜DSML｜parameter\s+name="([A-Za-z0-9_.:-]{1,200})"(?:\s+string="(true|false)")?>\s*([\s\S]*?)\s*<\/｜DSML｜parameter>/gu;
+    let parameterCursor = 0;
+    for (const parameter of parameters.matchAll(parameterPattern)) {
+      if (parameter.index === undefined || parameters.slice(parameterCursor, parameter.index).trim() !== "") return null;
+      parameterCursor = parameter.index + parameter[0].length;
+      const key = parameter[1]!;
+      if (Object.hasOwn(args, key)) return null;
+      const decoded = decodeDsmlEntities(parameter[3] ?? "");
+      if (parameter[2] === "true") {
+        args[key] = decoded;
+      } else {
+        try {
+          args[key] = JSON.parse(decoded) as unknown;
+        } catch {
+          return null;
+        }
+      }
+    }
+    if (parameters.slice(parameterCursor).trim() !== "") return null;
+    calls.push({ name, arguments: args });
+  }
+  if (calls.length === 0 || body.slice(invokeCursor).trim() !== "") return null;
+  return calls;
+}
+
+function decodeDsmlEntities(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
 }
 
 function createMcpClient(endpoint: URL, token: string) {

@@ -18,7 +18,7 @@ const questionSet: PaperclipQuestionSet = {
       required: true,
       answerMode: "single_select",
       options: [
-        { id: "staging", label: "Staging" },
+        { id: "staging", label: "Staging", recommended: true },
         { id: "production", label: "Production" },
       ],
       customAnswer: { enabled: true, label: "Other" },

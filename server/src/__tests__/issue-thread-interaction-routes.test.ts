@@ -40,12 +40,16 @@ const mockInteractionService = vi.hoisted(() => ({
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
+  skipInteraction: vi.fn(),
   withdrawInteraction: vi.fn(),
   recordSecretProposalExecutionResult: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
+}));
+const mockQuestionResponseDeliveries = vi.hoisted(() => ({
+  deliver: vi.fn(async () => ({ mode: "steered", status: "delivered" })),
 }));
 const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
@@ -206,6 +210,7 @@ function registerModuleMocks() {
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockInteractionService,
+    questionResponseDeliveryService: () => mockQuestionResponseDeliveries,
     taskWatchdogService: () => ({
       getActiveForIssue: vi.fn(async () => null),
       upsertForIssue: vi.fn(),
@@ -283,6 +288,7 @@ describe.sequential("issue thread interaction routes", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockInteractionService.getForIssue.mockReset();
+    mockQuestionResponseDeliveries.deliver.mockClear();
     mockResolveTaskWatchdogMutationScope.mockReset();
     mockResolveCoreTrustPreset.mockReset();
     mockAccessDecide.mockReset();
@@ -512,6 +518,25 @@ describe.sequential("issue thread interaction routes", () => {
       createdAt: "2026-04-20T12:00:00.000Z",
       updatedAt: "2026-04-20T12:05:00.000Z",
       resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    mockInteractionService.skipInteraction.mockResolvedValue({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "ask_user_questions",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      sourceCommentId: "comment-2",
+      sourceRunId: RUN_2,
+      payload: { version: 1, questions: [] },
+      result: {
+        version: 1,
+        outcome: "skipped",
+        answers: [],
+        cancelled: true,
+        cancellationReason: null,
+        summaryMarkdown: null,
+      },
     });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
@@ -749,7 +774,7 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("answers questions and emits a continuation wake", async () => {
+  it("answers questions and delegates causal delivery without an unconditional wake", async () => {
     const app = await createApp();
 
     const res = await request(app)
@@ -760,19 +785,9 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockInteractionService.answerQuestions).toHaveBeenCalled();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({
-        reason: "issue_commented",
-        payload: expect.objectContaining({
-          interactionId: "interaction-2",
-          interactionKind: "ask_user_questions",
-          interactionStatus: "answered",
-          sourceCommentId: "comment-2",
-          sourceRunId: RUN_2,
-        }),
-      }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledOnce();
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -781,7 +796,7 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("treats an answered question as the positive resolution for wake-on-accept", async () => {
+  it("routes wake-on-accept question answers through the same causal delivery service", async () => {
     mockInteractionService.answerQuestions.mockResolvedValueOnce({
       id: "interaction-2",
       companyId: "company-1",
@@ -801,16 +816,8 @@ describe.sequential("issue thread interaction routes", () => {
       .send({ answers: [{ questionId: "scope", optionIds: ["phase-1"] }] });
 
     expect(res.status).toBe(200);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({
-        idempotencyKey: "interaction:interaction-2:answered",
-        payload: expect.objectContaining({
-          interactionId: "interaction-2",
-          interactionStatus: "answered",
-        }),
-      }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("submits item verdicts and emits one continuation wake with resolved item ids", async () => {
@@ -1002,6 +1009,44 @@ describe.sequential("issue thread interaction routes", () => {
         action: "issue.thread_interaction_cancelled",
       }),
     );
+  });
+
+  it("skips any durable interaction without enqueuing a continuation wake", async () => {
+    const app = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/skip`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "cancelled", result: { outcome: "skipped" } });
+    expect(mockInteractionService.skipInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: ISSUE_ID }),
+      "interaction-2",
+      {},
+      expect.objectContaining({ userId: "local-board" }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.thread_interaction_skipped" }),
+    );
+  });
+
+  it("rejects Skip from an agent actor", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: RUN_2,
+    });
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/skip`)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.skipInteraction).not.toHaveBeenCalled();
   });
 
   it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
@@ -1543,6 +1588,13 @@ describe.sequential("issue thread interaction routes", () => {
         resolvedAt: "2026-04-20T12:05:00.000Z",
       },
       createdIssues: [],
+      continuationIssue: {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "todo",
+        workMode: "standard",
+      },
     });
     const app = await createApp();
 
@@ -2047,10 +2099,8 @@ describe.sequential("issue thread interaction routes", () => {
       expect.anything(),
       expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: RUN_2, userId: null }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({ idempotencyKey: "interaction:interaction-2:answered" }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       actorType: "agent",
       agentId: ASSIGNEE_AGENT_ID,
@@ -2491,10 +2541,8 @@ describe.sequential("issue thread interaction routes", () => {
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-addressed/respond")
       .send({ answers: [] });
     expect(addressee.status).toBe(200);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({ idempotencyKey: "interaction:interaction-2:answered" }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     const unrelatedApp = await createApp({
       type: "agent",

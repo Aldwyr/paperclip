@@ -62,6 +62,14 @@ describe("TaskChatProtocolActivityRow", () => {
     expect(container.querySelector("article")).toBeNull();
     expect(row?.textContent).toContain("Searched the web");
     expect(row?.textContent).toContain("smoked pork shoulder");
+    expect(
+      row
+        ?.querySelector('[data-testid="task-chat-protocol-activity-icon"]')
+        ?.parentElement?.classList.contains("justify-center"),
+    ).toBe(true);
+    expect(
+      row?.querySelector(".task-chat-collapsed-line-fade")?.textContent,
+    ).toContain("smoked pork shoulder");
     expect(row?.getAttribute("aria-expanded")).toBe("false");
     expect(row?.getAttribute("aria-controls")).toMatch(/^task-chat-protocol-activity-/);
 
@@ -126,6 +134,34 @@ describe("TaskChatProtocolActivityRow", () => {
     expect(link?.getAttribute("href")).toBe("/documents/notes");
     expect(link?.textContent).toContain("Added a document");
     expect(link?.textContent).toContain("Implementation notes");
+  });
+
+  it("renders MCP executions with semantic copy, source metadata, and the MCP icon", () => {
+    render({
+      id: "tool",
+      kind: "protocol",
+      surface: "provider_activity",
+      family: "tool_execution",
+      eventType: "tool.execution.completed",
+      status: "completed",
+      title: "Tool execution",
+      summary: "Searching the task index",
+      details: [
+        { label: "Transport", value: "mcp" },
+        { label: "Namespace", value: "paperclip", mono: true },
+        { label: "Operation", value: "search" },
+        { label: "Name", value: "search_tasks", mono: true },
+      ],
+      steps: [],
+      links: [],
+      children: [],
+    });
+
+    const row = container.querySelector('[data-testid="task-chat-protocol-activity-row"]');
+    expect(row?.textContent).toContain("Searched tasks");
+    expect(row?.textContent).toContain("Searching the task index · Paperclip · search_tasks");
+    expect(row?.textContent).not.toMatch(/Ran a tool|Tool execution|tool call/i);
+    expect(row?.querySelector('[data-testid="task-chat-protocol-activity-icon"]')?.querySelectorAll("path")).toHaveLength(3);
   });
 
   it("does not make an informational row focusable when it has no details", () => {

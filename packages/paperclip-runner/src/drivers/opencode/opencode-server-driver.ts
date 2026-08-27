@@ -31,6 +31,7 @@ import type {
 import {
   PAPERCLIP_QUESTION_SET_SCHEMA,
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
+  harnessRuntimeInputExpiredOutcome,
   harnessRuntimeRequestOutcome,
   parseHarnessRuntimeRequestResolution,
   parsePaperclipQuestionSet,
@@ -67,6 +68,7 @@ type DynamicToolHandler = (call: {
 
 export interface OpenCodeServerDriverOptions {
   model: string;
+  permissionMode?: "allow" | "ask" | "deny";
   taskEnvelope?: CodexTaskEnvelope;
   runnerInstanceId?: string;
   command?: string;
@@ -88,6 +90,7 @@ interface OpenCodeRuntime {
   baseUrl: string;
   authHeader: string;
   version: string;
+  permissionMode: "allow" | "ask" | "deny";
   process: ChildProcess;
   bridge: OpenCodeMcpBridge;
   trace: ProviderTraceFileSink | null;
@@ -114,6 +117,7 @@ const CAPABILITIES: NativeSessionCapabilities = {
   usage: true,
   dynamicTools: true,
   runtimeRequestResolution: true,
+  runtimeRequestHandoff: true,
   goals: false,
   threadLineage: false,
   unsupported: ["steering", "goals", "threadLineage"],
@@ -144,8 +148,12 @@ export class OpenCodeServerDriver implements HarnessDriver {
     if (!validModel(model)) issues.push({ path: "model", code: "invalid_model", message: "OpenCode model must use provider/model form." });
     const command = typeof candidate.command === "string" ? candidate.command.trim() : "opencode";
     if (!command) issues.push({ path: "command", code: "invalid_command", message: "OpenCode command cannot be empty." });
+    const permissionMode = candidate.permissionMode ?? "allow";
+    if (permissionMode !== "allow" && permissionMode !== "ask" && permissionMode !== "deny") {
+      issues.push({ path: "permissionMode", code: "invalid_permission_mode", message: "OpenCode permission mode must be allow, ask, or deny." });
+    }
     return issues.length === 0
-      ? { ok: true, config: { model, command }, issues: [] }
+      ? { ok: true, config: { model, command, permissionMode }, issues: [] }
       : { ok: false, config: null, issues };
   }
 
@@ -283,6 +291,8 @@ class OpenCodeHarnessSession implements HarnessSession {
     request: HarnessRuntimeRequest;
     nativeQuestions: Record<string, unknown>[];
     submittedResponse?: PaperclipQuestionResponse;
+    submittedAction?: "accept" | "accept_for_session" | "decline" | "cancel";
+    settling?: boolean;
   }>();
   #activeTraceFrameId: number | null = null;
   #activeTraceEmittedEventIds: string[] = [];
@@ -350,6 +360,7 @@ class OpenCodeHarnessSession implements HarnessSession {
         modelProvider: input.model.split("/", 1)[0],
         workingDirectory: input.workingDirectory,
         environmentKeys: sanitizedEnvironmentKeys(),
+        permissionMode: input.runtime.permissionMode,
       },
     });
     this.#emit("item.completed", {
@@ -384,9 +395,9 @@ class OpenCodeHarnessSession implements HarnessSession {
   events(): AsyncIterable<PrpEvent> { return this.#events; }
 
   startEventPump(): void {
-    void this.#recoverPendingQuestions()
+    void this.#recoverPendingRuntimeRequests()
       .catch((error) => this.#emit("harness.diagnostic", {
-        code: "opencode_question_recovery_failed",
+        code: "opencode_runtime_request_recovery_failed",
         message: redact(String(error), this.#runtime.sensitiveValues),
       }))
       .finally(() => this.#pumpEvents());
@@ -448,35 +459,70 @@ class OpenCodeHarnessSession implements HarnessSession {
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void> {
     const pending = this.#pendingRuntimeRequests.get(input.requestId);
-    if (!pending) throw new Error(`OpenCode question ${input.requestId} is no longer pending`);
+    if (!pending) throw new Error(`OpenCode request ${input.requestId} is no longer pending`);
     if (pending.request.turnId !== input.turnId || this.#activeTurnId !== input.turnId) {
-      throw new Error(`OpenCode question ${input.requestId} belongs to a stale turn`);
+      throw new Error(`OpenCode request ${input.requestId} belongs to a stale turn`);
     }
     const resolution = parseHarnessRuntimeRequestResolution(
       pending.request.requestKind,
       input.resolution,
       pending.request.input,
     );
-    const base = `/question/${encodeURIComponent(input.requestId)}`;
+    if (pending.settling) throw new Error(`OpenCode request ${input.requestId} is already settling`);
+    pending.settling = true;
+    const submit = async (operation: Promise<unknown>) => {
+      try {
+        await operation;
+      } catch (error) {
+        if (this.#pendingRuntimeRequests.get(input.requestId) === pending) pending.settling = false;
+        throw error;
+      }
+    };
     const workspace = `directory=${encodeURIComponent(this.#workingDirectory)}`;
+    if (pending.request.requestKind === "permission_approval") {
+      const action = resolution.action === "accept" || resolution.action === "accept_for_session"
+        ? resolution.action
+        : resolution.action === "decline" || resolution.action === "cancel"
+          ? resolution.action
+          : "decline";
+      pending.submittedAction = action;
+      await submit(api(
+        this.#fetch,
+        this.#runtime,
+        `/permission/${encodeURIComponent(input.requestId)}/reply?${workspace}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            reply: action === "accept" ? "once" : action === "accept_for_session" ? "always" : "reject",
+          }),
+        },
+      ));
+      if (!this.#pendingRuntimeRequests.delete(input.requestId)) return;
+      this.#emit("runtime_request.resolved", harnessRuntimeRequestOutcome(pending.request, { action }), {
+        turnId: input.turnId,
+        itemId: pending.request.itemId,
+      });
+      return;
+    }
+    const base = `/question/${encodeURIComponent(input.requestId)}`;
     if (resolution.action === "submit" && "response" in resolution) {
       // OpenCode can broadcast question.replied before the reply HTTP request
       // returns. Retain the canonical response before crossing that boundary
       // so the racing terminal event carries the same durable answer record.
       pending.submittedResponse = structuredClone(resolution.response);
-      await api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
+      await submit(api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
         method: "POST",
         body: JSON.stringify({ answers: openCodeAnswers(pending, resolution.response) }),
-      });
+      }));
     } else if (resolution.action === "submit" && "answers" in resolution) {
-      await api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
+      await submit(api(this.#fetch, this.#runtime, `${base}/reply?${workspace}`, {
         method: "POST",
         body: JSON.stringify({ answers: pending.nativeQuestions.map((question, index) =>
           resolution.answers[openCodeQuestionId(question, index)]?.answers ?? [],
         ) }),
-      });
+      }));
     } else {
-      await api(this.#fetch, this.#runtime, `${base}/reject?${workspace}`, { method: "POST" });
+      await submit(api(this.#fetch, this.#runtime, `${base}/reject?${workspace}`, { method: "POST" }));
     }
     // question.replied/question.rejected can race the HTTP response on the SSE
     // stream. The first terminal fact wins; the echo must not emit a duplicate.
@@ -487,6 +533,45 @@ class OpenCodeHarnessSession implements HarnessSession {
         ? { response: resolution.response }
         : {}),
     }), { turnId: input.turnId, itemId: pending.request.itemId });
+  }
+
+  async handoffRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }): Promise<"handed_off" | "already_settled"> {
+    const pending = this.#pendingRuntimeRequests.get(input.requestId);
+    if (
+      !pending
+      || pending.request.input === undefined
+      || pending.request.turnId !== input.turnId
+      || this.#activeTurnId !== input.turnId
+      || pending.settling
+      || pending.submittedResponse !== undefined
+      || pending.submittedAction !== undefined
+    ) return "already_settled";
+    if (!this.#pendingRuntimeRequests.delete(input.requestId)) return "already_settled";
+    this.#emit(
+      "runtime_request.expired",
+      harnessRuntimeInputExpiredOutcome(pending.request, input.reason),
+      { turnId: input.turnId, itemId: pending.request.itemId },
+    );
+    const workspace = `directory=${encodeURIComponent(this.#workingDirectory)}`;
+    await Promise.allSettled([
+      api(
+        this.#fetch,
+        this.#runtime,
+        `/question/${encodeURIComponent(input.requestId)}/reject?${workspace}`,
+        { method: "POST" },
+      ),
+      api(
+        this.#fetch,
+        this.#runtime,
+        `/session/${encodeURIComponent(this.#providerSessionId)}/abort`,
+        { method: "POST" },
+      ),
+    ]);
+    return "handed_off";
   }
 
   async read(): Promise<Record<string, unknown>> {
@@ -533,9 +618,13 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#closed = true;
     this.#abort.abort();
     for (const { request } of this.#pendingRuntimeRequests.values()) {
-      this.#emit("runtime_request.cancelled", harnessRuntimeRequestOutcome(request, {
-        reason: "session_closed",
-      }), { turnId: request.turnId, itemId: request.itemId });
+      this.#emit(
+        request.input === undefined ? "runtime_request.cancelled" : "runtime_request.expired",
+        request.input === undefined
+          ? harnessRuntimeRequestOutcome(request, { reason: "session_closed" })
+          : harnessRuntimeInputExpiredOutcome(request, "provider_process_lost"),
+        { turnId: request.turnId, itemId: request.itemId },
+      );
     }
     this.#pendingRuntimeRequests.clear();
     this.#events.close();
@@ -597,6 +686,21 @@ class OpenCodeHarnessSession implements HarnessSession {
       }, { turnId, itemId: call.callId });
       throw error;
     }
+  }
+
+  async #recoverPendingRuntimeRequests(): Promise<void> {
+    await this.#recoverPendingQuestions();
+    const value = await api(
+      this.#fetch,
+      this.#runtime,
+      `/permission?directory=${encodeURIComponent(this.#workingDirectory)}`,
+    );
+    const pending = Array.isArray(value)
+      ? value
+      : Array.isArray(record(value).permissions)
+        ? record(value).permissions as unknown[]
+        : [];
+    for (const entry of pending) this.#acceptPermission(record(entry), "permission.recovered");
   }
 
   async #recoverPendingQuestions(): Promise<void> {
@@ -661,6 +765,49 @@ class OpenCodeHarnessSession implements HarnessSession {
         status: "pending",
         prompt: request.prompt,
         input,
+        origin: request.origin,
+        turnId,
+        itemId: request.itemId,
+      },
+    }, { turnId, itemId: request.itemId });
+  }
+
+  #acceptPermission(properties: Record<string, unknown>, method: string): void {
+    const turnId = this.#activeTurnId;
+    if (!turnId) return;
+    const permission = isRecord(properties.permission)
+      ? properties.permission
+      : isRecord(properties.request)
+        ? properties.request
+        : properties;
+    const requestId = text(
+      permission.id,
+      text(permission.requestID, text(permission.requestId, text(permission.permissionID))),
+    );
+    if (!requestId || this.#pendingRuntimeRequests.has(requestId)) return;
+    const title = text(permission.title, text(permission.permission, text(permission.tool, "requested operation")));
+    const request: HarnessRuntimeRequest = {
+      requestId,
+      requestKind: "permission_approval",
+      method,
+      turnId,
+      itemId: requestId,
+      status: "pending",
+      prompt: `OpenCode requests permission for ${title}.`.slice(0, 4000),
+      details: bounded(permission),
+      origin: { adapter: "opencode-server", provider: "opencode", method },
+    };
+    this.#pendingRuntimeRequests.set(requestId, { request, nativeQuestions: [] });
+    this.#emit("runtime_request.created", {
+      request: {
+        schema: PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
+        requestKind: "runtime",
+        requestId,
+        type: "permission",
+        status: "pending",
+        prompt: request.prompt,
+        actions: ["accept", "accept_for_session", "decline", "cancel"],
+        details: request.details,
         origin: request.origin,
         turnId,
         itemId: request.itemId,
@@ -801,6 +948,39 @@ class OpenCodeHarnessSession implements HarnessSession {
     const turnId = this.#activeTurnId;
     if (type === "question.asked" && turnId) {
       this.#acceptQuestion(properties);
+      return;
+    }
+    if ((type === "permission.updated" || type === "permission.asked" || type === "permission.v2.asked") && turnId) {
+      this.#acceptPermission(properties, type);
+      return;
+    }
+    if ((type === "permission.replied" || type === "permission.v2.replied") && turnId) {
+      const permission = isRecord(properties.permission)
+        ? properties.permission
+        : isRecord(properties.request)
+          ? properties.request
+          : properties;
+      const requestId = text(
+        permission.id,
+        text(permission.requestID, text(permission.requestId, text(permission.permissionID))),
+      );
+      const pending = this.#pendingRuntimeRequests.get(requestId);
+      if (!pending || pending.request.requestKind !== "permission_approval") return;
+      this.#pendingRuntimeRequests.delete(requestId);
+      const nativeReply = text(
+        properties.reply,
+        text(properties.response, text(permission.reply, text(permission.response))),
+      );
+      const action = pending.submittedAction
+        ?? (nativeReply === "always" || nativeReply === "always_allow"
+          ? "accept_for_session"
+          : nativeReply === "once" || nativeReply === "allow"
+            ? "accept"
+            : "decline");
+      this.#emit("runtime_request.resolved", harnessRuntimeRequestOutcome(pending.request, { action }), {
+        turnId,
+        itemId: pending.request.itemId,
+      });
       return;
     }
     if ((type === "question.replied" || type === "question.rejected") && turnId) {
@@ -1119,7 +1299,10 @@ async function startRuntime(input: {
       question: true,
     },
     permission: {
-      "*": "allow",
+      "*": input.options.permissionMode ?? "allow",
+      question: "allow",
+      "paperclip_*": "allow",
+      "mcp__paperclip__*": "allow",
       external_directory: instructionRoot
         ? { "*": "deny", [`${instructionRoot}/**`]: "allow" }
         : "deny",
@@ -1165,7 +1348,11 @@ async function startRuntime(input: {
   let diagnostics = "";
   child.stderr?.on("data", (chunk) => {
     const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    diagnostics = `${diagnostics}${raw.toString("utf8")}`.slice(-8_192);
+    const redactedDiagnostic = redact(raw.toString("utf8"), [
+      password,
+      input.options.environment?.OPENROUTER_API_KEY,
+    ]);
+    diagnostics = `${diagnostics}${redactedDiagnostic}`.slice(-8_192);
     const frameId = input.trace?.frame({
       direction: "provider_stderr",
       raw,
@@ -1181,7 +1368,7 @@ async function startRuntime(input: {
         reason: "OpenCode stderr is retained only in the restricted trace sidecar",
       });
     }
-    input.options.onDiagnostic?.(redact(raw.toString("utf8"), [password, input.options.environment?.OPENROUTER_API_KEY]));
+    input.options.onDiagnostic?.(redactedDiagnostic);
   });
   try {
     await new Promise<void>((resolve, reject) => {
@@ -1199,7 +1386,7 @@ async function startRuntime(input: {
       authHeader,
       input.options.fetch ?? globalThis.fetch,
       child,
-      diagnostics,
+      () => diagnostics,
       input.trace,
     );
     const version = text(record(health).version);
@@ -1214,6 +1401,7 @@ async function startRuntime(input: {
       baseUrl,
       authHeader,
       version,
+      permissionMode: input.options.permissionMode ?? "allow",
       process: child,
       bridge,
       trace: input.trace,
@@ -1262,7 +1450,7 @@ export function normalizeOpenCodeQuestionSet(
       ...(text(question.header) ? { header: text(question.header).slice(0, 1_000) } : {}),
       prompt: text(question.question, text(question.prompt, `Question ${index + 1}`)).slice(0, 4_000),
       ...(text(question.description) ? { helpText: text(question.description).slice(0, 4_000) } : {}),
-      required: question.required !== false,
+      required: question.required === true,
       answerMode: options.length === 0 ? "text" : question.multiple === true ? "multi_select" : "single_select",
       ...(options.length > 0 ? { options } : {}),
       ...(question.custom === true || question.allowCustom === true
@@ -1409,6 +1597,8 @@ function retryableOpenCodeStartupError(error: unknown): boolean {
   return message.includes("request failed")
     || message.includes("did not become healthy")
     || message.includes("exited during startup")
+    || message.includes("provider_initialize_timeout")
+    || message.includes("provider_process_exited")
     || message.includes("HTTP 408")
     || message.includes("HTTP 425")
     || message.includes("HTTP 429")
@@ -1420,12 +1610,17 @@ async function waitForHealth(
   authHeader: string,
   fetcher: typeof globalThis.fetch,
   process: ChildProcess,
-  diagnostics: string,
+  diagnostics: () => string,
   trace: ProviderTraceFileSink | null,
 ): Promise<unknown> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (process.exitCode !== null || process.signalCode !== null) throw new Error(`OpenCode server exited during startup: ${redact(diagnostics)}`);
+    if (process.exitCode !== null || process.signalCode !== null) {
+      const detail = redact(diagnostics());
+      throw new Error(
+        `provider_process_exited: provider=opencode stage=health exitCode=${process.exitCode ?? "null"} signal=${process.signalCode ?? "null"}${detail ? ` stderrTail=${detail}` : ""}`,
+      );
+    }
     try {
       const requestFrameId = trace?.frame({
         direction: "client_to_provider",
@@ -1469,7 +1664,10 @@ async function waitForHealth(
     } catch { /* server is still starting */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error("OpenCode server did not become healthy within 10 seconds");
+  const detail = redact(diagnostics());
+  throw new Error(
+    `provider_initialize_timeout: provider=opencode stage=health${detail ? ` stderrTail=${detail}` : ""}`,
+  );
 }
 
 async function reservePort(): Promise<number> {

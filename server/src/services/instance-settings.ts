@@ -218,7 +218,6 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
   const parsed = instanceExperimentalSettingsStorageSchema.safeParse(raw ?? {});
   if (parsed.success) {
     return {
-      enableNativeRunner: parsed.data.enableNativeRunner ?? false,
       enableEnvironments: parsed.data.enableEnvironments ?? false,
       enableNativeRunner: parsed.data.enableNativeRunner ?? false,
       enableManagedSandboxOnly: parsed.data.enableManagedSandboxOnly ?? false,
@@ -241,6 +240,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableDecisions: parsed.data.enableDecisions ?? false,
       enableGoalsSidebarLink: parsed.data.enableGoalsSidebarLink ?? false,
       enableServerInfoDebugView: parsed.data.enableServerInfoDebugView ?? false,
+      enablePaperclipDeveloperMode: parsed.data.enablePaperclipDeveloperMode ?? false,
       enableSimplifiedEnglishInteractions: parsed.data.enableSimplifiedEnglishInteractions ?? false,
       autoRestartDevServerWhenIdle: parsed.data.autoRestartDevServerWhenIdle ?? false,
       enableIssueGraphLivenessAutoRecovery: parsed.data.enableIssueGraphLivenessAutoRecovery ?? false,
@@ -248,6 +248,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableWorkspaceDirtyQuarantineRepair: parsed.data.enableWorkspaceDirtyQuarantineRepair ?? true,
       enableOwnerInstanceAdmin: parsed.data.enableOwnerInstanceAdmin ?? false,
       enableSandboxDuplexBridge: parsed.data.enableSandboxDuplexBridge ?? false,
+      enableRunnerPreviewIngress: parsed.data.enableRunnerPreviewIngress ?? false,
       enableWorktreeRunExecution: parsed.data.enableWorktreeRunExecution ?? false,
       worktreeRunExecutionActivatedAt: parsed.data.worktreeRunExecutionActivatedAt ?? null,
       worktreeRunExecutionActivationInstanceId:
@@ -258,7 +259,6 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     };
   }
   return {
-    enableNativeRunner: false,
     enableEnvironments: false,
     enableNativeRunner: false,
     enableManagedSandboxOnly: false,
@@ -281,6 +281,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableDecisions: false,
     enableGoalsSidebarLink: false,
     enableServerInfoDebugView: false,
+    enablePaperclipDeveloperMode: false,
     enableSimplifiedEnglishInteractions: false,
     autoRestartDevServerWhenIdle: false,
     enableIssueGraphLivenessAutoRecovery: false,
@@ -288,6 +289,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableWorkspaceDirtyQuarantineRepair: true,
     enableOwnerInstanceAdmin: false,
     enableSandboxDuplexBridge: false,
+    enableRunnerPreviewIngress: false,
     enableWorktreeRunExecution: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,

@@ -18,7 +18,7 @@
     "attention": "Continuation and attention routing lifecycle.",
     "work": "Recorded work-assessment evidence.",
     "issue": "Issue-status decision proposal outcome and application evidence.",
-    "plan": "Structured provider plan revisions and completion commits.",
+    "plan": "Complete provider-authored within-turn checklist snapshots, separate from durable Paperclip Plan documents.",
     "tool": "Provider-neutral process, MCP, dynamic, and built-in execution activity.",
     "research": "Provider-reported search, page-open, and in-page research activity.",
     "delegation": "Child-agent delegation lifecycle and aggregate status.",
@@ -172,7 +172,7 @@
       "realSurface": "company issue create, child issue, assignment, and wake services",
       "mockStateDomains": ["company", "task", "actor", "blockers", "wake", "audit"],
       "prpEvidence": "company/task state diff, audit reference, and continuation wake evidence",
-      "gap": "Production binding is unbound and must preserve assignment and governed-action checks."
+      "gap": "create_task is production-bound to ordinary active-issue child creation with assignment, dependency-ready wake, company checks, child limits, and durable source-scoped idempotency."
     },
     {
       "id": "bl",
@@ -184,7 +184,7 @@
       "realSurface": "issue relations, blocker projection, liveness validation, and blocker wake services",
       "mockStateDomains": ["task", "blockers", "wake", "actor", "audit", "fault"],
       "prpEvidence": "dependency diff, block receipt, attention routing, and issue-status decision",
-      "gap": "Production binding is unbound; cancelled-blocker and wake receipts need typed additive evidence."
+      "gap": "set_dependencies is production-bound for the active issue; block_task remains unbound, and cancelled-blocker receipts still need typed additive evidence."
     },
     {
       "id": "dp",
@@ -304,7 +304,7 @@
     "taskModes": [
       "standard permits the full eligible catalog subject to claims and role checks.",
       "ask is answer-only: investigation reads are eligible, while implementation, document mutation, delegation, terminal, and governed writes are absent.",
-      "planning permits plan/document/progress/input operations but not terminal completion; accepted-plan continuation remains planning-specific.",
+      "planning permits plan/document/progress/input operations but not delegation or terminal completion; accepting a plan transitions the issue into a fresh standard execution continuation for the exact accepted revision.",
       "skill_test exposes only scenario-admitted tools. generic_api_request additionally requires the explicit test grant and allowlist and never supplies product coverage."
     ],
     "redaction": [

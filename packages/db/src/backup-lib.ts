@@ -901,33 +901,6 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // JavaScript backups are used when a worktree seed filters or transforms
-    // table data. Preserve user-defined routines so a restored schema retains
-    // behavior implemented by triggers as well as its tables and indexes.
-    const routines = await sql<{ definition: string }[]>`
-      SELECT pg_get_functiondef(p.oid) AS definition
-      FROM pg_proc p
-      JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
-        AND p.prokind IN ('f', 'p')
-        AND NOT EXISTS (
-          SELECT 1
-          FROM pg_depend d
-          WHERE d.classid = 'pg_proc'::regclass
-            AND d.objid = p.oid
-            AND d.deptype = 'e'
-        )
-      ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
-    `;
-    if (routines.length > 0) {
-      emit("-- Functions and procedures");
-      for (const routine of routines) {
-        const definition = routine.definition.trimEnd();
-        emitStatement(definition.endsWith(";") ? definition : `${definition};`);
-      }
-      emit("");
-    }
-
     // Dump data for each table
     for (const { schema_name, tablename } of tables) {
       const currentTableKey = tableKey(schema_name, tablename);

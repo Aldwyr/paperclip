@@ -91,6 +91,20 @@ describe("NativeExecutionInputV1", () => {
       ...context,
       mcp: { ...context.mcp, bindingId: "native-mcp:run-2" },
     })).toBe(parsed.runtimeContext.aggregateDigest);
+    const current = parseNativeExecutionInput({
+      ...parsed,
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "codex", model: null, approvalPolicy: "on-request" },
+    });
+    expect(current).toMatchObject({
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "codex", approvalPolicy: "on-request" },
+    });
+    expect(() => parseNativeExecutionInput({
+      ...parsed,
+      schema: "paperclip.native-execution-input.v4",
+      provider: { kind: "codex", model: null, approvalPolicy: "sometimes" },
+    })).toThrow("approvalPolicy");
   });
 
   it("rejects runtime-context traversal and aggregate digest drift", () => {
@@ -146,6 +160,7 @@ describe("NativeExecutionInputV1", () => {
       kind: "opencode",
       model: "openrouter/deepseek/deepseek-v4-flash-0731",
     });
+    expect(parseNativeExecutionInput(opencode)).toEqual(opencode);
     expect(() => parseNativeExecutionInput({
       ...input,
       session: { ...input.session, driverKind: "opencode_server" },
@@ -156,7 +171,13 @@ describe("NativeExecutionInputV1", () => {
   it("deserializes pre-provider Codex state as Codex", () => {
     const legacy = structuredClone(input) as Record<string, unknown>;
     delete legacy.provider;
-    expect(parseNativeExecutionInput(legacy).provider).toEqual({ kind: "codex", model: null });
+    expect(parseNativeExecutionInput(legacy).provider).toEqual({
+      kind: "codex",
+      model: null,
+    });
+    expect(parseNativeExecutionInput(parseNativeExecutionInput(legacy))).toEqual(
+      parseNativeExecutionInput(legacy),
+    );
   });
 
   it("accepts an immutable Claude Managed Agent profile and rejects driver or beta drift", () => {
@@ -263,7 +284,14 @@ describe("NativeExecutionInputV1", () => {
       session: { ...input.session, driverKind: "acpx_runtime" },
       provider,
     });
-    expect(parsed.provider).toEqual(provider);
+    expect(parsed.provider).toEqual({
+      kind: "acpx",
+      agent: "pi",
+      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      permissionPolicy: "interactive",
+      profile: provider.profile,
+    });
+    expect(parseNativeExecutionInput(parsed)).toEqual(parsed);
     expect(buildNativeModelEnvelope(parsed).workspace).toEqual({ cwd: "/safe/workspace" });
     expect(() => parseNativeExecutionInput({
       ...input,

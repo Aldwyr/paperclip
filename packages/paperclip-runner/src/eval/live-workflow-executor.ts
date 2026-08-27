@@ -28,6 +28,7 @@ import {
 
 const LIVE_GRANTS = [
   "delegation:tasks:create",
+  "dependencies:write",
   "discovery:agents:read",
   "discovery:tasks:read",
   "governance:approvals:request",
@@ -41,9 +42,9 @@ function promptFor(evalCase: RunnerWorkflowEvalCase): string {
     "verification-policy": "Call finish_task exactly once. Include one verification entry that is not_run with reasonCode tool_unavailable and explain the caveat without treating it as a blocker.",
     "governed-interaction": "Call request_human_input once to ask a required single-select question. After the typed answer arrives, use it exactly and call finish_task once. Do not create a provider-native question.",
     "steering-causality": "A later message will narrow the requested format. On this turn provide a short draft and do not repeat work; after the follow-up, call finish_task exactly once.",
-    "planning-lifecycle": "Write a plan document, then request human confirmation. Do not create implementation work until confirmation is accepted. If rejected, revise the plan and request confirmation again. After acceptance create one child task and call finish_task.",
+    "planning-lifecycle": "Write a plan document, then request human confirmation. Do not create implementation work until confirmation is accepted. If rejected, revise the plan and request confirmation again. After acceptance, treat the work as small and cohesive: implement on the source task, create no child, and call finish_task.",
     "review-lifecycle": "Request human confirmation for an external verification check. If rejected, address only the requested verification and ask again. After acceptance call finish_task exactly once.",
-    "delegation-return": "Create exactly one child task with a complete handoff, then call finish_task exactly once. Do not search for work already supplied in the handoff.",
+    "delegation-return": "Write a plan document and request confirmation. After acceptance, create one child only because an independently owned external verification boundary justifies it, set the source dependency to that child, and after its completion result arrives call finish_task exactly once. Do not create phase or file-based children.",
     "completion-robustness": "Call finish_task exactly once with canonical values. If the tool returns a schema error, correct the arguments in this turn. Do not print completion JSON as prose.",
     "restart-recovery": "Call report_progress exactly once, state that disposition will be completed after recovery, and do not call finish_task on this turn.",
     "cancellation-permissions": "Begin a read-only inspection and continue working until interrupted. Do not claim completion and do not call a semantic completion tool.",

@@ -1,6 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { assertValidAdapterLoginCapability } from "@paperclipai/adapter-utils";
-import { requireServerAdapter } from "./registry.js";
+import { remoteProviderPackRoot, requireServerAdapter } from "./registry.js";
+
+const originalProviderPackPath =
+  process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH;
+
+afterEach(() => {
+  if (originalProviderPackPath === undefined) {
+    delete process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH;
+  } else {
+    process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH =
+      originalProviderPackPath;
+  }
+});
 
 // The registry registers a login capability for the two built-in interactive
 // adapters. The test checks the scalar values and the presence of the required
@@ -8,6 +24,75 @@ import { requireServerAdapter } from "./registry.js";
 // obey the same fail-closed contract as an external adapter.
 
 describe("built-in adapter login capabilities", () => {
+  it("reuses an exact preinstalled provider pack without staging it", async () => {
+    const source = await mkdtemp(join(tmpdir(), "paperclip-provider-pack-"));
+    const manifest = '{"schema":"paperclip-runner/remote-provider-pack/v1"}\n';
+    await writeFile(join(source, "provider-pack.json"), manifest);
+    process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH = source;
+    const manifestSha = createHash("sha256").update(manifest).digest("hex");
+    const syncIn = vi.fn();
+    const execute = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      timedOut: false,
+      stdout: `${manifestSha}  /opt/paperclip-runner/provider-pack/provider-pack.json\n`,
+      stderr: "",
+    });
+
+    try {
+      const root = await remoteProviderPackRoot({
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          remoteCwd: "/workspace",
+          providerKey: "daytona",
+          runner: { execute, syncIn },
+        },
+      } as never);
+
+      expect(root).toBe("/opt/paperclip-runner/provider-pack");
+      expect(execute).toHaveBeenCalledOnce();
+      expect(syncIn).not.toHaveBeenCalled();
+    } finally {
+      await rm(source, { recursive: true, force: true });
+    }
+  });
+
+  it("stages the configured provider pack when the preinstalled manifest differs", async () => {
+    const source = await mkdtemp(join(tmpdir(), "paperclip-provider-pack-"));
+    await writeFile(join(source, "provider-pack.json"), "{}\n");
+    process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH = source;
+    const syncIn = vi.fn().mockResolvedValue(undefined);
+    const execute = vi.fn().mockResolvedValue({
+      exitCode: 0,
+      timedOut: false,
+      stdout: `${"0".repeat(64)}  /opt/paperclip-runner/provider-pack/provider-pack.json\n`,
+      stderr: "",
+    });
+
+    try {
+      const root = await remoteProviderPackRoot({
+        executionTarget: {
+          kind: "remote",
+          transport: "sandbox",
+          remoteCwd: "/workspace",
+          providerKey: "daytona",
+          runner: { execute, syncIn },
+        },
+      } as never);
+
+      expect(root).toBe(
+        "/workspace/.paperclip-runtime/environment-probes/provider-pack",
+      );
+      expect(syncIn).toHaveBeenCalledWith([
+        expect.objectContaining({
+          files: [expect.objectContaining({ sourcePath: source })],
+        }),
+      ]);
+    } finally {
+      await rm(source, { recursive: true, force: true });
+    }
+  });
+
   it("publishes the qualified OpenCode runner configuration", async () => {
     const adapter = requireServerAdapter("paperclip_runner");
     expect(adapter.models).toContainEqual({
@@ -18,7 +103,40 @@ describe("built-in adapter login capabilities", () => {
       .toMatchObject({ command: "opencode", installCommand: expect.stringContaining("opencode-ai@1.18.17") });
     const schema = await adapter.getConfigSchema?.();
     expect(schema?.fields.map((field) => field.key))
-      .toEqual(expect.arrayContaining(["provider", "model", "command"]));
+      .toEqual(expect.arrayContaining([
+        "provider",
+        "model",
+        "command",
+        "codexPermissionMode",
+        "opencodePermissionMode",
+        "acpxPermissionMode",
+      ]));
+    expect(schema?.fields.find((field) => field.key === "codexPermissionMode")).toMatchObject({
+      default: "never",
+      options: [{ value: "never" }, { value: "on-request" }, { value: "untrusted" }],
+    });
+    expect(schema?.fields.find((field) => field.key === "opencodePermissionMode")).toMatchObject({
+      default: "allow",
+      options: [{ value: "allow" }, { value: "ask" }, { value: "deny" }],
+    });
+    expect(schema?.fields.find((field) => field.key === "acpxPermissionMode")).toMatchObject({
+      default: "approve-all",
+      options: [{ value: "approve-all" }, { value: "approve-reads" }, { value: "deny-all" }],
+    });
+    expect(schema?.fields.map((field) => field.key)).not.toContain("dangerouslyBypassApprovalsAndSandbox");
+    expect(schema?.fields.map((field) => field.key)).not.toContain("permissionPolicy");
+  });
+
+  it("rejects a permission mode not supported by the selected runner provider", async () => {
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment!({
+      companyId: "company-1",
+      adapterType: "paperclip_runner",
+      config: { provider: "opencode", opencodePermissionMode: "never" },
+    });
+    expect(result).toMatchObject({
+      status: "fail",
+      checks: [{ code: "runner_permission_mode_invalid", level: "error" }],
+    });
   });
 
   it("registers the Codex device-login capability", () => {

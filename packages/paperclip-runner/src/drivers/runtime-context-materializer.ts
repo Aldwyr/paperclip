@@ -22,7 +22,24 @@ async function makeReadOnly(root: string): Promise<void> {
   await chmod(root, 0o555);
 }
 
+async function makeWritableForRemoval(root: string): Promise<void> {
+  const stat = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!stat || stat.isSymbolicLink()) return;
+  if (stat.isDirectory()) {
+    await chmod(root, 0o700);
+    for (const entry of await readdir(root)) {
+      await makeWritableForRemoval(join(root, entry));
+    }
+  } else if (stat.isFile()) {
+    await chmod(root, 0o600);
+  }
+}
+
 export async function materializeNativeRuntimeSkills(context: NativeRuntimeContextSnapshot | null, skillsHome: string): Promise<void> {
+  await makeWritableForRemoval(skillsHome);
   await rm(skillsHome, { recursive: true, force: true });
   await mkdir(skillsHome, { recursive: true, mode: 0o700 });
   if (!context) return;

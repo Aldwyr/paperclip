@@ -1108,6 +1108,7 @@ export async function commitNativeStatusDecision(input: {
       [decisionRow] = await tx.insert(statusDecisions).values({
         companyId: input.companyId,
         issueId: input.issueId,
+        runId: input.runId,
         assessmentId: input.assessmentId,
         decisionVersion: Math.max(input.priorStatusVersion, latestDecisionVersion) + 1,
         policyVersion: input.decision.policyVersion,

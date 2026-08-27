@@ -10,6 +10,7 @@ import type {
 } from "../protocol/replay-contract.js";
 import type {
   HarnessRuntimeRequest,
+  HarnessRuntimeRequestHandoffResult,
   HarnessRuntimeRequestResolution,
   HarnessThreadLineageEntry,
   NativeRuntimeContextCapabilities,
@@ -38,7 +39,10 @@ export interface PersistedNativeSession {
   providerSessionId?: string | null;
   /** Tagged provider-owned identity required for safe driver recovery. */
   providerIdentity?: PersistedHarnessProviderIdentity;
-  providerRecoveryPolicy?: "same_session_only" | "allow_replacement_after_governed_wait";
+  providerRecoveryPolicy?:
+    | "same_session_only"
+    | "allow_replacement_after_governed_wait"
+    | "allow_replacement_after_resume_failure";
   cursor?: string | null;
   semanticResult?: PrpStructuredRunResult | null;
   terminal?: PrpTerminalState | null;
@@ -71,6 +75,11 @@ export interface NativeSession {
     turnId: string;
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void>;
+  handoffRuntimeRequest?(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }): Promise<HarnessRuntimeRequestHandoffResult>;
   result(): Promise<{
     result: PrpStructuredRunResult;
     terminal: PrpTerminalState;
@@ -85,6 +94,11 @@ export interface NativeSession {
 export interface NativeSessionBackend {
   descriptor(): Promise<NativeSessionBackendDescriptor>;
   openSession(input: OpenNativeSessionInput): Promise<NativeSession>;
+  /** Open a fresh provider session after an explicitly governed continuity break. */
+  openReplacementSession?(
+    input: OpenNativeSessionInput,
+    previous: PersistedNativeSession,
+  ): Promise<NativeSession>;
   recoverSession?(
     snapshot: PersistedNativeSession,
   ): Promise<NativeSessionRecoveryResult>;

@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use crate::durable::redact_text;
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_TURN_DIFF_FILES: usize = 2_000;
+const MAX_TURN_DIFF_CHARS_PER_FILE: usize = 256 * 1024;
 
 fn text<'a>(value: Option<&'a Value>) -> &'a str {
     value.and_then(Value::as_str).unwrap_or("")
@@ -57,6 +59,161 @@ fn bounded_output(value: &str) -> Value {
     })
 }
 
+#[derive(Default)]
+struct ParsedDiffFile {
+    lines: Vec<String>,
+    old_path: Option<String>,
+    new_path: Option<String>,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
+    additions: u64,
+    deletions: u64,
+    binary: bool,
+    mode_change: bool,
+    in_hunk: bool,
+}
+
+fn git_diff_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed == "/dev/null" {
+        return None;
+    }
+    let decoded = if trimmed.starts_with('"') && trimmed.ends_with('"') {
+        serde_json::from_str::<String>(trimmed).ok()?
+    } else {
+        trimmed.to_owned()
+    };
+    let normalized = decoded.replace('\\', "/");
+    let relative = normalized
+        .strip_prefix("a/")
+        .or_else(|| normalized.strip_prefix("b/"))
+        .unwrap_or(&normalized);
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative.split('/').any(|part| part == "..")
+    {
+        return None;
+    }
+    Some(relative.chars().take(4096).collect())
+}
+
+fn git_diff_header_token(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    if value.starts_with('"') {
+        let mut escaped = false;
+        for (index, character) in value.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                return Some((&value[..=index], &value[index + 1..]));
+            }
+        }
+        return None;
+    }
+    let end = value.find(char::is_whitespace).unwrap_or(value.len());
+    (end > 0).then_some((&value[..end], &value[end..]))
+}
+
+fn git_diff_header_paths(value: &str) -> (Option<String>, Option<String>) {
+    let Some((old, remaining)) = git_diff_header_token(value) else {
+        return (None, None);
+    };
+    let Some((new, _)) = git_diff_header_token(remaining) else {
+        return (None, None);
+    };
+    (git_diff_path(old), git_diff_path(new))
+}
+
+fn finish_diff_file(current: ParsedDiffFile, files: &mut Vec<Value>) {
+    if files.len() >= MAX_TURN_DIFF_FILES {
+        return;
+    }
+    let path = current
+        .rename_to
+        .as_ref()
+        .or(current.new_path.as_ref())
+        .or(current.old_path.as_ref())
+        .cloned();
+    let Some(path) = path else { return };
+    let previous_path = current
+        .rename_from
+        .clone()
+        .or_else(|| current.rename_to.as_ref().and(current.old_path.clone()));
+    let operation = if current.rename_to.is_some() && previous_path.is_some() {
+        "rename"
+    } else if current.old_path.is_none() {
+        "create"
+    } else if current.new_path.is_none() {
+        "delete"
+    } else if current.mode_change && current.additions == 0 && current.deletions == 0 {
+        "mode_change"
+    } else {
+        "modify"
+    };
+    let patch = format!("{}\n", current.lines.join("\n"));
+    files.push(json!({
+        "path": path,
+        "operation": operation,
+        "previousPath": previous_path,
+        "additions": if current.binary { Value::Null } else { json!(current.additions) },
+        "deletions": if current.binary { Value::Null } else { json!(current.deletions) },
+        "binary": current.binary,
+        "diff": if current.binary { Value::Null } else { json!(patch.chars().take(MAX_TURN_DIFF_CHARS_PER_FILE).collect::<String>()) },
+    }));
+}
+
+fn parse_turn_diff(value: &str) -> Vec<Value> {
+    let mut files = Vec::new();
+    let mut current: Option<ParsedDiffFile> = None;
+    for line in value.lines() {
+        if line.starts_with("diff --git ") {
+            if let Some(previous) = current.take() {
+                finish_diff_file(previous, &mut files);
+            }
+            let (old_path, new_path) = line
+                .strip_prefix("diff --git ")
+                .map(git_diff_header_paths)
+                .unwrap_or((None, None));
+            current = Some(ParsedDiffFile {
+                lines: vec![line.to_owned()],
+                old_path,
+                new_path,
+                ..ParsedDiffFile::default()
+            });
+            continue;
+        }
+        let Some(file) = current.as_mut() else {
+            continue;
+        };
+        file.lines.push(line.to_owned());
+        if let Some(path) = line.strip_prefix("--- ") {
+            file.old_path = git_diff_path(path);
+        } else if let Some(path) = line.strip_prefix("+++ ") {
+            file.new_path = git_diff_path(path);
+        } else if let Some(path) = line.strip_prefix("rename from ") {
+            file.rename_from = git_diff_path(path);
+        } else if let Some(path) = line.strip_prefix("rename to ") {
+            file.rename_to = git_diff_path(path);
+        } else if line.starts_with("old mode ") || line.starts_with("new mode ") {
+            file.mode_change = true;
+        } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            file.binary = true;
+        } else if line.starts_with("@@") {
+            file.in_hunk = true;
+        } else if file.in_hunk && line.starts_with('+') && !line.starts_with("+++") {
+            file.additions += 1;
+        } else if file.in_hunk && line.starts_with('-') && !line.starts_with("---") {
+            file.deletions += 1;
+        }
+    }
+    if let Some(previous) = current {
+        finish_diff_file(previous, &mut files);
+    }
+    files
+}
+
 /// Convert native provider notifications into bounded provider-neutral PRP records.
 /// Unknown variants remain on the legacy diagnostic stream and are never interpreted from prose.
 pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, Value, String)> {
@@ -69,18 +226,87 @@ pub fn canonical_provider_events(method: &str, params: &Value) -> Vec<(String, V
         |result: &mut Vec<(String, Value, String)>, event: &str, payload: Value, item_id: &str| {
             result.push((event.to_owned(), payload, item_id.to_owned()))
         };
-    if (method == "item/started" || complete) && kind == "plan" || method == "turn/plan/updated" {
-        let steps: Vec<Value> = params.get("plan").and_then(Value::as_array).map(|values| values.iter().take(256).enumerate().map(|(index, value)| json!({"stepId": format!("step-{}", index + 1), "body": text(value.get("step")).chars().take(4000).collect::<String>(), "status": match text(value.get("status")) { "inProgress" | "in_progress" => "in_progress", "completed" => "completed", "blocked" => "blocked", _ => "pending" }})).collect()).unwrap_or_else(Vec::new);
-        let plan_complete = complete
-            || (!steps.is_empty()
-                && steps
+    if method == "turn/diff/updated" {
+        let turn_id = id(text(params.get("turnId")).trim(), "turn");
+        let patch = text(params.get("diff"));
+        let files = parse_turn_diff(patch);
+        if patch.trim().is_empty() || !files.is_empty() {
+            let known_stats = files.iter().all(|file| {
+                file.get("additions").and_then(Value::as_u64).is_some()
+                    && file.get("deletions").and_then(Value::as_u64).is_some()
+            });
+            let additions = known_stats.then(|| {
+                files
                     .iter()
-                    .all(|step| text(step.get("status")) == "completed"));
+                    .filter_map(|file| file.get("additions").and_then(Value::as_u64))
+                    .sum::<u64>()
+            });
+            let deletions = known_stats.then(|| {
+                files
+                    .iter()
+                    .filter_map(|file| file.get("deletions").and_then(Value::as_u64))
+                    .sum::<u64>()
+            });
+            let file_count = files.len();
+            let change_set_id = format!("{turn_id}:workspace");
+            push(
+                &mut result,
+                "workspace.change.updated",
+                json!({
+                    "schema": "paperclip.workspace.diff.v1",
+                    "changeSetId": change_set_id,
+                    "revision": params.get("revision").and_then(Value::as_u64).unwrap_or(1),
+                    "source": "harness_reported",
+                    "complete": false,
+                    "files": files,
+                    "totals": { "files": file_count, "additions": additions, "deletions": deletions },
+                    "patchArtifactRef": Value::Null,
+                }),
+                &change_set_id,
+            );
+        }
+    } else if method == "turn/plan/updated" {
+        let turn_plan_id = id(text(params.get("turnId")).trim(), "turn-plan");
+        let steps: Vec<Value> = params
+            .get("plan")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .take(256)
+                    .enumerate()
+                    .filter_map(|(index, value)| {
+                        let body = text(value.get("step"))
+                            .trim()
+                            .chars()
+                            .take(4000)
+                            .collect::<String>();
+                        if body.is_empty() {
+                            return None;
+                        }
+                        Some(json!({
+                            "stepId": format!("step-{}", index + 1),
+                            "body": body,
+                            "status": match text(value.get("status")) {
+                                "inProgress" | "in_progress" => "in_progress",
+                                "completed" => "completed",
+                                "blocked" | "failed" | "error" => "blocked",
+                                _ => "pending",
+                            }
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let plan_complete = !steps.is_empty()
+            && steps
+                .iter()
+                .all(|step| text(step.get("status")) == "completed");
         push(
             &mut result,
             "plan.updated",
-            json!({"schema":"paperclip.plan.updated.v1","planId":item_id,"revision":params.get("revision").and_then(Value::as_u64).unwrap_or(1),"explanation":params.get("explanation").and_then(Value::as_str),"steps":steps,"complete":plan_complete,"syncStatus":if plan_complete {"pending"} else {"streaming"},"documentRevision":Value::Null}),
-            &item_id,
+            json!({"schema":"paperclip.plan.updated.v1","planId":turn_plan_id,"revision":params.get("revision").and_then(Value::as_u64).unwrap_or(1),"explanation":params.get("explanation").and_then(Value::as_str),"steps":steps,"complete":plan_complete,"syncStatus":"not_applicable","documentRevision":Value::Null}),
+            &turn_plan_id,
         );
     } else if (method == "item/started" || complete)
         && ["commandExecution", "mcpToolCall", "dynamicToolCall"].contains(&kind)
@@ -404,7 +630,46 @@ mod tests {
             ]}),
         );
         assert_eq!(events[0].0, "plan.updated");
+        assert_eq!(events[0].2, "turn-1");
+        assert_eq!(events[0].1["planId"], "turn-1");
         assert_eq!(events[0].1["complete"], true);
-        assert_eq!(events[0].1["syncStatus"], "pending");
+        assert_eq!(events[0].1["syncStatus"], "not_applicable");
+        assert_eq!(events[0].1["documentRevision"], Value::Null);
+    }
+
+    #[test]
+    fn proposed_plan_text_is_not_a_turn_checklist() {
+        let events = canonical_provider_events(
+            "item/completed",
+            &json!({"item":{"id":"proposed-plan-1","type":"plan","text":"Ship it"}}),
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn empty_turn_plan_is_a_non_terminal_clearing_snapshot() {
+        let events =
+            canonical_provider_events("turn/plan/updated", &json!({"turnId":"turn-1","plan":[]}));
+        assert_eq!(events[0].1["steps"], json!([]));
+        assert_eq!(events[0].1["complete"], false);
+    }
+
+    #[test]
+    fn maps_turn_diff_to_a_stable_workspace_snapshot() {
+        let events = canonical_provider_events(
+            "turn/diff/updated",
+            &json!({
+                "turnId":"turn-1",
+                "diff":"diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1,2 @@\n-old\n+new\n+added\n"
+            }),
+        );
+        assert_eq!(events[0].0, "workspace.change.updated");
+        assert_eq!(events[0].2, "turn-1:workspace");
+        assert_eq!(events[0].1["changeSetId"], "turn-1:workspace");
+        assert_eq!(
+            events[0].1["totals"],
+            json!({"files":1,"additions":2,"deletions":1})
+        );
+        assert_eq!(events[0].1["files"][0]["path"], "src/a.ts");
     }
 }

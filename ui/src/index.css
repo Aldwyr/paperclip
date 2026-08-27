@@ -120,10 +120,14 @@
   --chip-match-identifier-bg: var(--muted);
   --chip-match-identifier-fg: var(--muted-foreground);
   --chip-match-identifier-border: var(--border);
-  --paperclip-doc-annotation-highlight-open: #fef08a;
-  --paperclip-doc-annotation-highlight-focused: #fde047;
-  --paperclip-doc-annotation-highlight-stale: #fef08a;
-  --paperclip-doc-annotation-highlight-resolved: #fef9c3;
+  --paperclip-doc-annotation-highlight-source: oklch(0.78 0.16 89);
+  --paperclip-doc-annotation-highlight-open: color-mix(in srgb, var(--paperclip-doc-annotation-highlight-source) 58%, var(--background));
+  --paperclip-doc-annotation-highlight-focused: color-mix(in srgb, var(--paperclip-doc-annotation-highlight-source) 60%, var(--background));
+  --paperclip-doc-annotation-highlight-stale: color-mix(in srgb, var(--paperclip-doc-annotation-highlight-source) 48%, var(--background));
+  --paperclip-doc-annotation-highlight-resolved: color-mix(in srgb, var(--paperclip-doc-annotation-highlight-source) 28%, var(--background));
+  --paperclip-doc-annotation-highlight-x-outset: 0.25rem;
+  --paperclip-doc-annotation-highlight-y-outset: 0.125rem;
+  --paperclip-doc-annotation-highlight-radius: 0.1875rem;
 
   /* Brand agent-capsule gradient stops (paperclip.ing/brand/).
      "The capsule is the agent" — each agent gets a 2-stop gradient,
@@ -263,11 +267,15 @@
   /* Portable side-panel geometry and hierarchy. These stay centralized so
      task, project, agent, and future hosts render the same Codex-like chrome. */
   --side-panel-header-height: var(--sz-48px);
-  --side-panel-tab-height: var(--sz-36px);
+  --side-panel-tab-height: var(--sz-30px);
   --side-panel-tab-label-max-width: var(--sz-100px);
+  --side-panel-tab-label-expanded-max-width: calc(var(--side-panel-tab-label-max-width) + var(--sz-18px));
+  --side-panel-tab-label-fade-width: var(--sz-18px);
   --side-panel-tab-radius: var(--radius-xl);
   --side-panel-control-radius: var(--radius-xl);
   --side-panel-launcher-width: var(--sz-320px);
+  --side-panel-bg: rgb(10 10 10);
+  --side-panel-fg: oklch(0.985 0 0);
   --side-panel-tab-active-bg: color-mix(in oklab, var(--accent) 88%, var(--background));
   --side-panel-tab-hover-bg: color-mix(in oklab, var(--accent) 58%, transparent);
 
@@ -294,6 +302,10 @@
   /* Redesigned chat-shell column cap (phase 2c): one token caps the page
      wrapper, thread body, and pinned composer so they widen in lockstep. */
   --tc-shell-max-w: 60rem;
+
+  /* Active-turn status island and its checklist overlay. */
+  --sz-turn-status-island: min(100%, 42rem);
+  --sz-turn-status-popover: min(32rem, calc(100vw - 2rem));
 
   /* Mobile pinned-composer bottom offset (PAP-495). Default clears just the
      safe-area inset (+20px); Layout raises it to the bottom-nav height
@@ -351,11 +363,6 @@
   --chip-match-identifier-bg: var(--muted);
   --chip-match-identifier-fg: var(--muted-foreground);
   --chip-match-identifier-border: var(--border);
-  --paperclip-doc-annotation-highlight-open: #a16207;
-  --paperclip-doc-annotation-highlight-focused: #ca8a04;
-  --paperclip-doc-annotation-highlight-stale: #854d0e;
-  --paperclip-doc-annotation-highlight-resolved: #713f12;
-
   /* Dark-mode AA overrides for the status-icon hues that need a mode-specific
      value (PAP-238). in_progress / blocked stay identical (same blue / red both
      modes) and in_queue tracks in_progress, so they need no override. */
@@ -367,23 +374,49 @@
 }
 
 ::highlight(paperclip-doc-annotation-open) {
-  background-color: var(--paperclip-doc-annotation-highlight-open);
+  background-color: transparent;
   color: inherit;
 }
 
 ::highlight(paperclip-doc-annotation-focused) {
-  background-color: var(--paperclip-doc-annotation-highlight-focused);
+  background-color: transparent;
   color: inherit;
 }
 
 ::highlight(paperclip-doc-annotation-stale) {
-  background-color: var(--paperclip-doc-annotation-highlight-stale);
+  background-color: transparent;
   color: inherit;
 }
 
 ::highlight(paperclip-doc-annotation-resolved) {
-  background-color: var(--paperclip-doc-annotation-highlight-resolved);
+  background-color: transparent;
   color: inherit;
+}
+
+.paperclip-doc-annotation-highlight::before {
+  position: absolute;
+  inset:
+    calc(-1 * var(--paperclip-doc-annotation-highlight-y-outset))
+    calc(-1 * var(--paperclip-doc-annotation-highlight-x-outset));
+  border-radius: var(--paperclip-doc-annotation-highlight-radius);
+  background-color: var(--paperclip-doc-annotation-highlight-open);
+  content: "";
+  transition-property: background-color;
+  transition-duration: var(--motion-duration-fast);
+  transition-timing-function: var(--motion-ease-standard);
+}
+
+.paperclip-doc-annotation-highlight[data-focused="true"]:not([data-anchor-state="stale"]):not([data-status="resolved"])::before,
+.paperclip-doc-annotation-highlight[data-hovered="true"]:not([data-anchor-state="stale"]):not([data-status="resolved"])::before {
+  background-color: var(--paperclip-doc-annotation-highlight-focused);
+}
+
+.paperclip-doc-annotation-highlight[data-anchor-state="stale"]:not([data-status="resolved"])::before {
+  background-color: var(--paperclip-doc-annotation-highlight-stale);
+}
+
+.paperclip-doc-annotation-highlight[data-status="resolved"]::before {
+  background-color: var(--paperclip-doc-annotation-highlight-resolved);
 }
 
 @layer base {
@@ -760,6 +793,12 @@
   transition-duration: var(--motion-side-panel-tab);
   transition-timing-function: var(--motion-ease-standard);
 }
+.side-panel-tab-label-fade {
+  -webkit-mask-image: linear-gradient(to right, black calc(100% - var(--side-panel-tab-label-fade-width)), transparent);
+  mask-image: linear-gradient(to right, black calc(100% - var(--side-panel-tab-label-fade-width)), transparent);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
 
 @media (prefers-reduced-motion: reduce) {
   .tc-enter-bubble,
@@ -1001,6 +1040,41 @@
 
 .tc-live-ping {
   animation: tc-live-ping var(--motion-approval-pulse) var(--motion-ease-standard) infinite;
+}
+
+.paperclip-markdown.task-chat-reasoning-markdown,
+.paperclip-markdown.task-chat-reasoning-markdown :is(h1, h2, h3, h4, h5, h6, strong) {
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: inherit;
+}
+
+/* Activity rows stay on one bounded line until explicitly expanded. The mask
+   gives long provider text a quieter edge than an ellipsis, while the shared
+   expanded treatment safely wraps paths, identifiers, and unbroken tokens. */
+.task-chat-collapsed-line-fade {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: clip;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    black 0,
+    black calc(100% - 2rem),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    black 0,
+    black calc(100% - 2rem),
+    transparent 100%
+  );
+}
+
+.task-chat-expanded-line-wrap,
+.paperclip-markdown.task-chat-reasoning-markdown,
+.paperclip-markdown.task-chat-reasoning-markdown :is(p, strong, em, a, code) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @media (prefers-reduced-motion: reduce) {

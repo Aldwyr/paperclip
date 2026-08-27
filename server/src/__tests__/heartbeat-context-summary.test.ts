@@ -52,8 +52,9 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
 
     expect(acceptedConfirmation).toContain(
-      "Use create_task to create exactly one standard implementation child containing the complete approved plan",
+      "Implement the accepted plan on this issue when the work is small and cohesive",
     );
+    expect(acceptedConfirmation).toContain("Do not create a child merely because a plan was accepted");
     expect(acceptedConfirmation).not.toContain("Make the plan only.");
   });
 
@@ -67,12 +68,19 @@ describe("buildPaperclipTaskMarkdown", () => {
         description: null,
       },
       acceptedPlanContinuation: true,
+      acceptedPlan: {
+        documentId: "document-plan",
+        revisionId: "revision-plan",
+        revisionNumber: 4,
+      },
     });
 
     expect(acceptedConfirmation).toContain("Accepted plan directive:");
     expect(acceptedConfirmation).toContain(
-      "Use create_task to create exactly one standard implementation child containing the complete approved plan",
+      "Use the paperclip-converting-plans-to-tasks skill to decide whether decomposition is justified",
     );
+    expect(acceptedConfirmation).toContain("Approved plan: revision 4 revision-plan of document document-plan");
+    expect(acceptedConfirmation).not.toContain("exactly one standard implementation child");
     expect(acceptedConfirmation).not.toContain("- Work mode: \"planning\"");
   });
 
@@ -243,6 +251,61 @@ describe("mergeCoalescedContextSnapshot", () => {
       selectedOptionIds: ["file-b"],
       selectedOptions: [{ id: "file-b", label: "b.txt", description: "Generated build output" }],
     });
+  });
+
+  it("preserves a deferred interaction when a later comment joins its successor wake", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        interactionId: "interaction-1",
+        interactionKind: "request_confirmation",
+        interactionStatus: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        wakeReason: "issue_commented",
+      },
+      {
+        issueId: "issue-1",
+        commentId: "comment-1",
+        wakeCommentId: "comment-1",
+        wakeReason: "issue_commented",
+      },
+      { preserveExistingInteractionContinuation: true },
+    );
+
+    expect(merged.interactionId).toBe("interaction-1");
+    expect(merged.interactionKind).toBe("request_confirmation");
+    expect(merged.interactionStatus).toBe("accepted");
+    expect(merged.continuationPolicy).toBe("wake_assignee_on_accept");
+    expect(merged.commentId).toBe("comment-1");
+    expect(merged.wakeCommentId).toBe("comment-1");
+  });
+
+  it("keeps a queued comment when an interaction joins its successor wake", () => {
+    const merged = mergeCoalescedContextSnapshot(
+      {
+        issueId: "issue-1",
+        commentId: "comment-1",
+        wakeCommentId: "comment-1",
+        wakeCommentIds: ["comment-1"],
+        wakeReason: "issue_commented",
+      },
+      {
+        issueId: "issue-1",
+        interactionId: "interaction-1",
+        interactionKind: "ask_user_questions",
+        interactionStatus: "answered",
+        continuationPolicy: "wake_assignee_on_accept",
+        wakeReason: "issue_commented",
+      },
+      { preserveExistingInteractionContinuation: true },
+    );
+
+    expect(merged.interactionId).toBe("interaction-1");
+    expect(merged.interactionKind).toBe("ask_user_questions");
+    expect(merged.interactionStatus).toBe("answered");
+    expect(merged.commentId).toBe("comment-1");
+    expect(merged.wakeCommentId).toBe("comment-1");
+    expect(merged.wakeCommentIds).toEqual(["comment-1"]);
   });
 });
 

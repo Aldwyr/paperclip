@@ -1,7 +1,6 @@
 {
   "name": "@paperclipai/paperclip-runner",
   "version": "0.1.2",
-  "private": true,
   "license": "MIT",
   "engines": {
     "node": ">=24.11.0"
@@ -55,9 +54,13 @@
     "styles.css",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "pnpm run build:typescript && pnpm run build:rust && pnpm run build:browser && pnpm run build:sdk && pnpm run build:standalone && pnpm run build:scenarios && pnpm run build:issue-thread",
     "build:typescript": "pnpm --filter @paperclipai/paperclip-eval-kernel build && pnpm run generate:protocol-types && tsc -p tsconfig.json",
+    "build:provider-pack": "pnpm run build:typescript && node scripts/build-provider-pack.mjs",
     "build:rust": "cargo build --manifest-path runner/Cargo.toml --locked --workspace",
     "build:browser": "vite build --config vite.config.ts",
     "build:sdk": "vite build --config vite.sdk.config.ts",
@@ -150,12 +153,13 @@
     "verify:rootless": "bash scripts/verify-rootless-linux.sh"
   },
   "dependencies": {
-    "@paperclipai/paperclip-eval-kernel": "workspace:*",
     "@agentclientprotocol/claude-agent-acp": "0.70.0",
     "@agentclientprotocol/codex-acp": "1.6.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
     "acpx": "0.13.1",
     "ajv": "^8.20.0",
+    "node": "24.11.0",
+    "opencode-ai": "1.18.17",
     "pi-acp": "0.0.33"
   },
   "peerDependencies": {
@@ -171,6 +175,7 @@
     }
   },
   "devDependencies": {
+    "@paperclipai/paperclip-eval-kernel": "workspace:*",
     "@playwright/test": "^1.61.1",
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.17",

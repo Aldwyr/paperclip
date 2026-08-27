@@ -32,11 +32,17 @@ import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import {
+  validatePrpEvent,
+  type PrpEvent,
+} from "../protocol/replay-contract.js";
+
 import { CapabilityMockControlPlaneAdapter } from "../mock-core/capability-mock-control-plane-adapter.js";
 import type { CapabilityFixtureSeed } from "../mock-core/capability-control-plane-types.js";
 import { capabilitySemanticToolDescriptor } from "../semantic-tools/catalog.js";
 import { CapabilitySemanticDispatcher } from "../semantic-tools/dispatcher.js";
 import { CAPABILITY_DISCOVERY_GATEWAY_DEFINITIONS } from "../semantic-tools/discovery.js";
+import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 import {
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
@@ -80,6 +86,30 @@ const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
 const maxFrameBytes = 1024 * 1024;
 const authChallengeTtlMs = 5_000;
+const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
+const commandTypes = new Set([
+  "run.prepare",
+  "run.attach",
+  "session.open",
+  "turn.start",
+  "turn.steer",
+  "turn.interrupt",
+  "turn.stop",
+  "request.resolve",
+  "interaction.receipt",
+  "semantic_tool.result",
+  "session.snapshot",
+  "session.close",
+  "session.budget.increase",
+  "session.destroy",
+  "run.cancel",
+  "runner.drain",
+  "runner.suspend",
+  "runner.shutdown",
+  // Deterministic recovery-eval commands retained by this branch.
+  "fault.harness_restart",
+  "fault.storage_pressure",
+]);
 
 function durableEvalConnectionLeaseTtlMs(turnTimeoutMs: number): number {
   return Math.max(60 * 60 * 1_000, turnTimeoutMs + 60_000);
@@ -195,10 +225,17 @@ export interface DurablePrpControlPlaneOptions {
     callId: string;
     operationId: string;
     input: unknown;
+    correlation: {
+      runId: string;
+      normalizedSessionId: string;
+      turnId: string;
+      itemId: string;
+    };
     /** Internal trace lineage for the canonical semantic_tool.input event. */
     sourceEventId?: string;
     sourceEventType?: string;
   }) => Promise<unknown>;
+  onCommittedEvent?: (event: PrpEvent) => Promise<void>;
   connectionLeaseTtlMs?: number;
 }
 
@@ -210,8 +247,31 @@ export interface RunnerProcessResult {
 }
 
 export interface RunnerProcessHandle {
-  child: ChildProcessWithoutNullStreams;
+  child: {
+    pid?: number;
+    exitCode: number | null;
+    signalCode?: NodeJS.Signals | null;
+    kill(signal?: NodeJS.Signals | number): boolean;
+  };
   completion: Promise<RunnerProcessResult>;
+  /** Relaunches the same immutable process specification with a fresh ticket. */
+  restart?(ticket: string): RunnerProcessHandle;
+}
+
+export type RunnerProcessConnection =
+  | { mode: "connect"; connectUrl: string; caBundlePath?: string }
+  | {
+      mode: "listen";
+      listenAddress: "0.0.0.0";
+      listenPort: number;
+      listenPath: string;
+    };
+
+export interface RunnerProcessLaunchSpec {
+  command: string;
+  args: readonly string[];
+  cwd: string;
+  environment: NodeJS.ProcessEnv;
 }
 
 function domainDigest(domain: string, parts: readonly Buffer[]): Buffer {
@@ -570,33 +630,53 @@ class DurableCoreStore {
   }
 }
 
-class MockWebSocketConnection {
+export interface TransportCloseReason {
+  readonly code?: number;
+  readonly message?: string;
+  readonly error?: unknown;
+}
+
+/** A transport-neutral JSON peer. PRP authentication and encryption stay above it. */
+export interface PrpWireConnection {
+  sendJson(value: unknown): void;
+  close(code?: number): void;
+  onJson(listener: (value: unknown) => void): void;
+  onClose(listener: (reason: TransportCloseReason) => void): void;
+}
+
+export interface PrpWireAttachment {
+  isAuthenticated(): boolean;
+}
+
+class RawWebSocketWireConnection implements PrpWireConnection {
   readonly socket: Duplex;
-  pendingChallenge: PendingChallenge | null = null;
-  secureChannel: SecureChannel | null = null;
-  lease: ConnectionLeaseRecord | null = null;
-  connectionId: string | null = null;
   #buffer = Buffer.alloc(0);
   #closed = false;
-  #onText: (text: string) => void;
-  #onClose: () => void;
+  #onJson: (value: unknown) => void = () => undefined;
+  #onClose: (reason: TransportCloseReason) => void = () => undefined;
 
-  constructor(
-    socket: Duplex,
-    onText: (text: string) => void,
-    onClose: () => void,
-  ) {
+  constructor(socket: Duplex) {
     this.socket = socket;
-    this.#onText = onText;
-    this.#onClose = onClose;
     socket.on("data", (chunk: Buffer) => this.#consume(chunk));
     socket.on("close", () => {
       if (!this.#closed) {
         this.#closed = true;
-        this.#onClose();
+        this.#onClose({ message: "socket_closed" });
       }
     });
-    socket.on("error", () => this.close());
+    socket.on("error", (error) => {
+      if (this.#closed) return;
+      this.#closed = true;
+      this.#onClose({ message: "socket_error", error });
+    });
+  }
+
+  onJson(listener: (value: unknown) => void): void {
+    this.#onJson = listener;
+  }
+
+  onClose(listener: (reason: TransportCloseReason) => void): void {
+    this.#onClose = listener;
   }
 
   acceptInitialData(data: Buffer<ArrayBufferLike>): void {
@@ -604,11 +684,7 @@ class MockWebSocketConnection {
   }
 
   sendJson(value: unknown): void {
-    const wire =
-      this.secureChannel === null
-        ? value
-        : encryptSecureJson(this.secureChannel, value);
-    this.sendText(JSON.stringify(wire));
+    this.sendText(JSON.stringify(value));
   }
 
   sendText(text: string): void {
@@ -631,13 +707,13 @@ class MockWebSocketConnection {
     this.socket.write(Buffer.concat([Buffer.from(header), payload]));
   }
 
-  close(): void {
+  close(_code?: number): void {
     if (this.#closed) {
       return;
     }
     this.#closed = true;
     this.socket.destroy();
-    this.#onClose();
+    this.#onClose({ message: "local_close" });
   }
 
   #consume(chunk: Buffer): void {
@@ -678,7 +754,14 @@ class MockWebSocketConnection {
         payload[index] = payload[index]! ^ mask[index % 4]!;
       }
       if (opcode === 0x1) {
-        this.#onText(payload.toString("utf8"));
+        try {
+          this.#onJson(JSON.parse(payload.toString("utf8")) as unknown);
+        } catch (error) {
+          this.#closed = true;
+          this.socket.destroy();
+          this.#onClose({ message: "invalid_json", error });
+          return;
+        }
       } else if (opcode === 0x8) {
         this.close();
         return;
@@ -699,6 +782,49 @@ class MockWebSocketConnection {
   }
 }
 
+class AuthorityConnection {
+  pendingChallenge: PendingChallenge | null = null;
+  secureChannel: SecureChannel | null = null;
+  lease: ConnectionLeaseRecord | null = null;
+  connectionId: string | null = null;
+  readonly wire: PrpWireConnection;
+  #closed = false;
+  #onClose: () => void;
+
+  constructor(input: {
+    wire: PrpWireConnection;
+    onJson: (value: unknown) => void;
+    onClose: () => void;
+  }) {
+    this.wire = input.wire;
+    this.#onClose = input.onClose;
+    this.wire.onJson(input.onJson);
+    this.wire.onClose(() => this.#markClosed());
+  }
+
+  sendJson(value: unknown): void {
+    if (this.#closed) return;
+    this.wire.sendJson(
+      this.secureChannel === null
+        ? value
+        : encryptSecureJson(this.secureChannel, value),
+    );
+  }
+
+  close(code?: number): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.wire.close(code);
+    this.#onClose();
+  }
+
+  #markClosed(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#onClose();
+  }
+}
+
 /** Authenticated, replay-safe PRP transport authority. Business operations are caller supplied. */
 export class DurablePrpControlPlane {
   readonly fault: DurableRecoveryFault;
@@ -707,11 +833,13 @@ export class DurablePrpControlPlane {
   #expectedRunnerVersion: string;
   #expectedRunnerDigest: string;
   #server: Server | null = null;
-  #connections = new Set<MockWebSocketConnection>();
+  #connections = new Set<AuthorityConnection>();
   #port: number | null = null;
   #faultTriggered = false;
   #replayCursorOverrideOnce = false;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
+  #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
+  #pendingSemanticCalls = new Set<string>();
   #connectionLeaseTtlMs: number;
   #faultTriggerResolve!: () => void;
   #faultTrigger = new Promise<void>((resolveFault) => {
@@ -730,6 +858,7 @@ export class DurablePrpControlPlane {
     this.#expectedRunnerDigest =
       options.expectedRunnerDigest ?? "sha256:durable-recovery-approved";
     this.#onSemanticToolInput = options.onSemanticToolInput;
+    this.#onCommittedEvent = options.onCommittedEvent;
     this.#connectionLeaseTtlMs = options.connectionLeaseTtlMs ?? 30_000;
   }
 
@@ -819,6 +948,36 @@ export class DurablePrpControlPlane {
     commandId?: string,
     deliverImmediately = false,
   ): DurableRecoveryCoreCommand {
+    if (
+      !commandTypes.has(type) ||
+      (commandId !== undefined &&
+        (commandId.length > 160 || !stableIdPattern.test(commandId)))
+    ) {
+      throw new Error("Durable PRP command is invalid.");
+    }
+    if (commandId !== undefined) {
+      const existing = this.store.state.commands.find(
+        (candidate) => candidate.commandId === commandId,
+      );
+      if (existing !== undefined) {
+        if (
+          existing.type !== type ||
+          canonicalJson(existing.payload) !== canonicalJson(payload)
+        ) {
+          throw new Error(
+            "Durable PRP command replay conflicts with persisted state.",
+          );
+        }
+        if (deliverImmediately && existing.status === "pending") {
+          for (const connection of this.#connections) {
+            if (connection.secureChannel !== null) {
+              this.#sendNextCommand(connection);
+            }
+          }
+        }
+        return existing;
+      }
+    }
     const controllerSeq = this.store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
       schema: "paperclip.prp.command.v1",
@@ -887,19 +1046,36 @@ export class DurablePrpControlPlane {
         "\r\n",
       ].join("\r\n"),
     );
-    const connection = new MockWebSocketConnection(
-      socket,
-      (text) => this.#handleText(connection, text),
-      () => this.#connections.delete(connection),
-    );
-    this.#connections.add(connection);
-    connection.acceptInitialData(head);
+    const wire = new RawWebSocketWireConnection(socket);
+    this.attachWireConnection(wire);
+    wire.acceptInitialData(head);
   }
 
-  #handleText(connection: MockWebSocketConnection, text: string): void {
+  /** Attach either an accepted inbound WebSocket or a Paperclip-opened peer. */
+  attachWireConnection(wire: PrpWireConnection): PrpWireAttachment {
+    let connection!: AuthorityConnection;
+    let processing = Promise.resolve();
+    connection = new AuthorityConnection({
+      wire,
+      onJson: (value) => {
+        processing = processing
+          .then(() => this.#handleJson(connection, value))
+          .catch(() => connection.close());
+      },
+      onClose: () => this.#connections.delete(connection),
+    });
+    this.#connections.add(connection);
+    return {
+      isAuthenticated: () => connection.secureChannel !== null,
+    };
+  }
+
+  async #handleJson(
+    connection: AuthorityConnection,
+    wire: unknown,
+  ): Promise<void> {
     let envelope: Record<string, unknown>;
     try {
-      const wire = JSON.parse(text) as unknown;
       envelope =
         connection.secureChannel === null
           ? (wire as Record<string, unknown>)
@@ -931,7 +1107,7 @@ export class DurablePrpControlPlane {
       return;
     }
     if (kind === "event") {
-      this.#event(connection, envelope);
+      await this.#event(connection, envelope);
       return;
     }
     if (kind === "command_result") {
@@ -1055,7 +1231,7 @@ export class DurablePrpControlPlane {
   }
 
   #authHello(
-    connection: MockWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     if (connection.pendingChallenge !== null) {
@@ -1120,7 +1296,7 @@ export class DurablePrpControlPlane {
   }
 
   #authResponse(
-    connection: MockWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     const pending = connection.pendingChallenge;
@@ -1196,13 +1372,19 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
+    // A successfully authenticated reconnect is the new connection generation.
+    // Retire any half-open predecessor only after the replacement proves the
+    // same run-bound capability, so a network partition cannot leave two
+    // authorities delivering commands concurrently.
+    for (const candidate of [...this.#connections]) {
+      if (candidate !== connection && candidate.secureChannel !== null) {
+        candidate.close(1000);
+      }
+    }
     this.#welcome(connection, leaseToken);
   }
 
-  #welcome(
-    connection: MockWebSocketConnection,
-    leaseToken: string | null,
-  ): void {
+  #welcome(connection: AuthorityConnection, leaseToken: string | null): void {
     const lease = connection.lease;
     if (lease === null || connection.connectionId === null) {
       connection.close();
@@ -1226,6 +1408,7 @@ export class DurablePrpControlPlane {
         (this.store.state.commandDeliveryCounts[command.commandId] ?? 0) + 1;
     }
     this.store.save();
+
     connection.sendJson({
       protocol,
       version: protocolVersion,
@@ -1267,7 +1450,11 @@ export class DurablePrpControlPlane {
       if (this.fault === "malformed-input") {
         this.store.state.malformedFrames += 1;
         this.store.save();
-        connection.sendText('{"kind":');
+        if (connection.wire instanceof RawWebSocketWireConnection) {
+          connection.wire.sendText('{"kind":');
+        } else {
+          connection.wire.sendJson(null);
+        }
       }
       if (this.fault === "lease-expiry") {
         lease.expiresAt = safeDate(-1);
@@ -1294,7 +1481,7 @@ export class DurablePrpControlPlane {
   }
 
   #controlEnvelope(
-    connection: MockWebSocketConnection,
+    connection: AuthorityConnection,
     envelopeId: string,
     kind: string,
     payload: Record<string, unknown>,
@@ -1322,7 +1509,7 @@ export class DurablePrpControlPlane {
     };
   }
 
-  #sendNextCommand(connection: MockWebSocketConnection): void {
+  #sendNextCommand(connection: AuthorityConnection): void {
     const [command] = this.#nextPendingCommand();
     if (command === undefined) return;
     this.store.state.commandDeliveryCounts[command.commandId] =
@@ -1339,7 +1526,7 @@ export class DurablePrpControlPlane {
   }
 
   #commandResult(
-    connection: MockWebSocketConnection,
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): void {
     const result = envelope.payload as Record<string, unknown> | undefined;
@@ -1369,6 +1556,28 @@ export class DurablePrpControlPlane {
         ? status
         : "failed";
     command.result = structuredClone(result);
+    if (command.type === "run.prepare" && command.status !== "completed") {
+      const blockedDetail =
+        typeof result.detail === "string"
+          ? result.detail
+          : "provider bootstrap failed";
+      for (const dependent of this.store.state.commands) {
+        if (
+          dependent.controllerSeq > command.controllerSeq &&
+          dependent.status === "pending" &&
+          (dependent.type === "session.open" || dependent.type.startsWith("turn."))
+        ) {
+          dependent.status = "rejected";
+          dependent.result = {
+            commandId: dependent.commandId,
+            controllerSeq: dependent.controllerSeq,
+            status: "rejected",
+            logicalEffectCount: 0,
+            detail: `provider bootstrap dependency failed: ${blockedDetail}`,
+          };
+        }
+      }
+    }
     if (command.status === "completed" && command.type === "run.attach") {
       this.#applyRunAttachment(command.payload);
       this.store.save();
@@ -1404,11 +1613,16 @@ export class DurablePrpControlPlane {
     }
   }
 
-  #event(
-    connection: MockWebSocketConnection,
+  async #event(
+    connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-  ): void {
-    const event = envelope.payload as Record<string, unknown> | undefined;
+  ): Promise<void> {
+    const validated = validatePrpEvent(envelope.payload);
+    if (!validated.ok) {
+      connection.close();
+      return;
+    }
+    const event = validated.event;
     const sourceSeq = event?.sourceSeq;
     const sourceEventId = event?.sourceEventId;
     const eventType = event?.eventType;
@@ -1426,22 +1640,59 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
+    const semantic = (event.payload as Record<string, unknown> | undefined)
+      ?.semantic_tool as Record<string, unknown> | undefined;
+    const semanticCorrelation = semantic?.correlation as
+      Record<string, unknown> | undefined;
+    const isSemanticInput =
+      eventType === "semantic_tool.input" || eventType === "mcp_app.tool_input";
+    if (
+      isSemanticInput &&
+      (this.#onSemanticToolInput === undefined ||
+        semantic?.phase !== "input" ||
+        typeof semantic.callId !== "string" ||
+        typeof semantic.operationId !== "string" ||
+        !Object.prototype.hasOwnProperty.call(semantic, "input") ||
+        typeof semantic.content !== "object" ||
+        semantic.content === null ||
+        (semantic.content as Record<string, unknown>).digest !==
+          digestPaperclipSemanticContent(semantic.input) ||
+        semanticCorrelation?.runId !== this.identity.runId ||
+        semanticCorrelation.normalizedSessionId !==
+          this.identity.normalizedSessionId ||
+        semanticCorrelation.turnId !== this.identity.turnId ||
+        semanticCorrelation.itemId !== this.identity.itemId)
+    ) {
+      connection.close();
+      return;
+    }
     const existing = this.store.state.committedEvents.find(
       (candidate) => candidate.sourceEventId === sourceEventId,
     );
-    let newlyCommitted = false;
     if (existing !== undefined) {
       if (canonicalJson(existing.envelope) !== canonicalJson(envelope)) {
         connection.close();
         return;
       }
+    } else if (sourceSeq !== this.store.state.ackedSourceSeq + 1) {
+      connection.close();
+      return;
+    }
+
+    // The caller's durable commit is the acknowledgement authority. If the
+    // process fails after that idempotent commit but before the local cursor is
+    // saved, runnerd safely replays the event and only then receives its ACK.
+    try {
+      await this.#onCommittedEvent?.(event);
+    } catch {
+      connection.close();
+      return;
+    }
+
+    if (existing !== undefined) {
       existing.deliveryCount += 1;
       this.store.state.replayDeliveries += 1;
     } else {
-      if (sourceSeq !== this.store.state.ackedSourceSeq + 1) {
-        connection.close();
-        return;
-      }
       this.store.state.committedEvents.push({
         sourceSeq,
         sourceEventId,
@@ -1451,19 +1702,13 @@ export class DurablePrpControlPlane {
         deliveryCount: 1,
         logicalEffectCount: 1,
       });
-      newlyCommitted = true;
       this.store.state.ackedSourceSeq = sourceSeq;
     }
     this.store.save();
-
-    const semantic = (event.payload as Record<string, unknown> | undefined)
-      ?.semantic_tool as Record<string, unknown> | undefined;
     if (
-      newlyCommitted &&
-      (eventType === "semantic_tool.input" ||
-        eventType === "mcp_app.tool_input") &&
+      isSemanticInput &&
       this.#onSemanticToolInput &&
-      semantic?.phase === "input" &&
+      semantic !== undefined &&
       typeof semantic.callId === "string" &&
       typeof semantic.operationId === "string"
     ) {
@@ -1471,28 +1716,63 @@ export class DurablePrpControlPlane {
         callId: semantic.callId,
         operationId: semantic.operationId,
         input: semantic.input,
+        correlation: {
+          runId: this.identity.runId,
+          normalizedSessionId: this.identity.normalizedSessionId,
+          turnId: this.identity.turnId,
+          itemId: this.identity.itemId,
+        },
         sourceEventId,
         sourceEventType: eventType,
       };
-      void this.#onSemanticToolInput(call).then((value) => {
-        const outcome =
-          typeof value === "object" && value !== null && !Array.isArray(value)
-            ? (value as Record<string, unknown>)
-            : {};
-        const wrapped = outcome.__paperclipSemanticToolOutcome === true;
-        const result = wrapped ? outcome.result : value;
-        const isError = wrapped && outcome.isError === true;
-        const runScope = createHash("sha256")
-          .update(this.identity.runId)
-          .digest("hex")
-          .slice(0, 12);
-        this.queueCommand(
-          "semantic_tool.result",
-          { ...call, result, isError },
-          `command_tool_${runScope}_${call.callId}`,
-          true,
-        );
-      });
+      const runScope = createHash("sha256")
+        .update(this.identity.runId)
+        .digest("hex")
+        .slice(0, 12);
+      const commandId = `command_tool_${runScope}_${call.callId}`;
+      const alreadyQueued = this.store.state.commands.some(
+        (command) => command.commandId === commandId,
+      );
+      if (!alreadyQueued && !this.#pendingSemanticCalls.has(commandId)) {
+        this.#pendingSemanticCalls.add(commandId);
+        void this.#onSemanticToolInput(call)
+          .then((value) => {
+            const outcome =
+              typeof value === "object" &&
+              value !== null &&
+              !Array.isArray(value)
+                ? (value as Record<string, unknown>)
+                : {};
+            const wrapped =
+              outcome.__paperclipSemanticToolOutcome === true ||
+              Object.prototype.hasOwnProperty.call(outcome, "result");
+            const result = wrapped ? outcome.result : value;
+            const isError = wrapped && outcome.isError === true;
+            this.queueCommand(
+              "semantic_tool.result",
+              { ...call, result, isError },
+              commandId,
+              true,
+            );
+          })
+          .catch(() => {
+            try {
+              this.queueCommand(
+                "semantic_tool.result",
+                {
+                  ...call,
+                  result: { code: "semantic_tool_bridge_failed" },
+                  isError: true,
+                },
+                commandId,
+                true,
+              );
+            } catch {
+              this.disconnectActiveRunner();
+            }
+          })
+          .finally(() => this.#pendingSemanticCalls.delete(commandId));
+      }
     }
 
     if (
@@ -1574,6 +1854,10 @@ function runnerEnvironment(
     "SSL_CERT_DIR",
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET",
     "RUST_BACKTRACE",
     // AgentCore resolves an AWS profile or workload identity inside runnerd,
     // then assumes the immutable invocation role. These are locator/config
@@ -1609,7 +1893,8 @@ function runnerEnvironment(
 }
 
 export function spawnRunner(options: {
-  connectUrl: string;
+  connectUrl?: string;
+  connection?: RunnerProcessConnection;
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
   ticket: string;
@@ -1617,15 +1902,39 @@ export function spawnRunner(options: {
   p0ReserveBytes: number;
   maxRuntimeMs?: number;
   maxLifetimeMs?: number;
+  reconnectGraceMs?: number;
   lifecyclePolicy?:
     | { mode: "per_turn"; idleTimeoutMs: null }
     | { mode: "warm"; idleTimeoutMs: number };
   runnerBinaryPath?: string;
   environment?: NodeJS.ProcessEnv;
+  processLauncher?: (spec: RunnerProcessLaunchSpec) => RunnerProcessHandle;
 }): RunnerProcessHandle {
+  const connection =
+    options.connection ??
+    (options.connectUrl
+      ? { mode: "connect" as const, connectUrl: options.connectUrl }
+      : null);
+  if (!connection) throw new Error("runner process connection is required");
+  const connectionArgs =
+    connection.mode === "connect"
+      ? [
+          "--connect-url",
+          connection.connectUrl,
+          ...(connection.caBundlePath
+            ? ["--ca-bundle-path", connection.caBundlePath]
+            : []),
+        ]
+      : [
+          "--listen-address",
+          connection.listenAddress,
+          "--listen-port",
+          String(connection.listenPort),
+          "--listen-path",
+          connection.listenPath,
+        ];
   const args = [
-    "--connect-url",
-    options.connectUrl,
+    ...connectionArgs,
     "--state-dir",
     options.stateDirectory,
     "--runner-id",
@@ -1653,12 +1962,15 @@ export function spawnRunner(options: {
     "--p0-reserve-bytes",
     String(options.p0ReserveBytes),
     "--reconnect-delay-ms",
-    "20",
+    "250",
   ];
   if (options.maxLifetimeMs !== undefined) {
     args.push("--max-lifetime-ms", String(options.maxLifetimeMs));
   } else if (options.maxRuntimeMs !== undefined) {
     args.push("--max-runtime-ms", String(options.maxRuntimeMs));
+  }
+  if (options.reconnectGraceMs !== undefined) {
+    args.push("--reconnect-grace-ms", String(options.reconnectGraceMs));
   }
   if (options.lifecyclePolicy !== undefined) {
     args.push("--lifecycle-mode", options.lifecyclePolicy.mode);
@@ -1669,9 +1981,25 @@ export function spawnRunner(options: {
       );
     }
   }
-  const child = spawn(options.runnerBinaryPath ?? runnerBinary, args, {
+  const command = options.runnerBinaryPath ?? runnerBinary;
+  const environment = runnerEnvironment(options.ticket, options.environment);
+  const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => ({
+    ...handle,
+    restart: (ticket) => spawnRunner({ ...options, ticket }),
+  });
+  if (options.processLauncher) {
+    return withRestart(
+      options.processLauncher({
+        command,
+        args,
+        cwd: packageRoot,
+        environment,
+      }),
+    );
+  }
+  const child = spawn(command, args, {
     cwd: packageRoot,
-    env: runnerEnvironment(options.ticket, options.environment),
+    env: environment,
     stdio: "pipe",
   });
   let stdout = "";
@@ -1690,7 +2018,7 @@ export function spawnRunner(options: {
       );
     },
   );
-  return { child, completion };
+  return withRestart({ child, completion });
 }
 
 export async function waitForProcess(
@@ -2008,6 +2336,7 @@ export interface DurableEvalSessionInput {
   includeCollaborationModeInstructions?: boolean;
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   acpxAgent?: QualifiedAcpxAgent;
+  acpxPermissionMode?: "approve-all" | "approve-reads" | "deny-all";
   acpxSidecarPath?: string;
   opencodeVersion?: string;
   opencodeCommand?: string;
@@ -2291,9 +2620,11 @@ export async function runDurableEvalSession(
   };
   let nativeResumeCall: NativeResumeCall | null = null;
   let releaseNativeSemanticDispatch!: () => void;
-  const nativeSemanticDispatchReleased = new Promise<void>((resolveDispatch) => {
-    releaseNativeSemanticDispatch = resolveDispatch;
-  });
+  const nativeSemanticDispatchReleased = new Promise<void>(
+    (resolveDispatch) => {
+      releaseNativeSemanticDispatch = resolveDispatch;
+    },
+  );
   let nativeSemanticHandlerCallCount = 0;
   const operations: Array<{
     operationId: string;
@@ -2484,7 +2815,8 @@ export async function runDurableEvalSession(
                 cwd: tmpdir(),
                 instructions:
                   "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
-                permissionPolicy: "interactive",
+                permissionMode: input.acpxPermissionMode ?? "approve-all",
+                permissionModePinned: true,
               }
             : {
                 kind: providerKind,
@@ -2493,8 +2825,8 @@ export async function runDurableEvalSession(
                   (input.nativeResume !== undefined
                     ? process.execPath
                     : providerKind === "opencode"
-                    ? process.execPath
-                    : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex")),
+                      ? process.execPath
+                      : (process.env.PAPERCLIP_CODEX_COMMAND ?? "codex")),
                 args:
                   input.providerArgs ??
                   (providerKind === "opencode"
@@ -2502,6 +2834,7 @@ export async function runDurableEvalSession(
                     : effectiveProviderArgs),
                 cwd: tmpdir(),
                 model: input.model,
+                approvalPolicy: "never",
                 instructions:
                   "You are a Paperclip agent. Use only the supplied Paperclip tools for company state. Follow the user request, then reply concisely. Do not use shell or filesystem tools.",
                 collaborationMode: "default",
@@ -2519,14 +2852,12 @@ export async function runDurableEvalSession(
       input.providerCommand ??
       process.env.PAPERCLIP_CODEX_COMMAND ??
       "codex";
-    const sharedArgs =
-      input.sharedProviderArgs ??
-      [
-        ...codexConfigArgs,
-        "app-server",
-        "--listen",
-        `unix://${sharedCodexSocket}`,
-      ];
+    const sharedArgs = input.sharedProviderArgs ?? [
+      ...codexConfigArgs,
+      "app-server",
+      "--listen",
+      `unix://${sharedCodexSocket}`,
+    ];
     sharedCodexServer = spawn(sharedCommand, sharedArgs, {
       cwd: tmpdir(),
       env: process.env,
@@ -2537,7 +2868,9 @@ export async function runDurableEvalSession(
       sharedCodexServerError = error;
     });
     sharedCodexServer.stderr.setEncoding("utf8").on("data", (chunk: string) => {
-      sharedCodexServerStderr = `${sharedCodexServerStderr}${chunk}`.slice(-16_384);
+      sharedCodexServerStderr = `${sharedCodexServerStderr}${chunk}`.slice(
+        -16_384,
+      );
     });
     const sharedServerDeadline = Date.now() + 10_000;
     while (
@@ -2558,34 +2891,34 @@ export async function runDurableEvalSession(
   }
   const launchRunner = (): RunnerProcessHandle =>
     spawnRunner({
-        connectUrl: core.connectUrl,
-        stateDirectory: runnerStateDirectory,
-        identity,
-        ticket: core.issueBootstrapTicket(),
-        maxOutboxBytes: 256 * 1024,
-        p0ReserveBytes: 64 * 1024,
-        maxRuntimeMs: input.turnTimeoutMs + 30_000,
-        runnerBinaryPath: input.runnerBinaryPath,
-        environment:
-          providerKind === "opencode"
-            ? {
-                ...process.env,
-                PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
-                PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
-                PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
-                PAPERCLIP_RUN_ID: identity.runId,
-                PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
-              }
-            : providerKind === "claude_managed"
-              ? createSanitizedClaudeManagedEnvironment(process.env)
-              : providerKind === "aws_agentcore"
-                ? sanitizedAwsEvalEnvironment(process.env)
-                : providerKind === "acpx"
-                  ? createSanitizedAcpxEnvironment(
-                      process.env,
-                      acpxProfile!.agent,
-                    )
-                  : process.env,
+      connectUrl: core.connectUrl,
+      stateDirectory: runnerStateDirectory,
+      identity,
+      ticket: core.issueBootstrapTicket(),
+      maxOutboxBytes: 256 * 1024,
+      p0ReserveBytes: 64 * 1024,
+      maxRuntimeMs: input.turnTimeoutMs + 30_000,
+      runnerBinaryPath: input.runnerBinaryPath,
+      environment:
+        providerKind === "opencode"
+          ? {
+              ...process.env,
+              PAPERCLIP_OPENCODE_COMMAND: input.opencodeCommand ?? "opencode",
+              PAPERCLIP_OPENCODE_RUNTIME_DIR: resolve(root, "opencode"),
+              PAPERCLIP_RUNNER_INSTANCE_ID: identity.runnerInstanceId,
+              PAPERCLIP_RUN_ID: identity.runId,
+              PAPERCLIP_NORMALIZED_SESSION_ID: identity.normalizedSessionId,
+            }
+          : providerKind === "claude_managed"
+            ? createSanitizedClaudeManagedEnvironment(process.env)
+            : providerKind === "aws_agentcore"
+              ? sanitizedAwsEvalEnvironment(process.env)
+              : providerKind === "acpx"
+                ? createSanitizedAcpxEnvironment(
+                    process.env,
+                    acpxProfile!.agent,
+                  )
+                : process.env,
     });
   let handle = launchRunner();
   const runnerProcessPids = [handle.child.pid].filter(
@@ -2619,7 +2952,9 @@ export async function runDurableEvalSession(
       handle.child.kill("SIGKILL");
       crashedRunner = await waitForProcess(handle, 10_000);
       if (crashedRunner.signal !== "SIGKILL") {
-        throw new Error(`native resume runner exited with ${String(crashedRunner.signal)}`);
+        throw new Error(
+          `native resume runner exited with ${String(crashedRunner.signal)}`,
+        );
       }
       runnerRestarts = 1;
       handle = launchRunner();
@@ -2634,8 +2969,7 @@ export async function runDurableEvalSession(
             event.envelope.payload as Record<string, unknown> | undefined
           )?.payload as Record<string, unknown> | undefined;
           const semantic = payload?.semantic_tool as
-            | Record<string, unknown>
-            | undefined;
+            Record<string, unknown> | undefined;
           return (
             semantic?.callId === pendingCall.callId &&
             semantic?.operationId === pendingCall.operationId
@@ -2646,7 +2980,9 @@ export async function runDurableEvalSession(
         await new Promise((resolveWait) => setTimeout(resolveWait, 20));
       }
       if (!pendingCallWasReconciled()) {
-        throw new Error("replacement Runner D did not reconcile the pending Codex tool call");
+        throw new Error(
+          "replacement Runner D did not reconcile the pending Codex tool call",
+        );
       }
       releaseNativeSemanticDispatch();
     }
@@ -3028,18 +3364,17 @@ export async function runDurableEvalSession(
     if (!assistantText)
       assistantText = "Provider completed the requested Paperclip operation.";
     const finalState = JSON.stringify(authority.snapshot());
-    const completedNativeResumeCall = nativeResumeCall as NativeResumeCall | null;
+    const completedNativeResumeCall =
+      nativeResumeCall as NativeResumeCall | null;
     const nativeResumeProof =
       input.nativeResume === undefined || completedNativeResumeCall === null
         ? undefined
         : (() => {
             const semanticEvents = records.flatMap((record) => {
               const payload = record.payload as
-                | Record<string, unknown>
-                | undefined;
+                Record<string, unknown> | undefined;
               const semantic = payload?.semantic_tool as
-                | Record<string, unknown>
-                | undefined;
+                Record<string, unknown> | undefined;
               return semantic?.callId === completedNativeResumeCall.callId &&
                 semantic.operationId === completedNativeResumeCall.operationId
                 ? [{ eventType: record.eventType, semantic }]
@@ -3049,13 +3384,13 @@ export async function runDurableEvalSession(
               comments?: unknown[];
             };
             const finalComments = authority.snapshot().comments;
-          return {
-            schema: "paperclip.runner.native-resume-proof/v1",
-            triggered: true,
-            runnerRestarts,
-            runnerProcessPids,
-            providerProcessPids,
-            sharedCodexServerPid: sharedCodexServer?.pid ?? null,
+            return {
+              schema: "paperclip.runner.native-resume-proof/v1",
+              triggered: true,
+              runnerRestarts,
+              runnerProcessPids,
+              providerProcessPids,
+              sharedCodexServerPid: sharedCodexServer?.pid ?? null,
               sameProviderThread:
                 providerThreadIds.length >= 2 &&
                 new Set(providerThreadIds).size === 1,
@@ -3119,7 +3454,9 @@ export async function runDurableEvalSession(
         status: "idle",
         activeTurnId: null,
         semanticResult,
-        ...(nativeResumeProof === undefined ? {} : { nativeResume: nativeResumeProof }),
+        ...(nativeResumeProof === undefined
+          ? {}
+          : { nativeResume: nativeResumeProof }),
         createdAt: now,
         updatedAt: now,
         authority: {

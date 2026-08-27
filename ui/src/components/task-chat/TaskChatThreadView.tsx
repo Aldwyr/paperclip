@@ -17,6 +17,7 @@ import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskMessageScroller } from "./TaskMessageScroller";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
+import { TaskChatProtocolActivityRow } from "./TaskChatProtocolActivityRow";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 
 interface TaskChatThreadViewProps {
@@ -28,7 +29,10 @@ interface TaskChatThreadViewProps {
    */
   header?: ReactNode;
   onApprovalDecision?: (statusItemId: string, optionId: string) => void;
-  onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void | Promise<void>;
+  onRuntimeRequestDecision?: (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => void | Promise<void>;
   /**
    * Renders an interleaved issue-thread interaction (the live thread supplies
    * TaskChatInteractionCard bound to its accept/reject handlers). Interaction
@@ -49,6 +53,9 @@ interface TaskChatThreadViewProps {
   renderMessageActions?: (item: TaskChatMessageItem) => ReactNode;
   /** Renders an interrupt action beside a queued human message. */
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode;
+  /** Requeues a blocked task from its no-live-execution-path failure surfaces. */
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void;
+  tryAgainNoLiveExecutionPathPending?: boolean;
   /** Content appended inside the transcript scroller after the settled thread. */
   tail?: ReactNode;
   /** Optional streaming-aware key when `tail` changes without changing `items`. */
@@ -65,7 +72,14 @@ function renderItem(
   renderBrief?: () => ReactNode,
   renderMessageActions?: (item: TaskChatMessageItem) => ReactNode,
   renderQueuedAction?: (item: TaskChatMessageItem) => ReactNode,
-  onRuntimeRequestDecision?: (item: TaskChatRuntimeRequestItem, decision: TaskChatRuntimeRequestDecision) => void | Promise<void>,
+  onRuntimeRequestDecision?: (
+    item: TaskChatRuntimeRequestItem,
+    decision: TaskChatRuntimeRequestDecision,
+  ) => void | Promise<void>,
+  activityAppearance: "classic" | "runner" = "classic",
+  onTryAgainNoLiveExecutionPath?: () => Promise<void> | void,
+  tryAgainNoLiveExecutionPathPending = false,
+  retryableMarkerId?: string,
 ) {
   switch (item.kind) {
     case "message": {
@@ -75,12 +89,32 @@ function renderItem(
       // put when the tool history expands (PAP-413). The two paths are mutually
       // exclusive at runtime, so only one host ever mounts the node.
       const actions = renderMessageActions?.(item);
-      const turn = item.attachedTurn ? (
+      const attachedTurnItem = item.attachedTurn?.standaloneHeader
+        ? {
+            ...item.attachedTurn,
+            agentName: item.attachedTurn.agentName ?? item.authorName,
+            agentIcon: item.attachedTurn.agentIcon ?? item.agentIcon,
+          }
+        : item.attachedTurn;
+      const turn = attachedTurnItem ? (
         <TaskChatTurn
-          item={item.attachedTurn}
-          timestampPrefix={item.attachedTurn.standaloneHeader ? undefined : item.timestamp}
-          leading={item.attachedTurn.standaloneHeader ? undefined : actions}
-          renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)}
+          item={attachedTurnItem}
+          timestampPrefix={
+            attachedTurnItem.standaloneHeader ? undefined : item.timestamp
+          }
+          leading={attachedTurnItem.standaloneHeader ? undefined : actions}
+          renderChild={(child) =>
+            renderItem(
+              child,
+              onApprovalDecision,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              onRuntimeRequestDecision,
+              item.attachedTurn?.standaloneHeader ? "runner" : "classic",
+            )
+          }
         />
       ) : undefined;
       return (
@@ -90,16 +124,37 @@ function renderItem(
           // their canonical server IDs. Animating either mount makes the same
           // text visibly fade twice during that handoff; user sends should
           // paint immediately and remain visually stable.
-          animateEntry={item.author !== "human" && !item.attachedTurn?.standaloneHeader}
-          actions={item.attachedTurn?.standaloneHeader ? actions : item.attachedTurn ? undefined : actions}
+          animateEntry={
+            item.author !== "human" && !item.attachedTurn?.standaloneHeader
+          }
+          actions={
+            item.attachedTurn?.standaloneHeader
+              ? actions
+              : item.attachedTurn
+                ? undefined
+                : actions
+          }
           queuedAction={renderQueuedAction?.(item)}
           beforeTurn={item.attachedTurn?.standaloneHeader ? turn : undefined}
           attachedTurn={item.attachedTurn?.standaloneHeader ? undefined : turn}
+          hideAgentIdentity={Boolean(item.attachedTurn?.standaloneHeader)}
+          onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
+          tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
         />
       );
     }
     case "marker":
-      return <TaskChatMarker item={item} />;
+      return (
+        <TaskChatMarker
+          item={item}
+          onTryAgain={
+            item.id === retryableMarkerId
+              ? onTryAgainNoLiveExecutionPath
+              : undefined
+          }
+          tryAgainPending={tryAgainNoLiveExecutionPathPending}
+        />
+      );
     case "thinking":
       return <TaskChatThinking item={item} />;
     case "tool":
@@ -108,28 +163,70 @@ function renderItem(
       return (
         <TaskChatStatusPill
           item={item}
-          onApprovalDecision={(optionId) => onApprovalDecision?.(item.id, optionId)}
+          onApprovalDecision={(optionId) =>
+            onApprovalDecision?.(item.id, optionId)
+          }
         />
       );
     case "usage":
       return <TaskChatUsageReadout item={item} />;
     case "activity_phase":
-      return <TaskChatActivityPhase item={item} renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)} />;
+      return (
+        <TaskChatActivityPhase
+          item={item}
+          appearance={activityAppearance}
+          renderChild={(child) =>
+            child.kind === "protocol" && child.surface !== "runtime_request" ? (
+              <TaskChatProtocolActivityRow item={child} />
+            ) : (
+              renderItem(
+                child,
+                onApprovalDecision,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                onRuntimeRequestDecision,
+              )
+            )
+          }
+        />
+      );
     case "interaction":
       return renderInteraction ? renderInteraction(item) : null;
     case "plan_document":
-      return <TaskChatPlanPreviewCard source={{ kind: "saved", document: item.document }} />;
+      return (
+        <TaskChatPlanPreviewCard
+          source={{ kind: "saved", document: item.document }}
+        />
+      );
     case "brief":
       return renderBrief ? renderBrief() : null;
     case "turn":
       return (
         <TaskChatTurn
           item={item}
-          renderChild={(child) => renderItem(child, onApprovalDecision, undefined, undefined, undefined, undefined, onRuntimeRequestDecision)}
+          renderChild={(child) =>
+            renderItem(
+              child,
+              onApprovalDecision,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              onRuntimeRequestDecision,
+              item.standaloneHeader ? "runner" : "classic",
+            )
+          }
         />
       );
     case "protocol":
-      return <TaskChatProtocolCard item={item} onRuntimeRequestDecision={onRuntimeRequestDecision} />;
+      return (
+        <TaskChatProtocolCard
+          item={item}
+          onRuntimeRequestDecision={onRuntimeRequestDecision}
+        />
+      );
     default: {
       // Exhaustiveness guard: a new item kind must add a branch above.
       const _never: never = item;
@@ -153,20 +250,48 @@ export function TaskChatThreadView({
   renderBrief,
   renderMessageActions,
   renderQueuedAction,
+  onTryAgainNoLiveExecutionPath,
+  tryAgainNoLiveExecutionPathPending = false,
   tail,
   contentKey,
   className,
   scroll = true,
 }: TaskChatThreadViewProps) {
+  const retryableMarkerId = onTryAgainNoLiveExecutionPath
+    ? [...items]
+        .reverse()
+        .find(
+          (item) =>
+            item.kind === "marker" &&
+            item.variant === "interrupted" &&
+            item.label === "Run failed",
+        )?.id
+    : undefined;
   const body = (
-    <div className={cn("mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-5 px-4 py-4", className)}>
+    <div
+      className={cn(
+        "mx-auto flex w-full max-w-(--tc-shell-max-w) flex-col gap-5 px-4 py-4",
+        className,
+      )}
+    >
       {header ? (
-        <div className="flex flex-col gap-6 pb-2" data-testid="task-chat-thread-header">
+        <div
+          className="flex flex-col gap-6 pb-2"
+          data-testid="task-chat-thread-header"
+        >
           {header}
         </div>
       ) : null}
-      {items.map((item) => (
-        <div key={item.id}>
+      {items.map((item, index) => (
+        <div
+          key={item.id}
+          className={cn(
+            index > 0 &&
+              item.kind === "interaction" &&
+              item.interaction.status !== "pending" &&
+              "-mt-3",
+          )}
+        >
           {renderItem(
             item,
             onApprovalDecision,
@@ -175,6 +300,10 @@ export function TaskChatThreadView({
             renderMessageActions,
             renderQueuedAction,
             onRuntimeRequestDecision,
+            "classic",
+            onTryAgainNoLiveExecutionPath,
+            tryAgainNoLiveExecutionPathPending,
+            retryableMarkerId,
           )}
         </div>
       ))}
@@ -197,12 +326,13 @@ export function TaskChatThreadView({
 function signatureOf(it: TaskChatItem): number {
   if (it.kind === "message") return it.text.length + (it.attachedTurn ? 1 : 0);
   if (it.kind === "thinking") return it.lines.reduce((n, l) => n + l.length, 0);
-  if (it.kind === "tool") return (it.diff?.lines?.length ?? 0) + (it.status === "completed" ? 1 : 0);
+  if (it.kind === "tool")
+    return (it.diff?.lines?.length ?? 0) + (it.status === "completed" ? 1 : 0);
   if (it.kind === "plan_document") {
     return it.document.body.length + it.document.latestRevisionNumber;
   }
   if (it.kind === "turn") {
-    if (it.settled) return 1;
+    if (it.settled) return 1 + (it.finalResponse?.text.length ?? 0);
     // The live parent row's header changes (gerund ↔ tool-state flashes,
     // streaming interstitial text growing) count too, so the collapsed
     // single-line turn still advances the key.
@@ -211,10 +341,16 @@ function signatureOf(it: TaskChatItem): number {
         (it.liveStatus.detail?.length ?? 0) +
         (it.liveStatus.selfTalk?.length ?? 0)
       : 0;
-    return it.items.reduce((n, child) => n + signatureOf(child), it.items.length + headerSig);
+    return it.items.reduce(
+      (n, child) => n + signatureOf(child),
+      it.items.length + headerSig + (it.finalResponse?.text.length ?? 0),
+    );
   }
   if (it.kind === "activity_phase") {
-    return it.items.reduce((n, child) => n + signatureOf(child), it.summary.length + (it.interstitial?.text.length ?? 0));
+    return it.items.reduce(
+      (n, child) => n + signatureOf(child),
+      it.summary.length + (it.interstitial?.text.length ?? 0),
+    );
   }
   return 1;
 }

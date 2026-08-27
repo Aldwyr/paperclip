@@ -112,6 +112,11 @@ import { secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
+  persistReprojectedWorkspaceDiffs,
+  projectCodexWorkspaceDiffsFromTrace,
+  type WorkspaceDiffReprojectionSkipReason,
+} from "../services/provider-trace-workspace-diff-reprojection.js";
+import {
   detectAdapterModel,
   findActiveServerAdapter,
   findServerAdapter,
@@ -213,6 +218,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
+import { PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import { logger } from "../middleware/logger.js";
@@ -1818,9 +1824,9 @@ export function agentRoutes(
    * (listEnabledServerAdapters documents the same rule: hidden from selection,
    * still functional for agents that already use them).
    */
-  function assertSelectableAdapterType(
+  async function assertSelectableAdapterType(
     type: string | null | undefined,
-  ): string {
+  ): Promise<string> {
     const adapterType = assertKnownAdapterType(type);
     if (adapterType === "paperclip_runner") {
       const experimental = await instanceSettings.getExperimental();
@@ -2279,6 +2285,15 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
   ): Record<string, unknown> {
     const next = { ...adapterConfig };
+    if (adapterType === "paperclip_runner") {
+      // Runner permissions are provider-specific and pinned in native input.
+      // Never carry the direct Codex sandbox bypass or the legacy ACPX
+      // interactive marker into newly persisted Runner configuration.
+      delete next.dangerouslyBypassApprovalsAndSandbox;
+      delete next.dangerouslyBypassSandbox;
+      delete next.permissionPolicy;
+      return ensureGatewayDeviceKey(adapterType, next);
+    }
     if (adapterType === "codex_local") {
       const hasBypassFlag =
         typeof next.dangerouslyBypassApprovalsAndSandbox === "boolean" ||
@@ -3971,7 +3986,7 @@ export function agentRoutes(
         applyStoredClaudeLogin: hireApplyStoredClaudeLogin,
         ...hireInput
       } = req.body;
-      hireInput.adapterType = assertSelectableAdapterType(
+      hireInput.adapterType = await assertSelectableAdapterType(
         hireInput.adapterType,
       );
       const rawHireAdapterConfig = (hireInput.adapterConfig ?? {}) as Record<
@@ -4228,7 +4243,7 @@ export function agentRoutes(
         applyStoredClaudeLogin: createApplyStoredClaudeLogin,
         ...createInput
       } = req.body;
-      createInput.adapterType = assertSelectableAdapterType(
+      createInput.adapterType = await assertSelectableAdapterType(
         createInput.adapterType,
       );
       const rawCreateAdapterConfig = (createInput.adapterConfig ??
@@ -4794,15 +4809,10 @@ export function agentRoutes(
     // it gets the selectable check; keeping the agent's current adapter (even
     // one since disabled) stays allowed, so a disabled harness does not make an
     // existing agent uneditable.
-    const requestedAdapterType = hasOwn(patchData, "adapterType")
-      ? (() => {
-          const next = assertKnownAdapterType(
-            patchData.adapterType as string | null | undefined,
-          );
-          return next === existing.adapterType
-            ? next
-            : assertSelectableAdapterType(next);
-        })()
+    const nextAdapterType = hasOwn(patchData, "adapterType")
+      ? assertKnownAdapterType(
+          patchData.adapterType as string | null | undefined,
+        )
       : existing.adapterType;
     const requestedAdapterType = nextAdapterType === existing.adapterType
       ? nextAdapterType
@@ -6566,6 +6576,65 @@ export function agentRoutes(
     res.set("Cache-Control", "no-cache, no-store");
     res.json(inspection);
   });
+
+  router.post(
+    "/heartbeat-runs/:runId/provider-trace/reproject-workspace-diffs",
+    async (req, res) => {
+      assertBoard(req);
+      const runId = req.params.runId as string;
+      const run = await getAccessibleResource(
+        req,
+        res,
+        heartbeat.getRun(runId),
+        "Heartbeat run not found",
+      );
+      if (!run) return;
+
+      const trace = await providerTraces.getByRun(run.id, run.companyId);
+      let unavailable: WorkspaceDiffReprojectionSkipReason | null = null;
+      if (!trace || trace.deletedAt) unavailable = { reason: "trace_unavailable" };
+      else if (trace.expiresAt <= new Date()) unavailable = { reason: "trace_expired" };
+      else if (trace.status !== "complete") unavailable = { reason: "trace_incomplete" };
+      if (unavailable !== null) {
+        res.json({ created: 0, skipped: 1, skipReasons: [unavailable] });
+        return;
+      }
+
+      const entries = await providerTraces
+        .readExactEntries(run.id, run.companyId)
+        .catch(() => null);
+      if (entries === null) {
+        res.json({
+          created: 0,
+          skipped: 1,
+          skipReasons: [{ reason: "trace_unavailable" }],
+        });
+        return;
+      }
+      const result = await persistReprojectedWorkspaceDiffs(db, {
+        traceId: trace.id,
+        runId: run.id,
+        companyId: run.companyId,
+        agentId: run.agentId,
+        projection: projectCodexWorkspaceDiffsFromTrace(entries),
+      });
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "local-board",
+        action: "provider_trace.workspace_diffs_reprojected",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          traceId: trace.id,
+          created: result.created,
+          skipped: result.skipped,
+          providerActionsReplayed: 0,
+        },
+      });
+      res.json(result);
+    },
+  );
 
   router.post(
     "/heartbeat-runs/:runId/provider-trace/frames/:frameId/reveal",

@@ -4567,6 +4567,15 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/heartbeat-runs/{runId}/provider-trace/reproject-workspace-diffs",
+  tags: ["runs"],
+  summary: "Reproject retained Codex workspace diffs into run events",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/heartbeat-runs/{runId}/provider-trace/frames/{frameId}/reveal",
   tags: ["runs"],
   summary: "Reveal one exact provider trace frame",
@@ -4606,8 +4615,15 @@ registry.registerPath({
   path: "/api/issues/{id}/queued-comments/{commentId}",
   tags: ["issues"],
   summary: "Edit a queued issue comment",
-  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+  request: {
+    params: z.object({ id: z.string(), commentId: z.string() }),
+    body: jsonBody(z.object({
+      queueId: z.string().min(1),
+      revision: z.string().min(1),
+      body: z.string().min(1).max(200_000),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -4615,8 +4631,15 @@ registry.registerPath({
   path: "/api/issues/{id}/queued-comments/order",
   tags: ["issues"],
   summary: "Reorder queued issue comments",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(z.object({
+      queueId: z.string().min(1),
+      revision: z.string().min(1),
+      orderedCommentIds: z.array(z.string().min(1)).max(500),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -4624,8 +4647,15 @@ registry.registerPath({
   path: "/api/issues/{id}/queued-comments/{commentId}/steer",
   tags: ["issues"],
   summary: "Steer a queued issue comment into the active run",
-  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+  request: {
+    params: z.object({ id: z.string(), commentId: z.string() }),
+    body: jsonBody(z.object({
+      queueId: z.string().min(1),
+      targetRunId: z.string().min(1),
+      revision: z.string().min(1),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
@@ -4633,8 +4663,14 @@ registry.registerPath({
   path: "/api/issues/{id}/queued-comments/{commentId}",
   tags: ["issues"],
   summary: "Delete a queued issue comment",
-  request: { params: z.object({ id: z.string(), commentId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  request: {
+    params: z.object({ id: z.string(), commentId: z.string() }),
+    body: jsonBody(z.object({
+      queueId: z.string().min(1),
+      revision: z.string().min(1),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

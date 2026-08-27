@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -6,12 +6,27 @@ import { join, resolve } from "node:path";
 import { expect, it } from "vitest";
 
 import {
+  NATIVE_RUNTIME_ASSET_SCHEMA,
+  PAPERCLIP_EXECUTION_PROMPT,
+  PAPERCLIP_EXECUTION_PROMPT_REVISION,
+  canonicalNativeRuntimeContextDigest,
+  nativeRuntimePromptDigest,
+  type NativeRuntimeContextSnapshot,
+} from "../contracts/runtime-context.js";
+import { materializeNativeRuntimeSkills } from "../drivers/runtime-context-materializer.js";
+
+import {
   createCapabilityRunnerdCodexTransport,
+  createCapabilityRunnerdProviderEnvironment,
   createSanitizedClaudeManagedEnvironment,
   createSanitizedAwsAgentCoreEnvironment,
   defaultCapabilityRunnerdBinary,
+  expandRunnerdCanonicalNotifications,
   rehydrateRunnerdPlanNotification,
+  rehydrateRunnerdResultNotification,
+  rehydrateRunnerdTurnNotification,
   rehydrateRunnerdUsageNotification,
+  rehydrateRunnerdWorkspaceChangeNotification,
   resolveSourceCodexHome,
   trustedRuntimeReadOnlyRoots,
   unwrapRunnerdProviderNotification,
@@ -40,6 +55,61 @@ it("resolves the ordinary ~/.codex credential home when CODEX_HOME is unset", ()
   ).toBe("/managed/codex");
 });
 
+it("preserves OpenCode runtime bindings when a durable runner is respawned", () => {
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "opencode",
+    options: {
+      provider: "opencode",
+      stateDirectory: "/isolated/session",
+      environment: { PATH: "/bin", OPENROUTER_API_KEY: "test-provider-key" },
+      opencodeCommand: "/provider-pack/opencode",
+      opencodeRuntimeDirectory: "/isolated/session/opencode",
+    },
+    identity: {
+      runnerInstanceId: "runner-1",
+      environmentLeaseId: "lease-1",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+    },
+    codexHome: "/isolated/codex-home",
+    runtimeContextPath: "/isolated/runtime-context.json",
+    hasRuntimeContext: true,
+  });
+  expect(environment).toMatchObject({
+    PAPERCLIP_OPENCODE_COMMAND: "/provider-pack/opencode",
+    PAPERCLIP_OPENCODE_RUNTIME_DIR: "/isolated/session/opencode",
+    PAPERCLIP_RUNNER_INSTANCE_ID: "runner-1",
+    PAPERCLIP_RUN_ID: "run-1",
+    PAPERCLIP_NORMALIZED_SESSION_ID: "session-1",
+    PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH: "/isolated/runtime-context.json",
+    OPENROUTER_API_KEY: "test-provider-key",
+  });
+});
+
+it.each(["opencode", "acpx"] as const)(
+  "advertises runner-managed planning through the %s provider boundary",
+  async (provider) => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-runner-plan-mode-"));
+    const { transport } = createCapabilityRunnerdCodexTransport({
+      provider,
+      stateDirectory: root,
+      ...(provider === "acpx" ? { acpxAgent: "pi" as const } : {}),
+    });
+    try {
+      await expect(
+        transport.request("collaborationMode/list", {}),
+      ).resolves.toMatchObject({
+        data: [{ mode: "plan", model: "runner-managed" }],
+      });
+    } finally {
+      await transport.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 it("allows trusted package-manager runtime roots without exposing HOME paths", () => {
   expect(
     trustedRuntimeReadOnlyRoots({
@@ -47,6 +117,28 @@ it("allows trusted package-manager runtime roots without exposing HOME paths", (
       PATH: "/Users/tester/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
     }),
   ).toEqual(["/opt/homebrew", "/usr/local"]);
+});
+
+it("rejects remote OpenCode before spawn when provider-pack paths are absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "paperclip-runner-remote-pack-"));
+  const { transport } = createCapabilityRunnerdCodexTransport({
+    provider: "opencode",
+    stateDirectory: root,
+    runnerFilesystemRoot: "/workspaces/task/.paperclip-runtime/session",
+  });
+  try {
+    await expect(
+      transport.request("thread/start", {
+        cwd: "/workspaces/task",
+        model: "openrouter/model",
+        baseInstructions: "Complete the task.",
+        dynamicTools: [],
+      }),
+    ).rejects.toThrow("runner_remote_provider_artifact_incompatible");
+  } finally {
+    await transport.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 it("passes only runtime basics and the Anthropic key to a Claude Managed runner", () => {
@@ -90,24 +182,79 @@ it("passes only workload-identity metadata to the AgentCore runner", () => {
   });
 });
 
-it("rehydrates normalized usage with the provider thread binding", () => {
+it("rehydrates normalized usage with the opened driver binding", () => {
   expect(
     rehydrateRunnerdUsageNotification(
       {
-        providerSessionId: "thread-1",
+        providerSessionId: "backend-session-1",
+        threadId: "provider-thread-1",
+        turnId: "durable-turn-1",
         cumulative: { inputTokens: 10 },
         runDelta: { inputTokens: 3 },
       },
-      "fallback-thread",
-      "turn-1",
+      "opened-thread-1",
+      "active-turn-1",
     ),
   ).toMatchObject({
-    threadId: "thread-1",
-    turnId: "turn-1",
+    providerSessionId: "backend-session-1",
+    threadId: "opened-thread-1",
+    turnId: "active-turn-1",
     tokenUsage: {
       total: { inputTokens: 10 },
       runDelta: { inputTokens: 3 },
     },
+  });
+});
+
+it("binds a durable semantic result to the active provider turn", () => {
+  expect(
+    rehydrateRunnerdResultNotification(
+      { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done" },
+      "opened-thread-1",
+      "provider-turn-1",
+      "finish-1",
+    ),
+  ).toEqual({
+    threadId: "opened-thread-1",
+    turnId: "provider-turn-1",
+    itemId: "finish-1",
+    result: {
+      schema: "paperclip.run_result.v1",
+      reportedWorkDisposition: "done",
+    },
+  });
+});
+
+it("binds a canonical runnerd terminal to the active provider turn", () => {
+  expect(
+    rehydrateRunnerdTurnNotification(
+      {
+        turnId: "durable-turn-1",
+        turn: { id: "durable-turn-1", status: "completed", items: [] },
+      },
+      "opened-thread-1",
+      "provider-turn-1",
+      "turn/completed",
+    ),
+  ).toEqual({
+    threadId: "opened-thread-1",
+    turnId: "provider-turn-1",
+    turn: { id: "provider-turn-1", status: "completed", items: [] },
+  });
+});
+
+it("preserves the provider turn assigned by a canonical runnerd start", () => {
+  expect(
+    rehydrateRunnerdTurnNotification(
+      { turn: { id: "provider-turn-1", status: "inProgress" } },
+      "opened-thread-1",
+      "temporary-transport-turn",
+      "turn/started",
+    ),
+  ).toEqual({
+    threadId: "opened-thread-1",
+    turnId: "provider-turn-1",
+    turn: { id: "provider-turn-1", status: "inProgress" },
   });
 });
 
@@ -135,10 +282,79 @@ it("rehydrates normalized plans into the Codex notification contract", () => {
   });
 });
 
+it("rehydrates canonical workspace changes without reconstructing the diff", () => {
+  const workspaceChange = {
+    schema: "paperclip.workspace.diff.v1",
+    changeSetId: "turn-1:workspace",
+    revision: 1,
+    source: "harness_reported",
+    complete: false,
+    files: [{
+      path: "src/index.ts",
+      operation: "modify",
+      previousPath: null,
+      additions: 2,
+      deletions: 1,
+      binary: false,
+      diff: "diff --git a/src/index.ts b/src/index.ts\n",
+    }],
+    totals: { files: 1, additions: 2, deletions: 1 },
+    patchArtifactRef: null,
+  };
+  expect(
+    rehydrateRunnerdWorkspaceChangeNotification(
+      workspaceChange,
+      "thread-1",
+      "turn-1",
+    ),
+  ).toEqual({
+    threadId: "thread-1",
+    turnId: "turn-1",
+    workspaceChange,
+  });
+});
+
 const fakeCodex = resolve(
   import.meta.dirname,
   "../../runner/target/debug/fake-codex-app-server",
 );
+
+function assignedRuntimeContext(skillRoot: string, instructionRoot: string): NativeRuntimeContextSnapshot {
+  const digest = "0".repeat(64);
+  const value = {
+    prompt: {
+      revision: PAPERCLIP_EXECUTION_PROMPT_REVISION,
+      text: PAPERCLIP_EXECUTION_PROMPT,
+      digest: nativeRuntimePromptDigest(),
+    },
+    instructions: {
+      entryPath: "AGENTS.md",
+      bundle: {
+        schema: NATIVE_RUNTIME_ASSET_SCHEMA,
+        digest,
+        manifestDigest: digest,
+        rootPath: instructionRoot,
+        fileCount: 1,
+        totalBytes: 1,
+      },
+    },
+    skills: [{
+      key: "company/assigned",
+      runtimeName: "assigned",
+      versionId: "version-1",
+      bundle: {
+        schema: NATIVE_RUNTIME_ASSET_SCHEMA,
+        digest,
+        manifestDigest: digest,
+        rootPath: skillRoot,
+        fileCount: 1,
+        totalBytes: 1,
+      },
+    }],
+    mcp: { assignmentSetId: "assigned", digest, bindingId: "binding" },
+  } satisfies Omit<NativeRuntimeContextSnapshot, "aggregateDigest">;
+  return { ...value, aggregateDigest: canonicalNativeRuntimeContextDigest(value) };
+}
 
 it("unwraps a coalesced provider notification without losing its turn identity", () => {
   expect(
@@ -172,6 +388,27 @@ it("replays every provider notification from a durable coalesced batch", () => {
     expect.objectContaining({ method: "item/started" }),
     expect.objectContaining({ method: "item/reasoning/summaryTextDelta" }),
     expect.objectContaining({ method: "item/completed" }),
+  ]);
+});
+
+it("expands coalesced canonical items without dropping strict bindings", () => {
+  expect(
+    expandRunnerdCanonicalNotifications("item/started", {
+      coalescedCount: 2,
+      events: [
+        { threadId: "thread-1", turnId: "turn-1", item: { id: "reasoning-1" } },
+        { threadId: "thread-1", turnId: "turn-1", item: { id: "reasoning-2" } },
+      ],
+    }),
+  ).toEqual([
+    {
+      method: "item/started",
+      params: expect.objectContaining({ threadId: "thread-1", turnId: "turn-1" }),
+    },
+    {
+      method: "item/started",
+      params: expect.objectContaining({ threadId: "thread-1", turnId: "turn-1" }),
+    },
   ]);
 });
 
@@ -214,11 +451,19 @@ it("runs the lab provider boundary through authenticated durable PRP", async () 
       input: [{ type: "text", text: "Read the task." }],
     });
     const methods: string[] = [];
+    let terminalParams: Record<string, unknown> | null = null;
     for await (const notification of bundle.transport.notifications()) {
       methods.push(notification.method);
-      if (notification.method === "turn/completed") break;
+      if (notification.method === "turn/completed") {
+        terminalParams = notification.params;
+        break;
+      }
     }
     expect(methods).toContain("turn/completed");
+    expect(terminalParams).toMatchObject({
+      threadId: opened.thread.id,
+      turnId: "fake-turn",
+    });
     expect(bundle.evidence().diagnostics).toContain(
       "runnerd authenticated to the durable PRP control plane",
     );
@@ -374,7 +619,7 @@ it("captures exact provider frames and correlates Rust and TypeScript interpreta
   const bundle = createCapabilityRunnerdCodexTransport({
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
-    codexArgs: [],
+    codexArgs: ["--structured-activity"],
     stateDirectory: join(traceDirectory, "state"),
     environment: {
       PAPERCLIP_PROVIDER_TRACE_PATH: tracePath,
@@ -469,6 +714,14 @@ it("captures exact provider frames and correlates Rust and TypeScript interpreta
       "typescript_codex_driver_normalization",
     ]),
   );
+  expect(
+    rehydratedEntries.find(
+      (entry) => entry.ruleId === "runnerd.rehydrate.workspace.change.updated",
+    ),
+  ).toMatchObject({
+    stage: "typescript_runnerd_rehydration",
+    disposition: "mapped",
+  });
   expect(
     rehydratedEntries.some(
       (entry) =>
@@ -651,6 +904,11 @@ it("attaches a second governed run to one warm runner and provider process", asy
 
 it("cold-restores a suspended provider session under a new run binding", async () => {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-cold-attach-"));
+  const skillRoot = join(stateDirectory, "runtime-skill");
+  const instructionRoot = join(stateDirectory, "runtime-instructions");
+  await Promise.all([mkdir(skillRoot), mkdir(instructionRoot)]);
+  await writeFile(join(skillRoot, "SKILL.md"), "# Assigned runtime skill\n");
+  await writeFile(join(instructionRoot, "AGENTS.md"), "Runtime instructions\n");
   const baseIdentity = {
     runnerInstanceId: "runner-cold-attach",
     environmentLeaseId: "lease-cold-attach",
@@ -662,9 +920,10 @@ it("cold-restores a suspended provider session under a new run binding", async (
   const options = {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
-    codexArgs: [],
+    codexArgs: ["--include-skill-instructions"],
     stateDirectory,
     lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null },
+    runtimeContext: assignedRuntimeContext(skillRoot, instructionRoot),
   };
   const dynamicTools = [
     {
@@ -690,6 +949,8 @@ it("cold-restores a suspended provider session under a new run binding", async (
       cwd: tmpdir(),
       dynamicTools,
     });
+    expect((await stat(join(stateDirectory, "codex-home", "skills", "assigned"))).mode & 0o222).toBe(0);
+    expect((await stat(join(stateDirectory, "codex-home", "skills", "assigned", "SKILL.md"))).mode & 0o222).toBe(0);
     await first.transport.request("turn/start", {
       input: [{ type: "text", text: "first process" }],
     });
@@ -717,6 +978,8 @@ it("cold-restores a suspended provider session under a new run binding", async (
   try {
     const read = await restored.transport.request("thread/read", {});
     expect(read.thread).toMatchObject({ id: "fake-thread" });
+    expect((await stat(join(stateDirectory, "codex-home", "skills", "assigned"))).mode & 0o222).toBe(0);
+    expect((await stat(join(stateDirectory, "codex-home", "skills", "assigned", "SKILL.md"))).mode & 0o222).toBe(0);
     const durable = JSON.parse(
       await readFile(
         join(stateDirectory, "runner", "runner-state.json"),
@@ -742,9 +1005,57 @@ it("cold-restores a suspended provider session under a new run binding", async (
     });
   } finally {
     await restored.transport.close();
+    await materializeNativeRuntimeSkills(null, join(stateDirectory, "codex-home", "skills"));
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("surfaces a runner exit while provider-ingress readiness is still pending", async () => {
+  const neverReady = new Promise<void>(() => undefined);
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerProcessLauncher: () => ({
+      child: {
+        pid: 42,
+        exitCode: 1,
+        signalCode: null,
+        kill: () => true,
+      },
+      completion: Promise.resolve({
+        code: 1,
+        signal: null,
+        stdout: "",
+        stderr: "restored runner could not start",
+      }),
+    }),
+    controlPlaneRegistration: async () => ({
+      connection: {
+        mode: "listen",
+        listenAddress: "0.0.0.0",
+        listenPort: 43_127,
+        listenPath: "/api/runner/v1/connect/run-ingress-exit",
+      },
+      ready: () => neverReady,
+      startupFailureCode: "runner_ingress_unavailable",
+      release: () => undefined,
+    }),
+  });
+  bundle.transport.setServerRequestHandler(async () => ({
+    success: true,
+    contentItems: [],
+  }));
+  try {
+    await expect(
+      bundle.transport.request("thread/start", {
+        cwd: tmpdir(),
+        dynamicTools: [],
+      }),
+    ).rejects.toThrow(
+      "runner_ingress_unavailable: runnerd exited unexpectedly with code 1: restored runner could not start",
+    );
+  } finally {
+    await bundle.transport.close();
+  }
+});
 
 it("rejects the notification stream promptly when runnerd exits after accepting a turn", async () => {
   const bundle = createCapabilityRunnerdCodexTransport({

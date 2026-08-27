@@ -1,6 +1,16 @@
+import { createHash } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns, issueApprovals, issueComments, issues, issueThreadInteractions } from "@paperclipai/db";
+import {
+  agents,
+  documentRevisions,
+  heartbeatRuns,
+  issueApprovals,
+  issueComments,
+  issueDocuments,
+  issues,
+  issueThreadInteractions,
+} from "@paperclipai/db";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../vendor/paperclip-runner/index.js";
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
@@ -12,7 +22,7 @@ import { persistActivity, publishActivity } from "../activity-log.js";
 const IMPLEMENTED_OPERATIONS = new Set([
   "get_task_context", "get_task_history", "search_tasks", "report_progress",
   "request_human_input",
-  "create_task",
+  "create_task", "set_dependencies",
   "list_documents", "read_document", "list_document_revisions", "write_document",
   "list_agents", "get_agent", "list_approvals", "get_approval", "get_approval_context",
 ]);
@@ -23,7 +33,6 @@ type Binding = {
   runId: string;
   agentId: string;
   workMode?: "standard" | "planning" | "ask";
-  acceptedPlanContinuation?: boolean;
   enqueueWakeup?: (agentId: string, options: {
     source: "assignment";
     triggerDetail: "system";
@@ -65,17 +74,7 @@ export class PaperclipRunnerToolAuthority {
     return CAPABILITY_SEMANTIC_TOOL_CATALOG
       .filter((descriptor) =>
         IMPLEMENTED_OPERATIONS.has(descriptor.operationId)
-        && (
-          descriptor.allowedModes.includes(workMode)
-          || (
-            descriptor.operationId === "create_task"
-            && this.binding.acceptedPlanContinuation === true
-          )
-        )
-        && (
-          descriptor.operationId !== "create_task"
-          || this.binding.acceptedPlanContinuation === true
-        )
+        && descriptor.allowedModes.includes(workMode)
       )
       .map((descriptor) => ({
         name: descriptor.operationId,
@@ -88,11 +87,8 @@ export class PaperclipRunnerToolAuthority {
     if (!IMPLEMENTED_OPERATIONS.has(call.tool)) throw new Error("paperclip_runner_tool_not_advertised");
     const context = await this.#boundContext();
     const descriptor = CAPABILITY_SEMANTIC_TOOL_CATALOG.find((candidate) => candidate.operationId === call.tool);
-    const acceptedPlanCreate = call.tool === "create_task"
-      && this.binding.acceptedPlanContinuation === true;
-    if (!descriptor || (
-      !descriptor.allowedModes.includes(context.issue.workMode as "standard" | "planning" | "ask")
-      && !acceptedPlanCreate
+    if (!descriptor || !descriptor.allowedModes.includes(
+      context.issue.workMode as "standard" | "planning" | "ask",
     )) {
       throw new Error("paperclip_runner_tool_mode_denied");
     }
@@ -103,6 +99,7 @@ export class PaperclipRunnerToolAuthority {
         actor: context.actor,
         activeTask: context.issue,
         run: { id: this.binding.runId },
+        acceptedPlan: await this.#acceptedPlan(context.run.contextSnapshot),
       };
       case "get_task_history": {
         const limit = boundedLimit(input.limit);
@@ -151,7 +148,8 @@ export class PaperclipRunnerToolAuthority {
       }
       case "report_progress": return this.#reportProgress(call.callId, input, context.issue);
       case "request_human_input": return this.#requestHumanInput(input, context.issue);
-      case "create_task": return this.#createAcceptedPlanTask(input);
+      case "create_task": return this.#createTask(input);
+      case "set_dependencies": return this.#setDependencies(input);
       default: throw new Error("paperclip_runner_tool_not_bound");
     }
   }
@@ -292,15 +290,8 @@ export class PaperclipRunnerToolAuthority {
     return result;
   }
 
-  async #createAcceptedPlanTask(input: Record<string, unknown>): Promise<unknown> {
-    if (!this.binding.acceptedPlanContinuation) {
-      throw new Error("paperclip_runner_tool_mode_denied");
-    }
+  async #createTask(input: Record<string, unknown>): Promise<unknown> {
     const idempotencyKey = requiredString(input.idempotencyKey);
-    const acceptedPlanRevisionId = await this.#acceptedPlanRevisionId();
-    if (!acceptedPlanRevisionId) {
-      throw new Error("paperclip_runner_accepted_plan_revision_not_found");
-    }
     const assigneeAgentId = input.assigneeActorId === null || input.assigneeActorId === undefined
       ? this.binding.agentId
       : requiredString(input.assigneeActorId);
@@ -314,61 +305,119 @@ export class PaperclipRunnerToolAuthority {
       : "medium";
     const blockedByIssueIds = Array.isArray(input.blockedByTaskIds)
       ? input.blockedByTaskIds.map(requiredString)
-      : undefined;
+      : [];
+    const durableIdempotencyKey =
+      `paperclip-runner:create-task:${this.binding.issueId}:${idempotencyKey}`;
+    const inputFingerprint = createHash("sha256")
+      .update(canonicalJson(input))
+      .digest("hex");
     const result = await this.#withMutationReceipt("create_task", idempotencyKey, input, async (tx) => {
-      const decomposition = await issueService(tx).decomposeAcceptedPlan(this.binding.issueId, {
-        acceptedPlanRevisionId,
-        children: [{
-          title: requiredString(input.title),
-          description: input.description === null || input.description === undefined
-            ? null
-            : requiredString(input.description),
-          status: "todo",
-          workMode: "standard",
-          priority,
-          assigneeAgentId,
-          ...(blockedByIssueIds ? { blockedByIssueIds } : {}),
-          blockParentUntilDone: true,
-          actorAgentId: this.binding.agentId,
-          actorRunId: this.binding.runId,
-        }],
+      const existingChild = await tx.select().from(issues).where(and(
+        eq(issues.companyId, this.binding.companyId),
+        eq(issues.parentId, this.binding.issueId),
+        eq(issues.originId, durableIdempotencyKey),
+      )).limit(1).then((rows) => rows[0] ?? null);
+      if (existingChild) {
+        if (existingChild.originFingerprint !== inputFingerprint) {
+          throw new Error("paperclip_runner_tool_idempotency_conflict");
+        }
+        return {
+          commandId: `create-task:${existingChild.id}`,
+          disposition: "duplicate",
+          stateRevision: existingChild.statusVersion,
+          entityRefs: [existingChild.id],
+          scheduledWakeIds: [],
+          task: {
+            id: existingChild.id,
+            identifier: existingChild.identifier,
+            parentId: existingChild.parentId,
+            status: existingChild.status,
+            assigneeActorId: existingChild.assigneeAgentId,
+          },
+        };
+      }
+      let deduplicated = false;
+      const created = await issueService(tx).createChild(this.binding.issueId, {
+        title: requiredString(input.title),
+        description: input.description === null || input.description === undefined
+          ? null
+          : requiredString(input.description),
+        status: blockedByIssueIds.length > 0 ? "blocked" : "todo",
+        workMode: "standard",
+        priority,
+        assigneeAgentId,
+        blockedByIssueIds,
+        blockParentUntilDone: false,
+        createdByAgentId: this.binding.agentId,
+        originKind: "manual",
+        originId: durableIdempotencyKey,
+        originFingerprint: inputFingerprint,
         actorAgentId: this.binding.agentId,
         actorRunId: this.binding.runId,
+        idempotencyKey: durableIdempotencyKey,
+        onDeduplicated: () => { deduplicated = true; },
       });
-      const child = decomposition.childIssues[0];
-      if (!child) throw new Error("paperclip_runner_accepted_plan_child_not_created");
+      const child = created.issue;
+      if (deduplicated && child.originFingerprint !== inputFingerprint) {
+        throw new Error("paperclip_runner_tool_idempotency_conflict");
+      }
+      let childStatus = child.status;
+      let childStatusVersion = child.statusVersion;
+      if (child.status === "blocked" && blockedByIssueIds.length > 0) {
+        const readiness = await issueService(tx).getDependencyReadiness(child.id, tx);
+        if (readiness.isDependencyReady) {
+          const readyChild = await issueService(tx).update(child.id, {
+            status: "todo",
+            actorAgentId: this.binding.agentId,
+          }, tx);
+          if (readyChild) {
+            childStatus = readyChild.status;
+            childStatusVersion = readyChild.statusVersion;
+          }
+        }
+      }
+      const wakeId = `created-child:${child.id}`;
+      const shouldWake = !deduplicated && childStatus === "todo" && Boolean(child.assigneeAgentId);
       return {
-        commandId: `accepted-plan:${acceptedPlanRevisionId}`,
-        disposition: decomposition.newlyCreatedIssues.length > 0 ? "applied" : "duplicate",
-        stateRevision: 1,
+        commandId: `create-task:${child.id}`,
+        disposition: deduplicated ? "duplicate" : "applied",
+        stateRevision: childStatusVersion,
         entityRefs: [child.id],
-        scheduledWakeIds: [`accepted-plan-child:${child.id}`],
-        childIssue: child,
-        acceptedPlanRevisionId,
-        decompositionId: decomposition.decomposition.id,
+        scheduledWakeIds: shouldWake ? [wakeId] : [],
+        task: {
+          id: child.id,
+          identifier: child.identifier,
+          parentId: child.parentId,
+          status: childStatus,
+          assigneeActorId: child.assigneeAgentId,
+        },
       };
     }) as Record<string, unknown>;
 
-    const child = record(result.childIssue);
-    const childId = requiredString(child.id);
-    if (this.binding.enqueueWakeup) {
-      await this.binding.enqueueWakeup(assigneeAgentId, {
+    const task = record(result.task);
+    const childId = requiredString(task.id);
+    const scheduledWakeIds = Array.isArray(result.scheduledWakeIds)
+      ? result.scheduledWakeIds.filter((value): value is string => typeof value === "string")
+      : [];
+    const assignedAgentId = typeof task.assigneeActorId === "string"
+      ? task.assigneeActorId
+      : null;
+    if (this.binding.enqueueWakeup && assignedAgentId && scheduledWakeIds.length > 0) {
+      await this.binding.enqueueWakeup(assignedAgentId, {
         source: "assignment",
         triggerDetail: "system",
         reason: "issue_assigned",
         payload: {
           issueId: childId,
-          mutation: "accepted_plan_decomposition",
-          acceptedPlanRevisionId,
+          mutation: "create_child",
           parentIssueId: this.binding.issueId,
         },
-        idempotencyKey: `accepted-plan-child:${acceptedPlanRevisionId}:${childId}`,
+        idempotencyKey: scheduledWakeIds[0]!,
         requestedByActorType: "agent",
         requestedByActorId: this.binding.agentId,
         contextSnapshot: {
           issueId: childId,
           source: "paperclip_runner.create_task",
-          acceptedPlanRevisionId,
           parentIssueId: this.binding.issueId,
         },
       });
@@ -376,7 +425,65 @@ export class PaperclipRunnerToolAuthority {
     return result;
   }
 
-  async #acceptedPlanRevisionId(): Promise<string | null> {
+  async #setDependencies(input: Record<string, unknown>): Promise<unknown> {
+    const idempotencyKey = requiredString(input.idempotencyKey);
+    if (!Array.isArray(input.blockedByTaskIds)) {
+      throw new Error("paperclip_runner_tool_input_invalid");
+    }
+    const blockedByIssueIds = input.blockedByTaskIds.map(requiredString);
+    return this.#withMutationReceipt("set_dependencies", idempotencyKey, input, async (tx) => {
+      const updated = await issueService(tx).update(this.binding.issueId, {
+        blockedByIssueIds,
+        actorAgentId: this.binding.agentId,
+      }, tx);
+      if (!updated) throw new Error("paperclip_runner_task_not_found");
+      return {
+        commandId: `set-dependencies:${updated.id}:${updated.statusVersion}`,
+        disposition: "applied",
+        stateRevision: updated.statusVersion,
+        entityRefs: [updated.id, ...blockedByIssueIds],
+        scheduledWakeIds: [],
+      };
+    });
+  }
+
+  async #acceptedPlan(contextSnapshot: unknown): Promise<{
+    documentId: string;
+    revisionId: string;
+    revisionNumber: number;
+    markdown: string;
+  } | null> {
+    const acceptedTarget = record(
+      record(record(contextSnapshot).planReviewInteraction).acceptedTargetRevision,
+    );
+    let revisionId = typeof acceptedTarget.revisionId === "string"
+      ? acceptedTarget.revisionId
+      : null;
+    if (!revisionId) revisionId = await this.#latestAcceptedPlanRevisionId();
+    if (!revisionId) return null;
+
+    const [revision] = await this.db.select({
+      documentId: documentRevisions.documentId,
+      revisionId: documentRevisions.id,
+      revisionNumber: documentRevisions.revisionNumber,
+      markdown: documentRevisions.body,
+    })
+      .from(documentRevisions)
+      .innerJoin(issueDocuments, and(
+        eq(issueDocuments.documentId, documentRevisions.documentId),
+        eq(issueDocuments.companyId, this.binding.companyId),
+        eq(issueDocuments.issueId, this.binding.issueId),
+        eq(issueDocuments.key, "plan"),
+      ))
+      .where(and(
+        eq(documentRevisions.id, revisionId),
+        eq(documentRevisions.companyId, this.binding.companyId),
+      ))
+      .limit(1);
+    return revision ?? null;
+  }
+
+  async #latestAcceptedPlanRevisionId(): Promise<string | null> {
     const rows = await this.db.select({ payload: issueThreadInteractions.payload })
       .from(issueThreadInteractions)
       .where(and(

@@ -38,6 +38,7 @@ import {
   createProviderTraceFileSink,
   type ProviderTraceFileSink,
 } from "../../contracts/provider-trace-file-sink.js";
+import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
 
 const PI_PERMISSION_TOOL = "__paperclip_runtime_permission";
 const PI_INPUT_TOOL = "__paperclip_runtime_input";
@@ -97,6 +98,7 @@ export interface AcpxRuntimeHostOptions {
   workingDirectory: string;
   agent: QualifiedAcpxAgent;
   model: string;
+  permissionMode?: NativeAcpxPermissionMode;
   systemInstructions?: string;
   runtimeContext?: NativeRuntimeContextSnapshot | null;
   expectedIdentity?: {
@@ -109,6 +111,7 @@ export interface AcpxRuntimeHostOptions {
     workspaceDigest: string;
     requestedModel: string;
     effectiveModel: string;
+    permissionMode?: NativeAcpxPermissionMode;
   };
   environment?: NodeJS.ProcessEnv;
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
@@ -133,6 +136,7 @@ export interface AcpxRuntimeIdentity {
   agentSessionId: string;
   requestedModel: string;
   effectiveModel: string;
+  permissionMode: NativeAcpxPermissionMode;
   profile: QualifiedAcpxProfile;
   commandPath: string;
   commandDigest: string;
@@ -196,6 +200,8 @@ export class AcpxRuntimeHost {
   }
 
   static async open(options: AcpxRuntimeHostOptions): Promise<AcpxRuntimeHost> {
+    const permissionMode = options.permissionMode
+      ?? (options.expectedIdentity ? options.expectedIdentity.permissionMode ?? "approve-reads" : "approve-all");
     const profile = resolveQualifiedAcpxProfile(options.agent, options.model);
     const cwd = validateWorkspace(options.workingDirectory);
     const root = sessionRoot(options.runtimeDirectory, options.normalizedSessionId);
@@ -217,7 +223,15 @@ export class AcpxRuntimeHost {
     });
     const traceState = { latestInboundFrameId: null as number | null };
     if (options.expectedIdentity) {
-      await verifyExpectedIdentity(options.expectedIdentity, root, options.normalizedSessionId, cwd, profile, options.model);
+      await verifyExpectedIdentity(
+        options.expectedIdentity,
+        root,
+        options.normalizedSessionId,
+        cwd,
+        profile,
+        options.model,
+        permissionMode,
+      );
     }
     await writeFile(join(root, "workspace"), `${cwd}\n`, { mode: 0o600 });
     if (options.agent === "pi") {
@@ -292,7 +306,13 @@ export class AcpxRuntimeHost {
         } : {}),
       } : {}),
       ...(options.agent === "claude" ? { CLAUDE_CONFIG_DIR: agentHome } : {}),
-      ...(options.agent === "codex" ? { CODEX_HOME: agentHome } : {}),
+      ...(options.agent === "codex" ? {
+        CODEX_HOME: agentHome,
+        NO_BROWSER: "1",
+        ...((options.environment?.CODEX_API_KEY || options.environment?.OPENAI_API_KEY)
+          ? { DEFAULT_AUTH_REQUEST: JSON.stringify({ methodId: "api-key" }) }
+          : {}),
+      } : {}),
       PAPERCLIP_ACPX_PROFILE: options.agent,
       PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
     }, options.agent);
@@ -313,7 +333,7 @@ export class AcpxRuntimeHost {
       url: nativeMcp.url,
       headers: [{ name: "Authorization", value: `Bearer ${nativeMcp.token}` }],
     }] : [])];
-    const routeAgentStderr = createAgentStderrRouter(
+    const agentStderr = createAgentStderrRouter(
       agentEnvironment,
       options.onUsage,
       options.onDiagnostic,
@@ -327,13 +347,9 @@ export class AcpxRuntimeHost {
         overrides: { [options.agent]: [process.execPath, command.path] },
       }),
       mcpServers,
-      permissionMode: "approve-reads",
+      permissionMode,
       nonInteractivePermissions: "fail",
-      permissionPolicy: {
-        autoApprove: ["read", "search", "list"],
-        escalate: ["execute", "write", "edit", "delete", "move"],
-        defaultAction: "escalate",
-      },
+      permissionPolicy: acpxPermissionPolicy(permissionMode),
       // Paperclip routes durable user interaction through PRP semantic tools.
       // Advertising ACP form elicitation to Codex diverts MCP-tool approvals
       // into a separate UI callback that this headless runner does not own.
@@ -358,12 +374,17 @@ export class AcpxRuntimeHost {
         )) {
           return { outcome: "allow_once" };
         }
+        if (permissionMode === "approve-all") return { outcome: "allow_once" };
+        if (permissionMode === "deny-all") return { outcome: "reject_once" };
+        if (["read", "search", "list"].includes(request.inferredKind ?? "")) {
+          return { outcome: "allow_once" };
+        }
         return options.onPermissionRequest
           ? options.onPermissionRequest({ request, signal: context.signal })
           : { outcome: "reject_once" };
       },
       spawnEnvironment: () => ({ ...agentEnvironment }),
-      onAgentStderr: routeAgentStderr,
+      onAgentStderr: agentStderr.push,
       onAcpMessage: (direction, message) => {
         try {
           const raw = `${JSON.stringify(message)}\n`;
@@ -432,6 +453,7 @@ export class AcpxRuntimeHost {
         agentSessionId: requiredIdentity(status.agentSessionId ?? handle.agentSessionId ?? backendSessionId, "agent session"),
         requestedModel: options.model,
         effectiveModel: requiredIdentity(status.models?.currentModelId, "effective model"),
+        permissionMode,
         profile,
         commandPath: command.path,
         commandDigest: command.digest,
@@ -442,6 +464,7 @@ export class AcpxRuntimeHost {
         agentSessionId: identity.agentSessionId,
         requestedModel: identity.requestedModel,
         effectiveModel: identity.effectiveModel,
+        permissionMode: identity.permissionMode,
         profileDigest: profile.commandDigest,
       }, null, 2)}\n`, { mode: 0o600 });
       return new AcpxRuntimeHost({
@@ -457,6 +480,7 @@ export class AcpxRuntimeHost {
         onElicitation: options.onElicitation,
       });
     } catch (error) {
+      agentStderr.flush();
       if (handle) {
         await runtime.close({ handle, reason: "ACPX startup failed", discardPersistentState: false }).catch(() => {});
       }
@@ -627,13 +651,37 @@ async function stageManagedCodexCredential(
   agentHome: string,
   options: AcpxRuntimeHostOptions,
 ): Promise<string[]> {
-  if (options.environment?.OPENAI_API_KEY || options.environment?.CODEX_API_KEY) return [];
+  const destination = join(agentHome, "auth.json");
+  if (options.environment?.OPENAI_API_KEY || options.environment?.CODEX_API_KEY) {
+    // codex-acp persists the selected API-key credential into CODEX_HOME during
+    // authentication. Treat that provider-generated file as ephemeral too.
+    return [destination];
+  }
+  const inlineCredential = options.environment?.PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET;
+  if (inlineCredential) {
+    const credential = Buffer.from(inlineCredential, "utf8");
+    try {
+      if (credential.length <= 0 || credential.length > 256 * 1024) {
+        throw new Error("Managed Codex credential document exceeds the bounded size");
+      }
+      const parsed = JSON.parse(credential.toString("utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("invalid credential document");
+      }
+      await writeFile(destination, credential, { mode: 0o600 });
+      return [destination];
+    } finally {
+      credential.fill(0);
+    }
+  }
   const source = options.managedCredentialSources?.codexAuthPath ?? join(homedir(), ".codex", "auth.json");
   let metadata;
   try {
     metadata = await stat(source);
   } catch {
-    return [];
+    throw new Error(
+      "provider_initialize_protocol_error: provider=acpx stage=credential.stage managed Codex credential missing",
+    );
   }
   if (!metadata.isFile() || metadata.size <= 0 || metadata.size > 256 * 1024) {
     throw new Error("Managed Codex credential source is not a bounded regular file");
@@ -648,7 +696,6 @@ async function stageManagedCodexCredential(
     credential.fill(0);
     throw new Error("Managed Codex credential source is malformed");
   }
-  const destination = join(agentHome, "auth.json");
   try {
     await writeFile(destination, credential, { mode: 0o600 });
     await chmod(destination, 0o600);
@@ -669,6 +716,7 @@ async function verifyExpectedIdentity(
   cwd: string,
   profile: QualifiedAcpxProfile,
   model: string,
+  permissionMode: NativeAcpxPermissionMode,
 ): Promise<void> {
   if (
     expected.normalizedSessionId !== normalizedSessionId
@@ -676,6 +724,7 @@ async function verifyExpectedIdentity(
     || expected.workspaceDigest !== workspaceDigest(cwd)
     || expected.requestedModel !== model
     || expected.effectiveModel !== model
+    || (expected.permissionMode ?? permissionMode) !== permissionMode
   ) throw new Error("ACPX recovery identity conflicts with the immutable session configuration");
   let persisted: Record<string, unknown>;
   try {
@@ -690,7 +739,24 @@ async function verifyExpectedIdentity(
     || persisted.profileDigest !== expected.profileDigest
     || persisted.requestedModel !== expected.requestedModel
     || persisted.effectiveModel !== expected.effectiveModel
+    || (persisted.permissionMode ?? "approve-reads") !== permissionMode
   ) throw new Error("ACPX recovery identity does not match the persisted runtime record");
+}
+
+function acpxPermissionPolicy(
+  mode: NativeAcpxPermissionMode,
+): NonNullable<AcpRuntimeOptions["permissionPolicy"]> {
+  if (mode === "approve-all") {
+    return { defaultAction: "approve" };
+  }
+  if (mode === "deny-all") {
+    return { defaultAction: "deny" };
+  }
+  return {
+    autoApprove: ["read", "search", "list"],
+    escalate: ["execute", "write", "edit", "delete", "move"],
+    defaultAction: "escalate",
+  };
 }
 
 async function requireVerifiedModel(
@@ -780,7 +846,12 @@ async function resolvePiRuntimeCommand(profile: QualifiedAcpxProfile): Promise<s
     ? packageJson.bin
     : packageJson.bin?.pi;
   if (!relativeBin) throw new Error("Qualified Pi runtime does not expose the pi executable");
-  return resolve(dirname(packageJsonPath), relativeBin);
+  const portableLauncher = resolve(dirname(packageJsonPath), "../../.bin/pi");
+  const launcherStat = await stat(portableLauncher);
+  if (!launcherStat.isFile() || (launcherStat.mode & 0o111) === 0) {
+    throw new Error("Qualified Pi runtime launcher is not executable");
+  }
+  return portableLauncher;
 }
 
 function resolvePackageJson(packageName: string): string {
@@ -936,6 +1007,9 @@ async function requestPiPermission(
   const target = typeof value.target === "string" ? value.target.slice(0, 4_096) : null;
   const rule = JSON.stringify({ operation, target });
   if (acceptedRules.has(rule)) return { decision: "accept_for_session" };
+  const permissionMode = options.permissionMode ?? "approve-all";
+  if (permissionMode === "approve-all") return { decision: "accept_for_session" };
+  if (permissionMode === "deny-all") return { decision: "decline" };
   if (!options.onPermissionRequest || signal.aborted) return { decision: "cancel" };
   const inferredKind = operation === "bash" ? "execute" : "edit";
   const decision = await options.onPermissionRequest({
@@ -1065,21 +1139,30 @@ function createAgentStderrRouter(
   environment: NodeJS.ProcessEnv,
   onUsage?: (usage: AcpxRuntimeUsage) => void,
   onDiagnostic?: (message: string) => void,
-): (chunk: string) => void {
+): { push: (chunk: string) => void; flush: () => void } {
   let pending = "";
-  return (chunk) => {
-    pending = `${pending}${chunk}`.slice(-128 * 1024);
-    const lines = pending.split(/\r?\n/);
-    pending = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.startsWith(PI_USAGE_PREFIX)) {
-        const usage = parsePiUsage(line.slice(PI_USAGE_PREFIX.length));
-        if (usage) onUsage?.(usage);
-        else onDiagnostic?.("Pi emitted a malformed bounded usage notification.");
-        continue;
-      }
-      if (line) onDiagnostic?.(redactDiagnostic(line, environment));
+  const emitLine = (line: string): void => {
+    if (line.startsWith(PI_USAGE_PREFIX)) {
+      const usage = parsePiUsage(line.slice(PI_USAGE_PREFIX.length));
+      if (usage) onUsage?.(usage);
+      else onDiagnostic?.("Pi emitted a malformed bounded usage notification.");
+      return;
     }
+    if (line) onDiagnostic?.(redactDiagnostic(line, environment));
+  };
+  return {
+    push: (chunk) => {
+      pending = `${pending}${chunk}`.slice(-128 * 1024);
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      for (const line of lines) emitLine(line);
+    },
+    flush: () => {
+      if (!pending) return;
+      const trailing = pending;
+      pending = "";
+      emitLine(trailing);
+    },
   };
 }
 

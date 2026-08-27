@@ -568,6 +568,7 @@ export interface PaperclipQuestionOption {
   id: string;
   label: string;
   description?: string;
+  recommended?: boolean;
 }
 
 export interface PaperclipQuestion {
@@ -638,7 +639,11 @@ export interface CLIAdapterModule {
 
 export interface CreateConfigValues {
   adapterType: string;
-  paperclipRunnerProvider?: "codex" | "opencode";
+  paperclipRunnerProvider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  paperclipRunnerAcpxAgent?: "pi" | "claude" | "codex";
+  codexPermissionMode?: "never" | "on-request" | "untrusted";
+  opencodePermissionMode?: "allow" | "ask" | "deny";
+  acpxPermissionMode?: "approve-all" | "approve-reads" | "deny-all";
   paperclipRunnerLifecycleMode?: "per_turn" | "warm";
   paperclipRunnerIdleTimeoutMs?: number;
   cwd: string;

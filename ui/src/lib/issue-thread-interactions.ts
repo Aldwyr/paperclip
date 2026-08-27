@@ -59,6 +59,19 @@ export interface SuggestedTaskTreeNode {
   children: SuggestedTaskTreeNode[];
 }
 
+/**
+ * These takeovers already expose a deliberate non-accept path in their form.
+ * Showing the composer's generic Skip beside Reject/Revise duplicates that
+ * escape hatch and makes the action hierarchy ambiguous.
+ */
+export function interactionReplacesComposerSkip(
+  interaction: IssueThreadInteraction,
+): boolean {
+  return interaction.kind === "request_confirmation"
+    || interaction.kind === "request_checkbox_confirmation"
+    || interaction.kind === "suggest_tasks";
+}
+
 export function isIssueThreadInteraction(
   value: unknown,
 ): value is IssueThreadInteraction {
@@ -183,6 +196,7 @@ export function buildIssueThreadInteractionSummary(
   const administrativeOutcome = interaction.result && "outcome" in interaction.result
     ? interaction.result.outcome
     : null;
+  if (administrativeOutcome === "skipped") return "Skipped interaction";
   if (administrativeOutcome === "withdrawn") return "Withdrawn interaction";
   if (administrativeOutcome === "issue_closed") return "Expired when issue closed";
   if (administrativeOutcome === "addressee_deleted") return "Cancelled when addressee was deleted";

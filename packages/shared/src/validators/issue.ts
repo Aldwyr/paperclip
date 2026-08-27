@@ -818,7 +818,7 @@ export const suggestTasksResultCreatedTaskSchema = z.object({
 
 export const suggestTasksResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["withdrawn", "issue_closed", "addressee_deleted"]).optional(),
+  outcome: z.enum(["skipped", "withdrawn", "issue_closed", "addressee_deleted"]).optional(),
   reason: z.string().trim().max(4000).nullable().optional(),
   createdTasks: z.array(suggestTasksResultCreatedTaskSchema).max(50).optional(),
   skippedClientKeys: z.array(z.string().trim().min(1).max(120)).max(50).optional(),
@@ -850,6 +850,7 @@ const paperclipQuestionOptionSchema = z.object({
   id: z.string().min(1).max(160),
   label: z.string().min(1).max(1000),
   description: z.string().max(4000).optional(),
+  recommended: z.boolean().optional(),
 });
 
 const paperclipQuestionSchema = z.object({
@@ -891,6 +892,8 @@ export const askUserQuestionsPayloadSchema = z.object({
   questions: z.array(askUserQuestionsQuestionSchema).min(1).max(64),
   /** Exact canonical presentation retained for a recovered harness request. */
   questionSet: paperclipQuestionSetSchema.optional(),
+  /** Stable correlation for draft handoff from a live runtime request. */
+  runtimeRequestId: z.string().trim().min(1).max(255).nullable().optional(),
 }).superRefine((value, ctx) => {
   const seenQuestionIds = new Set<string>();
   for (const [questionIndex, question] of value.questions.entries()) {
@@ -936,7 +939,7 @@ export const askUserQuestionsAnswerSchema = z.object({
 
 export const askUserQuestionsResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["withdrawn", "issue_closed", "addressee_deleted"]).optional(),
+  outcome: z.enum(["skipped", "withdrawn", "issue_closed", "addressee_deleted"]).optional(),
   reason: z.string().trim().max(4000).nullable().optional(),
   answers: z.array(askUserQuestionsAnswerSchema).max(64),
   cancelled: z.literal(true).optional(),
@@ -1163,6 +1166,7 @@ export const requestConfirmationResultSchema = z.object({
     "superseded_by_comment",
     "superseded_by_newer_request",
     "stale_target",
+    "skipped",
     "withdrawn",
     "issue_closed",
     "addressee_deleted",
@@ -1307,7 +1311,7 @@ export const requestItemVerdictsResultItemSchema = z.object({
 
 export const requestItemVerdictsResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled", "withdrawn", "issue_closed", "addressee_deleted"]),
+  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled", "skipped", "withdrawn", "issue_closed", "addressee_deleted"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   complete: z.boolean(),
   items: z.array(requestItemVerdictsResultItemSchema)
@@ -1437,6 +1441,11 @@ export const cancelIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
 });
 export type CancelIssueThreadInteraction = z.infer<typeof cancelIssueThreadInteractionSchema>;
+
+export const skipIssueThreadInteractionSchema = z.object({
+  reason: z.string().trim().max(4000).optional(),
+});
+export type SkipIssueThreadInteraction = z.infer<typeof skipIssueThreadInteractionSchema>;
 
 export const withdrawIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),

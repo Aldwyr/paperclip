@@ -10,6 +10,7 @@ const CONNECT_PATH_PREFIX = "/api/runner/v1/connect/";
 
 type Registration = {
   authority: DurablePrpControlPlane;
+  companyId: string | null;
   generation: symbol;
   runtimeRequestResolutions: Map<string, { fingerprint: string; commandId: string }>;
 };
@@ -30,8 +31,25 @@ function rejectUpgrade(socket: Duplex, status: 400 | 404 | 409, message: string)
   }
 }
 
-export function setupRunnerPrpWebSocketServer(server: Server, options: { port: number }): void {
-  loopbackOrigin = `ws://127.0.0.1:${options.port}`;
+export function setupRunnerPrpWebSocketServer(
+  server: Server,
+  options: { port: number } | { apiUrl: string },
+): void {
+  if ("apiUrl" in options) {
+    const apiUrl = new URL(options.apiUrl);
+    if (apiUrl.protocol !== "http:" && apiUrl.protocol !== "https:") {
+      throw new Error("runner_prp_websocket_api_url_invalid");
+    }
+    apiUrl.protocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+    apiUrl.username = "";
+    apiUrl.password = "";
+    apiUrl.pathname = "";
+    apiUrl.search = "";
+    apiUrl.hash = "";
+    loopbackOrigin = apiUrl.toString().replace(/\/$/, "");
+  } else {
+    loopbackOrigin = `ws://127.0.0.1:${options.port}`;
+  }
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(request.url ?? "/", "http://paperclip.invalid");
     if (!url.pathname.startsWith(CONNECT_PATH_PREFIX)) return;
@@ -54,6 +72,7 @@ export function setupRunnerPrpWebSocketServer(server: Server, options: { port: n
 }
 
 export async function registerRunnerPrpAuthority(input: {
+  companyId?: string;
   runId: string;
   authority: DurablePrpControlPlane;
 }): Promise<{ connectUrl: string; release: () => Promise<void> }> {
@@ -62,6 +81,7 @@ export async function registerRunnerPrpAuthority(input: {
   const generation = Symbol(input.runId);
   registrations.set(input.runId, {
     authority: input.authority,
+    companyId: input.companyId ?? null,
     generation,
     runtimeRequestResolutions: new Map(),
   });
@@ -120,6 +140,9 @@ export function queueRunnerPrpRuntimeRequestResolution(input: {
 
 export const runnerPrpWebSocketInternals = {
   connectPathPrefix: CONNECT_PATH_PREFIX,
+  activeRegistration(input: { companyId: string; runId: string }): boolean {
+    return registrations.get(input.runId)?.companyId === input.companyId;
+  },
   resetForTests(): void {
     registrations.clear();
     loopbackOrigin = null;

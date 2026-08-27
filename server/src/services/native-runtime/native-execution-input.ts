@@ -1,7 +1,10 @@
 import type {
   NativeAcpxAgent,
-  NativeExecutionInputV3,
+  NativeAcpxPermissionMode,
+  NativeCodexApprovalPolicy,
+  NativeExecutionInputV4,
   NativeInteractionResponseEnvelope,
+  NativeOpenCodePermissionMode,
   NativePlanningContext,
   NativeRuntimeContextSnapshot,
   StrictCompletionContractInput,
@@ -43,6 +46,9 @@ export function buildNativeExecutionInput(input: {
   normalizedSessionId: string | null;
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   acpxAgent?: NativeAcpxAgent;
+  codexApprovalPolicy?: NativeCodexApprovalPolicy;
+  opencodePermissionMode?: NativeOpenCodePermissionMode;
+  acpxPermissionMode?: NativeAcpxPermissionMode;
   model?: string | null;
   managedProfile?: {
     profileId: string;
@@ -72,7 +78,7 @@ export function buildNativeExecutionInput(input: {
   };
   maxEstimatedSessionCostUsd?: number;
   invocationLimits?: { maxIterations: number; maxOutputTokens: number; timeoutSeconds: number };
-  lifecyclePolicy?: NativeExecutionInputV3["session"]["lifecyclePolicy"];
+  lifecyclePolicy?: NativeExecutionInputV4["session"]["lifecyclePolicy"];
   executionMode?: "default" | "plan";
   planningContext?: NativePlanningContext | null;
   interactionResponses?: NativeInteractionResponseEnvelope[];
@@ -83,7 +89,7 @@ export function buildNativeExecutionInput(input: {
     contract: StrictCompletionContractInput;
   };
   runtimeContext: NativeRuntimeContextSnapshot;
-}): NativeExecutionInputV3 {
+}): NativeExecutionInputV4 {
   if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask") {
     throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, or ask");
   }
@@ -103,7 +109,7 @@ export function buildNativeExecutionInput(input: {
     .filter((section) => section.length > 0)
     .join("\n\n");
   return parseNativeExecutionInput({
-    schema: "paperclip.native-execution-input.v3",
+    schema: "paperclip.native-execution-input.v4",
     executionMode,
     planningContext: input.planningContext ?? null,
     binding: {
@@ -160,7 +166,7 @@ export function buildNativeExecutionInput(input: {
             kind: "acpx",
             agent: acpxProfile!.agent,
             model: input.model,
-            permissionPolicy: "interactive",
+            permissionMode: input.acpxPermissionMode ?? "approve-all",
             profile: {
               driverKind: acpxProfile!.driverKind,
               protocolVersion: acpxProfile!.protocolVersion,
@@ -174,13 +180,20 @@ export function buildNativeExecutionInput(input: {
               commandDigest: acpxProfile!.commandDigest,
             },
           }
-        : {
-            kind: input.provider ?? "codex",
-            model: input.model ?? null,
-          },
+        : input.provider === "opencode"
+          ? {
+              kind: "opencode",
+              model: input.model,
+              permissionMode: input.opencodePermissionMode ?? "allow",
+            }
+          : {
+              kind: "codex",
+              model: input.model ?? null,
+              approvalPolicy: input.codexApprovalPolicy ?? "never",
+            },
     completionContract: input.completionContract,
     interactionResponses: input.interactionResponses ?? [],
     credentialBindings: [],
     runtimeContext: input.runtimeContext,
-  }) as NativeExecutionInputV3;
+  }) as NativeExecutionInputV4;
 }

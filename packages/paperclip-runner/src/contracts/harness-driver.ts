@@ -4,6 +4,7 @@ import type {
 } from "../protocol/replay-contract.js";
 import type { NativeSessionCapabilities, NativeUserMessage } from "./types.js";
 import {
+  PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
   parsePaperclipQuestionResponse,
   type PaperclipQuestionResponse,
   type PaperclipQuestionSet,
@@ -128,6 +129,8 @@ export type HarnessRuntimeRequestResolution =
     };
 
 export type HarnessRuntimeRequestAction = HarnessRuntimeRequestResolution["action"];
+
+export type HarnessRuntimeRequestHandoffResult = "handed_off" | "already_settled";
 
 const RUNTIME_REQUEST_ACTIONS: readonly HarnessRuntimeRequestAction[] = [
   "accept",
@@ -334,6 +337,34 @@ export function harnessRuntimeRequestOutcome(
   };
 }
 
+/** Canonical non-replayable expiration used when a live input moves to a durable wait. */
+export function harnessRuntimeInputExpiredOutcome(
+  request: HarnessRuntimeRequest,
+  reason: "durable_handoff" | "provider_process_lost",
+): Omit<HarnessRuntimeRequestOutcome, "requestKind"> & {
+  requestKind: "runtime";
+  replayAllowed: false;
+  request: Record<string, unknown>;
+} {
+  return {
+    ...harnessRuntimeRequestOutcome(request, { reason }),
+    requestKind: "runtime",
+    replayAllowed: false,
+    request: {
+      schema: PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
+      requestKind: "runtime",
+      requestId: request.requestId,
+      type: "input",
+      status: request.status,
+      prompt: request.prompt,
+      input: structuredClone(request.input),
+      origin: structuredClone(request.origin),
+      turnId: request.turnId,
+      itemId: request.itemId,
+    },
+  };
+}
+
 export interface HarnessThreadGoal {
   threadId: string;
   objective: string;
@@ -382,6 +413,8 @@ export interface AcpxSessionIdentity {
   workspaceDigest: string;
   requestedModel: string;
   effectiveModel: string;
+  /** Missing on legacy snapshots; those used the historical approve-reads behavior. */
+  permissionMode?: "approve-all" | "approve-reads" | "deny-all";
 }
 
 export type PersistedHarnessProviderIdentity = AcpxSessionIdentity;
@@ -402,7 +435,10 @@ export interface PersistedHarnessSession {
   /** Tagged provider identity used to reject cross-profile recovery. */
   providerIdentity?: PersistedHarnessProviderIdentity;
   /** Narrow escape hatch for a durable response-wake when a provider cannot reload its prior native session. */
-  providerRecoveryPolicy?: "same_session_only" | "allow_replacement_after_governed_wait";
+  providerRecoveryPolicy?:
+    | "same_session_only"
+    | "allow_replacement_after_governed_wait"
+    | "allow_replacement_after_resume_failure";
 }
 
 export interface HarnessSessionRecoveryResult {
@@ -431,6 +467,11 @@ export interface HarnessSession {
     turnId: string;
     resolution: HarnessRuntimeRequestResolution;
   }): Promise<void>;
+  handoffRuntimeRequest?(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }): Promise<HarnessRuntimeRequestHandoffResult>;
   goal?(input: HarnessGoalOperation): Promise<HarnessThreadGoal | null>;
   lineage?(): HarnessThreadLineageEntry[];
   read?(): Promise<Record<string, unknown>>;

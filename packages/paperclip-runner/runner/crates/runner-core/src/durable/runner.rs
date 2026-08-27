@@ -1,3 +1,17 @@
+fn sleep_for_reconnect(base: Duration, attempt: &mut u32) {
+    let multiplier = 1_u128 << (*attempt).min(5);
+    let uncapped = base.as_millis().saturating_mul(multiplier);
+    let capped = uncapped.min(5_000).max(1) as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| u64::from(duration.subsec_nanos()));
+    let jitter_percent = 75 + nanos % 51;
+    *attempt = attempt.saturating_add(1);
+    thread::sleep(Duration::from_millis(
+        capped.saturating_mul(jitter_percent) / 100,
+    ));
+}
+
 pub fn run_durable_runner(
     config: DurableRunnerConfig,
     bootstrap_ticket: BootstrapTicket,
@@ -18,12 +32,17 @@ pub fn run_durable_runner(
         drop(bootstrap_ticket);
         return Ok(());
     }
+    let resuming_suspended_per_turn =
+        recovered && state.lifecycle == "suspended" && state.lifecycle_mode == "per_turn";
     if recovered && state.lifecycle == "suspended" {
         state.stop_after_flush = false;
         state.lifecycle = "ready".to_owned();
         state.record_diagnostic("resuming an explicitly suspended durable runner");
     }
-    let mut provider = match start_configured_provider(&mut state) {
+    // Bind listener mode before starting the harness. A fixed-port collision is
+    // an unhealthy lease and must fail without launching provider work.
+    let endpoint = RunnerTransportEndpoint::new(&config.connect_url)?;
+    let mut provider = match start_configured_provider(&mut state, resuming_suspended_per_turn) {
         Ok(provider) => provider,
         Err(error) => {
             persist_provider_failure(&mut state, &store, &error.to_string())?;
@@ -32,7 +51,9 @@ pub fn run_durable_runner(
     };
     if recovered {
         if let Some(runtime) = provider.as_ref() {
-            let descriptor = provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
+            let descriptor =
+                provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
+            let provider_identity = state.provider_session_identity.clone();
             enqueue_event(
                 &mut state,
                 &config,
@@ -43,6 +64,7 @@ pub fn run_durable_runner(
                     "runtimeIdentity": runtime.runtime_identity(),
                     "threadId": runtime.session_identity(),
                     "sessionId": runtime.provider_session_id(),
+                    "providerIdentity": provider_identity,
                     "resumed": true,
                 }),
                 None,
@@ -50,9 +72,6 @@ pub fn run_durable_runner(
         }
     }
     store.save(&state)?;
-    // Resolve once before authentication. Reconnects use only this validated,
-    // concrete address set, so DNS cannot redirect a retry.
-    let target = ResolvedWsTarget::resolve(&config.connect_url)?;
     if recovered {
         state.reconnect_count += 1;
         state.record_diagnostic("runner process restored the same durable identity");
@@ -78,8 +97,11 @@ pub fn run_durable_runner(
     let mut connection_lease_expires_at_unix_ms: Option<u64> = None;
     let mut connection_lease_revocation_epoch: Option<u64> = None;
     let started = Instant::now();
+    let mut reconnect_attempt = 0_u32;
+    let mut authenticated_once = false;
+    let mut disconnected_since: Option<Instant> = None;
 
-    loop {
+    'transport: loop {
         if started.elapsed() >= config.max_runtime && !state.active_turn {
             state.recoverable_failure = Some("transport_reconnect_deadline_exceeded".to_owned());
             state.lifecycle = "recoverable_failure".to_owned();
@@ -90,6 +112,23 @@ pub fn run_durable_runner(
             return Err(DurableRunnerError::invalid(
                 "transport reconnect deadline exceeded; durable state is preserved",
             ));
+        }
+        if authenticated_once {
+            let disconnected_at = disconnected_since.get_or_insert_with(Instant::now);
+            if config
+                .reconnect_grace
+                .is_some_and(|grace| disconnected_at.elapsed() >= grace)
+            {
+                state.recoverable_failure = Some("transport_reconnect_grace_exceeded".to_owned());
+                state.lifecycle = "recoverable_failure".to_owned();
+                state.record_diagnostic(
+                    "transport reconnect grace exceeded; durable state is preserved",
+                );
+                store.save(&state)?;
+                return Err(DurableRunnerError::invalid(
+                    "transport reconnect grace exceeded; durable state is preserved",
+                ));
+            }
         }
         if connection_lease_expires_at_unix_ms
             .is_some_and(|expires_at| current_unix_ms().is_ok_and(|now| now >= expires_at))
@@ -119,16 +158,21 @@ pub fn run_durable_runner(
                 )
             })?;
         let credential = CredentialMaterial::from_token(credential_token);
-        let mut client = match WsClient::connect(&target, config.max_frame_bytes) {
-            Ok(client) => client,
-            Err(error) => {
-                let text = error.to_string();
-                state.record_diagnostic(format!("transport reconnect scheduled: {text}"));
-                store.save(&state)?;
-                thread::sleep(config.reconnect_delay);
-                continue;
-            }
-        };
+        let mut client =
+            match endpoint.open(config.max_frame_bytes, config.ca_bundle_path.as_deref()) {
+                Ok(Some(client)) => client,
+                Ok(None) => {
+                    thread::sleep(config.reconnect_delay);
+                    continue;
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    state.record_diagnostic(format!("transport reconnect scheduled: {text}"));
+                    store.save(&state)?;
+                    sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
+                    continue;
+                }
+            };
         if let Err(error) = authenticate_transport(
             &mut client,
             &state,
@@ -143,7 +187,7 @@ pub fn run_durable_runner(
                 "transport peer authentication failed closed: {error}"
             ));
             store.save(&state)?;
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
             continue;
         }
         let mut welcome = loop {
@@ -156,12 +200,15 @@ pub fn run_durable_runner(
                 Err(error) => {
                     state.record_diagnostic(error.to_string());
                     store.save(&state)?;
-                    thread::sleep(config.reconnect_delay);
-                    continue;
+                    sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
+                    continue 'transport;
                 }
             }
         };
         let (_, connection) = validate_welcome(&welcome, &state)?;
+        authenticated_once = true;
+        disconnected_since = None;
+        reconnect_attempt = 0;
         let next_lease_token = match welcome.pointer_mut("/payload/connectionLeaseToken") {
             Some(Value::String(value)) => {
                 let token = std::mem::take(value);
@@ -226,14 +273,16 @@ pub fn run_durable_runner(
             state.record_diagnostic(error.to_string());
             state.reconnect_count += 1;
             store.save(&state)?;
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
             continue;
         }
 
         let mut revoke_deadline: Option<Instant> = None;
         let mut revoke_control_drained = false;
         let disconnected = loop {
-            poll_provider(&mut provider, &mut state, &store, &config)?;
+            if !state.stop_after_flush {
+                poll_provider(&mut provider, &mut state, &store, &config)?;
+            }
             if started.elapsed() >= config.max_runtime && !state.active_turn {
                 begin_automatic_suspend(
                     &mut state,
@@ -275,7 +324,9 @@ pub fn run_durable_runner(
             }
             if (state.stop_after_flush || state.lifecycle == "revoked")
                 && state.outbox.is_empty()
-                && (state.lifecycle != "revoked" || revoke_control_drained || revoke_deadline.is_none())
+                && (state.lifecycle != "revoked"
+                    || revoke_control_drained
+                    || revoke_deadline.is_none())
             {
                 if let Some(mut runtime) = provider.take() {
                     runtime.shutdown().map_err(|error| {
@@ -480,13 +531,14 @@ pub fn run_durable_runner(
             }
         };
         if disconnected {
-            thread::sleep(config.reconnect_delay);
+            sleep_for_reconnect(config.reconnect_delay, &mut reconnect_attempt);
         }
     }
 }
 
 fn start_configured_provider(
     state: &mut DurableRunnerState,
+    resuming_suspended_per_turn: bool,
 ) -> Result<Option<Box<dyn crate::codex_provider::Provider>>, DurableRunnerError> {
     let Some(provider_config) = state.provider_config.clone() else {
         return Ok(None);
@@ -497,39 +549,58 @@ fn start_configured_provider(
         .authorized_tools()
         .cloned()
         .collect::<Vec<_>>();
+    let completion_contract = state.completion_contract.as_ref().map(|contract| {
+        json!({
+            "revision": contract.revision,
+            "criterionIds": contract.criterion_ids,
+        })
+    });
+    let replace_acpx_provider_session = (resuming_suspended_per_turn
+        || std::env::var("PAPERCLIP_ACPX_PROVIDER_RECOVERY_POLICY")
+            .is_ok_and(|value| value == "allow_replacement_after_governed_wait")
+        || semantic_result_allows_governed_wait_replacement(state.semantic_result.as_ref()))
+        && matches!(provider_config, crate::codex_provider::ProviderConfig::Acpx(_))
+        && state.provider_session_identity.is_some();
+    let replacement_provider_session_key = replace_acpx_provider_session.then(|| {
+        format!(
+            "{}:governed-wait-replacement:{}",
+            state.normalized_session_id, state.run_id
+        )
+    });
     let runtime: Box<dyn crate::codex_provider::Provider> = match provider_config {
         crate::codex_provider::ProviderConfig::Local(local) => Box::new(
-            crate::codex_provider::CodexProvider::start(
+            crate::codex_provider::CodexProvider::start_with_completion_contract(
                 &local,
                 tools.into_iter(),
                 resume_thread_id.as_deref(),
+                completion_contract.as_ref(),
             )
             .map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to start local provider: {error}"))
             })?,
         ),
-        crate::codex_provider::ProviderConfig::ClaudeManaged(mut managed) => Box::new(
-            {
-                if let Some(value) = state.provider_budget_ceiling_usd {
-                    managed.max_session_list_cost_usd = value;
-                }
-                crate::claude_managed_provider::ClaudeManagedProvider::start(
-                    &managed,
-                    tools,
-                    resume_thread_id.as_deref(),
-                    state.provider_event_cursor.as_deref(),
-                    state.provider_usage_cumulative.as_ref()
-                        .and_then(|value| value.get("requests"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                )
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to start Claude Agent provider: {error}"
-                    ))
-                })?
-            },
-        ),
+        crate::codex_provider::ProviderConfig::ClaudeManaged(mut managed) => Box::new({
+            if let Some(value) = state.provider_budget_ceiling_usd {
+                managed.max_session_list_cost_usd = value;
+            }
+            crate::claude_managed_provider::ClaudeManagedProvider::start(
+                &managed,
+                tools,
+                resume_thread_id.as_deref(),
+                state.provider_event_cursor.as_deref(),
+                state
+                    .provider_usage_cumulative
+                    .as_ref()
+                    .and_then(|value| value.get("requests"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to start Claude Agent provider: {error}"
+                ))
+            })?
+        }),
         crate::codex_provider::ProviderConfig::AwsAgentcore(mut agentcore) => Box::new({
             if let Some(value) = state.provider_budget_ceiling_usd {
                 agentcore.max_estimated_session_cost_usd = value;
@@ -550,30 +621,65 @@ fn start_configured_provider(
             crate::acpx_provider::AcpxProvider::start(
                 &acpx,
                 tools,
-                state.provider_session_identity.as_ref(),
-            ).map_err(|error| {
+                if replace_acpx_provider_session {
+                    None
+                } else {
+                    state.provider_session_identity.as_ref()
+                },
+                replacement_provider_session_key.as_deref(),
+            )
+            .map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to start ACPX provider: {error}"))
             })?,
         ),
     };
-    if let Some(expected) = state.provider_session_id.as_deref() {
+    if !replace_acpx_provider_session {
+        if let Some(expected) = state.provider_session_id.as_deref() {
         if expected != runtime.session_identity() {
             return Err(DurableRunnerError::invalid(
                 "provider recovery returned a different durable session identity",
             ));
         }
+        }
+    }
+    if !replace_acpx_provider_session {
+        if let Some(expected) = state.provider_backend_session_id.as_deref() {
+        if Some(expected) != runtime.provider_session_id() {
+            return Err(DurableRunnerError::invalid(
+                "provider recovery returned a different provider-native session identity",
+            ));
+        }
+        }
     }
     let durable_identity = runtime.durable_session_identity();
-    if let Some(expected) = state.provider_session_identity.as_ref() {
+    if !replace_acpx_provider_session {
+        if let Some(expected) = state.provider_session_identity.as_ref() {
         if Some(expected) != durable_identity.as_ref() {
             return Err(DurableRunnerError::invalid(
                 "provider recovery returned a different tagged session identity",
             ));
         }
+        }
+    } else {
+        state.record_diagnostic(
+            "ACPX rotated its provider-native session after a per-turn suspension or governed wait",
+        );
     }
     state.provider_session_id = Some(runtime.session_identity().to_owned());
+    state.provider_backend_session_id = runtime.provider_session_id().map(str::to_owned);
     state.provider_session_identity = durable_identity;
     Ok(Some(runtime))
+}
+
+fn semantic_result_allows_governed_wait_replacement(result: Option<&Value>) -> bool {
+    result.is_some_and(|value| {
+        value
+            .get("reportedWorkDisposition")
+            .and_then(Value::as_str)
+            == Some("yielded")
+            && value.pointer("/continuation/kind").and_then(Value::as_str)
+                == Some("response_wake")
+    })
 }
 
 fn provider_kind_name(kind: crate::codex_provider::ProviderKind) -> &'static str {
@@ -636,12 +742,14 @@ fn provider_descriptor(
                 _ => None,
             },
             "agentProcessId": runtime.and_then(|item| item.agent_process_id()),
+            "permissionMode": value.permission_mode,
         }),
         Some(crate::codex_provider::ProviderConfig::Local(value)) => json!({
             "provider": provider_kind_name(value.kind),
             "driver": if value.kind == crate::codex_provider::ProviderKind::Opencode { "opencode_server" } else { "codex_app_server" },
             "model": value.model,
             "collaborationMode": value.collaboration_mode,
+            "approvalPolicy": value.approval_policy,
             "collaborationInstructions": value.include_collaboration_mode_instructions,
             "executionKind": "local_process",
             "providerVersion": if value.kind == crate::codex_provider::ProviderKind::Opencode { "1.18.17" } else { "unqualified" },
@@ -681,23 +789,34 @@ fn process_command_and_provider(
         if !fresh
             && processed.status == "completed"
             && command.get("type").and_then(Value::as_str) == Some("semantic_tool.result")
-            && provider.as_ref().is_some_and(|runtime| matches!(
-                runtime.kind(),
-                crate::codex_provider::ProviderKind::ClaudeManaged
-                    | crate::codex_provider::ProviderKind::AwsAgentcore
-            ))
+            && provider.as_ref().is_some_and(|runtime| {
+                matches!(
+                    runtime.kind(),
+                    crate::codex_provider::ProviderKind::ClaudeManaged
+                        | crate::codex_provider::ProviderKind::AwsAgentcore
+                )
+            })
         {
-            let result: crate::provider_bridge::ToolResult = serde_json::from_value(command["payload"].clone())
-                .map_err(|error| DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}")))?;
-            provider.as_mut().expect("checked above").deliver_tool_result(&result)
-                .map_err(|error| DurableRunnerError::invalid(format!("failed to reconcile remote provider tool result: {error}")))?;
+            let result: crate::provider_bridge::ToolResult =
+                serde_json::from_value(command["payload"].clone()).map_err(|error| {
+                    DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}"))
+                })?;
+            provider
+                .as_mut()
+                .expect("checked above")
+                .deliver_tool_result(&result)
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to reconcile remote provider tool result: {error}"
+                    ))
+                })?;
         }
         return Ok(processed);
     }
     match command.get("type").and_then(Value::as_str) {
         Some("run.prepare") => {
             if provider.is_none() {
-                *provider = match start_configured_provider(state) {
+                *provider = match start_configured_provider(state, false) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let detail = error.to_string();
@@ -716,17 +835,18 @@ fn process_command_and_provider(
                             "detail": detail,
                         }));
                         state.last_controller_command_seq = failed.controller_seq;
-                        state.processed_commands.insert(
-                            failed.command_id.clone(),
-                            failed.clone(),
-                        );
+                        state
+                            .processed_commands
+                            .insert(failed.command_id.clone(), failed.clone());
                         compact_processed_commands(state)?;
                         store.save(state)?;
                         return Ok(failed);
                     }
                 };
                 if let Some(runtime) = provider.as_ref() {
-                    let descriptor = provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
+                    let descriptor =
+                        provider_descriptor(state.provider_config.as_ref(), Some(runtime.as_ref()));
+                    let provider_identity = state.provider_session_identity.clone();
                     enqueue_event(
                         state,
                         config,
@@ -737,6 +857,7 @@ fn process_command_and_provider(
                             "runtimeIdentity": runtime.runtime_identity(),
                             "threadId": runtime.session_identity(),
                             "sessionId": runtime.provider_session_id(),
+                            "providerIdentity": provider_identity,
                             "resumed": state.reconnect_count > 0,
                         }),
                         None,
@@ -786,7 +907,9 @@ fn process_command_and_provider(
                     .map_err(|error| {
                         *state = before;
                         let _ = store.save(state);
-                        DurableRunnerError::invalid(format!("failed to replace provider tools: {error}"))
+                        DurableRunnerError::invalid(format!(
+                            "failed to replace provider tools: {error}"
+                        ))
                     })?;
             }
         }
@@ -820,8 +943,16 @@ fn process_command_and_provider(
                 }
                 validate_runtime_request_resolution(&pending.request, resolution)?;
                 (
-                    pending.request.pointer("/origin/adapter").and_then(Value::as_str).map(str::to_owned),
-                    pending.request.get("type").and_then(Value::as_str).map(str::to_owned),
+                    pending
+                        .request
+                        .pointer("/origin/adapter")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    pending
+                        .request
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 )
             };
             provider
@@ -866,9 +997,7 @@ fn process_command_and_provider(
                     .and_then(Value::as_str)
                     .unwrap_or(state.turn_id.as_str());
                 if turn_id != state.turn_id || !state.active_turn {
-                    return Err(DurableRunnerError::invalid(
-                        "turn.steer named a stale turn",
-                    ));
+                    return Err(DurableRunnerError::invalid("turn.steer named a stale turn"));
                 }
                 provider
                     .as_mut()
@@ -911,6 +1040,7 @@ fn process_command_and_provider(
                 serde_json::from_value(command["payload"].clone()).map_err(|error| {
                     DurableRunnerError::invalid(format!("semantic tool result is invalid: {error}"))
                 })?;
+            let completion_input = successful_completion_tool_input(&before, &result);
             provider
                 .as_mut()
                 .ok_or_else(|| {
@@ -922,6 +1052,16 @@ fn process_command_and_provider(
                         "failed to return tool result to provider: {error}"
                     ))
                 })?;
+            if let Some(input) = completion_input {
+                record_provider_semantic_result(
+                    state,
+                    config,
+                    input,
+                    Some(result.call_id.as_str()),
+                )?;
+                complete_turn_after_semantic_result(state, config)?;
+                store.save(state)?;
+            }
         }
         Some("turn.interrupt") => {
             let turn_id = command
@@ -959,17 +1099,26 @@ fn process_command_and_provider(
             store.save(state)?;
         }
         Some("session.budget.increase") => {
-            let value = command.pointer("/payload/maxSessionListCostUsd").and_then(Value::as_f64)
-                .ok_or_else(|| DurableRunnerError::invalid(
-                    "session.budget.increase payload.maxSessionListCostUsd is required",
-                ))?;
-            provider.as_mut()
-                .ok_or_else(|| DurableRunnerError::invalid("session budget increase requires a provider"))?
+            let value = command
+                .pointer("/payload/maxSessionListCostUsd")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid(
+                        "session.budget.increase payload.maxSessionListCostUsd is required",
+                    )
+                })?;
+            provider
+                .as_mut()
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("session budget increase requires a provider")
+                })?
                 .increase_budget(value)
                 .map_err(|error| {
                     *state = before.clone();
                     let _ = store.save(state);
-                    DurableRunnerError::invalid(format!("failed to increase remote session budget: {error}"))
+                    DurableRunnerError::invalid(format!(
+                        "failed to increase remote session budget: {error}"
+                    ))
                 })?;
             enqueue_event(
                 state,
@@ -991,8 +1140,9 @@ fn process_command_and_provider(
             store.save(state)?;
         }
         Some("session.destroy") => {
-            let mut runtime = provider.take()
-                .ok_or_else(|| DurableRunnerError::invalid("session.destroy requires a provider"))?;
+            let mut runtime = provider.take().ok_or_else(|| {
+                DurableRunnerError::invalid("session.destroy requires a provider")
+            })?;
             if let Err(error) = runtime.destroy_session() {
                 *provider = Some(runtime);
                 *state = before;
@@ -1002,6 +1152,7 @@ fn process_command_and_provider(
                 )));
             }
             state.provider_session_id = None;
+            state.provider_backend_session_id = None;
             state.provider_event_cursor = None;
             state.lifecycle = "stopped".to_owned();
             state.stop_after_flush = true;
@@ -1187,6 +1338,7 @@ fn poll_provider(
                         Some(&state.item_id.clone()),
                     )?;
                 } else {
+                    let input_digest = sha256_digest(canonical_json(&call.input).as_bytes());
                     enqueue_event(
                         state,
                         config,
@@ -1196,7 +1348,20 @@ fn poll_provider(
                             "semantic_tool": {
                                 "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
                                 "phase": "input", "operationId": call.operation_id,
-                                "callId": call.call_id, "input": call.input,
+                                "callId": call.call_id,
+                                "correlation": {
+                                    "runId": state.run_id,
+                                    "normalizedSessionId": state.normalized_session_id,
+                                    "turnId": state.turn_id,
+                                    "itemId": state.item_id,
+                                },
+                                "idempotencyKey": Value::Null,
+                                "content": {
+                                    "digest": input_digest,
+                                    "redactionDisposition": "digest_only",
+                                    "references": [],
+                                },
+                                "input": call.input,
                             }
                         }),
                         Some(&state.item_id.clone()),
@@ -1206,30 +1371,56 @@ fn poll_provider(
             }
             crate::codex_provider::ProviderEvent::Notification { method, params } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
+                if method == "item/completed" {
+                    let item = params.get("item").unwrap_or(&params);
+                    if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                        state.last_agent_message = item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                            .map(|text| text.chars().take(1_000_000).collect());
+                    }
+                }
                 for (canonical_type, canonical_payload, canonical_item_id) in
                     crate::provider_events::canonical_provider_events(&method, &params)
                 {
-                    enqueue_event(
-                        state,
-                        config,
-                        &canonical_type,
-                        if canonical_type.ends_with("completed") {
-                            1
-                        } else {
-                            2
-                        },
-                        canonical_payload,
-                        Some(&canonical_item_id),
-                    )?;
+                    if canonical_type == "run.result.proposed" {
+                        // Codex can expose the semantic completion as a
+                        // provider item rather than a dedicated notification.
+                        // Route both representations through the same durable
+                        // admission seam so terminal fallback cannot emit a
+                        // second, structurally different result.
+                        record_provider_semantic_result(
+                            state,
+                            config,
+                            canonical_payload,
+                            Some(&canonical_item_id),
+                        )?;
+                    } else {
+                        enqueue_event(
+                            state,
+                            config,
+                            &canonical_type,
+                            if canonical_type.ends_with("completed") {
+                                1
+                            } else {
+                                2
+                            },
+                            canonical_payload,
+                            Some(&canonical_item_id),
+                        )?;
+                    }
                 }
                 let event_type = match method.as_str() {
                     "turn/started" => "turn.started",
-                    "turn/completed" => match params.pointer("/turn/status").and_then(Value::as_str) {
-                        Some("failed") => "turn.failed",
-                        Some("interrupted") => "turn.interrupted",
-                        Some("cancelled" | "canceled") => "turn.cancelled",
-                        _ => "turn.completed",
-                    },
+                    "turn/completed" => {
+                        match params.pointer("/turn/status").and_then(Value::as_str) {
+                            Some("failed") => "turn.failed",
+                            Some("interrupted") => "turn.interrupted",
+                            Some("cancelled" | "canceled") => "turn.cancelled",
+                            _ => "turn.completed",
+                        }
+                    }
                     "item/started" => "item.started",
                     "item/delta" => "item.delta",
                     "item/completed" => "item.completed",
@@ -1246,7 +1437,10 @@ fn poll_provider(
                 };
                 let payload = if method == "thread/tokenUsage/updated" {
                     let cumulative = normalized_usage_measurement(&params);
-                    let baseline = state.provider_usage_run_baseline.as_ref().map(normalized_usage_measurement)
+                    let baseline = state
+                        .provider_usage_run_baseline
+                        .as_ref()
+                        .map(normalized_usage_measurement)
                         .unwrap_or_else(empty_usage_measurement);
                     let run_delta = usage_delta(&cumulative, &baseline);
                     state.provider_usage_cumulative = Some(cumulative.clone());
@@ -1266,21 +1460,56 @@ fn poll_provider(
                         "processGroupId": params.get("processGroupId").and_then(Value::as_u64),
                         "startedAt": params.get("startedAt").and_then(Value::as_str),
                     })
-                } else if matches!(method.as_str(), "turn/started" | "item/started" | "item/delta" | "item/completed" | "turn/completed" | "provider/budgetReached") {
+                } else if matches!(
+                    method.as_str(),
+                    "turn/started"
+                        | "item/started"
+                        | "item/delta"
+                        | "item/completed"
+                        | "turn/completed"
+                        | "provider/budgetReached"
+                ) {
                     params.clone()
                 } else {
                     json!({ "providerMethod": method, "detail": "provider event was not part of the normalized public contract" })
                 };
-                enqueue_event(state, config, event_type, priority, payload, Some(&state.item_id.clone()))?;
-                if method == "provider/budgetReached" {
-                    state.lifecycle = "waiting_input".to_owned();
-                }
-                if method == "turn/completed" {
+                let is_terminal = matches!(
+                    event_type,
+                    "turn.completed" | "turn.failed" | "turn.cancelled" | "turn.interrupted"
+                );
+                let bound_run_terminal = if is_terminal {
                     cancel_pending_runtime_requests_on_terminal(
                         state,
                         config,
                         "provider_turn_became_terminal",
                     )?;
+                    enqueue_bound_result_event(state, config, event_type)?
+                } else {
+                    None
+                };
+                enqueue_event(
+                    state,
+                    config,
+                    event_type,
+                    priority,
+                    payload,
+                    Some(&state.item_id.clone()),
+                )?;
+                if method == "provider/budgetReached" {
+                    state.lifecycle = "waiting_input".to_owned();
+                }
+                if is_terminal {
+                    if let Some(terminal) = bound_run_terminal {
+                        let item_id = state.item_id.clone();
+                        enqueue_event(
+                            state,
+                            config,
+                            "run.terminal",
+                            0,
+                            terminal,
+                            Some(&item_id),
+                        )?;
+                    }
                     state.active_turn = false;
                     if state.lifecycle_mode == "warm" {
                         state.lifecycle = "warm_idle".to_owned();
@@ -1301,25 +1530,28 @@ fn poll_provider(
             }
             crate::codex_provider::ProviderEvent::SemanticResult { result, item_id } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
-                enqueue_event(
-                    state,
-                    config,
-                    "run.result.proposed",
-                    0,
-                    result,
-                    item_id.as_deref(),
-                )?;
+                record_provider_semantic_result(state, config, result, item_id.as_deref())?;
                 store.save(state)?;
             }
             crate::codex_provider::ProviderEvent::RuntimeRequest { request } => {
                 state.last_activity_at_unix_ms = current_unix_ms()?;
-                let request_id = request.get("requestId").and_then(Value::as_str)
+                let request_id = request
+                    .get("requestId")
+                    .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
-                    .ok_or_else(|| DurableRunnerError::invalid("provider runtime request omitted requestId"))?
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid("provider runtime request omitted requestId")
+                    })?
                     .to_owned();
-                let request_kind = request.pointer("/origin/kind").and_then(Value::as_str)
-                    .unwrap_or("runtime").to_owned();
-                if state.pending_provider_runtime_requests.contains_key(&request_id) {
+                let request_kind = request
+                    .pointer("/origin/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("runtime")
+                    .to_owned();
+                if state
+                    .pending_provider_runtime_requests
+                    .contains_key(&request_id)
+                {
                     return Err(DurableRunnerError::invalid(
                         "provider reused a pending runtime request id",
                     ));
@@ -1393,30 +1625,48 @@ fn empty_usage_measurement() -> Value {
 }
 
 fn usage_number(value: &Value, snake: &str, camel: &str) -> f64 {
-    value.get(snake).or_else(|| value.get(camel)).and_then(Value::as_f64).unwrap_or(0.0)
+    value
+        .get(snake)
+        .or_else(|| value.get(camel))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
 }
 
 fn normalized_usage_measurement(value: &Value) -> Value {
-    let usage = value.get("usage")
+    let usage = value
+        .get("usage")
         .or_else(|| value.pointer("/tokenUsage/total"))
         .or_else(|| value.get("tokenUsage"))
         .unwrap_or(value);
     let cost = usage.get("list_cost").or_else(|| usage.get("listCost"));
     // Managed Agents reports list cost as an integer number of US cents.
     // Local providers already publish providerCostUsd as dollars.
-    let provider_cost = cost.and_then(|value| value.get("amount")).and_then(|value| {
-        value.as_f64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-    }).map(|cents| cents / 100.0)
+    let provider_cost = cost
+        .and_then(|value| value.get("amount"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })
+        .map(|cents| cents / 100.0)
         .unwrap_or_else(|| {
             let normalized = usage_number(usage, "provider_cost_usd", "providerCostUsd");
-            if normalized > 0.0 { normalized } else { usage_number(usage, "cost_usd", "costUsd") }
+            if normalized > 0.0 {
+                normalized
+            } else {
+                usage_number(usage, "cost_usd", "costUsd")
+            }
         });
-    let cache_creation = usage.get("cache_creation").or_else(|| usage.get("cacheCreation"));
+    let cache_creation = usage
+        .get("cache_creation")
+        .or_else(|| usage.get("cacheCreation"));
     let cache_write_tokens = usage_number(usage, "cache_creation_input_tokens", "cacheWriteTokens")
-        + cache_creation.map(|value| {
-            usage_number(value, "ephemeral_5m_input_tokens", "ephemeral5mInputTokens")
-                + usage_number(value, "ephemeral_1h_input_tokens", "ephemeral1hInputTokens")
-        }).unwrap_or(0.0);
+        + cache_creation
+            .map(|value| {
+                usage_number(value, "ephemeral_5m_input_tokens", "ephemeral5mInputTokens")
+                    + usage_number(value, "ephemeral_1h_input_tokens", "ephemeral1hInputTokens")
+            })
+            .unwrap_or(0.0);
     json!({
         "inputTokens": usage_number(usage, "input_tokens", "inputTokens") as u64,
         "outputTokens": usage_number(usage, "output_tokens", "outputTokens") as u64,
@@ -1433,10 +1683,18 @@ fn normalized_usage_measurement(value: &Value) -> Value {
 }
 
 fn usage_delta(cumulative: &Value, baseline: &Value) -> Value {
-    let integer_delta = |field: &str| cumulative.get(field).and_then(Value::as_u64).unwrap_or(0)
-        .saturating_sub(baseline.get(field).and_then(Value::as_u64).unwrap_or(0));
-    let number_delta = |field: &str| (cumulative.get(field).and_then(Value::as_f64).unwrap_or(0.0)
-        - baseline.get(field).and_then(Value::as_f64).unwrap_or(0.0)).max(0.0);
+    let integer_delta = |field: &str| {
+        cumulative
+            .get(field)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_sub(baseline.get(field).and_then(Value::as_u64).unwrap_or(0))
+    };
+    let number_delta = |field: &str| {
+        (cumulative.get(field).and_then(Value::as_f64).unwrap_or(0.0)
+            - baseline.get(field).and_then(Value::as_f64).unwrap_or(0.0))
+        .max(0.0)
+    };
     json!({
         "inputTokens": integer_delta("inputTokens"),
         "outputTokens": integer_delta("outputTokens"),
@@ -1481,11 +1739,19 @@ fn validate_runtime_request_resolution(
     request: &Value,
     resolution: &Value,
 ) -> Result<(), DurableRunnerError> {
-    let action = resolution.get("action").and_then(Value::as_str).ok_or_else(|| {
-        DurableRunnerError::invalid("runtime request resolution.action is required")
-    })?;
-    if !matches!(action, "accept" | "accept_for_session" | "decline" | "cancel" | "submit") {
-        return Err(DurableRunnerError::invalid("unsupported runtime request resolution action"));
+    let action = resolution
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid("runtime request resolution.action is required")
+        })?;
+    if !matches!(
+        action,
+        "accept" | "accept_for_session" | "decline" | "cancel" | "submit"
+    ) {
+        return Err(DurableRunnerError::invalid(
+            "unsupported runtime request resolution action",
+        ));
     }
     if request.get("schema").and_then(Value::as_str) != Some("paperclip.runtime_request.v2") {
         return Ok(());
@@ -1505,8 +1771,9 @@ fn validate_runtime_request_resolution(
         "../../../../../protocol/schemas/question-response.schema.json"
     ))
     .map_err(|_| DurableRunnerError::invalid("embedded question-response schema is invalid"))?;
-    let response_validator = jsonschema::validator_for(&response_schema)
-        .map_err(|_| DurableRunnerError::invalid("embedded question-response schema cannot compile"))?;
+    let response_validator = jsonschema::validator_for(&response_schema).map_err(|_| {
+        DurableRunnerError::invalid("embedded question-response schema cannot compile")
+    })?;
     if !response_validator.is_valid(response) {
         return Err(DurableRunnerError::invalid(
             "structured input response failed paperclip.question_response.v1 schema validation",
@@ -1517,12 +1784,18 @@ fn validate_runtime_request_resolution(
             "structured input response must use paperclip.question_response.v1",
         ));
     }
-    let answers = response.get("answers").and_then(Value::as_object).ok_or_else(|| {
-        DurableRunnerError::invalid("structured input response.answers must be an object")
-    })?;
-    let questions = request.pointer("/input/questions").and_then(Value::as_array).ok_or_else(|| {
-        DurableRunnerError::invalid("persisted runtime request has no question set")
-    })?;
+    let answers = response
+        .get("answers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid("structured input response.answers must be an object")
+        })?;
+    let questions = request
+        .pointer("/input/questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DurableRunnerError::invalid("persisted runtime request has no question set")
+        })?;
     let question_set = request.get("input").unwrap_or(&Value::Null);
     let question_set_schema: Value = serde_json::from_str(include_str!(
         "../../../../../protocol/schemas/question-set.schema.json"
@@ -1536,19 +1809,27 @@ fn validate_runtime_request_resolution(
         ));
     }
     for answer_id in answers.keys() {
-        if !questions.iter().any(|question| question.get("id").and_then(Value::as_str) == Some(answer_id)) {
+        if !questions
+            .iter()
+            .any(|question| question.get("id").and_then(Value::as_str) == Some(answer_id))
+        {
             return Err(DurableRunnerError::invalid(format!(
                 "structured input response named unknown question {answer_id}"
             )));
         }
     }
     for question in questions {
-        let question_id = question.get("id").and_then(Value::as_str).ok_or_else(|| {
-            DurableRunnerError::invalid("persisted question omitted id")
-        })?;
+        let question_id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DurableRunnerError::invalid("persisted question omitted id"))?;
         let answer = answers.get(question_id);
         if answer.is_none() {
-            if question.get("required").and_then(Value::as_bool).unwrap_or(false) {
+            if question
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 return Err(DurableRunnerError::invalid(format!(
                     "structured input response omitted required question {question_id}"
                 )));
@@ -1558,19 +1839,28 @@ fn validate_runtime_request_resolution(
         let answer = answer.and_then(Value::as_object).ok_or_else(|| {
             DurableRunnerError::invalid(format!("answer {question_id} must be an object"))
         })?;
-        if answer.get("selectedOptionIds").is_some_and(|value| !value.is_array()) {
+        if answer
+            .get("selectedOptionIds")
+            .is_some_and(|value| !value.is_array())
+        {
             return Err(DurableRunnerError::invalid(format!(
                 "answer {question_id} selectedOptionIds must be an array"
             )));
         }
         if answer.get("text").is_some_and(|value| !value.is_string())
-            || answer.get("customText").is_some_and(|value| !value.is_string())
+            || answer
+                .get("customText")
+                .is_some_and(|value| !value.is_string())
         {
             return Err(DurableRunnerError::invalid(format!(
                 "answer {question_id} text values must be strings"
             )));
         }
-        let selected = answer.get("selectedOptionIds").and_then(Value::as_array).cloned().unwrap_or_default();
+        let selected = answer
+            .get("selectedOptionIds")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         if selected.iter().any(|value| value.as_str().is_none()) {
             return Err(DurableRunnerError::invalid(format!(
                 "answer {question_id} selectedOptionIds must contain strings"
@@ -1586,7 +1876,10 @@ fn validate_runtime_request_resolution(
                 "answer {question_id} selectedOptionIds cannot contain duplicates"
             )));
         }
-        let mode = question.get("answerMode").and_then(Value::as_str).unwrap_or("");
+        let mode = question
+            .get("answerMode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let text = answer.get("text").and_then(Value::as_str);
         let custom = answer.get("customText").and_then(Value::as_str);
         if mode == "text" {
@@ -1614,15 +1907,27 @@ fn validate_runtime_request_resolution(
                     "single-select answer {question_id} cannot combine an option and custom text"
                 )));
             }
-            let options = question.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             for option_id in selected.iter().filter_map(Value::as_str) {
-                if !options.iter().any(|option| option.get("id").and_then(Value::as_str) == Some(option_id)) {
+                if !options
+                    .iter()
+                    .any(|option| option.get("id").and_then(Value::as_str) == Some(option_id))
+                {
                     return Err(DurableRunnerError::invalid(format!(
                         "answer {question_id} selected unknown option {option_id}"
                     )));
                 }
             }
-            if custom.is_some() && question.pointer("/customAnswer/enabled").and_then(Value::as_bool) != Some(true) {
+            if custom.is_some()
+                && question
+                    .pointer("/customAnswer/enabled")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+            {
                 return Err(DurableRunnerError::invalid(format!(
                     "answer {question_id} used a disabled custom answer"
                 )));
@@ -1631,7 +1936,12 @@ fn validate_runtime_request_resolution(
         let has_value = !selected.is_empty()
             || text.is_some_and(|value| !value.trim().is_empty())
             || custom.is_some_and(|value| !value.trim().is_empty());
-        if question.get("required").and_then(Value::as_bool).unwrap_or(false) && !has_value {
+        if question
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            && !has_value
+        {
             return Err(DurableRunnerError::invalid(format!(
                 "answer {question_id} is required"
             )));
@@ -1646,21 +1956,26 @@ fn validate_runtime_request_resolution(
             let validation = question.get("textValidation").unwrap_or(&Value::Null);
             if let Some(minimum) = validation.get("minLength").and_then(Value::as_u64) {
                 if value.chars().count() < minimum as usize {
-                    return Err(DurableRunnerError::invalid(format!("answer {question_id} is too short")));
+                    return Err(DurableRunnerError::invalid(format!(
+                        "answer {question_id} is too short"
+                    )));
                 }
             }
             if let Some(maximum) = validation.get("maxLength").and_then(Value::as_u64) {
                 if value.chars().count() > maximum as usize {
-                    return Err(DurableRunnerError::invalid(format!("answer {question_id} is too long")));
+                    return Err(DurableRunnerError::invalid(format!(
+                        "answer {question_id} is too long"
+                    )));
                 }
             }
             if let Some(pattern) = validation.get("pattern").and_then(Value::as_str) {
                 let pattern_schema = json!({"type": "string", "pattern": pattern});
-                let pattern_validator = jsonschema::validator_for(&pattern_schema).map_err(|_| {
-                    DurableRunnerError::invalid(format!(
-                        "question {question_id} contains an invalid text pattern"
-                    ))
-                })?;
+                let pattern_validator =
+                    jsonschema::validator_for(&pattern_schema).map_err(|_| {
+                        DurableRunnerError::invalid(format!(
+                            "question {question_id} contains an invalid text pattern"
+                        ))
+                    })?;
                 if !pattern_validator.is_valid(&json!(value)) {
                     return Err(DurableRunnerError::invalid(format!(
                         "answer {question_id} does not match its required format"
@@ -1669,21 +1984,33 @@ fn validate_runtime_request_resolution(
             }
             if let Some(input_type) = validation.get("inputType").and_then(Value::as_str) {
                 if matches!(input_type, "number" | "integer") {
-                    let numeric = value.parse::<f64>().map_err(|_| DurableRunnerError::invalid(format!(
-                        "answer {question_id} must be a valid {input_type}"
-                    )))?;
+                    let numeric = value.parse::<f64>().map_err(|_| {
+                        DurableRunnerError::invalid(format!(
+                            "answer {question_id} must be a valid {input_type}"
+                        ))
+                    })?;
                     if !numeric.is_finite() {
                         return Err(DurableRunnerError::invalid(format!(
                             "answer {question_id} must be a finite {input_type}"
                         )));
                     }
                     if input_type == "integer" && numeric.fract() != 0.0 {
-                        return Err(DurableRunnerError::invalid(format!("answer {question_id} must be an integer")));
+                        return Err(DurableRunnerError::invalid(format!(
+                            "answer {question_id} must be an integer"
+                        )));
                     }
-                    if validation.get("minimum").and_then(Value::as_f64).is_some_and(|minimum| numeric < minimum)
-                        || validation.get("maximum").and_then(Value::as_f64).is_some_and(|maximum| numeric > maximum)
+                    if validation
+                        .get("minimum")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|minimum| numeric < minimum)
+                        || validation
+                            .get("maximum")
+                            .and_then(Value::as_f64)
+                            .is_some_and(|maximum| numeric > maximum)
                     {
-                        return Err(DurableRunnerError::invalid(format!("answer {question_id} is outside its numeric bounds")));
+                        return Err(DurableRunnerError::invalid(format!(
+                            "answer {question_id} is outside its numeric bounds"
+                        )));
                     }
                 }
             }
@@ -1770,6 +2097,267 @@ fn cancel_pending_runtime_requests_on_terminal(
     Ok(())
 }
 
+fn enqueue_bound_result_event(
+    state: &mut DurableRunnerState,
+    config: &DurableRunnerConfig,
+    event_type: &str,
+) -> Result<Option<Value>, DurableRunnerError> {
+    let Some(contract) = state.completion_contract.as_ref() else {
+        return Ok(None);
+    };
+    let succeeded = event_type == "turn.completed";
+    let cancelled = matches!(event_type, "turn.cancelled" | "turn.interrupted");
+    let semantic_disposition = state
+        .semantic_result
+        .as_ref()
+        .and_then(|result| result.get("reportedWorkDisposition"))
+        .and_then(Value::as_str);
+    let disposition = semantic_disposition.unwrap_or(if succeeded {
+        "done"
+    } else {
+        "needs_review"
+    });
+    if state.semantic_result.is_some() {
+        return Ok(Some(json!({
+            "schema": "paperclip.prp.terminal.v1",
+            "turnTerminalState": if succeeded {
+                "completed"
+            } else if event_type == "turn.interrupted" {
+                "interrupted"
+            } else if cancelled {
+                "cancelled"
+            } else {
+                "failed"
+            },
+            "runTerminalState": if succeeded {
+                "succeeded"
+            } else if cancelled {
+                "cancelled"
+            } else {
+                "failed"
+            },
+            "reportedWorkDisposition": disposition,
+        })));
+    }
+    let summary = state.last_agent_message.clone().unwrap_or_else(|| {
+        if succeeded {
+            "The provider completed the requested work.".to_owned()
+        } else if cancelled {
+            "The provider run stopped before it completed.".to_owned()
+        } else {
+            "The provider run failed before it completed.".to_owned()
+        }
+    });
+    let evidence_ref = "provider:agent-message";
+    let criteria = contract
+        .criterion_ids
+        .iter()
+        .map(|criterion_id| {
+            json!({
+                "criterionId": criterion_id,
+                "status": if succeeded { "satisfied" } else { "unknown" },
+                "evidenceRefs": if succeeded {
+                    vec![evidence_ref]
+                } else {
+                    Vec::<&str>::new()
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let result = json!({
+        "schema": "paperclip.run_result.v1",
+        "reportedWorkDisposition": disposition,
+        "summary": summary,
+        "completionClaim": {
+            "contractRevision": contract.revision,
+            "objectiveSatisfied": succeeded,
+            "criteria": criteria,
+            "remainingWork": if succeeded {
+                Vec::<Value>::new()
+            } else {
+                vec![json!({
+                    "description": "Review the stopped provider run and continue the task.",
+                    "blocksCompletion": true,
+                })]
+            },
+        },
+        "evidence": if succeeded {
+            vec![json!({ "ref": evidence_ref })]
+        } else {
+            Vec::<Value>::new()
+        },
+        "verification": [],
+        "attentionRequests": if succeeded {
+            Vec::<Value>::new()
+        } else {
+            vec![json!({
+                "kind": "review",
+                "summary": "Review the stopped provider run before continuing.",
+                "ownerClass": "human",
+            })]
+        },
+        "artifacts": [],
+    });
+    let turn_terminal_state = if succeeded {
+        "completed"
+    } else if event_type == "turn.interrupted" {
+        "interrupted"
+    } else if cancelled {
+        "cancelled"
+    } else {
+        "failed"
+    };
+    let terminal = json!({
+        "schema": "paperclip.prp.terminal.v1",
+        "turnTerminalState": turn_terminal_state,
+        "runTerminalState": if succeeded {
+            "succeeded"
+        } else if cancelled {
+            "cancelled"
+        } else {
+            "failed"
+        },
+        "reportedWorkDisposition": disposition,
+    });
+    let item_id = state.item_id.clone();
+    enqueue_event(
+        state,
+        config,
+        "run.result.proposed",
+        0,
+        result,
+        Some(&item_id),
+    )?;
+    Ok(Some(terminal))
+}
+
+fn record_provider_semantic_result(
+    state: &mut DurableRunnerState,
+    config: &DurableRunnerConfig,
+    result: Value,
+    provider_item_id: Option<&str>,
+) -> Result<(), DurableRunnerError> {
+    if let Some(summary) = result
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.is_empty())
+    {
+        state.last_agent_message = Some(summary.chars().take(1_000_000).collect());
+    }
+    if state.semantic_result.is_none() {
+        state.semantic_result = Some(result.clone());
+        let item_id = provider_item_id.unwrap_or(state.item_id.as_str()).to_owned();
+        enqueue_event(
+            state,
+            config,
+            "run.result.proposed",
+            0,
+            result,
+            Some(&item_id),
+        )?;
+    } else {
+        let item_id = state.item_id.clone();
+        enqueue_event(
+            state,
+            config,
+            "harness.diagnostic",
+            1,
+            json!({
+                "code": "duplicate_semantic_result_ignored",
+                "message": "Duplicate provider semantic result ignored; the first result remains authoritative.",
+            }),
+            Some(&item_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn successful_completion_tool_input(
+    state_before_result: &DurableRunnerState,
+    result: &crate::provider_bridge::ToolResult,
+) -> Option<Value> {
+    if result.is_error
+        || !matches!(
+            result.operation_id.as_str(),
+            "paperclip_finish" | "paperclip_block"
+        )
+    {
+        return None;
+    }
+    state_before_result
+        .provider_tool_bridge
+        .pending_calls()
+        .find(|pending| {
+            pending.call_id == result.call_id && pending.operation_id == result.operation_id
+        })
+        .map(|pending| {
+            let mut input = pending.input.clone();
+            // The controller's semantic-tool authority accepts the same legacy
+            // provider shape as the TypeScript driver and deterministically fills
+            // these two collection fields. Persist that canonical shape here too:
+            // a PRP run.result.proposed event requires both fields even when empty.
+            if let Some(object) = input.as_object_mut() {
+                object
+                    .entry("attentionRequests".to_owned())
+                    .or_insert_with(|| json!([]));
+                object
+                    .entry("artifacts".to_owned())
+                    .or_insert_with(|| json!([]));
+            }
+            input
+        })
+}
+
+fn complete_turn_after_semantic_result(
+    state: &mut DurableRunnerState,
+    config: &DurableRunnerConfig,
+) -> Result<(), DurableRunnerError> {
+    cancel_pending_runtime_requests_on_terminal(
+        state,
+        config,
+        "semantic_completion_accepted",
+    )?;
+    let terminal = enqueue_bound_result_event(state, config, "turn.completed")?
+        .ok_or_else(|| DurableRunnerError::invalid("semantic completion omitted a run result"))?;
+    let item_id = state.item_id.clone();
+    enqueue_event(
+        state,
+        config,
+        "turn.completed",
+        0,
+        json!({
+            "status": "completed",
+            "turn": { "id": state.turn_id, "status": "completed", "items": [] },
+            "reason": "semantic_completion_accepted",
+        }),
+        Some(&item_id),
+    )?;
+    enqueue_event(
+        state,
+        config,
+        "run.terminal",
+        0,
+        terminal,
+        Some(&item_id),
+    )?;
+    state.active_turn = false;
+    if state.lifecycle_mode == "warm" {
+        state.lifecycle = "warm_idle".to_owned();
+    } else {
+        state.lifecycle = "suspending".to_owned();
+        state.stop_after_flush = true;
+        enqueue_event(
+            state,
+            config,
+            "runner.suspending",
+            0,
+            json!({ "reason": "per_turn_complete", "resumable": true }),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 fn begin_automatic_suspend(
     state: &mut DurableRunnerState,
     store: &DurableStateStore,
@@ -1837,13 +2425,38 @@ fn persist_provider_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_provider::{ProviderEvent, Provider, ProviderKind};
+    use crate::codex_provider::{Provider, ProviderEvent, ProviderKind};
     use crate::local_runner::LocalRunnerError;
-    use crate::provider_bridge::ToolResult;
+    use crate::provider_bridge::{
+        AuthorizedTool, AuthorizedToolSet, ToolResult, TOOL_SET_SCHEMA,
+    };
     use std::net::TcpListener;
     use std::sync::{mpsc, Arc, Mutex};
 
     static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn governed_response_wake_allows_acpx_provider_replacement() {
+        let yielded = json!({
+            "reportedWorkDisposition": "yielded",
+            "continuation": { "kind": "response_wake" },
+        });
+        assert!(semantic_result_allows_governed_wait_replacement(Some(
+            &yielded
+        )));
+        assert!(!semantic_result_allows_governed_wait_replacement(Some(
+            &json!({
+                "reportedWorkDisposition": "done",
+                "continuation": { "kind": "response_wake" },
+            })
+        )));
+        assert!(!semantic_result_allows_governed_wait_replacement(Some(
+            &json!({
+                "reportedWorkDisposition": "yielded",
+                "continuation": { "kind": "same_agent" },
+            })
+        )));
+    }
 
     struct OversizedFrameProvider;
 
@@ -1868,7 +2481,12 @@ mod tests {
         fn provider_session_id(&self) -> Option<&str> {
             Some("steering-session")
         }
-        fn start_turn(&mut self, _message: &str, _cwd: &str, _turn_id: &str) -> Result<Value, LocalRunnerError> {
+        fn start_turn(
+            &mut self,
+            _message: &str,
+            _cwd: &str,
+            _turn_id: &str,
+        ) -> Result<Value, LocalRunnerError> {
             unreachable!()
         }
         fn steer_turn(&mut self, turn_id: &str, message: &str) -> Result<Value, LocalRunnerError> {
@@ -1878,7 +2496,10 @@ mod tests {
                 return Err(LocalRunnerError::invalid("provider rejected steering"));
             }
             drop(fail_next);
-            self.calls.lock().unwrap().push((turn_id.to_owned(), message.to_owned()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((turn_id.to_owned(), message.to_owned()));
             Ok(json!({"acknowledged": true}))
         }
         fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
@@ -1914,7 +2535,12 @@ mod tests {
         fn provider_session_id(&self) -> Option<&str> {
             Some("test-session")
         }
-        fn start_turn(&mut self, _message: &str, _cwd: &str, _turn_id: &str) -> Result<Value, LocalRunnerError> {
+        fn start_turn(
+            &mut self,
+            _message: &str,
+            _cwd: &str,
+            _turn_id: &str,
+        ) -> Result<Value, LocalRunnerError> {
             unreachable!()
         }
         fn interrupt_turn(&mut self, _turn_id: &str) -> Result<Value, LocalRunnerError> {
@@ -1939,12 +2565,17 @@ mod tests {
     #[test]
     fn usage_counts_remain_observable_while_credential_tokens_are_redacted() {
         let sanitized = crate::durable::sanitize_value(&json!({
+            "authorizationBoundary": "active_task",
             "tokenUsage": { "total": {
                 "inputTokens": 12, "outputTokens": 3,
                 "cacheReadTokens": 0, "cacheWriteTokens": 5
             } },
             "accessToken": "secret-value",
         }));
+        assert_eq!(
+            sanitized.pointer("/authorizationBoundary"),
+            Some(&json!("active_task"))
+        );
         assert_eq!(
             sanitized.pointer("/tokenUsage/total/inputTokens"),
             Some(&json!(12))
@@ -2009,6 +2640,215 @@ mod tests {
             provider_failure_code("invalid JSON-RPC"),
             "provider_transport_failed"
         );
+    }
+
+    #[test]
+    fn provider_semantic_result_is_durable_and_precedes_the_terminal() {
+        let root = temporary_root("provider-semantic-result");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        state.completion_contract = Some(CompletionContractBinding {
+            revision: "1".to_owned(),
+            criterion_ids: vec!["objective".to_owned()],
+        });
+        let result = json!({
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done",
+            "summary": "PAPERCLIP_E2E_OK_test",
+            "completionClaim": {
+                "contractRevision": "1",
+                "objectiveSatisfied": true,
+                "criteria": [{
+                    "criterionId": "objective",
+                    "status": "satisfied",
+                    "evidenceRefs": []
+                }],
+                "remainingWork": []
+            },
+            "evidence": [],
+            "verification": [],
+            "attentionRequests": [],
+            "artifacts": []
+        });
+
+        record_provider_semantic_result(
+            &mut state,
+            &runner_config,
+            result.clone(),
+            Some("finish-1"),
+        )
+        .unwrap();
+        let terminal = enqueue_bound_result_event(
+            &mut state,
+            &runner_config,
+            "turn.completed",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(state.semantic_result, Some(result.clone()));
+        assert_eq!(state.last_agent_message.as_deref(), Some("PAPERCLIP_E2E_OK_test"));
+        let proposed = state
+            .outbox
+            .iter()
+            .filter(|event| event.event_type == "run.result.proposed")
+            .collect::<Vec<_>>();
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].item_id.as_deref(), Some("finish-1"));
+        assert_eq!(
+            proposed[0].envelope.pointer("/payload/payload"),
+            Some(&result)
+        );
+        assert_eq!(terminal["turnTerminalState"], "completed");
+        assert_eq!(terminal["runTerminalState"], "succeeded");
+        assert_eq!(terminal["reportedWorkDisposition"], "done");
+
+        record_provider_semantic_result(
+            &mut state,
+            &runner_config,
+            json!({"reportedWorkDisposition": "blocked", "summary": "later"}),
+            Some("finish-2"),
+        )
+        .unwrap();
+        assert_eq!(state.semantic_result, Some(result));
+        assert_eq!(
+            state
+                .outbox
+                .iter()
+                .filter(|event| event.event_type == "run.result.proposed")
+                .count(),
+            1
+        );
+        assert!(state.outbox.iter().any(|event| {
+            event.event_type == "harness.diagnostic"
+                && event.envelope["payload"]["payload"]["code"]
+                    == "duplicate_semantic_result_ignored"
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_completion_tool_result_commits_the_original_semantic_input() {
+        let root = temporary_root("completion-tool-result");
+        let runner_config = config(&root);
+        let store = DurableStateStore::new(&root).unwrap();
+        let (mut state, _) = store.load_or_create(&runner_config).unwrap();
+        state
+            .provider_tool_bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: "sha256:completion-tools".to_owned(),
+                operations: vec![AuthorizedTool {
+                    operation_id: "paperclip_finish".to_owned(),
+                    version: 1,
+                    description: "Finish the task.".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    response_schema: json!({"type": "object"}),
+                }],
+            })
+            .unwrap();
+        let semantic_input = json!({
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done",
+            "summary": "finished",
+            "completionClaim": {
+                "contractRevision": "1",
+                "objectiveSatisfied": true,
+                "criteria": [],
+                "remainingWork": []
+            },
+            "evidence": [],
+            "verification": []
+        });
+        let canonical_semantic_input = json!({
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done",
+            "summary": "finished",
+            "completionClaim": {
+                "contractRevision": "1",
+                "objectiveSatisfied": true,
+                "criteria": [],
+                "remainingWork": []
+            },
+            "evidence": [],
+            "verification": [],
+            "attentionRequests": [],
+            "artifacts": []
+        });
+        state
+            .provider_tool_bridge
+            .begin_call(
+                "finish-1".to_owned(),
+                "paperclip_finish".to_owned(),
+                semantic_input.clone(),
+            )
+            .unwrap();
+        let accepted = ToolResult {
+            call_id: "finish-1".to_owned(),
+            operation_id: "paperclip_finish".to_owned(),
+            result: json!({"success": true}),
+            is_error: false,
+        };
+        assert_eq!(
+            successful_completion_tool_input(&state, &accepted),
+            Some(canonical_semantic_input.clone())
+        );
+        assert_eq!(
+            successful_completion_tool_input(
+                &state,
+                &ToolResult {
+                    is_error: true,
+                    ..accepted.clone()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            successful_completion_tool_input(
+                &state,
+                &ToolResult {
+                    operation_id: "get_task_context".to_owned(),
+                    ..accepted
+                }
+            ),
+            None
+        );
+        state.completion_contract = Some(CompletionContractBinding {
+            revision: "1".to_owned(),
+            criterion_ids: Vec::new(),
+        });
+        state.active_turn = true;
+        state.lifecycle = "active".to_owned();
+        record_provider_semantic_result(
+            &mut state,
+            &runner_config,
+            canonical_semantic_input,
+            Some("finish-1"),
+        )
+        .unwrap();
+        complete_turn_after_semantic_result(&mut state, &runner_config).unwrap();
+        assert!(!state.active_turn);
+        assert!(state.stop_after_flush);
+        assert_eq!(state.lifecycle, "suspending");
+        assert_eq!(
+            state
+                .outbox
+                .iter()
+                .filter(|event| event.event_type == "run.result.proposed")
+                .count(),
+            1
+        );
+        assert!(state
+            .outbox
+            .iter()
+            .any(|event| event.event_type == "turn.completed"));
+        assert!(state
+            .outbox
+            .iter()
+            .any(|event| event.event_type == "run.terminal"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2094,7 +2934,8 @@ mod tests {
                 run_id: "run".to_owned(),
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
-                permission_policy: "interactive".to_owned(),
+                permission_mode: "approve-all".to_owned(),
+                permission_mode_pinned: true,
                 runtime_context: None,
             },
         ));
@@ -2105,7 +2946,7 @@ mod tests {
             state.lifecycle = lifecycle.to_owned();
             assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
         }
-            state.lifecycle = "active".to_owned();
+        state.lifecycle = "active".to_owned();
         state.stop_after_flush = true;
         assert!(!should_suspend_for_idle_at(&state, 2_000_000).unwrap());
         let _ = fs::remove_dir_all(root);
@@ -2134,7 +2975,8 @@ mod tests {
                 run_id: "run".to_owned(),
                 cwd: "/tmp/workspace".to_owned(),
                 instructions: "safe".to_owned(),
-                permission_policy: "interactive".to_owned(),
+                permission_mode: "approve-all".to_owned(),
+                permission_mode_pinned: true,
                 runtime_context: None,
             },
         ));
@@ -2212,7 +3054,10 @@ mod tests {
             .filter(|event| event.envelope["payload"]["eventType"] == "runtime_request.expired")
             .collect::<Vec<_>>();
         assert_eq!(expirations.len(), 1);
-        assert_eq!(expirations[0].envelope["payload"]["payload"]["request"], request);
+        assert_eq!(
+            expirations[0].envelope["payload"]["payload"]["request"],
+            request
+        );
         assert_eq!(
             expirations[0].envelope["payload"]["payload"]["reason"],
             "provider_process_lost"
@@ -2253,6 +3098,7 @@ mod tests {
     fn config(root: &Path) -> DurableRunnerConfig {
         DurableRunnerConfig {
             connect_url: "ws://127.0.0.1:1/durable_runner/connect".to_owned(),
+            ca_bundle_path: None,
             state_dir: root.to_path_buf(),
             runner_instance_id: "runner_durable_runner_stable".to_owned(),
             environment_lease_id: "lease_durable_runner_stable".to_owned(),
@@ -2268,6 +3114,7 @@ mod tests {
             p0_reserve_bytes: 8 * 1024,
             max_frame_bytes: 1024 * 1024,
             reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
             max_runtime: Duration::from_millis(10),
             lifecycle_mode: "per_turn".to_owned(),
             idle_timeout: None,
@@ -2465,27 +3312,23 @@ mod tests {
             json!({ "turnId": config.turn_id, "text": "Prioritize mobile overflow." }),
         );
 
-        let first = process_command_and_provider(
-            &mut state,
-            &store,
-            &config,
-            &mut provider,
-            &steering,
-        ).unwrap();
+        let first =
+            process_command_and_provider(&mut state, &store, &config, &mut provider, &steering)
+                .unwrap();
         let event_count = state.outbox.len();
-        let duplicate = process_command_and_provider(
-            &mut state,
-            &store,
-            &config,
-            &mut provider,
-            &steering,
-        ).unwrap();
+        let duplicate =
+            process_command_and_provider(&mut state, &store, &config, &mut provider, &steering)
+                .unwrap();
 
         assert_eq!(first.status, "completed");
         assert_eq!(duplicate.result, first.result);
-        assert_eq!(calls.lock().unwrap().as_slice(), &[
-            (config.turn_id.clone(), "Prioritize mobile overflow.".to_owned()),
-        ]);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(
+                config.turn_id.clone(),
+                "Prioritize mobile overflow.".to_owned()
+            ),]
+        );
         assert_eq!(state.outbox.len(), event_count);
         assert!(state.outbox.iter().any(|event| {
             event.envelope["payload"]["eventType"] == "item.completed"
@@ -2515,24 +3358,18 @@ mod tests {
             json!({ "turnId": config.turn_id, "text": "Retry me." }),
         );
 
-        let first_error = process_command_and_provider(
-            &mut state,
-            &store,
-            &config,
-            &mut provider,
-            &steering,
-        ).unwrap_err();
-        assert!(first_error.to_string().contains("provider rejected steering"));
+        let first_error =
+            process_command_and_provider(&mut state, &store, &config, &mut provider, &steering)
+                .unwrap_err();
+        assert!(first_error
+            .to_string()
+            .contains("provider rejected steering"));
         assert!(!state.processed_commands.contains_key("command-steer-retry"));
         assert_eq!(state.last_controller_command_seq, 0);
 
-        let retry = process_command_and_provider(
-            &mut state,
-            &store,
-            &config,
-            &mut provider,
-            &steering,
-        ).unwrap();
+        let retry =
+            process_command_and_provider(&mut state, &store, &config, &mut provider, &steering)
+                .unwrap();
         assert_eq!(retry.status, "completed");
         assert_eq!(calls.lock().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
@@ -2559,14 +3396,8 @@ mod tests {
                 }
             }),
         );
-        let processed = process_command_and_provider(
-            &mut state,
-            &store,
-            &config,
-            &mut None,
-            &value,
-        )
-        .unwrap();
+        let processed =
+            process_command_and_provider(&mut state, &store, &config, &mut None, &value).unwrap();
         assert_eq!(processed.status, "failed");
         assert_eq!(processed.logical_effect_count, 0);
         assert!(processed.result["detail"]
@@ -2576,15 +3407,28 @@ mod tests {
         assert_eq!(state.lifecycle, "recoverable_failure");
         assert_eq!(state.last_controller_command_seq, 1);
         assert!(state.outbox.is_empty());
-        let replay = process_command_and_provider(
+        let replay =
+            process_command_and_provider(&mut state, &store, &config, &mut None, &value).unwrap();
+        assert_eq!(replay.status, "failed");
+        let open_after_failure = process_command_and_provider(
             &mut state,
             &store,
             &config,
             &mut None,
-            &value,
+            &command(
+                "command_open_after_failed_prepare",
+                2,
+                "session.open",
+                json!({}),
+            ),
         )
         .unwrap();
-        assert_eq!(replay.status, "failed");
+        assert_eq!(open_after_failure.status, "rejected");
+        assert!(open_after_failure.result["detail"]
+            .as_str()
+            .unwrap()
+            .contains("provider bootstrap failed"));
+        assert!(state.outbox.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2722,7 +3566,7 @@ mod tests {
             |_host, _port| Ok(vec![address]),
         )
         .unwrap();
-        let mut client = WsClient::connect(&target, config.max_frame_bytes).unwrap();
+        let mut client = WsClient::connect(&target, config.max_frame_bytes, None).unwrap();
         let error = authenticate_transport(
             &mut client,
             &state,
@@ -2733,7 +3577,8 @@ mod tests {
             None,
             None,
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(error
             .to_string()
             .contains("transport authentication proof is invalid"));
@@ -3068,9 +3913,7 @@ mod tests {
     #[test]
     fn destination_validation_rejects_malformed_userinfo_query_and_fragment_before_resolution() {
         for url in [
-            "wss://127.0.0.1:3100/durable_runner/connect",
             "WS://127.0.0.1:3100/durable_runner/connect",
-            "ws://127.0.0.1/durable_runner/connect",
             "ws://127.0.0.1:0/durable_runner/connect",
             "ws://[::1:3100/durable_runner/connect",
             "ws://user@127.0.0.1:3100/durable_runner/connect",
@@ -3089,6 +3932,29 @@ mod tests {
                 "malformed URL reached destination resolution: {url}"
             );
         }
+    }
+
+    #[test]
+    fn destination_validation_allows_verified_wss_remote_addresses_and_default_ports() {
+        let target = resolve_ws_target_with(
+            "wss://paperclip.example.test/api/runner/v1/connect/run",
+            |host, port| {
+                assert_eq!(host, "paperclip.example.test");
+                assert_eq!(port, 443);
+                Ok(vec!["192.0.2.10:443".parse().unwrap()])
+            },
+        )
+        .unwrap();
+        assert!(target.secure);
+        assert_eq!(target.host, "paperclip.example.test");
+
+        let loopback =
+            resolve_ws_target_with("ws://127.0.0.1/api/runner/v1/connect/run", |_host, port| {
+                assert_eq!(port, 80);
+                Ok(vec!["127.0.0.1:80".parse().unwrap()])
+            })
+            .unwrap();
+        assert!(!loopback.secure);
     }
 
     #[test]
@@ -3112,7 +3978,7 @@ mod tests {
 
     #[test]
     fn oversized_outbound_websocket_frame_is_rejected_before_write() {
-        let error = encode_masked_frame(0x1, b"ninebytes", [0; 4], 8).unwrap_err();
+        let error = encode_frame(0x1, b"ninebytes", Some([0; 4]), 8).unwrap_err();
         assert!(error
             .to_string()
             .contains("outbound WebSocket frame exceeds"));
@@ -3124,6 +3990,85 @@ mod tests {
         assert!(error
             .to_string()
             .contains("inbound WebSocket frame exceeds"));
+    }
+
+    fn listener_client(request: &str) -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.write_all(request.as_bytes()).unwrap();
+        client.flush().unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn runner_listener_accepts_only_the_exact_websocket_path_without_compression() {
+        let (mut wrong_path_client, wrong_path_server) = listener_client(
+            "GET /unrelated HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let error = WsClient::accept(wrong_path_server, "/api/runner/v1/connect/run-1", 1024)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unrelated HTTP path"));
+        let response = read_http_headers(&mut wrong_path_client, "test response").unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 "));
+
+        let (_compression_client, compression_server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+        );
+        let error = WsClient::accept(compression_server, "/api/runner/v1/connect/run-1", 1024)
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("does not support WebSocket compression"));
+    }
+
+    #[test]
+    fn runner_listener_requires_masked_client_frames_and_enforces_control_limits() {
+        let (mut client, server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted = WsClient::accept(server, "/api/runner/v1/connect/run-1", 1024).unwrap();
+        let response = read_http_headers(&mut client, "test response").unwrap();
+        assert!(response.starts_with("HTTP/1.1 101 "));
+        client
+            .write_all(&encode_frame(0x1, b"{}", None, 1024).unwrap())
+            .unwrap();
+        let error = accepted.receive_plain_json().unwrap_err();
+        assert!(error.to_string().contains("masking direction is invalid"));
+
+        let (mut control_client, control_server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted =
+            WsClient::accept(control_server, "/api/runner/v1/connect/run-1", 1024).unwrap();
+        let _ = read_http_headers(&mut control_client, "test response").unwrap();
+        control_client.write_all(&[0x89, 0xFE, 0, 126]).unwrap();
+        let error = accepted.receive_plain_json().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("control frame exceeds 125 bytes"));
+    }
+
+    #[test]
+    fn runner_listener_preserves_a_partially_received_frame_across_poll_timeouts() {
+        let (mut client, server) = listener_client(
+            "GET /api/runner/v1/connect/run-1 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGVzdA==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let mut accepted = WsClient::accept(server, "/api/runner/v1/connect/run-1", 1024).unwrap();
+        let _ = read_http_headers(&mut client, "test response").unwrap();
+        let frame =
+            encode_frame(0x1, br#"{"crosses":"timeout"}"#, Some([1, 2, 3, 4]), 1024).unwrap();
+        let split = frame.len() - 4;
+        let writer = thread::spawn(move || {
+            client.write_all(&frame[..split]).unwrap();
+            thread::sleep(Duration::from_millis(400));
+            client.write_all(&frame[split..]).unwrap();
+        });
+        let value = accepted.receive_plain_json().unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(value, json!({ "crosses": "timeout" }));
     }
 
     #[test]

@@ -19,7 +19,9 @@ export const CODEX_THREAD_ITEM_CLASSIFICATION = {
   userMessage: "existing_transcript",
   hookPrompt: "hook",
   agentMessage: "existing_transcript",
-  plan: "plan",
+  // Codex's `plan` ThreadItem is proposed-plan document text. The live
+  // execution checklist is a separate `turn/plan/updated` notification.
+  plan: "existing_transcript",
   reasoning: "existing_reasoning",
   commandExecution: "tool_execution",
   fileChange: "existing_workspace_change",
@@ -81,6 +83,103 @@ function safeId(value: string, fallback: string): string {
   return /^[A-Za-z0-9]/.test(candidate) ? candidate : fallback;
 }
 
+const GENERIC_ACP_TOOL_NAMES = new Set(["tool", "tool call", "tool_call", "acp_tool"]);
+
+function normalizedToolWords(value: string): string[] {
+  return value
+    .replace(/^mcp__(.+?)__/, "")
+    .replace(/^mcp\.[^.]+\./, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^A-Za-z0-9]+/g, " ")
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function isGenericAcpToolName(value: unknown): boolean {
+  const name = text(value)
+    .trim()
+    .toLowerCase()
+    .replace(/\s*\((?:pending|in[_ -]?progress|completed|failed|cancelled|canceled)\)$/, "");
+  return !name || GENERIC_ACP_TOOL_NAMES.has(name);
+}
+
+function meaningfulAcpToolProgress(value: string, title: string | undefined, status: string | undefined): boolean {
+  const progress = value.trim();
+  if (!progress || /^tool(?:\s+|_)call\b/i.test(progress)) return false;
+  const normalizedStatus = (status ?? "").replaceAll("_", "[ _-]?");
+  if (!title || !normalizedStatus) return true;
+  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return !new RegExp(`^${escapedTitle}\\s*\\(${normalizedStatus}\\)\\s*$`, "i").test(progress);
+}
+
+interface AcpxToolLifecycleIdentity {
+  title?: string;
+  kind?: Extract<AcpRuntimeEvent, { type: "tool_call" }>["kind"];
+  locations?: Extract<AcpRuntimeEvent, { type: "tool_call" }>["locations"];
+  progress?: string;
+}
+
+/**
+ * ACP tool updates are deltas: a later update may omit the title, kind, and
+ * locations that were present on the opening event. ACPX represents a missing
+ * title as the literal `tool call`, so consumers must restore lifecycle
+ * identity before translating the event into a durable protocol record.
+ */
+export function createAcpxToolEventNormalizer(): (event: AcpRuntimeEvent) => AcpRuntimeEvent {
+  const lifecycle = new Map<string, AcpxToolLifecycleIdentity>();
+  return (event) => {
+    if (event.type !== "tool_call" || !event.toolCallId) return event;
+    const previous = lifecycle.get(event.toolCallId) ?? {};
+    const incomingTitle = isGenericAcpToolName(event.title) ? undefined : event.title?.trim();
+    const title = previous.title ?? incomingTitle;
+    const kind = previous.kind && previous.kind !== "other"
+      ? previous.kind
+      : event.kind ?? previous.kind;
+    const locations = event.locations?.length ? event.locations : previous.locations;
+    const progress = meaningfulAcpToolProgress(event.text, incomingTitle, event.status)
+      ? event.text
+      : previous.progress;
+    lifecycle.set(event.toolCallId, { title, kind, locations, progress });
+    return {
+      ...event,
+      title,
+      kind,
+      locations,
+      ...(progress && canonicalStatus(event.status, "running") === "running" ? { text: progress } : {}),
+    };
+  };
+}
+
+function acpxMcpToolIdentity(value: string): { namespace: string; name: string } | null {
+  const doubleUnderscore = value.match(/^mcp__(.+?)__(.+)$/i);
+  if (doubleUnderscore) return { namespace: doubleUnderscore[1], name: doubleUnderscore[2] };
+  const dotted = value.match(/^mcp\.([^.]+)\.(.+)$/i);
+  return dotted ? { namespace: dotted[1], name: dotted[2] } : null;
+}
+
+function acpxToolOperation(
+  kindValue: unknown,
+  name: string,
+): "read" | "search" | "list" | "execute" | "edit" | "unknown" {
+  const kind = text(kindValue).toLowerCase();
+  if (kind === "read") return "read";
+  if (kind === "search" || kind === "fetch") return "search";
+  if (["edit", "delete", "move"].includes(kind)) return "edit";
+  if (kind === "execute") return "execute";
+
+  const words = normalizedToolWords(name);
+  const first = words[0] ?? "";
+  const compact = words.join("");
+  if (["get", "read", "inspect", "view"].includes(first)) return "read";
+  if (["list", "glob"].includes(first)) return "list";
+  if (["toolsearch", "websearch"].includes(compact) || ["find", "search", "grep", "query", "lookup", "fetch", "open", "browse"].includes(first)) return "search";
+  if (["write", "edit", "update", "set", "patch", "upsert", "sync", "create", "add", "register", "upload", "delete", "remove", "move", "rename", "report", "answer", "request", "decide", "comment", "finish", "complete", "block"].includes(first)) return "edit";
+  if (["run", "execute", "bash", "shell", "command", "start", "spawn", "delegate", "send", "message", "stop", "cancel", "interrupt", "wait", "sleep", "poll"].includes(first)) return "execute";
+  return "unknown";
+}
+
 function digest(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
@@ -102,8 +201,12 @@ function canonicalStatus(value: unknown, fallback: "running" | "completed" | "fa
 }
 
 function planStepStatus(value: unknown): "pending" | "in_progress" | "completed" | "blocked" {
-  const status = text(value).toLowerCase().replaceAll("-", "_");
+  const status = text(value)
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replaceAll("-", "_");
   if (status === "in_progress" || status === "completed" || status === "blocked") return status;
+  if (status === "failed" || status === "error") return "blocked";
   return "pending";
 }
 
@@ -138,24 +241,25 @@ function executionPayload(item: Record<string, unknown>, status: string): Record
   };
 }
 
-function planPayload(params: Record<string, unknown>, item: Record<string, unknown>, complete: boolean): Record<string, unknown> {
+function turnPlanPayload(params: Record<string, unknown>): Record<string, unknown> {
   const plan = Array.isArray(params.plan) ? params.plan : [];
-  const textPlan = text(item.text);
-  const steps = plan.length > 0
-    ? plan.slice(0, 256).map((entry, index) => {
-        const step = record(entry);
-        return { stepId: `step-${index + 1}`, body: text(step.step).slice(0, 4000), status: planStepStatus(step.status) };
-      })
-    : textPlan.split("\n").filter(Boolean).slice(0, 256).map((body, index) => ({ stepId: `step-${index + 1}`, body: body.slice(0, 4000), status: "pending" }));
-  const planComplete = complete || (steps.length > 0 && steps.every((step) => step.status === "completed"));
+  const steps = plan.slice(0, 256).flatMap((entry, index) => {
+    const step = record(entry);
+    const body = text(step.step).trim().slice(0, 4000);
+    return body
+      ? [{ stepId: `step-${index + 1}`, body, status: planStepStatus(step.status) }]
+      : [];
+  });
+  const planComplete = steps.length > 0 && steps.every((step) => step.status === "completed");
+  const planId = safeId(text(params.turnId), "turn-plan");
   return {
     schema: "paperclip.plan.updated.v1",
-    planId: safeId(text(item.id, text(params.turnId)), "plan"),
+    planId,
     revision: Number.isSafeInteger(params.revision) ? Number(params.revision) : 1,
     explanation: text(params.explanation) || null,
     steps,
     complete: planComplete,
-    syncStatus: planComplete ? "pending" : "streaming",
+    syncStatus: "not_applicable",
     documentRevision: null,
   };
 }
@@ -183,11 +287,9 @@ export function canonicalProviderEventsFromCodex(method: string, paramsValue: un
   const type = text(item.type);
   const itemId = safeId(text(item.id, text(params.itemId)), "provider-item");
   const completed = method === "item/completed";
-  if ((method === "item/started" || completed) && type === "plan") {
-    return [{ eventType: "plan.updated", payload: planPayload(params, item, completed), itemId }];
-  }
   if (method === "turn/plan/updated") {
-    return [{ eventType: "plan.updated", payload: planPayload(params, item, false), itemId: safeId(text(params.turnId), "plan") }];
+    const turnPlanId = safeId(text(params.turnId), "turn-plan");
+    return [{ eventType: "plan.updated", payload: turnPlanPayload(params), itemId: turnPlanId }];
   }
   if ((method === "item/started" || completed) && ["commandExecution", "mcpToolCall", "dynamicToolCall"].includes(type)) {
     return [{ eventType: completed ? "tool.execution.completed" : "tool.execution.started", payload: executionPayload(item, completed ? canonicalStatus(item.status, "completed") : "running"), itemId }];
@@ -303,9 +405,10 @@ export function canonicalProviderEventsFromOpenCodePart(partValue: unknown): Can
 export function canonicalProviderEventsFromAcpxRuntimeEvent(
   event: AcpRuntimeEvent,
   fallbackItemId: string,
+  turnId?: string,
 ): CanonicalProviderEvent[] {
   const runtimeType = text(record(event).type);
-  if (!["text_delta", "status", "tool_call", "error", "done"].includes(runtimeType)) {
+  if (!["text_delta", "status", "tool_call", "plan", "error", "done"].includes(runtimeType)) {
     return [{
       eventType: "provider.notice.recorded",
       payload: {
@@ -322,31 +425,59 @@ export function canonicalProviderEventsFromAcpxRuntimeEvent(
     }];
   }
   const itemId = safeId(
-    event.type === "tool_call" ? text(event.toolCallId, fallbackItemId) : fallbackItemId,
+    event.type === "tool_call"
+      ? text(event.toolCallId, fallbackItemId)
+      : event.type === "plan"
+        ? text(turnId, fallbackItemId)
+        : fallbackItemId,
     "acpx-item",
   );
+  if (event.type === "plan") {
+    const steps = event.entries.slice(0, 256).flatMap((entry, index) => {
+      const body = entry.content.trim().slice(0, 4000);
+      return body
+        ? [{
+            stepId: `step-${index + 1}`,
+            body,
+            status: planStepStatus(entry.status),
+          }]
+        : [];
+    });
+    const complete = steps.length > 0 && steps.every((step) => step.status === "completed");
+    return [{
+      eventType: "plan.updated",
+      payload: {
+        schema: "paperclip.plan.updated.v1",
+        planId: safeId(text(turnId, fallbackItemId), "turn-plan"),
+        revision: 1,
+        explanation: null,
+        steps,
+        complete,
+        syncStatus: "not_applicable",
+        documentRevision: null,
+      },
+      itemId,
+    }];
+  }
   if (event.type === "tool_call") {
-    const kind = text(event.kind).toLowerCase();
     const status = canonicalStatus(event.status, "running");
     const output = typeof event.rawOutput === "string"
       ? event.rawOutput
       : event.rawOutput === undefined
         ? ""
         : JSON.stringify(event.rawOutput);
-    const operation = /read/.test(kind) ? "read"
-      : /search/.test(kind) ? "search"
-        : /list/.test(kind) ? "list"
-          : /edit|write|delete|move/.test(kind) ? "edit"
-            : /execute|terminal/.test(kind) ? "execute"
-              : "unknown";
+    const title = isGenericAcpToolName(event.title) ? "" : text(event.title).trim();
+    const mcp = acpxMcpToolIdentity(title);
+    const name = mcp?.name ?? title;
+    const operation = acpxToolOperation(event.kind, name);
     const payload = {
       schema: "paperclip.tool.execution.v1",
       executionId: itemId,
-      transport: "builtin",
+      transport: mcp ? "mcp" : "builtin",
       operation,
-      name: text(event.title) || null,
+      name: name || null,
       target: safeAcpLocation(event.locations?.[0]),
-      namespace: null,
+      namespace: mcp?.namespace ?? null,
       readOnly: ["read", "search", "list"].includes(operation),
       status,
       durationMs: null,
@@ -358,24 +489,6 @@ export function canonicalProviderEventsFromAcpxRuntimeEvent(
     return [{
       eventType: terminal ? "tool.execution.completed" : event.tag === "tool_call" ? "tool.execution.started" : "tool.execution.progressed",
       payload,
-      itemId,
-    }];
-  }
-  if (event.type === "status" && event.tag === "plan") {
-    const steps = event.text.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 256)
-      .map((body, index) => ({ stepId: `step-${index + 1}`, body: body.slice(0, 4000), status: "pending" }));
-    return [{
-      eventType: "plan.updated",
-      payload: {
-        schema: "paperclip.plan.updated.v1",
-        planId: itemId,
-        revision: 1,
-        explanation: null,
-        steps,
-        complete: true,
-        syncStatus: "pending",
-        documentRevision: null,
-      },
       itemId,
     }];
   }

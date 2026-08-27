@@ -95,6 +95,87 @@ const driver: HarnessDriver = {
 };
 
 describe("HarnessDriverBackend", () => {
+  it("rejects and closes a provider session without a durable provider identity", async () => {
+    let closed = false;
+    class MissingProviderIdentitySession extends FakeHarnessSession {
+      override ids() {
+        return {
+          driverSessionId: "driver-missing-provider",
+          providerSessionId: null,
+        };
+      }
+
+      override async close() {
+        closed = true;
+      }
+    }
+    const incompleteDriver: HarnessDriver = {
+      ...driver,
+      async openSession() {
+        return new MissingProviderIdentitySession();
+      },
+    };
+    const backend = new HarnessDriverBackend(incompleteDriver);
+
+    await expect(backend.openSession({
+      identity: {
+        runId: "run-incomplete",
+        sessionId: "session-incomplete",
+        companyId: "company-1",
+        issueId: "issue-1",
+        agentId: "agent-1",
+      },
+      workingDirectory: "/workspace",
+    })).rejects.toThrow(
+      "provider_initialize_protocol_error: provider=fake stage=session.open missing durable provider session identity",
+    );
+    expect(closed).toBe(true);
+  });
+
+  it("rejects and closes a recovered session without a durable provider identity", async () => {
+    let closed = false;
+    class MissingRecoveredIdentitySession extends FakeHarnessSession {
+      override ids() {
+        return {
+          driverSessionId: "driver-missing-recovered-provider",
+          providerSessionId: null,
+        };
+      }
+
+      override async close() {
+        closed = true;
+      }
+    }
+    const incompleteDriver: HarnessDriver = {
+      ...driver,
+      async recoverSession() {
+        return {
+          recovered: true,
+          session: new MissingRecoveredIdentitySession(),
+        };
+      },
+    };
+    const backend = new HarnessDriverBackend(incompleteDriver);
+
+    await expect(backend.recoverSession({
+      backendKind: "runner",
+      driverKind: "fake",
+      sessionId: "driver-1",
+      providerSessionId: "provider-1",
+      identity: {
+        runId: "run-recover-incomplete",
+        sessionId: "session-recover-incomplete",
+        companyId: "company-1",
+        issueId: "issue-1",
+        agentId: "agent-1",
+      },
+      cursor: "0",
+    })).rejects.toThrow(
+      "provider_initialize_protocol_error: provider=fake stage=session.recover missing durable provider session identity",
+    );
+    expect(closed).toBe(true);
+  });
+
   it("normalizes harness events, result, terminal, and snapshot", async () => {
     const backend = new HarnessDriverBackend(driver);
     const session = await backend.openSession({
@@ -169,7 +250,7 @@ describe("HarnessDriverBackend", () => {
     ]);
   });
 
-  it("emits one non-replayable input expiration before propagating provider loss", async () => {
+  it("emits one non-replayable input expiration and terminal wait after provider loss", async () => {
     const questionSet = {
       schema: "paperclip.question_set.v1" as const,
       questions: [{ id: "target", prompt: "Which target?", required: true, answerMode: "text" as const }],
@@ -210,7 +291,12 @@ describe("HarnessDriverBackend", () => {
         request: { input: questionSet },
       },
     } });
-    await expect(iterator.next()).rejects.toThrow("provider transport lost");
+    await expect(iterator.next()).resolves.toMatchObject({ value: {
+      eventType: "turn.interrupted",
+      sourceSeq: 3,
+      payload: { reason: "provider_process_lost" },
+    } });
+    await expect(iterator.next()).resolves.toMatchObject({ done: true });
   });
 
   it("does not synthesize a fallback after the input was already resolved", async () => {

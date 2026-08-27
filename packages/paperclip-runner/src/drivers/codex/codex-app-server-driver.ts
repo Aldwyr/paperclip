@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { parse, relative, resolve } from "node:path";
+import {
+  parseCodexTurnDiff,
+  type ParsedCodexTurnDiffFile,
+} from "./codex-turn-diff.js";
+
+export { parseCodexTurnDiff } from "./codex-turn-diff.js";
 
 import type {
   HarnessDriver,
@@ -17,6 +23,7 @@ import type {
   HarnessThreadLineageEntry,
   OpenHarnessSessionInput,
   PersistedHarnessSession,
+  PersistedHarnessProviderIdentity,
   PersistedHarnessSemanticResult,
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
@@ -25,6 +32,7 @@ import {
   HarnessOperationAlreadyTerminalError,
   HarnessReconciliationError,
   HarnessStaleTurnError,
+  harnessRuntimeInputExpiredOutcome,
   harnessRuntimeRequestOutcome,
   PAPERCLIP_QUESTION_SET_SCHEMA,
   PAPERCLIP_RUNTIME_REQUEST_SCHEMA_V2,
@@ -106,6 +114,9 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 
 export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
+  /** Explicit provider model selected by the persisted native execution. */
+  model?: string;
+  approvalPolicy?: "never" | "on-request" | "untrusted";
   baseInstructions?: string;
   includeSkillInstructions?: boolean;
   conversationMode?: "task" | "direct";
@@ -116,7 +127,9 @@ export interface CodexAppServerDriverOptions {
    * may opt out explicitly without changing the production default.
    */
   includeCollaborationModeInstructions?: boolean;
-  transportFactory?: () => CodexAppServerTransport;
+  transportFactory?: (context?: {
+    providerRecoveryPolicy?: PersistedHarnessSession["providerRecoveryPolicy"];
+  }) => CodexAppServerTransport;
   /** Additional control-plane tools exposed to the provider for this run. */
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
   /** Executes an admitted additional tool call. Completion tools remain driver-owned. */
@@ -148,6 +161,14 @@ export interface CodexAppServerDriverOptions {
     goals: boolean;
     threadLineage: boolean;
   }>;
+  /** Provider-specific identity retained when the Codex protocol facade is backed by runnerd. */
+  driverIdentity?: {
+    kind: string;
+    displayName: string;
+    version: string;
+  };
+  collaborationModes?: readonly ("default" | "plan")[];
+  requireProviderSessionIdentity?: boolean;
 }
 
 type CodexCapabilities = Required<
@@ -164,6 +185,7 @@ interface TerminalReplayConflict {
 interface OpenedCodexThread {
   threadId: string;
   providerSessionId: string | null;
+  providerIdentity?: PersistedHarnessProviderIdentity;
   collaborationMode: Record<string, unknown> | null;
   context: CodexModelContextSnapshot;
   lineage: HarnessThreadLineageEntry;
@@ -172,12 +194,54 @@ interface OpenedCodexThread {
 interface PendingRuntimeRequest {
   request: HarnessRuntimeRequest;
   settle: (response: Record<string, unknown>) => void;
+  settlingResolution?: HarnessRuntimeRequestResolution;
 }
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function parseProviderIdentity(
+  value: unknown,
+): PersistedHarnessProviderIdentity | undefined {
+  const identity = record(value);
+  if (identity.kind !== "acpx") return undefined;
+  const required = [
+    "normalizedSessionId",
+    "acpxRecordId",
+    "backendSessionId",
+    "agentSessionId",
+    "profileDigest",
+    "workspaceDigest",
+    "requestedModel",
+    "effectiveModel",
+  ] as const;
+  if (required.some((key) => typeof identity[key] !== "string" || identity[key].length === 0)) {
+    throw new Error("ACPX provider identity is incomplete");
+  }
+  const permissionMode = identity.permissionMode;
+  if (
+    permissionMode !== undefined
+    && permissionMode !== "approve-all"
+    && permissionMode !== "approve-reads"
+    && permissionMode !== "deny-all"
+  ) {
+    throw new Error("ACPX provider identity contains an invalid permission mode");
+  }
+  return {
+    kind: "acpx",
+    normalizedSessionId: identity.normalizedSessionId as string,
+    acpxRecordId: identity.acpxRecordId as string,
+    backendSessionId: identity.backendSessionId as string,
+    agentSessionId: identity.agentSessionId as string,
+    profileDigest: identity.profileDigest as string,
+    workspaceDigest: identity.workspaceDigest as string,
+    requestedModel: identity.requestedModel as string,
+    effectiveModel: identity.effectiveModel as string,
+    ...(permissionMode === undefined ? {} : { permissionMode }),
+  };
 }
 
 function text(value: unknown, fallback = ""): string {
@@ -247,6 +311,54 @@ function canonicalJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value) ?? "undefined";
+}
+
+function differingJsonPaths(
+  left: unknown,
+  right: unknown,
+  prefix = "",
+  limit = 12,
+): string[] {
+  if (canonicalJson(left) === canonicalJson(right)) return [];
+  if (limit <= 0) return [];
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const paths: string[] = [];
+    for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+      paths.push(...differingJsonPaths(
+        left[index],
+        right[index],
+        `${prefix}[${index}]`,
+        limit - paths.length,
+      ));
+      if (paths.length >= limit) break;
+    }
+    return paths.length > 0 ? paths : [prefix || "result"];
+  }
+  const leftRecord = record(left);
+  const rightRecord = record(right);
+  if (
+    (typeof left === "object" && left !== null) &&
+    (typeof right === "object" && right !== null) &&
+    !Array.isArray(left) &&
+    !Array.isArray(right)
+  ) {
+    const paths: string[] = [];
+    const keys = [...new Set([
+      ...Object.keys(leftRecord),
+      ...Object.keys(rightRecord),
+    ])].sort();
+    for (const key of keys) {
+      paths.push(...differingJsonPaths(
+        leftRecord[key],
+        rightRecord[key],
+        prefix ? `${prefix}.${key}` : key,
+        limit - paths.length,
+      ));
+      if (paths.length >= limit) break;
+    }
+    return paths.length > 0 ? paths : [prefix || "result"];
+  }
+  return [prefix || "result"];
 }
 
 function finishToolSpec(): Record<string, unknown> {
@@ -457,9 +569,10 @@ export class CodexAppServerDriver implements HarnessDriver {
       .filter(([, supported]) => !supported)
       .map(([operation]) => operation);
     return {
-      kind: DRIVER_KIND,
-      displayName: "Codex app-server",
-      version: DRIVER_VERSION,
+      kind: this.#options.driverIdentity?.kind ?? DRIVER_KIND,
+      displayName:
+        this.#options.driverIdentity?.displayName ?? "Codex app-server",
+      version: this.#options.driverIdentity?.version ?? DRIVER_VERSION,
       protocolVersion: CODEX_CODEX_PROTOCOL_VERSION,
       runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
       capabilities: {
@@ -489,9 +602,12 @@ export class CodexAppServerDriver implements HarnessDriver {
         usage: this.#caps.usage,
         dynamicTools: this.#caps.dynamicTools,
         runtimeRequestResolution: this.#caps.runtimeRequestResolution,
+        runtimeRequestHandoff: this.#caps.runtimeRequestResolution,
         goals: this.#caps.goals,
         threadLineage: this.#caps.threadLineage,
-        collaborationModes: ["default", "plan"],
+        collaborationModes: [
+          ...(this.#options.collaborationModes ?? ["default", "plan"]),
+        ],
         unsupported,
       },
     };
@@ -516,10 +632,21 @@ export class CodexAppServerDriver implements HarnessDriver {
           this.#options.includeCollaborationModeInstructions ?? true,
           this.#options.includeSkillInstructions ?? false,
         ),
-        approvalPolicy: "never",
+        approvalPolicy: this.#options.approvalPolicy ?? "never",
+        ...(this.#options.model ? { model: this.#options.model } : {}),
         ...(this.#direct()
           ? {}
-          : { baseInstructions: this.#baseInstructions() }),
+          : {
+              baseInstructions: this.#baseInstructions(),
+              completionContract: {
+                revision:
+                  this.#options.taskEnvelope.completionContract.revision,
+                criterionIds:
+                  this.#options.taskEnvelope.completionContract.criteria.map(
+                    (criterion) => criterion.id,
+                  ),
+              },
+            }),
         dynamicTools: this.#direct()
           ? []
           : this.#caps.dynamicTools
@@ -555,7 +682,11 @@ export class CodexAppServerDriver implements HarnessDriver {
         sourceSequence: 0,
       });
     } catch (error) {
-      await transport.close();
+      // Cleanup must never replace the provider/bootstrap failure that caused
+      // the session open to abort. Remote transports may perform checkpoint
+      // work during close; when no durable provider identity exists that
+      // cleanup can fail independently.
+      await transport.close().catch(() => {});
       throw error;
     }
   }
@@ -582,7 +713,13 @@ export class CodexAppServerDriver implements HarnessDriver {
         reason: "persisted session identity is incomplete",
       };
     }
-    const transport = this.#transport();
+    const transport = this.#transport({
+      providerRecoveryPolicy: snapshot.providerRecoveryPolicy,
+    });
+    const allowProviderReplacement =
+      snapshot.providerRecoveryPolicy ===
+        "allow_replacement_after_governed_wait" &&
+      snapshot.providerIdentity?.kind === "acpx";
     try {
       await this.#persistProcessOwnership(transport);
       const initialize = await this.#initialize(transport);
@@ -591,7 +728,10 @@ export class CodexAppServerDriver implements HarnessDriver {
         includeTurns: false,
       });
       const existingThread = record(existing.thread);
-      if (text(existingThread.id) !== snapshot.driverSessionId) {
+      if (
+        !allowProviderReplacement &&
+        text(existingThread.id) !== snapshot.driverSessionId
+      ) {
         await transport.close();
         return {
           recovered: false,
@@ -614,6 +754,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         baseInstructions: this.#direct()
           ? ""
           : this.#baseInstructions(),
+        approvalPolicy: this.#options.approvalPolicy ?? "never",
+        ...(this.#options.model ? { model: this.#options.model } : {}),
         persistExtendedHistory: false,
       });
       const collaborationMode = await this.#negotiateCollaborationMode(
@@ -627,7 +769,10 @@ export class CodexAppServerDriver implements HarnessDriver {
         workingDirectory,
         collaborationMode,
       );
-      if (opened.threadId !== snapshot.driverSessionId) {
+      if (
+        !allowProviderReplacement &&
+        opened.threadId !== snapshot.driverSessionId
+      ) {
         await transport.close();
         return {
           recovered: false,
@@ -635,6 +780,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         };
       }
       if (
+        !allowProviderReplacement &&
         snapshot.providerSessionId &&
         opened.providerSessionId !== snapshot.providerSessionId
       ) {
@@ -642,6 +788,18 @@ export class CodexAppServerDriver implements HarnessDriver {
         return {
           recovered: false,
           reason: "provider resumed a different provider session",
+        };
+      }
+      if (
+        !allowProviderReplacement &&
+        snapshot.providerIdentity !== undefined
+        && canonicalJson(opened.providerIdentity)
+          !== canonicalJson(snapshot.providerIdentity)
+      ) {
+        await transport.close();
+        return {
+          recovered: false,
+          reason: "provider resumed with a different tagged session identity",
         };
       }
       const goal = await this.#discoverGoal(transport, opened.threadId);
@@ -665,14 +823,16 @@ export class CodexAppServerDriver implements HarnessDriver {
         }),
       };
     } catch (error) {
-      await transport.close();
+      await transport.close().catch(() => {});
       return { recovered: false, reason: redactCodexDiagnostic(String(error)) };
     }
   }
 
-  #transport(): CodexAppServerTransport {
+  #transport(context?: {
+    providerRecoveryPolicy?: PersistedHarnessSession["providerRecoveryPolicy"];
+  }): CodexAppServerTransport {
     return (
-      this.#options.transportFactory?.() ??
+      this.#options.transportFactory?.(context) ??
       new ProcessCodexAppServerTransport({
         args: createIsolatedCodexAppServerArgs(this.#options.environment),
         environment: createSanitizedCodexEnvironment(this.#options.environment),
@@ -786,6 +946,12 @@ export class CodexAppServerDriver implements HarnessDriver {
     const threadId = text(thread.id);
     if (threadId.length === 0)
       throw new Error("Codex thread response omitted thread.id");
+    const providerSessionId = text(thread.sessionId) || null;
+    if (this.#options.requireProviderSessionIdentity && providerSessionId === null) {
+      throw new Error(
+        `provider_initialize_protocol_error: provider=${this.#options.driverIdentity?.kind ?? "codex"} stage=session.open omitted provider session identity`,
+      );
+    }
     const activePermissionProfile = record(thread.activePermissionProfile);
     const permissionProfileId = text(activePermissionProfile.id);
     const requestedMode = this.#options.requestedCollaborationMode ?? "default";
@@ -811,9 +977,11 @@ export class CodexAppServerDriver implements HarnessDriver {
         "Codex thread response changed the assigned working directory",
       );
     }
+    const providerIdentity = parseProviderIdentity(thread.providerIdentity);
     return {
       threadId,
-      providerSessionId: text(thread.sessionId) || null,
+      providerSessionId,
+      ...(providerIdentity === undefined ? {} : { providerIdentity }),
       collaborationMode,
       context: {
         protocolVersion: CODEX_CODEX_PROTOCOL_VERSION,
@@ -838,7 +1006,9 @@ export class CodexAppServerDriver implements HarnessDriver {
           workspaceAccess: requestedMode === "plan" ? "read" : "write",
           networkAccess: false,
         },
-        approvalPolicy: boundedCodexValue(response.approvalPolicy ?? "never"),
+        approvalPolicy: boundedCodexValue(
+          response.approvalPolicy ?? this.#options.approvalPolicy ?? "never",
+        ),
         baseInstructions: this.#baseInstructions(),
         instructionSources: Array.isArray(response.instructionSources)
           ? response.instructionSources
@@ -898,6 +1068,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       conversationMode: this.#direct() ? "direct" : "task",
       now: this.#options.now ?? (() => new Date()),
       runnerInstanceId: this.#options.runnerInstanceId ?? "runner-codex",
+      driverKind: this.#options.driverIdentity?.kind ?? DRIVER_KIND,
       capabilities: this.#caps,
       dynamicTools: this.#options.dynamicTools ?? [],
       dynamicToolHandler: this.#options.dynamicToolHandler,
@@ -914,6 +1085,7 @@ class CodexHarnessSession implements HarnessSession {
   readonly #conversationMode: "task" | "direct";
   readonly #now: () => Date;
   readonly #runnerInstanceId: string;
+  readonly #driverKind: string;
   readonly #capabilities: CodexCapabilities;
   readonly #dynamicTools: readonly Readonly<Record<string, unknown>>[];
   readonly #dynamicToolHandler: CodexAppServerDriverOptions["dynamicToolHandler"];
@@ -963,6 +1135,7 @@ class CodexHarnessSession implements HarnessSession {
     sourceSequence: number;
     now: () => Date;
     runnerInstanceId: string;
+    driverKind: string;
     capabilities: CodexCapabilities;
     dynamicTools: readonly Readonly<Record<string, unknown>>[];
     dynamicToolHandler?: CodexAppServerDriverOptions["dynamicToolHandler"];
@@ -978,6 +1151,7 @@ class CodexHarnessSession implements HarnessSession {
     this.#sourceSequence = input.sourceSequence;
     this.#now = input.now;
     this.#runnerInstanceId = input.runnerInstanceId;
+    this.#driverKind = input.driverKind;
     this.#capabilities = input.capabilities;
     this.#dynamicTools = input.dynamicTools;
     this.#dynamicToolHandler = input.dynamicToolHandler;
@@ -1344,13 +1518,27 @@ class CodexHarnessSession implements HarnessSession {
       input.resolution,
       pending.request.input,
     );
+    if (pending.settlingResolution !== undefined) {
+      throw new HarnessCapabilityUnavailableError(
+        "runtime request resolution",
+        `request ${input.requestId} is already settling`,
+      );
+    }
+    pending.settlingResolution = structuredClone(resolution);
     const response = runtimeRequestResponse(pending.request, resolution);
-    await this.#transport.resolveRuntimeRequest?.({
-      requestId: input.requestId,
-      turnId: input.turnId,
-      resolution,
-    });
-    this.#pendingRuntimeRequests.delete(input.requestId);
+    try {
+      await this.#transport.resolveRuntimeRequest?.({
+        requestId: input.requestId,
+        turnId: input.turnId,
+        resolution,
+      });
+    } catch (error) {
+      if (this.#pendingRuntimeRequests.get(input.requestId) === pending) {
+        pending.settlingResolution = undefined;
+      }
+      throw error;
+    }
+    if (!this.#pendingRuntimeRequests.delete(input.requestId)) return;
     this.#emit(
       "runtime_request.resolved",
       harnessRuntimeRequestOutcome(pending.request, {
@@ -1362,6 +1550,41 @@ class CodexHarnessSession implements HarnessSession {
       { turnId: input.turnId, itemId: pending.request.itemId },
     );
     pending.settle(response);
+  }
+
+  async handoffRuntimeRequest(input: {
+    requestId: string;
+    turnId: string;
+    reason: "durable_handoff";
+  }): Promise<"handed_off" | "already_settled"> {
+    this.#requireCapability("runtimeRequestResolution");
+    const pending = this.#pendingRuntimeRequests.get(input.requestId);
+    if (
+      pending === undefined
+      || pending.request.input === undefined
+      || pending.request.turnId !== input.turnId
+      || this.#activeTurnId !== input.turnId
+      || pending.settlingResolution !== undefined
+    ) return "already_settled";
+    if (!this.#pendingRuntimeRequests.delete(input.requestId)) return "already_settled";
+    this.#emit(
+      "runtime_request.expired",
+      harnessRuntimeInputExpiredOutcome(pending.request, input.reason),
+      { turnId: input.turnId, itemId: pending.request.itemId },
+    );
+    pending.settle(safeRequestResponse(pending.request.method, "cancel"));
+    await Promise.allSettled([
+      this.#transport.resolveRuntimeRequest?.({
+        requestId: input.requestId,
+        turnId: input.turnId,
+        resolution: { action: "cancel" },
+      }),
+      this.#transport.request("turn/interrupt", {
+        threadId: this.#opened.threadId,
+        turnId: input.turnId,
+      }),
+    ]);
+    return "handed_off";
   }
 
   async goal(input: HarnessGoalOperation): Promise<HarnessThreadGoal | null> {
@@ -1532,9 +1755,12 @@ class CodexHarnessSession implements HarnessSession {
 
   async snapshot(): Promise<PersistedHarnessSession> {
     return {
-      driverKind: DRIVER_KIND,
+      driverKind: this.#driverKind,
       driverSessionId: this.#opened.threadId,
       providerSessionId: this.#opened.providerSessionId,
+      ...(this.#opened.providerIdentity === undefined
+        ? {}
+        : { providerIdentity: structuredClone(this.#opened.providerIdentity) }),
       runId: this.#runId,
       normalizedSessionId: this.#normalizedSessionId,
       activeTurnId: this.#activeTurnId,
@@ -1638,6 +1864,15 @@ class CodexHarnessSession implements HarnessSession {
     const threadId = text(params.threadId);
     const turnId = text(params.turnId, text(turn.id));
     const itemId = text(item.id, text(params.itemId));
+    if (notification.method === "paperclip/workspaceChange/updated") {
+      if (!this.#notificationNamesActiveTurn(turnId, "workspace change")) return;
+      if (threadId.length > 0 && threadId !== this.#opened.threadId) return;
+      this.#recordCanonicalWorkspaceChange(
+        turnId,
+        params.workspaceChange ?? params,
+      );
+      return;
+    }
     if (
       (threadId.length === 0 || threadId === this.#opened.threadId) &&
       (turnId.length === 0 ||
@@ -1761,14 +1996,27 @@ class CodexHarnessSession implements HarnessSession {
       const pending = this.#pendingRuntimeRequests.get(requestId);
       if (pending === undefined || threadId !== this.#opened.threadId) return;
       this.#pendingRuntimeRequests.delete(requestId);
+      const resolution = pending.settlingResolution;
       this.#emit(
-        "runtime_request.cancelled",
-        harnessRuntimeRequestOutcome(pending.request, {
-          reason: "provider_resolved",
-        }),
+        resolution === undefined ? "runtime_request.cancelled" : "runtime_request.resolved",
+        harnessRuntimeRequestOutcome(
+          pending.request,
+          resolution === undefined
+            ? { reason: "provider_resolved" }
+            : {
+                action: resolution.action,
+                ...(resolution.action === "submit" && "response" in resolution
+                  ? { response: resolution.response }
+                  : {}),
+              },
+        ),
         { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
-      pending.settle(safeRequestResponse(pending.request.method, "cancel"));
+      pending.settle(
+        resolution === undefined
+          ? safeRequestResponse(pending.request.method, "cancel")
+          : runtimeRequestResponse(pending.request, resolution),
+      );
       return;
     }
     if (
@@ -1780,6 +2028,45 @@ class CodexHarnessSession implements HarnessSession {
       // item. The request() call is already the authoritative acknowledgement
       // and steer() emits the user-visible item with the active turn binding.
       // Do not reinterpret this transport-level echo as an unbound Codex item.
+      return;
+    }
+    if (notification.method === "paperclip/runResult") {
+      if (
+        threadId !== this.#opened.threadId
+        || !this.#notificationNamesActiveTurn(turnId, "semantic result")
+      ) {
+        if (threadId !== this.#opened.threadId) {
+          this.#failProtocol(
+            "thread_binding_mismatch",
+            "Provider semantic result did not name the opened thread.",
+          );
+        }
+        return;
+      }
+      if (!isRetainableCodexPayload(params.result)) {
+        this.#failProtocol(
+          "invalid_semantic_result",
+          "Provider semantic result exceeded the retained payload limit.",
+        );
+        return;
+      }
+      const validation = validatePrpStructuredRunResult(params.result);
+      if (!validation.ok) {
+        this.#failProtocol(
+          "invalid_semantic_result",
+          "Provider semantic result did not match the run-result contract.",
+        );
+        return;
+      }
+      const differingFields = this.#result === null
+        ? []
+        : differingJsonPaths(this.#result, validation.result);
+      if (this.#admitResult(validation.result, itemId, turnId) === "conflict") {
+        this.#failProtocol(
+          "conflicting_semantic_result",
+          `Provider supplied a different schema-valid semantic result after one was committed. Differing fields: ${differingFields.join(", ") || "unknown"}.`,
+        );
+      }
       return;
     }
     if (threadId !== this.#opened.threadId) {
@@ -1910,6 +2197,8 @@ class CodexHarnessSession implements HarnessSession {
       );
       if (notification.method === "item/fileChange/patchUpdated") {
         this.#recordWorkspaceChanges(turnId, params.changes, false);
+      } else if (notification.method === "turn/diff/updated") {
+        this.#recordTurnDiff(turnId, params.diff);
       }
       return;
     }
@@ -2029,6 +2318,116 @@ class CodexHarnessSession implements HarnessSession {
           : files.reduce((sum, file) => sum + Number(file.deletions), 0),
       },
       patchArtifactRef: null,
+    };
+    this.#workspaceChangesByTurn.set(turnId, payload);
+    this.#emit("workspace.change.updated", payload, {
+      turnId,
+      itemId: `${turnId}:workspace`,
+    });
+  }
+
+  #recordTurnDiff(turnId: string, value: unknown): void {
+    const diff = text(value);
+    const files = parseCodexTurnDiff(diff);
+    // An empty string is an authoritative empty aggregate snapshot. A
+    // non-empty value that cannot be parsed is left on the bounded diagnostic
+    // item.delta path instead of erasing the last valid workspace snapshot.
+    if (files.length === 0 && diff.trim()) return;
+    this.#recordWorkspaceSnapshot(turnId, files);
+  }
+
+  #recordCanonicalWorkspaceChange(turnId: string, value: unknown): void {
+    const candidate = record(value);
+    if (candidate.schema !== "paperclip.workspace.diff.v1") return;
+    if (!Array.isArray(candidate.files)) return;
+    const files = candidate.files.slice(0, 2_000).flatMap((value) => {
+      const file = record(value);
+      const path = workspaceRelativePath(file.path);
+      if (path === null) return [];
+      const operation = text(file.operation);
+      if (
+        operation !== "create" &&
+        operation !== "modify" &&
+        operation !== "delete" &&
+        operation !== "rename" &&
+        operation !== "mode_change"
+      ) return [];
+      const previousPath =
+        file.previousPath === null || file.previousPath === undefined
+          ? null
+          : workspaceRelativePath(file.previousPath);
+      if (operation === "rename" && previousPath === null) return [];
+      const binary = file.binary === true;
+      const diff =
+        binary || file.diff === null || file.diff === undefined
+          ? null
+          : typeof file.diff === "string"
+            ? file.diff.slice(0, 262_144)
+            : null;
+      const additions = boundedWorkspaceStat(file.additions);
+      const deletions = boundedWorkspaceStat(file.deletions);
+      return [{
+        path,
+        operation: operation as ParsedCodexTurnDiffFile["operation"],
+        previousPath,
+        additions: binary ? null : additions,
+        deletions: binary ? null : deletions,
+        binary,
+        diff,
+      }];
+    });
+    // Empty is an authoritative snapshot. If the provider supplied entries
+    // but every one failed validation, retain the previous valid revision.
+    if (candidate.files.length > 0 && files.length === 0) return;
+    this.#recordWorkspaceSnapshot(
+      turnId,
+      files,
+      candidate.revision,
+      typeof candidate.patchArtifactRef === "string"
+        ? candidate.patchArtifactRef.slice(0, 2_048)
+        : null,
+    );
+  }
+
+  #recordWorkspaceSnapshot(
+    turnId: string,
+    files: ReturnType<typeof parseCodexTurnDiff>,
+    requestedRevision?: unknown,
+    patchArtifactRef: string | null = null,
+  ): void {
+    const previous = this.#workspaceChangesByTurn.get(turnId);
+    if (
+      previous !== undefined &&
+      JSON.stringify(record(previous).files) === JSON.stringify(files) &&
+      record(previous).patchArtifactRef === patchArtifactRef
+    ) return;
+    const unknown = files.some(
+      (file) => file.additions === null || file.deletions === null,
+    );
+    const priorRevision = Number(record(previous).revision ?? 0);
+    const incomingRevision =
+      typeof requestedRevision === "number" &&
+      Number.isSafeInteger(requestedRevision) &&
+      requestedRevision > 0
+        ? requestedRevision
+        : 1;
+    const payload = {
+      schema: "paperclip.workspace.diff.v1",
+      changeSetId: `${turnId}:workspace`,
+      revision: Math.max(priorRevision + 1, incomingRevision),
+      source: "harness_reported",
+      complete: false,
+      files,
+      totals: {
+        files: files.length,
+        additions: unknown
+          ? null
+          : files.reduce((sum, file) => sum + Number(file.additions), 0),
+        deletions: unknown
+          ? null
+          : files.reduce((sum, file) => sum + Number(file.deletions), 0),
+      },
+      patchArtifactRef,
     };
     this.#workspaceChangesByTurn.set(turnId, payload);
     this.#emit("workspace.change.updated", payload, {
@@ -2421,7 +2820,7 @@ class CodexHarnessSession implements HarnessSession {
     if (workspace !== undefined) {
       this.#emit(
         "workspace.diff.recorded",
-        { ...workspace, complete: true },
+        { ...workspace, source: "runner_verified", complete: true },
         {
           turnId,
           itemId: `${turnId}:workspace`,
@@ -2535,8 +2934,10 @@ class CodexHarnessSession implements HarnessSession {
   #cancelPendingRequests(reason: string): void {
     for (const pending of this.#pendingRuntimeRequests.values()) {
       this.#emit(
-        "runtime_request.cancelled",
-        harnessRuntimeRequestOutcome(pending.request, { reason }),
+        pending.request.input === undefined ? "runtime_request.cancelled" : "runtime_request.expired",
+        pending.request.input === undefined
+          ? harnessRuntimeRequestOutcome(pending.request, { reason })
+          : harnessRuntimeInputExpiredOutcome(pending.request, "provider_process_lost"),
         { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
       pending.settle(safeRequestResponse(pending.request.method, "cancel"));
@@ -2549,16 +2950,7 @@ class CodexHarnessSession implements HarnessSession {
       if (pending.request.input === undefined) continue;
       this.#emit(
         "runtime_request.expired",
-        {
-          requestId: pending.request.requestId,
-          turnId: pending.request.turnId,
-          requestKind: pending.request.requestKind,
-          reason: "provider_process_lost",
-          replayAllowed: false,
-          adapter: pending.request.origin?.adapter,
-          requestType: "input",
-          request: runtimeRequestProtocolPayload(pending.request),
-        },
+        harnessRuntimeInputExpiredOutcome(pending.request, "provider_process_lost"),
         { turnId: pending.request.turnId, itemId: pending.request.itemId },
       );
       pending.settle(safeRequestResponse(pending.request.method, "cancel"));
@@ -2911,7 +3303,9 @@ export function normalizeCodexQuestionSet(method: string, params: Record<string,
         ...(text(question.header).length > 0 ? { header: boundedText(text(question.header), "", 1_000) } : {}),
         prompt: boundedText(text(question.question, text(question.prompt, `Question ${index + 1}`))),
         ...(text(question.description).length > 0 ? { helpText: boundedText(text(question.description)) } : {}),
-        required: question.required !== false,
+        // Codex requestUserInput questions do not normally declare requiredness.
+        // Do not invent a required constraint when the provider omitted one.
+        required: question.required === true,
         answerMode: options && options.length > 0
           ? question.multiSelect === true || question.multiple === true ? "multi_select" : "single_select"
           : "text",
@@ -3219,9 +3613,31 @@ function isBoundCodexNotification(method: string): boolean {
     method === "model/verification" ||
     method === "model/safetyBuffering/updated" ||
     method.startsWith("item/") ||
+    method === "paperclip/workspaceChange/updated" ||
+    method === "paperclip/runResult" ||
     method === "turn/diff/updated" ||
     method === "turn/plan/updated"
   );
+}
+
+function workspaceRelativePath(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const path = value.trim().replaceAll("\\", "/");
+  if (
+    path.length === 0 ||
+    path.length > 1_024 ||
+    path.startsWith("/") ||
+    path.startsWith("//") ||
+    /^[A-Za-z]:\//u.test(path) ||
+    path.split("/").some((part) => part === ".." || part.length === 0)
+  ) return null;
+  return path;
+}
+
+function boundedWorkspaceStat(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
 }
 
 function safeRequestResponse(

@@ -45,8 +45,6 @@ export interface InstanceGeneralSettings {
 }
 
 export interface InstanceExperimentalSettings {
-  /** Default-off Phase 6 native runner tracer and its instance kill switch. */
-  enableNativeRunner: boolean;
   enableEnvironments: boolean;
   /**
    * Exposes the experimental Paperclip Runner adapter for new selections.
@@ -77,6 +75,8 @@ export interface InstanceExperimentalSettings {
   enableDecisions: boolean;
   enableGoalsSidebarLink: boolean;
   enableServerInfoDebugView: boolean;
+  /** Shows internal Paperclip maintainer tools and observability links. */
+  enablePaperclipDeveloperMode: boolean;
   /**
    * Instructs agents to write user-interaction content (confirmations,
    * questions, suggested tasks, checkbox prompts) in ASD-STE100 Simplified
@@ -103,6 +103,8 @@ export interface InstanceExperimentalSettings {
    * redeploy.
    */
   enableSandboxDuplexBridge: boolean;
+  /** Default-off rollout gate for paperclip_runner provider WebSocket ingress. */
+  enableRunnerPreviewIngress: boolean;
   /**
    * Worktree preview instances (`PAPERCLIP_IN_WORKTREE=true`) suppress the
    * heartbeat run engine by default so previews never self-execute tasks. When

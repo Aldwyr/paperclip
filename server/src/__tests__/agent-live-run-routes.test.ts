@@ -37,10 +37,16 @@ const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
 
 const mockProviderTraceStore = vi.hoisted(() => ({
   inspect: vi.fn(),
+  getByRun: vi.fn(),
+  readExactEntries: vi.fn(),
   revealFrame: vi.fn(),
   download: vi.fn(),
   remove: vi.fn(),
   listMetadataForRuns: vi.fn(),
+}));
+const mockWorkspaceDiffReprojection = vi.hoisted(() => ({
+  project: vi.fn(),
+  persist: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
@@ -73,6 +79,11 @@ function registerModuleMocks() {
 
   vi.doMock("../services/provider-trace-store.js", () => ({
     providerTraceStore: () => mockProviderTraceStore,
+  }));
+
+  vi.doMock("../services/provider-trace-workspace-diff-reprojection.js", () => ({
+    projectCodexWorkspaceDiffsFromTrace: mockWorkspaceDiffReprojection.project,
+    persistReprojectedWorkspaceDiffs: mockWorkspaceDiffReprojection.persist,
   }));
 
   vi.doMock("../services/index.js", () => ({
@@ -283,6 +294,14 @@ describe("agent live run routes", () => {
     mockProviderTraceStore.inspect.mockResolvedValue({
       trace: null,
       entries: [],
+    });
+    mockProviderTraceStore.getByRun.mockResolvedValue(null);
+    mockProviderTraceStore.readExactEntries.mockResolvedValue([]);
+    mockWorkspaceDiffReprojection.project.mockReturnValue({ turns: [], skipReasons: [] });
+    mockWorkspaceDiffReprojection.persist.mockResolvedValue({
+      created: 0,
+      skipped: 0,
+      skipReasons: [],
     });
   });
 
@@ -878,5 +897,117 @@ describe("agent live run routes", () => {
         details: { traceId: "trace-1", rawPayloadRevealed: false },
       }),
     );
+  });
+
+  it("lets a board member reproject only retained workspace diffs", async () => {
+    mockProviderTraceStore.getByRun.mockResolvedValue({
+      id: "trace-1",
+      status: "complete",
+      deletedAt: null,
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    mockProviderTraceStore.readExactEntries.mockResolvedValue([
+      { kind: "frame", frameId: 1 },
+    ]);
+    const projection = { turns: [{ turnId: "turn-1" }], skipReasons: [] };
+    mockWorkspaceDiffReprojection.project.mockReturnValue(projection);
+    mockWorkspaceDiffReprojection.persist.mockResolvedValue({
+      created: 1,
+      skipped: 0,
+      skipReasons: [],
+    });
+
+    const res = await requestApp(await createApp(), (baseUrl) =>
+      request(baseUrl).post(
+        "/api/heartbeat-runs/run-1/provider-trace/reproject-workspace-diffs",
+      ),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toEqual({ created: 1, skipped: 0, skipReasons: [] });
+    expect(mockWorkspaceDiffReprojection.persist).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        traceId: "trace-1",
+        runId: "run-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        projection,
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "provider_trace.workspace_diffs_reprojected",
+        details: expect.objectContaining({ providerActionsReplayed: 0 }),
+      }),
+    );
+  });
+
+  it.each([
+    ["unavailable", null, "trace_unavailable"],
+    [
+      "expired",
+      {
+        id: "trace-1",
+        status: "complete",
+        deletedAt: null,
+        expiresAt: new Date(Date.now() - 60_000),
+      },
+      "trace_expired",
+    ],
+    [
+      "incomplete",
+      {
+        id: "trace-1",
+        status: "incomplete",
+        deletedAt: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      "trace_incomplete",
+    ],
+  ] as const)(
+    "does not write when a retained trace is %s",
+    async (_label, trace, reason) => {
+      mockProviderTraceStore.getByRun.mockResolvedValue(trace);
+
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).post(
+          "/api/heartbeat-runs/run-1/provider-trace/reproject-workspace-diffs",
+        ),
+      );
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toEqual({
+        created: 0,
+        skipped: 1,
+        skipReasons: [{ reason }],
+      });
+      expect(mockProviderTraceStore.readExactEntries).not.toHaveBeenCalled();
+      expect(mockWorkspaceDiffReprojection.persist).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects workspace-diff reprojection from an agent actor", async () => {
+    const res = await requestApp(
+      await createApp(
+        {},
+        {
+          type: "agent",
+          agentId: "agent-1",
+          companyId: "company-1",
+          runId: "run-1",
+          source: "agent_key",
+        },
+      ),
+      (baseUrl) =>
+        request(baseUrl).post(
+          "/api/heartbeat-runs/run-1/provider-trace/reproject-workspace-diffs",
+        ),
+    );
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockWorkspaceDiffReprojection.persist).not.toHaveBeenCalled();
   });
 });

@@ -3,6 +3,7 @@ import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or } fr
 import type { Db } from "@paperclipai/db";
 import {
   completionContracts,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueWorkProducts,
   issues,
@@ -233,16 +234,61 @@ export async function claimNativeSessionResumptions(input: {
       const profile = row.run.runnerProfileJson ?? {};
       const persistedInput = profile.nativeExecutionInput;
       const checkpoint = profile.sessionCheckpoint;
-      if (!persistedInput || !checkpoint) {
-        const failureCode = "native_session_checkpoint_missing";
+      const failureDetail = record(row.coordinator.failureDetail);
+      const originalFailureCode =
+        typeof failureDetail.originalFailureCode === "string"
+          ? failureDetail.originalFailureCode
+          : row.run.errorCode ?? row.coordinator.failureCode
+            ?? "native_session_interrupted";
+      const providerEvent = await tx
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, row.run.id),
+            inArray(heartbeatRunEvents.eventType, [
+              "harness.ready",
+              "session.started",
+              "session.resumed",
+              "session.updated",
+              "turn.started",
+              "provider.event",
+              "provider.rpc_result",
+            ]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const checkpointRecord = record(checkpoint);
+      const checkpointHasProviderIdentity =
+        (typeof checkpointRecord.providerSessionId === "string"
+          && checkpointRecord.providerSessionId.length > 0)
+        || Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
+      const bootstrapRetry =
+        !!persistedInput
+        && !checkpoint
+        && !providerEvent
+        && failureDetail.recoveryMode === "bootstrap_retry"
+        && failureDetail.providerSessionEstablished === false;
+      if (
+        !persistedInput
+        || (!checkpoint && !bootstrapRetry)
+        || (!!checkpoint && !checkpointHasProviderIdentity)
+      ) {
+        const failureCode = originalFailureCode;
         await tx.update(nativeRunFinalizations).set({
           phase: "terminal_failure",
           leaseOwner: null,
           leaseExpiresAt: null,
           failureCode,
           failureDetail: {
+            ...failureDetail,
+            originalFailureCode,
+            recoveryMode: "ambiguous_state",
+            providerSessionEstablished:
+              checkpointHasProviderIdentity || providerEvent !== null,
             recoveryOwner: { kind: "board" },
-            nextAction: "Inspect the interrupted native session; opening a replacement provider session is forbidden.",
+            nextAction: "Inspect the original provider failure; durable state is missing or ambiguous and opening a replacement provider session is forbidden.",
           },
           nextAttemptAt: null,
           updatedAt: now,
@@ -253,7 +299,9 @@ export async function claimNativeSessionResumptions(input: {
           nativePhase: "terminal_failure",
           nativePhaseUpdatedAt: now,
           errorCode: failureCode,
-          error: "Persisted native session cannot be resumed without both its envelope and provider checkpoint",
+          error: typeof failureDetail.message === "string"
+            ? failureDetail.message
+            : "Persisted native session state is ambiguous and cannot be resumed safely",
           updatedAt: now,
         }).where(eq(heartbeatRuns.id, row.run.id));
         await issueService(tx as unknown as Db).update(
@@ -270,8 +318,14 @@ export async function claimNativeSessionResumptions(input: {
           returnOwnerAgentId: row.run.agentId,
           cause: failureCode,
           fingerprint: createHash("sha256").update(`${row.run.id}:${failureCode}`).digest("hex"),
-          evidence: { runId: row.run.id, hasEnvelope: !!persistedInput, hasCheckpoint: !!checkpoint },
-          nextAction: "Inspect the interrupted native session and explicitly choose recovery; do not open a duplicate provider session.",
+          evidence: {
+            runId: row.run.id,
+            hasEnvelope: !!persistedInput,
+            hasCheckpoint: !!checkpoint,
+            providerEventsExist: providerEvent !== null,
+            originalFailureCode,
+          },
+          nextAction: "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.",
           wakePolicy: null,
           maxAttempts: 3,
           supersedeOnIdentityChange: true,

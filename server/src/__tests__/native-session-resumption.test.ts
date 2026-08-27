@@ -76,6 +76,7 @@ describe("P6-25 pre-result native session recovery", () => {
   const exhaustedRunId = "79000000-0000-4000-8000-000000000006";
   const missingCheckpointRunId = "79000000-0000-4000-8000-000000000007";
   const initialRunId = "79000000-0000-4000-8000-000000000008";
+  const bootstrapRetryRunId = "79000000-0000-4000-8000-000000000009";
   const persistedProfile = {
     mode: "native",
     nativeExecutionInput: { schema: "paperclip.native-execution-input.v1", binding: { runId } },
@@ -112,6 +113,7 @@ describe("P6-25 pre-result native session recovery", () => {
         id: runId,
         companyId,
         agentId,
+        nativeIssueId: issueId,
         status: "running",
         runtimeMode: "native",
         runtimeModeResolvedAt: new Date(),
@@ -122,6 +124,7 @@ describe("P6-25 pre-result native session recovery", () => {
         id: cancelledRunId,
         companyId,
         agentId,
+        nativeIssueId: issueId,
         status: "cancelled",
         runtimeMode: "native",
         runtimeModeResolvedAt: new Date(),
@@ -132,6 +135,7 @@ describe("P6-25 pre-result native session recovery", () => {
         id: exhaustedRunId,
         companyId,
         agentId,
+        nativeIssueId: issueId,
         status: "failed",
         runtimeMode: "native",
         runtimeModeResolvedAt: new Date(),
@@ -142,20 +146,49 @@ describe("P6-25 pre-result native session recovery", () => {
         id: missingCheckpointRunId,
         companyId,
         agentId,
+        nativeIssueId: issueId,
         status: "running",
         runtimeMode: "native",
         runtimeModeResolvedAt: new Date(),
-        runnerProfileJson: { nativeExecutionInput: persistedProfile.nativeExecutionInput },
+        runnerProfileJson: {
+          nativeExecutionInput: {
+            ...persistedProfile.nativeExecutionInput,
+            binding: { runId: missingCheckpointRunId },
+          },
+        },
         contextSnapshot: { issueId },
       },
       {
         id: initialRunId,
         companyId,
         agentId,
+        nativeIssueId: issueId,
         status: "running",
         runtimeMode: "native",
         runtimeModeResolvedAt: new Date(),
-        runnerProfileJson: { nativeExecutionInput: persistedProfile.nativeExecutionInput },
+        runnerProfileJson: {
+          nativeExecutionInput: {
+            ...persistedProfile.nativeExecutionInput,
+            binding: { runId: initialRunId },
+          },
+        },
+        contextSnapshot: { issueId },
+      },
+      {
+        id: bootstrapRetryRunId,
+        companyId,
+        agentId,
+        nativeIssueId: issueId,
+        status: "failed",
+        runtimeMode: "native",
+        runtimeModeResolvedAt: new Date(),
+        runnerProfileJson: {
+          nativeExecutionInput: {
+            ...persistedProfile.nativeExecutionInput,
+            binding: { runId: bootstrapRetryRunId },
+          },
+        },
+        errorCode: "provider_initialize_timeout",
         contextSnapshot: { issueId },
       },
     ]);
@@ -165,6 +198,23 @@ describe("P6-25 pre-result native session recovery", () => {
       { runId: exhaustedRunId, companyId, issueId, phase: "terminal_failure", attempt: 3 },
       { runId: missingCheckpointRunId, companyId, issueId, phase: "observed", attempt: 1 },
       { runId: initialRunId, companyId, issueId, phase: "observed", attempt: 0 },
+      {
+        runId: bootstrapRetryRunId,
+        companyId,
+        issueId,
+        phase: "retryable_failure",
+        attempt: 1,
+        nextAttemptAt: new Date(0),
+        failureCode: "native_session_interrupted",
+        failureDetail: {
+          message: "provider_initialize_timeout: provider=opencode stage=health",
+          originalFailureCode: "provider_initialize_timeout",
+          recoveryMode: "bootstrap_retry",
+          providerSessionEstablished: false,
+          providerEventsExist: false,
+          checkpointExists: false,
+        },
+      },
     ]);
   }, 30_000);
 
@@ -200,8 +250,18 @@ describe("P6-25 pre-result native session recovery", () => {
       dispatch: (claim) => dispatched.push(claim),
     })).resolves.toHaveLength(1);
     expect(dispatched).toEqual([{ runId, leaseOwner: expect.stringContaining("heartbeat-reaper:resume:") }]);
-    await expect(db.select().from(heartbeatRuns)).resolves.toHaveLength(5);
-    await expect(db.select().from(nativeRunFinalizations)).resolves.toHaveLength(5);
+    await expect(db.select().from(heartbeatRuns)).resolves.toHaveLength(6);
+    await expect(db.select().from(nativeRunFinalizations)).resolves.toHaveLength(6);
+  });
+
+  it("uses checkpoint-free bootstrap retry only when durable evidence proves no provider session existed", async () => {
+    await expect(claimNativeSessionResumptions({
+      db,
+      runnerInstanceId: "reaper",
+      runIds: [bootstrapRetryRunId],
+    })).resolves.toEqual([
+      { runId: bootstrapRetryRunId, leaseOwner: expect.stringContaining("reaper:resume:") },
+    ]);
   });
 
   it("does not resume cancelled or exhausted runs and fails closed without a checkpoint", async () => {
@@ -212,11 +272,11 @@ describe("P6-25 pre-result native session recovery", () => {
     })).resolves.toEqual([]);
     await expect(db.select().from(nativeRunFinalizations)
       .where(eq(nativeRunFinalizations.runId, missingCheckpointRunId))).resolves.toEqual([
-      expect.objectContaining({ phase: "terminal_failure", failureCode: "native_session_checkpoint_missing" }),
+      expect.objectContaining({ phase: "terminal_failure", failureCode: "native_session_interrupted" }),
     ]);
     await expect(db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId))).resolves.toEqual([
-      expect.objectContaining({ cause: "native_session_checkpoint_missing", wakePolicy: null }),
+      expect.objectContaining({ cause: "native_session_interrupted", wakePolicy: null }),
     ]);
   });
 
@@ -454,6 +514,7 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
       id: runId,
       companyId,
       agentId,
+      nativeIssueId: issueId,
       status: "running",
       runtimeMode: "native",
       runtimeModeResolverVersion: "phase6-v1",

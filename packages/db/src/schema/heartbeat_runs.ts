@@ -41,6 +41,7 @@ export const heartbeatRuns = pgTable(
     runnerProfileJson: jsonb("runner_profile_json").$type<Record<string, unknown>>(),
     runnerInstanceId: uuid("runner_instance_id"),
     nativeSessionId: uuid("native_session_id"),
+    nativeIssueId: uuid("native_issue_id"),
     driverKind: text("driver_kind"),
     driverVersion: text("driver_version"),
     completionContractId: uuid("completion_contract_id"),

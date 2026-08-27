@@ -1,6 +1,7 @@
 import type {
   IssueComment,
   IssueQueuedCommentQueue,
+  IssueQueuedCommentQueueState,
   IssueQueuedCommentSteeringDisposition,
 } from "@paperclipai/shared";
 
@@ -15,6 +16,7 @@ const STEERING_DISPOSITIONS = new Set<IssueQueuedCommentSteeringDisposition>([
   "unsupported",
   "temporarily_unavailable",
 ]);
+const QUEUE_STATES = new Set<IssueQueuedCommentQueueState>(["deferred", "queued"]);
 
 /** Defensive boundary shared by IssueDetail and Storybook queue fixtures. */
 export function normalizeIssueQueuedCommentQueue(
@@ -44,9 +46,15 @@ export function normalizeIssueQueuedCommentQueue(
     .sort((left, right) => left.position - right.position)
     .map((entry, position) => ({ ...entry, position }));
   const disposition = source?.steeringDisposition;
+  const state = source?.state;
 
   return {
     issueId: typeof source?.issueId === "string" ? source.issueId : fallbackIssueId,
+    queueId: typeof source?.queueId === "string" ? source.queueId : null,
+    state:
+      typeof state === "string" && QUEUE_STATES.has(state as IssueQueuedCommentQueueState)
+        ? state as IssueQueuedCommentQueueState
+        : null,
     targetRunId: typeof source?.targetRunId === "string" ? source.targetRunId : null,
     revision: typeof source?.revision === "string" ? source.revision : "unavailable",
     protocol: source?.protocol === "paperclip_runner_v1" ? "paperclip_runner_v1" : "legacy",

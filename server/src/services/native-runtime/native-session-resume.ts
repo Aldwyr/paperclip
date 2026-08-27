@@ -83,7 +83,7 @@ export function rebindNativeSessionCheckpoint(input: {
     priorSemanticResult.reportedWorkDisposition === "yielded"
     && priorContinuation.kind === "response_wake"
       ? "allow_replacement_after_governed_wait" as const
-      : "same_session_only" as const;
+      : "allow_replacement_after_resume_failure" as const;
 
   return {
     ...(structuredClone(rawCheckpoint) as unknown as PersistedNativeSession),

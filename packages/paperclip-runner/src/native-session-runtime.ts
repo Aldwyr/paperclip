@@ -6,6 +6,9 @@ import { buildNativeModelEnvelope, parseNativeExecutionInput } from "./contracts
 import type { NativeSession, NativeSessionBackend } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
 import type { PrpEvent, PrpStructuredRunResult, PrpTerminalState } from "./protocol/replay-contract.js";
+import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+
+export const DEFAULT_NATIVE_RUNTIME_INPUT_LIVE_WINDOW_MS = 120_000;
 
 export interface ExecuteNativeSessionOptions {
   input: NativeExecutionInput;
@@ -14,11 +17,21 @@ export interface ExecuteNativeSessionOptions {
   runnerInstanceId: string;
   controlPlaneInstanceId: string;
   timeoutMs?: number;
+  /** Internal test seam; production uses the fixed 120-second platform policy. */
+  runtimeInputLiveWindowMs?: number;
   onSession?: (session: NativeSession | null) => void;
   existingSession?: NativeSession;
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
   onCheckpoint?: (snapshot: PersistedNativeSession) => Promise<void> | void;
+  /** Called when exact provider recovery failed and policy opened a new provider session. */
+  onContinuityBreak?: (input: {
+    reason: string;
+    previousDriverSessionId: string;
+    previousProviderSessionId: string | null;
+    replacementDriverSessionId: string;
+    replacementProviderSessionId: string | null;
+  }) => Promise<void> | void;
   /**
    * Control-plane policy seam for a provider turn that completed after
    * durably creating a governed wait, but did not emit a semantic finish
@@ -60,9 +73,20 @@ async function consumeTurn(
   session: NativeSession,
   controlPlane: ControlPlanePort,
   timeoutMs: number,
+  runtimeInputLiveWindowMs: number,
   resolveGovernedWait?: ExecuteNativeSessionOptions["resolveGovernedWait"],
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const inputTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  let rejectHandoff: ((error: unknown) => void) | null = null;
+  const handoffFailure = new Promise<never>((_resolve, reject) => {
+    rejectHandoff = reject;
+  });
+  const clearInputTimer = (requestId: string) => {
+    const inputTimer = inputTimers.get(requestId);
+    if (inputTimer !== undefined) clearTimeout(inputTimer);
+    inputTimers.delete(requestId);
+  };
   try {
     return await Promise.race([
       (async () => {
@@ -73,6 +97,46 @@ async function consumeTurn(
           const receipt = await controlPlane.appendEvent(event);
           eventCount += receipt.disposition === "committed" ? 1 : 0;
           highestContiguousSourceSeq = Math.max(highestContiguousSourceSeq, receipt.highestContiguousSourceSeq);
+          const payload = event.payload as Record<string, unknown>;
+          const request = payload.request && typeof payload.request === "object" && !Array.isArray(payload.request)
+            ? payload.request as Record<string, unknown>
+            : null;
+          if (
+            receipt.disposition === "committed"
+            && event.eventType === "runtime_request.created"
+            && request?.schema === "paperclip.runtime_request.v2"
+            && request.type === "input"
+            && typeof request.requestId === "string"
+            && typeof request.turnId === "string"
+          ) {
+            try {
+              parsePaperclipQuestionSet(request.input);
+              const requestId = request.requestId;
+              const turnId = request.turnId;
+              clearInputTimer(requestId);
+              const inputTimer = setTimeout(() => {
+                inputTimers.delete(requestId);
+                if (session.handoffRuntimeRequest === undefined) {
+                  rejectHandoff?.(new Error("native_runtime_request_handoff_unavailable"));
+                  return;
+                }
+                void session.handoffRuntimeRequest({
+                  requestId,
+                  turnId,
+                  reason: "durable_handoff",
+                }).catch((error) => rejectHandoff?.(error));
+              }, runtimeInputLiveWindowMs);
+              inputTimer.unref?.();
+              inputTimers.set(requestId, inputTimer);
+            } catch {
+              // Invalid structured inputs remain rejected by the driver and never become durable questions.
+            }
+          } else if (
+            ["runtime_request.resolved", "runtime_request.cancelled", "runtime_request.expired"].includes(event.eventType)
+            && typeof payload.requestId === "string"
+          ) {
+            clearInputTimer(payload.requestId);
+          }
           if (governedResult === null && resolveGovernedWait) {
             governedResult = await resolveGovernedWait({
               turnId: event.turnId ?? null,
@@ -93,10 +157,52 @@ async function consumeTurn(
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(`native session timed out after ${timeoutMs}ms`)), timeoutMs);
       }),
+      handoffFailure,
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    for (const inputTimer of inputTimers.values()) clearTimeout(inputTimer);
+    inputTimers.clear();
   }
+}
+
+function checkpointCursor(cursor: string | null | undefined): number {
+  if (cursor === undefined || cursor === null || cursor === "") return 0;
+  const parsed = Number(cursor);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+async function reconcileRecoveryCursor(input: {
+  controlPlane: ControlPlanePort;
+  checkpoint: PersistedNativeSession;
+  runId: string;
+  sourceInstanceId: string;
+}): Promise<PersistedNativeSession> {
+  const checkpointHighWater = checkpointCursor(input.checkpoint.cursor);
+  let afterSourceSeq = checkpointHighWater;
+  let persistedHighWater = checkpointHighWater;
+  while (true) {
+    const replay = await input.controlPlane.replayEvents({
+      runId: input.runId,
+      sourceInstanceId: input.sourceInstanceId,
+      afterSourceSeq,
+      limit: 1_000,
+    });
+    if (replay.events.length === 0) break;
+    const pageHighWater = replay.events.reduce(
+      (highest, event) => Math.max(highest, event.sourceSeq),
+      afterSourceSeq,
+    );
+    if (pageHighWater <= afterSourceSeq) {
+      throw new Error("native_recovery_replay_did_not_advance");
+    }
+    persistedHighWater = Math.max(persistedHighWater, pageHighWater);
+    afterSourceSeq = pageHighWater;
+  }
+  if (persistedHighWater === checkpointHighWater && input.checkpoint.cursor === String(checkpointHighWater)) {
+    return input.checkpoint;
+  }
+  return { ...input.checkpoint, cursor: String(persistedHighWater) };
 }
 
 /**
@@ -111,7 +217,7 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
     const unsupported = (["instructions", "skills", "mcp"] as const).filter((key) => capabilities?.[key] !== "native");
     if (unsupported.length) throw new Error(`native_runtime_context_unsupported: ${descriptor.name} does not natively realize ${unsupported.join(", ")}`);
   }
-  const persistedSession = options.existingSession
+  let persistedSession = options.existingSession
     ? null
     : options.persistedSession ?? await options.controlPlane.loadSessionCheckpoint?.() ?? null;
   const normalizedSessionId = persistedSession?.identity.sessionId
@@ -128,6 +234,16 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
     backendKind: descriptor.kind,
     sourceInstanceId: options.runnerInstanceId,
   });
+  if (persistedSession) {
+    persistedSession = await reconcileRecoveryCursor({
+      controlPlane: options.controlPlane,
+      checkpoint: persistedSession,
+      runId: input.binding.runId,
+      sourceInstanceId: options.runnerInstanceId,
+    });
+    await options.controlPlane.checkpointSession?.(persistedSession);
+    await options.onCheckpoint?.(persistedSession);
+  }
 
   const identity = {
     runId: input.binding.runId,
@@ -148,6 +264,11 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
   ) throw new Error("native_session_checkpoint_binding_mismatch");
   let recovered = false;
   let session: NativeSession;
+  let continuityBreak: {
+    reason: string;
+    previousDriverSessionId: string;
+    previousProviderSessionId: string | null;
+  } | null = null;
   if (options.existingSession) {
     if (options.existingSession.attachRun === undefined) {
       throw new Error("native_session_multi_run_unavailable");
@@ -156,15 +277,35 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
     session = options.existingSession;
     recovered = true;
   } else if (persistedSession) {
-    if (!options.backend.recoverSession) {
-      throw new Error("native_session_recovery_unavailable: refusing to open a second provider session");
-    }
-    const recovery = await options.backend.recoverSession(persistedSession);
+    const replacementAllowed =
+      persistedSession.providerRecoveryPolicy ===
+      "allow_replacement_after_resume_failure";
+    const recovery = options.backend.recoverSession
+      ? await options.backend.recoverSession(persistedSession)
+      : { recovered: false as const, reason: "driver does not support recovery" };
     if (!recovery.recovered || !recovery.session) {
-      throw new Error(`native_session_recovery_failed: ${recovery.reason ?? "unknown"}`);
+      if (!replacementAllowed) {
+        throw new Error(`native_session_recovery_failed: ${recovery.reason ?? "unknown"}`);
+      }
+      continuityBreak = {
+        reason: recovery.reason ?? "provider session is no longer recoverable",
+        previousDriverSessionId: persistedSession.sessionId,
+        previousProviderSessionId: persistedSession.providerSessionId ?? null,
+      };
+      const replacementInput = {
+        identity,
+        workingDirectory: input.workspace.cwd,
+      };
+      session = options.backend.openReplacementSession
+        ? await options.backend.openReplacementSession(
+            replacementInput,
+            persistedSession,
+          )
+        : await options.backend.openSession(replacementInput);
+    } else {
+      session = recovery.session;
+      recovered = true;
     }
-    session = recovery.session;
-    recovered = true;
   } else {
     session = await options.backend.openSession({
       identity,
@@ -179,6 +320,14 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
       await options.onCheckpoint?.(snapshot);
     };
     const recoveredSnapshot = await session.snapshot();
+    if (continuityBreak) {
+      await options.onContinuityBreak?.({
+        ...continuityBreak,
+        replacementDriverSessionId: recoveredSnapshot.sessionId,
+        replacementProviderSessionId:
+          recoveredSnapshot.providerSessionId ?? null,
+      });
+    }
     await options.controlPlane.checkpointSession?.(recoveredSnapshot);
     await options.onCheckpoint?.(recoveredSnapshot);
 
@@ -203,6 +352,7 @@ export async function executeNativeSession(options: ExecuteNativeSessionOptions)
         session,
         options.controlPlane,
         options.timeoutMs ?? 900_000,
+        options.runtimeInputLiveWindowMs ?? DEFAULT_NATIVE_RUNTIME_INPUT_LIVE_WINDOW_MS,
         options.resolveGovernedWait,
       );
       // Event consumption must begin before startTurn so an eager provider cannot

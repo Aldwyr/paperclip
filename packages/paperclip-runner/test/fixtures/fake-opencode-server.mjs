@@ -43,9 +43,37 @@ function nativeQuestion() {
   };
 }
 
+function nativePermission(style) {
+  return style === "legacy"
+    ? {
+        id: "permission-native-1",
+        type: "tool",
+        pattern: "echo OK",
+        sessionID: session.id,
+        messageID: "message-permission",
+        callID: "call-permission",
+        title: "Run validation command",
+        metadata: {},
+        time: { created: Date.now() },
+      }
+    : {
+        id: "permission-native-1",
+        sessionID: session.id,
+        permission: "bash",
+        patterns: ["echo OK"],
+        always: ["echo *"],
+        metadata: {},
+        tool: { messageID: "message-permission", callID: "call-permission" },
+      };
+}
+
 let pendingQuestion = await readFile(join(process.env.XDG_DATA_HOME, "fake-pending-question.json"), "utf8")
   .then((value) => JSON.parse(value))
   .catch(() => null);
+let pendingPermission = await readFile(join(process.env.XDG_DATA_HOME, "fake-pending-permission.json"), "utf8")
+  .then((value) => JSON.parse(value))
+  .catch(() => null);
+let permissionStyle = "v2";
 
 await mkdir(process.env.XDG_DATA_HOME, { recursive: true });
 await writeFile(join(process.env.XDG_DATA_HOME, "fake-environment.json"), JSON.stringify({
@@ -142,6 +170,7 @@ const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === `/session/${session.id}/message`) return json(response, 200, []);
   if (request.method === "GET" && request.url === "/session/status") return json(response, 200, { [session.id]: { type: "idle" } });
   if (request.method === "GET" && request.url?.startsWith("/question?")) return json(response, 200, pendingQuestion ? [pendingQuestion] : []);
+  if (request.method === "GET" && request.url?.startsWith("/permission?")) return json(response, 200, pendingPermission ? [pendingPermission] : []);
   if (request.method === "POST" && request.url?.startsWith("/question/question-native-1/reply?")) {
     const chunks = [];
     request.on("data", (chunk) => chunks.push(chunk));
@@ -168,6 +197,27 @@ const server = createServer(async (request, response) => {
     }, 10);
     return;
   }
+  if (request.method === "POST" && request.url?.startsWith("/permission/permission-native-1/reply?")) {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      await writeFile(join(process.env.XDG_DATA_HOME, "fake-permission-reply.json"), JSON.stringify({ url: request.url, body }));
+      pendingPermission = null;
+      emit({
+        type: permissionStyle === "legacy" ? "permission.replied" : "permission.v2.replied",
+        id: "event-permission-replied",
+        properties: permissionStyle === "legacy"
+          ? { sessionID: session.id, permissionID: "permission-native-1", response: body.reply }
+          : { sessionID: session.id, requestID: "permission-native-1", reply: body.reply },
+      });
+      setTimeout(() => {
+        json(response, 200, true);
+        emit({ type: "session.idle", id: "event-permission-idle", properties: { sessionID: session.id } });
+      }, 10);
+    });
+    return;
+  }
   if (request.method === "POST" && request.url === `/session/${session.id}/abort`) return json(response, 200, true);
   if (request.method === "POST" && request.url === `/session/${session.id}/prompt_async`) {
     const chunks = [];
@@ -185,6 +235,16 @@ const server = createServer(async (request, response) => {
           pendingQuestion = nativeQuestion();
           emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
           emit({ type: "question.asked", id: "event-question-native-1", properties: pendingQuestion });
+          return;
+        }
+        if (String(parsedPrompt.message ?? "").includes("native-permission")) {
+          permissionStyle = String(parsedPrompt.message ?? "").includes("legacy") ? "legacy" : "v2";
+          pendingPermission = nativePermission(permissionStyle);
+          emit({
+            type: permissionStyle === "legacy" ? "permission.updated" : "permission.v2.asked",
+            id: `event-permission-${permissionStyle}`,
+            properties: pendingPermission,
+          });
           return;
         }
         if (String(parsedPrompt.message ?? "").includes("session-aborted")) {

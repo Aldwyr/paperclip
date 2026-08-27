@@ -15,7 +15,7 @@ const valid = {
   binaryName: "paperclip-runnerd",
   packageName: "@paperclipai/paperclip-runner",
   packageVersion: "0.1.2",
-  binaryContractVersion: 1,
+  binaryContractVersion: 2,
   nativeExecutionVersion: 1,
   harnessDriverVersion: 1,
   prp: { name: "paperclip.runner", minimumVersion: 1, maximumVersion: 1 },

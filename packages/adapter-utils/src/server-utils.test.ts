@@ -1168,6 +1168,42 @@ describe("renderPaperclipWakePrompt", () => {
     expect(fallbackPrompt).toContain("- fallback fetch needed: yes");
   });
 
+  it("renders answered questions after stale coalesced comments for legacy adapters", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_commented",
+      issue: {
+        id: "issue-1",
+        identifier: "DOT-240",
+        title: "Plan a Node server",
+        status: "in_progress",
+      },
+      interactionKind: "ask_user_questions",
+      interactionStatus: "answered",
+      questionResponse: {
+        interactionId: "interaction-answers",
+        summaryMarkdown: [
+          "Resolved questions and answers:",
+          "- What should the demo prove?: Minimal JSON API",
+          "- Which baseline?: JavaScript + ESM",
+        ].join("\n"),
+      },
+      commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+      comments: [{
+        id: "stale-comment",
+        body: "The questions are still pending.",
+        authorType: "user",
+      }],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("## Answered questions");
+    expect(prompt).toContain("- What should the demo prove?: Minimal JSON API");
+    expect(prompt).toContain("Continue from these answers now; do not wait for another response.");
+    expect(prompt.indexOf("The questions are still pending.")).toBeLessThan(
+      prompt.indexOf("## Answered questions"),
+    );
+  });
+
   it("renders the execution workspace branch guard only on non-resumed sessions", () => {
     const payload = {
       reason: "issue_assigned",
@@ -1507,8 +1543,8 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(prompt).toContain("Update the plan only. Do not write code or perform implementation work.");
-    expect(prompt).not.toContain("accepted-plan continuation");
-    expect(prompt).not.toContain("Create child issues from the approved plan only");
+    expect(prompt).not.toContain("accepted-plan directive");
+    expect(prompt).not.toContain("do not create a child merely because a plan was accepted");
   });
 
   it("renders accepted-plan continuation guidance for planning issues", () => {
@@ -1528,10 +1564,11 @@ describe("renderPaperclipWakePrompt", () => {
       fallbackFetchNeeded: false,
     });
 
-    expect(prompt).toContain("accepted-plan continuation");
-    expect(prompt).toContain("Create child issues from the approved plan only");
-    expect(prompt).toContain("may create child implementation issues");
-    expect(prompt).toContain("must not start implementation work on the planning issue itself");
+    expect(prompt).toContain("accepted-plan directive");
+    expect(prompt).toContain("implement the accepted plan on this issue when the work is small and cohesive");
+    expect(prompt).toContain("paperclip-converting-plans-to-tasks skill");
+    expect(prompt).toContain("do not create a child merely because a plan was accepted");
+    expect(prompt).not.toContain("must not start implementation work on the planning issue itself");
   });
 
   it("keeps accepted-plan guidance when stale comment ids have no loaded comments", () => {
@@ -1553,8 +1590,8 @@ describe("renderPaperclipWakePrompt", () => {
       fallbackFetchNeeded: true,
     });
 
-    expect(prompt).toContain("accepted-plan continuation");
-    expect(prompt).toContain("Create child issues from the approved plan only");
+    expect(prompt).toContain("accepted-plan directive");
+    expect(prompt).toContain("do not create a child merely because a plan was accepted");
     expect(prompt).not.toContain("Update the plan only");
   });
 

@@ -97,7 +97,30 @@ index e8102acb03c4c38830ad5ec22f356125eb0423b7..efea5921f1c5dd5523325bc443469fae
  //#region src/agent-registry.d.ts
  declare const DEFAULT_AGENT_NAME = "codex";
  //#endregion
-@@ -313,6 +313,29 @@ type AcpRuntimeOptions = {
+@@ -139,6 +139,11 @@ type AcpTextDeltaOriginMeta = {
+   kind?: string;
+   source?: string;
+ };
++type AcpRuntimePlanEntry = {
++  content: string;
++  priority?: string;
++  status: "pending" | "in_progress" | "completed";
++};
+ type AcpRuntimeEvent = {
+   type: "text_delta";
+   text: string;
+@@ -185,6 +190,10 @@ type AcpRuntimeEvent = {
+    * non-null `input` schema.
+    */
+   availableCommands?: AcpRuntimeAvailableCommand[];
++} | {
++  type: "plan";
++  tag: "plan";
++  entries: AcpRuntimePlanEntry[];
+ } | {
+   type: "tool_call";
+   text: string;
+@@ -313,6 +322,29 @@ type AcpRuntimeOptions = {
    onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
@@ -131,7 +154,27 @@ diff --git a/dist/runtime.js b/dist/runtime.js
 index a1f4a70a003792c6eacf68b6b038f37bfec1db53..ee3e155db800222aaf2353906dbad93698d17b74 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
-@@ -812,7 +812,16 @@ var AcpRuntimeManager = class {
+@@ -374 +374 @@ const PROMPT_EVENT_PARSERS = {
+-	plan: (payload) => statusUpdateEvent("plan", payload),
++	plan: planUpdateEvent,
+@@ -426,2 +426,16 @@ function availableCommandsUpdateEvent(payload) {
+ }
++function planUpdateEvent(payload) {
++	const raw = Array.isArray(payload.entries) ? payload.entries : [];
++	const entries = [];
++	for (const entry of raw) {
++		if (!isRecord(entry)) continue;
++		const content = asTrimmedString(entry.content);
++		if (!content) continue;
++		const status = asTrimmedString(entry.status);
++		if (status !== "pending" && status !== "in_progress" && status !== "completed") continue;
++		const priority = asTrimmedString(entry.priority);
++		entries.push({ content, status, ...priority ? { priority } : {} });
++	}
++	return { type: "plan", tag: "plan", entries };
++}
+ function normalizeUsageCost(value) {
+@@ -812,7 +826,16 @@ var AcpRuntimeManager = class {
  		this.deps = deps;
  	}
  	createClient(options) {
@@ -149,7 +192,7 @@ index a1f4a70a003792c6eacf68b6b038f37bfec1db53..ee3e155db800222aaf2353906dbad936
  	}
  	createSessionOwner(input) {
  		const owner = {
-@@ -823,10 +832,14 @@ var AcpRuntimeManager = class {
+@@ -823,10 +846,14 @@ var AcpRuntimeManager = class {
  		input.client.setEventHandlers({
 +			onAcpMessage: this.options.onAcpMessage,
  			onSessionUpdate: (notification) => this.routeOwnedSessionUpdate(owner, notification),
@@ -164,7 +207,7 @@ index a1f4a70a003792c6eacf68b6b038f37bfec1db53..ee3e155db800222aaf2353906dbad936
  		const active = owner.activeTurn;
  		if (active) {
  			const { task, turn } = active;
-@@ -863,6 +874,9 @@ var AcpRuntimeManager = class {
+@@ -863,6 +888,9 @@ var AcpRuntimeManager = class {
  		projection.checkpoint.request();
  	}
  	routeOwnedClientOperation(owner, operation) {

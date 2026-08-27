@@ -7,8 +7,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { TaskChatQueuedMessages } from "./TaskChatQueuedMessages";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
+}
+
 const queue: IssueQueuedCommentQueue = {
   issueId: "issue-1",
+  queueId: "wake-1",
+  state: "deferred",
   targetRunId: "run-1",
   revision: "rev-1",
   protocol: "paperclip_runner_v1",
@@ -96,6 +106,60 @@ describe("TaskChatQueuedMessages", () => {
     render({ queue: { ...queue, steeringDisposition: "unsupported" } });
     expect(container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-steer-comment-1"]')?.disabled)
       .toBe(true);
+  });
+
+  it("waits for authoritative discard acknowledgement before removing the row", async () => {
+    const acknowledgement = deferred<void>();
+    render({ onDiscard: vi.fn().mockReturnValue(acknowledgement.promise) });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Queued message discarded.");
+
+    await act(async () => {
+      acknowledgement.resolve();
+      await acknowledgement.promise;
+    });
+    expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).toBeNull();
+    expect(container.textContent).toContain("Queued message discarded.");
+  });
+
+  it("keeps a too-late discard visible with an explicit error", async () => {
+    render({
+      onDiscard: vi.fn().mockRejectedValue({
+        body: { details: { code: "queued_comment_already_dispatching" } },
+      }),
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.click();
+    });
+    expect(container.querySelector('[data-testid="task-chat-queued-message-comment-1"]')).not.toBeNull();
+    expect(container.textContent).toContain("Too late to discard: this message is already being sent.");
+  });
+
+  it("shows stale revisions without announcing a discard", async () => {
+    render({
+      onDiscard: vi.fn().mockRejectedValue({
+        body: { details: { code: "queued_comment_revision_conflict" } },
+      }),
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-discard-comment-1"]')?.click();
+    });
+    expect(container.textContent).toContain("The queue changed in another session. Review it and try again.");
+    expect(container.textContent).not.toContain("Queued message discarded.");
+  });
+
+  it("does not expose queue controls before a real queue id is acknowledged", () => {
+    const props = render({ queue: { ...queue, queueId: null, state: null } });
+    const discard = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-queued-discard-comment-1"]',
+    );
+    expect(discard?.disabled).toBe(true);
+    discard?.click();
+    expect(props.onDiscard).not.toHaveBeenCalled();
   });
 
 });

@@ -670,6 +670,7 @@ export const providerEventSchema = {
     },
     "plan": {
       "type": "object",
+      "description": "A complete provider-authored within-turn checklist snapshot. Consumers replace the prior snapshot with the same planId in PRP sourceSeq order; this is not Paperclip's durable Plan document.",
       "required": [
         "schema",
         "planId",
@@ -725,6 +726,7 @@ export const providerEventSchema = {
           "type": "boolean"
         },
         "syncStatus": {
+          "description": "Legacy compatibility field. Within-turn checklist snapshots use not_applicable.",
           "enum": [
             "streaming",
             "pending",
@@ -734,6 +736,7 @@ export const providerEventSchema = {
           ]
         },
         "documentRevision": {
+          "description": "Legacy compatibility field. Within-turn checklist snapshots use null.",
           "type": [
             "integer",
             "null"

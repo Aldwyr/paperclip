@@ -22,6 +22,7 @@ export default defineConfig({
       "server",
       "ui",
       "cli",
+      "tests/runner-e2e",
     ],
   },
 });

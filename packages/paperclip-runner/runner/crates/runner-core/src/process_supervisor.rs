@@ -13,6 +13,43 @@ use serde::Serialize;
 
 use crate::local_runner::LocalRunnerError;
 
+const SUPERVISED_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "WINDIR",
+    "HOME",
+    "CODEX_HOME",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "TZ",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_DIR",
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET",
+    "PAPERCLIP_OPENCODE_COMMAND",
+    "PAPERCLIP_OPENCODE_RUNTIME_DIR",
+    "PAPERCLIP_RUNNER_INSTANCE_ID",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PAPERCLIP_NATIVE_MCP_NAME",
+    "PAPERCLIP_NATIVE_MCP_URL",
+    "PAPERCLIP_NATIVE_MCP_TOKEN",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
+];
+
 pub(crate) enum ProcessOutput {
     Stdout(String),
     Stderr(String),
@@ -207,41 +244,7 @@ impl SupervisedProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for key in [
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "WINDIR",
-            "HOME",
-            "CODEX_HOME",
-            "LANG",
-            "LC_ALL",
-            "SSL_CERT_FILE",
-            "NODE_EXTRA_CA_CERTS",
-            "TMPDIR",
-            "TEMP",
-            "TMP",
-            "TZ",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-            "ALL_PROXY",
-            "SSL_CERT_DIR",
-            "OPENROUTER_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "OPENAI_API_KEY",
-            "CODEX_API_KEY",
-            "PAPERCLIP_OPENCODE_COMMAND",
-            "PAPERCLIP_OPENCODE_RUNTIME_DIR",
-            "PAPERCLIP_RUNNER_INSTANCE_ID",
-            "PAPERCLIP_RUN_ID",
-            "PAPERCLIP_NORMALIZED_SESSION_ID",
-            "PAPERCLIP_NATIVE_MCP_NAME",
-            "PAPERCLIP_NATIVE_MCP_URL",
-            "PAPERCLIP_NATIVE_MCP_TOKEN",
-            "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
-        ] {
+        for &key in SUPERVISED_ENV_KEYS {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
@@ -423,5 +426,15 @@ fn exit_fact(status: ExitStatus) -> ProcessExitFact {
             success: status.success(),
             signal: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SUPERVISED_ENV_KEYS;
+
+    #[test]
+    fn supervised_environment_allows_managed_acpx_codex_credential() {
+        assert!(SUPERVISED_ENV_KEYS.contains(&"PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET"));
     }
 }

@@ -4,3 +4,7 @@ export * from "./policy.js";
 export * from "./redaction.js";
 export * from "./provider-neutral.js";
 export * from "./dispatcher.js";
+export * from "./authorization.js";
+export * from "./paperclip-discovery.js";
+export * from "./paperclip-dispatcher.js";
+export * from "./receipts.js";

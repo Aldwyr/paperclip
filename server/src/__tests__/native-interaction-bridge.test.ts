@@ -19,6 +19,7 @@ import {
 import { and, eq } from "drizzle-orm";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import {
+  materializeLegacyQuestionResponseWakeProjection,
   materializeNativeInteractionResponses,
   NativeInteractionBridgeError,
 } from "../services/native-runtime/native-interaction-bridge.js";
@@ -271,6 +272,23 @@ describe("P6-19 native interaction bridge", () => {
         },
       },
     ]);
+  });
+
+  it("projects answered questions for legacy adapter wake prompts", async () => {
+    await expect(materializeLegacyQuestionResponseWakeProjection({
+      db,
+      companyId,
+      issueId,
+      runId,
+      agentId,
+      interactionId: questionsId,
+    })).resolves.toEqual({
+      interactionId: questionsId,
+      summaryMarkdown: [
+        "Resolved questions and answers:",
+        "- Which path?: Safe",
+      ].join("\n"),
+    });
   });
 
   it.each([

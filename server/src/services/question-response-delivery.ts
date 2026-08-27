@@ -275,25 +275,21 @@ export function questionResponseDeliveryService(
     errorCode?: string | null;
   }): Promise<QuestionResponseDeliveryOutcome> {
     const at = now();
-    const updated = await db.update(issueQuestionResponseDeliveries).set({
-      status: input.status,
-      deliveryMode: input.mode,
-      targetRunId: input.targetRunId,
-      targetTurnId: input.targetTurnId ?? null,
-      acknowledgedAt: input.status === "failed" ? null : at,
-      lastErrorCode: input.errorCode ?? null,
-      updatedAt: at,
-    }).where(and(
-      eq(issueQuestionResponseDeliveries.id, input.delivery.id),
-      eq(issueQuestionResponseDeliveries.status, "delivering"),
-    )).returning().then((rows) => rows[0] ?? null);
-
-    const result = updated ?? await db.select().from(issueQuestionResponseDeliveries)
-      .where(eq(issueQuestionResponseDeliveries.id, input.delivery.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? input.delivery);
-    if (updated) {
-      await logActivity(db, {
+    const updated = await db.transaction(async (tx) => {
+      const row = await tx.update(issueQuestionResponseDeliveries).set({
+        status: input.status,
+        deliveryMode: input.mode,
+        targetRunId: input.targetRunId,
+        targetTurnId: input.targetTurnId ?? null,
+        acknowledgedAt: input.status === "failed" ? null : at,
+        lastErrorCode: input.errorCode ?? null,
+        updatedAt: at,
+      }).where(and(
+        eq(issueQuestionResponseDeliveries.id, input.delivery.id),
+        eq(issueQuestionResponseDeliveries.status, "delivering"),
+      )).returning().then((rows) => rows[0] ?? null);
+      if (!row) return null;
+      await logActivity(tx as unknown as Db, {
         companyId: input.interaction.companyId,
         actorType: "system",
         actorId: "question-response-delivery",
@@ -305,19 +301,28 @@ export function questionResponseDeliveryService(
         entityType: "issue",
         entityId: input.interaction.issueId,
         details: {
-          deliveryId: result.id,
+          deliveryId: row.id,
           interactionId: input.interaction.id,
           sourceRunId: input.interaction.sourceRunId,
           targetRunId: input.targetRunId,
           targetTurnId: input.targetTurnId ?? null,
-          correlationId: result.correlationId,
-          payloadSha256: result.payloadSha256,
+          correlationId: row.correlationId,
+          payloadSha256: row.payloadSha256,
           deliveryStatus: input.status,
           deliveryMode: input.mode,
           adapter: input.adapter,
           errorCode: input.errorCode ?? null,
         },
       });
+      return row;
+    });
+
+    const persisted = updated ?? await db.select().from(issueQuestionResponseDeliveries)
+      .where(eq(issueQuestionResponseDeliveries.id, input.delivery.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const result: DeliveryRow = persisted ?? input.delivery;
+    if (updated) {
       getTelemetryClient()?.trackDynamic("question_response.delivery", {
         adapter: input.adapter,
         outcome: input.mode ?? "failed",
@@ -336,14 +341,16 @@ export function questionResponseDeliveryService(
   async function releaseForRetry(delivery: DeliveryRow, errorCode: string) {
     const at = now();
     const exhausted = delivery.attemptCount >= MAX_DELIVERY_ATTEMPTS;
-    await db.update(issueQuestionResponseDeliveries).set({
-      status: exhausted ? "failed" : "pending",
-      lastErrorCode: errorCode,
-      updatedAt: at,
-    }).where(and(
-      eq(issueQuestionResponseDeliveries.id, delivery.id),
-      eq(issueQuestionResponseDeliveries.status, "delivering"),
-    ));
+    if (!exhausted) {
+      await db.update(issueQuestionResponseDeliveries).set({
+        status: "pending",
+        lastErrorCode: errorCode,
+        updatedAt: at,
+      }).where(and(
+        eq(issueQuestionResponseDeliveries.id, delivery.id),
+        eq(issueQuestionResponseDeliveries.status, "delivering"),
+      ));
+    }
     return exhausted;
   }
 
@@ -407,13 +414,36 @@ export function questionResponseDeliveryService(
       inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
     )).orderBy(asc(heartbeatRuns.createdAt));
     const issueRuns = liveRuns.filter((run) => issueIdFromRun(run) === interaction.issueId);
-    const successorRunning = issueRuns.find((run) =>
+    // `executionRunId` is the issue's authoritative active-run pointer. Fall
+    // back to the newest matching running row only for legacy/racy rows where
+    // the pointer has not been populated yet; choosing the oldest stale row
+    // could steer an answer into the wrong provider turn.
+    const successorRunning = (
+      issue.executionRunId
+        ? issueRuns.find((run) =>
+            run.id === issue.executionRunId &&
+            run.status === "running" &&
+            run.id !== interaction.sourceRunId,
+          )
+        : null
+    ) ?? [...issueRuns].reverse().find((run) =>
       run.status === "running" && run.id !== interaction.sourceRunId,
     ) ?? null;
     const queuedSuccessor = issueRuns.find((run) =>
       (run.status === "queued" || run.status === "scheduled_retry") && run.id !== interaction.sourceRunId,
     ) ?? null;
     const envelope = buildQuestionResponseDeliveryEnvelope(hydrateQuestionInteraction(interaction));
+    if (nativeSha256(envelope) !== claimed.payloadSha256) {
+      return recordTerminal({
+        delivery: claimed,
+        interaction,
+        status: "failed",
+        mode: null,
+        targetRunId: null,
+        adapter,
+        errorCode: "question_response_payload_digest_mismatch",
+      });
+    }
 
     let steeringErrorCode: string | null = null;
     if (successorRunning?.runtimeMode === "native") {
@@ -494,7 +524,15 @@ export function questionResponseDeliveryService(
         exhausted,
       }, "question response delivery will retry after wake failure");
       if (!exhausted) return null;
-      return terminalOutcome(interactionId);
+      return recordTerminal({
+        delivery: claimed,
+        interaction,
+        status: "failed",
+        mode: null,
+        targetRunId: null,
+        adapter,
+        errorCode,
+      });
     }
   }
 

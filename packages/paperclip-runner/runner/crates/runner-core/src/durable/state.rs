@@ -3,8 +3,9 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,9 +14,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::codex_provider::ProviderConfig;
@@ -105,6 +110,7 @@ pub fn capture_bootstrap_ticket() -> Result<Option<BootstrapTicket>, DurableRunn
 #[derive(Clone, Debug)]
 pub struct DurableRunnerConfig {
     pub connect_url: String,
+    pub ca_bundle_path: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub runner_instance_id: String,
     pub environment_lease_id: String,
@@ -120,6 +126,7 @@ pub struct DurableRunnerConfig {
     pub p0_reserve_bytes: usize,
     pub max_frame_bytes: usize,
     pub reconnect_delay: Duration,
+    pub reconnect_grace: Option<Duration>,
     pub max_runtime: Duration,
     pub lifecycle_mode: String,
     pub idle_timeout: Option<Duration>,
@@ -167,6 +174,13 @@ pub struct PendingProviderRuntimeRequest {
     pub request: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionContractBinding {
+    pub revision: String,
+    pub criterion_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurableRunnerState {
@@ -208,10 +222,22 @@ pub struct DurableRunnerState {
     pub stop_after_flush: bool,
     #[serde(default)]
     pub provider_tool_bridge: ProviderToolBridge,
+    #[serde(default)]
+    pub completion_contract: Option<CompletionContractBinding>,
+    #[serde(default)]
+    pub last_agent_message: Option<String>,
+    /// First structured result emitted by the provider for the attached run.
+    /// This is per-run state: a warm session clears it when a new run attaches.
+    #[serde(default)]
+    pub semantic_result: Option<Value>,
     #[serde(default, alias = "codexProviderConfig")]
     pub provider_config: Option<ProviderConfig>,
     #[serde(default, alias = "codexProviderThreadId")]
     pub provider_session_id: Option<String>,
+    /// Provider-native backend identity (for example Codex's sessionId), kept
+    /// separately from the harness thread/record identity used to resume.
+    #[serde(default)]
+    pub provider_backend_session_id: Option<String>,
     #[serde(default)]
     pub provider_session_identity: Option<crate::codex_provider::ProviderSessionIdentity>,
     #[serde(default)]
@@ -239,7 +265,9 @@ impl DurableRunnerState {
             previous_attachment_identity: None,
             lifecycle: "connecting".to_owned(),
             lifecycle_mode: config.lifecycle_mode.clone(),
-            idle_timeout_ms: config.idle_timeout.and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+            idle_timeout_ms: config
+                .idle_timeout
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
             last_activity_at_unix_ms: 0,
             active_turn: false,
             next_source_seq: 1,
@@ -259,8 +287,12 @@ impl DurableRunnerState {
             harness_generation: 1,
             stop_after_flush: false,
             provider_tool_bridge: ProviderToolBridge::default(),
+            completion_contract: None,
+            last_agent_message: None,
+            semantic_result: None,
             provider_config: None,
             provider_session_id: None,
+            provider_backend_session_id: None,
             provider_session_identity: None,
             provider_event_cursor: None,
             provider_usage_cumulative: None,
@@ -683,6 +715,8 @@ fn redaction_key(key: &str) -> bool {
     // Codex usage vocabulary observable while continuing to redact bearer,
     // session, access, and other credential-shaped token fields.
     if [
+        "authorizationboundary",
+        "authorization_boundary",
         "tokenusage",
         "token_usage",
         "inputtokens",
@@ -1208,6 +1242,29 @@ fn execute_command_effect(
     }
     match command_type {
         "run.prepare" => {
+            if let Some(value) = payload.get("completionContract") {
+                let completion_contract: CompletionContractBinding =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.prepare completionContract is invalid: {error}"
+                        ))
+                    })?;
+                if completion_contract.revision.is_empty()
+                    || completion_contract.revision.len() > 120
+                    || completion_contract.criterion_ids.is_empty()
+                    || completion_contract.criterion_ids.len() > 256
+                    || completion_contract.criterion_ids.iter().any(|criterion| {
+                        criterion.is_empty()
+                            || criterion.len() > 240
+                            || criterion.chars().any(char::is_control)
+                    })
+                {
+                    return Err(DurableRunnerError::invalid(
+                        "run.prepare completionContract is malformed or oversized",
+                    ));
+                }
+                state.completion_contract = Some(completion_contract);
+            }
             if let Some(value) = payload.get("authorizedTools") {
                 let tool_set: AuthorizedToolSet =
                     serde_json::from_value(value.clone()).map_err(|error| {
@@ -1225,6 +1282,29 @@ fn execute_command_effect(
                     })?;
             }
             if let Some(value) = payload.get("provider") {
+                if let Some(provider_session_id) = value
+                    .get("providerSessionId")
+                    .and_then(Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                {
+                    if provider_session_id.len() > 240
+                        || provider_session_id.chars().any(char::is_control)
+                    {
+                        return Err(DurableRunnerError::invalid(
+                            "run.prepare providerSessionId is malformed or oversized",
+                        ));
+                    }
+                    if state
+                        .provider_session_id
+                        .as_deref()
+                        .is_some_and(|existing| existing != provider_session_id)
+                    {
+                        return Err(DurableRunnerError::invalid(
+                            "provider session changed across a durable session",
+                        ));
+                    }
+                    state.provider_session_id = Some(provider_session_id.to_owned());
+                }
                 let provider: ProviderConfig =
                     serde_json::from_value(value.clone()).map_err(|error| {
                         DurableRunnerError::invalid(format!(
@@ -1242,7 +1322,8 @@ fn execute_command_effect(
                     if let ProviderConfig::ClaudeManaged(managed) = &provider {
                         state.provider_budget_ceiling_usd = Some(managed.max_session_list_cost_usd);
                     } else if let ProviderConfig::AwsAgentcore(agentcore) = &provider {
-                        state.provider_budget_ceiling_usd = Some(agentcore.max_estimated_session_cost_usd);
+                        state.provider_budget_ceiling_usd =
+                            Some(agentcore.max_estimated_session_cost_usd);
                     }
                 }
                 state.provider_config = Some(provider);
@@ -1259,7 +1340,10 @@ fn execute_command_effect(
             Ok(("completed".to_owned(), 1, "run prepared".to_owned()))
         }
         "run.attach" => {
-            if state.active_turn || state.lifecycle == "active" || state.lifecycle == "waiting_input" {
+            if state.active_turn
+                || state.lifecycle == "active"
+                || state.lifecycle == "waiting_input"
+            {
                 return Ok((
                     "rejected".to_owned(),
                     0,
@@ -1267,24 +1351,44 @@ fn execute_command_effect(
                 ));
             }
             let required = |name: &str| {
-                payload.get(name).and_then(Value::as_str).filter(|value| !value.is_empty())
+                payload
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
                     .map(str::to_owned)
-                    .ok_or_else(|| DurableRunnerError::invalid(format!("run.attach payload.{name} is required")))
+                    .ok_or_else(|| {
+                        DurableRunnerError::invalid(format!(
+                            "run.attach payload.{name} is required"
+                        ))
+                    })
             };
             let run_id = required("runId")?;
             let turn_id = required("turnId")?;
             let item_id = required("itemId")?;
             if let Some(value) = payload.get("authorizedTools") {
-                let tool_set: AuthorizedToolSet = serde_json::from_value(value.clone()).map_err(|error| {
-                    DurableRunnerError::invalid(format!("run.attach authorizedTools is invalid: {error}"))
-                })?;
-                state.provider_tool_bridge.attach_run(tool_set).map_err(|error| {
-                    DurableRunnerError::invalid(format!("run.attach tool contract rejected: {error}"))
-                })?;
+                let tool_set: AuthorizedToolSet =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.attach authorizedTools is invalid: {error}"
+                        ))
+                    })?;
+                state
+                    .provider_tool_bridge
+                    .attach_run(tool_set)
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.attach tool contract rejected: {error}"
+                        ))
+                    })?;
             } else {
-                state.provider_tool_bridge.attach_existing_run().map_err(|error| {
-                    DurableRunnerError::invalid(format!("run.attach tool contract rejected: {error}"))
-                })?;
+                state
+                    .provider_tool_bridge
+                    .attach_existing_run()
+                    .map_err(|error| {
+                        DurableRunnerError::invalid(format!(
+                            "run.attach tool contract rejected: {error}"
+                        ))
+                    })?;
             }
             state.previous_attachment_identity = Some(AttachmentIdentity {
                 run_id: state.run_id.clone(),
@@ -1295,6 +1399,8 @@ fn execute_command_effect(
             state.run_id = run_id;
             state.turn_id = turn_id;
             state.item_id = item_id;
+            state.last_agent_message = None;
+            state.semantic_result = None;
             state.stop_after_flush = false;
             state.lifecycle = "ready".to_owned();
             enqueue_event(
@@ -1310,7 +1416,11 @@ fn execute_command_effect(
                 }),
                 None,
             )?;
-            Ok(("completed".to_owned(), 1, "run attached to durable session".to_owned()))
+            Ok((
+                "completed".to_owned(),
+                1,
+                "run attached to durable session".to_owned(),
+            ))
         }
         "semantic_tool.result" => {
             let result: ToolResult = serde_json::from_value(payload.clone()).map_err(|error| {
@@ -1323,6 +1433,18 @@ fn execute_command_effect(
                     DurableRunnerError::invalid(format!("semantic tool result rejected: {error}"))
                 })?;
             let item_id = state.item_id.clone();
+            let result_digest = sha256_digest(canonical_json(&result.result).as_bytes());
+            let outcome = if result.is_error {
+                "failed"
+            } else {
+                "succeeded"
+            };
+            let code = if result.is_error {
+                "semantic_tool_failed"
+            } else {
+                "semantic_tool_succeeded"
+            };
+            let operation_receipt_id = format!("operation_{}", result.call_id);
             enqueue_event(
                 state,
                 config,
@@ -1331,7 +1453,25 @@ fn execute_command_effect(
                 json!({ "semantic_tool": {
                     "schema": "paperclip.prp.semantic_tool.v1", "schemaVersion": 1,
                     "phase": "result", "operationId": result.operation_id,
-                    "callId": result.call_id, "result": result.result,
+                    "callId": result.call_id,
+                    "correlation": {
+                        "runId": state.run_id,
+                        "normalizedSessionId": state.normalized_session_id,
+                        "turnId": state.turn_id,
+                        "itemId": state.item_id,
+                    },
+                    "idempotencyKey": Value::Null,
+                    "content": {
+                        "digest": result_digest,
+                        "redactionDisposition": "digest_only",
+                        "references": [],
+                    },
+                    "outcome": outcome,
+                    "code": code,
+                    "retryable": false,
+                    "authorizationBoundary": "active_task",
+                    "operationReceiptId": operation_receipt_id,
+                    "result": result.result,
                     "isError": result.is_error,
                 }}),
                 Some(&item_id),
@@ -1343,7 +1483,28 @@ fn execute_command_effect(
             ))
         }
         "session.open" => {
-            let event_type = if state.reconnect_count > 0 { "session.resumed" } else { "session.started" };
+            if let Some(failure) = state.recoverable_failure.as_deref() {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    format!("provider bootstrap failed; session cannot open: {failure}"),
+                ));
+            }
+            if state.provider_config.is_some()
+                && (state.provider_session_id.is_none()
+                    || state.provider_backend_session_id.is_none())
+            {
+                return Ok((
+                    "rejected".to_owned(),
+                    0,
+                    "provider bootstrap did not persist a complete session identity".to_owned(),
+                ));
+            }
+            let event_type = if state.reconnect_count > 0 {
+                "session.resumed"
+            } else {
+                "session.started"
+            };
             enqueue_event(
                 state,
                 config,
@@ -1351,7 +1512,9 @@ fn execute_command_effect(
                 0,
                 json!({
                     "normalizedSessionId": state.normalized_session_id,
-                    "driverSessionId": "driver_durable_runner_fake",
+                    "driverSessionId": state.provider_session_id.as_deref().unwrap_or("driver_durable_runner_fake"),
+                    "providerSessionId": state.provider_session_id,
+                    "providerBackendSessionId": state.provider_backend_session_id,
                     "resumed": state.reconnect_count > 0,
                     "providerDescriptor": provider_descriptor(state.provider_config.as_ref(), None),
                 }),
@@ -1543,7 +1706,15 @@ fn execute_command_effect(
                 .or_else(|| payload.get("action"))
                 .and_then(Value::as_str)
                 .unwrap_or("cancel");
-            if !["accept", "accept_for_session", "decline", "cancel", "submit"].contains(&action) {
+            if ![
+                "accept",
+                "accept_for_session",
+                "decline",
+                "cancel",
+                "submit",
+            ]
+            .contains(&action)
+            {
                 return Ok((
                     "rejected".to_owned(),
                     0,
@@ -1562,11 +1733,15 @@ fn execute_command_effect(
             "provider thread read requested".to_owned(),
         )),
         "session.budget.increase" => {
-            let value = payload.get("maxSessionListCostUsd").and_then(Value::as_f64)
+            let value = payload
+                .get("maxSessionListCostUsd")
+                .and_then(Value::as_f64)
                 .filter(|value| value.is_finite() && *value > 0.0)
-                .ok_or_else(|| DurableRunnerError::invalid(
-                    "session.budget.increase payload.maxSessionListCostUsd must be positive",
-                ))?;
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid(
+                        "session.budget.increase payload.maxSessionListCostUsd must be positive",
+                    )
+                })?;
             if state.active_turn && state.lifecycle != "waiting_input" {
                 return Ok((
                     "rejected".to_owned(),
