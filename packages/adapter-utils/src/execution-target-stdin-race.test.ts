@@ -1,5 +1,6 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { symlinkSync } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -745,6 +746,109 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     return fakeBirthtimePreloadPath;
   }
 
+  // A test-only preload for PAP-5355: it deterministically simulates a
+  // same-sandbox peer that wins the gap between the wrapper's final identity
+  // check and its removal call. nextProbeFileName() is deterministic (pid +
+  // call sequence), so this preload can compute the exact probe path the
+  // wrapper itself will check next. It patches fs.promises.lstat inside the
+  // wrapper's own process: the first time that call targets the expected
+  // probe path, it replaces the path with a peer-owned entry before the real
+  // lstat runs, so the wrapper observes the swapped entry's identity, not its
+  // own. This is the worst case for the wrapper (the swap always lands
+  // before the wrapper's very last look at the path), so a wrapper that
+  // still leaves the peer's entry untouched under this preload proves the
+  // fix for every less-adversarial timing too. It never runs unless a test
+  // opts in, and it never touches this test file's own process.
+  let probeSwapPreloadDir: string | null = null;
+  afterAll(async () => {
+    if (probeSwapPreloadDir) await rm(probeSwapPreloadDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+  let probeSwapPreloadPath: Promise<string> | null = null;
+  async function getProbeSwapPreloadPath(): Promise<string> {
+    if (!probeSwapPreloadPath) {
+      probeSwapPreloadPath = (async () => {
+        const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-swap-preload-"));
+        probeSwapPreloadDir = dir;
+        const preloadPath = path.join(dir, "probe-swap-preload.cjs");
+        await writeFile(
+          preloadPath,
+          [
+            `const fs = require("fs");`,
+            `const path = require("path");`,
+            `const mode = process.env.PAPERCLIP_TEST_PROBE_SWAP_MODE;`,
+            `const seq = process.env.PAPERCLIP_TEST_PROBE_SWAP_SEQ;`,
+            `const symlinkTarget = process.env.PAPERCLIP_TEST_PROBE_SWAP_SYMLINK_TARGET;`,
+            `if (mode && seq) {`,
+            `  const expectedName = ".paperclip-birthtime-probe-" + process.pid + "-" + seq;`,
+            `  let swapped = false;`,
+            `  const originalLstat = fs.promises.lstat.bind(fs.promises);`,
+            `  fs.promises.lstat = async (candidatePath, opts) => {`,
+            `    if (!swapped && path.basename(String(candidatePath)) === expectedName) {`,
+            `      swapped = true;`,
+            `      try { fs.unlinkSync(candidatePath); } catch {}`,
+            `      if (mode === "file") fs.writeFileSync(candidatePath, "peer-owned-content");`,
+            `      else if (mode === "dir") fs.mkdirSync(candidatePath);`,
+            `      else if (mode === "symlink") fs.symlinkSync(symlinkTarget, candidatePath);`,
+            `    }`,
+            `    return originalLstat(candidatePath, opts);`,
+            `  };`,
+            `}`,
+          ].join("\n"),
+          "utf8",
+        );
+        return preloadPath;
+      })();
+    }
+    return probeSwapPreloadPath;
+  }
+
+  // A test-only preload for PAP-5374: it simulates fstat() failing on the
+  // wrapper's own just-opened probe file descriptor, the one signal the real
+  // filesystem in this sandbox never produces on demand. nextProbeFileName()
+  // is deterministic (pid + call sequence), so this preload knows which
+  // fs.promises.open() call is the wrapper's probe write and patches only the
+  // FileHandle that call returns, leaving every other open() untouched. It
+  // never runs unless a test opts in, and it never touches this test file's
+  // own process.
+  let fstatFailurePreloadDir: string | null = null;
+  afterAll(async () => {
+    if (fstatFailurePreloadDir) await rm(fstatFailurePreloadDir, { recursive: true, force: true }).catch(() => undefined);
+  });
+  let fstatFailurePreloadPath: Promise<string> | null = null;
+  async function getFstatFailurePreloadPath(): Promise<string> {
+    if (!fstatFailurePreloadPath) {
+      fstatFailurePreloadPath = (async () => {
+        const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-fstat-failure-preload-"));
+        fstatFailurePreloadDir = dir;
+        const preloadPath = path.join(dir, "fstat-failure-preload.cjs");
+        await writeFile(
+          preloadPath,
+          [
+            `const fs = require("fs");`,
+            `const path = require("path");`,
+            `const seq = process.env.PAPERCLIP_TEST_FSTAT_FAILURE_SEQ;`,
+            `if (seq) {`,
+            `  const expectedName = ".paperclip-birthtime-probe-" + process.pid + "-" + seq;`,
+            `  const originalOpen = fs.promises.open.bind(fs.promises);`,
+            `  fs.promises.open = async (targetPath, flags, mode) => {`,
+            `    const handle = await originalOpen(targetPath, flags, mode);`,
+            `    if (path.basename(String(targetPath)) === expectedName) {`,
+            `      handle.stat = async () => {`,
+            `        throw new Error("EIO: simulated fstat failure for test");`,
+            `      };`,
+            `    }`,
+            `    return handle;`,
+            `  };`,
+            `}`,
+          ].join("\n"),
+          "utf8",
+        );
+        return preloadPath;
+      })();
+    }
+    return fstatFailurePreloadPath;
+  }
+
   // Run the real emitted wrapper (either variant) as a node process, with no
   // sandbox and no bridge in front of it. The test owns the wrapper's node
   // ChildProcess handle directly, so it can observe the wrapper's own exit
@@ -770,6 +874,15 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     // Used to drive the lease timing overrides directly, with no host bridge
     // in front of the wrapper.
     env?: Record<string, string>;
+    // Makes the wrapper's own process observe a same-sandbox peer replacing
+    // its birth-time probe file, through the preload above (PAP-5355). seq 1
+    // is sessionDir's probe (the first one captureSessionIdentity() runs).
+    probeSwap?: { seq: 1 | 2; mode: "file" | "dir" | "symlink"; symlinkTarget?: string };
+    // Makes the wrapper's own process observe an fstat() failure on the open
+    // descriptor for its own birth-time probe file, through the preload above
+    // (PAP-5374). seq 1 is sessionDir's probe (the first one
+    // captureSessionIdentity() runs).
+    fstatFailure?: { seq: 1 | 2 };
   }) {
     const sessionDir = await mkdtemp(path.join(options?.parentDir ?? os.tmpdir(), "paperclip-wrapper-lifecycle-"));
     cleanupDirs.push(sessionDir);
@@ -798,6 +911,16 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
       env.PAPERCLIP_TEST_FAKE_BIRTHTIME_TARGET = options.fakeBirthtime.target;
       env.PAPERCLIP_TEST_FAKE_BIRTHTIME_MODE = options.fakeBirthtime.mode;
       execArgv.push("--require", await getFakeBirthtimePreloadPath());
+    }
+    if (options?.probeSwap) {
+      env.PAPERCLIP_TEST_PROBE_SWAP_SEQ = String(options.probeSwap.seq);
+      env.PAPERCLIP_TEST_PROBE_SWAP_MODE = options.probeSwap.mode;
+      if (options.probeSwap.symlinkTarget) env.PAPERCLIP_TEST_PROBE_SWAP_SYMLINK_TARGET = options.probeSwap.symlinkTarget;
+      execArgv.push("--require", await getProbeSwapPreloadPath());
+    }
+    if (options?.fstatFailure) {
+      env.PAPERCLIP_TEST_FSTAT_FAILURE_SEQ = String(options.fstatFailure.seq);
+      execArgv.push("--require", await getFstatFailurePreloadPath());
     }
 
     const child = spawn(process.execPath, [...execArgv, wrapperPath], {
@@ -852,6 +975,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
 
     return {
+      pid: child.pid,
       sessionDir,
       stdinDir,
       eventsDir,
@@ -1832,6 +1956,200 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     expect(wrapper.stderrText()).toMatch(/Latching on a lost process session identity/);
   }, 15_000);
 
+  it("T20 refuses to write through a probe path a sandbox peer pre-created as a symbolic link, and leaves that link and its target untouched", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-symlink-race-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t20-child.pid");
+    const childPath = path.join(rootDir, "t20-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const sessionDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-symlink-session-"));
+    cleanupDirs.push(sessionDir);
+    const stdinDir = path.join(sessionDir, "stdin");
+    await mkdir(stdinDir, { recursive: true });
+
+    const wrapperPath = path.join(sessionDir, "wrapper.mjs");
+    await writeFile(wrapperPath, getProcessSessionRemoteSource({ outputToStdout: true }), "utf8");
+    const config = { command: process.execPath, args: [childPath], cwd: sessionDir, env: {} };
+    const commandPayload = Buffer.from(JSON.stringify(config), "utf8").toString("base64");
+
+    // A file this test owns, standing in for a file a sandbox peer already
+    // controls. The wrapper's probe write must never reach it.
+    const probeLinkTarget = path.join(rootDir, "t20-probe-target.txt");
+    const knownContent = "t20-untouched-content";
+    await writeFile(probeLinkTarget, knownContent, "utf8");
+
+    const child = spawn(process.execPath, [wrapperPath], {
+      cwd: sessionDir,
+      env: {
+        ...process.env,
+        PAPERCLIP_PROCESS_SESSION_DIR: sessionDir,
+        PAPERCLIP_PROCESS_SESSION_COMMAND_B64: commandPayload,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    // Wins the race to the probe path against the wrapper's own probe write.
+    // nextProbeFileName() is deterministic: it names
+    // ".paperclip-birthtime-probe-<pid>-1" on the wrapper's first probe call,
+    // which always targets sessionDir. child.pid is available synchronously
+    // right after spawn() returns, well before the freshly spawned process
+    // has loaded Node or parsed its own script, so this synchronous
+    // symlinkSync call lands first. This is the same advantage a real
+    // sandbox peer racing to pre-create the path would have, so it gives the
+    // strongest proof: the real wrapper process, under the real race, must
+    // still refuse to follow the link.
+    const probePath = path.join(sessionDir, `.paperclip-birthtime-probe-${child.pid}-1`);
+    symlinkSync(probeLinkTarget, probePath);
+
+    let stderrText = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrText += chunk.toString("utf8");
+    });
+    const exited = new Promise<void>((resolve) => child.on("close", () => resolve()));
+
+    await Promise.race([
+      exited,
+      delay(8_000).then(() => {
+        throw new Error("The wrapper process did not exit.");
+      }),
+    ]);
+
+    await expectNoLiveProcessByArgvSubstring(childPath);
+    expect(stderrText).toMatch(/could not be created exclusively/);
+    expect((await lstat(probePath)).isSymbolicLink()).toBe(true);
+    expect(await readFile(probeLinkTarget, "utf8")).toBe(knownContent);
+  }, 15_000);
+
+  // ---- PAP-5355: identity-aware cleanup after a same-sandbox peer replaces
+  // the probe file this wrapper just created, in the gap between this
+  // wrapper's last identity check and its removal call. The probeSwap
+  // preload (see getProbeSwapPreloadPath above) simulates the worst-case
+  // timing for that gap deterministically, instead of racing real wall-clock
+  // time: it swaps the path the instant the wrapper itself looks at it for
+  // the last time before deciding whether to remove it.
+
+  it("T21 still removes its own probe file normally when no peer ever replaces it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-no-swap-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t21-child.pid");
+    const childPath = path.join(rootDir, "t21-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const wrapper = await startWrapperProcess({
+      outputToStdout: false,
+      command: process.execPath,
+      args: [childPath],
+    });
+    await waitForTrackedChildPid(pidFile);
+
+    const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+    await waitFor(async () => !(await lstat(probePath).then(() => true).catch(() => false)), 4_000);
+    await expect(lstat(probePath)).rejects.toThrow();
+  }, 15_000);
+
+  it("T22 leaves a peer's replacement file untouched instead of deleting it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-swap-file-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t22-child.pid");
+    const childPath = path.join(rootDir, "t22-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const wrapper = await startWrapperProcess({
+      outputToStdout: false,
+      command: process.execPath,
+      args: [childPath],
+      probeSwap: { seq: 1, mode: "file" },
+    });
+    await waitForTrackedChildPid(pidFile);
+
+    const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+    await waitFor(async () => (await readFile(probePath, "utf8").catch(() => null)) === "peer-owned-content", 4_000);
+    // The wrapper's own cleanup call already ran (the preload only swaps the
+    // path the moment the wrapper itself checks it). This delay proves that
+    // run settled and nothing removes the peer's file afterward.
+    await delay(200);
+    expect(await readFile(probePath, "utf8")).toBe("peer-owned-content");
+  }, 15_000);
+
+  it("T23 leaves a peer's replacement directory untouched instead of deleting it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-swap-dir-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t23-child.pid");
+    const childPath = path.join(rootDir, "t23-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const wrapper = await startWrapperProcess({
+      outputToStdout: false,
+      command: process.execPath,
+      args: [childPath],
+      probeSwap: { seq: 1, mode: "dir" },
+    });
+    await waitForTrackedChildPid(pidFile);
+
+    const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+    await waitFor(async () => await lstat(probePath).then((stats) => stats.isDirectory()).catch(() => false), 4_000);
+    await delay(200);
+    expect((await lstat(probePath)).isDirectory()).toBe(true);
+  }, 15_000);
+
+  it("T24 leaves a peer's replacement symbolic link and its target untouched instead of deleting or following it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-swap-symlink-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t24-child.pid");
+    const childPath = path.join(rootDir, "t24-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const linkTarget = path.join(rootDir, "t24-probe-target.txt");
+    const knownContent = "t24-untouched-content";
+    await writeFile(linkTarget, knownContent, "utf8");
+
+    const wrapper = await startWrapperProcess({
+      outputToStdout: false,
+      command: process.execPath,
+      args: [childPath],
+      probeSwap: { seq: 1, mode: "symlink", symlinkTarget: linkTarget },
+    });
+    await waitForTrackedChildPid(pidFile);
+
+    const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+    await waitFor(async () => await lstat(probePath).then((stats) => stats.isSymbolicLink()).catch(() => false), 4_000);
+    await delay(200);
+    expect((await lstat(probePath)).isSymbolicLink()).toBe(true);
+    expect(await readlink(probePath)).toBe(linkTarget);
+    expect(await readFile(linkTarget, "utf8")).toBe(knownContent);
+  }, 15_000);
+
+  it("T25 fails closed at capture when its own probe file's identity cannot be read, so no orphan wrapper or child ever starts polling", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-fstat-failure-"));
+    cleanupDirs.push(rootDir);
+    const pidFile = path.join(rootDir, "t25-child.pid");
+    const childPath = path.join(rootDir, "t25-child.mjs");
+    await writeFile(childPath, trackedChildSource(pidFile), "utf8");
+
+    const wrapper = await startWrapperProcess({
+      outputToStdout: false,
+      command: process.execPath,
+      args: [childPath],
+      fstatFailure: { seq: 1 },
+    });
+
+    await Promise.race([
+      wrapper.exited,
+      delay(8_000).then(() => {
+        throw new Error("The wrapper process did not exit.");
+      }),
+    ]);
+    expect(wrapper.stderrText()).toMatch(/its own probe file's identity could not be read/);
+    await expectNoLiveProcessByArgvSubstring(childPath);
+
+    // With no verified identity for the probe file, the wrapper must not
+    // remove it by path alone: it leaves the file exactly as it created it,
+    // rather than risking removal of a different entry a peer may have put
+    // at the same path.
+    const probePath = path.join(wrapper.sessionDir, `.paperclip-birthtime-probe-${wrapper.pid}-1`);
+    expect((await lstat(probePath)).isFile()).toBe(true);
+  }, 15_000);
   // ---- PAP-5361: a host-refreshed lease bounds the wrapper's own lifetime,
   // so a host crash cannot orphan it. The host writes and refreshes
   // ".paperclip-session-lease" under sessionDir; the wrapper reads only its
@@ -1840,7 +2158,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
 
   const LEASE_FILE_NAME = ".paperclip-session-lease";
 
-  it("T21 no refresh: the wrapper terminates itself and its child after the lease duration elapses", async () => {
+  it("T26 no refresh: the wrapper terminates itself and its child after the lease duration elapses", async () => {
     for (const outputToStdout of [false, true]) {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lease-no-refresh-"));
       cleanupDirs.push(rootDir);
@@ -1866,7 +2184,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 20_000);
 
-  it("T22 a valid rename-based refresh resets the deadline, and the wrapper stays alive past the lease duration", async () => {
+  it("T27 a valid rename-based refresh resets the deadline, and the wrapper stays alive past the lease duration", async () => {
     for (const outputToStdout of [false, true]) {
       const wrapper = await startWrapperProcess({
         outputToStdout,
@@ -1913,7 +2231,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 20_000);
 
-  it("T23 a missing lease never resets the deadline, and ordinary stdin traffic does not substitute for it", async () => {
+  it("T28 a missing lease never resets the deadline, and ordinary stdin traffic does not substitute for it", async () => {
     for (const outputToStdout of [false, true]) {
       const wrapper = await startWrapperProcess({
         outputToStdout,
@@ -1946,7 +2264,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 20_000);
 
-  it("T24 a symbolic link at the lease path is never followed, its target stays unchanged, and the wrapper expires", async () => {
+  it("T29 a symbolic link at the lease path is never followed, its target stays unchanged, and the wrapper expires", async () => {
     const { symlink } = await import("node:fs/promises");
     for (const outputToStdout of [false, true]) {
       const wrapper = await startWrapperProcess({
@@ -1973,7 +2291,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 20_000);
 
-  it("T25 a directory at the lease path is never treated as a valid lease, and the wrapper expires", async () => {
+  it("T30 a directory at the lease path is never treated as a valid lease, and the wrapper expires", async () => {
     for (const outputToStdout of [false, true]) {
       const wrapper = await startWrapperProcess({
         outputToStdout,
@@ -2000,7 +2318,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
   // touches the lease path defers this wrapper's expiry. This is not a
   // capability the peer lacked -- it can already spawn its own long-lived
   // work -- so a later change must not silently alter this shape.
-  it("T26 a peer that keeps touching the lease file defers this wrapper's expiry", async () => {
+  it("T31 a peer that keeps touching the lease file defers this wrapper's expiry", async () => {
     const { utimes } = await import("node:fs/promises");
     for (const outputToStdout of [false, true]) {
       const wrapper = await startWrapperProcess({
@@ -2040,7 +2358,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 20_000);
 
-  it("T27 each wrapper source has exactly one lease deadline declaration and one lease check call site, and the lease code adds no kill caller or numeric process identifier", () => {
+  it("T32 each wrapper source has exactly one lease deadline declaration and one lease check call site, and the lease code adds no kill caller or numeric process identifier", () => {
     for (const outputToStdout of [true, false]) {
       const src = getProcessSessionRemoteSource({ outputToStdout });
       const code = src
@@ -2071,7 +2389,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   });
 
-  it("T28 an injected slow lease refresh in flight during stop() cannot recreate sessionDir after removal", async () => {
+  it("T33 an injected slow lease refresh in flight during stop() cannot recreate sessionDir after removal", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lease-host-race-"));
     cleanupDirs.push(rootDir);
     const childPath = path.join(rootDir, "quiet-child.mjs");
@@ -2160,7 +2478,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     expect(stillThere).toBeNull();
   }, 15_000);
 
-  it("T29 the lease refresh command carries bypassSession and contains no mkdir", async () => {
+  it("T34 the lease refresh command carries bypassSession and contains no mkdir", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lease-command-shape-"));
     cleanupDirs.push(rootDir);
     const childPath = path.join(rootDir, "quiet-child.mjs");
@@ -2236,7 +2554,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     }
   }, 10_000);
 
-  it("T30 validation: a zero, a negative, a non-numeric, and a D<=P lease override pair all fall back to the defaults on the host and in the wrapper", async () => {
+  it("T35 validation: a zero, a negative, a non-numeric, and a D<=P lease override pair all fall back to the defaults on the host and in the wrapper", async () => {
     const invalidPairs: Array<[string, string]> = [
       ["0", "900000"],
       ["-1000", "900000"],
@@ -2320,7 +2638,7 @@ describe("deterministic remote process-session wrapper shutdown (PAP-5316)", () 
     ]);
   }, 30_000);
 
-  it("T31 the lease refresh exec carries its own short timeout, never the run's adapter timeout", async () => {
+  it("T36 the lease refresh exec carries its own short timeout, never the run's adapter timeout", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-lease-refresh-timeout-"));
     cleanupDirs.push(rootDir);
     const childPath = path.join(rootDir, "quiet-child.mjs");
