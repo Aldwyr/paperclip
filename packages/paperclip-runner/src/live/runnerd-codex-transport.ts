@@ -846,11 +846,14 @@ export function createCapabilityRunnerdProviderEnvironment(input: {
   if (input.provider === "aws_agentcore") {
     return createSanitizedAwsAgentCoreEnvironment(input.options.environment);
   }
-  return createSanitizedCodexEnvironment({
+  const environment = createSanitizedCodexEnvironment({
     ...input.options.environment,
     HOME: input.codexHome,
     CODEX_HOME: input.codexHome,
   });
+  const apiKey = input.options.environment?.OPENAI_API_KEY;
+  if (apiKey?.trim()) environment.OPENAI_API_KEY = apiKey;
+  return environment;
 }
 
 export function resolveSourceCodexHome(
@@ -1376,7 +1379,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
-        apiKey: this.options.environment?.OPENAI_API_KEY,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }
@@ -1699,7 +1701,6 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         sourceCodexHome:
           this.options.sourceCodexHome ??
           resolveSourceCodexHome(this.options.environment),
-        apiKey: this.options.environment?.OPENAI_API_KEY,
         nativeMcp: nativeMcpLaunchBinding(this.options.environment),
       });
     }

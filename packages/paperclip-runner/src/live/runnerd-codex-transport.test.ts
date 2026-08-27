@@ -88,6 +88,38 @@ it("preserves OpenCode runtime bindings when a durable runner is respawned", () 
   });
 });
 
+it("passes the configured Codex API key only through the provider process environment", () => {
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "codex",
+    options: {
+      provider: "codex",
+      environment: {
+        PATH: "/bin",
+        OPENAI_API_KEY: "configured-provider-key",
+        PAPERCLIP_API_KEY: "must-not-reach-provider",
+      },
+    },
+    identity: {
+      runnerInstanceId: "runner-1",
+      environmentLeaseId: "lease-1",
+      runId: "run-1",
+      normalizedSessionId: "session-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+    },
+    codexHome: "/isolated/codex-home",
+    runtimeContextPath: "/isolated/runtime-context.json",
+    hasRuntimeContext: false,
+  });
+  expect(environment).toMatchObject({
+    PATH: "/bin",
+    HOME: "/isolated/codex-home",
+    CODEX_HOME: "/isolated/codex-home",
+    OPENAI_API_KEY: "configured-provider-key",
+  });
+  expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
+});
+
 it.each(["opencode", "acpx"] as const)(
   "advertises runner-managed planning through the %s provider boundary",
   async (provider) => {
