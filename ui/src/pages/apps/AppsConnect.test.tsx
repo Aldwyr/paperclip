@@ -16,6 +16,7 @@ const connectAppMock = vi.hoisted(() => vi.fn());
 const startOAuthMock = vi.hoisted(() => vi.fn());
 const finishAppMock = vi.hoisted(() => vi.fn());
 const putConnectionInstallsMock = vi.hoisted(() => vi.fn());
+const completeConnectionIntentMock = vi.hoisted(() => vi.fn());
 const listAgentsMock = vi.hoisted(() => vi.fn());
 const mockNavigate = vi.hoisted(() => vi.fn());
 const navigateTopLevelMock = vi.hoisted(() => vi.fn());
@@ -34,11 +35,20 @@ vi.mock("@/api/tools", () => ({
     listApplications: (companyId: string) => listApplicationsMock(companyId),
     listConnections: (companyId: string) => listConnectionsMock(companyId),
     connectApp: (companyId: string, input: unknown) => connectAppMock(companyId, input),
-    startOAuth: (connectionId: string) => startOAuthMock(connectionId),
+    startOAuth: (connectionId: string, interactionId?: string) => interactionId
+      ? startOAuthMock(connectionId, interactionId)
+      : startOAuthMock(connectionId),
     finishApp: (companyId: string, connectionId: string, input: unknown) =>
       finishAppMock(companyId, connectionId, input),
     putConnectionInstalls: (connectionId: string, installs: unknown) =>
       putConnectionInstallsMock(connectionId, installs),
+  },
+}));
+
+vi.mock("@/api/connection-intents", () => ({
+  connectionIntentsApi: {
+    complete: (interactionId: string, connectionId: string) =>
+      completeConnectionIntentMock(interactionId, connectionId),
   },
 }));
 
@@ -181,6 +191,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       expiresAt: "2099-01-01T00:00:00.000Z",
     });
     finishAppMock.mockResolvedValue({});
+    completeConnectionIntentMock.mockResolvedValue({ status: "accepted" });
     putConnectionInstallsMock.mockResolvedValue({ connectionId: "conn-1", installs: [] });
     connectAppMock.mockResolvedValue({
       connectionId: "conn-1",
@@ -998,7 +1009,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
   });
 
   it("keeps Zapier visible and finishes without a separate access or install step", async () => {
-    mockSearch.value = "byo=1&source=zapier";
+    mockSearch.value = "byo=1&source=zapier&intent=11111111-1111-4111-8111-111111111111";
     listGalleryMock.mockResolvedValueOnce({
       apps: [
         { ...ZAPIER, branding: { ...ZAPIER.branding, logoUrl: "https://example.com/zapier.png" } },
@@ -1046,7 +1057,11 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     await flushReact();
 
     expect(connectAppMock).toHaveBeenCalledTimes(1);
-    expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({ link: zapierUrl, name: "Zapier" });
+    expect(connectAppMock.mock.calls[0]?.[1]).toMatchObject({
+      link: zapierUrl,
+      name: "Zapier",
+      interactionId: "11111111-1111-4111-8111-111111111111",
+    });
     // No grantKind is sent: the pasted-URL path never offered the choice, and
     // sending "user" without asking would mis-scope the credential.
     expect(connectAppMock.mock.calls[0]?.[1]).not.toHaveProperty("grantKind");
@@ -1059,6 +1074,10 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [
       { targetType: "company", targetId: "company-1" },
     ]);
+    expect(completeConnectionIntentMock).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "conn-1",
+    );
   });
 
   // PAP-10922: "Run your own" / "Paste a config" moved from the sidebar to rows
