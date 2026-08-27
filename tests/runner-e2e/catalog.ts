@@ -58,6 +58,11 @@ function commonAgent(
           "For planning tasks, publish or revise the canonical Plan document and its revision-bound request_confirmation, then wait. Only implement after that exact plan is accepted.",
           "Invoke assigned tools only through the runtime's real tool-call channel. Never print XML, DSML, JSON, or other tool-call markup as assistant text.",
           "Legacy adapters must use the public Paperclip API and the injected PAPERCLIP_API_URL, PAPERCLIP_API_KEY, PAPERCLIP_TASK_ID, and PAPERCLIP_RUN_ID values for comments, documents, interactions, and status changes.",
+          ...(adapterType === "paperclip_runner"
+            ? []
+            : [
+                "For a planning task, do not inspect the OpenAPI schema. PUT /api/issues/$PAPERCLIP_TASK_ID/documents/plan with {title:\"Plan\",format:\"markdown\",body,changeSummary}; read latestRevisionId and latestRevisionNumber from that response. Then POST /api/issues/$PAPERCLIP_TASK_ID/interactions with {kind:\"request_confirmation\",continuationPolicy:\"wake_assignee\",payload:{version:1,prompt,acceptLabel:\"Approve\",rejectLabel:\"Reject\",rejectRequiresReason:true,target:{type:\"issue_document\",key:\"plan\",revisionId,revisionNumber}}}, and PATCH the issue to {status:\"in_review\"}. Include Authorization and X-Paperclip-Run-Id on every write.",
+              ]),
           "Never print, persist, or expose credential values, and never create unrelated work.",
         ].join("\n"),
       },
@@ -193,7 +198,7 @@ export const runnerProfiles: readonly RunnerProfileFixture[] = [
       // canonical Plan document, and request confirmation. Four turns caused
       // the Claude CLI to terminate correctly but prematurely with
       // `max_turns_exhausted` during the revision flow.
-      maxTurnsPerRun: 12,
+      maxTurnsPerRun: 24,
     },
   }),
   legacyProfile({

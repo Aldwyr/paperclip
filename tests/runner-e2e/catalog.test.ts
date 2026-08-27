@@ -64,6 +64,38 @@ describe("runner E2E catalog", () => {
     }
   });
 
+  it("gives legacy planning agents a direct bounded API recipe", () => {
+    const task = runnerTasks.find(
+      (candidate) => candidate.id === "plan-revise-accept",
+    );
+    const execution = runnerMatrix.find(
+      (candidate) =>
+        candidate.profile.id === "legacy-claude" &&
+        candidate.environment.id === "local" &&
+        candidate.task.id === "plan-revise-accept",
+    );
+    expect(task).toBeDefined();
+    expect(execution).toBeDefined();
+    const agent = execution!.profile.buildAgent({
+      environmentId: "11111111-1111-4111-8111-111111111111",
+      environmentFixtureId: "local",
+      workspacePath: "/tmp/runner-e2e-workspace",
+      secretRefs: {
+        ANTHROPIC_API_KEY: {
+          type: "secret_ref",
+          secretId: "22222222-2222-4222-8222-222222222222",
+          version: "latest",
+        },
+      },
+      executionId: execution!.id,
+    });
+    expect(agent.adapterConfig).toMatchObject({ maxTurnsPerRun: 24 });
+    expect(agent.instructionsBundle).toMatchObject({
+      files: { "AGENTS.md": expect.stringContaining("/interactions") },
+    });
+    expect(task!.buildPrompt("nonce")).toContain("request_confirmation");
+  });
+
   it("accepts only complete immutable Daytona digests", () => {
     expect(
       isImmutableDaytonaImage(
