@@ -10,6 +10,8 @@ import { runnerMatrix } from "./catalog.js";
 import { renderRunnerE2EDashboard } from "./dashboard.js";
 import type { RunnerE2EResult } from "./types.js";
 
+const repositoryRoot = path.resolve(import.meta.dirname, "../..");
+
 interface EvidenceManifest {
   files?: string[];
   leaks?: Array<{ file: string; reason: string }>;
@@ -102,6 +104,21 @@ async function stageDashboardEvidence(
     });
   }
   return staged;
+}
+
+async function stageDashboardBrandAssets(output: string) {
+  const assets = path.join(output, "assets");
+  await mkdir(assets, { recursive: true });
+  await Promise.all([
+    copyFile(
+      path.join(repositoryRoot, "ui/public/favicon.svg"),
+      path.join(assets, "favicon.svg"),
+    ),
+    copyFile(
+      path.join(repositoryRoot, "ui/public/fonts/InterVariable.woff2"),
+      path.join(assets, "InterVariable.woff2"),
+    ),
+  ]);
 }
 
 async function main() {
@@ -205,7 +222,10 @@ async function main() {
   }
 
   await mkdir(output, { recursive: true });
-  const stagedEvidence = await stageDashboardEvidence(selected, output);
+  const [stagedEvidence] = await Promise.all([
+    stageDashboardEvidence(selected, output),
+    stageDashboardBrandAssets(output),
+  ]);
   const normalized = {
     schema: "paperclip.runner-e2e.campaign/v1",
     generatedAt: new Date().toISOString(),

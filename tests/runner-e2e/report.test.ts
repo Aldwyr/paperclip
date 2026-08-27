@@ -137,8 +137,19 @@ describe("runner E2E report aggregation", () => {
     expect(dashboard).toContain("runner-acpx-codex.daytona.message-marker");
     expect(dashboard).toContain("case-not-selected");
     expect(dashboard).toContain("<img");
+    expect(dashboard).toContain('class="brand-lockup"');
+    expect(dashboard).toContain("data-gallery-dialog");
+    expect(dashboard).toContain("data-gallery-previous");
+    expect(dashboard).toContain("data-gallery-next");
+    expect(dashboard).toContain("View gallery · 1");
     expect(dashboard).toContain("message_contains");
     expect(dashboard).toContain("Matchers and test context");
+    expect(
+      await readFile(path.join(output, "assets", "favicon.svg"), "utf8"),
+    ).toContain("<svg");
+    expect(
+      await readFile(path.join(output, "assets", "InterVariable.woff2")),
+    ).not.toHaveLength(0);
     expect(
       await readFile(
         path.join(
