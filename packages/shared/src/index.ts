@@ -2506,6 +2506,7 @@ export {
 } from "./feature-catalog.js";
 export {
   HIDEABLE_COMPANY_PAGES,
+  HIDEABLE_COMPANY_SECTIONS,
   HIDEABLE_GENERAL_SECTIONS,
   HIDEABLE_INSTANCE_PAGES,
   HIDEABLE_SETTING_KEYS,
@@ -2513,11 +2514,13 @@ export {
   UI_ONLY_GENERAL_SECTIONS,
   experimentalSettingKey,
   hidesCompanyPage,
+  hidesCompanySection,
   hidesExperimentalSetting,
   hidesGeneralSection,
   hidesInstancePage,
   parseHiddenSettingsList,
   type HideableCompanyPage,
+  type HideableCompanySection,
   type HideableExperimentalSetting,
   type HideableGeneralSection,
   type HideableInstancePage,
