@@ -231,6 +231,10 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      - name: Install pinned legacy Claude CLI
+        if: matrix.profileId == 'legacy-claude'
+        run: npm install --global --omit=dev @anthropic-ai/claude-code@2.1.19
+
       - name: Build native runner binaries
         if: startsWith(matrix.profileId, 'runner-')
         run: pnpm --filter @paperclipai/paperclip-runner build:runner-binaries
