@@ -87,22 +87,21 @@ jobs:
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
-      - name: Validate dependency resolution when manifests change
+      - name: Regenerate a stale lockfile for downstream jobs
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
-          manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$|^patches/'
-          if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
-            pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-            echo "regenerated=1" >> "$GITHUB_OUTPUT"
-          else
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+          if git diff --quiet -- pnpm-lock.yaml; then
             echo "regenerated=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "regenerated=1" >> "$GITHUB_OUTPUT"
           fi
 
-      # Manifest-only PRs (where pnpm-lock.yaml stays at base because the policy
-      # job above blocks committing it) need the regenerated lockfile for the
-      # downstream `pnpm install --frozen-lockfile` steps. Upload it here so
-      # every job consumes the same hash without recomputing.
+      # Manifest-only and stacked PRs keep pnpm-lock.yaml at their base because
+      # the policy job above blocks committing it. A stacked PR can inherit a
+      # stale lockfile without changing a manifest in its own diff, so detect
+      # the stale tree directly and upload the regenerated lockfile whenever
+      # needed. Every downstream job then consumes the same hash.
       - name: Upload regenerated lockfile for downstream jobs
         if: steps.regen_lockfile.outputs.regenerated == '1'
         uses: actions/upload-artifact@v7
