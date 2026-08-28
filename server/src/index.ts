@@ -1326,7 +1326,9 @@ export async function startServer(): Promise<StartedServer> {
 
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
-        scheduleTerminalWorkspaceSweep();
+        if (process.env.PAPERCLIP_TERMINAL_WORKSPACE_REAPER_ENABLED !== "false") {
+          scheduleTerminalWorkspaceSweep();
+        }
         scheduleAdapterLoginReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
 

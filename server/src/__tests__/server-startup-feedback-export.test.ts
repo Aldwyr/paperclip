@@ -507,6 +507,49 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  it("does not run the terminal workspace reaper when it is explicitly disabled", async () => {
+    const originalTerminalWorkspaceReaperEnabled =
+      process.env.PAPERCLIP_TERMINAL_WORKSPACE_REAPER_ENABLED;
+    process.env.PAPERCLIP_TERMINAL_WORKSPACE_REAPER_ENABLED = "false";
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "worktree_instance",
+    });
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
+      expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
+      expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).not.toHaveBeenCalled();
+      expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalTerminalWorkspaceReaperEnabled === undefined) {
+        delete process.env.PAPERCLIP_TERMINAL_WORKSPACE_REAPER_ENABLED;
+      } else {
+        process.env.PAPERCLIP_TERMINAL_WORKSPACE_REAPER_ENABLED =
+          originalTerminalWorkspaceReaperEnabled;
+      }
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("keeps external object refresh active when heartbeat scheduling is disabled", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: false,

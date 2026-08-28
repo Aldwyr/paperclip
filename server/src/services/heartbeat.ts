@@ -9320,6 +9320,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
+    if (await isVerifiedTimeoutContinuationAttempt(run)) return;
 
     const issue = await db
       .select({
@@ -9847,6 +9848,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  async function isVerifiedTimeoutContinuationAttempt(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
+    const sourceRunId = readNonEmptyString(context.retryOfRunId);
+    if (
+      !issueId ||
+      !sourceRunId ||
+      run.retryOfRunId !== sourceRunId ||
+      readNonEmptyString(context.resumeFromRunId) !== sourceRunId ||
+      readNonEmptyString(context.retryReason) !== "issue_continuation_needed" ||
+      readNonEmptyString(context.source) !== "issue.continuation_recovery"
+    ) {
+      return false;
+    }
+
+    const sourceRun = await db
+      .select({
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, sourceRunId),
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.agentId, run.agentId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (sourceRun?.status !== "timed_out") return false;
+
+    const sourceContext = parseObject(sourceRun.contextSnapshot);
+    const sourceIssueId = readNonEmptyString(sourceContext.issueId) ?? readNonEmptyString(sourceContext.taskId);
+    return sourceIssueId === issueId;
+  }
+
   async function refreshContinuationSummaryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -10066,6 +10103,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueCommentRetryQueuedAt: null,
       });
       return { outcome: "satisfied" as const, queuedRun: null };
+    }
+
+    if (run.status === "timed_out" || await isVerifiedTimeoutContinuationAttempt(run)) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Missing-comment retry suppressed so timeout recovery can own the single follow-up",
+      });
+      return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
     if (readNonEmptyString(contextSnapshot.retryReason) === "missing_issue_comment") {
@@ -16788,8 +16840,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recoveryAgent.status !== "paused" &&
       recoveryAgent.status !== "terminated" &&
       recoveryAgent.status !== "pending_approval";
+    const explicitTimeoutResumeSession = recoveryAgentInvokable && run.status === "timed_out"
+      ? await resolveExplicitResumeSessionOverride(recoveryAgent, { resumeFromRunId: run.id }, taskKey)
+      : null;
     const recoverySessionBefore = recoveryAgentInvokable
-      ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
+      ? explicitTimeoutResumeSession?.sessionDisplayId ?? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
     const recoveryAgentNameKey = normalizeAgentNameKey(recoveryAgent?.name);
 
@@ -17195,6 +17250,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null);
 
       const issueHasPersistedMonitor = Boolean(issue.monitorNextCheckAt);
+      const findPendingUserReviewPath = async () => {
+        const [pendingInteraction, pendingApproval] = await Promise.all([
+          tx
+            .select({ id: issueThreadInteractions.id })
+            .from(issueThreadInteractions)
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, issue.companyId),
+                eq(issueThreadInteractions.issueId, issue.id),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null),
+          tx
+            .select({ id: issueApprovals.approvalId })
+            .from(issueApprovals)
+            .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+            .where(
+              and(
+                eq(issueApprovals.companyId, issue.companyId),
+                eq(issueApprovals.issueId, issue.id),
+                eq(approvals.companyId, issue.companyId),
+                inArray(approvals.status, ["pending", "revision_requested"]),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null),
+        ]);
+        return pendingInteraction ?? pendingApproval;
+      };
       const findExplicitBlockerPath = () =>
         tx
           .select({ id: issueRelations.issueId })
@@ -17227,10 +17313,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
 
       if (issueNeedsReviewParticipantRecovery) {
-        const existingReviewParticipantExecutionPath = await findExistingExecutionPath(currentParticipant.agentId);
+        const [existingReviewParticipantExecutionPath, pendingUserReviewPath] = await Promise.all([
+          findExistingExecutionPath(currentParticipant.agentId),
+          findPendingUserReviewPath(),
+        ]);
         if (
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
+          pendingUserReviewPath ||
           issueHasPersistedMonitor ||
           await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)
         ) {
@@ -17345,7 +17435,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
       }
-      if (options.suppressImmediateRecovery) {
+      if (options.suppressImmediateRecovery || await isVerifiedTimeoutContinuationAttempt(run)) {
         return { kind: "released" as const };
       }
 
@@ -17399,6 +17489,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
         issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+      const resumeSourceRun = run.status === "timed_out" && retryReason === "issue_continuation_needed";
       const now = new Date();
       const recoveryContextSnapshot = withRecoveryModelProfileHint({
         issueId: issue.id,
@@ -17407,6 +17498,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retryReason,
         source: recoverySource,
         retryOfRunId: run.id,
+        ...(resumeSourceRun ? {
+          resumeFromRunId: run.id,
+          ...(explicitTimeoutResumeSession ? {
+            resumeSessionDisplayId: explicitTimeoutResumeSession.sessionDisplayId,
+            resumeSessionParams: explicitTimeoutResumeSession.sessionParams,
+          } : {}),
+        } : {}),
       }, "normal_model");
       const responsibleUserId = await resolveResponsibleUserIdForRunSeed({
         companyId: issue.companyId,
@@ -17440,6 +17538,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: withRecoveryModelProfileHint({
             issueId: issue.id,
             retryOfRunId: run.id,
+            ...(resumeSourceRun ? { resumeFromRunId: run.id } : {}),
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",

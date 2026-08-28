@@ -810,6 +810,62 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  async function isCompletedTimeoutContinuationAttempt(
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "assigneeAgentId">,
+    latestRun: LatestIssueRun,
+  ) {
+    if (
+      !latestRun ||
+      !isTerminalIssueRun(latestRun) ||
+      !issue.assigneeAgentId ||
+      latestRun.agentId !== issue.assigneeAgentId
+    ) {
+      return false;
+    }
+
+    const context = parseObject(latestRun.contextSnapshot);
+    const sourceRunId = readNonEmptyString(context.retryOfRunId);
+    if (
+      !sourceRunId ||
+      readNonEmptyString(context.resumeFromRunId) !== sourceRunId ||
+      readNonEmptyString(context.retryReason) !== "issue_continuation_needed" ||
+      readNonEmptyString(context.source) !== "issue.continuation_recovery"
+    ) {
+      return false;
+    }
+
+    const [continuationRun, sourceRun] = await Promise.all([
+      db
+        .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, latestRun.id),
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, latestRun.agentId),
+        ))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({
+          status: heartbeatRuns.status,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, sourceRunId),
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, latestRun.agentId),
+        ))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    if (continuationRun?.retryOfRunId !== sourceRunId || sourceRun?.status !== "timed_out") {
+      return false;
+    }
+    const sourceContext = parseObject(sourceRun.contextSnapshot);
+    const sourceIssueId = readNonEmptyString(sourceContext.issueId) ?? readNonEmptyString(sourceContext.taskId);
+    return sourceIssueId === issue.id;
+  }
+
   async function getLatestIssueRunForAgent(
     companyId: string,
     issueId: string,
@@ -1129,6 +1185,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryReason: "assignment_recovery" | "issue_continuation_needed" | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON;
     source: string;
     retryOfRunId?: string | null;
+    resumeFromRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
     const queued = await deps.enqueueWakeup(input.agentId, {
@@ -1138,6 +1195,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       payload: withRecoveryModelProfileHint({
         issueId: input.issueId,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+        ...(input.resumeFromRunId ? { resumeFromRunId: input.resumeFromRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
       requestedByActorType: "system",
@@ -1149,6 +1207,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: input.retryReason,
         source: input.source,
         ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
+        ...(input.resumeFromRunId ? { resumeFromRunId: input.resumeFromRunId } : {}),
         ...(input.extraContext ?? {}),
       }, "normal_model"),
     });
@@ -2583,9 +2642,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     preferredOwnerAgentId?: string | null;
+    forceBoardOwner?: boolean;
   }) {
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
+    if (input.forceBoardOwner) {
+      return {
+        ownerAgentId: null,
+        returnOwnerAgentId,
+        routingFallbackReason: null,
+      };
+    }
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
       input.recoveryCause === "codex_output_inactivity_monitor";
@@ -2869,6 +2936,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
+    forceBoardOwner?: boolean;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
@@ -2877,6 +2945,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestRun: input.latestRun,
       recoveryCause,
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
+      forceBoardOwner: input.forceBoardOwner,
     });
     const ownerAgentId = routing.ownerAgentId;
     const now = new Date();
@@ -3306,6 +3375,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
+    forceBoardOwner?: boolean;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
@@ -3323,6 +3393,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       latestRun: input.latestRun,
       recoveryCause,
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
+      forceBoardOwner: input.forceBoardOwner,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
@@ -3694,11 +3765,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
         : false;
-      if (issue.status !== "in_review" && !agentInvokable) {
-        result.skipped += 1;
-        continue;
-      }
-
       if (await hasActiveExecutionPath(
         issue.companyId,
         issue.id,
@@ -3724,6 +3790,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+        result.skipped += 1;
+        continue;
+      }
+      if (
+        issue.status === "in_progress" &&
+        await isCompletedTimeoutContinuationAttempt(issue, latestRun)
+      ) {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          recoveryCause: "stranded_assigned_issue",
+          forceBoardOwner: true,
+          notice: {
+            body:
+              "Paperclip completed the single continuation attempt after the source timeout, but the issue still " +
+              "has no live execution path. Moving it to `blocked` with a board-owned recovery action instead of " +
+              "starting another continuation.",
+            title: "Timeout continuation exhausted",
+            tone: "danger",
+          },
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+      if (issue.status !== "in_review" && !agentInvokable) {
         result.skipped += 1;
         continue;
       }
@@ -4292,6 +4389,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         retryReason: "issue_continuation_needed",
         source: "issue.continuation_recovery",
         retryOfRunId: latestRun?.id ?? issue.checkoutRunId ?? null,
+        resumeFromRunId: latestRun?.status === "timed_out" && latestRun.agentId === agentId
+          ? latestRun.id
+          : null,
       });
       if (queued) {
         result.continuationRequeued += 1;
