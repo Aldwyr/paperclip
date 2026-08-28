@@ -69,6 +69,7 @@ pub enum AcpxProviderStateEvent {
 #[derive(Clone, Debug, PartialEq)]
 struct PendingInput {
     value_bytes: usize,
+    question_set: Value,
 }
 
 /// Reduces validated sidecar events into bounded provider state.
@@ -173,7 +174,13 @@ impl AcpxProviderState {
                 self.admit_runtime_request(&request_id, value_bytes)?;
                 if self
                     .pending_inputs
-                    .insert(request_id.clone(), PendingInput { value_bytes })
+                    .insert(
+                        request_id.clone(),
+                        PendingInput {
+                            value_bytes,
+                            question_set: question_set.clone(),
+                        },
+                    )
                     .is_some()
                 {
                     return Err(LocalRunnerError::invalid(
@@ -301,6 +308,12 @@ impl AcpxProviderState {
             .pending_runtime_request_bytes
             .saturating_sub(pending.value_bytes);
         Ok(())
+    }
+
+    pub fn pending_question_set(&self, request_id: &str) -> Option<&Value> {
+        self.pending_inputs
+            .get(request_id)
+            .map(|pending| &pending.question_set)
     }
 
     pub fn semantic_result(&self) -> Option<&AcpxSemanticResult> {
