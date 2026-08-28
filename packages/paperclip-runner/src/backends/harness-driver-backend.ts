@@ -113,6 +113,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
       session: new HarnessNativeSession(
         { identity: snapshot.identity },
         recovered.session,
+        snapshot.terminal ?? null,
       ),
     };
   }
@@ -142,9 +143,14 @@ class HarnessNativeSession implements NativeSession {
   #terminal: PrpTerminalState | null = null;
   #explicitlyCancelled = false;
 
-  constructor(input: OpenNativeSessionInput, session: HarnessSession) {
+  constructor(
+    input: OpenNativeSessionInput,
+    session: HarnessSession,
+    terminal: PrpTerminalState | null = null,
+  ) {
     this.#input = structuredClone(input);
     this.#session = session;
+    this.#terminal = terminal === null ? null : structuredClone(terminal);
   }
 
   identity() {
