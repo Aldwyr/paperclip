@@ -4,6 +4,8 @@ on:
   pull_request:
     branches:
       - master
+      # Native GitHub stacks target each downstream PR at its predecessor.
+      - "codex/**"
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
