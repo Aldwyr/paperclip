@@ -132,6 +132,43 @@ describe("Codex ACPX runtime adapter", () => {
     });
   });
 
+  it("force-terminates the provider when ACPX runtime close stalls", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = fakeRuntime();
+      vi.mocked(runtime.close).mockImplementation(
+        () => new Promise<void>(() => undefined),
+      );
+      const command = fakeCommand();
+      const child = fakeChild();
+      vi.mocked(command.spawn).mockReturnValue(child);
+      let runtimeOptions: AcpRuntimeOptions | undefined;
+      const port = await openCodexAcpxRuntime(openOptions(command), {
+        createRegistry: () => registry(),
+        createStore: () => store(),
+        createRuntime: (options) => {
+          runtimeOptions = options;
+          return runtime;
+        },
+      });
+      runtimeOptions?.spawnAgent?.({
+        command: "ignored",
+        args: ["--stdio"],
+        options: {},
+      });
+
+      const closing = port.close({ reason: "stalled runtime" });
+      const rejected = expect(closing).rejects.toThrow(
+        "ACPX runtime and provider cleanup failed",
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      await rejected;
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("maps prompt turns to the admitted ACPX handle", async () => {
     const runtime = fakeRuntime();
     const turn = {

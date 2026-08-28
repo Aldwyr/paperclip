@@ -19,6 +19,7 @@ import type {
 import { decideAcpxPermission } from "./permission-policy.js";
 
 const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
+const RUNTIME_CLOSE_TIMEOUT_MS = 2_000;
 
 export interface CodexAcpxRuntimeDependencies {
   createRuntime?: (options: AcpRuntimeOptions) => AcpRuntime;
@@ -186,26 +187,24 @@ function runtimePort(
         mode: "prompt",
         requestId: input.requestId,
         ...(input.signal ? { signal: input.signal } : {}),
-        ...(input.onElicitation
-          ? { onElicitation: input.onElicitation }
-          : {}),
+        ...(input.onElicitation ? { onElicitation: input.onElicitation } : {}),
       });
     },
     async close(input) {
-      let closeError: unknown;
-      try {
-        await runtime.close({
-          handle,
-          reason: input.reason,
-          discardPersistentState: false,
-        });
-      } catch (error) {
-        closeError = error;
-      }
+      const closeError = await boundedRuntimeClose(
+        Promise.resolve(
+          runtime.close({
+            handle,
+            reason: input.reason,
+            discardPersistentState: false,
+          }),
+        ),
+        RUNTIME_CLOSE_TIMEOUT_MS,
+      );
       const processErrors = await children.terminate();
-      if (closeError !== undefined || processErrors.length > 0) {
+      if (closeError !== null || processErrors.length > 0) {
         const errors = [...processErrors];
-        if (closeError !== undefined) errors.unshift(closeError);
+        if (closeError !== null) errors.unshift(closeError);
         throw new AggregateError(
           errors,
           "ACPX runtime and provider cleanup failed",
@@ -213,6 +212,33 @@ function runtimePort(
       }
     },
   };
+}
+
+async function boundedRuntimeClose(
+  close: Promise<void>,
+  timeoutMs: number,
+): Promise<unknown | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      close.then(
+        () => null,
+        (error: unknown) => error,
+      ),
+      new Promise<Error>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve(
+              new Error("ACPX runtime close exceeded its shutdown timeout"),
+            ),
+          timeoutMs,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 class SpawnedChildSet {
