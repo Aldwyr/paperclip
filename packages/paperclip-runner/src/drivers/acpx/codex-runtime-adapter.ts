@@ -16,6 +16,7 @@ import type {
   AcpxRuntimePortIdentity,
   AcpxRuntimePortOpenOptions,
 } from "./runtime-host.js";
+import { decideAcpxPermission } from "./permission-policy.js";
 
 const VERIFIED_COMMAND_SENTINEL = "paperclip-verified-acpx-command";
 
@@ -37,13 +38,20 @@ export async function openCodexAcpxRuntime(
   dependencies: CodexAcpxRuntimeDependencies = {},
 ): Promise<AcpxRuntimePort> {
   if (options.profile.agent !== "codex") {
-    throw new Error("The production ACPX runtime currently supports Codex only");
+    throw new Error(
+      "The production ACPX runtime currently supports Codex only",
+    );
   }
 
   const createRegistry = dependencies.createRegistry ?? createAgentRegistry;
   const createStore = dependencies.createStore ?? createRuntimeStore;
   const createRuntime = dependencies.createRuntime ?? createAcpRuntime;
   const children = new SpawnedChildSet();
+  const runnerOwnedMcpServerNames = new Set(
+    options.mcpServers
+      .filter((server) => server.runnerOwned)
+      .map((server) => server.name),
+  );
   const runtime = createRuntime({
     cwd: options.cwd,
     sessionStore: createStore({ stateDir: options.stateDirectory }),
@@ -60,6 +68,28 @@ export async function openCodexAcpxRuntime(
       escalate: options.permissionPolicy.escalate
         ? [...options.permissionPolicy.escalate]
         : undefined,
+    },
+    mcpServers: options.mcpServers.map((server) => ({
+      type: "http" as const,
+      name: server.name,
+      url: server.url,
+      headers: [
+        { name: "Authorization", value: `Bearer ${server.bearerToken}` },
+      ],
+    })),
+    onPermissionRequest: async (request) => {
+      const disposition = decideAcpxPermission(
+        options.profile.agent,
+        options.permissionMode,
+        request,
+        {
+          runnerOwnedMcpServerNames,
+          allConfiguredMcpServersAreRunnerOwned:
+            options.mcpServers.length > 0 &&
+            options.mcpServers.every((server) => server.runnerOwned),
+        },
+      );
+      return disposition === "delegate" ? undefined : { outcome: disposition };
     },
     spawnEnvironment: () => definedEnvironment(options.launchEnvironment),
     spawnCwd: options.cwd,
