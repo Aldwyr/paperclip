@@ -38,6 +38,7 @@ export {
   decideRunLivenessContinuation,
   findExistingRunLivenessContinuationWake,
   readContinuationAttempt,
+  resolveBoundedChangesRequestedCorrection,
 } from "./run-liveness-continuations.js";
 export type {
   RunContinuationDecision,

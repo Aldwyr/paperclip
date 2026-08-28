@@ -223,6 +223,7 @@ import {
   isSuccessfulRunHandoffValidPathSkip,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  resolveBoundedChangesRequestedCorrection,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
@@ -9115,7 +9116,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function handleRunLivenessContinuation(run: typeof heartbeatRuns.$inferSelect) {
     const livenessState = run.livenessState as RunLivenessState | null;
-    if (livenessState !== "plan_only" && livenessState !== "empty_response") return;
+    if (
+      livenessState !== "plan_only" &&
+      livenessState !== "empty_response" &&
+      livenessState !== "needs_followup"
+    ) return;
 
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
@@ -9123,16 +9128,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const [issue, agent] = await Promise.all([
       db
-        .select({
-          id: issues.id,
-          companyId: issues.companyId,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          assigneeAgentId: issues.assigneeAgentId,
-          executionState: issues.executionState,
-          projectId: issues.projectId,
-        })
+        .select()
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
         .then((rows) => rows[0] ?? null),
@@ -9193,6 +9189,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey,
       })
       : null;
+    const verifiedCorrectionRun = issue
+      ? await isBoundedChangesRequestedCorrectionRun(run, issue)
+      : false;
 
     const decision = decideRunLivenessContinuation({
       run,
@@ -9203,17 +9202,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       nextAction: run.nextAction,
       budgetBlocked: Boolean(budgetBlock),
       idempotentWakeExists: Boolean(existingWake),
+      correctionContinuationSourceVerified: verifiedCorrectionRun,
     });
 
     if (decision.kind === "exhausted") {
       await setRunStatus(run.id, run.status, {
         livenessReason: `${run.livenessReason ?? "Run ended without concrete progress"}; continuation attempts exhausted`,
       });
-      await addContinuationExhaustedCommentOnce({
-        run,
-        issueId,
-        comment: decision.comment,
-      });
+      const previousStatus =
+        issue?.status === "todo" || issue?.status === "in_progress" || issue?.status === "in_review"
+          ? issue.status
+          : null;
+      const recovered = decision.requiresVisibleRecovery && issue && previousStatus
+        ? await recovery.escalateStrandedAssignedIssue({
+            issue,
+            previousStatus,
+            latestRun: run,
+            comment: decision.comment,
+            forceBoardOwner: true,
+          })
+        : null;
+      if (!recovered) {
+        await addContinuationExhaustedCommentOnce({
+          run,
+          issueId,
+          comment: decision.comment,
+        });
+      }
       return;
     }
 
@@ -9884,6 +9899,149 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return sourceIssueId === issueId;
   }
 
+  async function isBoundedChangesRequestedCorrectionRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    knownIssue?: Pick<
+      typeof issues.$inferSelect,
+      "id" | "companyId" | "assigneeAgentId" | "executionState"
+    >,
+  ) {
+    const livenessState = run.livenessState as RunLivenessState | null;
+    if (
+      livenessState !== "plan_only" &&
+      livenessState !== "empty_response" &&
+      livenessState !== "needs_followup"
+    ) return false;
+
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId || readNonEmptyString(context.taskId) !== issueId) return false;
+    const issue =
+      knownIssue?.id === issueId && knownIssue.companyId === run.companyId
+        ? knownIssue
+        : await db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionState: issues.executionState,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null);
+    if (!issue) return false;
+
+    const wakeReason = readNonEmptyString(context.wakeReason);
+    if (wakeReason === "execution_changes_requested") {
+      return Boolean(resolveBoundedChangesRequestedCorrection({
+        run,
+        issue,
+        livenessState,
+      }));
+    }
+    if (wakeReason !== RUN_LIVENESS_CONTINUATION_REASON) return false;
+
+    const sourceRunId = readNonEmptyString(context.livenessContinuationSourceRunId);
+    if (
+      !sourceRunId ||
+      readNonEmptyString(context.resumeFromRunId) !== sourceRunId ||
+      readContinuationAttempt(run.continuationAttempt) !== 1 ||
+      readContinuationAttempt(context.livenessContinuationAttempt) !== 1 ||
+      readContinuationAttempt(context.livenessContinuationMaxAttempts) !== 1
+    ) {
+      return false;
+    }
+
+    const sourceRun = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        livenessState: heartbeatRuns.livenessState,
+        continuationAttempt: heartbeatRuns.continuationAttempt,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, sourceRunId),
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.agentId, run.agentId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (
+      sourceRun?.status !== "succeeded" ||
+      readContinuationAttempt(sourceRun.continuationAttempt) !== 1 ||
+      !run.wakeupRequestId
+    ) return false;
+
+    const sourceLivenessState = sourceRun.livenessState as RunLivenessState | null;
+    if (
+      !sourceLivenessState ||
+      readNonEmptyString(context.livenessContinuationState) !== sourceLivenessState
+    ) {
+      return false;
+    }
+    const sourceContext = parseObject(sourceRun.contextSnapshot);
+    if (
+      readNonEmptyString(sourceContext.issueId) !== issueId ||
+      readNonEmptyString(sourceContext.taskId) !== issueId ||
+      !resolveBoundedChangesRequestedCorrection({
+        run: sourceRun,
+        issue,
+        livenessState: sourceLivenessState,
+      })
+    ) {
+      return false;
+    }
+
+    const expectedIdempotencyKey = buildRunLivenessContinuationIdempotencyKey({
+      issueId,
+      sourceRunId,
+      livenessState: sourceLivenessState,
+      nextAttempt: 1,
+    });
+    const continuationWake = await db
+      .select({
+        source: agentWakeupRequests.source,
+        triggerDetail: agentWakeupRequests.triggerDetail,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        runId: agentWakeupRequests.runId,
+      })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.agentId, run.agentId),
+        eq(agentWakeupRequests.runId, run.id),
+      ))
+      .then((rows) => rows[0] ?? null);
+    const wakePayload = parseObject(continuationWake?.payload);
+    if (
+      continuationWake?.source !== "automation" ||
+      continuationWake.triggerDetail !== "system" ||
+      continuationWake.reason !== RUN_LIVENESS_CONTINUATION_REASON ||
+      continuationWake.idempotencyKey !== expectedIdempotencyKey ||
+      continuationWake.runId !== run.id ||
+      readNonEmptyString(wakePayload.issueId) !== issueId ||
+      readNonEmptyString(wakePayload.sourceRunId) !== sourceRunId ||
+      readNonEmptyString(wakePayload.resumeFromRunId) !== sourceRunId ||
+      readNonEmptyString(wakePayload.livenessState) !== sourceLivenessState ||
+      readContinuationAttempt(wakePayload.continuationAttempt) !== 1 ||
+      readContinuationAttempt(wakePayload.maxContinuationAttempts) !== 1 ||
+      wakePayload.boundedChangesRequestedCorrection !== true
+    ) {
+      return false;
+    }
+
+    return Boolean(resolveBoundedChangesRequestedCorrection({
+      run,
+      issue,
+      livenessState,
+      correctionContinuationSourceVerified: true,
+    }));
+  }
+
   async function refreshContinuationSummaryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -10116,6 +10274,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stream: "system",
         level: "info",
         message: "Missing-comment retry suppressed so timeout recovery can own the single follow-up",
+      });
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
+    if (await isBoundedChangesRequestedCorrectionRun(run)) {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Missing-comment retry suppressed so bounded changes-requested recovery can own the single follow-up",
       });
       return { outcome: "not_applicable" as const, queuedRun: null };
     }

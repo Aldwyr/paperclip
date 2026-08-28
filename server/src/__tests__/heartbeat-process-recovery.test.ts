@@ -824,6 +824,71 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
   }
 
+  async function seedChangesRequestedCorrectionFixture() {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const decisionId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const executionStage = {
+      wakeRole: "executor" as const,
+      stageId,
+      stageType: "review" as const,
+      decisionId,
+      currentParticipant: { type: "user" as const, agentId: null, userId: "local-board" },
+      returnAssignee: { type: "agent" as const, agentId, userId: null },
+      reviewRequest: { instructions: "Apply the requested correction and resubmit the same issue." },
+      lastDecisionOutcome: "changes_requested" as const,
+      allowedActions: ["address_changes", "resubmit"],
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Correction Producer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Apply one bounded review correction",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      executionState: {
+        status: "changes_requested",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: executionStage.currentParticipant,
+        returnAssignee: executionStage.returnAssignee,
+        reviewRequest: executionStage.reviewRequest,
+        completedStageIds: [],
+        lastDecisionId: decisionId,
+        lastDecisionOutcome: "changes_requested",
+        changesRequestedCount: 1,
+      },
+    });
+
+    return { companyId, agentId, issueId, stageId, executionStage };
+  }
+
   async function seedInReviewParticipantRunFixture(input?: {
     wakeReason?: string;
     retryReason?: string | null;
@@ -6704,6 +6769,302 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue?.status).toBe("in_progress");
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("retries one nonproductive changes-requested executor turn with the exact correction context", async () => {
+    const { companyId, agentId, issueId, stageId, executionStage } =
+      await seedChangesRequestedCorrectionFixture();
+    let adapterCall = 0;
+    mockAdapterExecute.mockImplementation(async (ctx: { runId: string }) => {
+      adapterCall += 1;
+      if (adapterCall === 1) {
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "",
+          provider: "test",
+          model: "test-model",
+          sessionId: "correction-acp-session",
+          sessionDisplayId: "correction-acp-session",
+          sessionParams: { sessionId: "correction-acp-session" },
+        };
+      }
+
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorAgentId: agentId,
+        createdByRunId: ctx.runId,
+        body: "Applied the requested correction and resubmitted the issue.",
+      });
+      await db
+        .update(issues)
+        .set({
+          status: "in_review",
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: executionStage.currentParticipant,
+            returnAssignee: executionStage.returnAssignee,
+            reviewRequest: executionStage.reviewRequest,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            changesRequestedCount: 1,
+          },
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Correction applied and resubmitted for review.",
+        provider: "test",
+        model: "test-model",
+        sessionId: "correction-acp-session",
+        sessionDisplayId: "correction-acp-session",
+        sessionParams: { sessionId: "correction-acp-session" },
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    const sourceRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_changes_requested",
+      payload: { issueId, executionStage },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+        wakeReason: "execution_changes_requested",
+        source: "issue.execution_stage",
+        executionStage,
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(sourceRun).toBeTruthy();
+    await heartbeat.drainActiveRunExecutions();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(heartbeatRuns.createdAt);
+    expect(runs).toHaveLength(2);
+    expect(runs.map((run) => run.status)).toEqual(["succeeded", "succeeded"]);
+    expect(runs[0]?.livenessState).toBe("needs_followup");
+    expect(runs[1]?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: issueId,
+      taskKey: issueId,
+      wakeReason: "run_liveness_continuation",
+      resumeFromRunId: runs[0]?.id,
+      livenessContinuationAttempt: 1,
+      livenessContinuationMaxAttempts: 1,
+      executionStage,
+    });
+    expect(runs[1]?.sessionIdBefore).toBe("correction-acp-session");
+    expect(runs[1]?.contextSnapshot).not.toHaveProperty("modelProfile");
+    expect(runs[1]?.contextSnapshot).not.toHaveProperty("recoveryIntent");
+    expect(runs[1]?.contextSnapshot).not.toHaveProperty("allowDeliverableWork");
+    expect(runs[1]?.contextSnapshot).not.toHaveProperty("allowDocumentUpdates");
+    expect(runs[1]?.contextSnapshot).not.toHaveProperty("resumeRequiresNormalModel");
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .orderBy(agentWakeupRequests.requestedAt);
+    expect(wakes).toHaveLength(2);
+    expect(wakes.map((wake) => wake.reason)).toEqual([
+      "execution_changes_requested",
+      "run_liveness_continuation",
+    ]);
+    expect(wakes[1]?.payload).toMatchObject({
+      issueId,
+      sourceRunId: runs[0]?.id,
+      resumeFromRunId: runs[0]?.id,
+      continuationAttempt: 1,
+      maxContinuationAttempts: 1,
+      executionStage,
+    });
+    expect(wakes[1]?.payload).not.toHaveProperty("modelProfile");
+    expect(wakes[1]?.payload).not.toHaveProperty("recoveryIntent");
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens visible recovery without a third run when the one correction continuation is nonproductive", async () => {
+    const { agentId, issueId, executionStage } = await seedChangesRequestedCorrectionFixture();
+    mockAdapterExecute.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary: "",
+      provider: "test",
+      model: "test-model",
+      sessionId: "correction-acp-session",
+      sessionDisplayId: "correction-acp-session",
+      sessionParams: { sessionId: "correction-acp-session" },
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_changes_requested",
+      payload: { issueId, executionStage },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+        wakeReason: "execution_changes_requested",
+        source: "issue.execution_stage",
+        executionStage,
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    await heartbeat.drainActiveRunExecutions();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    expect(runs.every((run) => run.livenessState === "needs_followup")).toBe(true);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes).toHaveLength(2);
+    expect(wakes.filter((wake) => wake.reason === "run_liveness_continuation")).toHaveLength(1);
+    expect(wakes.some((wake) => wake.reason === "missing_issue_comment")).toBe(false);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]).toMatchObject({
+      status: "active",
+      cause: "stranded_assigned_issue",
+      ownerType: "board",
+    });
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("Bounded liveness continuation exhausted"))).toBe(true);
+  });
+
+  it("rejects a correction continuation whose wake is not causally linked to the source run", async () => {
+    const { agentId, issueId, executionStage } = await seedChangesRequestedCorrectionFixture();
+    let adapterCall = 0;
+    let signalSecondRun: (() => void) | null = null;
+    let releaseSecondRun: (() => void) | null = null;
+    const secondRunStarted = new Promise<void>((resolve) => {
+      signalSecondRun = resolve;
+    });
+    const secondRunHold = new Promise<void>((resolve) => {
+      releaseSecondRun = resolve;
+    });
+    mockAdapterExecute.mockImplementation(async () => {
+      adapterCall += 1;
+      if (adapterCall === 2) {
+        signalSecondRun?.();
+        await secondRunHold;
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "",
+        provider: "test",
+        model: "test-model",
+        sessionId: "correction-acp-session",
+        sessionDisplayId: "correction-acp-session",
+        sessionParams: { sessionId: "correction-acp-session" },
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    const sourceRun = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_changes_requested",
+      payload: { issueId, executionStage },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        taskKey: issueId,
+        wakeReason: "execution_changes_requested",
+        source: "issue.execution_stage",
+        executionStage,
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(sourceRun).toBeTruthy();
+    const drainPromise = heartbeat.drainActiveRunExecutions();
+    await secondRunStarted;
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agentId),
+        eq(heartbeatRuns.continuationAttempt, 1),
+      ))
+      .then((rows) => rows.find((row) => row.id !== sourceRun!.id) ?? null);
+    expect(retryRun?.wakeupRequestId).toBeTruthy();
+    await db
+      .update(agentWakeupRequests)
+      .set({ idempotencyKey: `tampered:${randomUUID()}` })
+      .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!));
+
+    releaseSecondRun?.();
+    await drainPromise;
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(recoveryActions).toHaveLength(0);
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakes.filter((wake) => wake.reason === "run_liveness_continuation")).toHaveLength(1);
+    expect(wakes.filter((wake) => wake.reason === "missing_issue_comment")).toHaveLength(0);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
   });
 
   it("classifies actionable plan-only recovery and enqueues one liveness continuation", async () => {

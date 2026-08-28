@@ -338,6 +338,7 @@ type ExecutionStageWakeContext = {
   wakeRole: "reviewer" | "approver" | "executor";
   stageId: string | null;
   stageType: ParsedExecutionState["currentStageType"];
+  decisionId: ParsedExecutionState["lastDecisionId"];
   currentParticipant: ParsedExecutionState["currentParticipant"];
   returnAssignee: ParsedExecutionState["returnAssignee"];
   reviewRequest: ParsedExecutionState["reviewRequest"];
@@ -1703,6 +1704,7 @@ function buildExecutionStageWakeContext(input: {
     wakeRole: input.wakeRole,
     stageId: input.state.currentStageId,
     stageType: input.state.currentStageType,
+    decisionId: input.state.lastDecisionId,
     currentParticipant: input.state.currentParticipant,
     returnAssignee: input.state.returnAssignee,
     reviewRequest: input.state.reviewRequest ?? null,

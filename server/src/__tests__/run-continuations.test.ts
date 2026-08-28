@@ -10,6 +10,58 @@ const companyId = "company-1";
 const agentId = "agent-1";
 const issueId = "issue-1";
 const runId = "run-1";
+const correctionAgentId = "11111111-1111-4111-8111-111111111111";
+const correctionStageId = "22222222-2222-4222-8222-222222222222";
+const correctionDecisionId = "33333333-3333-4333-8333-333333333333";
+
+const correctionStage = {
+  wakeRole: "executor",
+  stageId: correctionStageId,
+  stageType: "review",
+  currentParticipant: { type: "user", agentId: null, userId: "local-board" },
+  returnAssignee: { type: "agent", agentId: correctionAgentId, userId: null },
+  reviewRequest: { instructions: "Apply the requested correction." },
+  decisionId: correctionDecisionId,
+  lastDecisionOutcome: "changes_requested",
+  allowedActions: ["address_changes", "resubmit"],
+} as const;
+
+function correctionRun(
+  contextOverrides: Record<string, unknown> = {},
+  runOverrides: Record<string, unknown> = {},
+) {
+  return run({
+    agentId: correctionAgentId,
+    contextSnapshot: {
+      issueId,
+      taskId: issueId,
+      wakeReason: "execution_changes_requested",
+      source: "issue.execution_stage",
+      executionStage: correctionStage,
+      ...contextOverrides,
+    },
+    ...runOverrides,
+  });
+}
+
+function correctionIssue() {
+  return issue({
+    assigneeAgentId: correctionAgentId,
+    executionState: {
+      status: "changes_requested",
+      currentStageId: correctionStageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: correctionStage.currentParticipant,
+      returnAssignee: correctionStage.returnAssignee,
+      reviewRequest: correctionStage.reviewRequest,
+      completedStageIds: [],
+      lastDecisionId: correctionDecisionId,
+      lastDecisionOutcome: "changes_requested",
+      changesRequestedCount: 1,
+    },
+  });
+}
 
 function run(overrides: Record<string, unknown> = {}) {
   return {
@@ -169,5 +221,84 @@ describe("run liveness continuations", () => {
 
       expect(decision.kind).toBe("skip");
     }
+  });
+
+  it.each([
+    ["decision id", { decisionId: "44444444-4444-4444-8444-444444444444" }],
+    ["current participant", { currentParticipant: { type: "user", agentId: null, userId: "other-user" } }],
+    ["return assignee", { returnAssignee: { type: "agent", agentId: "55555555-5555-4555-8555-555555555555", userId: null } }],
+    ["review request", { reviewRequest: { instructions: "A stale correction request." } }],
+    ["decision outcome", { lastDecisionOutcome: "approved" }],
+    ["allowed actions", { allowedActions: ["address_changes"] }],
+  ])("rejects a changes-requested wake with a mismatched %s", (_label, stageOverride) => {
+    const decision = decideRunLivenessContinuation({
+      run: correctionRun({
+        executionStage: { ...correctionStage, ...stageOverride },
+      }),
+      issue: correctionIssue(),
+      agent: agent({ id: correctionAgentId }),
+      livenessState: "needs_followup",
+      livenessReason: "No concrete correction evidence",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision.kind).toBe("skip");
+  });
+
+  it.each([
+    ["missing resume link", { resumeFromRunId: undefined }],
+    ["wrong resume link", { resumeFromRunId: "wrong-run" }],
+    ["wrong liveness source", { livenessContinuationSourceRunId: "wrong-run" }],
+    ["wrong context attempt", { livenessContinuationAttempt: 2 }],
+  ])("rejects an unverified correction continuation with a %s", (_label, contextOverride) => {
+    const decision = decideRunLivenessContinuation({
+      run: correctionRun({
+        wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
+        boundedChangesRequestedCorrection: true,
+        resumeFromRunId: runId,
+        livenessContinuationSourceRunId: runId,
+        livenessContinuationAttempt: 1,
+        livenessContinuationMaxAttempts: 1,
+        ...contextOverride,
+      }, {
+        continuationAttempt: 1,
+      }),
+      issue: correctionIssue(),
+      agent: agent({ id: correctionAgentId }),
+      livenessState: "needs_followup",
+      livenessReason: "No concrete correction evidence",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+      correctionContinuationSourceVerified: true,
+    });
+
+    expect(decision.kind).toBe("skip");
+  });
+
+  it("rejects a correction continuation without verified source provenance", () => {
+    const decision = decideRunLivenessContinuation({
+      run: correctionRun({
+        wakeReason: RUN_LIVENESS_CONTINUATION_REASON,
+        boundedChangesRequestedCorrection: true,
+        resumeFromRunId: runId,
+        livenessContinuationSourceRunId: runId,
+        livenessContinuationAttempt: 1,
+        livenessContinuationMaxAttempts: 1,
+      }, {
+        continuationAttempt: 1,
+      }),
+      issue: correctionIssue(),
+      agent: agent({ id: correctionAgentId }),
+      livenessState: "needs_followup",
+      livenessReason: "No concrete correction evidence",
+      nextAction: null,
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision.kind).toBe("skip");
   });
 });

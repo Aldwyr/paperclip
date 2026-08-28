@@ -3531,6 +3531,7 @@ describe.sequential("issue comment reopen routes", () => {
           executionStage: expect.objectContaining({
             wakeRole: "executor",
             stageType: "review",
+            decisionId: expect.any(String),
             lastDecisionOutcome: "changes_requested",
             allowedActions: ["address_changes", "resubmit"],
           }),
