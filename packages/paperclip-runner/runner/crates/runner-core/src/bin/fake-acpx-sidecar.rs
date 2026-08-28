@@ -88,6 +88,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             | "turns-wrong-scope"
             | "turns-tool"
             | "turns-unauthorized-tool"
+            | "turns-permission"
             | "resolutions"
             | "resolutions-wrong-ack" => {
                 write_json(&mut stdout, &bootstrap_success(id, command, &request, mode))?;
@@ -128,6 +129,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     next_sequence += 1;
                 }
+                if command == "turn.start" && mode == "turns-permission" {
+                    write_turn_event(
+                        &mut stdout,
+                        next_sequence,
+                        "runtime.permission_requested",
+                        "run-1",
+                        turn_id,
+                        json!({
+                            "requestId":"permission-1",
+                            "kind":"execute",
+                            "title":"Run a command?",
+                        }),
+                    )?;
+                    next_sequence += 1;
+                }
                 if command == "turn.start"
                     && matches!(mode, "resolutions" | "resolutions-wrong-ack")
                 {
@@ -154,14 +170,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         "options":[{"id":"first","label":"First"}],
                                     }],
                                 },
-                            }),
-                        ),
-                        (
-                            "runtime.permission_requested",
-                            json!({
-                                "requestId":"permission-1",
-                                "kind":"execute",
-                                "title":"Run a command?",
                             }),
                         ),
                     ] {
@@ -245,7 +253,7 @@ fn bootstrap_success(id: u64, command: &str, request: &Value, mode: &str) -> Val
         }),
         "turn.cancel" => json!({"cancelled":mode != "turns-wrong-cancel"}),
         "tool.resolve" => json!({"resolved":mode != "resolutions-wrong-ack"}),
-        "input.resolve" | "permission.resolve" => json!({"resolved":true}),
+        "input.resolve" => json!({"resolved":true}),
         "session.close" => json!({"closed":true}),
         _ => json!({"command":command,"params":params}),
     };
