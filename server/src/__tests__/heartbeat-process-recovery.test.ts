@@ -838,7 +838,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       decisionId,
       currentParticipant: { type: "user" as const, agentId: null, userId: "local-board" },
       returnAssignee: { type: "agent" as const, agentId, userId: null },
-      reviewRequest: { instructions: "Apply the requested correction and resubmit the same issue." },
+      reviewRequest: null,
       lastDecisionOutcome: "changes_requested" as const,
       allowedActions: ["address_changes", "resubmit"],
     };

@@ -20,7 +20,7 @@ const correctionStage = {
   stageType: "review",
   currentParticipant: { type: "user", agentId: null, userId: "local-board" },
   returnAssignee: { type: "agent", agentId: correctionAgentId, userId: null },
-  reviewRequest: { instructions: "Apply the requested correction." },
+  reviewRequest: null,
   decisionId: correctionDecisionId,
   lastDecisionOutcome: "changes_requested",
   allowedActions: ["address_changes", "resubmit"],
@@ -178,7 +178,7 @@ describe("run liveness continuations", () => {
     });
   });
 
-  it("enqueues one advanced correction when the exact changes-requested workflow state is unchanged", () => {
+  it("enqueues one advanced correction when native changes_requested has cleared the review request", () => {
     const decision = decideRunLivenessContinuation({
       run: correctionRun(),
       issue: correctionIssue(),
@@ -201,6 +201,7 @@ describe("run liveness continuations", () => {
       maxContinuationAttempts: 1,
       boundedChangesRequestedCorrection: true,
     });
+    expect(decision.payload.instruction).toContain("latest changes-requested decision");
   });
 
   it("does not enqueue a third continuation and returns an exhaustion comment", () => {

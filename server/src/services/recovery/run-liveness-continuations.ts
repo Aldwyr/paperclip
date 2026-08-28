@@ -73,7 +73,8 @@ function executionPrincipalMatches(
     (candidate.userId ?? null) === (expected.userId ?? null);
 }
 
-function reviewRequestMatches(value: unknown, expected: { instructions: string }) {
+function reviewRequestMatches(value: unknown, expected: { instructions: string } | null) {
+  if (expected === null) return value === null;
   const candidate = readRecord(value);
   return candidate.instructions === expected.instructions && Object.keys(candidate).length === 1;
 }
@@ -105,8 +106,7 @@ export function resolveBoundedChangesRequestedCorrection(input: {
     !state.currentStageType ||
     !state.currentParticipant ||
     state.returnAssignee?.type !== "agent" ||
-    state.returnAssignee.agentId !== input.run.agentId ||
-    !state.reviewRequest
+    state.returnAssignee.agentId !== input.run.agentId
   ) {
     return null;
   }
@@ -278,7 +278,9 @@ export function decideRunLivenessContinuation(input: {
   }
 
   const instruction = correctionContext
-    ? `Apply the requested changes now and resubmit the same issue for review. Review request: ${correctionContext.reviewRequest.instructions}`
+    ? correctionContext.reviewRequest
+      ? `Apply the requested changes now and resubmit the same issue for review. Review request: ${correctionContext.reviewRequest.instructions}`
+      : "Apply the latest changes-requested decision now and resubmit the same issue for review. Read the review decision and related issue comments before acting."
     : nextAction ??
       "The previous run ended without concrete progress. Take the first concrete action now or mark the issue blocked with a specific unblock request.";
   const correctionPayload = correctionContext
