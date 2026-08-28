@@ -99,9 +99,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let call_log = argument(&args, "--call-log").map(PathBuf::from);
     let emit_question = args.iter().any(|value| value == "--emit-question");
     let emit_tool_call = args.iter().any(|value| value == "--emit-tool-call");
+    let emit_tool_call_on_resume = args
+        .iter()
+        .any(|value| value == "--emit-tool-call-on-resume");
+    let finish_turn_with_pending_tool = args
+        .iter()
+        .any(|value| value == "--finish-turn-with-pending-tool");
     let require_dynamic_tool = args.iter().any(|value| value == "--require-dynamic-tool");
     let hold_turn = args.iter().any(|value| value == "--hold-turn");
     let exit_after_turn_start = args.iter().any(|value| value == "--exit-after-turn-start");
+    let delayed_tool_after_failed_turn = args
+        .iter()
+        .any(|value| value == "--delayed-tool-after-failed-turn");
     let pre_response_notification = args
         .iter()
         .any(|value| value == "--notification-before-response");
@@ -170,6 +179,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "id": id,
                     "result": {"thread": {"id": state.thread_id, "sessionId": "codex-account-session"}}
                 }))?;
+                if emit_tool_call_on_resume {
+                    if let Some(turn_id) = state.active_turn_id.as_deref() {
+                        send(json!({
+                            "id": "tool-request-1",
+                            "method": "item/tool/call",
+                            "params": {
+                                "threadId": state.thread_id,
+                                "turnId": turn_id,
+                                "callId": "semantic-call-1",
+                                "tool": "get_task_context",
+                                "arguments": {}
+                            }
+                        }))?;
+                    }
+                }
             }
             "thread/read" => {
                 let turns = state
@@ -193,7 +217,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"turn": {"id": "provider-turn-1"}}
                 }))?;
-                if exit_after_turn_start {
+                if delayed_tool_after_failed_turn {
+                    send(json!({
+                        "method": "turn/failed",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turn": {"id": "provider-turn-1", "status": "failed"}
+                        }
+                    }))?;
+                    state.active_turn_id = None;
+                    save_state(&state_path, &state)?;
+                    send(json!({
+                        "id": "tool-request-delayed",
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": state.thread_id,
+                            "turnId": "provider-turn-1",
+                            "callId": "semantic-call-delayed",
+                            "tool": "get_task_context",
+                            "arguments": {}
+                        }
+                    }))?;
+                } else if exit_after_turn_start {
                     return Ok(());
                 } else if emit_tool_call {
                     send(json!({
@@ -207,6 +252,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "arguments": {}
                         }
                     }))?;
+                    if finish_turn_with_pending_tool {
+                        finish_turn(&state_path, &mut state, "completed")?;
+                    }
                 } else if emit_question {
                     send(json!({
                         "id": "runtime-request-1",

@@ -514,8 +514,13 @@ impl CodexProvider {
                 self.active_provider_turn_id.as_deref(),
                 &params,
             )?;
-            if method == "turn/completed" {
+            if matches!(
+                method,
+                "turn/completed" | "turn/failed" | "turn/cancelled" | "turn/interrupted"
+            ) {
                 self.active_provider_turn_id = None;
+                self.pending_tool_requests.clear();
+                self.pending_tool_input_bytes = 0;
             }
             return Ok(Some(CodexProviderEvent::Notification {
                 method: method.to_owned(),
@@ -719,7 +724,14 @@ fn codex_dynamic_tools(
 
 fn bounded_identifier(value: Option<&str>, label: &str) -> Result<String, LocalRunnerError> {
     let value = value.ok_or_else(|| LocalRunnerError::invalid(format!("{label} is required")))?;
-    if value.is_empty() || value.len() > 160 || value.chars().any(char::is_control) {
+    let mut characters = value.chars();
+    let valid_first = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric());
+    let valid_rest = characters.all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    });
+    if value.len() > 160 || !valid_first || !valid_rest {
         return Err(LocalRunnerError::invalid(format!("{label} is invalid")));
     }
     Ok(value.to_owned())
