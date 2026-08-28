@@ -521,6 +521,7 @@ impl CodexProvider {
                 self.active_provider_turn_id = None;
                 self.pending_tool_requests.clear();
                 self.pending_tool_input_bytes = 0;
+                self.pending_runtime_requests.clear();
             }
             return Ok(Some(CodexProviderEvent::Notification {
                 method: method.to_owned(),
