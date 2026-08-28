@@ -75,6 +75,12 @@ families as the direct Codex transport. Reasoning contents stay private, display
 paths are relative and bounded, and operational semantic-result and terminal
 events remain reserved for the stateful adapter rather than being duplicated.
 
+The package-local ACPX provider reducer preserves that order while it tracks one
+active turn, bounded assistant text, semantic results, and pending tool or input
+correlations. Terminal events flush the final assistant message first and clear
+unresolved turn-scoped requests. This reducer still does not select ACPX in
+runnerd.
+
 Run the complete contract gate with:
 
 ```sh
