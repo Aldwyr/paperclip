@@ -9119,7 +9119,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       livenessState !== "plan_only" &&
       livenessState !== "empty_response" &&
-      livenessState !== "needs_followup"
+      livenessState !== "needs_followup" &&
+      livenessState !== "advanced"
     ) return;
 
     const context = parseObject(run.contextSnapshot);
@@ -9142,6 +9143,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(agents.id, run.agentId))
         .then((rows) => rows[0] ?? null),
     ]);
+
+    const verifiedCorrectionRun = issue
+      ? await isBoundedChangesRequestedCorrectionRun(run, issue)
+      : false;
+    if (livenessState === "advanced" && !verifiedCorrectionRun) return;
 
     const budgetBlock =
       issue && agent
@@ -9189,9 +9195,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         idempotencyKey,
       })
       : null;
-    const verifiedCorrectionRun = issue
-      ? await isBoundedChangesRequestedCorrectionRun(run, issue)
-      : false;
 
     const decision = decideRunLivenessContinuation({
       run,
@@ -9910,7 +9913,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       livenessState !== "plan_only" &&
       livenessState !== "empty_response" &&
-      livenessState !== "needs_followup"
+      livenessState !== "needs_followup" &&
+      livenessState !== "advanced"
     ) return false;
 
     const context = parseObject(run.contextSnapshot);

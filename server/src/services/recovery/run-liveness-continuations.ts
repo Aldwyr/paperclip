@@ -13,6 +13,7 @@ const CORRECTION_LIVENESS_STATES = new Set<RunLivenessState>([
   "plan_only",
   "empty_response",
   "needs_followup",
+  "advanced",
 ]);
 const CONTINUATION_ACTIVE_ISSUE_STATUSES = new Set(["todo", "in_progress"]);
 // A prior adapter error should not permanently suppress bounded liveness

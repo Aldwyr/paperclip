@@ -6771,13 +6771,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
-  it("retries one nonproductive changes-requested executor turn with the exact correction context", async () => {
+  it("retries one advanced changes-requested executor turn with the exact correction context", async () => {
     const { companyId, agentId, issueId, stageId, executionStage } =
       await seedChangesRequestedCorrectionFixture();
     let adapterCall = 0;
     mockAdapterExecute.mockImplementation(async (ctx: { runId: string }) => {
       adapterCall += 1;
       if (adapterCall === 1) {
+        await db.insert(issueComments).values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          createdByRunId: ctx.runId,
+          body: "Recorded canary evidence without applying or resubmitting the requested correction.",
+        });
         return {
           exitCode: 0,
           signal: null,
@@ -6860,7 +6867,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .orderBy(heartbeatRuns.createdAt);
     expect(runs).toHaveLength(2);
     expect(runs.map((run) => run.status)).toEqual(["succeeded", "succeeded"]);
-    expect(runs[0]?.livenessState).toBe("needs_followup");
+    expect(runs[0]?.livenessState).toBe("advanced");
     expect(runs[1]?.contextSnapshot).toMatchObject({
       issueId,
       taskId: issueId,

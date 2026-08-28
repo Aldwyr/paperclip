@@ -178,6 +178,31 @@ describe("run liveness continuations", () => {
     });
   });
 
+  it("enqueues one advanced correction when the exact changes-requested workflow state is unchanged", () => {
+    const decision = decideRunLivenessContinuation({
+      run: correctionRun(),
+      issue: correctionIssue(),
+      agent: agent({ id: correctionAgentId }),
+      livenessState: "advanced",
+      livenessReason: "Run produced incidental comment and tool activity without resubmitting",
+      nextAction: "Apply the requested correction and resubmit.",
+      budgetBlocked: false,
+      idempotentWakeExists: false,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.nextAttempt).toBe(1);
+    expect(decision.payload).toMatchObject({
+      issueId,
+      sourceRunId: runId,
+      livenessState: "advanced",
+      continuationAttempt: 1,
+      maxContinuationAttempts: 1,
+      boundedChangesRequestedCorrection: true,
+    });
+  });
+
   it("does not enqueue a third continuation and returns an exhaustion comment", () => {
     const decision = decideRunLivenessContinuation({
       run: run({ continuationAttempt: 2 }),
