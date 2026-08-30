@@ -238,7 +238,10 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import {
+  assertAgentCloseHasCurrentHumanVerdict,
+  resolveSelectedSuggestedTasks,
+} from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -8997,15 +9000,31 @@ export function issueRoutes(
     const reviewPolicyChangeRequested =
       req.body.reviewPolicy !== undefined
       && req.body.reviewPolicy !== existing.reviewPolicy;
-    const reviewVerdictRequested =
-      existing.status === "in_review"
-      && (updateFields.status === "done" || updateFields.status === "cancelled");
     const reviewPolicySensitiveMutationRequested =
       req.body.reviewPolicy !== undefined
       || updateFields.status === "done"
       || updateFields.status === "cancelled";
+    const executionStageState = parseIssueExecutionState(existing.executionState);
+    const executionStageDecisionRequested =
+      existing.status === "in_review"
+      && updateFields.status === "done"
+      && executionStageState?.status === "pending"
+      && (
+        (actor.actorType === "agent"
+          && executionStageState.currentParticipant?.type === "agent"
+          && executionStageState.currentParticipant.agentId === actor.agentId)
+        || (actor.actorType === "user"
+          && executionStageState.currentParticipant?.type === "user"
+          && executionStageState.currentParticipant.userId === actor.actorId)
+      );
+    const reviewVerdictRequestedBeforeTransition =
+      existing.status === "in_review"
+      && (updateFields.status === "done" || updateFields.status === "cancelled");
     if (
-      (reviewVerdictRequested || reviewPolicyChangeRequested)
+      (
+        (reviewVerdictRequestedBeforeTransition && !executionStageDecisionRequested)
+        || reviewPolicyChangeRequested
+      )
       && existing.reviewPolicy != null
       && existing.reviewPolicy !== "anyone"
     ) {
@@ -9260,6 +9279,21 @@ export function issueRoutes(
     }
     Object.assign(updateFields, transition.patch);
 
+    const reviewVerdictRequestedAfterTransition =
+      existing.status === "in_review"
+      && (updateFields.status === "done" || updateFields.status === "cancelled");
+    if (
+      (reviewVerdictRequestedAfterTransition || reviewPolicyChangeRequested)
+      && existing.reviewPolicy != null
+      && existing.reviewPolicy !== "anyone"
+    ) {
+      await assertIssueReviewVerdictActorAllowed(db, {
+        issue: existing,
+        actor: { type: actor.actorType, id: actor.actorId },
+        reviewPolicy: existing.reviewPolicy,
+      });
+    }
+
     const nextStatus = updateFields.status ?? existing.status;
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
       throw unprocessable("unblockDescriptor requires blocked status");
@@ -9445,6 +9479,17 @@ export function issueRoutes(
           actor: { type: actor.actorType, id: actor.actorId },
           reviewPolicy: lockedExisting.reviewPolicy,
         });
+      }
+      const agentTerminalCloseRequested =
+        actor.actorType === "agent"
+        && lockedExisting.status !== "in_review"
+        && (updateFields.status === "done" || updateFields.status === "cancelled");
+      if (agentTerminalCloseRequested && lockedExisting.reviewPolicy === "human_only") {
+        await assertAgentCloseHasCurrentHumanVerdict(
+          tx as unknown as Db,
+          lockedExisting,
+          updateFields.status as "done" | "cancelled",
+        );
       }
       return true;
     };
