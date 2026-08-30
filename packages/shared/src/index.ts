@@ -1041,6 +1041,7 @@ export type {
   RequestConfirmationCustomTarget,
   RequestConfirmationTarget,
   RequestConfirmationPayload,
+  RequestConfirmationRejectionDisposition,
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,

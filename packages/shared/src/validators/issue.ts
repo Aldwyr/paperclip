@@ -1065,6 +1065,9 @@ export const requestConfirmationResultSchema = z.object({
     "addressee_deleted",
   ]),
   reason: z.string().trim().max(4000).nullable().optional(),
+  rejectionDisposition: z.enum(["changes_requested", "candidate_rejected"])
+    .nullable()
+    .optional(),
   commentId: z.string().uuid().nullable().optional(),
   supersededByInteractionId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
@@ -1325,6 +1328,7 @@ export type AcceptIssueThreadInteraction = z.infer<typeof acceptIssueThreadInter
 
 export const rejectIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
+  rejectionDisposition: z.enum(["changes_requested", "candidate_rejected"]).optional(),
 });
 export type RejectIssueThreadInteraction = z.infer<typeof rejectIssueThreadInteractionSchema>;
 

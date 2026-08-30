@@ -489,6 +489,36 @@ describe("IssueThreadInteractionCard", () => {
     expect(onRejectInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "request_confirmation" }),
       "Needs a smaller phase split",
+      "changes_requested",
+    );
+  });
+
+  it("records bare Reject as an explicit categorical candidate rejection", async () => {
+    const onRejectInteraction = vi.fn(async () => undefined);
+    const host = renderCard({
+      interaction: {
+        ...pendingRequestConfirmationInteraction,
+        payload: {
+          ...pendingRequestConfirmationInteraction.payload,
+          rejectRequiresReason: false,
+        },
+      },
+      onRejectInteraction,
+    });
+
+    const rejectButton = Array.from(host.querySelectorAll("button")).find((button) =>
+      button.textContent?.trim() === "Reject",
+    );
+    expect(rejectButton).toBeTruthy();
+
+    await act(async () => {
+      rejectButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onRejectInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "request_confirmation" }),
+      undefined,
+      "candidate_rejected",
     );
   });
 
@@ -712,6 +742,7 @@ describe("IssueThreadInteractionCard", () => {
     expect(onRejectInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "request_confirmation" }),
       undefined,
+      "candidate_rejected",
     );
   });
 
@@ -829,6 +860,7 @@ describe("IssueThreadInteractionCard", () => {
     expect(onRejectInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "request_confirmation" }),
       "![bug.png](https://cdn.example/shot.png)",
+      "changes_requested",
     );
   });
 

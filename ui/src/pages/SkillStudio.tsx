@@ -36,6 +36,7 @@ import type {
   CompanySkillVersion,
   IssueDocument,
   IssueThreadInteraction,
+  RequestConfirmationRejectionDisposition,
   AskUserQuestionsInteraction,
   AskUserQuestionsAnswer,
 } from "@paperclipai/shared";
@@ -3350,8 +3351,16 @@ function InteractionSection({
     onSuccess: onAnswered,
   });
   const reject = useMutation({
-    mutationFn: (vars: { interaction: IssueThreadInteraction; reason?: string }) =>
-      issuesApi.rejectInteraction(harnessIssueId!, vars.interaction.id, vars.reason),
+    mutationFn: (vars: {
+      interaction: IssueThreadInteraction;
+      reason?: string;
+      rejectionDisposition?: RequestConfirmationRejectionDisposition;
+    }) => issuesApi.rejectInteraction(
+      harnessIssueId!,
+      vars.interaction.id,
+      vars.reason,
+      vars.rejectionDisposition,
+    ),
     onSuccess: onAnswered,
   });
 
@@ -3375,8 +3384,8 @@ function InteractionSection({
                 onAcceptInteraction={async (interaction, _keys, optionIds) => {
                   await accept.mutateAsync({ interaction, optionIds });
                 }}
-                onRejectInteraction={async (interaction, reason) => {
-                  await reject.mutateAsync({ interaction, reason });
+                onRejectInteraction={async (interaction, reason, rejectionDisposition) => {
+                  await reject.mutateAsync({ interaction, reason, rejectionDisposition });
                 }}
                 onSubmitInteractionAnswers={async (interaction, answers) => {
                   await respond.mutateAsync({ interaction, answers });

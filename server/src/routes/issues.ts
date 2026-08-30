@@ -9020,9 +9020,17 @@ export function issueRoutes(
     const reviewVerdictRequestedBeforeTransition =
       existing.status === "in_review"
       && (updateFields.status === "done" || updateFields.status === "cancelled");
+    const agentHumanOnlyTerminalCloseBeforeTransition =
+      actor.actorType === "agent"
+      && existing.reviewPolicy === "human_only"
+      && reviewVerdictRequestedBeforeTransition;
     if (
       (
-        (reviewVerdictRequestedBeforeTransition && !executionStageDecisionRequested)
+        (
+          reviewVerdictRequestedBeforeTransition
+          && !executionStageDecisionRequested
+          && !agentHumanOnlyTerminalCloseBeforeTransition
+        )
         || reviewPolicyChangeRequested
       )
       && existing.reviewPolicy != null
@@ -9282,8 +9290,15 @@ export function issueRoutes(
     const reviewVerdictRequestedAfterTransition =
       existing.status === "in_review"
       && (updateFields.status === "done" || updateFields.status === "cancelled");
+    const agentHumanOnlyTerminalCloseAfterTransition =
+      actor.actorType === "agent"
+      && existing.reviewPolicy === "human_only"
+      && reviewVerdictRequestedAfterTransition;
     if (
-      (reviewVerdictRequestedAfterTransition || reviewPolicyChangeRequested)
+      (
+        (reviewVerdictRequestedAfterTransition && !agentHumanOnlyTerminalCloseAfterTransition)
+        || reviewPolicyChangeRequested
+      )
       && existing.reviewPolicy != null
       && existing.reviewPolicy !== "anyone"
     ) {
@@ -9469,8 +9484,15 @@ export function issueRoutes(
       const lockedReviewVerdictRequested =
         lockedExisting.status === "in_review"
         && (updateFields.status === "done" || updateFields.status === "cancelled");
+      const lockedAgentHumanOnlyTerminalClose =
+        actor.actorType === "agent"
+        && lockedExisting.reviewPolicy === "human_only"
+        && lockedReviewVerdictRequested;
       if (
-        (lockedReviewVerdictRequested || lockedPolicyChangeRequested)
+        (
+          (lockedReviewVerdictRequested && !lockedAgentHumanOnlyTerminalClose)
+          || lockedPolicyChangeRequested
+        )
         && lockedExisting.reviewPolicy != null
         && lockedExisting.reviewPolicy !== "anyone"
       ) {
@@ -9482,7 +9504,6 @@ export function issueRoutes(
       }
       const agentTerminalCloseRequested =
         actor.actorType === "agent"
-        && lockedExisting.status !== "in_review"
         && (updateFields.status === "done" || updateFields.status === "cancelled");
       if (agentTerminalCloseRequested && lockedExisting.reviewPolicy === "human_only") {
         await assertAgentCloseHasCurrentHumanVerdict(

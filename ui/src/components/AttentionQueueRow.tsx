@@ -504,7 +504,12 @@ function CompactDecisionActions({
         const issueId = item.subject.metadata?.issueId;
         if (typeof issueId !== "string") throw new Error("Missing issue reference for this decision.");
         if (action === "accept") return issuesApi.acceptInteraction(issueId, item.subject.id);
-        return issuesApi.rejectInteraction(issueId, item.subject.id);
+        return issuesApi.rejectInteraction(
+          issueId,
+          item.subject.id,
+          undefined,
+          "candidate_rejected",
+        );
       }
       throw new Error("This decision must be completed from its detail view.");
     },

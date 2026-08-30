@@ -17,6 +17,7 @@ export type {
   RequestConfirmationInteraction,
   RequestConfirmationIssueDocumentTarget,
   RequestConfirmationPayload,
+  RequestConfirmationRejectionDisposition,
   RequestConfirmationResult,
   RequestConfirmationTarget,
   RequestConfirmationToolActionPayload,

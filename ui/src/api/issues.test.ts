@@ -124,4 +124,21 @@ describe("issuesApi.list", () => {
       },
     );
   });
+
+  it("preserves the explicit confirmation rejection disposition", async () => {
+    await issuesApi.rejectInteraction(
+      "issue-1",
+      "interaction-1",
+      "Reject the candidate premise.",
+      "candidate_rejected",
+    );
+
+    expect(mockApi.post).toHaveBeenCalledWith(
+      "/issues/issue-1/interactions/interaction-1/reject",
+      {
+        reason: "Reject the candidate premise.",
+        rejectionDisposition: "candidate_rejected",
+      },
+    );
+  });
 });

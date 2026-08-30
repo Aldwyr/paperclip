@@ -1336,6 +1336,15 @@ export async function assertAgentCloseHasCurrentHumanVerdict(
       interactionId,
     );
   }
+  if (
+    terminalStatus === "cancelled"
+    && result.data.rejectionDisposition !== "candidate_rejected"
+  ) {
+    throw creatorConfirmationRequired(
+      "confirmation_rejection_is_not_categorical",
+      interactionId,
+    );
+  }
 
   const target = payload.success ? payload.data.target : null;
   if (!target || target.type !== "issue_document" || (target.issueId && target.issueId !== issue.id)) {
@@ -1780,6 +1789,8 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             version: 1,
             outcome: "rejected",
             reason: reason || null,
+            rejectionDisposition:
+              args.input.rejectionDisposition ?? "changes_requested",
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByRunId: args.actor.runId ?? null,

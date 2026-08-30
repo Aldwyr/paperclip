@@ -18,6 +18,7 @@ import type {
   PipelineCaseWorkProductOutputItem,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
+  RequestConfirmationRejectionDisposition,
   SuggestTasksInteraction,
 } from "@paperclipai/shared";
 import { AlertTriangle, ArrowUpDown, ArrowUpRight, BookOpenText, Check, ChevronDown, ChevronRight, ChevronUp, CircleDot, Download, ExternalLink, FileText, GitBranch, Hexagon, Image as ImageIcon, Info, Layers, List, ListTree, Loader2, MessageSquare, MoreHorizontal, Package, Paperclip, Plus, Search, Settings, Trash2, X } from "lucide-react";
@@ -2439,9 +2440,15 @@ export function PipelineItemDetailView({ pipelineId, caseId }: { pipelineId: str
   const handleRejectConversationInteraction = useCallback(async (
     interaction: PipelineConversationActionableInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => {
     if (!conversationIssueId) return;
-    await issuesApi.rejectInteraction(conversationIssueId, interaction.id, reason);
+    await issuesApi.rejectInteraction(
+      conversationIssueId,
+      interaction.id,
+      reason,
+      rejectionDisposition,
+    );
     await invalidateConversation();
   }, [conversationIssueId, invalidateConversation]);
 

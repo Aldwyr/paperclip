@@ -11,6 +11,7 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type RequestConfirmationRejectionDisposition,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictValue,
   type SuggestTasksInteraction,
@@ -76,8 +77,16 @@ export function AttentionInteractionResolver({
   });
 
   const rejectMutation = useMutation({
-    mutationFn: (input: { interactionId: string; reason?: string }) =>
-      issuesApi.rejectInteraction(issueId, input.interactionId, input.reason),
+    mutationFn: (input: {
+      interactionId: string;
+      reason?: string;
+      rejectionDisposition?: RequestConfirmationRejectionDisposition;
+    }) => issuesApi.rejectInteraction(
+      issueId,
+      input.interactionId,
+      input.reason,
+      input.rejectionDisposition,
+    ),
     onSuccess: invalidate,
   });
 
@@ -126,8 +135,12 @@ export function AttentionInteractionResolver({
       onAcceptInteraction={(target, selectedClientKeys, selectedOptionIds) =>
         acceptMutation.mutateAsync({ interaction: target, selectedClientKeys, selectedOptionIds }).then(() => undefined)
       }
-      onRejectInteraction={(target, reason) =>
-        rejectMutation.mutateAsync({ interactionId: target.id, reason }).then(() => undefined)
+      onRejectInteraction={(target, reason, rejectionDisposition) =>
+        rejectMutation.mutateAsync({
+          interactionId: target.id,
+          reason,
+          rejectionDisposition,
+        }).then(() => undefined)
       }
       onSubmitInteractionAnswers={(target: AskUserQuestionsInteraction, answers) =>
         respondMutation.mutateAsync({ interactionId: target.id, answers }).then(() => undefined)

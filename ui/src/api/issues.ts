@@ -249,8 +249,16 @@ export const issuesApi = {
     data?: { selectedClientKeys?: string[]; selectedOptionIds?: string[] },
   ) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/accept`, data ?? {}),
-  rejectInteraction: (id: string, interactionId: string, reason?: string) =>
-    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/reject`, reason ? { reason } : {}),
+  rejectInteraction: (
+    id: string,
+    interactionId: string,
+    reason?: string,
+    rejectionDisposition?: "changes_requested" | "candidate_rejected",
+  ) =>
+    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/reject`, {
+      ...(reason ? { reason } : {}),
+      ...(rejectionDisposition ? { rejectionDisposition } : {}),
+    }),
   cancelInteraction: (id: string, interactionId: string, reason?: string) =>
     api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/cancel`, reason ? { reason } : {}),
   respondToInteraction: (

@@ -480,17 +480,19 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       reviewPolicy: "human_only",
     });
 
-    const agentVerdict = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId)))
+    const agentRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const agentVerdict = await request(app(agentActor(
+      seeded.companyId,
+      seeded.assigneeAgentId,
+      agentRunId,
+    )))
       .patch(`/api/issues/${issueId}`)
       .send({ status: "cancelled" });
-    expect(agentVerdict.status).toBe(403);
+    expect(agentVerdict.status).toBe(409);
     expect(agentVerdict.body).toMatchObject({
-      error: expect.stringContaining("authenticated user"),
       details: {
-        code: "review_policy_denied",
-        policy: "human_only",
-        allowedActor: "authenticated_user_with_issue_write_access",
-        remediation: "Have an authenticated user with issue write access submit the verdict.",
+        code: "creator_confirmation_required",
+        reviewPolicy: "human_only",
       },
     });
 
@@ -651,16 +653,90 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     expect(persisted).toEqual({ status: "todo" });
   });
 
-  it("lets an agent cancel a human_only issue after the bound current revision is rejected by a user", async () => {
+  it("lets an agent cancel an in-review human_only issue only after an explicit categorical rejection", async () => {
     const seeded = await seedCompany("HRJ");
     const issueId = await seedReview({
       companyId: seeded.companyId,
       assigneeAgentId: seeded.assigneeAgentId,
       identifier: "HRJ-1",
-      status: "todo",
+      status: "in_progress",
       reviewPolicy: "human_only",
     });
-    await seedResolvedCreatorConfirmation({
+    const documentId = randomUUID();
+    const revisionId = randomUUID();
+    await db.insert(documents).values({
+      id: documentId,
+      companyId: seeded.companyId,
+      title: "Categorically rejected candidate",
+      format: "markdown",
+      latestBody: "candidate v1",
+      latestRevisionId: revisionId,
+      latestRevisionNumber: 1,
+    });
+    await db.insert(issueDocuments).values({
+      companyId: seeded.companyId,
+      issueId,
+      documentId,
+      key: "deliverable",
+    });
+    const reviewRunId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+    const reviewApp = app(agentActor(seeded.companyId, seeded.assigneeAgentId, reviewRunId));
+    const created = await request(reviewApp)
+      .post(`/api/issues/${issueId}/interactions`)
+      .send({
+        kind: "request_confirmation",
+        resolverPolicy: "human_only",
+        continuationPolicy: "none",
+        payload: {
+          version: 1,
+          prompt: "Accept this exact deliverable revision?",
+          target: {
+            type: "issue_document",
+            issueId,
+            documentId,
+            key: "deliverable",
+            revisionId,
+            revisionNumber: 1,
+          },
+        },
+      });
+    expect(created.status, JSON.stringify(created.body)).toBe(201);
+    await request(reviewApp)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", reviewInteractionId: created.body.id })
+      .expect(200);
+    const rejected = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+      .post(`/api/issues/${issueId}/interactions/${created.body.id}/reject`)
+      .send({
+        reason: "The candidate premise is rejected; start a fresh workflow.",
+        rejectionDisposition: "candidate_rejected",
+      });
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(200);
+    expect(rejected.body).toMatchObject({
+      id: created.body.id,
+      status: "rejected",
+      result: { rejectionDisposition: "candidate_rejected" },
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId);
+
+    const cancelled = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "cancelled" });
+
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
+    expect(cancelled.body).toMatchObject({ id: issueId, status: "cancelled" });
+  });
+
+  it("keeps an ordinary Creator revision request on the bounded correction path", async () => {
+    const seeded = await seedCompany("HRC");
+    const issueId = await seedReview({
+      companyId: seeded.companyId,
+      assigneeAgentId: seeded.assigneeAgentId,
+      identifier: "HRC-1",
+      status: "in_review",
+      reviewPolicy: "human_only",
+    });
+    const rejected = await seedResolvedCreatorConfirmation({
       companyId: seeded.companyId,
       issueId,
       requesterAgentId: seeded.assigneeAgentId,
@@ -673,8 +749,18 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ status: "cancelled" });
 
-    expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
-    expect(cancelled.body).toMatchObject({ id: issueId, status: "cancelled" });
+    expect(cancelled.status).toBe(409);
+    expect(cancelled.body).toMatchObject({
+      details: {
+        code: "creator_confirmation_required",
+        reason: "confirmation_rejection_is_not_categorical",
+        interactionId: rejected.interactionId,
+      },
+    });
+    const [persisted] = await db.select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(persisted).toEqual({ status: "in_review" });
   });
 
   it("does not let an agent bypass human_only by relaxing reviewPolicy in the verdict patch", async () => {

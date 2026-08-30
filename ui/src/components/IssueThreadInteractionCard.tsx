@@ -19,6 +19,7 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type RequestConfirmationRejectionDisposition,
   type RequestConfirmationTarget,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictsItem,
@@ -104,6 +105,7 @@ interface IssueThreadInteractionCardProps {
       | RequestConfirmationInteraction
       | RequestCheckboxConfirmationInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
     interaction: AskUserQuestionsInteraction,
@@ -2043,7 +2045,10 @@ function ConfirmationActionRow({
   canApprove: boolean;
   canReject: boolean;
   onApprove: () => void;
-  onReject: (reason: string | undefined) => void;
+  onReject: (
+    reason: string | undefined,
+    rejectionDisposition: RequestConfirmationRejectionDisposition,
+  ) => void;
   /** Compose the final reject reason from the typed text (plan cards append
    * screenshot markdown here). */
   composeReason?: (text: string) => string | undefined;
@@ -2069,7 +2074,10 @@ function ConfirmationActionRow({
   function submitRevision() {
     setAttempted(true);
     if (!canReject || reasonMissing) return;
-    onReject(composeReason ? composeReason(reason) : trimmed || undefined);
+    onReject(
+      composeReason ? composeReason(reason) : trimmed || undefined,
+      "changes_requested",
+    );
   }
 
   return (
@@ -2113,7 +2121,7 @@ function ConfirmationActionRow({
             size="sm"
             variant="ghost"
             disabled={!canReject || working !== null}
-            onClick={() => onReject(undefined)}
+            onClick={() => onReject(undefined, "candidate_rejected")}
           >
             {working === "reject" && !revising ? (
               <>
@@ -2197,6 +2205,7 @@ function RequestConfirmationCard({
   onRejectInteraction?: (
     interaction: RequestConfirmationInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => Promise<void> | void;
   onUploadImage?: (file: File) => Promise<string>;
   externalReferences?: MarkdownExternalReferenceMap;
@@ -2267,12 +2276,15 @@ function RequestConfirmationCard({
     }
   }
 
-  async function handleReject(reason: string | undefined) {
+  async function handleReject(
+    reason: string | undefined,
+    rejectionDisposition: RequestConfirmationRejectionDisposition,
+  ) {
     if (!onRejectInteraction) return;
     setWorking("reject");
     setActionError(null);
     try {
-      await onRejectInteraction(interaction, reason);
+      await onRejectInteraction(interaction, reason, rejectionDisposition);
     } catch (error) {
       setActionError(resolutionErrorMessage(error));
     } finally {
@@ -2314,7 +2326,8 @@ function RequestConfirmationCard({
           canApprove={Boolean(onAcceptInteraction)}
           canReject={Boolean(onRejectInteraction)}
           onApprove={() => void handleAccept()}
-          onReject={(reason) => void handleReject(reason)}
+          onReject={(reason, rejectionDisposition) =>
+            void handleReject(reason, rejectionDisposition)}
           composeReason={composeReason}
           extraReasonSatisfied={shots.length > 0}
           revisePanelChildren={
@@ -2527,6 +2540,7 @@ function RequestCheckboxConfirmationCard({
   onRejectInteraction?: (
     interaction: RequestCheckboxConfirmationInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => Promise<void> | void;
   externalReferences?: MarkdownExternalReferenceMap;
 }) {
@@ -2618,12 +2632,15 @@ function RequestCheckboxConfirmationCard({
     }
   }
 
-  async function handleReject(reason: string | undefined) {
+  async function handleReject(
+    reason: string | undefined,
+    rejectionDisposition: RequestConfirmationRejectionDisposition,
+  ) {
     if (!onRejectInteraction) return;
     setWorking("reject");
     setActionError(null);
     try {
-      await onRejectInteraction(interaction, reason);
+      await onRejectInteraction(interaction, reason, rejectionDisposition);
     } catch (error) {
       setActionError(resolutionErrorMessage(error));
     } finally {
@@ -2727,7 +2744,8 @@ function RequestCheckboxConfirmationCard({
           canApprove={Boolean(onAcceptInteraction)}
           canReject={Boolean(onRejectInteraction)}
           onApprove={() => void handleAccept()}
-          onReject={(reason) => void handleReject(reason)}
+          onReject={(reason, rejectionDisposition) =>
+            void handleReject(reason, rejectionDisposition)}
         />
       </div>
     </div>
