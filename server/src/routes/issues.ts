@@ -9486,6 +9486,7 @@ export function issueRoutes(
         && (updateFields.status === "done" || updateFields.status === "cancelled");
       const lockedAgentHumanOnlyTerminalClose =
         actor.actorType === "agent"
+        && existing.reviewPolicy === "human_only"
         && lockedExisting.reviewPolicy === "human_only"
         && lockedReviewVerdictRequested;
       if (
