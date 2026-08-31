@@ -165,6 +165,60 @@ describe("codex_local stderr fallback error derivation", () => {
 
     expect(result.errorMessage).toBe("Codex exited with code 1");
   });
+
+  it.each([
+    {
+      rejectionDisposition: "changes_requested" as const,
+      reason: "Revise the current document and return it for review.",
+    },
+    {
+      rejectionDisposition: "candidate_rejected" as const,
+      reason: "Reject this candidate and create a replacement ticket.",
+    },
+  ])(
+    "forwards $rejectionDisposition through the Codex CLI wake boundary",
+    async ({ rejectionDisposition, reason }) => {
+      mockFailedProcess("Error: fixture stop");
+      const ctx = buildContext({ engine: "cli" });
+      ctx.context = {
+        paperclipWake: {
+          reason: "issue_interaction_resolved",
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-3405",
+            title: "Review a document",
+            status: "in_progress",
+          },
+          interactionKind: "request_confirmation",
+          interactionStatus: "rejected",
+          confirmationResult: {
+            outcome: "rejected",
+            reason,
+            rejectionDisposition,
+            commentId: "11111111-1111-4111-8111-111111111111",
+          },
+          comments: [],
+          commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+          fallbackFetchNeeded: false,
+        },
+      };
+
+      await execute(ctx as never);
+
+      const call = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as
+        | [string, unknown, string, string[], { env: Record<string, string>; stdin: string }]
+        | undefined;
+      const wakePayload = JSON.parse(call?.[4].env.PAPERCLIP_WAKE_PAYLOAD_JSON ?? "{}");
+      expect(wakePayload.confirmationResult).toEqual({
+        outcome: "rejected",
+        reason,
+        rejectionDisposition,
+        commentId: "11111111-1111-4111-8111-111111111111",
+      });
+      expect(call?.[4].stdin).toContain(`- rejection disposition: ${rejectionDisposition}`);
+      expect(call?.[4].stdin).toContain(reason);
+    },
+  );
 });
 
 describe("firstMeaningfulStderrLine", () => {
