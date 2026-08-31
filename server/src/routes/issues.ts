@@ -238,7 +238,10 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
+import {
+  assertAgentCloseHasCurrentHumanVerdict,
+  resolveSelectedSuggestedTasks,
+} from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
@@ -657,9 +660,16 @@ function readPlanConfirmationTargetForIssue(payload: unknown, issueId: string) {
 function readConfirmationResultForWake(result: unknown) {
   const parsed = readObject(result);
   if (Object.keys(parsed).length === 0) return null;
+  const rawRejectionDisposition = readNonEmptyString(parsed.rejectionDisposition);
+  const rejectionDisposition =
+    rawRejectionDisposition === "changes_requested"
+    || rawRejectionDisposition === "candidate_rejected"
+      ? rawRejectionDisposition
+      : null;
   return {
     outcome: readNonEmptyString(parsed.outcome),
     reason: readNonEmptyString(parsed.reason) ?? readNonEmptyString(parsed.rejectionReason),
+    rejectionDisposition,
     commentId: readNonEmptyString(parsed.commentId),
   };
 }
@@ -2055,7 +2065,9 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   const forceFreshSession = input.forceFreshSession === true;
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
-  const interactionResult = readConfirmationResultForWake(input.interaction.result);
+  const confirmationResult = input.interaction.kind === "request_confirmation"
+    ? readConfirmationResultForWake(input.interaction.result)
+    : null;
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
   const toolAction = readToolActionContinuationContext(input.interaction);
   const newlyResolvedItemIds = input.newlyResolvedItemIds?.filter((value) => value.length > 0) ?? [];
@@ -2073,7 +2085,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           status: input.interaction.status,
           target: planTarget,
           acceptedTargetRevision: input.interaction.status === "accepted" ? planTarget : null,
-          result: interactionResult,
+          result: confirmationResult,
         }
       : null;
   void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
@@ -2085,6 +2097,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      ...(confirmationResult ? { confirmationResult } : {}),
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
@@ -2103,6 +2116,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      ...(confirmationResult ? { confirmationResult } : {}),
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
@@ -8997,15 +9011,39 @@ export function issueRoutes(
     const reviewPolicyChangeRequested =
       req.body.reviewPolicy !== undefined
       && req.body.reviewPolicy !== existing.reviewPolicy;
-    const reviewVerdictRequested =
-      existing.status === "in_review"
-      && (updateFields.status === "done" || updateFields.status === "cancelled");
     const reviewPolicySensitiveMutationRequested =
       req.body.reviewPolicy !== undefined
       || updateFields.status === "done"
       || updateFields.status === "cancelled";
+    const executionStageState = parseIssueExecutionState(existing.executionState);
+    const executionStageDecisionRequested =
+      existing.status === "in_review"
+      && updateFields.status === "done"
+      && executionStageState?.status === "pending"
+      && (
+        (actor.actorType === "agent"
+          && executionStageState.currentParticipant?.type === "agent"
+          && executionStageState.currentParticipant.agentId === actor.agentId)
+        || (actor.actorType === "user"
+          && executionStageState.currentParticipant?.type === "user"
+          && executionStageState.currentParticipant.userId === actor.actorId)
+      );
+    const reviewVerdictRequestedBeforeTransition =
+      existing.status === "in_review"
+      && (updateFields.status === "done" || updateFields.status === "cancelled");
+    const agentHumanOnlyTerminalCloseBeforeTransition =
+      actor.actorType === "agent"
+      && existing.reviewPolicy === "human_only"
+      && reviewVerdictRequestedBeforeTransition;
     if (
-      (reviewVerdictRequested || reviewPolicyChangeRequested)
+      (
+        (
+          reviewVerdictRequestedBeforeTransition
+          && !executionStageDecisionRequested
+          && !agentHumanOnlyTerminalCloseBeforeTransition
+        )
+        || reviewPolicyChangeRequested
+      )
       && existing.reviewPolicy != null
       && existing.reviewPolicy !== "anyone"
     ) {
@@ -9260,6 +9298,28 @@ export function issueRoutes(
     }
     Object.assign(updateFields, transition.patch);
 
+    const reviewVerdictRequestedAfterTransition =
+      existing.status === "in_review"
+      && (updateFields.status === "done" || updateFields.status === "cancelled");
+    const agentHumanOnlyTerminalCloseAfterTransition =
+      actor.actorType === "agent"
+      && existing.reviewPolicy === "human_only"
+      && reviewVerdictRequestedAfterTransition;
+    if (
+      (
+        (reviewVerdictRequestedAfterTransition && !agentHumanOnlyTerminalCloseAfterTransition)
+        || reviewPolicyChangeRequested
+      )
+      && existing.reviewPolicy != null
+      && existing.reviewPolicy !== "anyone"
+    ) {
+      await assertIssueReviewVerdictActorAllowed(db, {
+        issue: existing,
+        actor: { type: actor.actorType, id: actor.actorId },
+        reviewPolicy: existing.reviewPolicy,
+      });
+    }
+
     const nextStatus = updateFields.status ?? existing.status;
     if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
       throw unprocessable("unblockDescriptor requires blocked status");
@@ -9435,8 +9495,16 @@ export function issueRoutes(
       const lockedReviewVerdictRequested =
         lockedExisting.status === "in_review"
         && (updateFields.status === "done" || updateFields.status === "cancelled");
+      const lockedAgentHumanOnlyTerminalClose =
+        actor.actorType === "agent"
+        && existing.reviewPolicy === "human_only"
+        && lockedExisting.reviewPolicy === "human_only"
+        && lockedReviewVerdictRequested;
       if (
-        (lockedReviewVerdictRequested || lockedPolicyChangeRequested)
+        (
+          (lockedReviewVerdictRequested && !lockedAgentHumanOnlyTerminalClose)
+          || lockedPolicyChangeRequested
+        )
         && lockedExisting.reviewPolicy != null
         && lockedExisting.reviewPolicy !== "anyone"
       ) {
@@ -9445,6 +9513,16 @@ export function issueRoutes(
           actor: { type: actor.actorType, id: actor.actorId },
           reviewPolicy: lockedExisting.reviewPolicy,
         });
+      }
+      const agentTerminalCloseRequested =
+        actor.actorType === "agent"
+        && (updateFields.status === "done" || updateFields.status === "cancelled");
+      if (agentTerminalCloseRequested && lockedExisting.reviewPolicy === "human_only") {
+        await assertAgentCloseHasCurrentHumanVerdict(
+          tx as unknown as Db,
+          lockedExisting,
+          updateFields.status as "done" | "cancelled",
+        );
       }
       return true;
     };

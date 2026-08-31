@@ -801,6 +801,47 @@ describeEmbeddedPostgres("documentAnnotationService", () => {
     });
   });
 
+  it.each([
+    {
+      rejectionDisposition: "changes_requested" as const,
+      reason: "Revise this document in the existing workflow.",
+    },
+    {
+      rejectionDisposition: "candidate_rejected" as const,
+      reason: "Close this candidate and create a fresh linked workflow.",
+    },
+  ])(
+    "preserves $rejectionDisposition in the structured agent wake payload",
+    async ({ rejectionDisposition, reason }) => {
+      const { companyId, issueId } = await createIssueWithDocument("standard");
+
+      const payload = await buildPaperclipWakePayload({
+        db,
+        companyId,
+        contextSnapshot: {
+          issueId,
+          interactionId: randomUUID(),
+          interactionKind: "request_confirmation",
+          interactionStatus: "rejected",
+          confirmationResult: {
+            outcome: "rejected",
+            reason,
+            rejectionDisposition,
+            commentId: null,
+          },
+          wakeReason: "issue_commented",
+        },
+      });
+
+      expect(payload?.confirmationResult).toEqual({
+        outcome: "rejected",
+        reason,
+        rejectionDisposition,
+        commentId: null,
+      });
+    },
+  );
+
   it("groups non-plan annotations by most recently updated document and applies global caps", async () => {
     const { companyId, issueId } = await createIssueWithDocument("standard");
     const older = (await docs.upsertIssueDocument({

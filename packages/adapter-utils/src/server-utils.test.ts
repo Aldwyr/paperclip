@@ -1740,6 +1740,57 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt.indexOf("Open plan comments to incorporate:")).toBeLessThan(prompt.indexOf("New comments in order:"));
   });
 
+  it.each([
+    {
+      rejectionDisposition: "changes_requested" as const,
+      reason: "Revise the current document and return it for review.",
+    },
+    {
+      rejectionDisposition: "candidate_rejected" as const,
+      reason: "Reject this candidate and create a replacement ticket.",
+    },
+  ])(
+    "preserves $rejectionDisposition through the adapter wake JSON and prompt",
+    ({ rejectionDisposition, reason }) => {
+      const payload = {
+        reason: "issue_interaction_resolved",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-3405",
+          title: "Review a document",
+          status: "in_progress",
+        },
+        interactionKind: "request_confirmation",
+        interactionStatus: "rejected",
+        confirmationResult: {
+          outcome: "rejected",
+          reason,
+          rejectionDisposition,
+          commentId: "11111111-1111-4111-8111-111111111111",
+        },
+        comments: [],
+        commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+        fallbackFetchNeeded: false,
+      };
+
+      expect(JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}")).toMatchObject({
+        interactionKind: "request_confirmation",
+        interactionStatus: "rejected",
+        confirmationResult: {
+          outcome: "rejected",
+          reason,
+          rejectionDisposition,
+          commentId: "11111111-1111-4111-8111-111111111111",
+        },
+      });
+
+      const prompt = renderPaperclipWakePrompt(payload, { resumedSession: true });
+      expect(prompt).toContain("Creator confirmation result:");
+      expect(prompt).toContain(`- rejection disposition: ${rejectionDisposition}`);
+      expect(prompt).toContain(reason);
+    },
+  );
+
   it("renders grouped non-plan document annotations with editing scope", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "issue_commented",

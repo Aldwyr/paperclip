@@ -5420,6 +5420,7 @@ const INTERACTION_CONTINUATION_CONTEXT_KEYS = [
   "interactionKind",
   "interactionStatus",
   "continuationPolicy",
+  "confirmationResult",
   "checkboxSelection",
   "itemVerdicts",
   "newlyResolvedItemIds",
@@ -5740,6 +5741,22 @@ export async function buildPaperclipWakePayload(input: {
   const interactionId = readNonEmptyString(input.contextSnapshot.interactionId);
   const interactionKind = readNonEmptyString(input.contextSnapshot.interactionKind);
   const interactionStatus = readNonEmptyString(input.contextSnapshot.interactionStatus);
+  const rawConfirmationResult = parseObject(input.contextSnapshot.confirmationResult);
+  const rawRejectionDisposition = readNonEmptyString(rawConfirmationResult.rejectionDisposition);
+  const confirmationResult =
+    interactionKind === "request_confirmation"
+    && Object.keys(rawConfirmationResult).length > 0
+      ? {
+          outcome: readNonEmptyString(rawConfirmationResult.outcome),
+          reason: readNonEmptyString(rawConfirmationResult.reason),
+          rejectionDisposition:
+            rawRejectionDisposition === "changes_requested"
+            || rawRejectionDisposition === "candidate_rejected"
+              ? rawRejectionDisposition
+              : null,
+          commentId: readNonEmptyString(rawConfirmationResult.commentId),
+        }
+      : null;
   const checkboxSelection = parseObject(input.contextSnapshot.checkboxSelection);
   const planReviewContext = issueId
     ? await buildPlanReviewContext({
@@ -5840,6 +5857,7 @@ export async function buildPaperclipWakePayload(input: {
       : null,
     interactionKind,
     interactionStatus,
+    confirmationResult,
     checkboxSelection: Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     simplifiedEnglishInteractions: input.simplifiedEnglishInteractions === true,

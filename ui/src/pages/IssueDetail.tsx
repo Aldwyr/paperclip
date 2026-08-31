@@ -226,6 +226,7 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type RequestConfirmationRejectionDisposition,
   type RequestItemVerdictsInteraction,
   type RequestItemVerdictValue,
   type SuggestTasksInteraction,
@@ -1035,7 +1036,11 @@ type IssueDetailChatTabProps = {
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
   ) => Promise<void>;
-  onRejectInteraction: (interaction: ActionableIssueThreadInteraction, reason?: string) => Promise<void>;
+  onRejectInteraction: (
+    interaction: ActionableIssueThreadInteraction,
+    reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
+  ) => Promise<void>;
   onSubmitInteractionAnswers: (
     interaction: IssueThreadInteraction,
     answers: AskUserQuestionsAnswer[],
@@ -2880,8 +2885,15 @@ export function IssueDetail() {
     },
   });
   const rejectInteraction = useMutation({
-    mutationFn: ({ interaction, reason }: { interaction: ActionableIssueThreadInteraction; reason?: string }) =>
-      issuesApi.rejectInteraction(issueId!, interaction.id, reason),
+    mutationFn: ({
+      interaction,
+      reason,
+      rejectionDisposition,
+    }: {
+      interaction: ActionableIssueThreadInteraction;
+      reason?: string;
+      rejectionDisposition?: RequestConfirmationRejectionDisposition;
+    }) => issuesApi.rejectInteraction(issueId!, interaction.id, reason, rejectionDisposition),
     onSuccess: (interaction) => {
       upsertInteractionInCache(interaction);
       invalidateIssueDetail();
@@ -4041,8 +4053,12 @@ export function IssueDetail() {
   ) => {
     await acceptInteraction.mutateAsync({ interaction, selectedClientKeys, selectedOptionIds });
   }, [acceptInteraction]);
-  const handleRejectInteraction = useCallback(async (interaction: ActionableIssueThreadInteraction, reason?: string) => {
-    await rejectInteraction.mutateAsync({ interaction, reason });
+  const handleRejectInteraction = useCallback(async (
+    interaction: ActionableIssueThreadInteraction,
+    reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
+  ) => {
+    await rejectInteraction.mutateAsync({ interaction, reason, rejectionDisposition });
   }, [rejectInteraction]);
   const handleSubmitInteractionAnswers = useCallback(async (
     interaction: IssueThreadInteraction,

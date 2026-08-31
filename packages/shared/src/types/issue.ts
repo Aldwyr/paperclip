@@ -1264,6 +1264,10 @@ export interface RequestItemVerdictsPayload {
   target?: RequestConfirmationTarget | null;
 }
 
+export type RequestConfirmationRejectionDisposition =
+  | "changes_requested"
+  | "candidate_rejected";
+
 export interface RequestConfirmationResult {
   version: 1;
   outcome:
@@ -1276,6 +1280,7 @@ export interface RequestConfirmationResult {
     | "issue_closed"
     | "addressee_deleted";
   reason?: string | null;
+  rejectionDisposition?: RequestConfirmationRejectionDisposition | null;
   commentId?: string | null;
   supersededByInteractionId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;

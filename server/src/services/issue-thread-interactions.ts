@@ -68,6 +68,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
+  resolveIssueReviewRequester,
 } from "./issue-review-policy.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 import {
@@ -1280,6 +1281,91 @@ async function assertRequestConfirmationTargetIsCurrent(db: Db | any, args: {
   }
 }
 
+function creatorConfirmationRequired(reason: string, interactionId?: string | null) {
+  return conflict(
+    "A human_only issue requires a matching Creator verdict for the current document revision before an agent can close it.",
+    {
+      code: "creator_confirmation_required",
+      reviewPolicy: "human_only",
+      reason,
+      ...(interactionId ? { interactionId } : {}),
+    },
+  );
+}
+
+export async function assertAgentCloseHasCurrentHumanVerdict(
+  db: Db,
+  issue: {
+    id: string;
+    companyId: string;
+    reviewPolicy?: IssueReviewPolicy | null;
+    createdByAgentId?: string | null;
+    createdByUserId?: string | null;
+  },
+  terminalStatus: "done" | "cancelled",
+): Promise<void> {
+  const requester = await resolveIssueReviewRequester(db, issue);
+  const interactionId = requester?.reviewInteractionId ?? null;
+  if (!interactionId) throw creatorConfirmationRequired("missing_review_interaction_binding");
+
+  const interaction = await db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.id, interactionId),
+      eq(issueThreadInteractions.companyId, issue.companyId),
+      eq(issueThreadInteractions.issueId, issue.id),
+    ))
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  if (!interaction || interaction.kind !== "request_confirmation") {
+    throw creatorConfirmationRequired("missing_bound_request_confirmation", interactionId);
+  }
+
+  const payload = requestConfirmationPayloadSchema.safeParse(interaction.payload);
+  const result = requestConfirmationResultSchema.safeParse(interaction.result);
+  const requiredOutcome = terminalStatus === "done" ? "accepted" : "rejected";
+  if (
+    interaction.status !== requiredOutcome
+    || !interaction.resolvedByUserId
+    || !result.success
+    || result.data.outcome !== requiredOutcome
+  ) {
+    throw creatorConfirmationRequired(
+      "confirmation_verdict_does_not_authorize_terminal_status",
+      interactionId,
+    );
+  }
+  if (
+    terminalStatus === "cancelled"
+    && result.data.rejectionDisposition !== "candidate_rejected"
+  ) {
+    throw creatorConfirmationRequired(
+      "confirmation_rejection_is_not_categorical",
+      interactionId,
+    );
+  }
+
+  const target = payload.success ? payload.data.target : null;
+  if (!target || target.type !== "issue_document" || (target.issueId && target.issueId !== issue.id)) {
+    throw creatorConfirmationRequired("confirmation_not_bound_to_issue_document", interactionId);
+  }
+
+  const snapshot = await getIssueDocumentTargetSnapshot(db, {
+    companyId: issue.companyId,
+    issueId: issue.id,
+    target,
+    lockForUpdate: true,
+  });
+  const targetIsCurrent =
+    snapshot
+    && snapshot.latestRevisionId === target.revisionId
+    && (!target.revisionNumber || snapshot.latestRevisionNumber === target.revisionNumber);
+  if (!targetIsCurrent) {
+    throw creatorConfirmationRequired("confirmation_target_is_stale", interactionId);
+  }
+}
+
 async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
   row: IssueThreadInteractionRow;
   actor: InteractionActor;
@@ -1703,6 +1789,8 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
             version: 1,
             outcome: "rejected",
             reason: reason || null,
+            rejectionDisposition:
+              args.input.rejectionDisposition ?? "changes_requested",
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByRunId: args.actor.runId ?? null,

@@ -1560,6 +1560,78 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      rejectionDisposition: "changes_requested" as const,
+      reason: "Revise the current candidate using the Creator annotations.",
+    },
+    {
+      rejectionDisposition: "candidate_rejected" as const,
+      reason: "Reject this candidate and start a fresh linked workflow.",
+    },
+  ])(
+    "preserves $rejectionDisposition in non-plan request-confirmation wakes",
+    async ({ rejectionDisposition, reason }) => {
+      mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+        id: "interaction-creator-verdict",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "rejected",
+        continuationPolicy: "wake_assignee",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: RUN_3,
+        payload: {
+          version: 1,
+          prompt: "Approve this lore candidate?",
+          target: {
+            type: "issue_document",
+            issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            documentId: "document-lore-candidate",
+            key: "deliverable",
+            revisionId: "revision-lore-candidate",
+            revisionNumber: 4,
+          },
+        },
+        result: {
+          version: 1,
+          outcome: "rejected",
+          reason,
+          rejectionDisposition,
+        },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      });
+      const app = await createApp();
+
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-creator-verdict/reject")
+        .send({ reason, rejectionDisposition });
+
+      expect(res.status).toBe(200);
+      const expectedConfirmationResult = {
+        outcome: "rejected",
+        reason,
+        rejectionDisposition,
+        commentId: null,
+      };
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            confirmationResult: expectedConfirmationResult,
+          }),
+          contextSnapshot: expect.objectContaining({
+            confirmationResult: expectedConfirmationResult,
+          }),
+        }),
+      );
+    },
+  );
+
   it("overrides accept-only continuation when rejection consumes the last review path", async () => {
     const issue = createIssue({ status: "in_review" });
     mockIssueService.getById.mockResolvedValue(issue);

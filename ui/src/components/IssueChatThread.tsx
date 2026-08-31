@@ -66,6 +66,7 @@ import type {
   IssueThreadInteraction,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
+  RequestConfirmationRejectionDisposition,
   RequestItemVerdictsInteraction,
   RequestItemVerdictValue,
   SuggestTasksInteraction,
@@ -224,6 +225,7 @@ interface IssueChatMessageContext {
       | RequestConfirmationInteraction
       | RequestCheckboxConfirmationInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
     interaction: AskUserQuestionsInteraction,
@@ -549,6 +551,7 @@ interface IssueChatThreadProps {
       | RequestConfirmationInteraction
       | RequestCheckboxConfirmationInteraction,
     reason?: string,
+    rejectionDisposition?: RequestConfirmationRejectionDisposition,
   ) => Promise<void> | void;
   onSubmitInteractionAnswers?: (
     interaction: AskUserQuestionsInteraction,
