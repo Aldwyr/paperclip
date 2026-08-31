@@ -660,9 +660,16 @@ function readPlanConfirmationTargetForIssue(payload: unknown, issueId: string) {
 function readConfirmationResultForWake(result: unknown) {
   const parsed = readObject(result);
   if (Object.keys(parsed).length === 0) return null;
+  const rawRejectionDisposition = readNonEmptyString(parsed.rejectionDisposition);
+  const rejectionDisposition =
+    rawRejectionDisposition === "changes_requested"
+    || rawRejectionDisposition === "candidate_rejected"
+      ? rawRejectionDisposition
+      : null;
   return {
     outcome: readNonEmptyString(parsed.outcome),
     reason: readNonEmptyString(parsed.reason) ?? readNonEmptyString(parsed.rejectionReason),
+    rejectionDisposition,
     commentId: readNonEmptyString(parsed.commentId),
   };
 }
@@ -2058,7 +2065,9 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   const forceFreshSession = input.forceFreshSession === true;
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
-  const interactionResult = readConfirmationResultForWake(input.interaction.result);
+  const confirmationResult = input.interaction.kind === "request_confirmation"
+    ? readConfirmationResultForWake(input.interaction.result)
+    : null;
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
   const toolAction = readToolActionContinuationContext(input.interaction);
   const newlyResolvedItemIds = input.newlyResolvedItemIds?.filter((value) => value.length > 0) ?? [];
@@ -2076,7 +2085,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           status: input.interaction.status,
           target: planTarget,
           acceptedTargetRevision: input.interaction.status === "accepted" ? planTarget : null,
-          result: interactionResult,
+          result: confirmationResult,
         }
       : null;
   void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
@@ -2088,6 +2097,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      ...(confirmationResult ? { confirmationResult } : {}),
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
@@ -2106,6 +2116,7 @@ async function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      ...(confirmationResult ? { confirmationResult } : {}),
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),

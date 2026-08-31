@@ -158,7 +158,7 @@ describe("buildPaperclipTaskMarkdown", () => {
 });
 
 describe("mergeCoalescedContextSnapshot", () => {
-  it("clears stale accepted-plan interaction state when merging a later ordinary comment wake", () => {
+  it("clears stale interaction state when merging a later ordinary comment wake", () => {
     const merged = mergeCoalescedContextSnapshot(
       {
         issueId: "issue-1",
@@ -170,6 +170,12 @@ describe("mergeCoalescedContextSnapshot", () => {
           prompt: "Delete selected files?",
           selectedOptionIds: ["file-b"],
           selectedOptions: [{ id: "file-b", label: "b.txt", description: "Generated build output" }],
+        },
+        confirmationResult: {
+          outcome: "rejected",
+          reason: "Revise this candidate.",
+          rejectionDisposition: "changes_requested",
+          commentId: null,
         },
         wakeReason: "issue_commented",
       },
@@ -186,6 +192,7 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.interactionStatus).toBeUndefined();
     expect(merged.continuationPolicy).toBeUndefined();
     expect(merged.checkboxSelection).toBeUndefined();
+    expect(merged.confirmationResult).toBeUndefined();
     expect(merged.commentId).toBe("comment-1");
     expect(merged.wakeCommentId).toBe("comment-1");
   });
