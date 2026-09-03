@@ -17,6 +17,7 @@ import {
   issueDocuments,
   issueExecutionDecisions,
   issueRelations,
+  issueRecoveryActions,
   issueThreadInteractions,
   issues as issueRows,
   issueWorkProducts,
@@ -6668,9 +6669,56 @@ export function issueRoutes(
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+    const initialRecoveryIssueSnapshot = JSON.stringify({
+      status: existing.status,
+      assigneeAgentId: existing.assigneeAgentId,
+      assigneeUserId: existing.assigneeUserId,
+      executionPolicy: normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+      executionState: parseIssueExecutionState(existing.executionState),
+    });
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
-      let issue = existing;
+      const lockedIssue = await svc.getByIdForUpdate(id, tx);
+      if (!lockedIssue) throw notFound("Issue not found");
+      const lockedRecoveryIssueSnapshot = JSON.stringify({
+        status: lockedIssue.status,
+        assigneeAgentId: lockedIssue.assigneeAgentId,
+        assigneeUserId: lockedIssue.assigneeUserId,
+        executionPolicy: normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null),
+        executionState: parseIssueExecutionState(lockedIssue.executionState),
+      });
+      if (lockedRecoveryIssueSnapshot !== initialRecoveryIssueSnapshot) {
+        throw conflict(
+          "The active review stage changed before this recovery action could be resolved. Retry the recovery action.",
+        );
+      }
+      if (!activeRecoveryAction) throw notFound("Active recovery action not found");
+      const lockedRecoveryAction = await tx
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.id, actionId ?? activeRecoveryAction.id),
+          eq(issueRecoveryActions.companyId, existing.companyId),
+          eq(issueRecoveryActions.sourceIssueId, existing.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRecoveryAction) throw notFound("Active recovery action not found");
+      const activeRecoveryUpdatedAt = activeRecoveryAction.updatedAt instanceof Date
+        ? activeRecoveryAction.updatedAt.getTime()
+        : new Date(activeRecoveryAction.updatedAt).getTime();
+      if (
+        lockedRecoveryAction.status !== activeRecoveryAction.status
+        || lockedRecoveryAction.ownerType !== activeRecoveryAction.ownerType
+        || lockedRecoveryAction.ownerAgentId !== activeRecoveryAction.ownerAgentId
+        || lockedRecoveryAction.ownerUserId !== activeRecoveryAction.ownerUserId
+        || lockedRecoveryAction.updatedAt.getTime() !== activeRecoveryUpdatedAt
+      ) {
+        throw conflict("The active recovery action changed before it could be resolved. Retry the recovery action.");
+      }
+
+      let issue = lockedIssue;
       if (outcome === "blocked") {
         const unresolvedBlockers = await tx
           .select({ id: issueRows.id })
@@ -6710,7 +6758,7 @@ export function issueRoutes(
         {
           companyId: existing.companyId,
           sourceIssueId: existing.id,
-          actionId: actionId ?? null,
+          actionId: lockedRecoveryAction.id,
           status: actionStatus,
           outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
@@ -9011,6 +9059,7 @@ export function issueRoutes(
     const reviewPolicyChangeRequested =
       req.body.reviewPolicy !== undefined
       && req.body.reviewPolicy !== existing.reviewPolicy;
+    const executionPolicyMutationRequested = req.body.executionPolicy !== undefined;
     const reviewPolicySensitiveMutationRequested =
       req.body.reviewPolicy !== undefined
       || updateFields.status === "done"
@@ -9254,6 +9303,13 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    const executionStageMutationRequested =
+      Boolean(nextExecutionPolicy?.stages.length) &&
+      (
+        typeof updateFields.status === "string" ||
+        normalizedAssigneeAgentId !== undefined ||
+        req.body.assigneeUserId !== undefined
+      );
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
@@ -9266,25 +9322,43 @@ export function issueRoutes(
       req.body.executionPolicy !== undefined && monitorChanged,
     );
 
-    const transition = applyIssueExecutionPolicyTransition({
-      issue: existing,
-      policy: nextExecutionPolicy,
-      previousPolicy: previousExecutionPolicy,
-      requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
-      requestedAssigneePatch: {
-        assigneeAgentId: normalizedAssigneeAgentId,
-        assigneeUserId:
-          req.body.assigneeUserId === undefined ? undefined : (req.body.assigneeUserId as string | null),
-      },
-      actor: {
-        agentId: actor.agentId ?? null,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      },
-      allowBoardOverride: req.actor.type === "board",
-      commentBody,
-      reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-      monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
-    });
+    const deriveExecutionPolicyTransition = (issue: typeof existing) => {
+      const issuePreviousExecutionPolicy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const issueMonitorChanged = monitorPoliciesEqual(issuePreviousExecutionPolicy, nextExecutionPolicy) === false;
+      return applyIssueExecutionPolicyTransition({
+        issue,
+        policy: nextExecutionPolicy,
+        previousPolicy: issuePreviousExecutionPolicy,
+        requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+        requestedAssigneePatch: {
+          assigneeAgentId: normalizedAssigneeAgentId,
+          assigneeUserId:
+            req.body.assigneeUserId === undefined ? undefined : (req.body.assigneeUserId as string | null),
+        },
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        allowBoardOverride: req.actor.type === "board",
+        commentBody,
+        reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+        monitorExplicitlyUpdated: executionPolicyMutationRequested && issueMonitorChanged,
+      });
+    };
+    const executionStageConcurrencySnapshot = (issue: typeof existing) => {
+      const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const state = parseIssueExecutionState(issue.executionState);
+      return JSON.stringify({
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        policy,
+        state,
+      });
+    };
+    const initialExecutionStageSnapshot = executionStageConcurrencySnapshot(existing);
+    const transition = deriveExecutionPolicyTransition(existing);
+    const transitionBeforeDecisionId = JSON.stringify(transition);
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
       const nextExecutionState = transition.patch.executionState;
@@ -9601,7 +9675,9 @@ export function issueRoutes(
       Boolean(decision)
       || shouldRelayStop
       || persistReviewActivityTransactionally
-      || reviewPolicySensitiveMutationRequested;
+      || reviewPolicySensitiveMutationRequested
+      || executionPolicyMutationRequested
+      || executionStageMutationRequested;
     try {
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
@@ -9609,6 +9685,77 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
+          if (
+            executionPolicyMutationRequested
+            || executionStageMutationRequested
+            || transition.reviewEscalation
+            || decision
+          ) {
+            const lockedExisting = await svc.getByIdForUpdate(id, tx);
+            if (!lockedExisting) return null;
+
+            if (executionPolicyMutationRequested || executionStageMutationRequested || decision) {
+              const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+              if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedExisting)) {
+                throw conflict(
+                  executionStageMutationRequested || decision
+                    ? "Resolve the capped review decision through its interaction card."
+                    : "Resolve the capped review decision before changing the execution policy.",
+                );
+              }
+            }
+
+            if (executionPolicyMutationRequested) {
+              const lockedPreviousExecutionPolicy = normalizeIssueExecutionPolicy(
+                lockedExisting.executionPolicy ?? null,
+              );
+              if (JSON.stringify(lockedPreviousExecutionPolicy) !== JSON.stringify(previousExecutionPolicy)) {
+                throw conflict(
+                  "The execution policy changed before this update could be recorded. Retry the update.",
+                );
+              }
+              const lockedTransition = deriveExecutionPolicyTransition(lockedExisting);
+              if (JSON.stringify(lockedTransition) !== transitionBeforeDecisionId) {
+                throw conflict(
+                  "The active review stage changed before this update could be recorded. Retry the update.",
+                );
+              }
+            }
+
+            if (
+              (executionStageMutationRequested || decision)
+              && !executionPolicyMutationRequested
+              && !transition.reviewEscalation
+            ) {
+              if (executionStageConcurrencySnapshot(lockedExisting) !== initialExecutionStageSnapshot) {
+                throw conflict(
+                  "The active review stage changed before this decision could be recorded. Retry the update.",
+                );
+              }
+            }
+
+            if (transition.reviewEscalation) {
+              const expectedState = parseIssueExecutionState(existing.executionState);
+              const lockedState = parseIssueExecutionState(lockedExisting.executionState);
+              const lockedPolicy = normalizeIssueExecutionPolicy(lockedExisting.executionPolicy ?? null);
+              if (
+                !decisionId
+                || !expectedState
+                || !lockedState
+                || lockedExisting.status !== existing.status
+                || lockedExisting.assigneeAgentId !== existing.assigneeAgentId
+                || lockedExisting.assigneeUserId !== existing.assigneeUserId
+                || JSON.stringify(lockedPolicy) !== JSON.stringify(previousExecutionPolicy)
+                || lockedState.currentStageId !== expectedState.currentStageId
+                || JSON.stringify(lockedState.currentParticipant) !== JSON.stringify(expectedState.currentParticipant)
+                || lockedState.lastDecisionId !== expectedState.lastDecisionId
+              ) {
+                throw conflict(
+                  "The active review stage changed before this decision could be recorded. Retry the update.",
+                );
+              }
+            }
+          }
           const updated = await updateIssue(tx);
           if (!updated) return null;
 
@@ -9625,6 +9772,40 @@ export function issueRoutes(
               body: decision.body,
               createdByRunId: actor.runId ?? null,
             });
+          }
+
+          if (transition.reviewEscalation && decisionId) {
+            await issueThreadInteractionService(tx as unknown as Db).create(updated, {
+              kind: "request_confirmation",
+              idempotencyKey: `execution-review-escalation:${decisionId}`,
+              sourceRunId: actor.runId ?? null,
+              title: "Review decision required",
+              summary: "The review round limit was reached.",
+              continuationPolicy: "wake_assignee",
+              resolverPolicy: "human_only",
+              payload: {
+                version: 1,
+                prompt:
+                  "The review round limit was reached. Approve the reviewed work or return it to the executor.",
+                acceptLabel: "Approve reviewed work",
+                rejectRequiresReason: true,
+                allowDeclineReason: true,
+                declineReasonPlaceholder: "Describe the correction the executor must make.",
+                supersedeOnUserComment: false,
+                detailsMarkdown: [
+                  "**Review reason:**",
+                  "",
+                  transition.reviewEscalation.reason,
+                ].join("\n"),
+                reviewEscalation: {
+                  version: 1,
+                  decisionId,
+                  stageId: transition.reviewEscalation.stageId,
+                  reviewerAgentId: transition.reviewEscalation.reviewerAgentId,
+                  responsibleUserId: transition.reviewEscalation.responsibleUserId,
+                },
+              },
+            }, { allowReviewEscalationCreation: true });
           }
 
           if (shouldRelayStop) {
@@ -10687,7 +10868,22 @@ export function issueRoutes(
       finalIssueStatus: () => updated?.status,
     });
     try {
-      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+      updated = await db.transaction(async (tx) => {
+        const lockedIssue = await svc.getByIdForUpdate(id, tx);
+        if (!lockedIssue) throw notFound("Issue not found");
+
+        const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+        if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedIssue)) {
+          throw conflict("Resolve the capped review decision through its interaction card.");
+        }
+
+        return issueService(tx as unknown as Db).checkout(
+          id,
+          req.body.agentId,
+          req.body.expectedStatuses,
+          checkoutRunId,
+        );
+      });
     } catch (error) {
       if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
         res.status(409).json({
@@ -10880,6 +11076,11 @@ export function issueRoutes(
     if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
       throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
     }
+    if (req.body.kind === "request_confirmation" && req.body.payload?.reviewEscalation !== undefined) {
+      throw unprocessable(
+        "payload.reviewEscalation is server-owned metadata and cannot be supplied when creating an interaction",
+      );
+    }
 
     // Plan-document confirmation targets are validated authoritatively inside
     // issueThreadInteractionService.create, which re-reads the plan document's
@@ -10994,6 +11195,51 @@ export function issueRoutes(
       if (!suggestedTaskEffectsAuthorized) return;
 
       const actor = getActorInfo(req);
+      if (current.kind === "request_confirmation" && current.payload.reviewEscalation) {
+        const resolved = await interactionSvc.resolveReviewEscalation({
+          issue: { id: issue.id, companyId: issue.companyId },
+          interactionId,
+          outcome: "approved",
+          actor: {
+            agentId: actor.agentId,
+            runId: actor.runId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            resolverPolicyRestriction: resolutionAuthorization.resolverPolicyRestriction,
+          },
+        });
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.thread_interaction_accepted",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            interactionId: resolved.interaction.id,
+            interactionKind: resolved.interaction.kind,
+            interactionStatus: resolved.interaction.status,
+            resolutionActorKind: actor.actorType,
+            requestedResolverPolicy: resolved.interaction.requestedResolverPolicy,
+            effectiveResolverPolicy: resolved.interaction.effectiveResolverPolicy,
+            resolverPolicyProvenance: resolved.interaction.resolverPolicyProvenance,
+            effectiveResolverPolicySource: resolved.interaction.effectiveResolverPolicySource,
+            resolverAuthorizationReason: resolutionAuthorization.decision.reason,
+          },
+        });
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue: { ...resolved.issue, companyId: issue.companyId },
+          interaction: resolved.interaction,
+          actor,
+          source: "issue.interaction.accept",
+        });
+        res.json(resolved.interaction);
+        return;
+      }
       const { interaction, createdIssues, continuationIssue } = await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         runId: actor.runId,
@@ -11152,9 +11398,56 @@ export function issueRoutes(
         interactionId,
       );
       if (!authorizedResolution) return;
-      const { interactionSvc, resolutionAuthorization } = authorizedResolution;
+      const { interactionSvc, current, resolutionAuthorization } = authorizedResolution;
 
       const actor = getActorInfo(req);
+      if (current.kind === "request_confirmation" && current.payload.reviewEscalation) {
+        const resolved = await interactionSvc.resolveReviewEscalation({
+          issue: { id: issue.id, companyId: issue.companyId },
+          interactionId,
+          outcome: "changes_requested",
+          reason: req.body.reason,
+          actor: {
+            agentId: actor.agentId,
+            runId: actor.runId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+            resolverPolicyRestriction: resolutionAuthorization.resolverPolicyRestriction,
+          },
+        });
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.thread_interaction_rejected",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            interactionId: resolved.interaction.id,
+            interactionKind: resolved.interaction.kind,
+            interactionStatus: resolved.interaction.status,
+            resolutionActorKind: actor.actorType,
+            requestedResolverPolicy: resolved.interaction.requestedResolverPolicy,
+            effectiveResolverPolicy: resolved.interaction.effectiveResolverPolicy,
+            resolverPolicyProvenance: resolved.interaction.resolverPolicyProvenance,
+            effectiveResolverPolicySource: resolved.interaction.effectiveResolverPolicySource,
+            resolverAuthorizationReason: resolutionAuthorization.decision.reason,
+            rejectionReason: req.body.reason,
+          },
+        });
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue: { ...resolved.issue, companyId: issue.companyId },
+          interaction: resolved.interaction,
+          actor,
+          source: "issue.interaction.reject",
+        });
+        res.json(resolved.interaction);
+        return;
+      }
       const interaction = await interactionSvc.rejectInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         runId: actor.runId,
@@ -11932,6 +12225,13 @@ export function issueRoutes(
 
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
+    const currentExecutionStageSnapshot = JSON.stringify({
+      status: currentIssue.status,
+      assigneeAgentId: currentIssue.assigneeAgentId,
+      assigneeUserId: currentIssue.assigneeUserId,
+      policy: currentExecutionPolicy,
+      state: currentExecutionState,
+    });
     const shouldAutoApproveReviewComment =
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
@@ -11985,6 +12285,25 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          const lockedCurrentIssue = await svc.getByIdForUpdate(id, tx);
+          if (!lockedCurrentIssue) throw new AutoApprovalIssueMissingError();
+          const lockedExecutionStageSnapshot = JSON.stringify({
+            status: lockedCurrentIssue.status,
+            assigneeAgentId: lockedCurrentIssue.assigneeAgentId,
+            assigneeUserId: lockedCurrentIssue.assigneeUserId,
+            policy: normalizeIssueExecutionPolicy(lockedCurrentIssue.executionPolicy ?? null),
+            state: parseIssueExecutionState(lockedCurrentIssue.executionState),
+          });
+          if (lockedExecutionStageSnapshot !== currentExecutionStageSnapshot) {
+            throw conflict(
+              "The active review stage changed before this decision could be recorded. Retry the update.",
+            );
+          }
+          const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+          if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedCurrentIssue)) {
+            throw conflict("Resolve the capped review decision through its interaction card.");
+          }
+
           const insertedComment = await svc.addComment(
             id,
             req.body.body,

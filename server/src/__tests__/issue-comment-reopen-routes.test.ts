@@ -73,6 +73,7 @@ const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(async () => undefined),
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
+  hasPendingReviewEscalationForIssue: vi.fn(async () => false),
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -292,6 +293,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.listCompanyIds.mockReset();
     mockRoutineService.syncRunStatusForIssue.mockReset();
+    mockIssueThreadInteractionService.hasPendingReviewEscalationForIssue.mockReset();
     mockIssueThreadInteractionService.listForIssue.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset();
@@ -358,6 +360,7 @@ describe.sequential("issue comment reopen routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+    mockIssueThreadInteractionService.hasPendingReviewEscalationForIssue.mockResolvedValue(false);
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
     mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue(null);

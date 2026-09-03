@@ -6,12 +6,14 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   approvals,
   assets,
   companies,
   companyMemberships,
+  companySkills,
   costEvents,
   createDb,
   executionWorkspaces,
@@ -19,6 +21,7 @@ import {
   heartbeatRuns,
   issueAttachments,
   issueComments,
+  issueExecutionDecisions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -32,6 +35,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -110,6 +114,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(issueRelations);
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueAttachments);
     await db.delete(assets);
     await db.delete(approvals);
@@ -119,6 +124,8 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     await db.delete(projects);
     await db.delete(plugins);
     await db.delete(companyMemberships);
+    await db.delete(companySkills);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -978,6 +985,295 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     });
     return interactionId;
   }
+
+  async function seedCappedReviewEscalation() {
+    const { companyId, agentId: executorAgentId } = await seedCompanyAndAgent();
+    const reviewerAgentId = randomUUID();
+    const ownerUserId = randomUUID();
+    const issueId = randomUUID();
+    const stageId = randomUUID();
+    const decisionId = randomUUID();
+    const interactionId = randomUUID();
+    const policy = normalizeIssueExecutionPolicy({
+      maxReviewRounds: 1,
+      stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+    })!;
+    await db.insert(agents).values({
+      id: reviewerAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "reviewer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: ownerUserId,
+      status: "active",
+      membershipRole: "owner",
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Capped review",
+      status: "in_review",
+      priority: "medium",
+      assigneeUserId: ownerUserId,
+      responsibleUserId: ownerUserId,
+      executionPolicy: policy as never,
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: ownerUserId },
+        returnAssignee: { type: "agent", agentId: executorAgentId },
+        completedStageIds: [],
+        changesRequestedCount: 1,
+        lastDecisionId: decisionId,
+        lastDecisionOutcome: "changes_requested",
+      },
+    });
+    await db.insert(issueExecutionDecisions).values({
+      id: decisionId,
+      companyId,
+      issueId,
+      stageId,
+      stageType: "review",
+      actorAgentId: reviewerAgentId,
+      outcome: "changes_requested",
+      body: "The audit record is missing.",
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Review round limit reached.",
+        rejectRequiresReason: true,
+        reviewEscalation: {
+          version: 1,
+          decisionId,
+          stageId,
+          reviewerAgentId,
+          responsibleUserId: ownerUserId,
+        },
+      },
+    });
+    return { companyId, executorAgentId, ownerUserId, issueId, interactionId };
+  }
+
+  it.each(["status", "assignee", "execution state", "execution policy"] as const)(
+    "issues.update rejects a capped-review %s mutation while the owner decision is pending",
+    async (mutation) => {
+      const fixture = await seedCappedReviewEscalation();
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      const patch = mutation === "status"
+        ? { status: "done" as const }
+        : mutation === "assignee"
+          ? { assigneeAgentId: fixture.executorAgentId, assigneeUserId: null }
+          : mutation === "execution state"
+            ? { executionState: null }
+            : { executionPolicy: null };
+
+      await expect(services.issues.update({
+        issueId: fixture.issueId,
+        companyId: fixture.companyId,
+        patch: patch as never,
+      })).rejects.toThrow(
+        mutation === "execution state" || mutation === "execution policy"
+          ? "Unsupported issue patch field"
+          : "Resolve the capped review decision",
+      );
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: fixture.ownerUserId,
+      });
+      const [interaction] = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+      expect(interaction?.status).toBe("pending");
+
+      if (mutation === "status") {
+        const metadataUpdate = await services.issues.update({
+          issueId: fixture.issueId,
+          companyId: fixture.companyId,
+          patch: { title: "Capped review with additional context" },
+        });
+        expect(metadataUpdate.title).toBe("Capped review with additional context");
+      }
+    },
+  );
+
+  it("issues.update rejects a stale capped-review mutation after the owner decision wins the lock", async () => {
+    const fixture = await seedCappedReviewEscalation();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+    let signalIssueLocked!: () => void;
+    let releaseOwnerDecision!: () => void;
+    const issueLocked = new Promise<void>((resolve) => {
+      signalIssueLocked = resolve;
+    });
+    const ownerDecisionMayCommit = new Promise<void>((resolve) => {
+      releaseOwnerDecision = resolve;
+    });
+
+    const ownerDecision = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, fixture.issueId)).for("update");
+      signalIssueLocked();
+      await ownerDecisionMayCommit;
+      await tx
+        .update(issues)
+        .set({
+          status: "in_progress",
+          assigneeAgentId: fixture.executorAgentId,
+          assigneeUserId: null,
+        })
+        .where(eq(issues.id, fixture.issueId));
+      await tx
+        .update(issueThreadInteractions)
+        .set({
+          status: "rejected",
+          result: {
+            version: 1,
+            outcome: "rejected",
+            answers: [],
+            reason: "Restore the audit record.",
+          },
+          resolvedByUserId: fixture.ownerUserId,
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+    });
+
+    await issueLocked;
+    const staleUpdate = services.issues.update({
+      issueId: fixture.issueId,
+      companyId: fixture.companyId,
+      patch: { status: "done" },
+    }).then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error }),
+    );
+
+    // The plugin's initial snapshot is a non-locking read. While its
+    // transaction waits for the issue row, let the owner decision commit.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseOwnerDecision();
+    await ownerDecision;
+
+    const outcome = await staleUpdate;
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect((outcome.error as Error).message).toContain("active review stage changed");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: fixture.executorAgentId,
+      assigneeUserId: null,
+    });
+  });
+
+  it.each(["responsibleUserId", "createdByUserId"] as const)(
+    "issues.update rejects unsupported owner-binding field %s before a capped review exists",
+    async (field) => {
+      const fixture = await seedCappedReviewEscalation();
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      await db
+        .update(issueThreadInteractions)
+        .set({ status: "expired", resolvedAt: new Date(), updatedAt: new Date() })
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+      const forgedUserId = randomUUID();
+
+      await expect(services.issues.update({
+        issueId: fixture.issueId,
+        companyId: fixture.companyId,
+        patch: { [field]: forgedUserId } as never,
+      })).rejects.toThrow("Unsupported issue patch field");
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.responsibleUserId).toBe(fixture.ownerUserId);
+      expect(issue?.createdByUserId).not.toBe(forgedUserId);
+    },
+  );
+
+  it.each([
+    { action: "accept" as const, reason: undefined, interactionStatus: "accepted", issueStatus: "done", assigneeAgentId: null },
+    { action: "reject" as const, reason: "Restore the audit record.", interactionStatus: "rejected", issueStatus: "in_progress", assigneeAgentId: "executor" },
+  ])("respondInteraction applies the capped review $action through the execution-policy decision", async ({
+    action,
+    reason,
+    interactionStatus,
+    issueStatus,
+    assigneeAgentId,
+  }) => {
+    const fixture = await seedCappedReviewEscalation();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+
+    const result = await services.issues.respondInteraction({
+      issueId: fixture.issueId,
+      interactionId: fixture.interactionId,
+      companyId: fixture.companyId,
+      action,
+      ...(reason ? { reason } : {}),
+      actorUserId: fixture.ownerUserId,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.interaction).toMatchObject({ status: interactionStatus });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue).toMatchObject({
+      status: issueStatus,
+      assigneeAgentId: assigneeAgentId === "executor" ? fixture.executorAgentId : null,
+      executionState: expect.objectContaining({ changesRequestedCount: 0 }),
+    });
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, fixture.issueId));
+    expect(decisions).toHaveLength(2);
+    expect(decisions.some((decision) => decision.actorUserId === fixture.ownerUserId)).toBe(true);
+  });
+
+  it("respondInteraction keeps a capped review pending for a non-responsible human", async () => {
+    const fixture = await seedCappedReviewEscalation();
+    const otherUserId = randomUUID();
+    await db.insert(companyMemberships).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: otherUserId,
+      status: "active",
+      membershipRole: "owner",
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+
+    await expect(services.issues.respondInteraction({
+      issueId: fixture.issueId,
+      interactionId: fixture.interactionId,
+      companyId: fixture.companyId,
+      action: "accept",
+      actorUserId: otherUserId,
+    })).rejects.toThrow("Only the responsible user can resolve this review escalation");
+
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, fixture.interactionId));
+    expect(interaction?.status).toBe("pending");
+  });
 
   it("respondInteraction fails closed when actorUserId is omitted", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
