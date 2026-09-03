@@ -1186,6 +1186,15 @@ export interface RequestConfirmationToolActionPayload {
   expiresAt: string;
 }
 
+/** Server-owned binding for a review decision escalated at its round limit. */
+export interface RequestConfirmationReviewEscalationPayload {
+  version: 1;
+  decisionId: string;
+  stageId: string;
+  reviewerAgentId: string;
+  responsibleUserId: string;
+}
+
 /**
  * Lifecycle status written back onto the resolved interaction once the operator
  * approves. `approve = run`, so the terminal states are executed/failed/expired —
@@ -1214,6 +1223,7 @@ export interface RequestConfirmationPayload {
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
   toolAction?: RequestConfirmationToolActionPayload;
+  reviewEscalation?: RequestConfirmationReviewEscalationPayload;
 }
 
 export interface RequestCheckboxConfirmationOption {

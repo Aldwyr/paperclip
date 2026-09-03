@@ -1897,6 +1897,12 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 3,
     });
+    expect(result.reviewEscalation).toEqual({
+      stageId: reviewStageId,
+      reviewerAgentId: qaAgentId,
+      responsibleUserId: boardUserId,
+      reason: "Round three feedback — still not converging",
+    });
   });
 
   it("keeps the escalated hold sticky across unrelated transitions", () => {

@@ -913,6 +913,14 @@ export const requestConfirmationToolActionPayloadSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
+export const requestConfirmationReviewEscalationPayloadSchema = z.object({
+  version: z.literal(1),
+  decisionId: z.string().uuid(),
+  stageId: z.string().uuid(),
+  reviewerAgentId: z.string().uuid(),
+  responsibleUserId: z.string().trim().min(1).max(255),
+});
+
 export const requestConfirmationPayloadSchema = z.object({
   version: z.literal(1),
   prompt: z.string().trim().min(1).max(1000),
@@ -926,6 +934,7 @@ export const requestConfirmationPayloadSchema = z.object({
   supersedeOnUserComment: z.boolean().optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
+  reviewEscalation: requestConfirmationReviewEscalationPayloadSchema.optional(),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
