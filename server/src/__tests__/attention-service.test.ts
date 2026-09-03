@@ -1201,6 +1201,44 @@ describeEmbeddedPostgres("attention service", () => {
     expect(interactionIds).not.toContain(olderConfirmationId);
   });
 
+  it("does not surface a suspended review escalation for a cancelled issue", async () => {
+    const { companyId, reviewerId } = await seedCompany("ATS");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "ATS-1",
+      title: "Suspended capped review",
+      status: "cancelled",
+      assigneeUserId: "board-user",
+    });
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Review round limit reached.",
+        rejectRequiresReason: true,
+        reviewEscalation: {
+          version: 1,
+          decisionId: randomUUID(),
+          stageId: randomUUID(),
+          reviewerAgentId: reviewerId,
+          responsibleUserId: "board-user",
+        },
+      },
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.map((item) => item.subject.id)).not.toContain(interactionId);
+  });
+
   it("uses inbox_dismissals with attention-prefixed dedup keys and resurfaces newer activity", async () => {
     const { companyId } = await seedCompany("ATD");
     const approvalId = randomUUID();

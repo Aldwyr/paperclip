@@ -17,6 +17,7 @@ import {
   issueDocuments,
   issueExecutionDecisions,
   issueRelations,
+  issueRecoveryActions,
   issueThreadInteractions,
   issues as issueRows,
   issueWorkProducts,
@@ -6668,9 +6669,56 @@ export function issueRoutes(
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+    const initialRecoveryIssueSnapshot = JSON.stringify({
+      status: existing.status,
+      assigneeAgentId: existing.assigneeAgentId,
+      assigneeUserId: existing.assigneeUserId,
+      executionPolicy: normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+      executionState: parseIssueExecutionState(existing.executionState),
+    });
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
-      let issue = existing;
+      const lockedIssue = await svc.getByIdForUpdate(id, tx);
+      if (!lockedIssue) throw notFound("Issue not found");
+      const lockedRecoveryIssueSnapshot = JSON.stringify({
+        status: lockedIssue.status,
+        assigneeAgentId: lockedIssue.assigneeAgentId,
+        assigneeUserId: lockedIssue.assigneeUserId,
+        executionPolicy: normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null),
+        executionState: parseIssueExecutionState(lockedIssue.executionState),
+      });
+      if (lockedRecoveryIssueSnapshot !== initialRecoveryIssueSnapshot) {
+        throw conflict(
+          "The active review stage changed before this recovery action could be resolved. Retry the recovery action.",
+        );
+      }
+      if (!activeRecoveryAction) throw notFound("Active recovery action not found");
+      const lockedRecoveryAction = await tx
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.id, actionId ?? activeRecoveryAction.id),
+          eq(issueRecoveryActions.companyId, existing.companyId),
+          eq(issueRecoveryActions.sourceIssueId, existing.id),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRecoveryAction) throw notFound("Active recovery action not found");
+      const activeRecoveryUpdatedAt = activeRecoveryAction.updatedAt instanceof Date
+        ? activeRecoveryAction.updatedAt.getTime()
+        : new Date(activeRecoveryAction.updatedAt).getTime();
+      if (
+        lockedRecoveryAction.status !== activeRecoveryAction.status
+        || lockedRecoveryAction.ownerType !== activeRecoveryAction.ownerType
+        || lockedRecoveryAction.ownerAgentId !== activeRecoveryAction.ownerAgentId
+        || lockedRecoveryAction.ownerUserId !== activeRecoveryAction.ownerUserId
+        || lockedRecoveryAction.updatedAt.getTime() !== activeRecoveryUpdatedAt
+      ) {
+        throw conflict("The active recovery action changed before it could be resolved. Retry the recovery action.");
+      }
+
+      let issue = lockedIssue;
       if (outcome === "blocked") {
         const unresolvedBlockers = await tx
           .select({ id: issueRows.id })
@@ -6710,7 +6758,7 @@ export function issueRoutes(
         {
           companyId: existing.companyId,
           sourceIssueId: existing.id,
-          actionId: actionId ?? null,
+          actionId: lockedRecoveryAction.id,
           status: actionStatus,
           outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
@@ -9255,6 +9303,13 @@ export function issueRoutes(
       updateFields.executionPolicy !== undefined
         ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
         : previousExecutionPolicy;
+    const executionStageMutationRequested =
+      Boolean(nextExecutionPolicy?.stages.length) &&
+      (
+        typeof updateFields.status === "string" ||
+        normalizedAssigneeAgentId !== undefined ||
+        req.body.assigneeUserId !== undefined
+      );
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
@@ -9290,6 +9345,18 @@ export function issueRoutes(
         monitorExplicitlyUpdated: executionPolicyMutationRequested && issueMonitorChanged,
       });
     };
+    const executionStageConcurrencySnapshot = (issue: typeof existing) => {
+      const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+      const state = parseIssueExecutionState(issue.executionState);
+      return JSON.stringify({
+        status: issue.status,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        policy,
+        state,
+      });
+    };
+    const initialExecutionStageSnapshot = executionStageConcurrencySnapshot(existing);
     const transition = deriveExecutionPolicyTransition(existing);
     const transitionBeforeDecisionId = JSON.stringify(transition);
     const decisionId = transition.decision ? randomUUID() : null;
@@ -9609,7 +9676,8 @@ export function issueRoutes(
       || shouldRelayStop
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested
-      || executionPolicyMutationRequested;
+      || executionPolicyMutationRequested
+      || executionStageMutationRequested;
     try {
       if (shouldUseTransactionalIssueUpdate) {
         issue = await db.transaction(async (tx) => {
@@ -9617,9 +9685,25 @@ export function issueRoutes(
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
           ) return null;
-          if (executionPolicyMutationRequested || transition.reviewEscalation) {
+          if (
+            executionPolicyMutationRequested
+            || executionStageMutationRequested
+            || transition.reviewEscalation
+            || decision
+          ) {
             const lockedExisting = await svc.getByIdForUpdate(id, tx);
             if (!lockedExisting) return null;
+
+            if (executionPolicyMutationRequested || executionStageMutationRequested || decision) {
+              const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+              if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedExisting)) {
+                throw conflict(
+                  executionStageMutationRequested || decision
+                    ? "Resolve the capped review decision through its interaction card."
+                    : "Resolve the capped review decision before changing the execution policy.",
+                );
+              }
+            }
 
             if (executionPolicyMutationRequested) {
               const lockedPreviousExecutionPolicy = normalizeIssueExecutionPolicy(
@@ -9630,14 +9714,22 @@ export function issueRoutes(
                   "The execution policy changed before this update could be recorded. Retry the update.",
                 );
               }
-              const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
-              if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedExisting)) {
-                throw conflict("Resolve the capped review decision before changing the execution policy.");
-              }
               const lockedTransition = deriveExecutionPolicyTransition(lockedExisting);
               if (JSON.stringify(lockedTransition) !== transitionBeforeDecisionId) {
                 throw conflict(
                   "The active review stage changed before this update could be recorded. Retry the update.",
+                );
+              }
+            }
+
+            if (
+              (executionStageMutationRequested || decision)
+              && !executionPolicyMutationRequested
+              && !transition.reviewEscalation
+            ) {
+              if (executionStageConcurrencySnapshot(lockedExisting) !== initialExecutionStageSnapshot) {
+                throw conflict(
+                  "The active review stage changed before this decision could be recorded. Retry the update.",
                 );
               }
             }
@@ -10776,7 +10868,22 @@ export function issueRoutes(
       finalIssueStatus: () => updated?.status,
     });
     try {
-      updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+      updated = await db.transaction(async (tx) => {
+        const lockedIssue = await svc.getByIdForUpdate(id, tx);
+        if (!lockedIssue) throw notFound("Issue not found");
+
+        const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+        if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedIssue)) {
+          throw conflict("Resolve the capped review decision through its interaction card.");
+        }
+
+        return issueService(tx as unknown as Db).checkout(
+          id,
+          req.body.agentId,
+          req.body.expectedStatuses,
+          checkoutRunId,
+        );
+      });
     } catch (error) {
       if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
         res.status(409).json({
@@ -12118,6 +12225,13 @@ export function issueRoutes(
 
     const currentExecutionState = parseIssueExecutionState(currentIssue.executionState);
     const currentExecutionPolicy = normalizeIssueExecutionPolicy(currentIssue.executionPolicy ?? null);
+    const currentExecutionStageSnapshot = JSON.stringify({
+      status: currentIssue.status,
+      assigneeAgentId: currentIssue.assigneeAgentId,
+      assigneeUserId: currentIssue.assigneeUserId,
+      policy: currentExecutionPolicy,
+      state: currentExecutionState,
+    });
     const shouldAutoApproveReviewComment =
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
@@ -12171,6 +12285,25 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
+          const lockedCurrentIssue = await svc.getByIdForUpdate(id, tx);
+          if (!lockedCurrentIssue) throw new AutoApprovalIssueMissingError();
+          const lockedExecutionStageSnapshot = JSON.stringify({
+            status: lockedCurrentIssue.status,
+            assigneeAgentId: lockedCurrentIssue.assigneeAgentId,
+            assigneeUserId: lockedCurrentIssue.assigneeUserId,
+            policy: normalizeIssueExecutionPolicy(lockedCurrentIssue.executionPolicy ?? null),
+            state: parseIssueExecutionState(lockedCurrentIssue.executionState),
+          });
+          if (lockedExecutionStageSnapshot !== currentExecutionStageSnapshot) {
+            throw conflict(
+              "The active review stage changed before this decision could be recorded. Retry the update.",
+            );
+          }
+          const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+          if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedCurrentIssue)) {
+            throw conflict("Resolve the capped review decision through its interaction card.");
+          }
+
           const insertedComment = await svc.addComment(
             id,
             req.body.body,

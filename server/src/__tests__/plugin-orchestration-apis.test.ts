@@ -1073,6 +1073,143 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     return { companyId, executorAgentId, ownerUserId, issueId, interactionId };
   }
 
+  it.each(["status", "assignee", "execution state", "execution policy"] as const)(
+    "issues.update rejects a capped-review %s mutation while the owner decision is pending",
+    async (mutation) => {
+      const fixture = await seedCappedReviewEscalation();
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      const patch = mutation === "status"
+        ? { status: "done" as const }
+        : mutation === "assignee"
+          ? { assigneeAgentId: fixture.executorAgentId, assigneeUserId: null }
+          : mutation === "execution state"
+            ? { executionState: null }
+            : { executionPolicy: null };
+
+      await expect(services.issues.update({
+        issueId: fixture.issueId,
+        companyId: fixture.companyId,
+        patch: patch as never,
+      })).rejects.toThrow(
+        mutation === "execution state" || mutation === "execution policy"
+          ? "Unsupported issue patch field"
+          : "Resolve the capped review decision",
+      );
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: fixture.ownerUserId,
+      });
+      const [interaction] = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+      expect(interaction?.status).toBe("pending");
+
+      if (mutation === "status") {
+        const metadataUpdate = await services.issues.update({
+          issueId: fixture.issueId,
+          companyId: fixture.companyId,
+          patch: { title: "Capped review with additional context" },
+        });
+        expect(metadataUpdate.title).toBe("Capped review with additional context");
+      }
+    },
+  );
+
+  it("issues.update rejects a stale capped-review mutation after the owner decision wins the lock", async () => {
+    const fixture = await seedCappedReviewEscalation();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+    let signalIssueLocked!: () => void;
+    let releaseOwnerDecision!: () => void;
+    const issueLocked = new Promise<void>((resolve) => {
+      signalIssueLocked = resolve;
+    });
+    const ownerDecisionMayCommit = new Promise<void>((resolve) => {
+      releaseOwnerDecision = resolve;
+    });
+
+    const ownerDecision = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, fixture.issueId)).for("update");
+      signalIssueLocked();
+      await ownerDecisionMayCommit;
+      await tx
+        .update(issues)
+        .set({
+          status: "in_progress",
+          assigneeAgentId: fixture.executorAgentId,
+          assigneeUserId: null,
+        })
+        .where(eq(issues.id, fixture.issueId));
+      await tx
+        .update(issueThreadInteractions)
+        .set({
+          status: "rejected",
+          result: {
+            version: 1,
+            outcome: "rejected",
+            answers: [],
+            reason: "Restore the audit record.",
+          },
+          resolvedByUserId: fixture.ownerUserId,
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+    });
+
+    await issueLocked;
+    const staleUpdate = services.issues.update({
+      issueId: fixture.issueId,
+      companyId: fixture.companyId,
+      patch: { status: "done" },
+    }).then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error }),
+    );
+
+    // The plugin's initial snapshot is a non-locking read. While its
+    // transaction waits for the issue row, let the owner decision commit.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseOwnerDecision();
+    await ownerDecision;
+
+    const outcome = await staleUpdate;
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect((outcome.error as Error).message).toContain("active review stage changed");
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: fixture.executorAgentId,
+      assigneeUserId: null,
+    });
+  });
+
+  it.each(["responsibleUserId", "createdByUserId"] as const)(
+    "issues.update rejects unsupported owner-binding field %s before a capped review exists",
+    async (field) => {
+      const fixture = await seedCappedReviewEscalation();
+      const services = buildHostServices(db, "plugin-record-id", "paperclip.gateway", createEventBusStub());
+      await db
+        .update(issueThreadInteractions)
+        .set({ status: "expired", resolvedAt: new Date(), updatedAt: new Date() })
+        .where(eq(issueThreadInteractions.id, fixture.interactionId));
+      const forgedUserId = randomUUID();
+
+      await expect(services.issues.update({
+        issueId: fixture.issueId,
+        companyId: fixture.companyId,
+        patch: { [field]: forgedUserId } as never,
+      })).rejects.toThrow("Unsupported issue patch field");
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+      expect(issue?.responsibleUserId).toBe(fixture.ownerUserId);
+      expect(issue?.createdByUserId).not.toBe(forgedUserId);
+    },
+  );
+
   it.each([
     { action: "accept" as const, reason: undefined, interactionStatus: "accepted", issueStatus: "done", assigneeAgentId: null },
     { action: "reject" as const, reason: "Restore the audit record.", interactionStatus: "rejected", issueStatus: "in_progress", assigneeAgentId: "executor" },

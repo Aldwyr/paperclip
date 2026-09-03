@@ -34,6 +34,7 @@ import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -65,7 +66,7 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -84,6 +85,7 @@ import {
   SANDBOX_STARTUP_SPAN_ATTRS,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumentation.js";
+import { conflict, unprocessable } from "../errors.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -1953,11 +1955,81 @@ export function buildHostServices(
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
-        const updated = (await issues.update(params.issueId, {
+        const reviewEscalationSafePatchFields = new Set([
+          "title",
+          "description",
+          "priority",
+          "billingCode",
+          "originKind",
+          "originId",
+          "originRunId",
+          "requestDepth",
+          "executionWorkspaceId",
+          "executionWorkspacePreference",
+          "executionWorkspaceSettings",
+          "blockedByIssueIds",
+          "labelIds",
+        ]);
+        const supportedIssueUpdateFields = new Set([
+          ...reviewEscalationSafePatchFields,
+          "status",
+          "assigneeAgentId",
+          "assigneeUserId",
+        ]);
+        const unsupportedIssueUpdateFields = Object.keys(patch)
+          .filter((key) => !supportedIssueUpdateFields.has(key));
+        if (unsupportedIssueUpdateFields.length > 0) {
+          throw unprocessable(
+            `Unsupported issue patch field${unsupportedIssueUpdateFields.length === 1 ? "" : "s"}: ${unsupportedIssueUpdateFields.join(", ")}`,
+          );
+        }
+        const reviewEscalationSensitiveMutationRequested = Object.keys(patch)
+          .some((key) => !reviewEscalationSafePatchFields.has(key));
+        const executionStageSnapshot = (issue: {
+          status: string;
+          assigneeAgentId?: string | null;
+          assigneeUserId?: string | null;
+          executionPolicy?: unknown;
+          executionState?: unknown;
+        }) => JSON.stringify({
+          status: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
+          policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+          state: parseIssueExecutionState(issue.executionState),
+        });
+        const initialExecutionStageSnapshot = executionStageSnapshot(existing);
+        const updateData = {
           ...(patch as any),
           actorAgentId,
           actorUserId,
-        })) as Issue;
+        };
+        const postCommitActivityPublications: ActivityPublication[] = [];
+        const updated = reviewEscalationSensitiveMutationRequested
+          ? await db.transaction(async (tx) => {
+              const lockedExisting = requireInCompany(
+                "Issue",
+                await issues.getByIdForUpdate(params.issueId, tx),
+                companyId,
+              );
+              if (executionStageSnapshot(lockedExisting) !== initialExecutionStageSnapshot) {
+                throw conflict(
+                  "The active review stage changed before this update could be recorded. Retry the update.",
+                );
+              }
+              const interactionSvc = issueThreadInteractionService(tx as unknown as Db);
+              if (await interactionSvc.hasPendingReviewEscalationForIssue(lockedExisting)) {
+                throw conflict("Resolve the capped review decision through its interaction card.");
+              }
+              return issues.update(
+                params.issueId,
+                updateData,
+                tx,
+                postCommitActivityPublications,
+              ) as Promise<Issue>;
+            })
+          : await issues.update(params.issueId, updateData) as Issue;
+        for (const publication of postCommitActivityPublications) publishActivity(publication);
         await logPluginActivity({
           companyId,
           action: "issue.updated",

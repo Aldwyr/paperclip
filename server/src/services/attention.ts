@@ -1181,9 +1181,17 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           updatedAt: issueThreadInteractions.updatedAt,
         })
         .from(issueThreadInteractions)
+        .innerJoin(
+          issues,
+          and(
+            eq(issueThreadInteractions.issueId, issues.id),
+            eq(issueThreadInteractions.companyId, issues.companyId),
+          ),
+        )
         .where(and(
           eq(issueThreadInteractions.companyId, companyId),
           inArray(issueThreadInteractions.status, [...PENDING_INTERACTION_STATUSES]),
+          notInArray(issues.status, ["done", "cancelled"]),
         ))
         .orderBy(desc(issueThreadInteractions.updatedAt), desc(issueThreadInteractions.id));
       // Addressee invokability needs the org graph; the audience line also needs

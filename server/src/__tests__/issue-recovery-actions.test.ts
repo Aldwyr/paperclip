@@ -14,6 +14,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueInboxArchives,
+  issueThreadInteractions,
   issueRecoveryActions,
   issueRelations,
   issues,
@@ -26,6 +27,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -137,6 +139,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(issueThreadInteractions);
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
@@ -1544,6 +1547,247 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resolutionNote: "Try the source issue again.",
     });
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("does not resolve a recovery action through a pending capped-review owner decision", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    const decisionId = randomUUID();
+    const interactionId = randomUUID();
+    const executionPolicy = normalizeIssueExecutionPolicy({
+      maxReviewRounds: 1,
+      stages: [{
+        id: stageId,
+        type: "review",
+        participants: [{ type: "agent", agentId: managerId }],
+      }],
+    })!;
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        responsibleUserId: "board-user",
+        executionPolicy,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", userId: "board-user" },
+          returnAssignee: { type: "agent", agentId: coderId },
+          completedStageIds: [],
+          changesRequestedCount: 1,
+          lastDecisionId: decisionId,
+          lastDecisionOutcome: "changes_requested",
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: sourceIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Review round limit reached.",
+        rejectRequiresReason: true,
+        reviewEscalation: {
+          version: 1,
+          decisionId,
+          stageId,
+          reviewerAgentId: managerId,
+          responsibleUserId: "board-user",
+        },
+      },
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:capped-review",
+      evidence: { latestIssueStatus: "in_review" },
+      nextAction: "Resolve the owner review decision.",
+      wakePolicy: { type: "manual" },
+    });
+
+    const response = await request(createApp())
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Retry the source issue.",
+      });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.error).toContain("Resolve the capped review decision");
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
+  });
+
+  it("rejects a stale recovery resolution after the capped-review owner decision wins the issue lock", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const stageId = randomUUID();
+    const decisionId = randomUUID();
+    const interactionId = randomUUID();
+    const executionPolicy = normalizeIssueExecutionPolicy({
+      maxReviewRounds: 1,
+      stages: [{
+        id: stageId,
+        type: "review",
+        participants: [{ type: "agent", agentId: managerId }],
+      }],
+    })!;
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        responsibleUserId: "board-user",
+        executionPolicy,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", userId: "board-user" },
+          returnAssignee: { type: "agent", agentId: coderId },
+          completedStageIds: [],
+          changesRequestedCount: 1,
+          lastDecisionId: decisionId,
+          lastDecisionOutcome: "changes_requested",
+        },
+      })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId: sourceIssueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Review round limit reached.",
+        rejectRequiresReason: true,
+        reviewEscalation: {
+          version: 1,
+          decisionId,
+          stageId,
+          reviewerAgentId: managerId,
+          responsibleUserId: "board-user",
+        },
+      },
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:capped-review-race",
+      evidence: { latestIssueStatus: "in_review" },
+      nextAction: "Resolve the owner review decision.",
+      wakePolicy: { type: "manual" },
+    });
+
+    let signalIssueLocked!: () => void;
+    let releaseOwnerDecision!: () => void;
+    const issueLocked = new Promise<void>((resolve) => {
+      signalIssueLocked = resolve;
+    });
+    const ownerDecisionMayCommit = new Promise<void>((resolve) => {
+      releaseOwnerDecision = resolve;
+    });
+    const ownerDecision = db.transaction(async (tx) => {
+      await tx.select().from(issues).where(eq(issues.id, sourceIssueId)).for("update");
+      signalIssueLocked();
+      await ownerDecisionMayCommit;
+      await tx
+        .update(issues)
+        .set({
+          status: "in_progress",
+          assigneeAgentId: coderId,
+          assigneeUserId: null,
+        })
+        .where(eq(issues.id, sourceIssueId));
+      await tx
+        .update(issueThreadInteractions)
+        .set({
+          status: "rejected",
+          result: {
+            version: 1,
+            outcome: "rejected",
+            reason: "Restore the audit record.",
+            rejectionDisposition: "changes_requested",
+          },
+          resolvedByUserId: "board-user",
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(issueThreadInteractions.id, interactionId));
+    });
+
+    await issueLocked;
+    const staleRecovery = request(createApp(undefined, {
+      recoveryActionEnqueueWakeup: vi.fn(async () => null),
+    }))
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "Retry the source issue.",
+      })
+      .then((response) => response);
+
+    // Let the recovery request take its unlocked authorization snapshot and
+    // block behind the owner's issue-row lock before that decision commits.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseOwnerDecision();
+    await ownerDecision;
+
+    const response = await staleRecovery;
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(response.body.error).toContain("active review stage changed");
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(sourceIssue).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: coderId,
+      assigneeUserId: null,
+    });
+    const [interaction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(interaction).toMatchObject({ status: "rejected", resolvedByUserId: "board-user" });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id,
+      status: "active",
+    });
   });
 
   it("marks a recovery action stale when a blocked source issue is manually moved to todo", async () => {

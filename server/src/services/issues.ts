@@ -87,7 +87,11 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  buildInitialIssueMonitorFields,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -7713,6 +7717,40 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        const reviewEscalationSensitiveMutationRequested =
+          (issueData.status !== undefined && issueData.status !== receiptExisting.status)
+          || (
+            issueData.assigneeAgentId !== undefined
+            && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId
+          )
+          || (
+            issueData.assigneeUserId !== undefined
+            && issueData.assigneeUserId !== receiptExisting.assigneeUserId
+          )
+          || (
+            issueData.responsibleUserId !== undefined
+            && issueData.responsibleUserId !== receiptExisting.responsibleUserId
+          )
+          || (
+            issueData.createdByUserId !== undefined
+            && issueData.createdByUserId !== receiptExisting.createdByUserId
+          )
+          || (
+            issueData.executionPolicy !== undefined
+            && JSON.stringify(normalizeIssueExecutionPolicy(issueData.executionPolicy))
+              !== JSON.stringify(normalizeIssueExecutionPolicy(receiptExisting.executionPolicy))
+          )
+          || (
+            issueData.executionState !== undefined
+            && JSON.stringify(parseIssueExecutionState(issueData.executionState))
+              !== JSON.stringify(parseIssueExecutionState(receiptExisting.executionState))
+          );
+        if (reviewEscalationSensitiveMutationRequested) {
+          const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+          if (await issueThreadInteractionService(tx).hasPendingReviewEscalationForIssue(receiptExisting)) {
+            throw conflict("Resolve the capped review decision through its interaction card.");
+          }
+        }
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])

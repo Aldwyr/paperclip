@@ -8,6 +8,8 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
+  issueThreadInteractions,
   issueTreeHoldMembers,
   issueTreeHolds,
   issues,
@@ -18,6 +20,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { issueService } from "../services/issues.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -41,6 +45,8 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     await db.delete(issueComments);
+    await db.delete(issueExecutionDecisions);
+    await db.delete(issueThreadInteractions);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -270,6 +276,11 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     const runningChildId = randomUUID();
     const todoChildId = randomUUID();
     const doneChildId = randomUUID();
+    const reviewEscalationInteractionId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const executorAgentId = randomUUID();
+    const reviewStageId = randomUUID();
+    const reviewDecisionId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -277,6 +288,30 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(agents).values([
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "reviewer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: executorAgentId,
+        companyId,
+        name: "Executor",
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
     await db.insert(issues).values([
       {
         id: rootIssueId,
@@ -290,9 +325,31 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
         id: runningChildId,
         companyId,
         parentId: rootIssueId,
-        title: "Running child",
-        status: "in_progress",
+        title: "Capped review child",
+        status: "in_review",
         priority: "medium",
+        assigneeUserId: "board-user",
+        responsibleUserId: "board-user",
+        executionPolicy: normalizeIssueExecutionPolicy({
+          maxReviewRounds: 1,
+          stages: [{
+            id: reviewStageId,
+            type: "review",
+            participants: [{ type: "agent", agentId: reviewerAgentId }],
+          }],
+        }),
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "user", userId: "board-user" },
+          returnAssignee: { type: "agent", agentId: executorAgentId },
+          completedStageIds: [],
+          changesRequestedCount: 1,
+          lastDecisionId: reviewDecisionId,
+          lastDecisionOutcome: "changes_requested",
+        },
         createdAt: new Date("2026-04-21T10:01:00.000Z"),
       },
       {
@@ -314,6 +371,28 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
         createdAt: new Date("2026-04-21T10:03:00.000Z"),
       },
     ]);
+    await db.insert(issueThreadInteractions).values({
+      id: reviewEscalationInteractionId,
+      companyId,
+      issueId: runningChildId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: {
+        version: 1,
+        prompt: "Review round limit reached.",
+        rejectRequiresReason: true,
+        reviewEscalation: {
+          version: 1,
+          decisionId: reviewDecisionId,
+          stageId: reviewStageId,
+          reviewerAgentId,
+          responsibleUserId: "board-user",
+        },
+      },
+    });
 
     const svc = issueTreeControlService(db);
     const cancel = await svc.createHold(companyId, rootIssueId, {
@@ -340,6 +419,21 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       [todoChildId]: "cancelled",
       [doneChildId]: "done",
     });
+    const [reviewEscalationInteraction] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, reviewEscalationInteractionId));
+    expect(reviewEscalationInteraction).toMatchObject({
+      status: "pending",
+      result: null,
+    });
+    await expect(issueThreadInteractionService(db).listForIssue(runningChildId)).resolves.toEqual([
+      expect.objectContaining({
+        id: reviewEscalationInteractionId,
+        status: "expired",
+        result: expect.objectContaining({ outcome: "issue_closed" }),
+      }),
+    ]);
 
     await db
       .update(issues)
@@ -371,10 +465,13 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       .from(issues)
       .where(inArray(issues.id, [runningChildId, todoChildId, doneChildId]));
     expect(Object.fromEntries(afterRestore.map((issue) => [issue.id, issue.status]))).toMatchObject({
-      [runningChildId]: "todo",
+      [runningChildId]: "in_review",
       [todoChildId]: "blocked",
       [doneChildId]: "done",
     });
+    await expect(issueThreadInteractionService(db).listForIssue(runningChildId)).resolves.toEqual([
+      expect.objectContaining({ id: reviewEscalationInteractionId, status: "pending" }),
+    ]);
 
     const holds = await db
       .select({ id: issueTreeHolds.id, mode: issueTreeHolds.mode, status: issueTreeHolds.status })
@@ -383,6 +480,23 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     expect(Object.fromEntries(holds.map((hold) => [hold.mode, hold.status]))).toMatchObject({
       cancel: "released",
       restore: "released",
+    });
+
+    const ownerDecision = await issueThreadInteractionService(db).resolveReviewEscalation({
+      issue: { id: runningChildId, companyId },
+      interactionId: reviewEscalationInteractionId,
+      outcome: "changes_requested",
+      reason: "Restore the missing evidence.",
+      actor: { userId: "board-user" },
+    });
+    expect(ownerDecision).toMatchObject({
+      interaction: { status: "rejected" },
+      issue: {
+        id: runningChildId,
+        status: "in_progress",
+        assigneeAgentId: executorAgentId,
+        assigneeUserId: null,
+      },
     });
   });
 
